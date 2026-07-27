@@ -1,0 +1,284 @@
+import { CountryVocabulary } from '../src/types';
+import { incrementQuota, getQuota, getYouTubeKeyPool } from './db';
+
+/**
+ * STRICT BANNED KEYWORD SANITIZER
+ * Strips any occurrence of 'discord' or related forbidden search keywords.
+ */
+const BARE_GEOGRAPHIC_TERMS = [
+  'netherlands', 'amsterdam', 'holland', 'italy', 'rome', 'milan', 'south africa',
+  'united kingdom', 'london', 'germany', 'berlin', 'france', 'paris', 'spain', 'madrid',
+  'australia', 'sydney', 'canada', 'toronto', 'united states'
+];
+
+export function sanitizeSearchQuery(query: string, defaultCountry = ''): string {
+  let cleaned = query.replace(/discord/gi, '').trim();
+  cleaned = cleaned.replace(/\s+/g, ' ');
+
+  // If query is purely a geographic term or empty, anchor it with trading terms
+  const lower = cleaned.toLowerCase();
+  if (BARE_GEOGRAPHIC_TERMS.includes(lower)) {
+    cleaned = `${cleaned} trading marktanalyse`;
+  } else if (cleaned.length < 3) {
+    cleaned = defaultCountry ? `${defaultCountry} trading analysis` : 'trading market structure';
+  }
+
+  return cleaned;
+}
+
+/**
+ * Generates country-specific trading search queries using real native terminology.
+ */
+export function generateCountryQueries(vocab: CountryVocabulary, count = 5): string[] {
+  const queries: string[] = [];
+
+  const terms = vocab.native_trading_terminology || [];
+  const instruments = vocab.popular_instruments || [];
+  const formats = vocab.common_content_format_names || [];
+  const phrases = vocab.local_market_phrases || [];
+
+  // Combine terms with instruments or content formats
+  for (let i = 0; i < count; i++) {
+    const term = terms[i % terms.length] || 'trading';
+    const inst = instruments[i % instruments.length] || '';
+    const fmt = formats[i % formats.length] || '';
+    const phrase = phrases[i % phrases.length] || '';
+
+    let q = '';
+    if (i % 3 === 0) q = `${term} ${fmt}`.trim();
+    else if (i % 3 === 1) q = `${inst} ${term}`.trim();
+    else q = `${phrase} ${term}`.trim();
+
+    const sanitized = sanitizeSearchQuery(q);
+    if (sanitized && !queries.includes(sanitized)) {
+      queries.push(sanitized);
+    }
+  }
+
+  return queries;
+}
+
+export interface DiscoveredChannelRaw {
+  channelId: string;
+  channelName: string;
+  youtubeUrl: string;
+  description: string;
+  videoTitles: string[];
+  locationTag?: string;
+  channelLinks?: string[];
+  pinnedComment?: string;
+  videoDescriptions?: string[];
+  subscriberCount?: string;
+  channelThumbnailUrl?: string;
+}
+
+/**
+ * Retrieves all valid YouTube API keys available in environment variables.
+ * Checks YOUTUBE_API_KEY, YOUTUBE_API_KEY_1..5, and GEMINI_API_KEY.
+ */
+let activeKeyIndex = 0;
+
+/**
+ * Searches YouTube for trading channels using YouTube Data API with automatic API key rotation & failover,
+ * falling back to the realistic trader discovery simulator if all keys hit quota limits or are unconfigured.
+ */
+export async function searchYouTubeChannels(
+  query: string,
+  countryName: string,
+  vocab?: CountryVocabulary
+): Promise<DiscoveredChannelRaw[]> {
+  const sanitizedQuery = sanitizeSearchQuery(query, countryName);
+  if (!sanitizedQuery) return [];
+
+  const keyPool = getYouTubeKeyPool();
+
+  if (keyPool.length > 0) {
+    const attemptsCount = keyPool.length;
+    for (let attempt = 0; attempt < attemptsCount; attempt++) {
+      const currentIndex = (activeKeyIndex + attempt) % keyPool.length;
+      const apiKey = keyPool[currentIndex];
+
+      try {
+        console.log(`[YouTube API Pool] Attempting search with key #${currentIndex + 1}/${keyPool.length} (${apiKey.slice(0, 6)}...)...`);
+        const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(
+          sanitizedQuery
+        )}&maxResults=10&key=${apiKey}`;
+
+        const res = await fetch(searchUrl);
+
+        if (res.ok) {
+          activeKeyIndex = currentIndex; // Pin working key as preferred
+          await incrementQuota(100); // 100 units for YouTube Search call
+          const data = await res.json();
+          const results: DiscoveredChannelRaw[] = [];
+
+          for (const item of data.items || []) {
+            const channelId = item.id?.channelId || item.snippet?.channelId;
+            const channelName = item.snippet?.channelTitle || item.snippet?.title;
+            const thumb = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.medium?.url || item.snippet?.thumbnails?.default?.url;
+            if (channelId && channelName) {
+              results.push({
+                channelId,
+                channelName,
+                youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
+                description: item.snippet?.description || '',
+                videoTitles: [sanitizedQuery],
+                locationTag: item.snippet?.country || undefined,
+                channelLinks: [],
+                channelThumbnailUrl: thumb
+              });
+            }
+          }
+
+          console.log(`[YouTube API Pool] Key #${currentIndex + 1} succeeded. Discovered ${results.length} channels.`);
+          if (results.length > 0) return results;
+        } else {
+          const errBody = await res.json().catch(() => ({}));
+          const reason = errBody?.error?.errors?.[0]?.reason || errBody?.error?.message || `HTTP ${res.status}`;
+          console.warn(`[YouTube API Pool] Key #${currentIndex + 1} failed (${res.status}: ${reason}). Rotating to next key in pool...`);
+        }
+      } catch (e) {
+        console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
+      }
+    }
+    console.warn('[YouTube API Pool] All API keys in pool encountered quotaExceeded or error or returned no results.');
+  }
+
+  // Return empty array when no real YouTube API channels are discovered
+  return [];
+}
+
+/**
+ * Fetches recent video titles and descriptions for a channel using YouTube Data API.
+ * Rotates API key pool automatically.
+ */
+export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Promise<string[]> {
+  const keyPool = getYouTubeKeyPool();
+  if (keyPool.length === 0 || !channelId) return [];
+
+  for (let attempt = 0; attempt < keyPool.length; attempt++) {
+    const currentIndex = (activeKeyIndex + attempt) % keyPool.length;
+    const apiKey = keyPool[currentIndex];
+
+    try {
+      const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&order=date&type=video&maxResults=5&key=${apiKey}`;
+      const res = await fetch(searchUrl);
+
+      if (res.ok) {
+        activeKeyIndex = currentIndex;
+        await incrementQuota(100);
+        const data = await res.json();
+        const videoIds: string[] = [];
+        const snippets: string[] = [];
+
+        for (const item of data.items || []) {
+          const vId = item.id?.videoId;
+          if (vId) videoIds.push(vId);
+          if (item.snippet?.description) {
+            snippets.push(item.snippet.description);
+          }
+        }
+
+        if (videoIds.length > 0) {
+          const videosUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoIds.join(',')}&key=${apiKey}`;
+          const vRes = await fetch(videosUrl);
+          if (vRes.ok) {
+            await incrementQuota(1);
+            const vData = await vRes.json();
+            const fullDescs: string[] = [];
+            for (const item of vData.items || []) {
+              if (item.snippet?.description) {
+                fullDescs.push(item.snippet.description);
+              }
+            }
+            if (fullDescs.length > 0) return fullDescs;
+          }
+        }
+
+        if (snippets.length > 0) return snippets;
+      }
+    } catch (e) {
+      console.warn(`[YouTube API] Failed to fetch video descriptions for ${channelId}:`, e);
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Realistic Trader Discovery Simulator
+ * Creates realistic country-native trading creator channel records based on the query & vocabulary
+ * so operators can test the full pipeline out-of-the-box.
+ */
+function simulateTraderDiscovery(
+  query: string,
+  countryName: string,
+  vocab?: CountryVocabulary
+): DiscoveredChannelRaw[] {
+  const countrySlug = countryName.toLowerCase().replace(/\s+/g, '');
+  const idPrefix = `UC_${countrySlug}_${Math.floor(Math.random() * 899999 + 100000)}`;
+
+  const nativeTerm = vocab?.native_trading_terminology?.[0] || query;
+  const instrument = vocab?.popular_instruments?.[0] || 'Futures';
+
+  // Sample names by country
+  const channelTemplates: Record<string, string[]> = {
+    'Germany': ['DAX Trader Berlin', 'Börsenanalyse Pro', 'Hansecapital Trading', 'Munich Futures Lab'],
+    'France': ['CAC 40 Intraday', 'Le Trader Parisien', 'Bourse & Orderflow', 'Capitole Finance'],
+    'Spain': ['Ibex Intradía Trader', 'Análisis Bursátil Madrid', 'Futuros y Mercado', 'Valencia Price Action'],
+    'United Kingdom': ['London Price Action', 'FTSE Market Structure', 'Mayfair Orderflow', 'City Trader Journal'],
+    'Netherlands': ['AEX Beurs Analyse', 'Amsterdam Daytrader', 'Opties & Futures NL', 'Delft Trading Lab'],
+    'Italy': ['Milano FTSE MIB Trader', 'Borsa e Volumi', 'Roma Trading Journal', 'Torino Price Action'],
+    'Australia': ['Sydney ASX Session', 'Aussie Order Flow', 'Commodities Trader AU', 'Melbourne Market Prep'],
+    'Canada': ['Toronto TSX Energy', 'Canadian Market Structure', 'Oil & Futures Calgary', 'Montreal Daytrader'],
+    'United States': ['NYC Orderflow Trading', 'Apex Prop Trader', 'NQ Price Action Lab', 'SMC Futures Journal']
+  };
+
+  const names = channelTemplates[countryName] || [`${countryName} ${instrument} Trader`, `Pro Trading ${countryName}`];
+  const selectedName = names[Math.floor(Math.random() * names.length)];
+  const channelId = `${idPrefix}_${Math.floor(Math.random() * 9000 + 1000)}`;
+
+  // Randomly simulate whether Discord invite is in Bio, Links, or Video descriptions
+  const hasDiscord = Math.random() > 0.3; // 70% chance to find a Discord community
+  const inviteCode = `trader-${countrySlug}-${Math.floor(Math.random() * 899 + 100)}`;
+
+  let bio = `Official YouTube channel of ${selectedName}. Providing daily ${nativeTerm} and ${instrument} market structure breakdowns.`;
+  let channelLinks: string[] = [];
+  let videoDescs: string[] = [
+    `Daily ${query} recap and trade breakdown.`,
+    `How to trade ${nativeTerm} using order flow and liquidity sweeps.`
+  ];
+
+  if (hasDiscord) {
+    const spot = Math.floor(Math.random() * 3);
+    if (spot === 0) {
+      bio += ` Join our official community: discord.gg/${inviteCode}`;
+    } else if (spot === 1) {
+      channelLinks = [`https://linktr.ee/${selectedName.toLowerCase().replace(/\s+/g, '')}`];
+      // Note: linktree crawler will find discord.gg/${inviteCode}
+    } else {
+      videoDescs.push(`Community & Chat: https://discord.com/invite/${inviteCode}`);
+    }
+  } else {
+    channelLinks = [`https://${selectedName.toLowerCase().replace(/\s+/g, '')}.com`];
+  }
+
+  return [
+    {
+      channelId,
+      channelName: selectedName,
+      youtubeUrl: `https://www.youtube.com/@${selectedName.toLowerCase().replace(/\s+/g, '')}`,
+      description: bio,
+      videoTitles: [
+        `${query} — Live Execution & Market Structure`,
+        `${nativeTerm} Key Levels for Today's Session`
+      ],
+      locationTag: countryName,
+      channelLinks,
+      pinnedComment: hasDiscord && Math.random() > 0.7 ? `Discord server link: discord.gg/${inviteCode}` : undefined,
+      videoDescriptions: videoDescs,
+      subscriberCount: `${Math.floor(Math.random() * 80 + 5)}K subscribers`,
+      channelThumbnailUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(selectedName)}&background=0f172a&color=38bdf8&bold=true`
+    }
+  ];
+}

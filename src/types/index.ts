@@ -1,0 +1,269 @@
+export type CountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
+
+export type DiscordStatus = 'PENDING' | 'NOT_FOUND' | 'ACTIVE' | 'ACTIVE_LOW_VOLUME' | 'NON_TRADING' | 'DEAD' | 'UNCERTAIN';
+
+export type ScanStatus = 'PENDING' | 'LOCKED' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED';
+
+export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
+
+export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+
+export type TradingCategory =
+  | 'Futures'
+  | 'Forex'
+  | 'Options'
+  | 'Crypto'
+  | 'Stocks'
+  | 'Order Flow'
+  | 'ICT / Smart Money'
+  | 'Market Structure'
+  | 'Swing Trading'
+  | 'Scalping'
+  | 'Investing'
+  | 'Macro'
+  | 'Prop Firm'
+  | 'General Finance'
+  | 'General Trading';
+
+export interface TradingClassificationResult {
+  status: TradingStatus;
+  confidenceScore: number;
+  category: TradingCategory | string;
+  breakdown: TradingRelevanceBreakdown;
+}
+
+export interface RawChannelInput {
+  channel_id?: string;
+  channel_name: string;
+  description: string;
+  video_titles?: string[];
+  video_descriptions?: string[];
+  country?: string;
+  external_links?: string[];
+  location_tag?: string;
+  discord_invite?: string | null;
+}
+
+export interface TradingRelevanceBreakdown {
+  stage_a_score: number;       // 0 to 100
+  consistency_ratio: number;  // 0.0 to 1.0
+  ai_reviewed: boolean;
+  fast_heuristic_status?: 'FAST_ACCEPT' | 'FAST_REJECT' | 'UNCERTAIN';
+  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER';
+  ai_prompt_payload?: string;
+  ai_raw_response?: string;
+  ai_model?: string;
+  reasoning: string[];
+}
+
+export interface InspectionStep {
+  step: 'COUNTRY_VALIDATION' | 'BIO' | 'EXTERNAL_LINKS' | 'PINNED_COMMENT' | 'VIDEO_DESCRIPTIONS' | 'SOCIAL_BIO' | 'CUSTOM_DOMAINS';
+  title: string;
+  status: 'FOUND' | 'NOT_FOUND' | 'SKIPPED' | 'ERROR' | 'REJECTED';
+  details?: string;
+  detectedInvite?: string;
+  inviteLocation?: string;
+  timestamp: string;
+}
+
+export type QueryCollection = 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED';
+
+export type QueryIntent =
+  | 'market_analysis'
+  | 'premarket_prep'
+  | 'live_trading'
+  | 'educational'
+  | 'weekly_reviews'
+  | 'trading_journals'
+  | 'session_analysis'
+  | 'strategy_breakdowns'
+  | 'prop_firm';
+
+export interface QualityScoreBreakdown {
+  educational_authenticity: number; // 0 to 35
+  freshness_activity: number;        // 0 to 25
+  community_presence: number;        // 0 to 25
+  low_fluff_score: number;           // 0 to 15
+  reasons: string[];
+}
+
+export interface ChannelRecord {
+  channel_id: string;
+  channel_name: string;
+  youtube_url: string;
+  country: string;
+  country_status: CountryStatus;
+  confidence_score: number; // 0 to 100
+  discord_status: DiscordStatus;
+  discord_invite?: string | null;
+  scan_status: ScanStatus;
+  scan_attempts: number;
+  discovery_source: DiscoverySource;
+  first_seen: string;
+  last_checked?: string | null;
+  inspection_trail?: InspectionStep[];
+  subscriber_count?: string;
+  channel_thumbnail_url?: string;
+  quality_score?: number; // 0 to 100
+  quality_breakdown?: QualityScoreBreakdown;
+  trading_status?: TradingStatus;
+  trading_confidence_score?: number; // 0 to 100
+  trading_category?: TradingCategory | string;
+  trading_relevance_breakdown?: TradingRelevanceBreakdown;
+}
+
+export interface QueryRecord {
+  id: number;
+  query: string;
+  country: string;
+  collection: QueryCollection;
+  intent: QueryIntent;
+  times_executed: number;
+  last_executed?: string | null;
+  total_channels_found: number;
+  unique_channels_found: number;
+  quality_channels_found: number;
+  community_channels_found: number;
+  avg_quality_score: number;
+  performance_score: number; // 0 to 100
+  created_at: string;
+  status: 'ACTIVE' | 'ARCHIVED';
+  ucb_score?: number;
+}
+
+export interface QueryExecutionLog {
+  id: number;
+  query_id?: number;
+  query: string;
+  country: string;
+  executed_at: string;
+  channels_discovered: number;
+  unique_new_channels: number;
+  quality_creators_discovered: number;
+  communities_discovered: number;
+  cycle_quality_score: number;
+  logs?: string[];
+}
+
+export interface ExtractedTermRecord {
+  id: number;
+  country: string;
+  term: string;
+  category: 'terminology' | 'instrument' | 'phrase' | 'format';
+  source_channel_id?: string;
+  occurrences: number;
+  first_extracted: string;
+  last_extracted: string;
+}
+
+export interface CountryVocabulary {
+  country: string;
+  languages: string[];
+  native_trading_terminology: string[];
+  popular_instruments: string[];
+  local_market_phrases: string[];
+  common_content_format_names: string[];
+}
+
+export interface ExcludedCountry {
+  country_name: string;
+  reason: string;
+}
+
+export interface QueueStatus {
+  searchJobs: { depth: number; isPaused: boolean };
+  channelProcessing: { depth: number; isPaused: boolean };
+  discordValidation: { depth: number; isPaused: boolean };
+}
+
+export interface KeyQuotaUsage {
+  keyIndex: number;
+  maskedKey: string;
+  unitsUsed: number;
+  limit: number;
+  isActive: boolean;
+}
+
+export interface QuotaInfo {
+  unitsUsed: number;
+  dailyLimit: number;
+  lastReset: string;
+  totalKeys?: number;
+  keyUsage?: KeyQuotaUsage[];
+}
+
+export interface SearchJob {
+  id: string;
+  query: string;
+  country: string;
+  source: DiscoverySource;
+  status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  attempts: number;
+  createdAt: string;
+}
+
+export interface BenchmarkSample {
+  channel_id: string;
+  channel_name: string;
+  country: string;
+  ground_truth_trading: 'TRADING_CONFIRMED' | 'NON_TRADING';
+  ground_truth_discord: 'ACTIVE' | 'NOT_FOUND';
+  ground_truth_category: string;
+  sample_description: string;
+  sample_video_titles: string[];
+}
+
+export interface RegressionRunMetrics {
+  total_tested: number;
+  classified_trading: number;
+  classified_non_trading: number;
+  true_positives: number;
+  true_negatives: number;
+  false_positives: number;
+  false_negatives: number;
+  precision: number;            // percentage 0 to 100
+  recall: number;               // percentage 0 to 100
+  f1_score: number;             // percentage 0 to 100
+  discord_target_total: number;
+  discord_discovered: number;
+  discord_discovery_rate: number; // percentage 0 to 100
+  avg_processing_time_ms: number;
+  api_quota_consumed: number;
+  query_performance_index: number; // 0 to 100
+}
+
+export interface RegressionRunRecord {
+  id: number;
+  run_timestamp: string;
+  run_label: string;
+  metrics: RegressionRunMetrics;
+  sample_results: Array<{
+    channel_id: string;
+    channel_name: string;
+    country: string;
+    ground_truth_trading: 'TRADING_CONFIRMED' | 'NON_TRADING';
+    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+    ground_truth_discord: 'ACTIVE' | 'NOT_FOUND';
+    predicted_discord: string;
+    is_correct_trading: boolean;
+    is_correct_discord: boolean;
+    processing_time_ms: number;
+  }>;
+}
+
+export interface RegressionDiffReport {
+  baseline_label: string;
+  current_label: string;
+  baseline_timestamp: string;
+  current_timestamp: string;
+  precision_delta: number;
+  recall_delta: number;
+  f1_delta: number;
+  discord_rate_delta: number;
+  latency_delta_ms: number;
+  quota_delta: number;
+  query_index_delta: number;
+  has_regression_alert: boolean;
+  regression_alerts: string[];
+}
+

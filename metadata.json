@@ -1,0 +1,6 @@
+{
+  "name": "Trading Community Discovery Engine",
+  "description": "Automated system that discovers YouTube trading channels, validates country of origin, and detects active Discord communities.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
