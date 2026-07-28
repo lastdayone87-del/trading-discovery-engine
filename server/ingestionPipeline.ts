@@ -19,6 +19,8 @@ export interface IngestionPipelineOutcome {
   channelId: string;
   channelName: string;
   isNew: boolean;
+  wasKnown: boolean;
+  persisted: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
   tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
   discordStatus: DiscordStatus;
@@ -87,6 +89,8 @@ export async function processChannelThroughPipeline(
         channelId: candidate.channelId,
         channelName: candidate.channelName,
         isNew: false,
+        wasKnown: true,
+        persisted: true,
         countryStatus: existing.country_status,
         tradingStatus: existing.trading_status || 'UNCERTAIN',
         discordStatus: existing.discord_status,
@@ -134,7 +138,9 @@ export async function processChannelThroughPipeline(
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,
-      isNew: !existing,
+      isNew: false,
+      wasKnown: !!existing,
+      persisted: false,
       countryStatus: 'REJECTED',
       tradingStatus: 'UNCERTAIN',
       discordStatus: 'NOT_FOUND',
@@ -202,6 +208,8 @@ export async function processChannelThroughPipeline(
       channelId: candidate.channelId,
       channelName: candidate.channelName,
       isNew: !existing,
+      wasKnown: !!existing,
+      persisted: true,
       countryStatus: countryVal.status,
       tradingStatus: 'NON_TRADING',
       discordStatus: 'NON_TRADING',
@@ -259,7 +267,6 @@ export async function processChannelThroughPipeline(
       await enqueueJob(
         'ENRICH_CHANNEL',
         { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate },
-
         { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}` }
       );
     }
@@ -268,6 +275,8 @@ export async function processChannelThroughPipeline(
       channelId: candidate.channelId,
       channelName: candidate.channelName,
       isNew: !existing,
+      wasKnown: !!existing,
+      persisted: true,
       countryStatus: countryVal.status,
       tradingStatus: finalUncertainStatus,
       discordStatus: 'UNCERTAIN',
@@ -334,6 +343,8 @@ export async function processChannelThroughPipeline(
     channelId: candidate.channelId,
     channelName: candidate.channelName,
     isNew: !existing,
+    wasKnown: !!existing,
+    persisted: true,
     countryStatus: countryVal.status,
     tradingStatus: finalChannel.trading_status || tradingVal.status,
     discordStatus: finalChannel.discord_status,

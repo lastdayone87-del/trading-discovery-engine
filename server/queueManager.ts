@@ -22,7 +22,8 @@ import {
   tryReserveQuota,
   finishQuotaReservation,
   getAppSetting,
-  heartbeatJob
+  heartbeatJob,
+  recordQueryRunSightings
 } from './db';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection, InspectionResult } from './inspector';
@@ -30,6 +31,7 @@ import { validateDiscordInvite } from './discordValidator';
 import { searchYouTubeChannels, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw } from './youtube';
 import { classifyTradingRelevance } from './tradingRelevanceClassifier';
 import { evaluateQueryPerformance } from './queryIntelligence';
+import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
@@ -178,32 +180,42 @@ export async function processNextSearchJob(
     const vocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
     if (queryRunId) await startQueryRun(queryRunId);
     const extracted = await searchYouTubeChannels(query, country, vocab);
-    const processedChannels: ChannelRecord[] = [];
-    let uniqueCount = 0;
-    for (const raw of extracted) {
+    const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
+    const observations: QueryObservation[] = [];
+    const sightings = [];
+    for (const [index, raw] of distinctExtracted.entries()) {
       const outcome = await processDiscoveredChannel(raw, country, source);
-      if (outcome.isNew) uniqueCount++;
-      if (outcome.channelRecord) processedChannels.push(outcome.channelRecord);
+      const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
+        ? 'COUNTRY_REJECTED'
+        : outcome.tradingStatus;
+      const qualityScore = outcome.channelRecord?.quality_score || 0;
+      const hasCommunity = outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME';
+      observations.push({ channelId: outcome.channelId, wasKnown: outcome.wasKnown, persisted: outcome.persisted, funnelOutcome, qualityScore, hasCommunity });
+      sightings.push({
+        channelId: outcome.channelId, resultRank: index + 1, wasKnown: outcome.wasKnown, persisted: outcome.persisted,
+        countryOutcome: outcome.countryStatus, tradingOutcome: outcome.tradingStatus, funnelOutcome,
+        metadata: { channelName: outcome.channelName, source }
+      });
     }
     if (queryRunId && queryId) {
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
-      const performance = await evaluateQueryPerformance(queryRecord, processedChannels, uniqueCount);
-      const qualityCount = processedChannels.filter(channel => (channel.quality_score || 0) >= 55).length;
-      const communities = processedChannels.filter(channel => channel.discord_status === 'ACTIVE' || channel.discord_status === 'ACTIVE_LOW_VOLUME').length;
+      const metrics = calculateQueryFunnel(extracted.length, observations);
+      await recordQueryRunSightings(queryRunId, queryId, sightings);
+      const performance = await evaluateQueryPerformance(queryRecord, metrics);
       await completeQueryRun(queryRunId, {
-        rawResults: extracted.length,
-        uniqueChannels: uniqueCount,
-        qualityChannels: qualityCount,
-        communitiesDiscovered: communities,
+        ...metrics,
+        uniqueChannels: metrics.newChannels,
+        qualityChannels: metrics.qualityChannels,
+        communitiesDiscovered: metrics.communitiesDiscovered,
         quotaUsed: 100
       });
       await addQueryExecutionLog({
         query_id: queryId, query, country, executed_at: new Date().toISOString(),
-        channels_discovered: extracted.length, unique_new_channels: uniqueCount,
-        quality_creators_discovered: qualityCount, communities_discovered: communities,
+        channels_discovered: metrics.distinctResults, unique_new_channels: metrics.newChannels,
+        quality_creators_discovered: metrics.qualityChannels, communities_discovered: metrics.communitiesDiscovered,
         cycle_quality_score: performance.performanceScore,
-        logs: [`Durable autonomous run ${queryRunId} completed by ${workerId}.`]
+        logs: [`Durable autonomous run ${queryRunId} completed by ${workerId}.`, `Funnel: ${JSON.stringify(metrics)}`]
       });
     }
     await completeJob(job.id);
@@ -241,6 +253,8 @@ export interface ProcessDiscoveredChannelOutcome {
   channelId: string;
   channelName: string;
   isNew: boolean;
+  wasKnown: boolean;
+  persisted: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
   tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
   discordStatus: DiscordStatus;

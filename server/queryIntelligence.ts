@@ -15,6 +15,7 @@ import {
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { selectQueryCollection, type QueryFunnelMetrics } from './queryPerformance';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -409,69 +410,17 @@ export async function generateCandidateQueriesForCountry(
  */
 export async function evaluateQueryPerformance(
   queryRecord: QueryRecord,
-  discoveredChannels: ChannelRecord[],
-  uniqueNewCount: number
+  metrics: QueryFunnelMetrics
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
-  const totalDiscovered = discoveredChannels.length;
-
-  if (totalDiscovered === 0) {
-    const perfScore = 0;
-    const newCollection = (queryRecord.times_executed >= 2) ? 'REJECTED' as QueryCollection : queryRecord.collection;
-    await updateQueryExecutionStats(queryRecord.id, {
-      totalChannelsFound: 0,
-      uniqueChannelsFound: 0,
-      qualityChannelsFound: 0,
-      communityChannelsFound: 0,
-      avgQualityScore: 0,
-      performanceScore: perfScore,
-      newCollection
-    });
-    return {
-      performanceScore: perfScore,
-      newCollection,
-      summary: `Query returned 0 channels. Demoted to ${newCollection}.`
-    };
-  }
-
-  // Calculate quality, trading relevance, and community yields
-  const tradingConfirmedChannels = discoveredChannels.filter(c => c.trading_status === 'TRADING_CONFIRMED');
-  const qualityChannels = discoveredChannels.filter(c => (c.quality_score || 0) >= 55);
-  const communityChannels = discoveredChannels.filter(c => c.discord_status === 'ACTIVE' || c.discord_status === 'ACTIVE_LOW_VOLUME');
-
-  const tradingYieldRatio = tradingConfirmedChannels.length / totalDiscovered;
-  const qualityYieldRatio = qualityChannels.length / totalDiscovered;
-  const communityYieldRatio = communityChannels.length / totalDiscovered;
-  const uniqueRatio = uniqueNewCount / Math.max(1, totalDiscovered);
-
-  const totalQualitySum = discoveredChannels.reduce((sum, c) => sum + (c.quality_score || 0), 0);
-  const avgQualityScore = Math.round(totalQualitySum / totalDiscovered);
-
-  // Performance formula (0 - 100) incorporating Trading Relevance Yield
-  const performanceScore = Math.round(
-    (0.35 * (tradingYieldRatio * 100)) +
-    (0.25 * (uniqueRatio * 100)) +
-    (0.25 * avgQualityScore) +
-    (0.15 * (communityYieldRatio * 100))
-  );
-
-  // Determine Collection Promotion / Demotion
-  let newCollection = queryRecord.collection;
-  const totalRuns = queryRecord.times_executed + 1;
-
-  if (performanceScore >= 60 && totalRuns >= 1) {
-    newCollection = 'PROVEN';
-  } else if (performanceScore < 25 && totalRuns >= 2) {
-    newCollection = 'REJECTED';
-  } else {
-    newCollection = 'EXPERIMENTAL';
-  }
+  const performanceScore = metrics.performanceScore;
+  const newCollection = selectQueryCollection(queryRecord.collection, queryRecord.times_executed, metrics);
 
   await updateQueryExecutionStats(queryRecord.id, {
-    totalChannelsFound: totalDiscovered,
-    uniqueChannelsFound: uniqueNewCount,
-    qualityChannelsFound: qualityChannels.length,
-    communityChannelsFound: communityChannels.length,
-    avgQualityScore,
+    totalChannelsFound: metrics.distinctResults,
+    uniqueChannelsFound: metrics.newChannels,
+    qualityChannelsFound: metrics.qualityChannels,
+    communityChannelsFound: metrics.communitiesDiscovered,
+    avgQualityScore: metrics.averageQualityScore,
     performanceScore,
     newCollection
   });
@@ -479,6 +428,6 @@ export async function evaluateQueryPerformance(
   return {
     performanceScore,
     newCollection,
-    summary: `Executed with score ${performanceScore}/100 (${uniqueNewCount} unique, ${qualityChannels.length} quality, ${communityChannels.length} communities). Collection: ${newCollection}.`
+    summary: `Executed with score ${performanceScore}/100 (${metrics.newChannels} new, ${metrics.knownChannels} known, ${metrics.countryRejected} wrong-country, ${metrics.nonTrading} non-trading, ${metrics.uncertain} uncertain, ${metrics.tradingConfirmed} confirmed). Collection: ${newCollection}.`
   };
 }

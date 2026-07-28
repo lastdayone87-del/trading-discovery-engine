@@ -242,6 +242,20 @@ export interface ScheduledAutonomousRun {
   query: QueryRecord;
 }
 
+function queryComponents(query: QueryRecord): Array<{ type: string; term: string; tier: number; position: number }> {
+  const metadata = query.generation_metadata || {};
+  const components = [
+    { type: 'QUERY_TEXT', term: query.query, tier: 1, position: -1 },
+    { type: 'PRIMARY_TERM', term: query.primary_term, tier: 1, position: 0 },
+    { type: 'LOCAL_TERM', term: metadata.localTier1Term as string | undefined, tier: 1, position: 1 },
+    { type: 'LEARNED_TERM', term: metadata.learnedTerm as string | undefined, tier: query.knowledge_tiers?.includes(2) ? 2 : 3, position: 2 },
+    { type: 'CONTENT_FORMAT', term: metadata.contentFormat as string | undefined, tier: 1, position: 3 }
+  ];
+  return components
+    .filter((component): component is { type: string; term: string; tier: number; position: number } => !!component.term?.trim())
+    .filter((component, index, all) => all.findIndex(other => other.type === component.type && other.term.trim().toLocaleLowerCase('en') === component.term.trim().toLocaleLowerCase('en')) === index);
+}
+
 export async function getAutonomousSchedulingSnapshot(): Promise<AutonomousSchedulingSnapshot> {
   const db = await getDb();
   await db.query(`UPDATE quota_reservations SET status='EXPIRED' WHERE status='RESERVED' AND expires_at <= now()`);
@@ -287,6 +301,13 @@ export async function scheduleAutonomousQueryRuns(
         [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, JSON.stringify(candidate.query.generation_metadata || {})]
       );
       const runId = run.rows[0].id;
+      for (const component of queryComponents(candidate.query)) {
+        await client.query(
+          `INSERT INTO query_run_components(query_run_id,component_type,term,normalized_term,knowledge_tier,position)
+           VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+          [runId, component.type, component.term.trim(), component.term.normalize('NFKC').trim().toLocaleLowerCase('en'), component.tier, component.position]
+        );
+      }
       const job = await client.query(
         `INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key)
          VALUES('SEARCH_YOUTUBE',$1,20,3,$2) RETURNING id`,
@@ -331,6 +352,15 @@ export async function startQueryRun(runId: string): Promise<void> {
 
 export async function completeQueryRun(runId: string, metrics: {
   rawResults: number;
+  distinctResults: number;
+  duplicateResults: number;
+  knownChannels: number;
+  newChannels: number;
+  countryRejected: number;
+  nonTrading: number;
+  uncertain: number;
+  needsReview: number;
+  tradingConfirmed: number;
   uniqueChannels: number;
   qualityChannels: number;
   communitiesDiscovered: number;
@@ -341,10 +371,16 @@ export async function completeQueryRun(runId: string, metrics: {
   try {
     await client.query('BEGIN');
     const run = await client.query(
-      `UPDATE query_runs SET status='COMPLETED',raw_results=$2,unique_channels=$3,quality_channels=$4,
-       communities_discovered=$5,quota_used=$6,completed_at=now() WHERE id=$1 RETURNING query_id`,
-      [runId, metrics.rawResults, metrics.uniqueChannels, metrics.qualityChannels, metrics.communitiesDiscovered, metrics.quotaUsed]
+      `UPDATE query_runs SET status='COMPLETED',raw_results=$2,distinct_results=$3,duplicate_results=$4,
+       known_channels=$5,new_channels=$6,country_rejected=$7,non_trading=$8,uncertain=$9,needs_review=$10,
+       trading_confirmed=$11,unique_channels=$12,quality_channels=$13,communities_discovered=$14,quota_used=$15,
+       performance_details=$16,completed_at=now() WHERE id=$1 RETURNING query_id`,
+      [runId, metrics.rawResults, metrics.distinctResults, metrics.duplicateResults, metrics.knownChannels,
+       metrics.newChannels, metrics.countryRejected, metrics.nonTrading, metrics.uncertain, metrics.needsReview,
+       metrics.tradingConfirmed, metrics.uniqueChannels, metrics.qualityChannels, metrics.communitiesDiscovered,
+       metrics.quotaUsed, JSON.stringify(metrics)]
     );
+    await client.query(`UPDATE query_run_components SET performance_details=$2 WHERE query_run_id=$1`, [runId, JSON.stringify(metrics)]);
     if (run.rowCount) {
       await client.query(
         `UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL,
@@ -356,6 +392,45 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export interface QueryRunSighting {
+  channelId: string;
+  resultRank: number;
+  searchLane?: string;
+  pageNumber?: number;
+  wasKnown: boolean;
+  persisted: boolean;
+  countryOutcome: string;
+  tradingOutcome: string;
+  funnelOutcome: string;
+  metadata?: Record<string, unknown>;
+}
+
+export async function recordQueryRunSightings(runId: string, queryId: number, sightings: QueryRunSighting[]): Promise<void> {
+  if (!sightings.length) return;
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    for (const sighting of sightings) {
+      await client.query(
+        `INSERT INTO channel_sightings(query_run_id,query_id,channel_id,result_rank,search_lane,page_number,
+         was_known,persisted,country_outcome,trading_outcome,funnel_outcome,metadata)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         ON CONFLICT(query_run_id,channel_id,search_lane,page_number) DO NOTHING`,
+        [runId, queryId, sighting.channelId, sighting.resultRank, sighting.searchLane || 'CHANNEL', sighting.pageNumber || 1,
+         sighting.wasKnown, sighting.persisted, sighting.countryOutcome, sighting.tradingOutcome, sighting.funnelOutcome,
+         JSON.stringify(sighting.metadata || {})]
+      );
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
