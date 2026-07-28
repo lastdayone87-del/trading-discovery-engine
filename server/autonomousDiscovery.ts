@@ -6,6 +6,7 @@ import {
   getExcludedCountries,
   getSchedulerState,
   releaseSchedulerLock,
+  recoverStaleJobs,
   scheduleAutonomousQueryRuns,
   setAppSetting,
   updateSchedulerState
@@ -232,14 +233,21 @@ export async function getAutonomousDiscoveryStatus(): Promise<DiscoveryCycleStat
   };
 }
 
-export function startAutonomousDiscoveryScheduler(): void {
+export function startAutonomousDiscoveryScheduler(intervalMs?: number): void {
   if (schedulerHandle) return;
+
+  recoverStaleJobs().catch(err => console.error('[Autonomous Intelligence Scheduler] Stale job recovery failed:', err));
+
   const schedule = async (delayMs: number) => {
     nextScheduledTime = new Date(Date.now() + delayMs).toISOString();
     await updateSchedulerState('autonomous_discovery', { next_run_at: nextScheduledTime }).catch(() => undefined);
     schedulerHandle = setTimeout(async () => {
       try {
-        await runAutonomousDiscoveryCycle();
+        if (await isQueryIntelligencePaused()) {
+          console.log('[Autonomous Producer] Query Intelligence is PAUSED. Skipping scheduled cycle.');
+        } else {
+          await runAutonomousDiscoveryCycle();
+        }
       } catch (error) {
         console.error('[Autonomous Producer] Cycle failed:', error);
       } finally {

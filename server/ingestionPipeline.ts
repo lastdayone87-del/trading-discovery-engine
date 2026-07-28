@@ -259,6 +259,7 @@ export async function processChannelThroughPipeline(
       await enqueueJob(
         'ENRICH_CHANNEL',
         { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate },
+
         { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}` }
       );
     }
