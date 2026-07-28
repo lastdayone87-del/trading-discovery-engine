@@ -1243,13 +1243,13 @@ export const BENCHMARK_DATASET: BenchmarkSample[] = [
  */
 export async function initializeRegressionDatabase(): Promise<void> {
   const db = await getDb();
-  db.exec(`
+  await db.query(`
     CREATE TABLE IF NOT EXISTS regression_runs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_timestamp TEXT NOT NULL,
+      id SERIAL PRIMARY KEY,
+      run_timestamp TIMESTAMPTZ NOT NULL,
       run_label TEXT NOT NULL,
-      metrics TEXT NOT NULL,
-      sample_results TEXT NOT NULL
+      metrics JSONB NOT NULL,
+      sample_results JSONB NOT NULL
     );
   `);
 }
@@ -1269,7 +1269,7 @@ export async function runRegressionTestSuite(customRunLabel?: string): Promise<R
     channel_name: string;
     country: string;
     ground_truth_trading: 'TRADING_CONFIRMED' | 'NON_TRADING';
-    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
     ground_truth_discord: 'ACTIVE' | 'NOT_FOUND';
     predicted_discord: string;
     is_correct_trading: boolean;
@@ -1384,14 +1384,12 @@ export async function runRegressionTestSuite(customRunLabel?: string): Promise<R
   const label = customRunLabel || `Automated Run ${now.slice(0, 19).replace('T', ' ')}`;
 
   const db = await getDb();
-  db.run(
-    `INSERT INTO regression_runs (run_timestamp, run_label, metrics, sample_results) VALUES (?, ?, ?, ?)`,
+  const insertRes = await db.query(
+    `INSERT INTO regression_runs (run_timestamp, run_label, metrics, sample_results) VALUES ($1, $2, $3, $4) RETURNING id`,
     [now, label, JSON.stringify(metrics), JSON.stringify(sampleResults)]
   );
 
-  // Retrieve the created record ID
-  const row = db.exec(`SELECT MAX(id) as max_id FROM regression_runs`);
-  const recordId = row[0]?.values[0]?.[0] as number || 1;
+  const recordId = insertRes.rows[0]?.id as number || 1;
 
   return {
     id: recordId,
@@ -1408,21 +1406,15 @@ export async function runRegressionTestSuite(customRunLabel?: string): Promise<R
 export async function getRegressionRuns(): Promise<RegressionRunRecord[]> {
   await initializeRegressionDatabase();
   const db = await getDb();
-  const stmt = db.prepare(`SELECT id, run_timestamp, run_label, metrics, sample_results FROM regression_runs ORDER BY id DESC`);
+  const res = await db.query(`SELECT id, run_timestamp, run_label, metrics, sample_results FROM regression_runs ORDER BY id DESC`);
 
-
-  const runs: RegressionRunRecord[] = [];
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    runs.push({
-      id: row.id as number,
-      run_timestamp: row.run_timestamp as string,
-      run_label: row.run_label as string,
-      metrics: JSON.parse(row.metrics as string),
-      sample_results: JSON.parse(row.sample_results as string)
-    });
-  }
-  stmt.free();
+  const runs: RegressionRunRecord[] = res.rows.map((row: any) => ({
+    id: row.id as number,
+    run_timestamp: row.run_timestamp instanceof Date ? row.run_timestamp.toISOString() : row.run_timestamp as string,
+    run_label: row.run_label as string,
+    metrics: typeof row.metrics === 'string' ? JSON.parse(row.metrics) : row.metrics,
+    sample_results: typeof row.sample_results === 'string' ? JSON.parse(row.sample_results) : row.sample_results
+  }));
 
   // If no runs exist yet, trigger an initial baseline run!
   if (runs.length === 0) {
@@ -1515,4 +1507,3 @@ export function addSampleToBenchmarkDataset(sample: BenchmarkSample): number {
   }
   return BENCHMARK_DATASET.length;
 }
-

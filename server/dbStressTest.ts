@@ -17,7 +17,7 @@ export interface StressTestResult {
  * Tests:
  * 1. Singleton initialization under race conditions (50 concurrent async callers to getDb())
  * 2. Rapid concurrent writes (50 simultaneous upsert operations)
- * 3. Save, backup, and cold-reinit cycle verification
+ * 3. Transactional write visibility verification
  * 4. Verification that total record count equals initialCount + insertedCount with 0 loss
  */
 export async function runDatabaseStressTest(): Promise<StressTestResult> {
@@ -79,14 +79,11 @@ export async function runDatabaseStressTest(): Promise<StressTestResult> {
 
   logs.push(`✔ PASS: ${testBatchSize} channels concurrently upserted without thread-lock exceptions.`);
 
-  // 4. Force atomic save
+  // 4. PostgreSQL writes are committed per upsert; saveDb is retained as a no-op compatibility shim.
   saveDb();
-  logs.push('[Stress Test] Database snapshot written to disk (`trading_engine.db` & backup snapshot).');
+  logs.push('[Stress Test] PostgreSQL transactional writes committed; verifying read-after-write visibility.');
 
-  // 5. Simulate cold server restart by re-initializing database
-  logs.push('[Stress Test] Test 3: Simulating cold server restart and re-initialization...');
-  
-  // Verify channels after disk re-read
+  // 5. Verify channels after committed writes
   const postSaveChannels = await getAllChannels();
   const expectedCount = initialCount + testBatchSize;
   
@@ -105,7 +102,7 @@ export async function runDatabaseStressTest(): Promise<StressTestResult> {
     };
   }
 
-  logs.push(`✔ PASS: All ${expectedCount} records intact after restart simulation.`);
+  logs.push(`✔ PASS: All ${expectedCount} records visible after PostgreSQL committed writes.`);
 
   return {
     success: true,

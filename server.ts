@@ -48,13 +48,26 @@ import {
 } from './server/regressionSuite';
 import { runDatabaseStressTest } from './server/dbStressTest';
 import { verifyChannelTradingRelevance, generateClassificationReport } from './server/evidenceEngine';
+import { assertCountryAllowed, ExcludedCountryError } from './server/countryExclusion';
 
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
 
   app.use(express.json());
+
+  const sendOperationError = (res: express.Response, err: any) => {
+    if (err instanceof ExcludedCountryError) {
+      return res.status(422).json({
+        error: err.message,
+        code: err.code,
+        country: err.country,
+        reason: err.reason
+      });
+    }
+    return res.status(500).json({ error: err.message });
+  };
 
   // Purge synthetic test records on startup
   try {
@@ -66,8 +79,14 @@ async function startServer() {
   // --- API ROUTES ---
 
   // Health check
-  app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok' });
+  app.get('/api/health', async (req, res) => {
+    try {
+      const schema = await getSchemaInfo();
+      const queues = await getQueueStatus();
+      res.json({ status: 'ok', database: 'ok', schemaVersion: schema.currentVersion, channelCount: schema.channelCount, queues });
+    } catch (err: any) {
+      res.status(503).json({ status: 'error', database: 'unavailable', error: err.message });
+    }
   });
 
   // 1. Get all channels (returns active validated channels by default; include_rejected=true returns all)
@@ -111,6 +130,7 @@ async function startServer() {
     try {
       const channel = await getChannelById(req.params.id);
       if (!channel) return res.status(404).json({ error: 'Channel not found' });
+
       res.json(channel);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -123,6 +143,8 @@ async function startServer() {
       const channel = await getChannelById(req.params.id);
       if (!channel) return res.status(404).json({ error: 'Channel not found' });
 
+      await assertCountryAllowed(channel.country, 'stored_classification_report');
+
       const report = await generateClassificationReport({
         channel_id: channel.channel_id,
         channel_name: channel.channel_name,
@@ -134,7 +156,7 @@ async function startServer() {
 
       res.json(report);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendOperationError(res, err);
     }
   });
 
@@ -144,6 +166,8 @@ async function startServer() {
       const { channelName, channel_name, description, videoTitles, video_titles, country, locationTag, location_tag } = req.body;
       const cName = channelName || channel_name;
       if (!cName) return res.status(400).json({ error: 'Missing channel_name or channelName parameter.' });
+
+      await assertCountryAllowed(country || 'United States', 'relevance_verification');
 
       const decision = await verifyChannelTradingRelevance({
         channel_name: cName,
@@ -155,7 +179,7 @@ async function startServer() {
 
       res.json(decision);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendOperationError(res, err);
     }
   });
 
@@ -165,6 +189,8 @@ async function startServer() {
       const { channelName, channel_name, description, videoTitles, video_titles, country, locationTag, location_tag } = req.body;
       const cName = channelName || channel_name;
       if (!cName) return res.status(400).json({ error: 'Missing channel_name or channelName parameter.' });
+
+      await assertCountryAllowed(country || 'United States', 'classification_report');
 
       const report = await generateClassificationReport({
         channel_name: cName,
@@ -176,7 +202,7 @@ async function startServer() {
 
       res.json(report);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendOperationError(res, err);
     }
   });
 
@@ -224,7 +250,7 @@ async function startServer() {
 
       res.json({ message: `Generated ${queries.length} native queries for ${country}. Jobs queued.`, queries });
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendOperationError(res, err);
     }
   });
 
@@ -426,7 +452,7 @@ async function startServer() {
       const result = await runAutonomousDiscoveryCycle(country);
       res.json(result);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendOperationError(res, err);
     }
   });
 
@@ -438,7 +464,7 @@ async function startServer() {
       const generated = await generateCandidateQueriesForCountry(country, count || 3);
       res.json(generated);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendOperationError(res, err);
     }
   });
 
@@ -527,7 +553,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Trading Community Discovery Engine running on http://0.0.0.0:${PORT}`);
-    startAutonomousDiscoveryScheduler(30 * 60 * 1000); // 30 minute autonomous cycle
+    startAutonomousDiscoveryScheduler();
   });
 }
 

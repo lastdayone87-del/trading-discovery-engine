@@ -40,6 +40,8 @@ export class ConfigurableWeightedStrategy {
 
     // Check if negative evidence contains explicit irrelevant domain signals (e.g. gaming, cooking, vlogs)
     const hasIrrelevantDomainNegative = negativeItems.some(i => i.category === 'IRRELEVANT_DOMAIN');
+    const hasAdjacentFinanceNegative = negativeItems.some(i => i.category === 'NON_TRADING_ADJACENT');
+    const hasSevereHypeNegative = negativeItems.some(i => i.category === 'HYPE_SPECULATION');
 
     // Calculate Net Evidence Score (baseline 50)
     const netWeight = totalPositiveWeight - totalNegativeWeight;
@@ -63,13 +65,13 @@ export class ConfigurableWeightedStrategy {
 
     if (
       // Standard condition: positive weight >= threshold and score >= 65 and consistency ratio
-      (totalPositiveWeight >= this.config.minPositiveWeightTrading && confidenceScore >= this.config.minVerifiedTradingScore && consistencyRatio >= this.config.minMultiVideoConsistency) ||
+      (totalPositiveWeight >= this.config.minPositiveWeightTrading && confidenceScore >= this.config.minVerifiedTradingScore && consistencyRatio >= this.config.minMultiVideoConsistency && !hasSevereHypeNegative && !hasAdjacentFinanceNegative) ||
       // Concept / Methodology condition: strong positive evidence without negative domain matches
-      (totalPositiveWeight >= 15 && !hasIrrelevantDomainNegative && (hasMethodologyConcept || hasHighReliabilityMatch)) ||
+      (totalPositiveWeight >= 15 && !hasIrrelevantDomainNegative && !hasSevereHypeNegative && !hasAdjacentFinanceNegative && (hasMethodologyConcept || hasHighReliabilityMatch)) ||
       // Platform / Prop firm match: explicit tool references
-      (hasPlatformOrPropFirm && totalPositiveWeight >= 15 && !hasIrrelevantDomainNegative) ||
+      (hasPlatformOrPropFirm && totalPositiveWeight >= 15 && !hasIrrelevantDomainNegative && !hasSevereHypeNegative && !hasAdjacentFinanceNegative) ||
       // Strong net positive weight
-      (totalPositiveWeight >= 25 && !hasIrrelevantDomainNegative)
+      (totalPositiveWeight >= 25 && !hasIrrelevantDomainNegative && !hasSevereHypeNegative && !hasAdjacentFinanceNegative)
     ) {
       status = 'TRADING_CONFIRMED';
       confidenceScore = Math.max(82, confidenceScore);
@@ -81,6 +83,8 @@ export class ConfigurableWeightedStrategy {
       (totalNegativeWeight >= 25 && totalPositiveWeight <= 5) ||
       // Low confidence score with negative domain presence
       (confidenceScore <= 30 && hasIrrelevantDomainNegative) ||
+      // Adjacent finance/news and hype are not trading channels without methodology evidence
+      ((hasAdjacentFinanceNegative || hasSevereHypeNegative) && totalPositiveWeight < 15) ||
       // Zero positive trading weight (no financial terms found anywhere in metadata or videos)
       (totalPositiveWeight === 0 && (hasIrrelevantDomainNegative || totalNegativeWeight > 0 || confidenceScore <= 50))
     ) {
