@@ -28,7 +28,7 @@ import {
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection, InspectionResult } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
-import { searchYouTubeChannels, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw } from './youtube';
+import { searchYouTubeChannels, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import { classifyTradingRelevance } from './tradingRelevanceClassifier';
 import { evaluateQueryPerformance } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
@@ -171,15 +171,15 @@ export async function processNextSearchJob(
       return true;
     }
 
-    const { query, country, source, queryRunId, queryId } = job.payload as {
-      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number;
+    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO' } = job.payload as {
+      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane;
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
     const vocabs = await getCountryVocabularies();
     const vocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
     if (queryRunId) await startQueryRun(queryRunId);
-    const extracted = await searchYouTubeChannels(query, country, vocab);
+    const extracted = await searchYouTubeChannels(query, country, vocab, retrievalLane);
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
     const observations: QueryObservation[] = [];
     const sightings = [];
@@ -192,9 +192,9 @@ export async function processNextSearchJob(
       const hasCommunity = outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME';
       observations.push({ channelId: outcome.channelId, wasKnown: outcome.wasKnown, persisted: outcome.persisted, funnelOutcome, qualityScore, hasCommunity });
       sightings.push({
-        channelId: outcome.channelId, resultRank: index + 1, wasKnown: outcome.wasKnown, persisted: outcome.persisted,
+        channelId: outcome.channelId, resultRank: index + 1, searchLane: retrievalLane, wasKnown: outcome.wasKnown, persisted: outcome.persisted,
         countryOutcome: outcome.countryStatus, tradingOutcome: outcome.tradingStatus, funnelOutcome,
-        metadata: { channelName: outcome.channelName, source }
+        metadata: { channelName: outcome.channelName, source, retrievalLane }
       });
     }
     if (queryRunId && queryId) {
@@ -215,7 +215,7 @@ export async function processNextSearchJob(
         channels_discovered: metrics.distinctResults, unique_new_channels: metrics.newChannels,
         quality_creators_discovered: metrics.qualityChannels, communities_discovered: metrics.communitiesDiscovered,
         cycle_quality_score: performance.performanceScore,
-        logs: [`Durable autonomous run ${queryRunId} completed by ${workerId}.`, `Funnel: ${JSON.stringify(metrics)}`]
+        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId}.`, `Funnel: ${JSON.stringify(metrics)}`]
       });
     }
     await completeJob(job.id);
