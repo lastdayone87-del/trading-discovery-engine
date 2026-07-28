@@ -17,6 +17,7 @@ import {
 } from './db';
 import { searchYouTubeChannels } from './youtube';
 import { processDiscoveredChannel, ProcessDiscoveredChannelOutcome } from './queueManager';
+import { processDiscoveredChannel, addSearchJob, ProcessDiscoveredChannelOutcome } from './queueManager';
 import { assertCountryAllowed } from './countryExclusion';
 import {
   selectNextQueryForCountry,
