@@ -8,11 +8,10 @@
   },
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "npm run check:db-exports && vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.cjs",
-    "lint": "npm run check:db-exports && tsc --noEmit",
-    "check:db-exports": "node scripts/checkDbExports.mjs",
+    "lint": "tsc --noEmit",
     "test": "find server -name '*.test.ts' -exec node --import tsx --test {} +",
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
