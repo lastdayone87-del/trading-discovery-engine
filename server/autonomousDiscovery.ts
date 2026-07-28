@@ -40,6 +40,10 @@ interface DiscoveryCycleStatus {
   lastRunTime?: string;
   nextScheduledTime?: string;
   lastReport?: DiscoveryProducerReport;
+  schedulerIntervalMinutes: number;
+  batchSize: number;
+  targetQueueDepth: number;
+  dailyQuotaBudget: number;
 }
 
 interface DiscoveryConfig {
@@ -219,8 +223,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
 }
 
 export async function getAutonomousDiscoveryStatus(): Promise<DiscoveryCycleStatus> {
-  const [isPaused, scopeInfo, persisted] = await Promise.all([
-    isQueryIntelligencePaused(), getDiscoveryScope(), getSchedulerState('autonomous_discovery')
+  const [isPaused, scopeInfo, persisted, config] = await Promise.all([
+    isQueryIntelligencePaused(), getDiscoveryScope(), getSchedulerState('autonomous_discovery'), getDiscoveryConfig()
   ]);
   return {
     isRunning: isCycleRunning || !!persisted?.is_running,
@@ -229,29 +233,27 @@ export async function getAutonomousDiscoveryStatus(): Promise<DiscoveryCycleStat
     selectedCountries: scopeInfo.selectedCountries,
     lastRunTime: lastRunTime || persisted?.last_run_at?.toISOString?.() || persisted?.last_run_at,
     nextScheduledTime: nextScheduledTime || persisted?.next_run_at?.toISOString?.() || persisted?.next_run_at,
-    lastReport: lastReport || persisted?.last_report
+    lastReport: lastReport || persisted?.last_report,
+    schedulerIntervalMinutes: config.intervalMinutes,
+    batchSize: config.batchSize,
+    targetQueueDepth: config.targetQueueDepth,
+    dailyQuotaBudget: config.dailyQuotaBudget
   };
 }
 
-export function startAutonomousDiscoveryScheduler(intervalMs?: number): void {
+export function startAutonomousDiscoveryScheduler(): void {
   if (schedulerHandle) return;
-
-  recoverStaleJobs().catch(err => console.error('[Autonomous Intelligence Scheduler] Stale job recovery failed:', err));
-
   const schedule = async (delayMs: number) => {
     nextScheduledTime = new Date(Date.now() + delayMs).toISOString();
     await updateSchedulerState('autonomous_discovery', { next_run_at: nextScheduledTime }).catch(() => undefined);
     schedulerHandle = setTimeout(async () => {
       try {
-        if (await isQueryIntelligencePaused()) {
-          console.log('[Autonomous Producer] Query Intelligence is PAUSED. Skipping scheduled cycle.');
-        } else {
-          await runAutonomousDiscoveryCycle();
-        }
+        await runAutonomousDiscoveryCycle();
       } catch (error) {
         console.error('[Autonomous Producer] Cycle failed:', error);
       } finally {
         const config = await getDiscoveryConfig();
+        console.log(`[Autonomous Producer] Next wake scheduled in ${config.intervalMinutes} minute(s).`);
         void schedule(config.intervalMinutes * 60_000);
       }
     }, delayMs);

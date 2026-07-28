@@ -42,6 +42,10 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     lastRunTime?: string;
     nextScheduledTime?: string;
     lastReport?: any;
+    schedulerIntervalMinutes?: number;
+    batchSize?: number;
+    targetQueueDepth?: number;
+    dailyQuotaBudget?: number;
   }>({ isRunning: false, isPaused: false, scope: 'GLOBAL', selectedCountries: [] });
 
   const [selectedCountry, setSelectedCountry] = useState<string>('All');
@@ -261,7 +265,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     ? 'Engine Paused (State Preserved)'
                     : status.isRunning || isCycleRunning
                     ? 'Executing Cycle...'
-                    : '30-Min Scheduler Active'}
+                    : `${status.schedulerIntervalMinutes ?? 5}-Min Scheduler Active`}
                 </span>
               </div>
               {!status.isPaused && status.nextScheduledTime && (
@@ -634,12 +638,12 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         {activeSubTab === 'logs' && (
           <div className="space-y-3">
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Complete execution history of 30-minute autonomous intelligence cycles.
+              Complete execution history of quota-paced autonomous producer cycles running every {status.schedulerIntervalMinutes ?? 5} minutes.
             </p>
             <div className="space-y-2">
               {logs.length === 0 ? (
                 <div className="p-8 text-center text-slate-400 dark:text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl">
-                  No execution logs recorded yet. Trigger a manual cycle or wait for the 30-minute autonomous scheduler.
+                  No execution logs recorded yet. Trigger a manual cycle or wait for the {status.schedulerIntervalMinutes ?? 5}-minute autonomous producer.
                 </div>
               ) : (
                 logs.map(log => (
@@ -681,4 +685,3 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     </div>
   );
 };
-
