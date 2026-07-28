@@ -1,10 +1,11 @@
 import { CountryKnowledgePack, LanguageKnowledge, LayeredKnowledgeContext } from './types';
+import { SUPPORTED_CLASSIFICATION_COUNTRIES } from './multilingualTerminology';
 
 // ============================================================================
 // 1. GLOBAL KNOWLEDGE PACK (Universal Financial Market Terms)
 // ============================================================================
 export const GLOBAL_INSTRUMENTS = [
-  'nq', 'es', 'ym', 'rty', 'dax', 'ftse', 'cac40', 'nikkei', 'nifty', 'sensex', 'spx', 'ndx', 'vix',
+  'nq', 'es', 'ym', 'rty', 'dax', 'ftse', 'cac40', 'nikkei', 'spx', 'ndx', 'vix',
   'eurusd', 'gbpusd', 'usdjpy', 'audusd', 'usdcad', 'usdchf', 'nzdusd', 'xauusd', 'xagusd', 'cl', 'ng', 'btc', 'eth', 'sol',
   'futures', 'forex', 'options', '0dte', 'perpetual futures', 'leverage', 'equities', 'bonds', 'treasuries', 'stocks', 'crypto', 'defi'
 ];
@@ -20,8 +21,7 @@ export const GLOBAL_ADVANCED_CONCEPTS = [
   'ict', 'smart money concepts', 'smc', 'fair value gap', 'fvg', 'order block', 'liquidity sweep', 'break of structure',
   'price action', 'market structure', 'scalping', 'swing trading', 'day trading', 'position sizing', 'risk management',
   'backtesting', 'trading journal', 'technical analysis', 'chart patterns', 'candlestick', 'trading psychology',
-  'trader mindset', 'market analysis', 'daily bias', 'premarket analysis', 'trade setup', 'trading strategy',
-  'crypto yield', 'yield farming', 'portefeuille', 'pea', 'dividendos', 'criptomonedas'
+  'trader mindset', 'market analysis', 'daily bias', 'premarket analysis', 'trade setup', 'trading strategy'
 ];
 
 export const GLOBAL_NEGATIVE_TERMS = [
@@ -74,54 +74,12 @@ export const LANGUAGE_KNOWLEDGE_PACKS: Record<string, LanguageKnowledge> = {
     negativeTerms: ['videogiochi', 'ricette', 'trucco', 'pasta italiana'],
     commonPhrases: ['analisi ftse mib', 'corso di trading', 'trading dal vivo']
   },
-  pt: {
-    languageCode: 'pt',
-    languageName: 'Portuguese',
-    positiveTerms: ['bolsa de valores', 'mini indice', 'mini dolar', 'b3', 'mesa proprietaria', 'analise tecnica', 'ações e dividendos', 'day trade ao vivo', 'operando mini indice'],
-    negativeTerms: ['jogos', 'receitas', 'maquiagem', 'futebol', 'cozinha'],
-    commonPhrases: ['operando mini indice', 'day trade ao vivo', 'analise b3', 'ações e dividendos b3']
-  },
   ja: {
     languageCode: 'ja',
     languageName: 'Japanese',
     positiveTerms: ['FXトレード', '株式投資', '日経225', 'テクニカル分析', 'チャート分析', 'プロップファーム', 'ドル円', 'デイトレード', '暗号資産', 'スマートマネー', '株主優待', '高配当株'],
     negativeTerms: ['ゲーム実況', 'メイク', '料理', 'アニメ'],
     commonPhrases: ['日経225チャート分析', 'FX初心者講座', 'リアルタイムトレード', 'ドル円 デイトレード']
-  },
-  ko: {
-    languageCode: 'ko',
-    languageName: 'Korean',
-    positiveTerms: ['주식매매', '해외선물', '코스피', '나스닥매매', '차트분석', '프랍트레이딩', '조건검색식', '단타', '선물 차트분석', '외환선물', '비트코인 선물'],
-    negativeTerms: ['게임방송', '먹방', '뷰티', '일상브이로그'],
-    commonPhrases: ['해외선물 나스닥 매매', '주식 차트 분석', '실전 트레이딩', '조건검색식 단타']
-  },
-  vi: {
-    languageCode: 'vi',
-    languageName: 'Vietnamese',
-    positiveTerms: ['chúng khoán', 'chungkhoan', 'giao dịch forex', 'phân tích kỹ thuật', 'quản lý vốn', 'quy fonde', 'chứng khoán', 'bảng điện tử'],
-    negativeTerms: ['ẩm thực', 'am thuc', 'du lịch', 'liên quân', 'gameplay'],
-    commonPhrases: ['phân tích vn-index', 'chiến lược giao dịch vàng', 'học forex cơ bản']
-  },
-  pl: {
-    languageCode: 'pl',
-    languageName: 'Polish',
-    positiveTerms: ['gpw warszawa', 'wig20', 'inwestowanie', 'analiza techniczna', 'polska prop firm', 'spółki z gpw'],
-    negativeTerms: ['gry komputerowe', 'przepisy kulinarne', 'vlogi'],
-    commonPhrases: ['analiza gpw wig20', 'handel na forexie', 'poradnik inwestowania']
-  },
-  hi: {
-    languageCode: 'hi',
-    languageName: 'Hindi',
-    positiveTerms: ['share market hindi', 'nifty option trading', 'banknifty scalp', 'technical analysis hindi', 'candlestick hindi', 'trading strategy hindi'],
-    negativeTerms: ['smartphone unboxing', 'gaming hindi', 'cricket highlights'],
-    commonPhrases: ['nifty banknifty live', 'share market for beginners', 'option trading hindi']
-  },
-  ar: {
-    languageCode: 'ar',
-    languageName: 'Arabic',
-    positiveTerms: ['تداول', 'فوركس', 'الأسهم', 'التحليل الفني', 'سوق المال', 'تداول العملات', 'شركة تمويل', 'بروب فيرم', 'تداول دبي'],
-    negativeTerms: ['العاب', 'طبخ', 'عطور'],
-    commonPhrases: ['تحليل سوق الأسهم', 'تداول الفوركس للمبتدئين']
   },
   nl: {
     languageCode: 'nl',
@@ -196,16 +154,6 @@ export const COUNTRY_KNOWLEDGE_PACKS: Record<string, CountryKnowledgePack> = {
     nativeTradingTerminology: ['Apertura Piazza Affari', 'Analisi tecnica Borsa Italiana', 'Titoli azionari'],
     regionalNegativeTerms: ['Ricette di pasta', 'Cucina italiana', 'Turismo']
   },
-  'Brazil': {
-    countryName: 'Brazil',
-    primaryLanguage: 'pt',
-    regionalExchanges: ['B3', 'Bolsa do Brasil'],
-    localBrokers: ['XP Investimentos', 'BTG Pactual', 'Clear Corretora', 'Rico'],
-    popularInstruments: ['Mini Índice', 'Mini Dólar', 'B3', 'PETR4', 'VALE3'],
-    localPropFirms: ['Mesa Proprietária', 'Atom Educacional', 'FlixTrading'],
-    nativeTradingTerminology: ['Operando mini índice', 'Day trade ao vivo', 'Ações e dividendos B3', 'Análise B3'],
-    regionalNegativeTerms: ['Futebol', 'Receitas rápidas', 'Cozinha', 'Carnaval']
-  },
   'Japan': {
     countryName: 'Japan',
     primaryLanguage: 'ja',
@@ -215,76 +163,6 @@ export const COUNTRY_KNOWLEDGE_PACKS: Record<string, CountryKnowledgePack> = {
     localPropFirms: ['Fintokei Japan', 'FTMO Japan'],
     nativeTradingTerminology: ['東京市場', '日経平均', '為替介入', 'ローソク足', '板情報', 'ドル円 デイトレード', 'スマートマネーコンセプト', '株主優待'],
     regionalNegativeTerms: ['アニメ感想', 'ゲーム実況', 'スマート家電']
-  },
-  'South Korea': {
-    countryName: 'South Korea',
-    primaryLanguage: 'ko',
-    regionalExchanges: ['KRX', 'Korea Exchange', 'KOSPI', 'KOSDAQ'],
-    localBrokers: ['Kiwoom Securities', 'Samsung Securities', 'NH Investment'],
-    popularInstruments: ['해외선물', '나스닥', 'KOSPI 200', 'USD/KRW'],
-    localPropFirms: ['프랍트레이딩', 'FTMO Korea'],
-    nativeTradingTerminology: ['해외선물 나스닥', '국내주식 단타', '조건검색식', '차트분석', '비트코인 선물'],
-    regionalNegativeTerms: ['게임방송', '먹방', 'K-pop vlogs']
-  },
-  'Vietnam': {
-    countryName: 'Vietnam',
-    primaryLanguage: 'vi',
-    regionalExchanges: ['HOSE', 'HNX', 'UPCoM'],
-    localBrokers: ['VPS Securities', 'SSI Securities', 'VNDirect', 'TCBS'],
-    popularInstruments: ['VN30', 'VN-Index', 'Gold XAUUSD', 'EURUSD'],
-    localPropFirms: ['Quỹ FTMO', 'Quỹ Topstep Việt Nam'],
-    nativeTradingTerminology: ['Bảng điện tử', 'Khớp lệnh', 'Thị trường chứng khoán', 'Kháng cự hỗ trợ'],
-    regionalNegativeTerms: ['Ẩm thực đường phố', 'Game Liên Quân', 'ẩm thực']
-  },
-  'Poland': {
-    countryName: 'Poland',
-    primaryLanguage: 'pl',
-    regionalExchanges: ['GPW', 'Giełda Papierów Wartościowych w Warszawie'],
-    localBrokers: ['XTB Polska', 'DM BOŚ', 'mBank Brokerage'],
-    popularInstruments: ['WIG20', 'MWIG40', 'EURUSD', 'USDPLN'],
-    localPropFirms: ['Polska Prop Firm', 'FTMO Poland'],
-    nativeTradingTerminology: ['Otwarcie GPW', 'Społki z GPW', 'Dźwignia finansowa', 'Analiza świecowa'],
-    regionalNegativeTerms: ['Szlak w Tatrach', 'Gotowanie w domu']
-  },
-  'India': {
-    countryName: 'India',
-    primaryLanguage: 'hi',
-    regionalExchanges: ['NSE', 'BSE'],
-    localBrokers: ['Zerodha', 'Groww', 'Angel One', 'Upstox'],
-    popularInstruments: ['Nifty', 'Bank Nifty', 'Finnifty', 'Sensex'],
-    localPropFirms: ['FTMO India'],
-    nativeTradingTerminology: ['Nifty option trading', 'Banknifty scalp', 'Share market hindi', 'Candlestick pattern'],
-    regionalNegativeTerms: ['Cricket match highlights', 'Bollywood news', 'Smartphone unboxing']
-  },
-  'Mexico': {
-    countryName: 'Mexico',
-    primaryLanguage: 'es',
-    regionalExchanges: ['BMV', 'Bolsa Mexicana de Valores'],
-    localBrokers: ['GBM+', 'Interactive Brokers Mexico'],
-    popularInstruments: ['IPC', 'USDMXN'],
-    localPropFirms: ['PropFirm Mexico'],
-    nativeTradingTerminology: ['Apertura BMV', 'Analisis de mercado MX'],
-    regionalNegativeTerms: ['Lucha libre', 'Deportes MX', 'Comida mexicana']
-  },
-  'United Arab Emirates': {
-    countryName: 'United Arab Emirates',
-    primaryLanguage: 'ar',
-    regionalExchanges: ['DFM', 'ADX', 'Nasdaq Dubai'],
-    localBrokers: ['ADSS', 'Century Financial', 'CFI Dubai'],
-    popularInstruments: ['Gold', 'Oil', 'EURUSD', 'US500'],
-    localPropFirms: ['FTMO Dubai', 'Prop Firm Dubai'],
-    nativeTradingTerminology: ['تداول العملات', 'التحليل الفني', 'سوق دبي المالي', 'Prop Firm Dubai'],
-    regionalNegativeTerms: ['Desert safari', 'Arabic perfumes', 'Real estate off plan']
-  },
-  'Singapore': {
-    countryName: 'Singapore',
-    primaryLanguage: 'en',
-    regionalExchanges: ['SGX', 'Singapore Exchange'],
-    localBrokers: ['DBS Vickers', 'Tiger Brokers SG', 'Moomoo SG'],
-    popularInstruments: ['STI', 'US Equities', 'FX'],
-    localPropFirms: ['FTMO SG'],
-    nativeTradingTerminology: ['SGX market update', 'US stock options SG'],
-    regionalNegativeTerms: ['Hawker food guide', 'Singapore vlogs']
   },
   'Canada': {
     countryName: 'Canada',
@@ -316,27 +194,15 @@ export const COUNTRY_KNOWLEDGE_PACKS: Record<string, CountryKnowledgePack> = {
     nativeTradingTerminology: ['beurs analyse', 'AEX trading', 'technische analyse', 'handelen in opties', 'marktanalyse', 'beleggen en trading', 'daghandel strategie', 'beursvideos'],
     regionalNegativeTerms: ['Voetbal', 'Amsterdam vlog', 'Recepten']
   },
-  'South Africa': {
-    countryName: 'South Africa',
-    primaryLanguage: 'en',
-    regionalExchanges: ['JSE', 'Johannesburg Stock Exchange'],
-    localBrokers: ['EasyEquities', 'IG South Africa', 'Standard Bank Webtrader'],
-    popularInstruments: ['JSE', 'ALSI', 'USDZAR', 'Gold'],
-    localPropFirms: ['FTMO ZA', 'Funding Pips ZA'],
-    nativeTradingTerminology: ['JSE trading', 'rand trading', 'USDZAR analysis', 'South Africa trading'],
-    regionalNegativeTerms: ['Safari vlog', 'Braai recipes', 'Springboks highlights']
-  }
 };
 
-/**
- * Resolve Layered Knowledge Context: Global → Language → Country
- */
+/** Resolve classification knowledge only for the ten supported discovery countries. */
 export function getLayeredKnowledgeContext(countryName?: string): LayeredKnowledgeContext {
   const cName = countryName && countryName !== 'UNKNOWN' ? countryName : 'UNKNOWN';
-  const countryPack = COUNTRY_KNOWLEDGE_PACKS[cName] || (cName === 'UNKNOWN' ? undefined : COUNTRY_KNOWLEDGE_PACKS['United States']);
+  const supported = (SUPPORTED_CLASSIFICATION_COUNTRIES as readonly string[]).includes(cName);
+  const countryPack = supported ? COUNTRY_KNOWLEDGE_PACKS[cName] : undefined;
   const langCode = countryPack?.primaryLanguage || 'en';
-  const languagePack = LANGUAGE_KNOWLEDGE_PACKS[langCode] || LANGUAGE_KNOWLEDGE_PACKS['en'];
-
+  const languagePack = LANGUAGE_KNOWLEDGE_PACKS[langCode] || LANGUAGE_KNOWLEDGE_PACKS.en;
   return {
     globalInstruments: GLOBAL_INSTRUMENTS,
     globalPlatformsPropFirms: GLOBAL_PLATFORMS_BROKERS_PROPFIRMS,
