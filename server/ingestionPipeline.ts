@@ -116,35 +116,14 @@ export async function processChannelThroughPipeline(
     console.log(
       `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`
     );
-    const rejectedChannel: ChannelRecord = existing || {
-      channel_id: candidate.channelId,
-      channel_name: candidate.channelName,
-      youtube_url: candidate.youtubeUrl,
-      country: targetCountry,
-      country_status: 'REJECTED',
-      confidence_score: countryVal.score,
-      discord_status: 'NOT_FOUND',
-      discord_invite: null,
-      scan_status: 'SKIPPED_EXCLUDED',
-      scan_attempts: 0,
-      discovery_source: source,
-      first_seen: now,
-      last_checked: now,
-      inspection_trail: [countryValidationStep],
-      subscriber_count: candidate.subscriberCount,
-      channel_thumbnail_url: candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
-      trading_status: 'UNCERTAIN',
-      trading_confidence_score: 0,
-      trading_category: 'General Trading'
-    };
-
-    rejectedChannel.country_status = 'REJECTED';
-    rejectedChannel.confidence_score = countryVal.score;
-    rejectedChannel.scan_status = 'SKIPPED_EXCLUDED';
-    rejectedChannel.last_checked = now;
-    rejectedChannel.inspection_trail = [countryValidationStep];
-
-    await upsertChannel(rejectedChannel);
+    console.warn(JSON.stringify({
+      event: 'excluded_channel_blocked',
+      channelId: candidate.channelId,
+      targetCountry,
+      reason: countryVal.rejectionReason,
+      context: 'ingestion_gate',
+      timestamp: now
+    }));
 
     return {
       channelId: candidate.channelId,
@@ -154,7 +133,9 @@ export async function processChannelThroughPipeline(
       tradingStatus: 'UNCERTAIN',
       discordStatus: 'NOT_FOUND',
       discordInvite: null,
-      channelRecord: rejectedChannel
+      // Exclusion audit is emitted to logs; excluded candidates do not create or
+      // mutate channel records and never reach trading AI or Discord inspection.
+      channelRecord: undefined
     };
   }
 

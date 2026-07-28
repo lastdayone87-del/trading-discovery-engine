@@ -12,6 +12,7 @@ import {
   getChannelById,
   upsertChannel
 } from './db';
+import { assertCountryAllowed } from './countryExclusion';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -357,6 +358,7 @@ export async function generateCandidateQueriesForCountry(
   country: string,
   count = 3
 ): Promise<QueryRecord[]> {
+  await assertCountryAllowed(country, 'query_generation');
   const vocabs = await getCountryVocabularies();
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
   const extractedTerms = await getExtractedVocabulary(country);
