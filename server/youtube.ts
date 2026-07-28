@@ -74,7 +74,7 @@ export interface DiscoveredChannelRaw {
 
 /**
  * Retrieves all valid YouTube API keys available in environment variables.
- * Checks YOUTUBE_API_KEY, YOUTUBE_API_KEY_1..5, and GEMINI_API_KEY.
+ * Checks YOUTUBE_API_KEY and YOUTUBE_API_KEY_1..5.
  */
 let activeKeyIndex = 0;
 
@@ -261,82 +261,4 @@ export async function fetchYouTubeChannelEnrichment(
   }
 
   throw lastError || new Error(`YouTube enrichment failed for '${channelId}'.`);
-}
-
-/**
- * Realistic Trader Discovery Simulator
- * Creates realistic country-native trading creator channel records based on the query & vocabulary
- * so operators can test the full pipeline out-of-the-box.
- */
-function simulateTraderDiscovery(
-  query: string,
-  countryName: string,
-  vocab?: CountryVocabulary
-): DiscoveredChannelRaw[] {
-  const countrySlug = countryName.toLowerCase().replace(/\s+/g, '');
-  const idPrefix = `UC_${countrySlug}_${Math.floor(Math.random() * 899999 + 100000)}`;
-
-  const nativeTerm = vocab?.native_trading_terminology?.[0] || query;
-  const instrument = vocab?.popular_instruments?.[0] || 'Futures';
-
-  // Sample names by country
-  const channelTemplates: Record<string, string[]> = {
-    'Germany': ['DAX Trader Berlin', 'Börsenanalyse Pro', 'Hansecapital Trading', 'Munich Futures Lab'],
-    'France': ['CAC 40 Intraday', 'Le Trader Parisien', 'Bourse & Orderflow', 'Capitole Finance'],
-    'Spain': ['Ibex Intradía Trader', 'Análisis Bursátil Madrid', 'Futuros y Mercado', 'Valencia Price Action'],
-    'United Kingdom': ['London Price Action', 'FTSE Market Structure', 'Mayfair Orderflow', 'City Trader Journal'],
-    'Netherlands': ['AEX Beurs Analyse', 'Amsterdam Daytrader', 'Opties & Futures NL', 'Delft Trading Lab'],
-    'Italy': ['Milano FTSE MIB Trader', 'Borsa e Volumi', 'Roma Trading Journal', 'Torino Price Action'],
-    'Australia': ['Sydney ASX Session', 'Aussie Order Flow', 'Commodities Trader AU', 'Melbourne Market Prep'],
-    'Canada': ['Toronto TSX Energy', 'Canadian Market Structure', 'Oil & Futures Calgary', 'Montreal Daytrader'],
-    'United States': ['NYC Orderflow Trading', 'Apex Prop Trader', 'NQ Price Action Lab', 'SMC Futures Journal']
-  };
-
-  const names = channelTemplates[countryName] || [`${countryName} ${instrument} Trader`, `Pro Trading ${countryName}`];
-  const selectedName = names[Math.floor(Math.random() * names.length)];
-  const channelId = `${idPrefix}_${Math.floor(Math.random() * 9000 + 1000)}`;
-
-  // Randomly simulate whether Discord invite is in Bio, Links, or Video descriptions
-  const hasDiscord = Math.random() > 0.3; // 70% chance to find a Discord community
-  const inviteCode = `trader-${countrySlug}-${Math.floor(Math.random() * 899 + 100)}`;
-
-  let bio = `Official YouTube channel of ${selectedName}. Providing daily ${nativeTerm} and ${instrument} market structure breakdowns.`;
-  let channelLinks: string[] = [];
-  let videoDescs: string[] = [
-    `Daily ${query} recap and trade breakdown.`,
-    `How to trade ${nativeTerm} using order flow and liquidity sweeps.`
-  ];
-
-  if (hasDiscord) {
-    const spot = Math.floor(Math.random() * 3);
-    if (spot === 0) {
-      bio += ` Join our official community: discord.gg/${inviteCode}`;
-    } else if (spot === 1) {
-      channelLinks = [`https://linktr.ee/${selectedName.toLowerCase().replace(/\s+/g, '')}`];
-      // Note: linktree crawler will find discord.gg/${inviteCode}
-    } else {
-      videoDescs.push(`Community & Chat: https://discord.com/invite/${inviteCode}`);
-    }
-  } else {
-    channelLinks = [`https://${selectedName.toLowerCase().replace(/\s+/g, '')}.com`];
-  }
-
-  return [
-    {
-      channelId,
-      channelName: selectedName,
-      youtubeUrl: `https://www.youtube.com/@${selectedName.toLowerCase().replace(/\s+/g, '')}`,
-      description: bio,
-      videoTitles: [
-        `${query} — Live Execution & Market Structure`,
-        `${nativeTerm} Key Levels for Today's Session`
-      ],
-      locationTag: countryName,
-      channelLinks,
-      pinnedComment: hasDiscord && Math.random() > 0.7 ? `Discord server link: discord.gg/${inviteCode}` : undefined,
-      videoDescriptions: videoDescs,
-      subscriberCount: `${Math.floor(Math.random() * 80 + 5)}K subscribers`,
-      channelThumbnailUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(selectedName)}&background=0f172a&color=38bdf8&bold=true`
-    }
-  ];
 }

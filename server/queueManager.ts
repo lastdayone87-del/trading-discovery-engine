@@ -596,6 +596,6 @@ setInterval(async () => {
   try {
     await processNextSearchJob();
   } catch (e) {
-    // Ignore worker tick error
+    console.error('[Queue Worker] Worker tick failed:', e);
   }
 }, 4000); // Ticks every 4 seconds

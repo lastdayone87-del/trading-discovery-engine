@@ -6,6 +6,8 @@ import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
+// One database-wide lock serializes deploy-time migrations across Railway replicas.
+const MIGRATION_ADVISORY_LOCK = 741963284;
 
 let pool: InstanceType<typeof Pool> | null = null;
 let initPromise: Promise<InstanceType<typeof Pool>> | null = null;
@@ -52,29 +54,33 @@ function iso(value: any): string | null {
 
 export async function runMigrations(): Promise<Array<{ version: number; name: string; applied_at: string }>> {
   const db = pool || new Pool({ connectionString: requireDatabaseUrl(), ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
-  await db.query(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
-  const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
-  for (const file of files) {
-    const version = Number(file.split('_')[0]);
-    const exists = await db.query('SELECT 1 FROM schema_migrations WHERE version=$1', [version]);
-    if (exists.rowCount) continue;
-    const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
-    const client = await db.connect();
-    try {
+  const client = await db.connect();
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_ADVISORY_LOCK]);
+    await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
+    for (const file of files) {
+      const version = Number(file.split('_')[0]);
+      const exists = await client.query('SELECT 1 FROM schema_migrations WHERE version=$1', [version]);
+      if (exists.rowCount) continue;
+      const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
       await client.query('BEGIN');
-      await client.query(sql);
-      await client.query('INSERT INTO schema_migrations(version,name,applied_at) VALUES($1,$2,now())', [version, file]);
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
+      try {
+        await client.query(sql);
+        await client.query('INSERT INTO schema_migrations(version,name,applied_at) VALUES($1,$2,now())', [version, file]);
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      }
     }
+    const res = await client.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version');
+    return res.rows.map(r => ({ version: r.version, name: r.name, applied_at: iso(r.applied_at)! }));
+  } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_ADVISORY_LOCK]).catch(() => undefined);
+    client.release();
+    if (!pool) await db.end();
   }
-  const res = await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version');
-  if (!pool) await db.end();
-  return res.rows.map(r => ({ version: r.version, name: r.name, applied_at: iso(r.applied_at)! }));
 }
 
 async function seedDefaults(): Promise<void> {
@@ -179,6 +185,7 @@ export async function getQueueStatus(): Promise<QueueStatus> {
 }
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{const db=await getDb(); await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);}
 
+export function getYouTubeKeyPool(): string[] { return [process.env.YOUTUBE_API_KEY,process.env.YOUTUBE_API_KEY_1,process.env.YOUTUBE_API_KEY_2,process.env.YOUTUBE_API_KEY_3,process.env.YOUTUBE_API_KEY_4,process.env.YOUTUBE_API_KEY_5].filter((k):k is string=>!!k&&!!k.trim()&&!k.trim().startsWith('MY_')).map(k=>k.trim()).filter((k,i,a)=>a.indexOf(k)===i); }
 export function getYouTubeKeyPool(): string[] { return [process.env.YOUTUBE_API_KEY,process.env.YOUTUBE_API_KEY_1,process.env.YOUTUBE_API_KEY_2,process.env.YOUTUBE_API_KEY_3,process.env.YOUTUBE_API_KEY_4,process.env.YOUTUBE_API_KEY_5,process.env.GEMINI_API_KEY].filter((k):k is string=>!!k&&!!k.trim()&&!k.trim().startsWith('MY_')).map(k=>k.trim()).filter((k,i,a)=>a.indexOf(k)===i); }
 export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; limit:number; isActive:boolean; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
@@ -212,6 +219,7 @@ export async function performManualDatabaseBackup():Promise<{success:boolean;tim
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
 export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; }
+export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string}={}):Promise<DurableJob>{const db=await getDb(); const res=await db.query(`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END RETURNING *`,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null]); return rowToJob(res.rows[0]);}
 export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string}={}):Promise<DurableJob>{const db=await getDb(); const res=await db.query(`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null]); return rowToJob(res.rows[0]);}
 function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||''};}
 export async function claimNextJob(workerId:string,types?:string[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) ORDER BY priority DESC,created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`,[types||null]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0]; const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]); await client.query(`INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,$2,'PROCESSING')`,[job.id,upd.rows[0].attempts]); await client.query('COMMIT'); return rowToJob(upd.rows[0]);}catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}}

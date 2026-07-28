@@ -16,6 +16,7 @@ import {
   recoverStaleJobs
 } from './db';
 import { searchYouTubeChannels } from './youtube';
+import { processDiscoveredChannel, ProcessDiscoveredChannelOutcome } from './queueManager';
 import { processDiscoveredChannel, addSearchJob, ProcessDiscoveredChannelOutcome } from './queueManager';
 import { assertCountryAllowed } from './countryExclusion';
 import {
@@ -139,26 +140,34 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     throw new Error('Autonomous discovery scheduler lock is already held by another worker.');
   }
 
-  // Check if paused
-  const paused = await isQueryIntelligencePaused();
-  if (paused && !targetCountry) {
-    console.log('[Query Intelligence] Engine is currently PAUSED. Skipping discovery cycle.');
-    return {
-      country: 'N/A',
-      query: 'N/A',
-      strategy: 'PAUSED',
-      discoveredCount: 0,
-      uniqueCount: 0,
-      qualityCreatorsCount: 0,
-      performanceScore: 0,
-      newCollection: 'NONE',
-      summary: 'Query Intelligence is currently PAUSED. Resume engine to continue discovery.',
-      logs: ['Engine is paused. State preserved.'],
-      isPaused: true
-    };
-  }
-
   isCycleRunning = true;
+  try {
+    // Explicitly release before a paused return so scheduler_state cannot stay
+    // is_running=true until stale-lock recovery.
+    const paused = await isQueryIntelligencePaused();
+    if (paused && !targetCountry) {
+      console.log('[Query Intelligence] Engine is currently PAUSED. Skipping discovery cycle.');
+      isCycleRunning = false;
+      await releaseSchedulerLock('autonomous_discovery', lastReport, nextScheduledTime);
+      return {
+        country: 'N/A',
+        query: 'N/A',
+        strategy: 'PAUSED',
+        discoveredCount: 0,
+        uniqueCount: 0,
+        qualityCreatorsCount: 0,
+        performanceScore: 0,
+        newCollection: 'NONE',
+        summary: 'Query Intelligence is currently PAUSED. Resume engine to continue discovery.',
+        logs: ['Engine is paused. State preserved.'],
+        isPaused: true
+      };
+    }
+  } catch (err) {
+    isCycleRunning = false;
+    await releaseSchedulerLock('autonomous_discovery', lastReport, nextScheduledTime);
+    throw err;
+  }
   const cycleLogs: string[] = [];
   const log = (msg: string) => {
     console.log(`[Autonomous Intelligence] ${msg}`);
@@ -241,9 +250,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     log(`Step 2 (UCB1 Query Intelligence): Strategy [${selectionStrategy}] selected query "${selectedQueryStr}" (Query ID #${queryRecord.id}). Reason: ${reason}`);
     log(`Step 2 Metadata: Knowledge Tiers [${queryRecord.knowledge_tiers?.join(', ') || 'legacy'}] | Generated as [${queryRecord.generation_mode || 'LEGACY'}] | Objective: ${queryRecord.discovery_objective || 'Discover relevant trading creators.'}`);
 
-    // 3. Search Job Creation in Queue
-    const searchJob = await addSearchJob(selectedQueryStr, countryName, 'automated_query');
-    log(`Step 3 (Queue Worker): Search Job created with ID '${searchJob.id}' in queue.`);
+    // This locked cycle owns synchronous execution. Do not also enqueue the
+    // same search: that caused a second worker to repeat the API call later.
+    log('Step 3 (Execution Ownership): Scheduler lock owns this synchronous search; no duplicate queue job created.');
 
     // 4. YouTube API Search Execution
     log(`Step 4 (YouTube Crawler): Executing search for query "${selectedQueryStr}" in region "${countryName}"...`);
