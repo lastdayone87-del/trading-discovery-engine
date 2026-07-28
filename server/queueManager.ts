@@ -1,6 +1,11 @@
 import {
   getDb,
   saveDb,
+  enqueueJob,
+  claimNextJob,
+  completeJob,
+  failJob,
+  recoverStaleJobs,
   getAllChannels,
   getChannelById,
   upsertChannel,
@@ -18,25 +23,26 @@ import { classifyTradingRelevance } from './tradingRelevanceClassifier';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 
-// In-Memory job lists backed by database queries
-let searchQueue: SearchJob[] = [];
+const WORKER_ID = `worker_${process.pid}`;
 
 /**
  * Pushes a new search query job to the Search Jobs Queue.
  */
 export async function addSearchJob(query: string, country: string, source: DiscoverySource): Promise<SearchJob> {
-  const job: SearchJob = {
-    id: `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+  const job = await enqueueJob(
+    'SEARCH_YOUTUBE',
+    { query, country, source },
+    { idempotencyKey: `search:${source}:${country.toLowerCase()}:${query.toLowerCase()}` }
+  );
+  return {
+    id: job.id,
     query,
     country,
     source,
-    status: 'PENDING',
-    attempts: 0,
-    createdAt: new Date().toISOString()
+    status: job.status === 'PROCESSING' ? 'PROCESSING' : job.status === 'COMPLETED' ? 'COMPLETED' : job.status === 'FAILED' ? 'FAILED' : 'PENDING',
+    attempts: job.attempts,
+    createdAt: job.created_at
   };
-
-  searchQueue.push(job);
-  return job;
 }
 
 /**
@@ -91,35 +97,25 @@ export async function addAutomatedCountrySearch(countryName: string): Promise<st
  * Worker loop that processes 1 Search Job from queue.
  */
 export async function processNextSearchJob(): Promise<boolean> {
+  await recoverStaleJobs();
   const qStatus = await getQueueStatus();
   if (qStatus.searchJobs.isPaused) return false;
 
-  const pendingJob = searchQueue.find(j => j.status === 'PENDING');
-  if (!pendingJob) return false;
-
-  pendingJob.status = 'PROCESSING';
+  const job = await claimNextJob(WORKER_ID, ['SEARCH_YOUTUBE']);
+  if (!job) return false;
 
   try {
+    const { query, country, source } = job.payload as { query: string; country: string; source: DiscoverySource };
     const vocabs = await getCountryVocabularies();
-    const vocab = vocabs.find(v => v.country.toLowerCase() === pendingJob.country.toLowerCase());
-
-    const extracted = await searchYouTubeChannels(pendingJob.query, pendingJob.country, vocab);
-
+    const vocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
+    const extracted = await searchYouTubeChannels(query, country, vocab);
     for (const raw of extracted) {
-      await processDiscoveredChannel(raw, pendingJob.country, pendingJob.source);
+      await processDiscoveredChannel(raw, country, source);
     }
-
-    pendingJob.status = 'COMPLETED';
-    // Remove completed job
-    searchQueue = searchQueue.filter(j => j.id !== pendingJob.id);
+    await completeJob(job.id);
     return true;
   } catch (err: any) {
-    pendingJob.attempts++;
-    if (pendingJob.attempts >= 3) {
-      pendingJob.status = 'FAILED';
-    } else {
-      pendingJob.status = 'PENDING';
-    }
+    await failJob(job.id, err);
     return false;
   }
 }

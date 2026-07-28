@@ -52,7 +52,7 @@ import { verifyChannelTradingRelevance, generateClassificationReport } from './s
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
 
   app.use(express.json());
 
@@ -66,8 +66,14 @@ async function startServer() {
   // --- API ROUTES ---
 
   // Health check
-  app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok' });
+  app.get('/api/health', async (req, res) => {
+    try {
+      const schema = await getSchemaInfo();
+      const queues = await getQueueStatus();
+      res.json({ status: 'ok', database: 'ok', schemaVersion: schema.currentVersion, channelCount: schema.channelCount, queues });
+    } catch (err: any) {
+      res.status(503).json({ status: 'error', database: 'unavailable', error: err.message });
+    }
   });
 
   // 1. Get all channels (returns active validated channels by default; include_rejected=true returns all)
