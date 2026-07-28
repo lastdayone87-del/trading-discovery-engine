@@ -12,7 +12,7 @@ interface Props {
 
 export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, channels, queueStatus, quotaInfo }) => {
   const activeDiscords = channels.filter(c => c.discord_status === 'ACTIVE' || c.discord_status === 'ACTIVE_LOW_VOLUME').length;
-  const pendingScans = channels.filter(c => c.scan_status === 'PENDING' || c.scan_status === 'LOCKED').length;
+  const pendingScans = channels.filter(c => ['PENDING', 'LOCKED', 'ENRICHMENT_PENDING', 'ENRICHING', 'NEEDS_REVIEW'].includes(c.scan_status)).length;
 
   const navItems = [
     { id: 'discovery', label: 'Discovery & Search', icon: Radar },
