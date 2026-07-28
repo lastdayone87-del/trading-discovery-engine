@@ -10,6 +10,7 @@
     "clean": "rm -rf dist server.cjs",
     "lint": "tsc --noEmit",
     "test": "find server -name '*.test.ts' -exec node --import tsx --test {} +",
+    "test": "node --import tsx --test server/*.test.ts",
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts"
