@@ -17,6 +17,7 @@ import {
 } from './db';
 import { searchYouTubeChannels } from './youtube';
 import { processDiscoveredChannel, addSearchJob, ProcessDiscoveredChannelOutcome } from './queueManager';
+import { assertCountryAllowed } from './countryExclusion';
 import {
   selectNextQueryForCountry,
   calculateCreatorQualityScore,
@@ -125,6 +126,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
   logs: string[];
   isPaused?: boolean;
 }> {
+  if (targetCountry) {
+    await assertCountryAllowed(targetCountry, 'autonomous_cycle');
+  }
   if (isCycleRunning) {
     throw new Error('An autonomous discovery cycle is already in progress.');
   }
@@ -494,4 +498,3 @@ export function stopAutonomousDiscoveryScheduler(): void {
     console.log('[Autonomous Intelligence Scheduler] Stopped background scheduler.');
   }
 }
-

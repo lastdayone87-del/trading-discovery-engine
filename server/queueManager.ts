@@ -22,6 +22,7 @@ import { searchYouTubeChannels, generateCountryQueries, DiscoveredChannelRaw } f
 import { classifyTradingRelevance } from './tradingRelevanceClassifier';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
+import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -29,6 +30,7 @@ const WORKER_ID = `worker_${process.pid}`;
  * Pushes a new search query job to the Search Jobs Queue.
  */
 export async function addSearchJob(query: string, country: string, source: DiscoverySource): Promise<SearchJob> {
+  await assertCountryAllowed(country, `queue:${source}`);
   const job = await enqueueJob(
     'SEARCH_YOUTUBE',
     { query, country, source },
@@ -49,6 +51,7 @@ export async function addSearchJob(query: string, country: string, source: Disco
  * Enqueues a manual search query and expands it using the country vocabulary engine.
  */
 export async function addManualCountrySearch(userQuery: string, countryName: string): Promise<{ baseJob: SearchJob; expandedQueries: string[] }> {
+  await assertCountryAllowed(countryName, 'manual_search_queue_expansion');
   const baseJob = await addSearchJob(userQuery, countryName, 'manual_search');
 
   const expandedQueries: string[] = [userQuery];
@@ -78,6 +81,7 @@ export async function addManualCountrySearch(userQuery: string, countryName: str
  * Generates and enqueues country native queries for an automated discovery run.
  */
 export async function addAutomatedCountrySearch(countryName: string): Promise<string[]> {
+  await assertCountryAllowed(countryName, 'automated_search_generation');
   const vocabs = await getCountryVocabularies();
   const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
   
@@ -106,6 +110,8 @@ export async function processNextSearchJob(): Promise<boolean> {
 
   try {
     const { query, country, source } = job.payload as { query: string; country: string; source: DiscoverySource };
+    // Defense in depth for jobs queued before a country was excluded.
+    await assertCountryAllowed(country, `worker:${job.id}`);
     const vocabs = await getCountryVocabularies();
     const vocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
     const extracted = await searchYouTubeChannels(query, country, vocab);
@@ -115,6 +121,12 @@ export async function processNextSearchJob(): Promise<boolean> {
     await completeJob(job.id);
     return true;
   } catch (err: any) {
+    if (err instanceof ExcludedCountryError) {
+      // A policy change can make an already-persisted job ineligible. Consume it
+      // without retrying so it can never spend external API quota.
+      await completeJob(job.id);
+      return true;
+    }
     await failJob(job.id, err);
     return false;
   }
@@ -331,6 +343,12 @@ export async function triggerManualRecheck(channelId: string, enableDebug?: bool
     return { success: false, message: 'Channel not found in database.' };
   }
 
+  const exclusion = await getCountryExclusion(channel.country);
+  if (exclusion) {
+    console.warn(JSON.stringify({ event: 'excluded_country_blocked', country: exclusion.country, reason: exclusion.reason, context: 'manual_recheck', channelId, timestamp: new Date().toISOString() }));
+    return { success: false, message: `Manual re-scan blocked because ${exclusion.country} is excluded: ${exclusion.reason}`, channel };
+  }
+
   // Acquire Lock and Reset Attempt Counter
   channel.scan_status = 'LOCKED';
   channel.scan_attempts = 0;
@@ -403,9 +421,9 @@ export async function executeFullManualSearch(
   logs.push(`  Country: ${countryName}`);
 
   // Hard Exclusion Pre-Check
-  const excludedCountries = await getExcludedCountries();
-  const isExcluded = excludedCountries.some(e => e.country_name.toLowerCase() === countryName.toLowerCase());
-  if (isExcluded) {
+  const exclusion = await getCountryExclusion(countryName);
+  if (exclusion) {
+    console.warn(JSON.stringify({ event: 'excluded_country_blocked', country: exclusion.country, reason: exclusion.reason, context: 'manual_search', timestamp: new Date().toISOString() }));
     logs.push(`\n[HARD EXCLUSION GATE: REJECTED IMMEDIATELY]`);
     logs.push(`Target region '${countryName}' is explicitly configured in the Hard Exclusion List.`);
     logs.push(`Exiting pipeline immediately with SKIPPED_EXCLUDED before:`);
