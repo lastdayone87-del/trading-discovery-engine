@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import { ChannelRecord, CountryVocabulary, QualityScoreBreakdown, QueryRecord, QueryCollection, QueryIntent, ExtractedTermRecord } from '../src/types';
+import { ChannelRecord, CountryVocabulary, QualityScoreBreakdown, QueryRecord, QueryCollection, ExtractedTermRecord } from '../src/types';
 import {
   getDb,
   getCountryVocabularies,
@@ -10,9 +10,11 @@ import {
   saveExtractedTerm,
   getExtractedVocabulary,
   getChannelById,
-  upsertChannel
+  upsertChannel,
+  getAppSetting
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
+import { limitRepeatedPrimaryTerms, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent } from './queryPlanner';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -169,7 +171,7 @@ export async function extractVocabularyFromCreator(
   const extracted: ExtractedTermRecord[] = [];
   const ai = getAIClient();
 
-  if (!channel.country || channel.country === 'Unknown') return [];
+  if (!channel.country || channel.country === 'Unknown' || channel.trading_status !== 'TRADING_CONFIRMED') return [];
 
   // 1. Rule-based extraction of instruments & terminology
   const text = `${channel.channel_name} ${description} ${videoTitles.join(' ')}`;
@@ -263,41 +265,49 @@ export async function selectNextQueryForCountry(country: string): Promise<{
   selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION';
   reason: string;
 }> {
-  const queries = await getQueriesByCountry(country);
+  const queries = (await getQueriesByCountry(country)).filter(query => query.collection !== 'REJECTED');
   const now = new Date();
+  const cooldownMinutes = Math.max(1, Number(await getAppSetting('query_intelligence_query_cooldown_minutes', process.env.QUERY_INTELLIGENCE_COOLDOWN_MINUTES || '360')) || 360);
+  const maxPrimaryUses = Math.max(1, Number(await getAppSetting('query_intelligence_primary_term_max_uses', process.env.QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES || '2')) || 2);
+  const explorationRatio = Math.min(0.9, Math.max(0.1, Number(await getAppSetting('query_intelligence_exploration_ratio', process.env.QUERY_INTELLIGENCE_EXPLORATION_RATIO || '0.4')) || 0.4));
 
   // If no queries exist for country, generate cold-start initial queries
   if (queries.length === 0) {
-    const generated = await generateCandidateQueriesForCountry(country, 4);
+    const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START');
     const selected = generated[0];
     return {
       queryRecord: selected,
       selectionStrategy: 'COLD_START_GENERATION',
-      reason: `Cold start query initialization for ${country}`
+      reason: selected.generation_reason || `Cold start query initialization for ${country}`
+    };
+  }
+
+  // Cooldown is a hard eligibility gate, never merely a score penalty.
+  const outsideCooldown = queriesOutsideCooldown(queries, now, cooldownMinutes);
+  let eligible = limitRepeatedPrimaryTerms(outsideCooldown, queries, now, cooldownMinutes, maxPrimaryUses);
+  eligible = rotateAwayFromMostRecentIntent(eligible, queries);
+  if (eligible.length === 0) {
+    const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION');
+    const selected = generated[0];
+    return {
+      queryRecord: selected,
+      selectionStrategy: 'UCB1_EXPLORATION',
+      reason: `${selected.generation_reason} Existing queries were unavailable due to the ${cooldownMinutes}-minute cooldown or primary-term diversity limit.`
     };
   }
 
   // Calculate UCB1 score for each query
-  const totalExecutionsSum = queries.reduce((acc, q) => acc + q.times_executed, 0);
+  const totalExecutionsSum = eligible.reduce((acc, q) => acc + q.times_executed, 0);
   const totalExecutions = Math.max(1, totalExecutionsSum);
 
-  const scoredQueries = queries.map(q => {
-    // Cooldown check: penalize queries executed in the last 2 hours
-    let cooldownPenalty = 0;
-    if (q.last_executed) {
-      const elapsedMinutes = (now.getTime() - new Date(q.last_executed).getTime()) / (1000 * 60);
-      if (elapsedMinutes < 120) {
-        cooldownPenalty = 0.5; // reduces UCB score significantly
-      }
-    }
-
+  const scoredQueries = eligible.map(q => {
     // Normalized performance score (0 to 1)
     const normPerformance = (q.performance_score || 0) / 100;
 
     // UCB1 formula: Score + c * sqrt(ln(N) / (n_i + 1))
     const explorationConst = 0.8;
     const ucbTerm = explorationConst * Math.sqrt(Math.log(totalExecutions + 1) / ((q.times_executed || 0) + 1));
-    const ucbScore = Math.max(0, normPerformance + ucbTerm - cooldownPenalty);
+    const ucbScore = Math.max(0, normPerformance + ucbTerm);
 
     return {
       ...q,
@@ -308,8 +318,8 @@ export async function selectNextQueryForCountry(country: string): Promise<{
   // Sort by UCB score descending
   scoredQueries.sort((a, b) => (b.ucb_score || 0) - (a.ucb_score || 0));
 
-  // Determine whether to Exploit (60% chance) or Explore (40% chance)
-  const isExploration = Math.random() < 0.4;
+  // Explicitly configured exploration prevents permanent overfitting to winners.
+  const isExploration = Math.random() < explorationRatio;
 
   let selected: QueryRecord | null = null;
   let strategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' = 'UCB1_EXPLOITATION';
@@ -317,19 +327,21 @@ export async function selectNextQueryForCountry(country: string): Promise<{
 
   if (isExploration) {
     // Pick an EXPERIMENTAL query with highest UCB or generate a new candidate
-    const experimental = scoredQueries.filter(q => q.collection === 'EXPERIMENTAL');
+    const experimental = scoredQueries
+      .filter(q => q.collection === 'EXPERIMENTAL')
+      .sort((a, b) => a.times_executed - b.times_executed || (b.ucb_score || 0) - (a.ucb_score || 0));
     if (experimental.length > 0) {
       selected = experimental[0];
       strategy = 'UCB1_EXPLORATION';
-      reason = `Selected top experimental query "${selected.query}" (UCB Score: ${selected.ucb_score})`;
+      reason = `Exploration selected an eligible experimental query outside the ${cooldownMinutes}-minute cooldown: ${selected.generation_reason || selected.query} (UCB ${selected.ucb_score}).`;
     }
   }
 
   if (!selected) {
     // Default to top overall UCB query (usually PROVEN)
-    selected = scoredQueries[0];
+    selected = scoredQueries.find(query => query.collection === 'PROVEN') || scoredQueries[0];
     strategy = selected.collection === 'PROVEN' ? 'UCB1_EXPLOITATION' : 'UCB1_EXPLORATION';
-    reason = `Selected top performing ${selected.collection} query "${selected.query}" (UCB Score: ${selected.ucb_score})`;
+    reason = `${strategy === 'UCB1_EXPLOITATION' ? 'Exploitation retained a historically successful query' : 'Exploration selected the best eligible candidate'} outside the ${cooldownMinutes}-minute cooldown (UCB ${selected.ucb_score}). ${selected.generation_reason || ''}`.trim();
   }
 
   return { queryRecord: selected, selectionStrategy: strategy, reason };
@@ -339,115 +351,46 @@ export async function selectNextQueryForCountry(country: string): Promise<{
 // 4. CANDIDATE QUERY GENERATOR
 // ==========================================
 
-const INTENTS: QueryIntent[] = [
-  'market_analysis',
-  'premarket_prep',
-  'live_trading',
-  'educational',
-  'weekly_reviews',
-  'trading_journals',
-  'session_analysis',
-  'strategy_breakdowns',
-  'prop_firm'
-];
-
 /**
- * Generates brand new candidate queries combining knowledge base + learned vocabulary
+ * Generates auditable candidates led by curated institutional knowledge. Verified
+ * learned terms may augment it, while unverified candidate terms are rate-limited.
  */
 export async function generateCandidateQueriesForCountry(
   country: string,
-  count = 3
+  count = 3,
+  mode: 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START' = 'EXPLORATION'
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
-  const vocabs = await getCountryVocabularies();
+  const [vocabs, extractedTerms, existingQueries] = await Promise.all([
+    getCountryVocabularies(),
+    getExtractedVocabulary(country),
+    getQueriesByCountry(country)
+  ]);
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
-  const extractedTerms = await getExtractedVocabulary(country);
-
-  const nativeTerms = countryVocab?.native_trading_terminology || ['trading analysis', 'market structure'];
-  const instruments = countryVocab?.popular_instruments || ['EURUSD', 'S&P 500'];
-  const formatNames = countryVocab?.common_content_format_names || ['Market breakdown', 'Trading journal'];
-  const learnedTerms = extractedTerms.map(t => t.term);
-
-  const combinedTerms = Array.from(new Set([...nativeTerms, ...learnedTerms]));
-
-  const ai = getAIClient();
+  const planned = planDiverseQueries({
+    country,
+    count,
+    countryVocabulary: countryVocab,
+    learnedVocabulary: extractedTerms,
+    existingQueries,
+    mode
+  });
   const newQueries: QueryRecord[] = [];
-
-  if (ai) {
-    try {
-      const prompt = `You are the Search Query Intelligence Engine for a YouTube trading creator discovery platform.
-Target Country: "${country}"
-Primary Languages: ${countryVocab?.languages?.join(', ') || 'English'}
-Known Financial Instruments: ${instruments.join(', ')}
-Native Trading Terminology & Learned Vocabulary: ${combinedTerms.join(', ')}
-Content Formats: ${formatNames.join(', ')}
-
-Generate ${count} distinct, highly specific search queries that authentic educational trading creators in ${country} would use in their YouTube video titles or channel descriptions.
-Requirements:
-1. NEVER output generic or spammy words like "get rich", "best signals", "crypto 1000x".
-2. Prefer queries focusing on active market analysis, session breakdowns, futures/forex/stock trading, and trading journals.
-3. Incorporate local country trading terms in native language when applicable.
-4. Output JSON array of objects:
-[
-  {
-    "query": "string",
-    "intent": "market_analysis | premarket_prep | live_trading | educational | weekly_reviews | trading_journals | session_analysis | strategy_breakdowns | prop_firm"
+  for (const candidate of planned) {
+    const record = await upsertQueryRecord({
+      query: candidate.query,
+      country,
+      collection: 'EXPERIMENTAL',
+      intent: candidate.intent,
+      knowledgeTiers: candidate.knowledgeTiers,
+      generationMode: candidate.generationMode,
+      generationReason: candidate.generationReason,
+      discoveryObjective: candidate.discoveryObjective,
+      primaryTerm: candidate.primaryTerm,
+      generationMetadata: candidate.metadata
+    });
+    newQueries.push(record);
   }
-]`;
-
-      const response = await callGeminiSafe(() => ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: prompt
-      }));
-
-      const resText = response.text || '';
-      const jsonMatch = resText.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        const parsed: Array<{ query: string; intent: string }> = JSON.parse(jsonMatch[0]);
-        for (const item of parsed) {
-          if (item.query && item.query.trim().length > 3) {
-            const record = await upsertQueryRecord({
-              query: item.query.trim(),
-              country,
-              collection: 'EXPERIMENTAL',
-              intent: item.intent || 'market_analysis'
-            });
-            newQueries.push(record);
-          }
-        }
-      }
-    } catch (e: any) {
-      const msg = e?.message || String(e);
-      const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-      const is503 = msg.includes('503') || msg.includes('high demand');
-      if (isQuota) {
-        console.warn(`[Query Generation] Gemini API quota limit reached (429) for ${country}. Fallback queries will be generated.`);
-      } else if (is503) {
-        console.warn(`[Query Generation] Gemini API temporarily busy (503) for ${country}. Fallback queries will be generated.`);
-      } else {
-        console.warn(`[Query Generation] Notice for ${country}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
-      }
-    }
-  }
-
-  // Fallback programmatic query construction if AI fails or returns fewer than requested
-  if (newQueries.length < count) {
-    for (let i = newQueries.length; i < count; i++) {
-      const term = combinedTerms[i % combinedTerms.length] || 'market structure';
-      const inst = instruments[i % instruments.length] || '';
-      const intent = INTENTS[i % INTENTS.length];
-
-      const queryText = `${inst} ${term}`.trim();
-      const record = await upsertQueryRecord({
-        query: queryText,
-        country,
-        collection: 'EXPERIMENTAL',
-        intent
-      });
-      newQueries.push(record);
-    }
-  }
-
   return newQueries;
 }
 

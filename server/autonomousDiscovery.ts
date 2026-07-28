@@ -239,6 +239,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     selectionStrat = selectionStrategy;
 
     log(`Step 2 (UCB1 Query Intelligence): Strategy [${selectionStrategy}] selected query "${selectedQueryStr}" (Query ID #${queryRecord.id}). Reason: ${reason}`);
+    log(`Step 2 Metadata: Knowledge Tiers [${queryRecord.knowledge_tiers?.join(', ') || 'legacy'}] | Generated as [${queryRecord.generation_mode || 'LEGACY'}] | Objective: ${queryRecord.discovery_objective || 'Discover relevant trading creators.'}`);
 
     // 3. Search Job Creation in Queue
     const searchJob = await addSearchJob(selectedQueryStr, countryName, 'automated_query');

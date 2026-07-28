@@ -69,6 +69,17 @@ export interface InspectionStep {
 export type QueryCollection = 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED';
 
 export type QueryIntent =
+  | 'beginner'
+  | 'strategy'
+  | 'news'
+  | 'education'
+  | 'indicators'
+  | 'psychology'
+  | 'futures'
+  | 'forex'
+  | 'crypto'
+  | 'stocks'
+  | 'options'
   | 'market_analysis'
   | 'premarket_prep'
   | 'live_trading'
@@ -129,6 +140,12 @@ export interface QueryRecord {
   created_at: string;
   status: 'ACTIVE' | 'ARCHIVED';
   ucb_score?: number;
+  knowledge_tiers?: Array<1 | 2 | 3>;
+  generation_mode?: 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START' | 'LEGACY';
+  generation_reason?: string;
+  discovery_objective?: string;
+  primary_term?: string;
+  generation_metadata?: Record<string, unknown>;
 }
 
 export interface QueryExecutionLog {
@@ -154,6 +171,8 @@ export interface ExtractedTermRecord {
   occurrences: number;
   first_extracted: string;
   last_extracted: string;
+  trust_tier?: 2 | 3;
+  validation_count?: number;
 }
 
 export interface CountryVocabulary {
