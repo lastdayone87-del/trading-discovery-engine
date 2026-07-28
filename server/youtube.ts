@@ -74,7 +74,7 @@ export interface DiscoveredChannelRaw {
 
 /**
  * Retrieves all valid YouTube API keys available in environment variables.
- * Checks YOUTUBE_API_KEY, YOUTUBE_API_KEY_1..5, and GEMINI_API_KEY.
+ * Checks YOUTUBE_API_KEY and YOUTUBE_API_KEY_1..5.
  */
 let activeKeyIndex = 0;
 
@@ -206,79 +206,59 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
 }
 
 /**
- * Realistic Trader Discovery Simulator
- * Creates realistic country-native trading creator channel records based on the query & vocabulary
- * so operators can test the full pipeline out-of-the-box.
+ * Fetches richer official channel metadata and recent uploads for a borderline
+ * creator. Unlike discovery search, this is only called by a durable enrichment
+ * job and throws when all configured keys fail so queue retry/backoff applies.
  */
-function simulateTraderDiscovery(
-  query: string,
-  countryName: string,
-  vocab?: CountryVocabulary
-): DiscoveredChannelRaw[] {
-  const countrySlug = countryName.toLowerCase().replace(/\s+/g, '');
-  const idPrefix = `UC_${countrySlug}_${Math.floor(Math.random() * 899999 + 100000)}`;
-
-  const nativeTerm = vocab?.native_trading_terminology?.[0] || query;
-  const instrument = vocab?.popular_instruments?.[0] || 'Futures';
-
-  // Sample names by country
-  const channelTemplates: Record<string, string[]> = {
-    'Germany': ['DAX Trader Berlin', 'Börsenanalyse Pro', 'Hansecapital Trading', 'Munich Futures Lab'],
-    'France': ['CAC 40 Intraday', 'Le Trader Parisien', 'Bourse & Orderflow', 'Capitole Finance'],
-    'Spain': ['Ibex Intradía Trader', 'Análisis Bursátil Madrid', 'Futuros y Mercado', 'Valencia Price Action'],
-    'United Kingdom': ['London Price Action', 'FTSE Market Structure', 'Mayfair Orderflow', 'City Trader Journal'],
-    'Netherlands': ['AEX Beurs Analyse', 'Amsterdam Daytrader', 'Opties & Futures NL', 'Delft Trading Lab'],
-    'Italy': ['Milano FTSE MIB Trader', 'Borsa e Volumi', 'Roma Trading Journal', 'Torino Price Action'],
-    'Australia': ['Sydney ASX Session', 'Aussie Order Flow', 'Commodities Trader AU', 'Melbourne Market Prep'],
-    'Canada': ['Toronto TSX Energy', 'Canadian Market Structure', 'Oil & Futures Calgary', 'Montreal Daytrader'],
-    'United States': ['NYC Orderflow Trading', 'Apex Prop Trader', 'NQ Price Action Lab', 'SMC Futures Journal']
-  };
-
-  const names = channelTemplates[countryName] || [`${countryName} ${instrument} Trader`, `Pro Trading ${countryName}`];
-  const selectedName = names[Math.floor(Math.random() * names.length)];
-  const channelId = `${idPrefix}_${Math.floor(Math.random() * 9000 + 1000)}`;
-
-  // Randomly simulate whether Discord invite is in Bio, Links, or Video descriptions
-  const hasDiscord = Math.random() > 0.3; // 70% chance to find a Discord community
-  const inviteCode = `trader-${countrySlug}-${Math.floor(Math.random() * 899 + 100)}`;
-
-  let bio = `Official YouTube channel of ${selectedName}. Providing daily ${nativeTerm} and ${instrument} market structure breakdowns.`;
-  let channelLinks: string[] = [];
-  let videoDescs: string[] = [
-    `Daily ${query} recap and trade breakdown.`,
-    `How to trade ${nativeTerm} using order flow and liquidity sweeps.`
-  ];
-
-  if (hasDiscord) {
-    const spot = Math.floor(Math.random() * 3);
-    if (spot === 0) {
-      bio += ` Join our official community: discord.gg/${inviteCode}`;
-    } else if (spot === 1) {
-      channelLinks = [`https://linktr.ee/${selectedName.toLowerCase().replace(/\s+/g, '')}`];
-      // Note: linktree crawler will find discord.gg/${inviteCode}
-    } else {
-      videoDescs.push(`Community & Chat: https://discord.com/invite/${inviteCode}`);
-    }
-  } else {
-    channelLinks = [`https://${selectedName.toLowerCase().replace(/\s+/g, '')}.com`];
+export async function fetchYouTubeChannelEnrichment(
+  channelId: string,
+  fallback: DiscoveredChannelRaw
+): Promise<DiscoveredChannelRaw> {
+  const keyPool = getYouTubeKeyPool();
+  if (keyPool.length === 0) {
+    throw new Error('YouTube enrichment requires at least one configured YouTube API key.');
   }
 
-  return [
-    {
-      channelId,
-      channelName: selectedName,
-      youtubeUrl: `https://www.youtube.com/@${selectedName.toLowerCase().replace(/\s+/g, '')}`,
-      description: bio,
-      videoTitles: [
-        `${query} — Live Execution & Market Structure`,
-        `${nativeTerm} Key Levels for Today's Session`
-      ],
-      locationTag: countryName,
-      channelLinks,
-      pinnedComment: hasDiscord && Math.random() > 0.7 ? `Discord server link: discord.gg/${inviteCode}` : undefined,
-      videoDescriptions: videoDescs,
-      subscriberCount: `${Math.floor(Math.random() * 80 + 5)}K subscribers`,
-      channelThumbnailUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(selectedName)}&background=0f172a&color=38bdf8&bold=true`
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < keyPool.length; attempt++) {
+    const currentIndex = (activeKeyIndex + attempt) % keyPool.length;
+    const apiKey = keyPool[currentIndex];
+    try {
+      const channelUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,brandingSettings,statistics&id=${encodeURIComponent(channelId)}&key=${apiKey}`;
+      const recentUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${encodeURIComponent(channelId)}&order=date&type=video&maxResults=10&key=${apiKey}`;
+      const [channelResponse, recentResponse] = await Promise.all([fetch(channelUrl), fetch(recentUrl)]);
+      if (!channelResponse.ok || !recentResponse.ok) {
+        throw new Error(`YouTube enrichment failed (channel ${channelResponse.status}, uploads ${recentResponse.status}).`);
+      }
+
+      activeKeyIndex = currentIndex;
+      await incrementQuota(101);
+      const channelData = await channelResponse.json();
+      const recentData = await recentResponse.json();
+      const channel = channelData.items?.[0];
+      if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
+
+      const description = channel.snippet?.description || fallback.description;
+      const recentItems = recentData.items || [];
+      const extractedLinks = description.match(/https?:\/\/[^\s)\]}]+/g) || [];
+
+      return {
+        ...fallback,
+        channelId,
+        channelName: channel.snippet?.title || fallback.channelName,
+        youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
+        description,
+        videoTitles: recentItems.map((item: any) => item.snippet?.title).filter(Boolean),
+        videoDescriptions: recentItems.map((item: any) => item.snippet?.description).filter(Boolean),
+        locationTag: channel.snippet?.country || fallback.locationTag,
+        channelLinks: Array.from(new Set([...(fallback.channelLinks || []), ...extractedLinks])),
+        subscriberCount: channel.statistics?.subscriberCount || fallback.subscriberCount,
+        channelThumbnailUrl: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.default?.url || fallback.channelThumbnailUrl
+      };
+    } catch (error: any) {
+      lastError = error instanceof Error ? error : new Error(String(error));
     }
-  ];
+  }
+
+  throw lastError || new Error(`YouTube enrichment failed for '${channelId}'.`);
 }
