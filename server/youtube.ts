@@ -1,5 +1,7 @@
 import { CountryVocabulary } from '../src/types';
 import { incrementQuota, getAppSetting, getYouTubeKeyPool } from './db';
+import { RetrievalLane } from './retrievalLanes';
+export type { RetrievalLane } from './retrievalLanes';
 
 /**
  * STRICT BANNED KEYWORD SANITIZER
@@ -78,6 +80,36 @@ export interface DiscoveredChannelRaw {
  */
 let activeKeyIndex = 0;
 
+export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, sanitizedQuery: string): DiscoveredChannelRaw[] {
+  const results = new Map<string, DiscoveredChannelRaw>();
+  for (const item of items) {
+    const channelId = lane === 'VIDEO' ? item.snippet?.channelId : (item.id?.channelId || item.snippet?.channelId);
+    const channelName = item.snippet?.channelTitle || item.snippet?.title;
+    const thumb = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.medium?.url || item.snippet?.thumbnails?.default?.url;
+    if (!channelId || !channelName) continue;
+    const existing = results.get(channelId);
+    const videoTitle = lane === 'VIDEO' ? item.snippet?.title : undefined;
+    const videoDescription = lane === 'VIDEO' ? item.snippet?.description : undefined;
+    if (existing) {
+      if (videoTitle && !existing.videoTitles.includes(videoTitle)) existing.videoTitles.push(videoTitle);
+      if (videoDescription && !existing.videoDescriptions?.includes(videoDescription)) existing.videoDescriptions?.push(videoDescription);
+      continue;
+    }
+    results.set(channelId, {
+      channelId,
+      channelName,
+      youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
+      description: item.snippet?.description || '',
+      videoTitles: videoTitle ? [videoTitle] : [sanitizedQuery],
+      videoDescriptions: videoDescription ? [videoDescription] : [],
+      locationTag: item.snippet?.country || undefined,
+      channelLinks: [],
+      channelThumbnailUrl: thumb
+    });
+  }
+  return [...results.values()];
+}
+
 /**
  * Searches real YouTube channels using API key rotation and fails explicitly
  * when no key can serve the request; production discovery never synthesizes results.
@@ -85,7 +117,8 @@ let activeKeyIndex = 0;
 export async function searchYouTubeChannels(
   query: string,
   countryName: string,
-  vocab?: CountryVocabulary
+  vocab?: CountryVocabulary,
+  lane: RetrievalLane = 'VIDEO'
 ): Promise<DiscoveredChannelRaw[]> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return [];
@@ -106,7 +139,8 @@ export async function searchYouTubeChannels(
 
       try {
         console.log(`[YouTube API Pool] Attempting search with key #${currentIndex + 1}/${keyPool.length} (${apiKey.slice(0, 6)}...)...`);
-        const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(
+        const searchType = lane === 'VIDEO' ? 'video' : 'channel';
+        const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=${searchType}&q=${encodeURIComponent(
           sanitizedQuery
         )}&maxResults=${maxResults}&key=${apiKey}`;
 
@@ -116,27 +150,9 @@ export async function searchYouTubeChannels(
           activeKeyIndex = currentIndex; // Pin working key as preferred
           await incrementQuota(100); // 100 units for YouTube Search call
           const data = await res.json();
-          const results: DiscoveredChannelRaw[] = [];
+          const results = extractDiscoveredChannels(data.items || [], lane, sanitizedQuery);
 
-          for (const item of data.items || []) {
-            const channelId = item.id?.channelId || item.snippet?.channelId;
-            const channelName = item.snippet?.channelTitle || item.snippet?.title;
-            const thumb = item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.medium?.url || item.snippet?.thumbnails?.default?.url;
-            if (channelId && channelName) {
-              results.push({
-                channelId,
-                channelName,
-                youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
-                description: item.snippet?.description || '',
-                videoTitles: [sanitizedQuery],
-                locationTag: item.snippet?.country || undefined,
-                channelLinks: [],
-                channelThumbnailUrl: thumb
-              });
-            }
-          }
-
-          console.log(`[YouTube API Pool] Key #${currentIndex + 1} succeeded. Discovered ${results.length} channels.`);
+          console.log(`[YouTube API Pool] Key #${currentIndex + 1} succeeded. ${lane} lane discovered ${results.length} unique channels.`);
           // An empty successful response is authoritative. Retrying the same
           // query against every key would multiply quota cost without changing it.
           return results;
