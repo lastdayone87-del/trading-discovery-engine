@@ -49,6 +49,7 @@ import {
 import { runDatabaseStressTest } from './server/dbStressTest';
 import { verifyChannelTradingRelevance, generateClassificationReport } from './server/evidenceEngine';
 import { assertCountryAllowed, ExcludedCountryError } from './server/countryExclusion';
+import { getManualSearchSession, listManualSearchSessions, requestManualSearchCancellation } from './server/manualSearchStore';
 
 
 async function startServer() {
@@ -233,6 +234,21 @@ async function startServer() {
       console.error('[Manual Search Error]', err);
       res.status(500).json({ error: err.message });
     }
+  });
+
+  app.get('/api/search/manual/sessions', async (req, res) => {
+    try { res.json(await listManualSearchSessions(Number(req.query.limit || 20))); }
+    catch (err: any) { sendOperationError(res, err); }
+  });
+
+  app.get('/api/search/manual/sessions/:id', async (req, res) => {
+    try { const session = await getManualSearchSession(req.params.id); if (!session) return res.status(404).json({ error: 'Manual search session not found.' }); res.json(session); }
+    catch (err: any) { sendOperationError(res, err); }
+  });
+
+  app.post('/api/search/manual/sessions/:id/cancel', async (req, res) => {
+    try { const session = await requestManualSearchCancellation(req.params.id); if (!session) return res.status(404).json({ error: 'Manual search session not found.' }); res.status(202).json(session); }
+    catch (err: any) { sendOperationError(res, err); }
   });
 
   // 4. Generate & Run Automated Country Search
