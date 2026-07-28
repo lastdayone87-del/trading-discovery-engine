@@ -6,6 +6,7 @@ import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
 import { CountryKnowledgeProvider } from './providers/CountryKnowledgeProvider';
 import { GeminiSemanticProvider } from './providers/GeminiSemanticProvider';
 import { DiscordProvider } from './providers/DiscordProvider';
+import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { ConfigurableWeightedStrategy } from './scoringEngine';
 
 export class EvidenceBasedTradingEngine {
@@ -18,6 +19,7 @@ export class EvidenceBasedTradingEngine {
       new VideoMetadataProvider(),
       new ExternalLinkProvider(),
       new CountryKnowledgeProvider(),
+      new MultilingualContextProvider(),
       new GeminiSemanticProvider(),
       new DiscordProvider()
     ];
