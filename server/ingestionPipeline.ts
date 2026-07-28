@@ -108,10 +108,11 @@ export async function processChannelThroughPipeline(
     },
     targetCountry
   );
+  const resolvedCountry = countryVal.detectedCountry || targetCountry;
 
   const countryValidationStep = {
     step: 'COUNTRY_VALIDATION' as const,
-    title: `Country Validation (${targetCountry})`,
+    title: `Country Validation (${resolvedCountry})`,
     status: countryVal.status === 'REJECTED' ? ('REJECTED' as const) : ('FOUND' as const),
     details: countryVal.decisionLogs,
     timestamp: now
@@ -124,7 +125,7 @@ export async function processChannelThroughPipeline(
     console.warn(JSON.stringify({
       event: 'excluded_channel_blocked',
       channelId: candidate.channelId,
-      targetCountry,
+      targetCountry: resolvedCountry,
       reason: countryVal.rejectionReason,
       context: 'ingestion_gate',
       timestamp: now
@@ -150,7 +151,7 @@ export async function processChannelThroughPipeline(
     candidate.description,
     candidate.videoTitles,
     candidate.videoDescriptions?.join(' ') || '',
-    targetCountry,
+    resolvedCountry,
     candidate.channelLinks,
     undefined
   );
@@ -164,7 +165,7 @@ export async function processChannelThroughPipeline(
       channel_id: candidate.channelId,
       channel_name: candidate.channelName,
       youtube_url: candidate.youtubeUrl,
-      country: targetCountry,
+      country: resolvedCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
       discord_status: 'NON_TRADING',
@@ -184,6 +185,7 @@ export async function processChannelThroughPipeline(
     };
 
     nonTradingChannel.country_status = countryVal.status;
+    nonTradingChannel.country = resolvedCountry;
     nonTradingChannel.confidence_score = countryVal.score;
     nonTradingChannel.trading_status = 'NON_TRADING';
     nonTradingChannel.trading_confidence_score = tradingVal.confidenceScore;
@@ -221,7 +223,7 @@ export async function processChannelThroughPipeline(
       channel_id: candidate.channelId,
       channel_name: candidate.channelName,
       youtube_url: candidate.youtubeUrl,
-      country: targetCountry,
+      country: resolvedCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
       discord_status: 'UNCERTAIN',
@@ -241,6 +243,7 @@ export async function processChannelThroughPipeline(
     };
 
     uncertainChannel.country_status = countryVal.status;
+    uncertainChannel.country = resolvedCountry;
     uncertainChannel.confidence_score = countryVal.score;
     uncertainChannel.trading_status = finalUncertainStatus;
     uncertainChannel.trading_confidence_score = tradingVal.confidenceScore;
@@ -255,6 +258,7 @@ export async function processChannelThroughPipeline(
     if (lifecycle.shouldEnqueue) {
       await enqueueJob(
         'ENRICH_CHANNEL',
+        { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate },
         { channelId: candidate.channelId, targetCountry, source, candidate },
         { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}` }
       );
@@ -281,7 +285,7 @@ export async function processChannelThroughPipeline(
     channel_id: candidate.channelId,
     channel_name: candidate.channelName,
     youtube_url: candidate.youtubeUrl,
-    country: targetCountry,
+    country: resolvedCountry,
     country_status: countryVal.status,
     confidence_score: countryVal.score,
     discord_status: 'PENDING',
@@ -301,6 +305,7 @@ export async function processChannelThroughPipeline(
   };
 
   activeChannel.country_status = countryVal.status;
+  activeChannel.country = resolvedCountry;
   activeChannel.confidence_score = countryVal.score;
   activeChannel.trading_status = tradingVal.status;
   activeChannel.trading_confidence_score = tradingVal.confidenceScore;

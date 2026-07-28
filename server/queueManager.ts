@@ -222,7 +222,7 @@ export async function inspectAndValidateChannel(
         channelName: channel.channel_name,
         description: rawDetails?.description || channel.inspection_trail?.map(t => t.details || '').join(' ') || channel.channel_name,
         videoTitles: rawDetails?.videoTitles || [channel.channel_name],
-        locationTag: rawDetails?.locationTag || channel.country,
+        locationTag: rawDetails?.locationTag,
         externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : [])
       },
       channel.country
@@ -251,6 +251,7 @@ export async function inspectAndValidateChannel(
     // Update country status & decision trail
     channel.country_status = valRes.status;
     channel.confidence_score = valRes.score;
+    if (valRes.detectedCountry) channel.country = valRes.detectedCountry;
 
     // 2. Step-by-step Channel Inspection Engine for Discord Invites (force live YouTube scrape on manual scan)
     const inspection = await runChannelInspection({
@@ -325,7 +326,6 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
           channelName: channel.channel_name,
           description: trailDetails,
           videoTitles: [channel.channel_name],
-          locationTag: channel.country,
           externalLinks: channel.discord_invite ? [channel.discord_invite] : []
         },
         channel.country
@@ -403,7 +403,6 @@ export async function triggerManualRecheck(channelId: string, enableDebug?: bool
       youtubeUrl: channel.youtube_url,
       description: channel.channel_name,
       videoTitles: [channel.channel_name],
-      locationTag: channel.country,
       channelLinks: channel.discord_invite ? [channel.discord_invite] : [],
       channelThumbnailUrl: channel.channel_thumbnail_url
     },
