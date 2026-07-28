@@ -2,11 +2,11 @@ export type CountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
 
 export type DiscordStatus = 'PENDING' | 'NOT_FOUND' | 'ACTIVE' | 'ACTIVE_LOW_VOLUME' | 'NON_TRADING' | 'DEAD' | 'UNCERTAIN';
 
-export type ScanStatus = 'PENDING' | 'LOCKED' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED';
+export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED';
 
 export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 
-export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
 
 export type TradingCategory =
   | 'Futures'
@@ -242,7 +242,7 @@ export interface RegressionRunRecord {
     channel_name: string;
     country: string;
     ground_truth_trading: 'TRADING_CONFIRMED' | 'NON_TRADING';
-    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
     ground_truth_discord: 'ACTIVE' | 'NOT_FOUND';
     predicted_discord: string;
     is_correct_trading: boolean;
@@ -266,4 +266,3 @@ export interface RegressionDiffReport {
   has_regression_alert: boolean;
   regression_alerts: string[];
 }
-
