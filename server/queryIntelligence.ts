@@ -359,8 +359,14 @@ export async function selectNextQueryForCountry(country: string): Promise<{
 // ==========================================
 
 /**
+<<<<<<< HEAD
+ * Generates compact, retrieval-oriented candidates led by typed local trading
+ * atoms. Verified learned terms may augment them, while unverified candidates
+ * remain rate-limited.
+=======
  * Generates auditable candidates led by curated institutional knowledge. Verified
  * learned terms may augment it, while unverified candidate terms are rate-limited.
+>>>>>>> origin/main
  */
 export async function generateCandidateQueriesForCountry(
   country: string,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
-import { limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 
 function query(overrides: Partial<QueryRecord>): QueryRecord {
   return {
@@ -52,7 +52,7 @@ test('intent rotation avoids immediately repeating the most recently executed in
   assert.deepEqual(rotateAwayFromMostRecentIntent([forex, psychology], [recent]).map(item => item.id), [3]);
 });
 
-test('planner creates unique, intent-diverse queries with auditable metadata', () => {
+test('planner creates short, unique, attributable retrieval queries', () => {
   const planned = planDiverseQueries({
     country: 'Germany',
     count: 15,
@@ -66,12 +66,57 @@ test('planner creates unique, intent-diverse queries with auditable metadata', (
   });
   assert.equal(planned.length, 15);
   assert.equal(new Set(planned.map(item => normalizeQuery(item.query))).size, 15);
-  assert.ok(new Set(planned.map(item => item.intent)).size >= 12);
+  assert.ok(new Set(planned.map(item => item.intent)).size >= 5);
+  assert.ok(planned.every(item => queryTokenCount(item.query) <= 3));
+  assert.ok(planned.every(item => isRetrievalOrientedQuery('Germany', item.query)));
   assert.ok(planned.every(item => item.knowledgeTiers.includes(1)));
   assert.ok(planned.every(item => item.generationReason && item.discoveryObjective && item.primaryTerm));
+  assert.ok(planned.every(item => Array.isArray(item.metadata.atoms) && item.metadata.retrievalOptimized === true));
   assert.ok(planned.some(item => item.knowledgeTiers.includes(2)));
   assert.ok(planned.some(item => item.knowledgeTiers.includes(3)));
   assert.ok(planned.filter(item => item.knowledgeTiers.includes(3)).length <= Math.ceil(planned.length / 5));
+});
+
+test('planner uses native compact vocabulary in every supported market', () => {
+  const expected: Record<string, RegExp> = {
+    'United States': /NQ Futures|ES Futures|Order Flow/,
+    'United Kingdom': /FTSE Trading|GBPUSD|London Session/,
+    Germany: /DAX Analyse|Börsenanalyse|Technische Analyse/,
+    France: /CAC40 Analyse|Analyse Technique|Euronext/,
+    Spain: /IBEX35|Análisis Técnico|Trading Forex/,
+    Netherlands: /AEX Trading|Technische Analyse|Opties Handelen/,
+    Italy: /FTSE MIB|Analisi Tecnica|Trading Futures/,
+    Australia: /ASX Trading|ASX 200|AUDUSD/,
+    Canada: /TSX Trading|TSX 60|USDCAD/,
+    Japan: /日経225|FX トレード|オーダーフロー/
+  };
+  for (const [country, pattern] of Object.entries(expected)) {
+    const planned = planDiverseQueries({ country, count: 5, learnedVocabulary: [], existingQueries: [] });
+    assert.equal(planned.length, 5, country);
+    assert.ok(planned.some(item => pattern.test(item.query)), country);
+    assert.ok(planned.every(item => queryTokenCount(item.query) <= 3), country);
+    assert.ok(planned.every(item => isCountryScriptCompatible(country, item.query)), country);
+  }
+});
+
+test('script policy rejects cross-market scripts and Japanese prose-like Latin text', () => {
+  assert.equal(isCountryScriptCompatible('France', '日経225'), false);
+  assert.equal(isCountryScriptCompatible('Japan', 'market analysis lesson'), false);
+  assert.equal(isCountryScriptCompatible('Japan', 'USDJPY'), true);
+  assert.equal(isCountryScriptCompatible('Japan', 'テクニカル分析'), true);
+});
+
+test('planner never emits the previous descriptive multi-concept pattern', () => {
+  const planned = planDiverseQueries({
+    country: 'France', count: 10, learnedVocabulary: [], existingQueries: [],
+    countryVocabulary: {
+      country: 'France', languages: ['French'], native_trading_terminology: ['analyse technique'],
+      popular_instruments: ['CAC 40'], local_market_phrases: ['Ouverture Bourse de Paris'],
+      common_content_format_names: ['Analyse hebdomadaire', 'Debriefing marché']
+    }
+  });
+  assert.ok(planned.every(item => !/AMF France strategy breakdown|Euronext Paris weekly market review/i.test(item.query)));
+  assert.ok(planned.every(item => item.query.length <= 40 && queryTokenCount(item.query) <= 3));
 });
 
 test('planner never recreates an existing normalized query', () => {
