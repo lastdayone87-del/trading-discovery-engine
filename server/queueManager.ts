@@ -1,6 +1,5 @@
 import {
   getDb,
-  saveDb,
   enqueueJob,
   claimNextJob,
   completeJob,
@@ -10,10 +9,7 @@ import {
   getChannelById,
   upsertChannel,
   getCountryVocabularies,
-  getExcludedCountries,
   getQueueStatus,
-  incrementQuota,
-  getQuota,
   getQueryById,
   startQueryRun,
   completeQueryRun,
@@ -26,16 +22,16 @@ import {
   recordQueryRunSightings
 } from './db';
 import { validateChannelCountry } from './countryValidator';
-import { runChannelInspection, InspectionResult } from './inspector';
+import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
-import { searchYouTubeChannels, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
-import { classifyTradingRelevance } from './tradingRelevanceClassifier';
+import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import { evaluateQueryPerformance } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
+import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -117,13 +113,14 @@ export async function addAutomatedCountrySearch(countryName: string): Promise<st
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
+  if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
   if (claimableTypes.length === 0) return false;
 
@@ -135,6 +132,21 @@ export async function processNextSearchJob(
   heartbeat.unref?.();
 
   try {
+    if (job.type === 'MANUAL_SEARCH_PAGE') {
+      const sessionId = String(job.payload.sessionId || '');
+      try {
+        const session = await getManualSearchSession(sessionId);
+        if (!session) throw new Error(`Manual search session ${sessionId} no longer exists.`);
+        if (session.status === 'CANCEL_REQUESTED') { await cancelManualSearch(sessionId); await completeJob(job.id); return true; }
+        if (session.status !== 'RUNNING') { await completeJob(job.id); return true; }
+        await executeManualSearchPage(sessionId, Number(job.payload.pageNumber), String(job.payload.pageToken || '') || null, Number(job.payload.variantIndex || 0));
+        await completeJob(job.id);
+      } catch (error) {
+        if (job.attempts >= job.max_attempts) await failManualSearch(sessionId, error);
+        throw error;
+      }
+      return true;
+    }
     if (job.type === 'ENRICH_CHANNEL') {
       const { channelId, targetCountry, source, candidate } = job.payload as {
         channelId: string;
@@ -525,170 +537,72 @@ export interface SearchExecutionResult {
  * Traces and logs full execution status flow:
  * QUEUED -> SEARCHING -> PROCESSING CHANNELS -> VALIDATING COUNTRY -> INSPECTING -> COMPLETED
  */
-export async function executeFullManualSearch(
-  userQuery: string,
-  countryName: string
-): Promise<SearchExecutionResult> {
-  const logs: string[] = [];
-  const statusFlow = ['QUEUED', 'SEARCHING', 'PROCESSING CHANNELS', 'VALIDATING COUNTRY', 'INSPECTING', 'COMPLETED'];
-
-  // Stage 1: QUEUED
-  logs.push(`[Stage 1: QUEUED]`);
-  logs.push(`Search Started:`);
-  logs.push(`  Query: ${userQuery}`);
-  logs.push(`  Country: ${countryName}`);
-
-  // Hard Exclusion Pre-Check
-  const exclusion = await getCountryExclusion(countryName);
-  if (exclusion) {
-    console.warn(JSON.stringify({ event: 'excluded_country_blocked', country: exclusion.country, reason: exclusion.reason, context: 'manual_search', timestamp: new Date().toISOString() }));
-    logs.push(`\n[HARD EXCLUSION GATE: REJECTED IMMEDIATELY]`);
-    logs.push(`Target region '${countryName}' is explicitly configured in the Hard Exclusion List.`);
-    logs.push(`Exiting pipeline immediately with SKIPPED_EXCLUDED before:`);
-    logs.push(`  - YouTube Search API is invoked (0 API units spent)`);
-    logs.push(`  - Evidence Providers execute (0 web crawls)`);
-    logs.push(`  - Gemini Classifier is called (0 AI tokens used)`);
-    logs.push(`  - Database records are created (0 DB mutations)`);
-
-    logs.push(`\n[Stage 6: COMPLETED - SKIPPED_EXCLUDED]`);
-    return {
-      statusFlow: ['QUEUED', 'HARD_EXCLUSION_CHECK', 'SKIPPED_EXCLUDED'],
-      summary: {
-        query: userQuery,
-        country: countryName,
-        returnedFromYouTube: 0,
-        extracted: 0,
-        newChannels: 0,
-        duplicatesUpdated: 0,
-        acceptedCountry: 0,
-        rejectedCountry: 1,
-        insertedOrUpdatedInDb: 0
-      },
-      logs,
-      channels: []
-    };
-  }
-
-  // Stage 2: SEARCHING
-  logs.push(`\n[Stage 2: SEARCHING]`);
-  const vocabs = await getCountryVocabularies();
-  const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
-
-  const queriesToRun: string[] = [userQuery];
-  if (vocab && vocab.native_trading_terminology?.[0]) {
-    queriesToRun.push(`${userQuery} ${vocab.native_trading_terminology[0]}`);
-  }
-
-  const manualOperationId = randomUUID();
-  const manualQuotaReserved = await tryReserveQuota({
-    operationType: 'MANUAL_SEARCH', operationId: manualOperationId, allocation: 'MANUAL',
-    units: queriesToRun.length * 100,
-    dailyBudget: Number(await getAppSetting('daily_youtube_quota_budget', process.env.DAILY_YOUTUBE_QUOTA_BUDGET || '9000')),
-    allocationPercent: Number(await getAppSetting('discovery_manual_quota_percent', process.env.DISCOVERY_MANUAL_QUOTA_PERCENT || '10'))
-  });
-  if (!manualQuotaReserved) throw new Error('Manual YouTube quota allocation is currently exhausted.');
-
-  let allDiscoveredRaw: DiscoveredChannelRaw[] = [];
-  try {
-    for (const q of queriesToRun) {
-      try {
-        logs.push(`Executing YouTube Search for: '${q}'...`);
-        const results = await searchYouTubeChannels(q, countryName, vocab);
-        logs.push(`YouTube API: Response received. Channels returned: ${results.length}`);
-        allDiscoveredRaw.push(...results);
-      } catch (e: any) {
-        logs.push(`YouTube API Call Error for '${q}': ${e.message}`);
-      }
-    }
-    await finishQuotaReservation('MANUAL_SEARCH', manualOperationId, true);
-  } catch (error) {
-    await finishQuotaReservation('MANUAL_SEARCH', manualOperationId, false);
-    throw error;
-  }
-
-  // Stage 3: PROCESSING CHANNELS
-  logs.push(`\n[Stage 3: PROCESSING CHANNELS]`);
-  logs.push(`Extraction: Channels extracted from API responses: ${allDiscoveredRaw.length}`);
-
-  // Deduplicate raw channels list by channelId
-  const uniqueRawMap = new Map<string, DiscoveredChannelRaw>();
-  for (const raw of allDiscoveredRaw) {
-    if (!uniqueRawMap.has(raw.channelId)) {
-      uniqueRawMap.set(raw.channelId, raw);
-    }
-  }
-  const uniqueRawList = Array.from(uniqueRawMap.values());
-
-  let newChannelsCount = 0;
-  let duplicatesUpdatedCount = 0;
-  let acceptedCountryCount = 0;
-  let rejectedCountryCount = 0;
-  let insertedOrUpdatedCount = 0;
-  const processedChannels: ChannelRecord[] = [];
-
-  // Stage 4: UNIFIED INGESTION PIPELINE (Gate 1 Country -> Gate 2 Trading Classifier -> Gate 3 Discord Inspection)
-  logs.push(`\n[Stage 4 & 5: UNIFIED INGESTION PIPELINE]`);
-  for (const raw of uniqueRawList) {
-    logs.push(`\nProcessing candidate '${raw.channelName}' (${raw.channelId}) through unified pipeline...`);
-    const outcome = await processChannelThroughPipeline(raw, countryName, 'manual_search', true);
-
-    if (outcome.isNew) {
-      newChannelsCount++;
-    } else {
-      duplicatesUpdatedCount++;
-    }
-
-    if (outcome.countryStatus === 'REJECTED') {
-      rejectedCountryCount++;
-      logs.push(`  └─ Gate 1 Country Validation: REJECTED (Hard Exclusion Engine)`);
-    } else {
-      acceptedCountryCount++;
-      logs.push(`  ├─ Gate 1 Country Validation: ${outcome.countryStatus}`);
-      logs.push(`  ├─ Gate 2 Trading Relevance: ${outcome.tradingStatus}`);
-      logs.push(`  └─ Gate 3 Discord Inspection: ${outcome.discordStatus} (${outcome.discordInvite ? `Invite: ${outcome.discordInvite}` : 'No invite found'})`);
-    }
-
-    if (outcome.channelRecord) {
-      insertedOrUpdatedCount++;
-      processedChannels.push(outcome.channelRecord);
-    }
-  }
-
-  saveDb();
-
-  // Stage 6: COMPLETED
-  logs.push(`\n[Stage 6: COMPLETED]`);
-  logs.push(`Workflow execution finished.`);
-  logs.push(`Summary:`);
-  logs.push(`  Query: ${userQuery}`);
-  logs.push(`  Country: ${countryName}`);
-  logs.push(`  YouTube API Channels Returned: ${allDiscoveredRaw.length}`);
-  logs.push(`  Channels Extracted: ${uniqueRawList.length}`);
-  logs.push(`  New Channels Discovered: ${newChannelsCount}`);
-  logs.push(`  Duplicates Updated: ${duplicatesUpdatedCount}`);
-  logs.push(`  Country Validation Accepted: ${acceptedCountryCount}`);
-  logs.push(`  Country Validation Rejected: ${rejectedCountryCount}`);
-  logs.push(`  Database Inserts/Updates: ${insertedOrUpdatedCount}`);
-
-  return {
-    statusFlow,
-    summary: {
-      query: userQuery,
-      country: countryName,
-      returnedFromYouTube: allDiscoveredRaw.length,
-      extracted: uniqueRawList.length,
-      newChannels: newChannelsCount,
-      duplicatesUpdated: duplicatesUpdatedCount,
-      acceptedCountry: acceptedCountryCount,
-      rejectedCountry: rejectedCountryCount,
-      insertedOrUpdatedInDb: insertedOrUpdatedCount
-    },
-    logs,
-    channels: processedChannels
-  };
+function manualVariants(query: string, vocab?: Awaited<ReturnType<typeof getCountryVocabularies>>[number]): string[] {
+  return [...new Set([query, vocab?.native_trading_terminology?.[0] ? `${query} ${vocab.native_trading_terminology[0]}` : '', vocab?.common_content_format_names?.[0] ? `${query} ${vocab.common_content_format_names[0]}` : ''].filter(Boolean))];
 }
 
-function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL', concurrency: number): void {
+async function executeManualSearchPage(sessionId: string, pageNumber: number, pageToken: string | null, variantIndex = 0): Promise<any> {
+  const session = await getManualSearchSession(sessionId);
+  if (!session || session.status !== 'RUNNING') return session;
+  // A completed observation is the idempotency boundary for retried queue jobs.
+  if (session.pagesProcessed >= pageNumber) return session;
+  const maxPages = Math.max(1, Number(await getAppSetting('manual_search_max_pages', '8')));
+  const maxCreators = Math.max(1, Number(await getAppSetting('manual_search_max_unique_creators', '150')));
+  const minNovelty = Math.max(0, Number(await getAppSetting('manual_search_min_new_channel_ratio', '0.20')));
+  const maxDuplicate = Math.min(1, Number(await getAppSetting('manual_search_max_duplicate_ratio', '0.80')));
+  const maxLowYield = Math.max(1, Number(await getAppSetting('manual_search_max_low_yield_pages', '2')));
+  const dailyBudget = Number(await getAppSetting('daily_youtube_quota_budget', process.env.DAILY_YOUTUBE_QUOTA_BUDGET || '9000'));
+  const quotaPercent = Number(await getAppSetting('manual_search_quota_percent', '20'));
+  const operationId = `${sessionId}:${pageNumber}`;
+  const queryVariant = session.generatedQueryVariants[variantIndex] || session.originalQuery;
+  const reserved = await tryReserveQuota({ operationType: 'MANUAL_SEARCH_PAGE', operationId, allocation: 'MANUAL', units: 100, dailyBudget, allocationPercent: quotaPercent });
+  if (!reserved) {
+    return recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: null, rawIds: [], uniqueIds: [], knownIds: [], acceptedIds: [], noveltyRatio: 0, duplicateRatio: 0, quotaUnits: 0, quotaEfficiency: 0, creatorYield: 0, lowYield: true, maxPages, stopReason: 'QUOTA_ALLOCATION_EXHAUSTED' });
+  }
+  try {
+    const vocabs = await getCountryVocabularies();
+    const vocab = vocabs.find(v => v.country.toLowerCase() === session.country.toLowerCase());
+    const page = await searchYouTubeChannelPage(queryVariant, session.country, vocab, session.retrievalLane, pageToken);
+    await finishQuotaReservation('MANUAL_SEARCH_PAGE', operationId, true);
+    const rawIds = page.channels.map(c => c.channelId);
+    const unique = [...new Map(page.channels.map(c => [c.channelId, c])).values()];
+    const uniqueIds = unique.map(c => c.channelId);
+    const knownIds: string[] = [];
+    const acceptedIds: string[] = [];
+    for (const raw of unique) {
+      const outcome = await processDiscoveredChannel(raw, session.country, 'manual_search');
+      if (outcome.wasKnown) knownIds.push(outcome.channelId);
+      if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);
+    }
+    const previous = new Set(session.uniqueChannelIds);
+    const novelIds = uniqueIds.filter(id => !previous.has(id));
+    const noveltyRatio = uniqueIds.length ? novelIds.length / uniqueIds.length : 0;
+    const duplicateRatio = rawIds.length ? 1 - (novelIds.length / rawIds.length) : 1;
+    const lowYield = noveltyRatio < minNovelty || duplicateRatio > maxDuplicate;
+    const projectedUnique = new Set([...session.uniqueChannelIds, ...uniqueIds]).size;
+    const projectedLowYield = lowYield ? session.consecutiveLowYieldPages + 1 : 0;
+    const hasNextVariant = variantIndex + 1 < session.generatedQueryVariants.length;
+    const stopReason = pageNumber >= maxPages ? 'MAX_PAGES_REACHED' : projectedUnique >= maxCreators ? 'MAX_UNIQUE_CREATORS_REACHED' : projectedLowYield >= maxLowYield ? 'CONSECUTIVE_LOW_YIELD_PAGES' : !page.nextPageToken && !hasNextVariant ? 'NO_NEXT_PAGE_TOKEN' : null;
+    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawIds, uniqueIds, knownIds, acceptedIds, noveltyRatio, duplicateRatio, quotaUnits: 100, quotaEfficiency: novelIds.length / 100, creatorYield: acceptedIds.length, lowYield, maxPages, stopReason });
+    if (!stopReason) {
+      const nextVariantIndex = page.nextPageToken ? variantIndex : variantIndex + 1;
+      await enqueueJob('MANUAL_SEARCH_PAGE', { sessionId, pageNumber: pageNumber + 1, pageToken: page.nextPageToken, variantIndex: nextVariantIndex }, { priority: 200, maxAttempts: 3, idempotencyKey: `manual-page:${sessionId}:${pageNumber + 1}` });
+    }
+    return updated;
+  } catch (error) { await finishQuotaReservation('MANUAL_SEARCH_PAGE', operationId, false); throw error; }
+}
+
+/** Starts a durable session, returning only after its first page has been processed. */
+export async function executeFullManualSearch(userQuery: string, countryName: string): Promise<any> {
+  await assertCountryAllowed(countryName, 'manual_search_session');
+  const vocabs = await getCountryVocabularies();
+  const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
+  const session = await createManualSearchSession({ id: randomUUID(), query: userQuery, country: countryName, variants: manualVariants(userQuery, vocab), lane: 'VIDEO' });
+  const firstPage = await executeManualSearchPage(session.id, 1, null, 0);
+  return { session: firstPage, message: firstPage.status === 'RUNNING' ? 'First page complete; deep discovery is continuing in the high-priority queue.' : 'Manual discovery completed on the first page.' };
+}
+
+function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number): void {
   const safeConcurrency = Math.min(20, Math.max(1, Math.floor(concurrency) || 1));
   for (let index = 0; index < safeConcurrency; index++) {
     const workerId = `${type.toLowerCase()}_${process.pid}_${index}`;
@@ -707,4 +621,5 @@ function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL', concurrency:
 }
 
 startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)));
+startWorkerPool('MANUAL_SEARCH_PAGE', Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1)));
 startWorkerPool('ENRICH_CHANNEL', Math.max(1, Number(process.env.ENRICHMENT_WORKER_CONCURRENCY || 1)));

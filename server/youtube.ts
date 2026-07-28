@@ -120,8 +120,24 @@ export async function searchYouTubeChannels(
   vocab?: CountryVocabulary,
   lane: RetrievalLane = 'VIDEO'
 ): Promise<DiscoveredChannelRaw[]> {
+  return (await searchYouTubeChannelPage(query, countryName, vocab, lane)).channels;
+}
+
+export interface YouTubeChannelPage {
+  channels: DiscoveredChannelRaw[];
+  nextPageToken: string | null;
+}
+
+/** Fetch one explicit result page so durable callers can resume without replaying pages. */
+export async function searchYouTubeChannelPage(
+  query: string,
+  countryName: string,
+  vocab?: CountryVocabulary,
+  lane: RetrievalLane = 'VIDEO',
+  pageToken?: string | null
+): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
-  if (!sanitizedQuery) return [];
+  if (!sanitizedQuery) return { channels: [], nextPageToken: null };
 
   const keyPool = getYouTubeKeyPool();
   const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));
@@ -142,7 +158,7 @@ export async function searchYouTubeChannels(
         const searchType = lane === 'VIDEO' ? 'video' : 'channel';
         const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=${searchType}&q=${encodeURIComponent(
           sanitizedQuery
-        )}&maxResults=${maxResults}&key=${apiKey}`;
+        )}&maxResults=${maxResults}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}&key=${apiKey}`;
 
         const res = await fetch(searchUrl);
 
@@ -155,7 +171,7 @@ export async function searchYouTubeChannels(
           console.log(`[YouTube API Pool] Key #${currentIndex + 1} succeeded. ${lane} lane discovered ${results.length} unique channels.`);
           // An empty successful response is authoritative. Retrying the same
           // query against every key would multiply quota cost without changing it.
-          return results;
+          return { channels: results, nextPageToken: data.nextPageToken || null };
         } else {
           const errBody = await res.json().catch(() => ({}));
           const reason = errBody?.error?.errors?.[0]?.reason || errBody?.error?.message || `HTTP ${res.status}`;

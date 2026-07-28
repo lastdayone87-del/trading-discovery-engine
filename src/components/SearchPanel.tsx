@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { CountryVocabulary } from '../types';
-import { Search, Sparkles, Play, CheckCircle2, ShieldAlert, Terminal, Check, ArrowRight, Loader2 } from 'lucide-react';
+import { Search, Sparkles, Play, CheckCircle2, ShieldAlert, Terminal, Check, ArrowRight, Loader2, XCircle } from 'lucide-react';
 
 interface Props {
   vocabularies: CountryVocabulary[];
@@ -18,6 +18,22 @@ export const SearchPanel: React.FC<Props> = ({ vocabularies, onManualSearch, onA
   const [currentStage, setCurrentStage] = useState<string | null>(null);
   const [executionResult, setExecutionResult] = useState<any>(null);
   const [autoSuccessMsg, setAutoSuccessMsg] = useState('');
+
+  const session = executionResult?.session;
+  useEffect(() => {
+    if (!session?.id || !['RUNNING', 'CANCEL_REQUESTED'].includes(session.status)) return;
+    const timer = setInterval(async () => {
+      const response = await fetch(`/api/search/manual/sessions/${session.id}`);
+      if (response.ok) { const updatedSession = await response.json(); setExecutionResult((current: any) => ({ ...current, session: updatedSession })); }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [session?.id, session?.status]);
+
+  const cancelManualSearch = async () => {
+    if (!session?.id) return;
+    const response = await fetch(`/api/search/manual/sessions/${session.id}/cancel`, { method: 'POST' });
+    if (response.ok) { const updatedSession = await response.json(); setExecutionResult((current: any) => ({ ...current, session: updatedSession })); }
+  };
 
   // Find vocabulary for automated generator preview
   const selectedVocab = vocabularies.find(v => v.country === autoCountry) || vocabularies[0];
@@ -125,9 +141,9 @@ export const SearchPanel: React.FC<Props> = ({ vocabularies, onManualSearch, onA
                       <Terminal className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
                       Execution Status Flow:
                     </span>
-                    {isSearchingManual ? (
+                    {isSearchingManual || session?.status === 'RUNNING' || session?.status === 'CANCEL_REQUESTED' ? (
                       <span className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400 text-[11px] animate-pulse">
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" /> Processing Search...
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" /> {session?.status === 'CANCEL_REQUESTED' ? 'Cancelling…' : 'Deep discovery running…'}
                       </span>
                     ) : (
                       <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 text-[11px]">
@@ -135,6 +151,22 @@ export const SearchPanel: React.FC<Props> = ({ vocabularies, onManualSearch, onA
                       </span>
                     )}
                   </div>
+
+                  {session && (
+                    <div className="space-y-2 border-t border-indigo-200 dark:border-indigo-900 pt-3">
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                        <div><span className="block text-slate-500">Pages completed</span><strong>{session.pagesProcessed}</strong></div>
+                        <div><span className="block text-slate-500">Creators discovered</span><strong>{session.uniqueChannelIds.length}</strong></div>
+                        <div><span className="block text-slate-500">Quota consumed</span><strong>{session.quotaConsumed} units</strong></div>
+                        <div><span className="block text-slate-500">Current page</span><strong>{session.currentPage ?? '—'}</strong></div>
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full bg-indigo-600 transition-all" style={{ width: `${session.progress}%` }} /></div>
+                      <div className="flex items-center justify-between gap-3 text-[11px]">
+                        <span>{session.stopReason ? `Stop reason: ${session.stopReason.replaceAll('_', ' ')}` : session.estimatedCompletion ? `Estimated completion: ${new Date(session.estimatedCompletion).toLocaleTimeString()}` : 'Evaluating discovery yield…'}</span>
+                        {session.status === 'RUNNING' && <button type="button" onClick={cancelManualSearch} className="flex items-center gap-1 font-semibold text-rose-600 hover:text-rose-700"><XCircle className="h-3.5 w-3.5" /> Cancel</button>}
+                      </div>
+                    </div>
+                  )}
 
                   {/* Flow Badges */}
                   <div className="flex flex-wrap items-center gap-1 text-[10px] font-mono font-semibold">
