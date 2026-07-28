@@ -1,5 +1,5 @@
 import { CountryVocabulary } from '../src/types';
-import { incrementQuota, getQuota, getYouTubeKeyPool } from './db';
+import { incrementQuota, getAppSetting, getYouTubeKeyPool } from './db';
 
 /**
  * STRICT BANNED KEYWORD SANITIZER
@@ -79,8 +79,8 @@ export interface DiscoveredChannelRaw {
 let activeKeyIndex = 0;
 
 /**
- * Searches YouTube for trading channels using YouTube Data API with automatic API key rotation & failover,
- * falling back to the realistic trader discovery simulator if all keys hit quota limits or are unconfigured.
+ * Searches real YouTube channels using API key rotation and fails explicitly
+ * when no key can serve the request; production discovery never synthesizes results.
  */
 export async function searchYouTubeChannels(
   query: string,
@@ -91,6 +91,12 @@ export async function searchYouTubeChannels(
   if (!sanitizedQuery) return [];
 
   const keyPool = getYouTubeKeyPool();
+  const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));
+  const maxResults = Math.min(50, Math.max(10, Number.isFinite(configuredMaxResults) ? configuredMaxResults : 25));
+
+  if (keyPool.length === 0) {
+    throw new Error('YouTube discovery requires at least one configured YouTube API key.');
+  }
 
   if (keyPool.length > 0) {
     const attemptsCount = keyPool.length;
@@ -102,7 +108,7 @@ export async function searchYouTubeChannels(
         console.log(`[YouTube API Pool] Attempting search with key #${currentIndex + 1}/${keyPool.length} (${apiKey.slice(0, 6)}...)...`);
         const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(
           sanitizedQuery
-        )}&maxResults=10&key=${apiKey}`;
+        )}&maxResults=${maxResults}&key=${apiKey}`;
 
         const res = await fetch(searchUrl);
 
@@ -131,7 +137,9 @@ export async function searchYouTubeChannels(
           }
 
           console.log(`[YouTube API Pool] Key #${currentIndex + 1} succeeded. Discovered ${results.length} channels.`);
-          if (results.length > 0) return results;
+          // An empty successful response is authoritative. Retrying the same
+          // query against every key would multiply quota cost without changing it.
+          return results;
         } else {
           const errBody = await res.json().catch(() => ({}));
           const reason = errBody?.error?.errors?.[0]?.reason || errBody?.error?.message || `HTTP ${res.status}`;
@@ -144,8 +152,7 @@ export async function searchYouTubeChannels(
     console.warn('[YouTube API Pool] All API keys in pool encountered quotaExceeded or error or returned no results.');
   }
 
-  // Return empty array when no real YouTube API channels are discovered
-  return [];
+  throw new Error('All configured YouTube API keys failed for this discovery request.');
 }
 
 /**

@@ -17,7 +17,8 @@ authentication, and Railway backups are not configured by this repository.
    cooldown-eligible query, and records generation provenance.
 2. Manual and queued searches enter the PostgreSQL `jobs` queue. Workers claim rows
    with `FOR UPDATE SKIP LOCKED`, call YouTube, and feed candidates into ingestion.
-   Autonomous cycles are synchronously executed under a PostgreSQL scheduler lock.
+   The autonomous producer reserves diverse queries and quota, then enqueues durable
+   search jobs; it never calls YouTube directly.
 3. Ingestion deduplicates by channel ID, applies country inference/exclusion, runs the
    evidence-based classifier, schedules uncertain channels for durable enrichment,
    and performs Discord inspection only after preceding gates pass.
@@ -34,8 +35,8 @@ authentication, and Railway backups are not configured by this repository.
 - Queue claims use row locks with `SKIP LOCKED`, retry with exponential backoff, and
   recover stale processing locks. Terminal idempotency keys can now be reused while
   pending/processing jobs remain deduplicated.
-- The autonomous scheduler uses persisted state and a database lock. This audit fixed
-  a paused-cycle lock leak and removed duplicate enqueue-plus-synchronous execution.
+- The autonomous scheduler is a short-lived, quota-paced producer. Query runs,
+  reservations, and job attribution remain durable across process restarts.
 - Country exclusion runs before country-targeted queue creation and is checked again
   by workers. Candidate-level country inference precedes classifier/Discord work.
 - Uncertain classifications enter durable enrichment and become reviewable after the
@@ -67,9 +68,8 @@ authentication, and Railway backups are not configured by this repository.
   does not import legacy `quota_tracker` or `search_jobs_queue` rows. Do not claim a
   complete legacy migration unless those tables are intentionally declared ephemeral
   or migrated separately.
-- Autonomous cycle work is locked and stateful but synchronous; an interrupted cycle
-  is not resumed at its exact channel offset. The next scheduled cycle can proceed
-  after stale-lock expiry, without duplicate concurrent execution.
+- Autonomous searches are restart-safe durable jobs. Candidate processing within one
+  claimed search remains sequential, with a worker heartbeat protecting long claims.
 - Stale queue recovery resets jobs but leaves the corresponding open attempt row
   unfinished. This affects operational audit quality, not job recovery itself.
 - `server/db.ts` contains dense one-line compatibility code, increasing review and
@@ -78,9 +78,8 @@ authentication, and Railway backups are not configured by this repository.
   startup write side effect and should be removed after test-data policy is finalized.
 - PostgreSQL TLS defaults to `rejectUnauthorized: false` in production. Confirm the
   exact Railway certificate requirements; use verified TLS where supported.
-- Quota accounting is aggregate and increments after successful responses. Concurrent
-  workers can exceed the configured budget because there is no atomic pre-call quota
-  reservation.
+- Quota reservations are transactional for autonomous, enrichment, and manual work;
+  production staging still needs to prove reset, expiry, and allocation behavior.
 - External provider calls need explicit timeouts/cancellation and production metrics.
   Provider errors can degrade to reduced evidence, which is resilient but can increase
   uncertain classifications.
@@ -109,8 +108,8 @@ existing incompatible legacy operation: it returns an error by design.
 
 - `/api/channels` reads every channel and filters in Node; move filtering and paging to
   SQL before large datasets.
-- Workers process one job per process every four seconds, and channel candidates are
-  handled serially. This is safe but low-throughput.
+- Configurable search and enrichment worker pools drain continuously; channel
+  candidates within each search are still handled serially.
 - Query and channel helper functions perform repeated round trips and some full-table
   reads. Add indexes/query plans and metrics based on staging load, not speculation.
 - The health endpoint queries database and queue state on each probe. This is useful
@@ -130,8 +129,18 @@ existing incompatible legacy operation: it returns an error by design.
 | `QUERY_INTELLIGENCE_COOLDOWN_MINUTES` | Optional; default 360. |
 | `QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES` | Optional; default 2. |
 | `QUERY_INTELLIGENCE_EXPLORATION_RATIO` | Optional; default 0.4. |
+| `DISCOVERY_INTERVAL_MINUTES` | Optional producer cadence; default 5. |
+| `DISCOVERY_BATCH_SIZE` | Optional maximum jobs per producer wake; default 5. |
+| `DISCOVERY_TARGET_QUEUE_DEPTH` | Optional autonomous queue watermark; default 15. |
+| `DAILY_YOUTUBE_QUOTA_BUDGET` | Application quota budget; default 9000. |
+| `DISCOVERY_AUTONOMOUS_QUOTA_PERCENT` | Autonomous allocation; default 70. |
+| `DISCOVERY_ENRICHMENT_QUOTA_PERCENT` | Enrichment allocation; default 20. |
+| `DISCOVERY_MANUAL_QUOTA_PERCENT` | Manual reserve; default 10. |
+| `SEARCH_WORKER_CONCURRENCY` | Search worker count; default 1. |
+| `ENRICHMENT_WORKER_CONCURRENCY` | Enrichment worker count; default 1. |
+| `YOUTUBE_DISCOVERY_MAX_RESULTS` | Results requested per search, clamped 10–50; default 25. |
 
-`APP_URL` and `DAILY_YOUTUBE_QUOTA_LIMIT` are currently documented but not consumed by
+`APP_URL` and legacy `DAILY_YOUTUBE_QUOTA_LIMIT` are currently documented but not consumed by
 the audited server runtime. Remove or wire them in a separate, reviewed change.
 
 ## Migration and Railway checklist
