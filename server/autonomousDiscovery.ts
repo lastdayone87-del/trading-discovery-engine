@@ -5,6 +5,7 @@ import {
   getCountryVocabularies,
   getExcludedCountries,
   getSchedulerState,
+  recoverStaleJobs,
   releaseSchedulerLock,
   scheduleAutonomousQueryRuns,
   setAppSetting,

@@ -12,6 +12,48 @@ export interface SearchAtom {
   origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED';
 }
 
+interface IntentKnowledge {
+  intent: QueryIntent;
+  primaryTerms: string[];
+  objective: string;
+}
+
+export const INSTITUTIONAL_KNOWLEDGE: IntentKnowledge[] = [
+  { intent: 'beginner', primaryTerms: ['trading for beginners', 'risk management basics'], objective: 'Find beginner-focused creators teaching foundational market skills.' },
+  { intent: 'strategy', primaryTerms: ['price action strategy', 'market structure strategy'], objective: 'Find creators demonstrating repeatable trading strategies.' },
+  { intent: 'news', primaryTerms: ['market news analysis', 'economic calendar outlook'], objective: 'Find creators interpreting current macro and market news.' },
+  { intent: 'education', primaryTerms: ['trading education', 'technical analysis lesson'], objective: 'Find structured educational trading channels.' },
+  { intent: 'indicators', primaryTerms: ['volume profile indicator', 'vwap indicator analysis'], objective: 'Find creators teaching indicator-based analysis.' },
+  { intent: 'psychology', primaryTerms: ['trading psychology', 'trader discipline journal'], objective: 'Find creators focused on execution discipline and psychology.' },
+  { intent: 'futures', primaryTerms: ['futures trading', 'index futures analysis'], objective: 'Find active futures-market creators.' },
+  { intent: 'forex', primaryTerms: ['forex market analysis', 'currency trading education'], objective: 'Find educational foreign-exchange creators.' },
+  { intent: 'crypto', primaryTerms: ['crypto market structure', 'bitcoin technical analysis'], objective: 'Find evidence-led crypto market educators.' },
+  { intent: 'stocks', primaryTerms: ['stock market analysis', 'equity trading education'], objective: 'Find creators analyzing listed equities.' },
+  { intent: 'options', primaryTerms: ['options trading education', 'options risk analysis'], objective: 'Find creators teaching options and derivatives risk.' },
+  { intent: 'market_analysis', primaryTerms: ['institutional market analysis', 'daily market structure'], objective: 'Find creators publishing current market analysis.' },
+  { intent: 'premarket_prep', primaryTerms: ['premarket preparation', 'opening session key levels'], objective: 'Find creators publishing pre-session preparation.' },
+  { intent: 'live_trading', primaryTerms: ['live trade execution', 'live trading commentary'], objective: 'Find creators showing authentic live execution.' },
+  { intent: 'weekly_reviews', primaryTerms: ['weekly market review', 'weekly trading recap'], objective: 'Find creators reviewing market and execution outcomes.' },
+  { intent: 'trading_journals', primaryTerms: ['trading journal review', 'trade review process'], objective: 'Find creators documenting trades and lessons.' },
+  { intent: 'session_analysis', primaryTerms: ['session analysis', 'opening range analysis'], objective: 'Find session-specific market analysts.' },
+  { intent: 'strategy_breakdowns', primaryTerms: ['strategy breakdown', 'trade setup explanation'], objective: 'Find detailed setup and strategy breakdowns.' },
+  { intent: 'prop_firm', primaryTerms: ['prop firm risk management', 'funded trader education'], objective: 'Find responsible proprietary-trading educators.' }
+];
+
+export const INSTITUTIONAL_ENTITIES: Record<string, string[]> = {
+  GLOBAL: ['Interactive Brokers', 'CME futures', 'market microstructure', 'risk management'],
+  'United States': ['SEC investor education', 'CFTC futures', 'NYSE', 'Nasdaq'],
+  'United Kingdom': ['FCA regulated trading', 'London Stock Exchange', 'FTSE'],
+  Germany: ['BaFin', 'Xetra', 'Frankfurt Stock Exchange', 'DAX futures'],
+  France: ['AMF France', 'Euronext Paris', 'CAC 40'],
+  Spain: ['CNMV', 'Bolsa de Madrid', 'IBEX 35'],
+  Netherlands: ['AFM Netherlands', 'Euronext Amsterdam', 'AEX'],
+  Italy: ['CONSOB', 'Borsa Italiana', 'FTSE MIB'],
+  Australia: ['ASIC trading education', 'Australian Securities Exchange', 'ASX 200'],
+  Canada: ['CIRO investor education', 'Toronto Stock Exchange', 'TSX'],
+  Japan: ['JFSA', 'Japan Exchange Group', 'Nikkei 225']
+};
+
 export interface PlannedQuery {
   query: string;
   intent: QueryIntent;
@@ -123,6 +165,12 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
   return [...unique.values()];
 }
 
+function orderedIntents(existing: QueryRecord[]): IntentKnowledge[] {
+  const counts = new Map<QueryIntent, number>();
+  existing.forEach(query => counts.set(query.intent, (counts.get(query.intent) || 0) + 1));
+  return [...INSTITUTIONAL_KNOWLEDGE].sort((a, b) => (counts.get(a.intent) || 0) - (counts.get(b.intent) || 0));
+}
+
 export function planDiverseQueries(args: {
   country: string;
   count: number;
@@ -145,58 +193,127 @@ export function planDiverseQueries(args: {
   const methods = anchors.filter(item => item.type === 'METHOD');
   const compatiblePairs = anchors
     .filter(item => item.type === 'INSTRUMENT' || item.type === 'MARKET')
-    .flatMap(anchor => methods.map(method => ({ atoms: [anchor, method], template: 'COMPACT_PAIR' as const })))
-    .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
-  candidates.push(...compatiblePairs);
+    .flatMap(anchor => methods.map(method => ({ atoms: [anchor, method], template: 'COMPACT_PAIR' })));
 
-  const learned = args.learnedVocabulary
-    .filter(term => term.trust_tier === 2 ? (term.validation_count || 0) >= 2 : true)
-    .map(term => atom(term.term, 'LEARNED', 'strategy', term.trust_tier === 2 ? 2 : 3, 'LEARNED'));
-  const learnedCandidates = learned.flatMap((learnedAtom, index) => {
-    const rotated = [...anchors.slice(index), ...anchors.slice(0, index)];
-    const anchor = rotated.find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${learnedAtom.term}`));
-    if (!anchor) return [];
-    return [{ atoms: [anchor, learnedAtom], template: 'ANCHOR_LEARNED' as const }];
-  });
-  candidates.splice(Math.min(3, candidates.length), 0, ...learnedCandidates);
-  candidates.sort((a, b) => (intentUsage.get(a.atoms[0].intent) || 0) - (intentUsage.get(b.atoms[0].intent) || 0));
-
-  const planned: PlannedQuery[] = [];
-  let tier3Used = 0;
-  for (const candidate of candidates) {
-    if (planned.length >= count) break;
-    const query = candidate.atoms.map(item => item.term).join(' ');
-    const normalized = normalizeQuery(query);
-    const hasTier3 = candidate.atoms.some(item => item.tier === 3);
-    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query)) continue;
-    if (hasTier3 && tier3Used >= Math.ceil(count / 5)) continue;
-    if (hasTier3) tier3Used++;
-    const tiers = [...new Set(candidate.atoms.map(item => item.tier))] as QueryKnowledgeTier[];
-    const primary = candidate.atoms[0];
-    planned.push({
-      query,
-      intent: primary.intent,
-      primaryTerm: primary.term,
-      knowledgeTiers: tiers,
-      generationMode: mode,
-      generationReason: candidate.template === 'SINGLE_ATOM'
-        ? `Selected a compact ${primary.origin.toLowerCase()} ${primary.type.toLowerCase()} atom for YouTube retrieval.`
-        : candidate.template === 'COMPACT_PAIR'
-          ? 'Combined one concrete local instrument or market with one compatible trading method.'
-          : `Combined one compact Tier 1 local anchor with constrained Tier ${candidate.atoms[1].tier} learned vocabulary.`,
-      discoveryObjective: OBJECTIVES[primary.intent] || 'Find relevant trading creators using authentic local search vocabulary.',
-      metadata: {
-        country: args.country,
-        queryTemplate: candidate.template,
-        retrievalOptimized: true,
-        tokenCount: queryTokenCount(query),
-        scriptValidated: true,
-        atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
-        localTier1Term: primary.term,
-        learnedTerm: candidate.atoms.find(item => item.type === 'LEARNED')?.term
-      }
-    });
-    generated.add(normalized);
+  // Combine anchors with learned vocabulary
+  for (const learned of args.learnedVocabulary) {
+    if (isRetrievalOrientedQuery(args.country, learned.term)) {
+      candidates.push({ atoms: [atom(learned.term, 'LEARNED', inferIntent(learned.term, 'education'), learned.trust_tier, 'LEARNED')], template: 'SINGLE_ATOM' });
+    }
   }
-  return planned;
+
+  // Generate queries
+  const plannedQueries: PlannedQuery[] = [];
+  const availableIntents = orderedIntents(args.existingQueries);
+
+  for (const intentKnowledge of availableIntents) {
+    if (plannedQueries.length >= count) break;
+
+    // Try to generate queries based on institutional knowledge
+    for (const primaryTerm of intentKnowledge.primaryTerms) {
+      if (plannedQueries.length >= count) break;
+      const query = `${primaryTerm} ${args.country === 'United States' ? '' : 'trading'}`.trim();
+      if (!blocked.has(normalizeQuery(query)) && !generated.has(normalizeQuery(query))) {
+        plannedQueries.push({
+          query,
+          intent: intentKnowledge.intent,
+          primaryTerm,
+          knowledgeTiers: [1],
+          generationMode: mode,
+          generationReason: `Institutional knowledge for ${intentKnowledge.intent} in ${args.country}`,
+          discoveryObjective: intentKnowledge.objective,
+          metadata: { source: 'INSTITUTIONAL_KNOWLEDGE' }
+        });
+        generated.add(normalizeQuery(query));
+      }
+    }
+
+    // Try to generate queries based on country-specific institutional entities
+    const countryEntities = INSTITUTIONAL_ENTITIES[args.country] || INSTITUTIONAL_ENTITIES.GLOBAL;
+    for (const entity of countryEntities) {
+      if (plannedQueries.length >= count) break;
+      const query = `${entity} ${intentKnowledge.primaryTerms[0] || intentKnowledge.intent}`.trim();
+      if (!blocked.has(normalizeQuery(query)) && !generated.has(normalizeQuery(query))) {
+        plannedQueries.push({
+          query,
+          intent: intentKnowledge.intent,
+          primaryTerm: entity,
+          knowledgeTiers: [1],
+          generationMode: mode,
+          generationReason: `Country-specific institutional entity for ${intentKnowledge.intent} in ${args.country}`,
+          discoveryObjective: intentKnowledge.objective,
+          metadata: { source: 'INSTITUTIONAL_ENTITY' }
+        });
+        generated.add(normalizeQuery(query));
+      }
+    }
+  }
+
+  // Add queries from country-specific vocabulary (Tier 2)
+  if (args.countryVocabulary) {
+    const vocabTerms = [
+      ...(args.countryVocabulary.native_trading_terminology || []).map(term => ({ term, type: 'METHOD', intent: inferIntent(term, 'strategy') })),
+      ...(args.countryVocabulary.popular_instruments || []).map(term => ({ term, type: 'INSTRUMENT', intent: inferIntent(term, 'market_analysis') })),
+      ...(args.countryVocabulary.local_market_phrases || []).map(term => ({ term, type: 'MARKET', intent: inferIntent(term, 'session_analysis') })),
+      ...(args.countryVocabulary.common_content_format_names || []).map(term => ({ term, type: 'FORMAT', intent: inferIntent(term, 'education') })),
+    ];
+
+    for (const vt of vocabTerms) {
+      if (plannedQueries.length >= count) break;
+      const query = `${vt.term} trading`.trim();
+      if (!blocked.has(normalizeQuery(query)) && !generated.has(normalizeQuery(query))) {
+        plannedQueries.push({
+          query,
+          intent: vt.intent,
+          primaryTerm: vt.term,
+          knowledgeTiers: [1, 2],
+          generationMode: mode,
+          generationReason: `Country vocabulary term: ${vt.term}`,
+          discoveryObjective: OBJECTIVES[vt.intent] || 'Discover relevant content',
+          metadata: { source: 'COUNTRY_VOCABULARY' }
+        });
+        generated.add(normalizeQuery(query));
+      }
+    }
+  }
+
+  // Add queries from learned vocabulary (Tier 3)
+  for (const lt of args.learnedVocabulary) {
+    if (plannedQueries.length >= count) break;
+    const query = `${lt.term} ${lt.category === 'instrument' ? 'analysis' : 'strategy'}`.trim();
+    if (!blocked.has(normalizeQuery(query)) && !generated.has(normalizeQuery(query))) {
+      plannedQueries.push({
+        query,
+        intent: inferIntent(lt.term, 'education'),
+        primaryTerm: lt.term,
+        knowledgeTiers: [1, 3],
+        generationMode: mode,
+        generationReason: `Learned vocabulary term: ${lt.term}`,
+        discoveryObjective: OBJECTIVES.education || 'Discover educational content',
+        metadata: { source: 'LEARNED_VOCABULARY' }
+      });
+      generated.add(normalizeQuery(query));
+    }
+  }
+
+  // Fill with generic queries if needed
+  while (plannedQueries.length < count) {
+    const genericIntent = Array.from(intentUsage.keys()).sort((a, b) => (intentUsage.get(a) || 0) - (intentUsage.get(b) || 0))[0] || 'market_analysis';
+    const genericQuery = `${genericIntent} trading in ${args.country}`;
+    if (!blocked.has(normalizeQuery(genericQuery)) && !generated.has(normalizeQuery(genericQuery))) {
+      plannedQueries.push({
+        query: genericQuery,
+        intent: genericIntent,
+        primaryTerm: genericIntent,
+        knowledgeTiers: [1],
+        generationMode: mode,
+        generationReason: 'Generic fill-in query',
+        discoveryObjective: OBJECTIVES[genericIntent] || 'Discover relevant content',
+        metadata: { source: 'GENERIC_FILL' }
+      });
+      generated.add(normalizeQuery(genericQuery));
+    }
+  }
+
+  return plannedQueries.slice(0, count);
 }
