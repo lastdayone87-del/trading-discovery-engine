@@ -1,5 +1,6 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
 import { textMatchesTerm } from '../utils/textMatching';
+import { isTradingFocusedText } from '../multilingualTerminology';
 
 export class VideoMetadataProvider implements EvidenceProvider {
   name = 'video_metadata' as const;
@@ -14,16 +15,6 @@ export class VideoMetadataProvider implements EvidenceProvider {
       return items;
     }
 
-    const allPositiveTerms = [
-      ...knowledgeContext.globalInstruments,
-      ...knowledgeContext.globalPlatformsPropFirms,
-      ...knowledgeContext.globalAdvancedConcepts,
-      ...(knowledgeContext.languageKnowledge?.positiveTerms || []),
-      ...(knowledgeContext.countryKnowledge?.nativeTradingTerminology || []),
-      'trading', 'trader', 'futures', 'forex', 'options', 'crypto', 'stocks', 'price action', 'charting',
-      'fomc', 'premarket', 'live trading', 'trading strategy', 'trading psychology', 'risk management'
-    ];
-
     let tradingFocusedCount = 0;
     const matchedInstrumentsInVideos: string[] = [];
     const matchedPlatformsInVideos: string[] = [];
@@ -34,7 +25,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
       const desc = descriptions[i] || '';
       const combo = `${title} ${desc}`;
 
-      const isTrading = allPositiveTerms.some(term => textMatchesTerm(combo, term));
+      const isTrading = isTradingFocusedText(combo, knowledgeContext);
       if (isTrading) {
         tradingFocusedCount++;
       }
