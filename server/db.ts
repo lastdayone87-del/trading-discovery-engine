@@ -193,9 +193,9 @@ export async function incrementQuota(units:number):Promise<void>{const db=await 
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
 
-function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{})};}
+function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{}),reserved_until:iso(r.reserved_until),next_eligible_at:iso(r.next_eligible_at)} as QueryRecord;}
 export async function getAllQueries():Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library ORDER BY performance_score DESC,times_executed DESC'); return res.rows.map(rowToQuery);}
-export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{return (await getAllQueries()).filter(q=>q.country.toLowerCase()===country.toLowerCase()&&q.status==='ACTIVE');}
+export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
 export async function getQueryByText(queryText:string):Promise<QueryRecord|null>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library WHERE LOWER(query)=LOWER($1)',[queryText.trim()]); return res.rows[0]?rowToQuery(res.rows[0]):null;}
 export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;}):Promise<QueryRecord>{const db=await getDb(); const res=await db.query(`INSERT INTO query_library(query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()) ON CONFLICT(query) DO UPDATE SET collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[record.query.trim(),record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(record.generationMetadata||{})]); return rowToQuery(res.rows[0]);}
 export async function updateQueryExecutionStats(queryId:number,stats:{totalChannelsFound:number;uniqueChannelsFound:number;qualityChannelsFound:number;communityChannelsFound:number;avgQualityScore:number;performanceScore:number;newCollection?:'PROVEN'|'EXPERIMENTAL'|'REJECTED';}):Promise<void>{const db=await getDb(); await db.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`,[stats.totalChannelsFound,stats.uniqueChannelsFound,stats.qualityChannelsFound,stats.communityChannelsFound,stats.avgQualityScore,stats.performanceScore,stats.newCollection||null,queryId]);}
@@ -217,8 +217,222 @@ export async function claimNextJob(workerId:string,types?:string[]):Promise<Dura
 export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
 export async function failJob(jobId:string,error:any):Promise<void>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return; const {attempts,max_attempts}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); if(attempts>=max_attempts){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,msg]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,msg,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,msg]);}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const res=await db.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval RETURNING id`,[String(staleAfterMinutes)]); return res.rowCount||0;}
+export async function heartbeatJob(jobId:string,workerId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET locked_at=now(),updated_at=now() WHERE id=$1 AND status='PROCESSING' AND locked_by=$2`,[jobId,workerId]);}
 
 export async function getSchedulerState(name='autonomous_discovery'):Promise<any>{const db=await getDb(); const res=await db.query('SELECT * FROM scheduler_state WHERE name=$1',[name]); return res.rows[0]||null;}
 export async function updateSchedulerState(name:string,patch:Record<string,any>):Promise<void>{const db=await getDb(); const current=await getSchedulerState(name); if(!current) await db.query('INSERT INTO scheduler_state(name) VALUES($1) ON CONFLICT DO NOTHING',[name]); const sets=Object.keys(patch).map((k,i)=>`${k}=$${i+2}`).join(','); if(sets) await db.query(`UPDATE scheduler_state SET ${sets},updated_at=now() WHERE name=$1`,[name,...Object.values(patch).map(v=>typeof v==='object'&&v!==null?JSON.stringify(v):v)]);}
 export async function acquireSchedulerLock(name:string,workerId:string,staleAfterMinutes=15):Promise<boolean>{const db=await getDb(); const res=await db.query(`UPDATE scheduler_state SET is_running=true,locked_by=$2,locked_at=now(),updated_at=now() WHERE name=$1 AND is_enabled=true AND (locked_at IS NULL OR locked_at < now()-($3||' minutes')::interval OR is_running=false)`,[name,workerId,String(staleAfterMinutes)]); return !!res.rowCount;}
 export async function releaseSchedulerLock(name:string,report?:any,nextRunAt?:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE scheduler_state SET is_running=false,locked_by=NULL,locked_at=NULL,last_run_at=now(),next_run_at=$2,last_report=$3,updated_at=now() WHERE name=$1`,[name,nextRunAt||null,report?JSON.stringify(report):null]);}
+
+export interface AutonomousQueryCandidate {
+  query: QueryRecord;
+  strategy: string;
+  reason: string;
+}
+
+export interface AutonomousSchedulingSnapshot {
+  queueDepth: number;
+  autonomousUnitsUsed: number;
+  autonomousUnitsReserved: number;
+}
+
+export interface ScheduledAutonomousRun {
+  runId: string;
+  jobId: string;
+  query: QueryRecord;
+}
+
+export async function getAutonomousSchedulingSnapshot(): Promise<AutonomousSchedulingSnapshot> {
+  const db = await getDb();
+  await db.query(`UPDATE quota_reservations SET status='EXPIRED' WHERE status='RESERVED' AND expires_at <= now()`);
+  const [depth, used, reserved] = await Promise.all([
+    db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE type='SEARCH_YOUTUBE' AND status IN ('PENDING','PROCESSING') AND payload->>'source'='automated_query'`),
+    db.query(`SELECT COALESCE(SUM(quota_used),0)::int AS units FROM query_runs WHERE source='automated_query' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`),
+    db.query(`SELECT COALESCE(SUM(quota_reserved),0)::int AS units FROM query_runs WHERE source='automated_query' AND status IN ('SCHEDULED','RUNNING','RETRYING')`)
+  ]);
+  return {
+    queueDepth: depth.rows[0]?.count || 0,
+    autonomousUnitsUsed: used.rows[0]?.units || 0,
+    autonomousUnitsReserved: reserved.rows[0]?.units || 0
+  };
+}
+
+export async function scheduleAutonomousQueryRuns(
+  candidates: AutonomousQueryCandidate[],
+  workerId: string,
+  cooldownMinutes: number
+): Promise<ScheduledAutonomousRun[]> {
+  const db = await getDb();
+  const client = await db.connect();
+  const scheduled: ScheduledAutonomousRun[] = [];
+  try {
+    await client.query('BEGIN');
+    for (const candidate of candidates) {
+      const reserved = await client.query(
+        `UPDATE query_library
+         SET reserved_at=now(), reserved_until=now()+interval '20 minutes', reserved_by=$2, last_queued_at=now()
+         WHERE id=$1 AND status='ACTIVE' AND collection<>'REJECTED'
+           AND (reserved_until IS NULL OR reserved_until <= now())
+           AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+           AND (last_executed IS NULL OR last_executed <= now()-($3||' minutes')::interval)
+           AND NOT EXISTS (SELECT 1 FROM query_runs qr WHERE qr.query_id=query_library.id AND qr.status IN ('SCHEDULED','RUNNING','RETRYING'))
+         RETURNING *`,
+        [candidate.query.id, workerId, String(cooldownMinutes)]
+      );
+      if (!reserved.rowCount) continue;
+
+      const run = await client.query(
+        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,quota_reserved,metadata)
+         VALUES($1,$2,'automated_query',$3,$4,100,$5) RETURNING id`,
+        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, JSON.stringify(candidate.query.generation_metadata || {})]
+      );
+      const runId = run.rows[0].id;
+      const job = await client.query(
+        `INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key)
+         VALUES('SEARCH_YOUTUBE',$1,20,3,$2) RETURNING id`,
+        [JSON.stringify({
+          queryRunId: runId,
+          queryId: candidate.query.id,
+          query: candidate.query.query,
+          country: candidate.query.country,
+          source: 'automated_query'
+        }), `search-run:${runId}`]
+      );
+      const jobId = job.rows[0].id;
+      await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
+      await client.query(
+        `INSERT INTO quota_reservations(operation_type,operation_id,allocation,units,expires_at)
+         VALUES('SEARCH_YOUTUBE',$1,'AUTONOMOUS',100,now()+interval '20 minutes')`,
+        [runId]
+      );
+      scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]) });
+    }
+    await client.query('COMMIT');
+    return scheduled;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getQueryById(queryId: number): Promise<QueryRecord | null> {
+  const db = await getDb();
+  const res = await db.query('SELECT * FROM query_library WHERE id=$1', [queryId]);
+  return res.rows[0] ? rowToQuery(res.rows[0]) : null;
+}
+
+export async function startQueryRun(runId: string): Promise<void> {
+  const db = await getDb();
+  await db.query(`UPDATE query_runs SET status='RUNNING',started_at=COALESCE(started_at,now()) WHERE id=$1`, [runId]);
+  await db.query(`UPDATE quota_reservations SET expires_at=now()+interval '20 minutes' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+}
+
+export async function completeQueryRun(runId: string, metrics: {
+  rawResults: number;
+  uniqueChannels: number;
+  qualityChannels: number;
+  communitiesDiscovered: number;
+  quotaUsed: number;
+}): Promise<void> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const run = await client.query(
+      `UPDATE query_runs SET status='COMPLETED',raw_results=$2,unique_channels=$3,quality_channels=$4,
+       communities_discovered=$5,quota_used=$6,completed_at=now() WHERE id=$1 RETURNING query_id`,
+      [runId, metrics.rawResults, metrics.uniqueChannels, metrics.qualityChannels, metrics.communitiesDiscovered, metrics.quotaUsed]
+    );
+    if (run.rowCount) {
+      await client.query(
+        `UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL,
+         next_eligible_at=NULL
+         WHERE id=$1`, [run.rows[0].query_id]
+      );
+    }
+    await client.query(
+      `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
+       WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function failQueryRun(runId: string, error: unknown, terminal: boolean): Promise<void> {
+  const db = await getDb();
+  const message = String((error as any)?.message || error).slice(0, 2000);
+  if (!terminal) {
+    await db.query(`UPDATE query_runs SET status='RETRYING',error=$2 WHERE id=$1`, [runId, message]);
+    return;
+  }
+  const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now() WHERE id=$1 RETURNING query_id`, [runId, message]);
+  if (run.rowCount) await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
+  await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+}
+
+export async function tryReserveQuota(args: {
+  operationType: string;
+  operationId: string;
+  allocation: 'MANUAL' | 'ENRICHMENT';
+  units: number;
+  dailyBudget: number;
+  allocationPercent: number;
+}): Promise<boolean> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
+    await client.query(`UPDATE quota_reservations SET status='EXPIRED' WHERE status='RESERVED' AND expires_at<=now()`);
+    const existing = await client.query(
+      `SELECT status FROM quota_reservations WHERE operation_type=$1 AND operation_id=$2`,
+      [args.operationType, args.operationId]
+    );
+    if (existing.rows[0]?.status === 'RESERVED') {
+      await client.query('COMMIT');
+      return true;
+    }
+    const totals = await client.query(
+      `SELECT
+         COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
+         COALESCE(SUM(units) FILTER (WHERE status='RESERVED'),0)::int AS reserved_total,
+         COALESCE(SUM(units) FILTER (WHERE allocation=$1 AND status IN ('RESERVED','CONSUMED') AND reserved_at>=date_trunc('day',now() AT TIME ZONE 'UTC')),0)::int AS allocation_used
+       FROM quota_reservations`, [args.allocation]
+    );
+    const row = totals.rows[0];
+    const allocationBudget = Math.floor(args.dailyBudget * args.allocationPercent / 100);
+    if (row.actual_used + row.reserved_total + args.units > args.dailyBudget || row.allocation_used + args.units > allocationBudget) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+    await client.query(
+      `INSERT INTO quota_reservations(operation_type,operation_id,allocation,units,expires_at)
+       VALUES($1,$2,$3,$4,now()+interval '20 minutes')
+       ON CONFLICT(operation_type,operation_id) DO UPDATE SET status='RESERVED',units=excluded.units,reserved_at=now(),expires_at=excluded.expires_at`,
+      [args.operationType, args.operationId, args.allocation, args.units]
+    );
+    await client.query('COMMIT');
+    return true;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function finishQuotaReservation(operationType: string, operationId: string, consumed: boolean): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE quota_reservations SET status=$3,consumed_at=CASE WHEN $3='CONSUMED' THEN now() ELSE NULL END
+     WHERE operation_type=$1 AND operation_id=$2 AND status='RESERVED'`,
+    [operationType, operationId, consumed ? 'CONSUMED' : 'RELEASED']
+  );
+}

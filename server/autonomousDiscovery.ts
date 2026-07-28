@@ -1,119 +1,22 @@
-import { ChannelRecord, QueryExecutionLog, QueryRecord } from '../src/types';
 import {
+  acquireSchedulerLock,
+  getAppSetting,
+  getAutonomousSchedulingSnapshot,
   getCountryVocabularies,
   getExcludedCountries,
-  getChannelById,
-  getAllChannels,
-  getRecentQueryExecutionLogs,
-  addQueryExecutionLog,
-  upsertChannel,
-  getAppSetting,
-  setAppSetting,
   getSchedulerState,
-  acquireSchedulerLock,
   releaseSchedulerLock,
-  updateSchedulerState,
-  recoverStaleJobs
+  scheduleAutonomousQueryRuns,
+  setAppSetting,
+  updateSchedulerState
 } from './db';
-import { searchYouTubeChannels } from './youtube';
-import { processDiscoveredChannel, ProcessDiscoveredChannelOutcome } from './queueManager';
 import { assertCountryAllowed } from './countryExclusion';
-import {
-  selectNextQueryForCountry,
-  calculateCreatorQualityScore,
-  extractVocabularyFromCreator,
-  evaluateQueryPerformance
-} from './queryIntelligence';
+import { selectNextQueryForCountry } from './queryIntelligence';
+import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
-interface DiscoveryCycleStatus {
-  isRunning: boolean;
-  isPaused: boolean;
-  scope: DiscoveryScopeMode;
-  selectedCountries: string[];
-  lastRunTime?: string;
-  nextScheduledTime?: string;
-  lastReport?: {
-    country: string;
-    query: string;
-    strategy: string;
-    discoveredCount: number;
-    uniqueCount: number;
-    qualityCreatorsCount: number;
-    performanceScore: number;
-    newCollection: string;
-    summary: string;
-  };
-}
-
-let schedulerHandle: NodeJS.Timeout | null = null;
-let currentCountryIndex = 0;
-let isCycleRunning = false;
-let lastRunTime: string | undefined = undefined;
-let nextScheduledTime: string | undefined = undefined;
-let lastReport: DiscoveryCycleStatus['lastReport'] = undefined;
-
-/**
- * Checks if Query Intelligence is currently paused.
- */
-export async function isQueryIntelligencePaused(): Promise<boolean> {
-  const val = await getAppSetting('query_intelligence_paused', 'false');
-  return val === 'true';
-}
-
-/**
- * Pauses Query Intelligence safely.
- * Finishes processing the current creator, saves queue & progress, and halts further cycles.
- */
-export async function pauseQueryIntelligence(): Promise<{ message: string; isPaused: boolean }> {
-  await setAppSetting('query_intelligence_paused', 'true');
-  console.log('[Query Intelligence] Engine PAUSED by user. Saved discovery state.');
-  return { message: 'Query Intelligence safely paused. Current state and queue preserved.', isPaused: true };
-}
-
-/**
- * Resumes Query Intelligence from exact saved state.
- */
-export async function resumeQueryIntelligence(): Promise<{ message: string; isPaused: boolean }> {
-  await setAppSetting('query_intelligence_paused', 'false');
-  console.log('[Query Intelligence] Engine RESUMED by user.');
-  return { message: 'Query Intelligence resumed. Continuing from saved discovery state.', isPaused: false };
-}
-
-/**
- * Gets persistent Discovery Scope configuration from database.
- */
-export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
-  const scopeStr = await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL');
-  const scope: DiscoveryScopeMode = scopeStr === 'SELECTED_COUNTRIES' ? 'SELECTED_COUNTRIES' : 'GLOBAL';
-  const countriesJson = await getAppSetting('query_intelligence_selected_countries', '[]');
-  let selectedCountries: string[] = [];
-  try {
-    selectedCountries = JSON.parse(countriesJson);
-    if (!Array.isArray(selectedCountries)) selectedCountries = [];
-  } catch (e) {
-    selectedCountries = [];
-  }
-  return { scope, selectedCountries };
-}
-
-/**
- * Updates persistent Discovery Scope configuration in database.
- */
-export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCountries: string[]): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
-  const cleanCountries = Array.from(new Set(selectedCountries.map(c => c.trim()).filter(Boolean)));
-  await setAppSetting('query_intelligence_discovery_scope', scope);
-  await setAppSetting('query_intelligence_selected_countries', JSON.stringify(cleanCountries));
-  console.log(`[Query Intelligence] Discovery Scope updated: ${scope} (${cleanCountries.join(', ') || 'None'})`);
-  return { scope, selectedCountries: cleanCountries };
-}
-
-/**
- * Runs a single Query Intelligence discovery cycle for a given country or automatically selected next country.
- * Respects Pause state and Discovery Scope configuration.
- */
-export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promise<{
+interface DiscoveryProducerReport {
   country: string;
   query: string;
   strategy: string;
@@ -123,336 +26,201 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
   performanceScore: number;
   newCollection: string;
   summary: string;
-  logs: string[];
-  isPaused?: boolean;
-}> {
-  if (targetCountry) {
-    await assertCountryAllowed(targetCountry, 'autonomous_cycle');
-  }
-  if (isCycleRunning) {
-    throw new Error('An autonomous discovery cycle is already in progress.');
-  }
+  queuedCount?: number;
+  queueDepth?: number;
+  remainingAutonomousQuota?: number;
+}
 
-  const schedulerWorkerId = `autonomous_${process.pid}`;
-  const lockAcquired = await acquireSchedulerLock('autonomous_discovery', schedulerWorkerId);
-  if (!lockAcquired) {
-    throw new Error('Autonomous discovery scheduler lock is already held by another worker.');
-  }
+interface DiscoveryCycleStatus {
+  isRunning: boolean;
+  isPaused: boolean;
+  scope: DiscoveryScopeMode;
+  selectedCountries: string[];
+  lastRunTime?: string;
+  nextScheduledTime?: string;
+  lastReport?: DiscoveryProducerReport;
+}
 
-  isCycleRunning = true;
-  try {
-    // Explicitly release before a paused return so scheduler_state cannot stay
-    // is_running=true until stale-lock recovery.
-    const paused = await isQueryIntelligencePaused();
-    if (paused && !targetCountry) {
-      console.log('[Query Intelligence] Engine is currently PAUSED. Skipping discovery cycle.');
-      isCycleRunning = false;
-      await releaseSchedulerLock('autonomous_discovery', lastReport, nextScheduledTime);
-      return {
-        country: 'N/A',
-        query: 'N/A',
-        strategy: 'PAUSED',
-        discoveredCount: 0,
-        uniqueCount: 0,
-        qualityCreatorsCount: 0,
-        performanceScore: 0,
-        newCollection: 'NONE',
-        summary: 'Query Intelligence is currently PAUSED. Resume engine to continue discovery.',
-        logs: ['Engine is paused. State preserved.'],
-        isPaused: true
-      };
-    }
-  } catch (err) {
-    isCycleRunning = false;
-    await releaseSchedulerLock('autonomous_discovery', lastReport, nextScheduledTime);
-    throw err;
-  }
-  const cycleLogs: string[] = [];
-  const log = (msg: string) => {
-    console.log(`[Autonomous Intelligence] ${msg}`);
-    cycleLogs.push(`${new Date().toISOString().split('T')[1].slice(0, 8)} - ${msg}`);
+interface DiscoveryConfig {
+  intervalMinutes: number;
+  batchSize: number;
+  targetQueueDepth: number;
+  dailyQuotaBudget: number;
+  autonomousQuotaPercent: number;
+}
+
+let schedulerHandle: NodeJS.Timeout | null = null;
+let currentCountryIndex = 0;
+let isCycleRunning = false;
+let lastRunTime: string | undefined;
+let nextScheduledTime: string | undefined;
+let lastReport: DiscoveryProducerReport | undefined;
+
+async function numericSetting(key: string, envKey: string, fallback: number, min: number, max: number): Promise<number> {
+  const value = Number(await getAppSetting(key, process.env[envKey] || String(fallback)));
+  return Math.min(max, Math.max(min, Number.isFinite(value) ? value : fallback));
+}
+
+async function getDiscoveryConfig(): Promise<DiscoveryConfig> {
+  return {
+    intervalMinutes: await numericSetting('discovery_interval_minutes', 'DISCOVERY_INTERVAL_MINUTES', 5, 1, 60),
+    batchSize: await numericSetting('discovery_batch_size', 'DISCOVERY_BATCH_SIZE', 5, 1, 50),
+    targetQueueDepth: await numericSetting('discovery_target_queue_depth', 'DISCOVERY_TARGET_QUEUE_DEPTH', 15, 1, 500),
+    dailyQuotaBudget: await numericSetting('daily_youtube_quota_budget', 'DAILY_YOUTUBE_QUOTA_BUDGET', 9000, 100, 1_000_000),
+    autonomousQuotaPercent: await numericSetting('discovery_autonomous_quota_percent', 'DISCOVERY_AUTONOMOUS_QUOTA_PERCENT', 70, 1, 100)
   };
+}
 
-  const executedAt = new Date().toISOString();
-  let countryName = targetCountry || 'Unknown';
-  let selectedQueryStr = 'None';
-  let queryObj: QueryRecord | null = null;
-  let selectionStrat = 'MANUAL';
+export async function isQueryIntelligencePaused(): Promise<boolean> {
+  return await getAppSetting('query_intelligence_paused', 'false') === 'true';
+}
 
+export async function pauseQueryIntelligence(): Promise<{ message: string; isPaused: boolean }> {
+  await setAppSetting('query_intelligence_paused', 'true');
+  return { message: 'Query Intelligence safely paused. Current state and queue preserved.', isPaused: true };
+}
+
+export async function resumeQueryIntelligence(): Promise<{ message: string; isPaused: boolean }> {
+  await setAppSetting('query_intelligence_paused', 'false');
+  return { message: 'Query Intelligence resumed. Continuing from saved discovery state.', isPaused: false };
+}
+
+export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
+  const scopeValue = await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL');
+  const scope: DiscoveryScopeMode = scopeValue === 'SELECTED_COUNTRIES' ? 'SELECTED_COUNTRIES' : 'GLOBAL';
   try {
-    log('=== AUTONOMOUS DISCOVERY CYCLE TRIGGERED ===');
-
-    // 1. Target Country Selection based on Discovery Scope
-    const vocabs = await getCountryVocabularies();
-    const excluded = await getExcludedCountries();
-    const excludedNames = excluded.map(e => e.country_name.toLowerCase());
-
-    const scopeConfig = await getDiscoveryScope();
-    log(`Discovery Scope Config: Mode [${scopeConfig.scope}] | Selected Countries: [${scopeConfig.selectedCountries.join(', ') || 'All'}]`);
-
-    let eligibleVocabs = vocabs.filter(v => !excludedNames.includes(v.country.toLowerCase()));
-
-    // Filter by Selected Countries if scope is set to SELECTED_COUNTRIES
-    if (scopeConfig.scope === 'SELECTED_COUNTRIES' && scopeConfig.selectedCountries.length > 0) {
-      const selectedLower = scopeConfig.selectedCountries.map(c => c.toLowerCase());
-      eligibleVocabs = eligibleVocabs.filter(v => selectedLower.includes(v.country.toLowerCase()));
-      log(`Scoped Country Filter applied. Eligible countries in scope: ${eligibleVocabs.map(v => v.country).join(', ')}`);
-    }
-
-    if (eligibleVocabs.length === 0) {
-      log('REJECTED: No eligible target countries available matching current Discovery Scope & Exclusion rules.');
-      await addQueryExecutionLog({
-        query: 'N/A',
-        country: targetCountry || 'N/A',
-        executed_at: executedAt,
-        channels_discovered: 0,
-        unique_new_channels: 0,
-        quality_creators_discovered: 0,
-        communities_discovered: 0,
-        cycle_quality_score: 0,
-        logs: cycleLogs
-      });
-      return {
-        country: targetCountry || 'N/A',
-        query: 'N/A',
-        strategy: 'ABORTED',
-        discoveredCount: 0,
-        uniqueCount: 0,
-        qualityCreatorsCount: 0,
-        performanceScore: 0,
-        newCollection: 'NONE',
-        summary: 'No eligible target countries available matching current Discovery Scope.',
-        logs: cycleLogs
-      };
-    }
-
-    // Restore saved country index from SQLite
-    const savedIdxStr = await getAppSetting('qi_current_country_index', '0');
-    currentCountryIndex = parseInt(savedIdxStr, 10) || 0;
-
-    if (!targetCountry) {
-      countryName = eligibleVocabs[currentCountryIndex % eligibleVocabs.length].country;
-      currentCountryIndex = (currentCountryIndex + 1) % eligibleVocabs.length;
-      await setAppSetting('qi_current_country_index', currentCountryIndex.toString());
-    } else {
-      countryName = targetCountry;
-    }
-
-    log(`Step 1 (Target Selection): Selected country "${countryName}" (Active candidates in scope: ${eligibleVocabs.length}).`);
-
-    // 2. Multi-Armed Bandit (UCB1) Query Selection
-    const { queryRecord, selectionStrategy, reason } = await selectNextQueryForCountry(countryName);
-    queryObj = queryRecord;
-    selectedQueryStr = queryRecord.query;
-    selectionStrat = selectionStrategy;
-
-    log(`Step 2 (UCB1 Query Intelligence): Strategy [${selectionStrategy}] selected query "${selectedQueryStr}" (Query ID #${queryRecord.id}). Reason: ${reason}`);
-    log(`Step 2 Metadata: Knowledge Tiers [${queryRecord.knowledge_tiers?.join(', ') || 'legacy'}] | Generated as [${queryRecord.generation_mode || 'LEGACY'}] | Objective: ${queryRecord.discovery_objective || 'Discover relevant trading creators.'}`);
-
-    // This locked cycle owns synchronous execution. Do not also enqueue the
-    // same search: that caused a second worker to repeat the API call later.
-    log('Step 3 (Execution Ownership): Scheduler lock owns this synchronous search; no duplicate queue job created.');
-
-    // 4. YouTube API Search Execution
-    log(`Step 4 (YouTube Crawler): Executing search for query "${selectedQueryStr}" in region "${countryName}"...`);
-
-    const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
-    const rawChannels = await searchYouTubeChannels(selectedQueryStr, countryName, vocab);
-
-    log(`Step 4 Results: YouTube search returned ${rawChannels.length} raw channel candidate(s).`);
-
-    if (rawChannels.length === 0) {
-      log(`REJECTED: YouTube search returned 0 results for query "${selectedQueryStr}".`);
-      const emptyPerf = await evaluateQueryPerformance(queryRecord, [], 0);
-      
-      await addQueryExecutionLog({
-        query_id: queryRecord.id,
-        query: selectedQueryStr,
-        country: countryName,
-        executed_at: executedAt,
-        channels_discovered: 0,
-        unique_new_channels: 0,
-        quality_creators_discovered: 0,
-        communities_discovered: 0,
-        cycle_quality_score: 0,
-        logs: cycleLogs
-      });
-
-      lastRunTime = executedAt;
-      lastReport = {
-        country: countryName,
-        query: selectedQueryStr,
-        strategy: selectionStrategy,
-        discoveredCount: 0,
-        uniqueCount: 0,
-        qualityCreatorsCount: 0,
-        performanceScore: emptyPerf.performanceScore,
-        newCollection: emptyPerf.newCollection,
-        summary: emptyPerf.summary
-      };
-      await updateSchedulerState('autonomous_discovery', { last_run_at: executedAt, last_report: lastReport });
-
-      return {
-        country: countryName,
-        query: selectedQueryStr,
-        strategy: selectionStrategy,
-        discoveredCount: 0,
-        uniqueCount: 0,
-        qualityCreatorsCount: 0,
-        performanceScore: emptyPerf.performanceScore,
-        newCollection: emptyPerf.newCollection,
-        summary: emptyPerf.summary,
-        logs: cycleLogs
-      };
-    }
-
-    // 5. Channel Processing Pipeline (Country Validation -> Trading Classifier -> Discord Inspection)
-    log(`Step 5 (Pipeline Processing): Routing ${rawChannels.length} channels through 2-Stage Gate pipeline & Discord Crawler...`);
-
-    let uniqueCount = 0;
-    let rejectedCountryCount = 0;
-    let rejectedTradingCount = 0;
-    let confirmedTradingCount = 0;
-    let validatedCommunitiesCount = 0;
-    const processedChannels: ChannelRecord[] = [];
-
-    for (const raw of rawChannels) {
-      // Safe Pause Check: finish current creator and stop safely if pause requested
-      if (await isQueryIntelligencePaused()) {
-        log(`PAUSE DETECTED: Pause was requested. Safely finished current creator "${raw.channelName}". Preserving remaining queue and discovery state.`);
-        break;
-      }
-
-      const outcome = await processDiscoveredChannel(raw, countryName, 'automated_query');
-
-      if (outcome.isNew) uniqueCount++;
-
-      if (outcome.countryStatus === 'REJECTED') {
-        rejectedCountryCount++;
-        log(`  - Channel "${raw.channelName}": REJECTED by Country Validation Hard Gate.`);
-        continue;
-      }
-
-      if (outcome.tradingStatus === 'NON_TRADING') {
-        rejectedTradingCount++;
-        log(`  - Channel "${raw.channelName}": REJECTED by Trading Classifier (Irrelevant niche / non-trading).`);
-        continue;
-      }
-
-      confirmedTradingCount++;
-
-      if (outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME') {
-        validatedCommunitiesCount++;
-        log(`  - Channel "${raw.channelName}": CONFIRMED TRADING & DISCORD DISCOVERED [${outcome.discordStatus}] (Invite: ${outcome.discordInvite})`);
-      } else {
-        log(`  - Channel "${raw.channelName}": CONFIRMED TRADING (Discord status: ${outcome.discordStatus})`);
-      }
-
-      const channel = outcome.channelRecord || await getChannelById(raw.channelId);
-      if (channel) {
-        // Calculate Quality Score
-        const qualityResult = calculateCreatorQualityScore(channel, raw.videoTitles, raw.description);
-        channel.quality_score = qualityResult.score;
-        channel.quality_breakdown = qualityResult.breakdown;
-        await upsertChannel(channel);
-
-        processedChannels.push(channel);
-
-        // Vocabulary Extraction Loop
-        if (qualityResult.score >= 55) {
-          log(`  - Quality Creator Identified: "${channel.channel_name}" (Score: ${qualityResult.score}/100). Extracting native terms...`);
-          await extractVocabularyFromCreator(channel, raw.videoTitles, raw.description);
-        }
-      }
-    }
-
-    log(`Step 5 Audit Summary:`);
-    log(`  Total Processed: ${processedChannels.length} / ${rawChannels.length}`);
-    log(`  Rejected by Country Validation: ${rejectedCountryCount}`);
-    log(`  Rejected by Trading Classifier: ${rejectedTradingCount}`);
-    log(`  Confirmed Trading Creators: ${confirmedTradingCount}`);
-    log(`  Validated Discord Communities Discovered: ${validatedCommunitiesCount}`);
-
-    // 6. Query Intelligence Performance & Collection Promotion
-    const perfEval = await evaluateQueryPerformance(queryRecord, processedChannels, uniqueCount);
-    log(`Step 6 (MAB Intelligence Update): ${perfEval.summary}`);
-
-    const qualityCreatorsCount = processedChannels.filter(c => (c.quality_score || 0) >= 60).length;
-
-    lastRunTime = executedAt;
-    lastReport = {
-      country: countryName,
-      query: selectedQueryStr,
-      strategy: selectionStrategy,
-      discoveredCount: processedChannels.length,
-      uniqueCount,
-      qualityCreatorsCount,
-      performanceScore: perfEval.performanceScore,
-      newCollection: perfEval.newCollection,
-      summary: perfEval.summary
-    };
-    await updateSchedulerState('autonomous_discovery', { last_run_at: executedAt, last_report: lastReport });
-
-    // Save Execution Audit Trail to SQLite
-    await addQueryExecutionLog({
-      query_id: queryRecord.id,
-      query: selectedQueryStr,
-      country: countryName,
-      executed_at: executedAt,
-      channels_discovered: rawChannels.length,
-      unique_new_channels: uniqueCount,
-      quality_creators_discovered: qualityCreatorsCount,
-      communities_discovered: validatedCommunitiesCount,
-      cycle_quality_score: perfEval.performanceScore,
-      logs: cycleLogs
-    });
-
-    log(`=== CYCLE COMPLETED SUCCESSFULLY ===`);
-
-    return {
-      country: countryName,
-      query: selectedQueryStr,
-      strategy: selectionStrategy,
-      discoveredCount: processedChannels.length,
-      uniqueCount,
-      qualityCreatorsCount,
-      performanceScore: perfEval.performanceScore,
-      newCollection: perfEval.newCollection,
-      summary: perfEval.summary,
-      logs: cycleLogs
-    };
-
-  } catch (err: any) {
-    log(`FATAL EXCEPTION in discovery cycle: ${err.message}`);
-    
-    await addQueryExecutionLog({
-      query_id: queryObj?.id,
-      query: selectedQueryStr,
-      country: countryName,
-      executed_at: executedAt,
-      channels_discovered: 0,
-      unique_new_channels: 0,
-      quality_creators_discovered: 0,
-      communities_discovered: 0,
-      cycle_quality_score: 0,
-      logs: cycleLogs
-    });
-
-    throw err;
-  } finally {
-    isCycleRunning = false;
-    const nextRunAt = nextScheduledTime;
-    await releaseSchedulerLock('autonomous_discovery', lastReport, nextRunAt);
+    const selectedCountries = JSON.parse(await getAppSetting('query_intelligence_selected_countries', '[]'));
+    return { scope, selectedCountries: Array.isArray(selectedCountries) ? selectedCountries : [] };
+  } catch {
+    return { scope, selectedCountries: [] };
   }
 }
 
+export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCountries: string[]): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
+  const cleanCountries = Array.from(new Set(selectedCountries.map(country => country.trim()).filter(Boolean)));
+  await setAppSetting('query_intelligence_discovery_scope', scope);
+  await setAppSetting('query_intelligence_selected_countries', JSON.stringify(cleanCountries));
+  return { scope, selectedCountries: cleanCountries };
+}
+
 /**
- * Gets current autonomous discovery engine status.
+ * Produces a quota-paced batch of durable work. It deliberately performs no
+ * YouTube or channel processing; workers are the only autonomous executors.
  */
+export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
+  if (targetCountry) await assertCountryAllowed(targetCountry, 'autonomous_cycle');
+  if (isCycleRunning) throw new Error('An autonomous discovery producer cycle is already in progress.');
+
+  const workerId = `autonomous_producer_${process.pid}`;
+  if (!await acquireSchedulerLock('autonomous_discovery', workerId)) {
+    throw new Error('Autonomous discovery scheduler lock is already held by another producer.');
+  }
+
+  isCycleRunning = true;
+  const logs: string[] = [];
+  const log = (message: string) => {
+    logs.push(message);
+    console.log(`[Autonomous Producer] ${message}`);
+  };
+
+  try {
+    if (await isQueryIntelligencePaused() && !targetCountry) {
+      return {
+        country: 'N/A', query: 'N/A', strategy: 'PAUSED', discoveredCount: 0,
+        uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0,
+        newCollection: 'NONE', summary: 'Query Intelligence is paused.', logs, isPaused: true
+      };
+    }
+
+    const config = await getDiscoveryConfig();
+    const snapshot = await getAutonomousSchedulingSnapshot();
+    const now = new Date();
+    const minutesSinceUtcMidnight = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const capacity = calculateDiscoveryCapacity({
+      batchSize: config.batchSize,
+      targetQueueDepth: config.targetQueueDepth,
+      currentQueueDepth: snapshot.queueDepth,
+      dailyBudget: config.dailyQuotaBudget,
+      allocationPercent: config.autonomousQuotaPercent,
+      unitsUsed: snapshot.autonomousUnitsUsed,
+      unitsReserved: snapshot.autonomousUnitsReserved,
+      minutesSinceUtcMidnight
+    });
+
+    if (capacity === 0) {
+      lastReport = {
+        country: 'MULTI', query: 'NONE', strategy: 'QUOTA_OR_QUEUE_GUARD', discoveredCount: 0,
+        uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'NONE',
+        queuedCount: 0, queueDepth: snapshot.queueDepth,
+        remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved),
+        summary: 'No work scheduled: queue target or paced autonomous quota capacity is exhausted.'
+      };
+      return { ...lastReport, logs };
+    }
+
+    const [vocabs, exclusions, scope] = await Promise.all([
+      getCountryVocabularies(), getExcludedCountries(), getDiscoveryScope()
+    ]);
+    const excluded = new Set(exclusions.map(item => item.country_name.toLowerCase()));
+    const selectedScope = new Set(scope.selectedCountries.map(country => country.toLowerCase()));
+    let countries = vocabs.map(item => item.country).filter(country => !excluded.has(country.toLowerCase()));
+    if (scope.scope === 'SELECTED_COUNTRIES' && selectedScope.size > 0) {
+      countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
+    }
+    if (targetCountry) countries = [targetCountry];
+    if (countries.length === 0) throw new Error('No eligible countries are available for autonomous discovery.');
+
+    currentCountryIndex = Number(await getAppSetting('qi_current_country_index', '0')) || 0;
+    const cooldownMinutes = await numericSetting('query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', 360, 1, 10080);
+    const scheduled = [];
+    const usedIntents = new Set<string>();
+    const usedPrimaryTerms = new Set<string>();
+    let attempts = 0;
+
+    while (scheduled.length < capacity && attempts < capacity * Math.max(3, countries.length)) {
+      const country = countries[(currentCountryIndex + attempts) % countries.length];
+      attempts++;
+      const selected = await selectNextQueryForCountry(country);
+      const intent = selected.queryRecord.intent;
+      const primaryTerm = selected.queryRecord.primary_term || selected.queryRecord.query;
+      if ((usedIntents.has(intent) || usedPrimaryTerms.has(primaryTerm)) && attempts < countries.length * 2) continue;
+      const created = await scheduleAutonomousQueryRuns([{
+        query: selected.queryRecord,
+        strategy: selected.selectionStrategy,
+        reason: selected.reason
+      }], workerId, cooldownMinutes);
+      if (created.length) {
+        scheduled.push(...created);
+        usedIntents.add(intent);
+        usedPrimaryTerms.add(primaryTerm);
+      }
+    }
+
+    currentCountryIndex = (currentCountryIndex + Math.max(1, scheduled.length)) % countries.length;
+    await setAppSetting('qi_current_country_index', String(currentCountryIndex));
+    lastRunTime = now.toISOString();
+    lastReport = {
+      country: scheduled.length === 1 ? scheduled[0].query.country : 'MULTI',
+      query: scheduled.map(item => item.query.query).join(' | ') || 'NONE',
+      strategy: 'DURABLE_BATCH_PRODUCER', discoveredCount: 0, uniqueCount: 0,
+      qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'PENDING',
+      queuedCount: scheduled.length, queueDepth: snapshot.queueDepth + scheduled.length,
+      remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved - scheduled.length * 100),
+      summary: `Scheduled ${scheduled.length} diverse durable search job(s); workers own all YouTube execution.`
+    };
+    log(lastReport.summary);
+    await updateSchedulerState('autonomous_discovery', { last_run_at: lastRunTime, last_report: lastReport });
+    return { ...lastReport, logs };
+  } finally {
+    isCycleRunning = false;
+    await releaseSchedulerLock('autonomous_discovery', lastReport, nextScheduledTime);
+  }
+}
+
 export async function getAutonomousDiscoveryStatus(): Promise<DiscoveryCycleStatus> {
-  const isPaused = await isQueryIntelligencePaused();
-  const scopeInfo = await getDiscoveryScope();
-  const persisted = await getSchedulerState('autonomous_discovery');
+  const [isPaused, scopeInfo, persisted] = await Promise.all([
+    isQueryIntelligencePaused(), getDiscoveryScope(), getSchedulerState('autonomous_discovery')
+  ]);
   return {
     isRunning: isCycleRunning || !!persisted?.is_running,
     isPaused,
@@ -464,46 +232,27 @@ export async function getAutonomousDiscoveryStatus(): Promise<DiscoveryCycleStat
   };
 }
 
-/**
- * Starts the 30-minute autonomous discovery background scheduler.
- */
-export function startAutonomousDiscoveryScheduler(intervalMs = 30 * 60 * 1000): void {
+export function startAutonomousDiscoveryScheduler(): void {
   if (schedulerHandle) return;
-  recoverStaleJobs().catch(err => console.error('[Autonomous Intelligence Scheduler] Stale job recovery failed:', err));
-
-  const scheduleNext = () => {
-    nextScheduledTime = new Date(Date.now() + intervalMs).toISOString();
-    updateSchedulerState('autonomous_discovery', { next_run_at: nextScheduledTime }).catch(() => {});
-  };
-
-  scheduleNext();
-
-  schedulerHandle = setInterval(async () => {
-    try {
-      if (await isQueryIntelligencePaused()) {
-        console.log('[Autonomous Intelligence Scheduler] Query Intelligence is PAUSED. Skipping scheduled 30-minute cycle.');
-        return;
+  const schedule = async (delayMs: number) => {
+    nextScheduledTime = new Date(Date.now() + delayMs).toISOString();
+    await updateSchedulerState('autonomous_discovery', { next_run_at: nextScheduledTime }).catch(() => undefined);
+    schedulerHandle = setTimeout(async () => {
+      try {
+        await runAutonomousDiscoveryCycle();
+      } catch (error) {
+        console.error('[Autonomous Producer] Cycle failed:', error);
+      } finally {
+        const config = await getDiscoveryConfig();
+        void schedule(config.intervalMinutes * 60_000);
       }
-      console.log('[Autonomous Intelligence Scheduler] Triggering 30-minute discovery cycle...');
-      await runAutonomousDiscoveryCycle();
-    } catch (err) {
-      console.error('[Autonomous Intelligence Scheduler] Error during cycle:', err);
-    } finally {
-      scheduleNext();
-    }
-  }, intervalMs);
-
-  console.log(`[Autonomous Intelligence Scheduler] Started background cycle every ${intervalMs / 1000 / 60} minutes.`);
+    }, delayMs);
+  };
+  void schedule(0);
 }
 
-/**
- * Stops the autonomous scheduler.
- */
 export function stopAutonomousDiscoveryScheduler(): void {
-  if (schedulerHandle) {
-    clearInterval(schedulerHandle);
-    schedulerHandle = null;
-    nextScheduledTime = undefined;
-    console.log('[Autonomous Intelligence Scheduler] Stopped background scheduler.');
-  }
+  if (schedulerHandle) clearTimeout(schedulerHandle);
+  schedulerHandle = null;
+  nextScheduledTime = undefined;
 }

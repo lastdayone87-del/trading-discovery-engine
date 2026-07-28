@@ -553,7 +553,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Trading Community Discovery Engine running on http://0.0.0.0:${PORT}`);
-    startAutonomousDiscoveryScheduler(30 * 60 * 1000); // 30 minute autonomous cycle
+    startAutonomousDiscoveryScheduler();
   });
 }
 

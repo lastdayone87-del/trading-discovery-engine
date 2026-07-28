@@ -265,8 +265,14 @@ export async function selectNextQueryForCountry(country: string): Promise<{
   selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION';
   reason: string;
 }> {
-  const queries = (await getQueriesByCountry(country)).filter(query => query.collection !== 'REJECTED');
   const now = new Date();
+  const queries = (await getQueriesByCountry(country)).filter(query => {
+    const reservedUntil = (query as QueryRecord & { reserved_until?: string | null }).reserved_until;
+    const nextEligibleAt = (query as QueryRecord & { next_eligible_at?: string | null }).next_eligible_at;
+    return query.collection !== 'REJECTED'
+      && (!reservedUntil || new Date(reservedUntil) <= now)
+      && (!nextEligibleAt || new Date(nextEligibleAt) <= now);
+  });
   const cooldownMinutes = Math.max(1, Number(await getAppSetting('query_intelligence_query_cooldown_minutes', process.env.QUERY_INTELLIGENCE_COOLDOWN_MINUTES || '360')) || 360);
   const maxPrimaryUses = Math.max(1, Number(await getAppSetting('query_intelligence_primary_term_max_uses', process.env.QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES || '2')) || 2);
   const explorationRatio = Math.min(0.9, Math.max(0.1, Number(await getAppSetting('query_intelligence_exploration_ratio', process.env.QUERY_INTELLIGENCE_EXPLORATION_RATIO || '0.4')) || 0.4));
