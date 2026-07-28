@@ -1,6 +1,11 @@
 import {
   getDb,
   saveDb,
+  enqueueJob,
+  claimNextJob,
+  completeJob,
+  failJob,
+  recoverStaleJobs,
   getAllChannels,
   getChannelById,
   upsertChannel,
@@ -13,36 +18,40 @@ import {
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection, InspectionResult } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
-import { searchYouTubeChannels, generateCountryQueries, DiscoveredChannelRaw } from './youtube';
+import { searchYouTubeChannels, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw } from './youtube';
 import { classifyTradingRelevance } from './tradingRelevanceClassifier';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
+import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 
-// In-Memory job lists backed by database queries
-let searchQueue: SearchJob[] = [];
+const WORKER_ID = `worker_${process.pid}`;
 
 /**
  * Pushes a new search query job to the Search Jobs Queue.
  */
 export async function addSearchJob(query: string, country: string, source: DiscoverySource): Promise<SearchJob> {
-  const job: SearchJob = {
-    id: `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+  await assertCountryAllowed(country, `queue:${source}`);
+  const job = await enqueueJob(
+    'SEARCH_YOUTUBE',
+    { query, country, source },
+    { idempotencyKey: `search:${source}:${country.toLowerCase()}:${query.toLowerCase()}` }
+  );
+  return {
+    id: job.id,
     query,
     country,
     source,
-    status: 'PENDING',
-    attempts: 0,
-    createdAt: new Date().toISOString()
+    status: job.status === 'PROCESSING' ? 'PROCESSING' : job.status === 'COMPLETED' ? 'COMPLETED' : job.status === 'FAILED' ? 'FAILED' : 'PENDING',
+    attempts: job.attempts,
+    createdAt: job.created_at
   };
-
-  searchQueue.push(job);
-  return job;
 }
 
 /**
  * Enqueues a manual search query and expands it using the country vocabulary engine.
  */
 export async function addManualCountrySearch(userQuery: string, countryName: string): Promise<{ baseJob: SearchJob; expandedQueries: string[] }> {
+  await assertCountryAllowed(countryName, 'manual_search_queue_expansion');
   const baseJob = await addSearchJob(userQuery, countryName, 'manual_search');
 
   const expandedQueries: string[] = [userQuery];
@@ -72,6 +81,7 @@ export async function addManualCountrySearch(userQuery: string, countryName: str
  * Generates and enqueues country native queries for an automated discovery run.
  */
 export async function addAutomatedCountrySearch(countryName: string): Promise<string[]> {
+  await assertCountryAllowed(countryName, 'automated_search_generation');
   const vocabs = await getCountryVocabularies();
   const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
   
@@ -88,38 +98,73 @@ export async function addAutomatedCountrySearch(countryName: string): Promise<st
 }
 
 /**
- * Worker loop that processes 1 Search Job from queue.
+ * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(): Promise<boolean> {
+  await recoverStaleJobs();
   const qStatus = await getQueueStatus();
-  if (qStatus.searchJobs.isPaused) return false;
+  const claimableTypes: string[] = [];
+  if (!qStatus.searchJobs.isPaused) claimableTypes.push('SEARCH_YOUTUBE');
+  if (!qStatus.channelProcessing.isPaused) claimableTypes.push('ENRICH_CHANNEL');
+  if (claimableTypes.length === 0) return false;
 
-  const pendingJob = searchQueue.find(j => j.status === 'PENDING');
-  if (!pendingJob) return false;
-
-  pendingJob.status = 'PROCESSING';
+  const job = await claimNextJob(WORKER_ID, claimableTypes);
+  if (!job) return false;
 
   try {
-    const vocabs = await getCountryVocabularies();
-    const vocab = vocabs.find(v => v.country.toLowerCase() === pendingJob.country.toLowerCase());
+    if (job.type === 'ENRICH_CHANNEL') {
+      const { channelId, targetCountry, source, candidate } = job.payload as {
+        channelId: string;
+        targetCountry: string;
+        source: DiscoverySource;
+        candidate: DiscoveredChannelRaw;
+      };
+      await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
+      const channel = await getChannelById(channelId);
+      if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+        await completeJob(job.id);
+        return true;
+      }
 
-    const extracted = await searchYouTubeChannels(pendingJob.query, pendingJob.country, vocab);
-
-    for (const raw of extracted) {
-      await processDiscoveredChannel(raw, pendingJob.country, pendingJob.source);
+      channel.scan_status = 'ENRICHING';
+      channel.scan_attempts = job.attempts;
+      await upsertChannel(channel);
+      const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate);
+      await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
+      await completeJob(job.id);
+      return true;
     }
 
-    pendingJob.status = 'COMPLETED';
-    // Remove completed job
-    searchQueue = searchQueue.filter(j => j.id !== pendingJob.id);
+    const { query, country, source } = job.payload as { query: string; country: string; source: DiscoverySource };
+    // Defense in depth for jobs queued before a country was excluded.
+    await assertCountryAllowed(country, `worker:${job.id}`);
+    const vocabs = await getCountryVocabularies();
+    const vocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
+    const extracted = await searchYouTubeChannels(query, country, vocab);
+    for (const raw of extracted) {
+      await processDiscoveredChannel(raw, country, source);
+    }
+    await completeJob(job.id);
     return true;
   } catch (err: any) {
-    pendingJob.attempts++;
-    if (pendingJob.attempts >= 3) {
-      pendingJob.status = 'FAILED';
-    } else {
-      pendingJob.status = 'PENDING';
+    if (err instanceof ExcludedCountryError) {
+      // A policy change can make an already-persisted job ineligible. Consume it
+      // without retrying so it can never spend external API quota.
+      await completeJob(job.id);
+      return true;
     }
+    if (job.type === 'ENRICH_CHANNEL' && job.attempts >= job.max_attempts) {
+      const channelId = String(job.payload?.channelId || '');
+      const channel = channelId ? await getChannelById(channelId) : null;
+      if (channel && channel.trading_status === 'UNCERTAIN') {
+        channel.scan_status = 'NEEDS_REVIEW';
+        channel.trading_status = 'NEEDS_REVIEW';
+        channel.scan_attempts = job.attempts;
+        channel.last_checked = new Date().toISOString();
+        await upsertChannel(channel);
+      }
+    }
+    await failJob(job.id, err);
     return false;
   }
 }
@@ -129,7 +174,7 @@ export interface ProcessDiscoveredChannelOutcome {
   channelName: string;
   isNew: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
-  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
   discordStatus: DiscordStatus;
   discordInvite: string | null;
   channelRecord?: ChannelRecord;
@@ -335,6 +380,12 @@ export async function triggerManualRecheck(channelId: string, enableDebug?: bool
     return { success: false, message: 'Channel not found in database.' };
   }
 
+  const exclusion = await getCountryExclusion(channel.country);
+  if (exclusion) {
+    console.warn(JSON.stringify({ event: 'excluded_country_blocked', country: exclusion.country, reason: exclusion.reason, context: 'manual_recheck', channelId, timestamp: new Date().toISOString() }));
+    return { success: false, message: `Manual re-scan blocked because ${exclusion.country} is excluded: ${exclusion.reason}`, channel };
+  }
+
   // Acquire Lock and Reset Attempt Counter
   channel.scan_status = 'LOCKED';
   channel.scan_attempts = 0;
@@ -407,9 +458,9 @@ export async function executeFullManualSearch(
   logs.push(`  Country: ${countryName}`);
 
   // Hard Exclusion Pre-Check
-  const excludedCountries = await getExcludedCountries();
-  const isExcluded = excludedCountries.some(e => e.country_name.toLowerCase() === countryName.toLowerCase());
-  if (isExcluded) {
+  const exclusion = await getCountryExclusion(countryName);
+  if (exclusion) {
+    console.warn(JSON.stringify({ event: 'excluded_country_blocked', country: exclusion.country, reason: exclusion.reason, context: 'manual_search', timestamp: new Date().toISOString() }));
     logs.push(`\n[HARD EXCLUSION GATE: REJECTED IMMEDIATELY]`);
     logs.push(`Target region '${countryName}' is explicitly configured in the Hard Exclusion List.`);
     logs.push(`Exiting pipeline immediately with SKIPPED_EXCLUDED before:`);

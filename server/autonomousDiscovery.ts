@@ -8,10 +8,16 @@ import {
   addQueryExecutionLog,
   upsertChannel,
   getAppSetting,
-  setAppSetting
+  setAppSetting,
+  getSchedulerState,
+  acquireSchedulerLock,
+  releaseSchedulerLock,
+  updateSchedulerState,
+  recoverStaleJobs
 } from './db';
 import { searchYouTubeChannels } from './youtube';
 import { processDiscoveredChannel, addSearchJob, ProcessDiscoveredChannelOutcome } from './queueManager';
+import { assertCountryAllowed } from './countryExclusion';
 import {
   selectNextQueryForCountry,
   calculateCreatorQualityScore,
@@ -120,8 +126,17 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
   logs: string[];
   isPaused?: boolean;
 }> {
+  if (targetCountry) {
+    await assertCountryAllowed(targetCountry, 'autonomous_cycle');
+  }
   if (isCycleRunning) {
     throw new Error('An autonomous discovery cycle is already in progress.');
+  }
+
+  const schedulerWorkerId = `autonomous_${process.pid}`;
+  const lockAcquired = await acquireSchedulerLock('autonomous_discovery', schedulerWorkerId);
+  if (!lockAcquired) {
+    throw new Error('Autonomous discovery scheduler lock is already held by another worker.');
   }
 
   // Check if paused
@@ -266,6 +281,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         newCollection: emptyPerf.newCollection,
         summary: emptyPerf.summary
       };
+      await updateSchedulerState('autonomous_discovery', { last_run_at: executedAt, last_report: lastReport });
 
       return {
         country: countryName,
@@ -366,6 +382,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       newCollection: perfEval.newCollection,
       summary: perfEval.summary
     };
+    await updateSchedulerState('autonomous_discovery', { last_run_at: executedAt, last_report: lastReport });
 
     // Save Execution Audit Trail to SQLite
     await addQueryExecutionLog({
@@ -415,6 +432,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     throw err;
   } finally {
     isCycleRunning = false;
+    const nextRunAt = nextScheduledTime;
+    await releaseSchedulerLock('autonomous_discovery', lastReport, nextRunAt);
   }
 }
 
@@ -424,14 +443,15 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
 export async function getAutonomousDiscoveryStatus(): Promise<DiscoveryCycleStatus> {
   const isPaused = await isQueryIntelligencePaused();
   const scopeInfo = await getDiscoveryScope();
+  const persisted = await getSchedulerState('autonomous_discovery');
   return {
-    isRunning: isCycleRunning,
+    isRunning: isCycleRunning || !!persisted?.is_running,
     isPaused,
     scope: scopeInfo.scope,
     selectedCountries: scopeInfo.selectedCountries,
-    lastRunTime,
-    nextScheduledTime,
-    lastReport
+    lastRunTime: lastRunTime || persisted?.last_run_at?.toISOString?.() || persisted?.last_run_at,
+    nextScheduledTime: nextScheduledTime || persisted?.next_run_at?.toISOString?.() || persisted?.next_run_at,
+    lastReport: lastReport || persisted?.last_report
   };
 }
 
@@ -440,9 +460,11 @@ export async function getAutonomousDiscoveryStatus(): Promise<DiscoveryCycleStat
  */
 export function startAutonomousDiscoveryScheduler(intervalMs = 30 * 60 * 1000): void {
   if (schedulerHandle) return;
+  recoverStaleJobs().catch(err => console.error('[Autonomous Intelligence Scheduler] Stale job recovery failed:', err));
 
   const scheduleNext = () => {
     nextScheduledTime = new Date(Date.now() + intervalMs).toISOString();
+    updateSchedulerState('autonomous_discovery', { next_run_at: nextScheduledTime }).catch(() => {});
   };
 
   scheduleNext();
@@ -476,4 +498,3 @@ export function stopAutonomousDiscoveryScheduler(): void {
     console.log('[Autonomous Intelligence Scheduler] Stopped background scheduler.');
   }
 }
-
