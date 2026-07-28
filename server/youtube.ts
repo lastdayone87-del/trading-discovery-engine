@@ -206,6 +206,64 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
 }
 
 /**
+ * Fetches richer official channel metadata and recent uploads for a borderline
+ * creator. Unlike discovery search, this is only called by a durable enrichment
+ * job and throws when all configured keys fail so queue retry/backoff applies.
+ */
+export async function fetchYouTubeChannelEnrichment(
+  channelId: string,
+  fallback: DiscoveredChannelRaw
+): Promise<DiscoveredChannelRaw> {
+  const keyPool = getYouTubeKeyPool();
+  if (keyPool.length === 0) {
+    throw new Error('YouTube enrichment requires at least one configured YouTube API key.');
+  }
+
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < keyPool.length; attempt++) {
+    const currentIndex = (activeKeyIndex + attempt) % keyPool.length;
+    const apiKey = keyPool[currentIndex];
+    try {
+      const channelUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,brandingSettings,statistics&id=${encodeURIComponent(channelId)}&key=${apiKey}`;
+      const recentUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${encodeURIComponent(channelId)}&order=date&type=video&maxResults=10&key=${apiKey}`;
+      const [channelResponse, recentResponse] = await Promise.all([fetch(channelUrl), fetch(recentUrl)]);
+      if (!channelResponse.ok || !recentResponse.ok) {
+        throw new Error(`YouTube enrichment failed (channel ${channelResponse.status}, uploads ${recentResponse.status}).`);
+      }
+
+      activeKeyIndex = currentIndex;
+      await incrementQuota(101);
+      const channelData = await channelResponse.json();
+      const recentData = await recentResponse.json();
+      const channel = channelData.items?.[0];
+      if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
+
+      const description = channel.snippet?.description || fallback.description;
+      const recentItems = recentData.items || [];
+      const extractedLinks = description.match(/https?:\/\/[^\s)\]}]+/g) || [];
+
+      return {
+        ...fallback,
+        channelId,
+        channelName: channel.snippet?.title || fallback.channelName,
+        youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
+        description,
+        videoTitles: recentItems.map((item: any) => item.snippet?.title).filter(Boolean),
+        videoDescriptions: recentItems.map((item: any) => item.snippet?.description).filter(Boolean),
+        locationTag: channel.snippet?.country || fallback.locationTag,
+        channelLinks: Array.from(new Set([...(fallback.channelLinks || []), ...extractedLinks])),
+        subscriberCount: channel.statistics?.subscriberCount || fallback.subscriberCount,
+        channelThumbnailUrl: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.default?.url || fallback.channelThumbnailUrl
+      };
+    } catch (error: any) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  throw lastError || new Error(`YouTube enrichment failed for '${channelId}'.`);
+}
+
+/**
  * Realistic Trader Discovery Simulator
  * Creates realistic country-native trading creator channel records based on the query & vocabulary
  * so operators can test the full pipeline out-of-the-box.

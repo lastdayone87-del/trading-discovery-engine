@@ -18,7 +18,7 @@ import {
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection, InspectionResult } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
-import { searchYouTubeChannels, generateCountryQueries, DiscoveredChannelRaw } from './youtube';
+import { searchYouTubeChannels, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw } from './youtube';
 import { classifyTradingRelevance } from './tradingRelevanceClassifier';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
@@ -98,17 +98,43 @@ export async function addAutomatedCountrySearch(countryName: string): Promise<st
 }
 
 /**
- * Worker loop that processes 1 Search Job from queue.
+ * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(): Promise<boolean> {
   await recoverStaleJobs();
   const qStatus = await getQueueStatus();
-  if (qStatus.searchJobs.isPaused) return false;
+  const claimableTypes: string[] = [];
+  if (!qStatus.searchJobs.isPaused) claimableTypes.push('SEARCH_YOUTUBE');
+  if (!qStatus.channelProcessing.isPaused) claimableTypes.push('ENRICH_CHANNEL');
+  if (claimableTypes.length === 0) return false;
 
-  const job = await claimNextJob(WORKER_ID, ['SEARCH_YOUTUBE']);
+  const job = await claimNextJob(WORKER_ID, claimableTypes);
   if (!job) return false;
 
   try {
+    if (job.type === 'ENRICH_CHANNEL') {
+      const { channelId, targetCountry, source, candidate } = job.payload as {
+        channelId: string;
+        targetCountry: string;
+        source: DiscoverySource;
+        candidate: DiscoveredChannelRaw;
+      };
+      await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
+      const channel = await getChannelById(channelId);
+      if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+        await completeJob(job.id);
+        return true;
+      }
+
+      channel.scan_status = 'ENRICHING';
+      channel.scan_attempts = job.attempts;
+      await upsertChannel(channel);
+      const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate);
+      await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
+      await completeJob(job.id);
+      return true;
+    }
+
     const { query, country, source } = job.payload as { query: string; country: string; source: DiscoverySource };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
@@ -127,6 +153,17 @@ export async function processNextSearchJob(): Promise<boolean> {
       await completeJob(job.id);
       return true;
     }
+    if (job.type === 'ENRICH_CHANNEL' && job.attempts >= job.max_attempts) {
+      const channelId = String(job.payload?.channelId || '');
+      const channel = channelId ? await getChannelById(channelId) : null;
+      if (channel && channel.trading_status === 'UNCERTAIN') {
+        channel.scan_status = 'NEEDS_REVIEW';
+        channel.trading_status = 'NEEDS_REVIEW';
+        channel.scan_attempts = job.attempts;
+        channel.last_checked = new Date().toISOString();
+        await upsertChannel(channel);
+      }
+    }
     await failJob(job.id, err);
     return false;
   }
@@ -137,7 +174,7 @@ export interface ProcessDiscoveredChannelOutcome {
   channelName: string;
   isNew: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
-  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
   discordStatus: DiscordStatus;
   discordInvite: string | null;
   channelRecord?: ChannelRecord;
