@@ -106,6 +106,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect }
               <option value="TRADING_CONFIRMED">TRADING CONFIRMED</option>
               <option value="NON_TRADING">NON-TRADING (Filtered Out)</option>
               <option value="UNCERTAIN">UNCERTAIN</option>
+              <option value="NEEDS_REVIEW">NEEDS REVIEW</option>
             </select>
 
             {/* Discord Status */}
@@ -136,6 +137,9 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect }
               <option value="SKIPPED_NON_TRADING">SKIPPED (Non-Trading)</option>
               <option value="PENDING">PENDING</option>
               <option value="LOCKED">LOCKED</option>
+              <option value="ENRICHMENT_PENDING">ENRICHMENT PENDING</option>
+              <option value="ENRICHING">ENRICHING</option>
+              <option value="NEEDS_REVIEW">NEEDS REVIEW</option>
               <option value="FAILED">FAILED</option>
               <option value="FAILED_PERMANENT">FAILED_PERMANENT</option>
             </select>
@@ -227,7 +231,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect }
                               ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 border border-rose-300/50 dark:border-rose-800'
                               : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
                           }`}>
-                            {c.trading_status === 'TRADING_CONFIRMED' ? 'TRADING CONFIRMED' : c.trading_status === 'NON_TRADING' ? 'NON-TRADING' : 'UNCERTAIN'}
+                            {c.trading_status === 'TRADING_CONFIRMED' ? 'TRADING CONFIRMED' : c.trading_status === 'NON_TRADING' ? 'NON-TRADING' : c.trading_status === 'NEEDS_REVIEW' ? 'NEEDS REVIEW' : 'UNCERTAIN'}
                           </span>
                           <span className="text-[10px] font-mono font-semibold text-slate-500 dark:text-slate-400">
                             {c.trading_confidence_score || 0}%
@@ -335,13 +339,15 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect }
                       <span className={`font-mono text-[11px] font-semibold ${
                         c.scan_status === 'COMPLETED'
                           ? 'text-emerald-600 dark:text-emerald-400'
-                          : c.scan_status === 'LOCKED'
+                          : c.scan_status === 'LOCKED' || c.scan_status === 'ENRICHING'
                           ? 'text-amber-600 dark:text-amber-400 animate-pulse'
+                          : c.scan_status === 'NEEDS_REVIEW'
+                          ? 'text-violet-600 dark:text-violet-400 font-bold'
                           : c.scan_status === 'FAILED_PERMANENT'
                           ? 'text-rose-600 dark:text-rose-400 font-bold'
                           : 'text-slate-500'
                       }`}>
-                        {c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status}
+                        {c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status === 'ENRICHING' ? 'ENRICHING (Reclassifying)' : c.scan_status}
                       </span>
                       {c.scan_attempts > 0 && (
                         <span className="block text-[10px] text-slate-400 mt-0.5">

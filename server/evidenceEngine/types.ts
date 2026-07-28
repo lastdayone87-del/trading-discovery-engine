@@ -5,6 +5,7 @@ export type EvidenceSourceType =
   | 'video_metadata'
   | 'external_links'
   | 'country_knowledge'
+  | 'multilingual_context'
   | 'gemini_semantic'
   | 'discord_metadata';
 
@@ -17,6 +18,8 @@ export type EvidenceCategory =
   | 'TERMINOLOGY'
   | 'MULTI_VIDEO_CONSISTENCY'
   | 'EXTERNAL_RESOURCE'
+  | 'NON_TRADING_ADJACENT'
+  | 'HYPE_SPECULATION'
   | 'IRRELEVANT_DOMAIN';
 
 export type EvidenceReliability = 'VERY_HIGH' | 'HIGH' | 'MEDIUM' | 'LOWER';

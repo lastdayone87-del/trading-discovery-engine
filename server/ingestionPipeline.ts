@@ -5,9 +5,11 @@ import { classifyTradingRelevance } from './tradingRelevanceClassifier';
 import { inspectAndValidateChannel } from './queueManager';
 import {
   getChannelById,
-  upsertChannel
+  upsertChannel,
+  enqueueJob
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
+import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -18,7 +20,7 @@ export interface IngestionPipelineOutcome {
   channelName: string;
   isNew: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
-  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
+  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
   discordStatus: DiscordStatus;
   discordInvite: string | null;
   channelRecord?: ChannelRecord;
@@ -34,7 +36,9 @@ export function isTerminalState(channel: ChannelRecord): boolean {
     channel.country_status === 'REJECTED' ||
     channel.trading_status === 'NON_TRADING' ||
     channel.scan_status === 'SKIPPED_EXCLUDED' ||
-    channel.scan_status === 'SKIPPED_NON_TRADING'
+    channel.scan_status === 'SKIPPED_NON_TRADING' ||
+    channel.scan_status === 'NEEDS_REVIEW' ||
+    channel.trading_status === 'NEEDS_REVIEW'
   );
 }
 
@@ -52,7 +56,8 @@ export async function processChannelThroughPipeline(
   candidate: IngestionCandidate,
   targetCountry: string,
   source: DiscoverySource,
-  isManualScan: boolean = false
+  isManualScan: boolean = false,
+  isEnrichmentPass: boolean = false
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
 
@@ -103,10 +108,11 @@ export async function processChannelThroughPipeline(
     },
     targetCountry
   );
+  const resolvedCountry = countryVal.detectedCountry || targetCountry;
 
   const countryValidationStep = {
     step: 'COUNTRY_VALIDATION' as const,
-    title: `Country Validation (${targetCountry})`,
+    title: `Country Validation (${resolvedCountry})`,
     status: countryVal.status === 'REJECTED' ? ('REJECTED' as const) : ('FOUND' as const),
     details: countryVal.decisionLogs,
     timestamp: now
@@ -116,35 +122,14 @@ export async function processChannelThroughPipeline(
     console.log(
       `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`
     );
-    const rejectedChannel: ChannelRecord = existing || {
-      channel_id: candidate.channelId,
-      channel_name: candidate.channelName,
-      youtube_url: candidate.youtubeUrl,
-      country: targetCountry,
-      country_status: 'REJECTED',
-      confidence_score: countryVal.score,
-      discord_status: 'NOT_FOUND',
-      discord_invite: null,
-      scan_status: 'SKIPPED_EXCLUDED',
-      scan_attempts: 0,
-      discovery_source: source,
-      first_seen: now,
-      last_checked: now,
-      inspection_trail: [countryValidationStep],
-      subscriber_count: candidate.subscriberCount,
-      channel_thumbnail_url: candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
-      trading_status: 'UNCERTAIN',
-      trading_confidence_score: 0,
-      trading_category: 'General Trading'
-    };
-
-    rejectedChannel.country_status = 'REJECTED';
-    rejectedChannel.confidence_score = countryVal.score;
-    rejectedChannel.scan_status = 'SKIPPED_EXCLUDED';
-    rejectedChannel.last_checked = now;
-    rejectedChannel.inspection_trail = [countryValidationStep];
-
-    await upsertChannel(rejectedChannel);
+    console.warn(JSON.stringify({
+      event: 'excluded_channel_blocked',
+      channelId: candidate.channelId,
+      targetCountry: resolvedCountry,
+      reason: countryVal.rejectionReason,
+      context: 'ingestion_gate',
+      timestamp: now
+    }));
 
     return {
       channelId: candidate.channelId,
@@ -154,7 +139,9 @@ export async function processChannelThroughPipeline(
       tradingStatus: 'UNCERTAIN',
       discordStatus: 'NOT_FOUND',
       discordInvite: null,
-      channelRecord: rejectedChannel
+      // Exclusion audit is emitted to logs; excluded candidates do not create or
+      // mutate channel records and never reach trading AI or Discord inspection.
+      channelRecord: undefined
     };
   }
 
@@ -164,7 +151,7 @@ export async function processChannelThroughPipeline(
     candidate.description,
     candidate.videoTitles,
     candidate.videoDescriptions?.join(' ') || '',
-    targetCountry,
+    resolvedCountry,
     candidate.channelLinks,
     undefined
   );
@@ -178,7 +165,7 @@ export async function processChannelThroughPipeline(
       channel_id: candidate.channelId,
       channel_name: candidate.channelName,
       youtube_url: candidate.youtubeUrl,
-      country: targetCountry,
+      country: resolvedCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
       discord_status: 'NON_TRADING',
@@ -198,6 +185,7 @@ export async function processChannelThroughPipeline(
     };
 
     nonTradingChannel.country_status = countryVal.status;
+    nonTradingChannel.country = resolvedCountry;
     nonTradingChannel.confidence_score = countryVal.score;
     nonTradingChannel.trading_status = 'NON_TRADING';
     nonTradingChannel.trading_confidence_score = tradingVal.confidenceScore;
@@ -224,19 +212,23 @@ export async function processChannelThroughPipeline(
 
   if (tradingVal.status === 'UNCERTAIN') {
     console.log(
-      `[Unified Ingestion Pipeline - Gate 2] Channel '${candidate.channelName}' classified as UNCERTAIN (${tradingVal.confidenceScore}/100). Preserving in dormant state. Skipping Discord discovery.`
+      `[Unified Ingestion Pipeline - Gate 2] Channel '${candidate.channelName}' classified as UNCERTAIN (${tradingVal.confidenceScore}/100). ${isEnrichmentPass ? 'Routing to human review.' : 'Scheduling durable enrichment.'}`
     );
+
+    const lifecycle = resolveUncertainLifecycle(isEnrichmentPass);
+    const finalUncertainStatus = lifecycle.tradingStatus;
+    const finalScanStatus = lifecycle.scanStatus;
 
     const uncertainChannel: ChannelRecord = existing || {
       channel_id: candidate.channelId,
       channel_name: candidate.channelName,
       youtube_url: candidate.youtubeUrl,
-      country: targetCountry,
+      country: resolvedCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
       discord_status: 'UNCERTAIN',
       discord_invite: null,
-      scan_status: 'COMPLETED',
+      scan_status: finalScanStatus,
       scan_attempts: 0,
       discovery_source: source,
       first_seen: now,
@@ -244,30 +236,39 @@ export async function processChannelThroughPipeline(
       inspection_trail: [countryValidationStep],
       subscriber_count: candidate.subscriberCount,
       channel_thumbnail_url: candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
-      trading_status: 'UNCERTAIN',
+      trading_status: finalUncertainStatus,
       trading_confidence_score: tradingVal.confidenceScore,
       trading_category: tradingVal.category,
       trading_relevance_breakdown: tradingVal.breakdown
     };
 
     uncertainChannel.country_status = countryVal.status;
+    uncertainChannel.country = resolvedCountry;
     uncertainChannel.confidence_score = countryVal.score;
-    uncertainChannel.trading_status = 'UNCERTAIN';
+    uncertainChannel.trading_status = finalUncertainStatus;
     uncertainChannel.trading_confidence_score = tradingVal.confidenceScore;
     uncertainChannel.trading_category = tradingVal.category;
     uncertainChannel.trading_relevance_breakdown = tradingVal.breakdown;
-    uncertainChannel.scan_status = 'COMPLETED';
+    uncertainChannel.scan_status = finalScanStatus;
     uncertainChannel.discord_status = 'UNCERTAIN';
     uncertainChannel.last_checked = now;
 
     await upsertChannel(uncertainChannel);
+
+    if (lifecycle.shouldEnqueue) {
+      await enqueueJob(
+        'ENRICH_CHANNEL',
+        { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate },
+        { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}` }
+      );
+    }
 
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,
       isNew: !existing,
       countryStatus: countryVal.status,
-      tradingStatus: 'UNCERTAIN',
+      tradingStatus: finalUncertainStatus,
       discordStatus: 'UNCERTAIN',
       discordInvite: null,
       channelRecord: uncertainChannel
@@ -283,7 +284,7 @@ export async function processChannelThroughPipeline(
     channel_id: candidate.channelId,
     channel_name: candidate.channelName,
     youtube_url: candidate.youtubeUrl,
-    country: targetCountry,
+    country: resolvedCountry,
     country_status: countryVal.status,
     confidence_score: countryVal.score,
     discord_status: 'PENDING',
@@ -303,6 +304,7 @@ export async function processChannelThroughPipeline(
   };
 
   activeChannel.country_status = countryVal.status;
+  activeChannel.country = resolvedCountry;
   activeChannel.confidence_score = countryVal.score;
   activeChannel.trading_status = tradingVal.status;
   activeChannel.trading_confidence_score = tradingVal.confidenceScore;
