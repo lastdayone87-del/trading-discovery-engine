@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
@@ -10,7 +13,6 @@
     "clean": "rm -rf dist server.cjs",
     "lint": "tsc --noEmit",
     "test": "find server -name '*.test.ts' -exec node --import tsx --test {} +",
-    "test": "node --import tsx --test server/*.test.ts",
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts"
