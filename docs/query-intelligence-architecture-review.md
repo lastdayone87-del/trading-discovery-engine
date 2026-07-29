@@ -23,6 +23,9 @@ the product objective is maximum ecosystem coverage, however, the higher-order
 investment is the persistent topic-exploration controller described below: it can use
 learned vocabulary while also pursuing graph, website, playlist, relationship, and
 other acquisition paths.
+After those foundations, this is the strongest remaining *discovery-quality*
+investment because it addresses vocabulary coverage rather than merely optimizing a
+fixed search space.
 
 This is also not a wholly new subsystem. Phase F already has country-scoped canonical
 terms, aliases, append-only observations, lifecycle events, controlled eligibility,
@@ -162,6 +165,11 @@ learning layer expands the reachable search space and can reveal regional langua
 emerging instruments, new platforms, and creator-native content formats. A persistent
 topic-exploration controller goes further by deciding which search and non-search
 branches remain worth pursuing until topic-level marginal coverage is genuinely low.
+Yes, **after operational readiness**, evidence-derived query expansion is the
+strongest remaining improvement to discovery recall. Adaptive pagination, ordering,
+and bandit selection can only search more efficiently within known concepts. A concept
+learning layer expands the reachable ecosystem and can reveal regional language,
+emerging instruments, new platforms, and creator-native content formats.
 
 ### Immediate answer
 
