@@ -1,5 +1,5 @@
 import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
-import { DiscoveredChannelRaw } from './youtube';
+import { DiscoveredChannelRaw, fetchYouTubeChannelCountryMetadata } from './youtube';
 import { validateChannelCountry } from './countryValidator';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
@@ -105,16 +105,27 @@ export async function processChannelThroughPipeline(
   }
 
   // Step 1: GATE 1 - Country Validation Hard Gate
-  const countryVal = await validateChannelCountry(
+  let countryVal = await validateChannelCountry(
     {
       channelName: candidate.channelName,
       description: candidate.description,
       videoTitles: candidate.videoTitles,
       locationTag: candidate.locationTag,
-      externalLinks: candidate.channelLinks
+      externalLinks: candidate.channelLinks,
+      metadataStatus: candidate.countryMetadataStatus
     },
     targetCountry
   );
+  // Country uncertainty is independent of trading uncertainty. Hydrate the
+  // authoritative channel resource with a one-unit call before spending on AI
+  // or community crawling. Failure remains observable and conservatively does
+  // not turn absence of metadata into an exclusion.
+  if (countryVal.status === 'UNCERTAIN' && candidate.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED') {
+    const hydrated = await fetchYouTubeChannelCountryMetadata(candidate.channelId, candidate);
+    Object.assign(candidate, hydrated);
+    countryVal = await validateChannelCountry({ channelName:candidate.channelName, description:candidate.description,
+      videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus }, targetCountry);
+  }
   const resolvedCountry = countryVal.detectedCountry || targetCountry;
 
   const countryValidationStep = {
@@ -209,6 +220,7 @@ export async function processChannelThroughPipeline(
     nonTradingChannel.discord_status = 'NON_TRADING';
     nonTradingChannel.discord_invite = null;
     nonTradingChannel.last_checked = now;
+    applyCandidateObservability(nonTradingChannel, candidate);
 
     await upsertChannel(nonTradingChannel);
 
@@ -268,6 +280,7 @@ export async function processChannelThroughPipeline(
     uncertainChannel.scan_status = finalScanStatus;
     uncertainChannel.discord_status = 'UNCERTAIN';
     uncertainChannel.last_checked = now;
+    applyCandidateObservability(uncertainChannel, candidate);
 
     await upsertChannel(uncertainChannel);
 
@@ -329,6 +342,7 @@ export async function processChannelThroughPipeline(
   activeChannel.trading_category = tradingVal.category;
   activeChannel.trading_relevance_breakdown = tradingVal.breakdown;
   activeChannel.scan_status = 'LOCKED';
+  applyCandidateObservability(activeChannel, candidate);
 
   await upsertChannel(activeChannel);
 
@@ -363,4 +377,16 @@ export async function processChannelThroughPipeline(
     discordInvite: finalChannel.discord_invite || null,
     channelRecord: finalChannel
   };
+}
+
+function applyCandidateObservability(channel: ChannelRecord, candidate: IngestionCandidate): void {
+  channel.country_metadata_status = candidate.countryMetadataStatus || channel.country_metadata_status || 'NOT_REQUESTED';
+  channel.country_metadata_checked_at = candidate.countryMetadataCheckedAt || channel.country_metadata_checked_at || null;
+  channel.latest_upload_at = candidate.latestUploadAt || channel.latest_upload_at || null;
+  channel.uploads_last_30_days = candidate.uploadsLast30Days ?? channel.uploads_last_30_days ?? 0;
+  channel.uploads_last_90_days = candidate.uploadsLast90Days ?? channel.uploads_last_90_days ?? 0;
+  channel.uploads_last_365_days = candidate.uploadsLast365Days ?? channel.uploads_last_365_days ?? 0;
+  channel.activity_band = candidate.activityBand || channel.activity_band || 'UNKNOWN';
+  channel.activity_score = candidate.activityScore ?? channel.activity_score ?? 50;
+  channel.activity_observed_at = candidate.activityObservedAt || channel.activity_observed_at || null;
 }

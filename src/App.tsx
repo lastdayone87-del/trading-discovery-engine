@@ -1,26 +1,33 @@
 import { AUTH_REQUIRED_EVENT, apiFetch, operatorToken, setOperatorToken } from './apiClient';
-import React, { useState, useEffect } from 'react';
-import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QuotaInfo } from './types';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { ChannelRecord, CountryVocabulary, DashboardOperationalSummary, ExcludedCountry, QueueStatus, QuotaInfo } from './types';
 import { Navbar } from './components/Navbar';
 import { SearchPanel } from './components/SearchPanel';
 import { ResultsTable } from './components/ResultsTable';
+import type { DashboardChannelFilters } from './components/ResultsTable';
 import { PendingRecheckPanel } from './components/PendingRecheckPanel';
 import { QueueMonitor } from './components/QueueMonitor';
 import { CountrySettings } from './components/CountrySettings';
 import { InspectionModal } from './components/InspectionModal';
 import { QueryIntelligenceEngine } from './components/QueryIntelligenceEngine';
 import { RegressionSuiteDashboard } from './components/RegressionSuiteDashboard';
+import { channelListingSearchParams } from './channelListingQuery';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'discovery' | 'intelligence' | 'regression' | 'results' | 'pending' | 'queues' | 'settings'>('discovery');
 
 
   const [channels, setChannels] = useState<ChannelRecord[]>([]);
+  const [channelTotal, setChannelTotal] = useState(0);
+  const [channelOffset, setChannelOffset] = useState(0);
+  const listingRevision = useRef<string | null>(null);
+  const [channelFilters,setChannelFilters]=useState<DashboardChannelFilters>({search:'',country:'ALL',countryStatus:'ALL',tradingStatus:'ALL',discordStatus:'ALL',scanStatus:'ALL'});
   const [includeRejected, setIncludeRejected] = useState(false);
   const [vocabularies, setVocabularies] = useState<CountryVocabulary[]>([]);
   const [excludedCountries, setExcludedCountries] = useState<ExcludedCountry[]>([]);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [quotaInfo, setQuotaInfo] = useState<QuotaInfo | null>(null);
+  const [operationalSummary,setOperationalSummary]=useState<DashboardOperationalSummary|null>(null);
   const [accessToken, setAccessToken] = useState(() => operatorToken());
   const [tokenDraft, setTokenDraft] = useState(() => operatorToken());
   const [authError, setAuthError] = useState<'missing' | 'invalid' | 'forbidden' | null>(() => operatorToken() ? null : 'missing');
@@ -28,19 +35,21 @@ export default function App() {
   const [inspectingChannel, setInspectingChannel] = useState<ChannelRecord | null>(null);
 
   // Fetch Channels
-  const fetchChannels = async (overrideInclude?: boolean) => {
+  const fetchChannels = useCallback(async (overrideInclude?: boolean, overrideOffset?: number) => {
     try {
       const showAll = overrideInclude !== undefined ? overrideInclude : includeRejected;
-      const res = await apiFetch(`/api/channels${showAll ? '?include_rejected=true' : ''}`);
+      const offset=overrideOffset ?? channelOffset;
+      const params=channelListingSearchParams(channelFilters,showAll);params.set('limit','100');params.set('offset',String(offset));
+      const res = await apiFetch(`/api/channels?${params}`);
       const cType = res.headers.get('content-type');
       if (res.ok && cType && cType.includes('application/json')) {
         const data = await res.json();
-        setChannels(data);
+        setChannels(data.items); setChannelTotal(data.total); listingRevision.current=data.revision;
       }
     } catch (e) {
       console.error('Failed to fetch channels:', e);
     }
-  };
+  },[includeRejected,channelOffset,channelFilters]);
 
   useEffect(() => {
     const onAuthRequired = (event: Event) => {
@@ -81,6 +90,7 @@ export default function App() {
       console.error('Failed to fetch queue status:', e);
     }
   };
+  const fetchOperationalSummary=async()=>{try{const response=await apiFetch('/api/dashboard/summary');if(response.ok)setOperationalSummary(await response.json());}catch(error){console.error('Failed to fetch dashboard summary:',error);}};
 
   // Poll Data
   useEffect(() => {
@@ -88,14 +98,23 @@ export default function App() {
     fetchChannels();
     fetchSettings();
     fetchQueueStatus();
+    fetchOperationalSummary();
 
-    const interval = setInterval(() => {
-      fetchChannels();
-      fetchQueueStatus();
-    }, 3000); // 3-second auto refresh
+    const revisionInterval = setInterval(async () => {
+      if(document.hidden)return;
+      const params=channelListingSearchParams(channelFilters,includeRejected);
+      const response=await apiFetch(`/api/channels-revision?${params}`);
+      if(response.ok){const snapshot=await response.json();if(snapshot.revision!==listingRevision.current)await fetchChannels();}
+    }, 3000);
+    const statusInterval=setInterval(()=>{if(!document.hidden){void fetchQueueStatus();void fetchOperationalSummary();}},10000);
 
-    return () => clearInterval(interval);
-  }, [includeRejected, accessToken]);
+    return () => {clearInterval(revisionInterval);clearInterval(statusInterval);};
+  }, [includeRejected, accessToken, fetchChannels]);
+
+  const changeChannelPage=(offset:number)=>{setChannelOffset(offset);void fetchChannels(undefined,offset);};
+
+  const inspectChannel=async(channel:ChannelRecord)=>{const response=await apiFetch(`/api/channels/${encodeURIComponent(channel.channel_id)}`);setInspectingChannel(response.ok?await response.json():channel);};
+  const updateChannelFilters=useCallback((filters:DashboardChannelFilters)=>{setChannelFilters(filters);setChannelOffset(0);},[]);
 
   const authenticateDashboard = (event: React.FormEvent) => {
     event.preventDefault();
@@ -230,9 +249,10 @@ export default function App() {
       <Navbar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        channels={channels}
         queueStatus={queueStatus}
         quotaInfo={quotaInfo}
+        matchingResults={channelTotal}
+        operationalSummary={operationalSummary}
       />
 
       {/* Main View Area */}
@@ -250,7 +270,7 @@ export default function App() {
             <div className="pt-4 border-t border-slate-200 dark:border-slate-800">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="font-bold text-sm text-slate-900 dark:text-white">
-                  Recently Discovered Channels ({channels.length})
+                  Recently Discovered Channels (showing {Math.min(10,channels.length)} of {channelTotal} matching)
                 </h3>
                 <button
                   onClick={() => setActiveTab('results')}
@@ -263,7 +283,7 @@ export default function App() {
               <ResultsTable
                 channels={channels.slice(0, 10)}
                 onRecheck={handleRecheck}
-                onInspect={channel => setInspectingChannel(channel)}
+                onInspect={inspectChannel}
               />
             </div>
           </div>
@@ -285,7 +305,7 @@ export default function App() {
           <div className="space-y-4">
             <div className="flex items-center justify-between px-1">
               <h2 className="text-sm font-bold text-slate-800 dark:text-slate-200">
-                Discovered Channel Directory ({channels.length} {includeRejected ? 'total records including rejected' : 'validated active channels'})
+                Matching Results: {channelTotal} {includeRejected ? '(including diagnostics / excluded channels)' : '(validated active channels)'}
               </h2>
               <label className="flex items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-400 cursor-pointer bg-white dark:bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-xs">
                 <input
@@ -294,7 +314,7 @@ export default function App() {
                   onChange={(e) => {
                     const checked = e.target.checked;
                     setIncludeRejected(checked);
-                    fetchChannels(checked);
+                    setChannelOffset(0); fetchChannels(checked,0);
                   }}
                   className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                 />
@@ -304,10 +324,12 @@ export default function App() {
             <ResultsTable
               channels={channels}
               onRecheck={handleRecheck}
-              onInspect={channel => setInspectingChannel(channel)}
+              onInspect={inspectChannel}
               onReviewCompleted={fetchChannels}
               reviewEnabled
+              onFiltersChange={updateChannelFilters}
             />
+            {channelTotal>100&&<div className="flex items-center justify-end gap-2 text-xs"><button disabled={channelOffset===0} onClick={()=>changeChannelPage(Math.max(0,channelOffset-100))} className="rounded border px-3 py-1.5 disabled:opacity-40">Previous</button><span>{channelOffset+1}–{Math.min(channelOffset+100,channelTotal)} of {channelTotal}</span><button disabled={channelOffset+100>=channelTotal} onClick={()=>changeChannelPage(channelOffset+100)} className="rounded border px-3 py-1.5 disabled:opacity-40">Next</button></div>}
           </div>
         )}
 
@@ -315,7 +337,7 @@ export default function App() {
           <PendingRecheckPanel
             channels={channels}
             onRecheck={handleRecheck}
-            onInspect={channel => setInspectingChannel(channel)}
+            onInspect={inspectChannel}
           />
         )}
 
