@@ -28,6 +28,7 @@ import { inspectCorpus, inspectDocument } from './server/candidateCorpus';
 import { inspectCandidateAssertions } from './server/candidateScoring';
 import { inspectConceptGraph, moderateConcept } from './server/conceptGraph';
 import { buildCatalog, createEvaluation, inspectEvaluations, reviewCatalog } from './server/offlineEvaluation';
+import { createExperiment, inspectExperiments, transitionExperiment } from './server/terminologyTrials';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -115,6 +116,9 @@ async function startServer() {
   app.post('/api/offline-evaluations',async(req,res)=>{try{res.status(202).json(await createEvaluation({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_OFFLINE_EVALUATION',requestId:req.requestId});}});
   app.post('/api/offline-evaluations/:id/catalogs',async(req,res)=>{try{res.status(201).json(await buildCatalog(req.params.id,req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_CATALOG',requestId:req.requestId});}});
   app.post('/api/candidate-catalogs/:id/review',async(req,res)=>{try{res.json(await reviewCatalog({catalogId:req.params.id,decision:req.body.decision,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId,reason:req.body.reason}));}catch(err:any){res.status(err.message==='CATALOG_REVIEW_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  app.get('/api/terminology-experiments',async(req,res)=>{try{res.json(await inspectExperiments(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/terminology-experiments',async(req,res)=>{try{res.status(201).json(await createExperiment({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_EXPERIMENT',requestId:req.requestId});}});
+  app.post('/api/terminology-experiments/:id/state',async(req,res)=>{try{res.json(await transitionExperiment({id:req.params.id,expectedVersion:Number(req.body.expectedVersion),action:req.body.action,reason:req.body.reason,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='EXPERIMENT_VERSION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/pause',async(req,res)=>{try{res.json(await updatePilotControl({paused:true,killSwitch:true},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/resume',async(req,res)=>{try{res.json(await updatePilotControl({paused:false},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/budget',async(req,res)=>{try{res.json(await updatePilotControl({mode:req.body.mode,dailyYoutubeCap:req.body.dailyYoutubeCap,totalYoutubeCap:req.body.totalYoutubeCap},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
