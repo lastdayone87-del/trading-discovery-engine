@@ -32,6 +32,8 @@ import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatu
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
+import { evaluateContinuation } from './continuationPolicy';
+import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -208,15 +210,19 @@ export async function processNextSearchJob(
       return true;
     }
 
-    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO' } = job.payload as {
-      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane;
+    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', pageNumber = 1, pageToken = null } = job.payload as {
+      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; pageNumber?:number; pageToken?:string|null;
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
     const vocabs = await getCountryVocabularies();
     const vocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
     if (queryRunId) await startQueryRun(queryRunId);
-    const extracted = await searchYouTubeChannels(query, country, vocab, retrievalLane);
+    if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
+    const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
+    if(queryRunId&&pageNumber>1){const budget=Number(await getAppSetting('daily_youtube_quota_budget','9000'));const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent})){await failQueryRun(queryRunId,new Error('Autonomous quota allocation exhausted.'),true);await completeJob(job.id);return true;}}
+    const searchPage = queryRunId ? await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken) : null;
+    const extracted = searchPage?.channels || await searchYouTubeChannels(query, country, vocab, retrievalLane);
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
     const observations: QueryObservation[] = [];
     const sightings = [];
@@ -237,20 +243,28 @@ export async function processNextSearchJob(
     if (queryRunId && queryId) {
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
-      const metrics = calculateQueryFunnel(extracted.length, observations);
-      await recordQueryRunSightings(queryRunId, queryId, sightings);
-      const performance = await evaluateQueryPerformance(queryRecord, metrics, { retrievalLane, quotaConsumed: 100 });
+      const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations);
+      await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
+      if(pageNumber>1) await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
+      const maxPages=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_pages','3')));const maxLow=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_low_yield_pages','2')));
+      const prior=await getAutonomousContinuationState(queryRunId);
+      const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
+      const enabled=await getAppSetting('autonomous_pagination_enabled','false')==='true';
+      await recordAutonomousPage({queryRunId,pageNumber,inputPageToken:pageToken,nextPageToken:searchPage?.nextPageToken||null,retrievalLane,rawResultCount:metrics.rawResults,distinctCreatorCount:metrics.distinctResults,knownCreators:metrics.knownChannels,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,averageQualityScore:metrics.averageQualityScore,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,noveltyRatio:metrics.noveltyRatio,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,quotaUnits:100,decision,stoppingReason:decision.shouldContinue?null:decision.primaryReason,pageMetrics:metrics});
+      if(enabled&&decision.shouldContinue&&searchPage?.nextPageToken){await enqueueJob('SEARCH_YOUTUBE',{...job.payload,pageNumber:pageNumber+1,pageToken:searchPage.nextPageToken},{priority:20,maxAttempts:3,idempotencyKey:`search-run:${queryRunId}:page:${pageNumber+1}`});await completeJob(job.id);return true;}
+      const finalMetrics=await getAutonomousRunMetrics(queryRunId);
+      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, quotaConsumed: pageNumber*100 });
       await completeQueryRun(queryRunId, {
-        ...metrics,
-        uniqueChannels: metrics.newChannels,
-        qualityChannels: metrics.qualityChannels,
-        communitiesDiscovered: metrics.communitiesDiscovered,
-        quotaUsed: 100
+        ...finalMetrics,
+        uniqueChannels: finalMetrics.newChannels,
+        qualityChannels: finalMetrics.qualityChannels,
+        communitiesDiscovered: finalMetrics.communitiesDiscovered,
+        quotaUsed: pageNumber*100
       });
       await addQueryExecutionLog({
         query_id: queryId, query, country, executed_at: new Date().toISOString(),
-        channels_discovered: metrics.distinctResults, unique_new_channels: metrics.newChannels,
-        quality_creators_discovered: metrics.qualityChannels, communities_discovered: metrics.communitiesDiscovered,
+        channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
+        quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
         cycle_quality_score: performance.performanceScore,
         logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId}.`, `Funnel: ${JSON.stringify(metrics)}`]
       });
@@ -586,7 +600,7 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
   const queryVariant = session.generatedQueryVariants[variantIndex] || session.originalQuery;
   const reserved = await tryReserveQuota({ operationType: 'MANUAL_SEARCH_PAGE', operationId, allocation: 'MANUAL', units: 100, dailyBudget, allocationPercent: quotaPercent });
   if (!reserved) {
-    return recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: null, rawIds: [], uniqueIds: [], knownIds: [], acceptedIds: [], noveltyRatio: 0, duplicateRatio: 0, quotaUnits: 0, quotaEfficiency: 0, creatorYield: 0, lowYield: true, maxPages, stopReason: 'QUOTA_ALLOCATION_EXHAUSTED' });
+    return recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: null, rawResultCount:0, rawIds: [], uniqueIds: [], knownIds: [], acceptedIds: [], confirmedIds:[], qualityConfirmedIds:[], averageQualityScore:0, countryPrecision:0, communityDiversity:0, noveltyRatio: 0, duplicateRatio: 0, quotaUnits: 0, quotaEfficiency: 0, creatorYield: 0, lowYield: true, marginalUtility:0, shouldContinue:false, primaryReason:'QUOTA_ALLOCATION_EXHAUSTED', reasonCodes:['QUOTA_ALLOCATION_EXHAUSTED'], maxPages, stopReason: 'QUOTA_ALLOCATION_EXHAUSTED' });
   }
   try {
     const vocabs = await getCountryVocabularies();
@@ -598,21 +612,33 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
     const uniqueIds = unique.map(c => c.channelId);
     const knownIds: string[] = [];
     const acceptedIds: string[] = [];
+    const confirmedIds: string[] = [];
+    const qualityConfirmedIds: string[] = [];
+    const qualityScores: number[] = [];
+    const communityIds: string[] = [];
+    let countryAccepted = 0;
     for (const raw of unique) {
       const outcome = await processDiscoveredChannel(raw, session.country, 'manual_search');
       if (outcome.wasKnown) knownIds.push(outcome.channelId);
       if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);
+      if (outcome.countryStatus !== 'REJECTED') countryAccepted++;
+      if (outcome.tradingStatus === 'TRADING_CONFIRMED') {
+        confirmedIds.push(outcome.channelId);
+        const score = outcome.channelRecord?.quality_score || 0;
+        qualityScores.push(score);
+        if (score >= 55) qualityConfirmedIds.push(outcome.channelId);
+        if (outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME') communityIds.push(outcome.channelId);
+      }
     }
     const previous = new Set(session.uniqueChannelIds);
     const novelIds = uniqueIds.filter(id => !previous.has(id));
     const noveltyRatio = uniqueIds.length ? novelIds.length / uniqueIds.length : 0;
     const duplicateRatio = rawIds.length ? 1 - (novelIds.length / rawIds.length) : 1;
-    const lowYield = noveltyRatio < minNovelty || duplicateRatio > maxDuplicate;
     const projectedUnique = new Set([...session.uniqueChannelIds, ...uniqueIds]).size;
-    const projectedLowYield = lowYield ? session.consecutiveLowYieldPages + 1 : 0;
     const hasNextVariant = variantIndex + 1 < session.generatedQueryVariants.length;
-    const stopReason = pageNumber >= maxPages ? 'MAX_PAGES_REACHED' : projectedUnique >= maxCreators ? 'MAX_UNIQUE_CREATORS_REACHED' : projectedLowYield >= maxLowYield ? 'CONSECUTIVE_LOW_YIELD_PAGES' : !page.nextPageToken && !hasNextVariant ? 'NO_NEXT_PAGE_TOKEN' : null;
-    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawIds, uniqueIds, knownIds, acceptedIds, noveltyRatio, duplicateRatio, quotaUnits: 100, quotaEfficiency: novelIds.length / 100, creatorYield: acceptedIds.length, lowYield, maxPages, stopReason });
+    const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:uniqueIds.length,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:unique.length?countryAccepted/unique.length:0,communityDiversity:confirmedIds.length?communityIds.length/confirmedIds.length:0,duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield});
+    const stopReason = decision.shouldContinue ? null : decision.primaryReason;
+    const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:unique.length?countryAccepted/unique.length:0,communityDiversity:confirmedIds.length?communityIds.length/confirmedIds.length:0,noveltyRatio, duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
     if (!stopReason) {
       const nextVariantIndex = page.nextPageToken ? variantIndex : variantIndex + 1;
       await enqueueJob('MANUAL_SEARCH_PAGE', { sessionId, pageNumber: pageNumber + 1, pageToken: page.nextPageToken, variantIndex: nextVariantIndex }, { priority: 200, maxAttempts: 3, idempotencyKey: `manual-page:${sessionId}:${pageNumber + 1}` });
