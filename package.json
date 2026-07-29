@@ -22,7 +22,8 @@
     "phase6:verify": "npm test && npm run lint && npm run build",
     "phase7:verify": "npm test && npm run lint && npm run build",
     "phase8:verify": "npm test && npm run lint && npm run build"
-    ,"phase9:verify": "npm test && npm run lint && npm run build"
+    ,"phase9:verify": "npm test && npm run lint && npm run build",
+    "phase10:verify": "npm test && npm run lint && npm run build"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
