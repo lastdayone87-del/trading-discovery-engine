@@ -39,6 +39,7 @@ import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
+import { processOfflineEvaluationJob } from './offlineEvaluation';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -121,7 +122,7 @@ export async function addAutomatedCountrySearch(countryName: string, provenance?
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -137,6 +138,7 @@ export async function processNextSearchJob(
     if(control.rowCount&&!control.rows[0].paused)claimableTypes.push('TERM_HARVEST');
   }
   if(!claimableOverride||claimableOverride.includes('PROPOSE_CONCEPT_RESOLUTION')){const db=await getDb();const control=await db.query('SELECT resolution_paused FROM concept_graph_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].resolution_paused)claimableTypes.push('PROPOSE_CONCEPT_RESOLUTION');}
+  if(!claimableOverride||claimableOverride.includes('OFFLINE_CANDIDATE_EVALUATION')){const db=await getDb();const control=await db.query('SELECT evaluation_paused,provider_access_allowed FROM offline_evaluation_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].evaluation_paused&&!control.rows[0].provider_access_allowed)claimableTypes.push('OFFLINE_CANDIDATE_EVALUATION');}
   if (!claimableOverride || claimableOverride.includes('SCORE_CANDIDATES') || claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')) {
     const db=await getDb();const control=await db.query(`SELECT scoring_paused,ai_paused FROM candidate_scoring_controls WHERE singleton=true`);
     if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES')))claimableTypes.push('SCORE_CANDIDATES');
@@ -156,6 +158,7 @@ export async function processNextSearchJob(
     if(job.type==='SCORE_CANDIDATES'){await processCandidateScoringJob(job);return true;}
     if(job.type==='AI_ADJUDICATE_CANDIDATE'){await processAiAdjudicationJob(job);return true;}
     if(job.type==='PROPOSE_CONCEPT_RESOLUTION'){await processConceptResolutionJob(job);return true;}
+    if(job.type==='OFFLINE_CANDIDATE_EVALUATION'){await processOfflineEvaluationJob(job);return true;}
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
       const channelId=String(job.payload.channelId||'');
       const before=await getChannelById(channelId);
