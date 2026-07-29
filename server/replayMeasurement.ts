@@ -4,7 +4,7 @@ export const OUTCOME_EVENT_VERSION = 1;
 export const REPLAY_POLICY_VERSION = 'current-query-policy-v1';
 export const REPLAY_FEATURE_VERSION = 'query-funnel-v1';
 export type VerificationStatus = 'PROVISIONAL'|'VERIFIED'|'CORRECTIVE';
-export type OutcomeEventType = 'QUERY_FUNNEL_RECORDED'|'CHANNEL_OBSERVED'|'REVIEW_VERIFIED'|'REVIEW_CORRECTED'|'QUOTA_FINALIZED';
+export type OutcomeEventType = 'QUERY_FUNNEL_RECORDED'|'PAGE_FUNNEL_RECORDED'|'CHANNEL_OBSERVED'|'REVIEW_VERIFIED'|'REVIEW_CORRECTED'|'QUOTA_FINALIZED';
 
 export interface ReplayEvent { eventKey:string; subjectId:string; eventType:OutcomeEventType; verificationStatus:VerificationStatus; eventTime:string; recordedAt:string; country?:string|null; retrievalLane?:string|null; payload:Record<string,unknown> }
 export interface FunnelMetrics { rawResults:number; distinctResults:number; duplicateResults:number; knownChannels:number; newChannels:number; countryRejected:number; nonTrading:number; uncertain:number; needsReview:number; tradingConfirmed:number; uniqueChannels:number; qualityChannels:number; communitiesDiscovered:number; quotaUsed:number }
