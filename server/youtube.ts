@@ -76,6 +76,18 @@ export interface DiscoveredChannelRaw {
   subscriberCount?: string;
   channelThumbnailUrl?: string;
 }
+export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
+
+/** One bounded playlistItems call (cost: one unit); no pagination is followed by the canary. */
+export async function fetchYouTubePlaylistChannels(playlistId:string,limit:number):Promise<PlaylistChannelObservation[]> {
+  const keys=getYouTubeKeyPool();if(!keys.length)throw new Error('YouTube playlist inspection requires an API key.');
+  const maxResults=Math.min(50,Math.max(1,Math.trunc(limit)));const observedAt=new Date().toISOString();
+  for(let attempt=0;attempt<keys.length;attempt++){const index=(activeKeyIndex+attempt)%keys.length;
+    try{const url=`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${encodeURIComponent(playlistId)}&maxResults=${maxResults}&key=${keys[index]}`;const response=await youtubeFetch(url,'playlist-items',1,attempt+1);const data=await response.json();await incrementQuota(1);activeKeyIndex=index;
+      return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
+    }catch(error){if(attempt===keys.length-1)throw error;}
+  }throw new Error('All configured YouTube API keys failed for playlist inspection.');
+}
 
 /**
  * Retrieves all valid YouTube API keys available in environment variables.

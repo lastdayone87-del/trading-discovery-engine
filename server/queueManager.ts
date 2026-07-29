@@ -41,6 +41,7 @@ import { processAiAdjudicationJob, processCandidateScoringJob } from './candidat
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
 import { getActiveCatalogPin } from './catalogPublication';
+import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -124,7 +125,7 @@ export async function addAutomatedCountrySearch(countryName: string, provenance?
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -135,6 +136,7 @@ export async function processNextSearchJob(
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('POST_APPROVAL_ENRICH'))) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('FORCE_REVIEW_RESCAN'))) claimableTypes.push('FORCE_REVIEW_RESCAN');
+  if(!claimableOverride||claimableOverride.includes('INSPECT_PLAYLIST')){const db=await getDb();const c=await db.query(`SELECT mode,paused,kill_switch FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_PLAYLIST'`);if(c.rows[0]?.mode==='CANARY'&&!c.rows[0].paused&&!c.rows[0].kill_switch)claimableTypes.push('INSPECT_PLAYLIST');}
   if (!claimableOverride || claimableOverride.includes('TERM_HARVEST')) {
     const db=await getDb();const control=await db.query(`SELECT paused FROM corpus_controls WHERE singleton=true`);
     if(control.rowCount&&!control.rows[0].paused)claimableTypes.push('TERM_HARVEST');
@@ -161,6 +163,7 @@ export async function processNextSearchJob(
     if(job.type==='AI_ADJUDICATE_CANDIDATE'){await processAiAdjudicationJob(job);return true;}
     if(job.type==='PROPOSE_CONCEPT_RESOLUTION'){await processConceptResolutionJob(job);return true;}
     if(job.type==='OFFLINE_CANDIDATE_EVALUATION'){await processOfflineEvaluationJob(job);return true;}
+    if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannel);return true;}
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
       const channelId=String(job.payload.channelId||'');
       const before=await getChannelById(channelId);
