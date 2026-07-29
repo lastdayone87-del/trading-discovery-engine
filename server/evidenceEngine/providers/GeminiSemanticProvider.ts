@@ -1,5 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
+import { executeProviderCall } from '../../providerResilience';
+import { appendProviderCallEvent } from '../../db';
 
 let aiClient: GoogleGenAI | null = null;
 function getGenAI(): GoogleGenAI | null {
@@ -74,11 +76,11 @@ Respond strictly with a JSON object in this exact schema:
 }`;
 
     try {
-      const response = await callGeminiSafe(() => ai.models.generateContent({
+      const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'semantic-classification'},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
         model: modelName,
         contents: prompt,
         config: { responseMimeType: 'application/json' }
-      }));
+      })}));
 
       const resText = response.text || '';
       if (resText) {

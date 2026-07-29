@@ -1,5 +1,6 @@
 import { CountryVocabulary } from '../src/types';
-import { incrementQuota, getAppSetting, getYouTubeKeyPool } from './db';
+import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEvent } from './db';
+import { executeProviderCall } from './providerResilience';
 import { RetrievalLane } from './retrievalLanes';
 import { SearchOrdering, youtubeOrder } from './searchOrdering';
 export type { SearchOrdering } from './searchOrdering';
@@ -81,6 +82,12 @@ export interface DiscoveredChannelRaw {
  * Checks YOUTUBE_API_KEY and YOUTUBE_API_KEY_1..5.
  */
 let activeKeyIndex = 0;
+
+async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1):Promise<Response>{
+  const enabled=(await getAppSetting('provider_deadlines_enabled',process.env.PROVIDER_DEADLINES_ENABLED||'false'))==='true';
+  const timeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
+  return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{const response=await fetch(url,{signal});if(!response.ok){const error=Object.assign(new Error(`YouTube HTTP ${response.status}`),{status:response.status});throw error;}return response;}});
+}
 
 export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, sanitizedQuery: string): DiscoveredChannelRaw[] {
   const results = new Map<string, DiscoveredChannelRaw>();
@@ -165,7 +172,7 @@ export async function searchYouTubeChannelPage(
           sanitizedQuery
         )}&maxResults=${maxResults}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}&key=${apiKey}`;
 
-        const res = await fetch(searchUrl);
+        const res = await youtubeFetch(searchUrl,'search',100,attempt+1);
 
         if (res.ok) {
           activeKeyIndex = currentIndex; // Pin working key as preferred
@@ -177,10 +184,6 @@ export async function searchYouTubeChannelPage(
           // An empty successful response is authoritative. Retrying the same
           // query against every key would multiply quota cost without changing it.
           return { channels: results, nextPageToken: data.nextPageToken || null, rawResultCount: (data.items || []).length };
-        } else {
-          const errBody = await res.json().catch(() => ({}));
-          const reason = errBody?.error?.errors?.[0]?.reason || errBody?.error?.message || `HTTP ${res.status}`;
-          console.warn(`[YouTube API Pool] Key #${currentIndex + 1} failed (${res.status}: ${reason}). Rotating to next key in pool...`);
         }
       } catch (e) {
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
@@ -206,7 +209,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
 
     try {
       const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&order=date&type=video&maxResults=5&key=${apiKey}`;
-      const res = await fetch(searchUrl);
+      const res = await youtubeFetch(searchUrl,'recent-videos-search',100,attempt+1);
 
       if (res.ok) {
         activeKeyIndex = currentIndex;
@@ -225,7 +228,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
 
         if (videoIds.length > 0) {
           const videosUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoIds.join(',')}&key=${apiKey}`;
-          const vRes = await fetch(videosUrl);
+          const vRes = await youtubeFetch(videosUrl,'video-details',1,1);
           if (vRes.ok) {
             await incrementQuota(1);
             const vData = await vRes.json();
@@ -270,10 +273,7 @@ export async function fetchYouTubeChannelEnrichment(
     try {
       const channelUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,brandingSettings,statistics&id=${encodeURIComponent(channelId)}&key=${apiKey}`;
       const recentUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${encodeURIComponent(channelId)}&order=date&type=video&maxResults=10&key=${apiKey}`;
-      const [channelResponse, recentResponse] = await Promise.all([fetch(channelUrl), fetch(recentUrl)]);
-      if (!channelResponse.ok || !recentResponse.ok) {
-        throw new Error(`YouTube enrichment failed (channel ${channelResponse.status}, uploads ${recentResponse.status}).`);
-      }
+      const [channelResponse, recentResponse] = await Promise.all([youtubeFetch(channelUrl,'channel-details',1,attempt+1),youtubeFetch(recentUrl,'channel-uploads',100,attempt+1)]);
 
       activeKeyIndex = currentIndex;
       await incrementQuota(101);

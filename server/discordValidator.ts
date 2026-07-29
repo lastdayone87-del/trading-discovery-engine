@@ -1,4 +1,6 @@
 import { DiscordStatus } from '../src/types';
+import { executeProviderCall } from './providerResilience';
+import { appendProviderCallEvent } from './db';
 
 export interface DiscordValidationResult {
   status: DiscordStatus;
@@ -63,11 +65,11 @@ export async function validateDiscordInvite(
 
   try {
     const apiUrl = `https://discord.com/api/v9/invites/${encodeURIComponent(cleanCode)}?with_counts=true`;
-    const res = await fetch(apiUrl, {
-      headers: {
+    const res = await executeProviderCall({context:{provider:'discord',operation:'invite-lookup'},timeoutMs:Number(process.env.DISCORD_PROVIDER_TIMEOUT_MS||'15000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:signal=>fetch(apiUrl, {
+      signal, headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
-    });
+    })});
 
     if (!res.ok) {
       // 404 or expired invite
