@@ -1,3 +1,4 @@
+import { apiFetch } from '../apiClient';
 import React, { useState, useEffect } from 'react';
 import { QueryRecord, QueryExecutionLog, ExtractedTermRecord, CountryVocabulary, CanonicalTradingTerm } from '../types';
 import {
@@ -67,12 +68,12 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const fetchData = async () => {
     try {
       const [libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes] = await Promise.all([
-        fetch('/api/query-intelligence/library'),
-        fetch('/api/query-intelligence/vocabulary'),
-        fetch('/api/query-intelligence/terminology'),
-        fetch('/api/query-intelligence/logs'),
-        fetch('/api/query-intelligence/status'),
-        fetch('/api/query-intelligence/scope')
+        apiFetch('/api/query-intelligence/library'),
+        apiFetch('/api/query-intelligence/vocabulary'),
+        apiFetch('/api/query-intelligence/terminology'),
+        apiFetch('/api/query-intelligence/logs'),
+        apiFetch('/api/query-intelligence/status'),
+        apiFetch('/api/query-intelligence/scope')
       ]);
 
       if (libRes.ok) setQueries(await libRes.json());
@@ -104,7 +105,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     setIsPauseToggling(true);
     try {
       const endpoint = status.isPaused ? '/api/query-intelligence/resume' : '/api/query-intelligence/pause';
-      const res = await fetch(endpoint, { method: 'POST' });
+      const res = await apiFetch(endpoint, { method: 'POST' });
       if (res.ok) {
         await fetchData();
       }
@@ -120,7 +121,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     setIsSavingScope(true);
     setScopeSaveMessage(null);
     try {
-      const res = await fetch('/api/query-intelligence/scope', {
+      const res = await apiFetch('/api/query-intelligence/scope', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope: mode, selectedCountries: countries })
@@ -159,7 +160,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   const handleTriggerCycle = async () => {
     setIsCycleRunning(true);
     try {
-      const res = await fetch('/api/query-intelligence/run-cycle', {
+      const res = await apiFetch('/api/query-intelligence/run-cycle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ country: selectedCountry !== 'All' ? selectedCountry : undefined })
@@ -179,7 +180,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     if (selectedCountry === 'All') return;
     setIsGeneratingCandidates(true);
     try {
-      const res = await fetch('/api/query-intelligence/generate-candidates', {
+      const res = await apiFetch('/api/query-intelligence/generate-candidates', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ country: selectedCountry, count: 3 })
@@ -197,7 +198,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   // Change query collection manually
   const handleMoveCollection = async (queryId: number, collection: 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED') => {
     try {
-      const res = await fetch(`/api/query-intelligence/queries/${queryId}/collection`, {
+      const res = await apiFetch(`/api/query-intelligence/queries/${queryId}/collection`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ collection })

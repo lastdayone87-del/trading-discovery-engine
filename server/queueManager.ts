@@ -41,11 +41,12 @@ const WORKER_ID = `worker_${process.pid}`;
 /**
  * Pushes a new search query job to the Search Jobs Queue.
  */
-export async function addSearchJob(query: string, country: string, source: DiscoverySource): Promise<SearchJob> {
+export interface JobProvenance { actorId: string; requestId?: string }
+export async function addSearchJob(query: string, country: string, source: DiscoverySource, provenance: JobProvenance = {actorId:'system:scheduler'}): Promise<SearchJob> {
   await assertCountryAllowed(country, `queue:${source}`);
   const job = await enqueueJob(
     'SEARCH_YOUTUBE',
-    { query, country, source },
+    { query, country, source, provenance },
     {
       idempotencyKey: `search:${source}:${country.toLowerCase()}:${query.toLowerCase()}`,
       priority: source === 'manual_search' ? 100 : 20
@@ -95,7 +96,7 @@ export async function addManualCountrySearch(userQuery: string, countryName: str
 /**
  * Generates and enqueues country native queries for an automated discovery run.
  */
-export async function addAutomatedCountrySearch(countryName: string): Promise<string[]> {
+export async function addAutomatedCountrySearch(countryName: string, provenance?: JobProvenance): Promise<string[]> {
   await assertCountryAllowed(countryName, 'automated_search_generation');
   const vocabs = await getCountryVocabularies();
   const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
@@ -106,7 +107,7 @@ export async function addAutomatedCountrySearch(countryName: string): Promise<st
 
   const generatedQueries = generateCountryQueries(vocab, 5);
   for (const q of generatedQueries) {
-    await addSearchJob(q, countryName, 'automated_query');
+    await addSearchJob(q, countryName, 'automated_query', provenance);
   }
 
   return generatedQueries;
