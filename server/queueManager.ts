@@ -36,6 +36,7 @@ import { createManualSearchSession, getManualSearchSession, recordManualSearchPa
 import { evaluateContinuation } from './continuationPolicy';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
+import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -118,7 +119,7 @@ export async function addAutomatedCountrySearch(countryName: string, provenance?
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -129,6 +130,10 @@ export async function processNextSearchJob(
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('POST_APPROVAL_ENRICH'))) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('FORCE_REVIEW_RESCAN'))) claimableTypes.push('FORCE_REVIEW_RESCAN');
+  if (!claimableOverride || claimableOverride.includes('TERM_HARVEST')) {
+    const db=await getDb();const control=await db.query(`SELECT paused FROM corpus_controls WHERE singleton=true`);
+    if(control.rowCount&&!control.rows[0].paused)claimableTypes.push('TERM_HARVEST');
+  }
   if (claimableTypes.length === 0) return false;
 
   const job = await claimNextJob(workerId, claimableTypes);
@@ -139,6 +144,7 @@ export async function processNextSearchJob(
   heartbeat.unref?.();
 
   try {
+    if(job.type==='TERM_HARVEST'){await processTermHarvestJob(job);return true;}
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
       const channelId=String(job.payload.channelId||'');
       const before=await getChannelById(channelId);
@@ -158,6 +164,7 @@ export async function processNextSearchJob(
           await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true);
           const db=await getDb();
           await db.query(`UPDATE extracted_vocabulary_sources SET provenance='HUMAN_APPROVED',eligible_after_enrichment=true WHERE channel_id=$1`,[channelId]);
+          await enqueueTermHarvest({channelId,text,lineage:'HUMAN_APPROVED',approved:true});
         }
       }
       await completeJob(job.id); return true;

@@ -15,6 +15,7 @@ const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; acti
   { method:'GET', pattern:/^\/api\/validation-status$/, policy:'operator', action:'validation.read' },
   { method:'GET', pattern:/^\/api\/measurement\/replay$/, policy:'operator', action:'measurement.replay.read' },
   { method:'GET', pattern:/^\/api\/research-programs(?:\/price-action-trading(?:\/coverage)?)?$/, policy:'operator', action:'research.read' },
+  { method:'GET', pattern:/^\/api\/corpus(?:\/documents\/[^/]+)?$/, policy:'operator', action:'corpus.read' },
   { method:'GET', pattern:/^\/api\/operator-audit-events$/, policy:'admin', action:'audit.read' },
   { method:'POST', pattern:/^\/api\/(database\/backup|db\/stress-test|db\/clean-stress-tests|queues\/pause|query-intelligence\/(pause|resume|scope|run-cycle)|regression\/run)$/, policy:'admin', action:'administration.execute' },
   { method:'POST', pattern:/^\/api\/research-programs\/price-action-trading\/(pause|resume|budget|kill-switch)$/, policy:'admin', action:'research.control' },
