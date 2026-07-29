@@ -52,7 +52,7 @@ import { verifyChannelTradingRelevance, generateClassificationReport } from './s
 import { assertCountryAllowed, ExcludedCountryError } from './server/countryExclusion';
 import { getManualSearchSession, listManualSearchSessions, requestManualSearchCancellation } from './server/manualSearchStore';
 import { decideReview, getReviewDetails, listReviewQueue, ReviewConflictError, ReviewNotFoundError } from './server/reviewStore';
-import { timingSafeEqual } from 'node:crypto';
+import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 
 
 async function startServer() {
@@ -62,11 +62,9 @@ async function startServer() {
   app.use(express.json());
 
   const requireReviewer: express.RequestHandler = (req,res,next) => {
-    const configured=process.env.REVIEW_API_TOKEN;
     const supplied=req.header('authorization')?.replace(/^Bearer\s+/i,'')||'';
-    if(!configured) return res.status(503).json({error:'REVIEW_API_TOKEN is not configured.'});
-    const a=Buffer.from(configured),b=Buffer.from(supplied);
-    if(a.length!==b.length || !timingSafeEqual(a,b)) return res.status(401).json({error:'Valid reviewer bearer token required.'});
+    if(!process.env.REVIEW_API_TOKEN && !process.env.DEFAULT_REVIEWER_API_TOKEN) return res.status(503).json({error:'A reviewer API token is not configured.'});
+    if(!reviewerTokenIsValid(supplied)) return res.status(401).json({error:'Valid reviewer bearer token required.'});
     next();
   };
 
@@ -91,9 +89,10 @@ async function startServer() {
 
   // --- API ROUTES ---
 
+  app.get('/api/reviewer-credentials', (_req,res)=>res.json({defaultsAvailable:reviewerDefaultsAvailable()}));
   app.get('/api/reviews', requireReviewer, async(req,res)=>{try{res.json(await listReviewQueue({country:req.query.country as string|undefined,search:req.query.search as string|undefined,limit:Number(req.query.limit||50),offset:Number(req.query.offset||0)}));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/reviews/:channelId', requireReviewer, async(req,res)=>{try{res.json(await getReviewDetails(req.params.channelId));}catch(err:any){res.status(err instanceof ReviewNotFoundError?404:500).json({error:err.message});}});
-  const reviewAction=(action:'APPROVE'|'REJECT'|'FORCE_RESCAN'):express.RequestHandler=>async(req,res)=>{try{const reviewer=req.header('x-reviewer-id')?.trim();if(!reviewer)return res.status(400).json({error:'X-Reviewer-Id header is required.'});const result=await decideReview({channelId:req.params.channelId,action,expectedVersion:Number(req.body.reviewVersion),reviewer,reason:String(req.body.reason||''),notes:req.body.notes,idempotencyKey:req.header('idempotency-key')||''});res.json(result);}catch(err:any){res.status(err instanceof ReviewConflictError?409:err instanceof ReviewNotFoundError?404:400).json({error:err.message});}};
+  const reviewAction=(action:'APPROVE'|'REJECT'|'FORCE_RESCAN'):express.RequestHandler=>async(req,res)=>{try{const reviewer=resolveReviewerIdentity(req.header('x-reviewer-id'));if(!reviewer)return res.status(400).json({error:'X-Reviewer-Id header is required.'});const result=await decideReview({channelId:req.params.channelId,action,expectedVersion:Number(req.body.reviewVersion),reviewer,reason:String(req.body.reason||''),notes:req.body.notes,idempotencyKey:req.header('idempotency-key')||''});res.json(result);}catch(err:any){res.status(err instanceof ReviewConflictError?409:err instanceof ReviewNotFoundError?404:400).json({error:err.message});}};
   app.post('/api/reviews/:channelId/approve',requireReviewer,reviewAction('APPROVE'));
   app.post('/api/reviews/:channelId/reject',requireReviewer,reviewAction('REJECT'));
   app.post('/api/reviews/:channelId/force-rescan',requireReviewer,reviewAction('FORCE_RESCAN'));

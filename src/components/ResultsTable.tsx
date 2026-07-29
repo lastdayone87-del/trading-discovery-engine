@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ChannelRecord, ReviewQueueItem } from '../types';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
 
@@ -24,6 +24,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   const [recheckingId, setRecheckingId] = useState<string | null>(null);
   const [reviewToken, setReviewToken] = useState(() => localStorage.getItem('review-token') || '');
   const [reviewer, setReviewer] = useState(() => localStorage.getItem('reviewer-id') || '');
+  const [reviewerDefaultsAvailable, setReviewerDefaultsAvailable] = useState<boolean | null>(null);
   const [pendingReviewOnly, setPendingReviewOnly] = useState(false);
   const [reviewBusy, setReviewBusy] = useState<string | null>(null);
   const [reviewError, setReviewError] = useState('');
@@ -31,6 +32,16 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   const [decidedChannelIds, setDecidedChannelIds] = useState<Set<string>>(() => new Set());
 
   const countries = Array.from(new Set(channels.map(c => c.country)));
+
+  useEffect(() => {
+    if (!reviewEnabled) return;
+    let active = true;
+    fetch('/api/reviewer-credentials')
+      .then(response => response.ok ? response.json() : Promise.reject())
+      .then(({ defaultsAvailable }) => { if (active) setReviewerDefaultsAvailable(Boolean(defaultsAvailable)); })
+      .catch(() => { if (active) setReviewerDefaultsAvailable(false); });
+    return () => { active = false; };
+  }, [reviewEnabled]);
 
   const filteredChannels = channels.filter(c => {
     const matchesSearch = c.channel_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -52,10 +63,9 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  const reviewHeaders = () => ({
-    Authorization: `Bearer ${reviewToken}`,
-    'X-Reviewer-Id': reviewer
-  });
+  const reviewHeaders = (): Record<string, string> => reviewerDefaultsAvailable
+    ? {}
+    : { Authorization: `Bearer ${reviewToken}`, 'X-Reviewer-Id': reviewer };
 
   const parseError = async (response: Response) => {
     const body = await response.json().catch(() => ({}));
@@ -70,7 +80,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   };
 
   const openReviewDetails = async (channelId: string) => {
-    if (!reviewToken || !reviewer) {
+    if (!reviewerDefaultsAvailable && (!reviewToken || !reviewer)) {
       setReviewError('Enter a reviewer API token and reviewer identity to inspect or decide reviews.');
       return;
     }
@@ -85,7 +95,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   };
 
   const handleReviewAction = async (channelId: string, action: ReviewAction, currentDetails?: ReviewQueueItem) => {
-    if (!reviewToken || !reviewer) {
+    if (!reviewerDefaultsAvailable && (!reviewToken || !reviewer)) {
       setReviewError('Enter a reviewer API token and reviewer identity before making a decision.');
       return;
     }
@@ -149,7 +159,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               <p className="text-[11px] text-slate-500 mt-0.5">Review channels awaiting a decision directly in the table.</p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <input
+              {reviewerDefaultsAvailable === false && <input
                 aria-label="Reviewer API token"
                 type="password"
                 value={reviewToken}
@@ -159,8 +169,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                 }}
                 placeholder="Reviewer API token"
                 className="w-44 px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
-              />
-              <input
+              />}
+              {reviewerDefaultsAvailable === false && <input
                 aria-label="Reviewer identity"
                 value={reviewer}
                 onChange={event => {
@@ -169,7 +179,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                 }}
                 placeholder="Reviewer identity"
                 className="w-40 px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
-              />
+              />}
               <button
                 type="button"
                 onClick={() => setPendingReviewOnly(value => !value)}
