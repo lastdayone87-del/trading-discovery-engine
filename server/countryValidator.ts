@@ -1,4 +1,5 @@
 import type { CountryStatus } from '../src/types';
+import type { CountryMetadataStatus } from '../src/types';
 import { getExcludedCountries, getCountryVocabularies } from './db';
 import { CountryInferenceEvidence, inferChannelCountry } from './countryInference';
 
@@ -23,6 +24,7 @@ export async function validateChannelCountry(
     locationTag?: string;
     externalLinks?: string[];
     socialBios?: string[];
+    metadataStatus?: CountryMetadataStatus;
   },
   targetCountryName: string
 ): Promise<ValidationResult> {
@@ -49,6 +51,7 @@ export async function validateChannelCountry(
     `  [P${item.priority}] ${item.source}: ${item.detectedCountry} (${item.confidence}/100) — ${item.reasoning}`
   );
   const decisionLogs = [
+    `Official Metadata: ${channelData.metadataStatus === 'UNAVAILABLE' ? 'Unavailable (provider/configuration failure)' : channelData.metadataStatus === 'AVAILABLE_NOT_DECLARED' ? 'Available; channel declared no country' : channelData.metadataStatus === 'AVAILABLE_DECLARED' ? 'Available with declared country' : 'Not requested'}`,
     `Detected Country: ${inference.detectedCountry || 'Unknown'}`,
     `Calculated Score: ${inference.confidence}/100 (Status: ${inference.status})`,
     `Decision Basis: ${inference.reasoning}`,

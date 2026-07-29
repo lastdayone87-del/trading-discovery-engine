@@ -9,6 +9,8 @@ export interface InspectionResult {
   foundLocation?: string;
   steps: InspectionStep[];
   extractedThumbnailUrl?: string;
+  observedAboutBio: string;
+  observedChannelLinks: string[];
 }
 
 /**
@@ -637,7 +639,7 @@ export async function runChannelInspection(channelData: {
   if (directBioInvite) {
     step1Logs.push(`Direct Discord invite detected in Channel Bio: Invite Code "${directBioInvite}"`);
     addStep('BIO', 'Step 1 — Channel Bio & About Panel', 'FOUND', step1Logs, directBioInvite, 'CHANNEL_ABOUT');
-    return { foundInvite: directBioInvite, foundLocation: 'CHANNEL_ABOUT', steps, extractedThumbnailUrl, debugLog };
+    return { foundInvite: directBioInvite, foundLocation: 'CHANNEL_ABOUT', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
   } else {
     step1Logs.push('No direct Discord invite found in channel bio.');
     addStep('BIO', 'Step 1 — Channel Bio & About Panel', 'NOT_FOUND', step1Logs);
@@ -656,7 +658,7 @@ export async function runChannelInspection(channelData: {
       if (inv) {
         step2Logs.push(`Direct Discord invite detected in channel links: ${link}`);
         addStep('EXTERNAL_LINKS', 'Step 2 — Channel External Links', 'FOUND', step2Logs, inv, 'CHANNEL_LINKS');
-        return { foundInvite: inv, foundLocation: 'CHANNEL_LINKS', steps, extractedThumbnailUrl, debugLog };
+        return { foundInvite: inv, foundLocation: 'CHANNEL_LINKS', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
       }
     }
     step2Logs.push('No direct Discord invite found in channel links.');
@@ -679,7 +681,7 @@ export async function runChannelInspection(channelData: {
       if (inv) {
         step3Logs.push(`Discord invite detected in ${sourceName}`);
         addStep('VIDEO_DESCRIPTIONS', 'Step 3 — Latest Video Descriptions', 'FOUND', step3Logs, inv, sourceName);
-        return { foundInvite: inv, foundLocation: sourceName, steps, extractedThumbnailUrl, debugLog };
+        return { foundInvite: inv, foundLocation: sourceName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
       }
     }
     step3Logs.push('No direct Discord invite found in video descriptions.');
@@ -724,7 +726,7 @@ export async function runChannelInspection(channelData: {
       if (crawlRes.foundInvite) {
         step5Logs.push(`Discord invite found! ${crawlRes.details}`);
         addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', 'FOUND', step5Logs, crawlRes.foundInvite, locName);
-        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog };
+        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
       }
     }
     step5Logs.push('No Discord invite found in linked websites.');
@@ -749,7 +751,7 @@ export async function runChannelInspection(channelData: {
       if (crawlRes.foundInvite) {
         step6Logs.push(`Discord invite found! ${crawlRes.details}`);
         addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', 'FOUND', step6Logs, crawlRes.foundInvite, locName);
-        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog };
+        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
       }
     }
     step6Logs.push('No Discord invite found in social profile bios.');
@@ -762,5 +764,5 @@ export async function runChannelInspection(channelData: {
     debugLog.failureStep = 'ALL_EXHAUSTED';
   }
 
-  return { foundInvite: null, steps, extractedThumbnailUrl, debugLog };
+  return { foundInvite: null, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
 }

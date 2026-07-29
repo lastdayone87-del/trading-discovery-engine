@@ -19,7 +19,8 @@ import {
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
-  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport
+  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
+  listChannelsPage, getChannelListingRevision
 } from './server/db';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
@@ -162,21 +163,12 @@ async function startServer() {
   app.get('/api/channels', async (req, res) => {
     try {
       const includeRejected = req.query.include_rejected === 'true';
-      const allChannels = await getAllChannels();
-      if (includeRejected) {
-        res.json(allChannels);
-      } else {
-        const activeChannels = allChannels.filter(c =>
-          c.country_status !== 'REJECTED' &&
-          c.scan_status !== 'SKIPPED_EXCLUDED' &&
-          c.trading_status !== 'NON_TRADING'
-        );
-        res.json(activeChannels);
-      }
+      res.json(await listChannelsPage({includeRejected,limit:Number(req.query.limit||100),offset:Number(req.query.offset||0),search:req.query.search as string|undefined,country:req.query.country as string|undefined,countryStatus:req.query.country_status as string|undefined,tradingStatus:req.query.trading_status as string|undefined,discordStatus:req.query.discord_status as string|undefined,scanStatus:req.query.scan_status as string|undefined}));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
+  app.get('/api/channels-revision',async(req,res)=>{try{res.json(await getChannelListingRevision(req.query.include_rejected==='true'));}catch(err:any){res.status(500).json({error:err.message});}});
 
   // Dedicated diagnostics view for rejected / excluded channels
   app.get('/api/channels/diagnostics/rejected', async (req, res) => {

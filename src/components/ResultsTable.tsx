@@ -1,5 +1,5 @@
 import { apiFetch } from '../apiClient';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ChannelRecord, ReviewQueueItem } from '../types';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
 
@@ -9,11 +9,13 @@ interface Props {
   onInspect: (channel: ChannelRecord) => void;
   onReviewCompleted?: () => Promise<void>;
   reviewEnabled?: boolean;
+  onFiltersChange?: (filters:DashboardChannelFilters)=>void;
 }
+export interface DashboardChannelFilters {search:string;country:string;countryStatus:string;tradingStatus:string;discordStatus:string;scanStatus:string}
 
 type ReviewAction = 'approve' | 'reject' | 'force-rescan';
 
-export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, onReviewCompleted, reviewEnabled = false }) => {
+export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, onReviewCompleted, reviewEnabled = false, onFiltersChange }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCountry, setSelectedCountry] = useState('ALL');
   const [selectedCountryStatus, setSelectedCountryStatus] = useState('ALL');
@@ -32,7 +34,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   const [reviewDetails, setReviewDetails] = useState<ReviewQueueItem | null>(null);
   const [decidedChannelIds, setDecidedChannelIds] = useState<Set<string>>(() => new Set());
 
-  const countries = Array.from(new Set(channels.map(c => c.country)));
+  const countries = useMemo(()=>Array.from(new Set(channels.map(c => c.country))),[channels]);
 
   useEffect(() => {
     if (!reviewEnabled) return;
@@ -44,7 +46,9 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     return () => { active = false; };
   }, [reviewEnabled]);
 
-  const filteredChannels = channels.filter(c => {
+  useEffect(()=>{if(!onFiltersChange)return;const timer=setTimeout(()=>onFiltersChange({search:searchTerm,country:selectedCountry,countryStatus:selectedCountryStatus,tradingStatus:selectedTradingStatus,discordStatus:selectedDiscordStatus,scanStatus:selectedScanStatus}),200);return()=>clearTimeout(timer);},[searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,onFiltersChange]);
+
+  const filteredChannels = useMemo(()=>channels.filter(c => {
     const matchesSearch = c.channel_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
       c.youtube_url.toLowerCase().includes(searchTerm.toLowerCase());
 
@@ -56,7 +60,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     const matchesReviewView = !pendingReviewOnly || (c.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(c.channel_id));
 
     return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesReviewView;
-  });
+  }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds]);
 
   const handleCopyLink = (url: string, id: string) => {
     navigator.clipboard.writeText(url);
@@ -432,6 +436,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       </div>
                       <div className="text-[10px] text-slate-500 dark:text-slate-400 mt-1">
                         {(c.quality_score || 0) >= 60 ? 'Active Educational' : 'Standard Creator'}
+                      </div>
+                      <div className="text-[10px] text-slate-500 dark:text-slate-400 mt-1" title={c.latest_upload_at ? `Latest upload ${new Date(c.latest_upload_at).toLocaleString()}` : 'Upload activity has not been observed'}>
+                        Activity: <span className="font-semibold">{(c.activity_band || 'UNKNOWN').replaceAll('_',' ')}</span>
+                        {c.latest_upload_at ? ` · ${new Date(c.latest_upload_at).toLocaleDateString()}` : ''}
                       </div>
                     </td>
 

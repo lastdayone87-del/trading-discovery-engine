@@ -176,7 +176,15 @@ function rowToChannel(row: any): ChannelRecord {
     trading_status: row.trading_status || 'UNCERTAIN',
     trading_confidence_score: row.trading_confidence_score || 0,
     trading_category: row.trading_category || 'General Trading',
-    trading_relevance_breakdown: parseJson(row.trading_relevance_breakdown, undefined)
+    trading_relevance_breakdown: parseJson(row.trading_relevance_breakdown, undefined),
+    country_metadata_status: row.country_metadata_status || 'NOT_REQUESTED',
+    country_metadata_checked_at: iso(row.country_metadata_checked_at),
+    latest_upload_at: iso(row.latest_upload_at),
+    uploads_last_30_days: row.uploads_last_30_days || 0,
+    uploads_last_90_days: row.uploads_last_90_days || 0,
+    uploads_last_365_days: row.uploads_last_365_days || 0,
+    activity_band: row.activity_band || 'UNKNOWN', activity_score: row.activity_score ?? 50,
+    activity_observed_at: iso(row.activity_observed_at)
   };
 }
 
@@ -184,6 +192,30 @@ export async function getAllChannels(): Promise<ChannelRecord[]> {
   const db = await getDb();
   const res = await db.query('SELECT * FROM channels ORDER BY first_seen DESC');
   return res.rows.map(rowToChannel);
+}
+
+export async function listChannelsPage(args:{includeRejected:boolean;limit:number;offset:number;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
+  const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
+  const clauses=[args.includeRejected?'TRUE':`country_status <> 'REJECTED' AND scan_status <> 'SKIPPED_EXCLUDED' AND trading_status <> 'NON_TRADING'`]; const values:any[]=[];
+  const add=(sql:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(sql.replace('?',`$${values.length}`));}};
+  add(`(channel_name ILIKE '%'||?||'%' OR youtube_url ILIKE '%'||?||'%')`,args.search);
+  // Search has two placeholders but one value; normalize the second reference.
+  if(args.search) clauses[clauses.length-1]=clauses[clauses.length-1].replace('?',`$${values.length}`);
+  add('country=?',args.country); add('country_status=?',args.countryStatus); add('trading_status=?',args.tradingStatus);
+  add('discord_status=?',args.discordStatus); add('scan_status=?',args.scanStatus);
+  const where=clauses.join(' AND ');
+  const columns=`channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at`;
+  const [page,summary]=await Promise.all([
+    db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY first_seen DESC,channel_id LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
+    db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values)
+  ]);
+  return {items:page.rows.map(rowToChannel),total:Number(summary.rows[0].total||0),revision:iso(summary.rows[0].revision)};
+}
+
+export async function getChannelListingRevision(includeRejected=false):Promise<{total:number;revision:string|null}> {
+  const db=await getDb(); const where=includeRejected?'TRUE':`country_status <> 'REJECTED' AND scan_status <> 'SKIPPED_EXCLUDED' AND trading_status <> 'NON_TRADING'`;
+  const result=await db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`);
+  return {total:Number(result.rows[0].total||0),revision:iso(result.rows[0].revision)};
 }
 
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {
@@ -195,17 +227,21 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
 export async function upsertChannel(channel: ChannelRecord): Promise<void> {
   const db = await getDb();
   await db.query(`INSERT INTO channels (
-    channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,updated_at
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,now())
+    channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,updated_at
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,now())
   ON CONFLICT(channel_id) DO UPDATE SET
-    channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,discord_status=excluded.discord_status,discord_invite=excluded.discord_invite,scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,updated_at=now()`, [
+    channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,discord_status=excluded.discord_status,discord_invite=excluded.discord_invite,scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=excluded.subscriber_count,channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,updated_at=now()`, [
     channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
     channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
     channel.first_seen || new Date().toISOString(), channel.last_checked || null, null, JSON.stringify(channel.inspection_trail || []),
     channel.subscriber_count || null, channel.channel_thumbnail_url || null, channel.quality_score || 0,
     channel.quality_breakdown ? JSON.stringify(channel.quality_breakdown) : null, channel.trading_status || 'UNCERTAIN',
     channel.trading_confidence_score || 0, channel.trading_category || 'General Trading',
-    channel.trading_relevance_breakdown ? JSON.stringify(channel.trading_relevance_breakdown) : null
+    channel.trading_relevance_breakdown ? JSON.stringify(channel.trading_relevance_breakdown) : null,
+    channel.country_metadata_status || 'NOT_REQUESTED', channel.country_metadata_checked_at || null,
+    channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
+    channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
+    channel.activity_observed_at || null
   ]);
 }
 
