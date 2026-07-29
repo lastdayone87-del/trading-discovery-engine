@@ -19,7 +19,8 @@ import {
   finishQuotaReservation,
   getAppSetting,
   heartbeatJob,
-  recordQueryRunSightings
+  recordQueryRunSightings,
+  getDailyYouTubeQuotaBudget
 } from './db';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
@@ -191,8 +192,8 @@ export async function processNextSearchJob(
       channel.scan_status = 'ENRICHING';
       channel.scan_attempts = job.attempts;
       await upsertChannel(channel);
-      const dailyBudget = Number(await getAppSetting('daily_youtube_quota_budget', process.env.DAILY_YOUTUBE_QUOTA_BUDGET || '9000'));
-      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '20'));
+      const dailyBudget = getDailyYouTubeQuotaBudget();
+      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
         units: 101, dailyBudget, allocationPercent: enrichmentPercent
@@ -220,6 +221,7 @@ export async function processNextSearchJob(
     if (queryRunId) await startQueryRun(queryRunId);
     if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
+    if(queryRunId&&pageNumber>1){const budget=getDailyYouTubeQuotaBudget();const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent})){await failQueryRun(queryRunId,new Error('Autonomous quota allocation exhausted.'),true);await completeJob(job.id);return true;}}
     if(queryRunId&&pageNumber>1){const budget=Number(await getAppSetting('daily_youtube_quota_budget','9000'));const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent})){await failQueryRun(queryRunId,new Error('Autonomous quota allocation exhausted.'),true);await completeJob(job.id);return true;}}
     const searchPage = queryRunId ? await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering) : null;
     const extracted = searchPage?.channels || await searchYouTubeChannels(query, country, vocab, retrievalLane);
@@ -594,8 +596,8 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
   const minNovelty = Math.max(0, Number(await getAppSetting('manual_search_min_new_channel_ratio', '0.20')));
   const maxDuplicate = Math.min(1, Number(await getAppSetting('manual_search_max_duplicate_ratio', '0.80')));
   const maxLowYield = Math.max(1, Number(await getAppSetting('manual_search_max_low_yield_pages', '2')));
-  const dailyBudget = Number(await getAppSetting('daily_youtube_quota_budget', process.env.DAILY_YOUTUBE_QUOTA_BUDGET || '9000'));
-  const quotaPercent = Number(await getAppSetting('manual_search_quota_percent', '20'));
+  const dailyBudget = getDailyYouTubeQuotaBudget();
+  const quotaPercent = Number(await getAppSetting('manual_search_quota_percent', process.env.DISCOVERY_MANUAL_QUOTA_PERCENT || '20'));
   const operationId = `${sessionId}:${pageNumber}`;
   const queryVariant = session.generatedQueryVariants[variantIndex] || session.originalQuery;
   const reserved = await tryReserveQuota({ operationType: 'MANUAL_SEARCH_PAGE', operationId, allocation: 'MANUAL', units: 100, dailyBudget, allocationPercent: quotaPercent });
