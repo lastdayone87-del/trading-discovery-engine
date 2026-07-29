@@ -1,4 +1,6 @@
 export type CountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
+export type CountryMetadataStatus = 'AVAILABLE_DECLARED' | 'AVAILABLE_NOT_DECLARED' | 'UNAVAILABLE' | 'NOT_REQUESTED';
+export type ChannelActivityBand = 'VERY_ACTIVE' | 'ACTIVE' | 'OCCASIONAL' | 'DORMANT' | 'UNKNOWN';
 
 export type DiscordStatus = 'PENDING' | 'NOT_FOUND' | 'ACTIVE' | 'ACTIVE_LOW_VOLUME' | 'NON_TRADING' | 'DEAD' | 'UNCERTAIN';
 
@@ -130,6 +132,15 @@ export interface ChannelRecord {
   trading_confidence_score?: number; // 0 to 100
   trading_category?: TradingCategory | string;
   trading_relevance_breakdown?: TradingRelevanceBreakdown;
+  country_metadata_status?: CountryMetadataStatus;
+  country_metadata_checked_at?: string | null;
+  latest_upload_at?: string | null;
+  uploads_last_30_days?: number;
+  uploads_last_90_days?: number;
+  uploads_last_365_days?: number;
+  activity_band?: ChannelActivityBand;
+  activity_score?: number;
+  activity_observed_at?: string | null;
 }
 
 export interface QueryRecord {

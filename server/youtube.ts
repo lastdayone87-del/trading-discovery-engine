@@ -1,4 +1,4 @@
-import { CountryVocabulary } from '../src/types';
+import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary } from '../src/types';
 import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEvent } from './db';
 import { executeProviderCall } from './providerResilience';
 import { RetrievalLane } from './retrievalLanes';
@@ -76,6 +76,16 @@ export interface DiscoveredChannelRaw {
   videoDescriptions?: string[];
   subscriberCount?: string;
   channelThumbnailUrl?: string;
+  countryMetadataStatus?: CountryMetadataStatus;
+  countryMetadataCheckedAt?: string;
+  uploadTimestamps?: string[];
+  latestUploadAt?: string;
+  uploadsLast30Days?: number;
+  uploadsLast90Days?: number;
+  uploadsLast365Days?: number;
+  activityBand?: ChannelActivityBand;
+  activityScore?: number;
+  activityObservedAt?: string;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
@@ -314,6 +324,15 @@ export async function fetchYouTubeChannelEnrichment(
 
       const description = channel.snippet?.description || fallback.description;
       const recentItems = recentData.items || [];
+      const observedAt = new Date();
+      const uploadTimestamps = recentItems.map((item: any) => item.snippet?.publishedAt).filter((value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value)));
+      const countSince = (days: number) => uploadTimestamps.filter(value => Date.parse(value) >= observedAt.getTime() - days * 86_400_000).length;
+      const latestUploadAt = uploadTimestamps.slice().sort().at(-1);
+      const uploadsLast30Days = countSince(30), uploadsLast90Days = countSince(90), uploadsLast365Days = countSince(365);
+      const ageDays = latestUploadAt ? (observedAt.getTime() - Date.parse(latestUploadAt)) / 86_400_000 : Infinity;
+      const activityBand: ChannelActivityBand = !latestUploadAt ? 'UNKNOWN' : ageDays <= 30 ? 'VERY_ACTIVE' : ageDays <= 90 ? 'ACTIVE' : ageDays <= 365 ? 'OCCASIONAL' : 'DORMANT';
+      const activityScore = !latestUploadAt ? 50 : Math.max(5, Math.round(100 * Math.exp(-ageDays / 365)));
+      const officialCountry = channel.brandingSettings?.channel?.country;
       const extractedLinks = description.match(/https?:\/\/[^\s)\]}]+/g) || [];
 
       return {
@@ -324,10 +343,14 @@ export async function fetchYouTubeChannelEnrichment(
         description,
         videoTitles: recentItems.map((item: any) => item.snippet?.title).filter(Boolean),
         videoDescriptions: recentItems.map((item: any) => item.snippet?.description).filter(Boolean),
-        locationTag: channel.snippet?.country || fallback.locationTag,
+        locationTag: officialCountry || fallback.locationTag,
+        countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED',
+        countryMetadataCheckedAt: observedAt.toISOString(),
         channelLinks: Array.from(new Set([...(fallback.channelLinks || []), ...extractedLinks])),
         subscriberCount: channel.statistics?.subscriberCount || fallback.subscriberCount,
-        channelThumbnailUrl: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.default?.url || fallback.channelThumbnailUrl
+        channelThumbnailUrl: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.default?.url || fallback.channelThumbnailUrl,
+        uploadTimestamps, latestUploadAt, uploadsLast30Days, uploadsLast90Days, uploadsLast365Days,
+        activityBand, activityScore, activityObservedAt: observedAt.toISOString()
       };
     } catch (error: any) {
       if (isQuotaExceeded(error)) quotaExceededCount++;
@@ -339,4 +362,31 @@ export async function fetchYouTubeChannelEnrichment(
   if (quotaExceededCount === keyPool.length) youtubePoolBackoff.beginAcquisition();
 
   throw lastError || new Error(`YouTube enrichment failed for '${channelId}'.`);
+}
+
+/** One-unit metadata hydration used only when country evidence remains uncertain. */
+export async function fetchYouTubeChannelCountryMetadata(channelId: string, fallback: DiscoveredChannelRaw): Promise<DiscoveredChannelRaw> {
+  const keys = getYouTubeKeyPool();
+  const checkedAt = new Date().toISOString();
+  if (!keys.length) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
+  try { youtubePoolBackoff.beginAcquisition(); }
+  catch { return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt }; }
+  let quotaExceededCount = 0;
+  for (let attempt = 0; attempt < keys.length; attempt++) {
+    const index = (activeKeyIndex + attempt) % keys.length;
+    try {
+      const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,brandingSettings&id=${encodeURIComponent(channelId)}&key=${keys[index]}`;
+      const response = await youtubeFetch(url, 'channel-country-metadata', 1, attempt + 1);
+      const data = await response.json();
+      const channel = data.items?.[0];
+      if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
+      await incrementQuota(1); activeKeyIndex = index; youtubePoolBackoff.reportSuccess();
+      const officialCountry = channel.brandingSettings?.channel?.country;
+      return { ...fallback, description: channel.snippet?.description || fallback.description,
+        locationTag: officialCountry || fallback.locationTag,
+        countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
+    } catch (error) { if (isQuotaExceeded(error)) quotaExceededCount++; }
+  }
+  youtubePoolBackoff.reportFailure(quotaExceededCount === keys.length);
+  return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
 }

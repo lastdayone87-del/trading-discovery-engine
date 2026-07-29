@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { ChannelRecord, QueueStatus, QuotaInfo } from '../types';
 import { Radar, Table, Clock, Cpu, Settings, ShieldCheck, Database, Radio, Brain } from 'lucide-react';
 
@@ -8,17 +8,20 @@ interface Props {
   channels: ChannelRecord[];
   queueStatus: QueueStatus | null;
   quotaInfo: QuotaInfo | null;
+  channelTotal?: number;
 }
 
-export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, channels, queueStatus, quotaInfo }) => {
-  const activeDiscords = channels.filter(c => c.discord_status === 'ACTIVE' || c.discord_status === 'ACTIVE_LOW_VOLUME').length;
-  const pendingScans = channels.filter(c => ['PENDING', 'LOCKED', 'ENRICHMENT_PENDING', 'ENRICHING', 'NEEDS_REVIEW'].includes(c.scan_status)).length;
+export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, channels, queueStatus, quotaInfo, channelTotal }) => {
+  const {activeDiscords,pendingScans}=useMemo(()=>({
+    activeDiscords:channels.filter(c => c.discord_status === 'ACTIVE' || c.discord_status === 'ACTIVE_LOW_VOLUME').length,
+    pendingScans:channels.filter(c => ['PENDING', 'LOCKED', 'ENRICHMENT_PENDING', 'ENRICHING', 'NEEDS_REVIEW'].includes(c.scan_status)).length
+  }),[channels]);
 
   const navItems = [
     { id: 'discovery', label: 'Discovery & Search', icon: Radar },
     { id: 'intelligence', label: 'Query Intelligence', icon: Brain },
     { id: 'regression', label: 'Regression Suite', icon: ShieldCheck },
-    { id: 'results', label: `Channels Table (${channels.length})`, icon: Table },
+    { id: 'results', label: `Channels Table (${channelTotal ?? channels.length})`, icon: Table },
     { id: 'pending', label: 'Pending & Re-checks', icon: Clock },
     { id: 'queues', label: 'Queue Monitor', icon: Cpu },
     { id: 'settings', label: 'Country & Vocabulary', icon: Settings }
@@ -56,7 +59,7 @@ export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, channels, que
             <div className="px-3 py-1.5 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center gap-2">
               <Database className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
               <span className="text-slate-500 dark:text-slate-400">Stored Channels:</span>
-              <span className="font-extrabold font-mono text-slate-900 dark:text-white">{channels.length}</span>
+              <span className="font-extrabold font-mono text-slate-900 dark:text-white">{channelTotal ?? channels.length}</span>
             </div>
 
             <div className="px-3 py-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-900/50 flex items-center gap-2 text-emerald-800 dark:text-emerald-300">

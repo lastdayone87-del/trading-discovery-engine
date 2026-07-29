@@ -388,7 +388,8 @@ export async function inspectAndValidateChannel(
         description: rawDetails?.description || channel.inspection_trail?.map(t => t.details || '').join(' ') || channel.channel_name,
         videoTitles: rawDetails?.videoTitles || [channel.channel_name],
         locationTag: rawDetails?.locationTag,
-        externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : [])
+        externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : []),
+        metadataStatus: rawDetails?.countryMetadataStatus || channel.country_metadata_status
       },
       channel.country
     );
@@ -430,6 +431,21 @@ export async function inspectAndValidateChannel(
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description
     });
+
+    // Live About-page hydration can reveal stronger country evidence than the
+    // search snippet. Re-evaluate before persisting any discovered community.
+    const liveCountry = await validateChannelCountry({channelName:channel.channel_name,
+      description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
+      locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
+      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, channel.country);
+    if (liveCountry.status === 'REJECTED') {
+      channel.country_status='REJECTED'; channel.country=liveCountry.detectedCountry || channel.country;
+      channel.confidence_score=liveCountry.score; channel.discord_invite=null; channel.discord_status='NOT_FOUND';
+      channel.scan_status='COMPLETED'; channel.last_checked=now;
+      channel.inspection_trail=[countryStep,{step:'COUNTRY_VALIDATION',title:`Country Validation (${channel.country}) — Live About`,status:'REJECTED',details:liveCountry.decisionLogs,timestamp:now}];
+      return;
+    }
+    if (liveCountry.detectedCountry) { channel.country=liveCountry.detectedCountry; channel.country_status=liveCountry.status; channel.confidence_score=liveCountry.score; }
 
     // Combine Country Validation step as Step 1 with Discord Inspection steps
     channel.inspection_trail = [countryStep, ...inspection.steps];
