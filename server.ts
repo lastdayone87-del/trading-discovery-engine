@@ -30,6 +30,7 @@ import { inspectConceptGraph, moderateConcept } from './server/conceptGraph';
 import { buildCatalog, createEvaluation, inspectEvaluations, reviewCatalog } from './server/offlineEvaluation';
 import { createExperiment, inspectExperiments, transitionExperiment } from './server/terminologyTrials';
 import { approveCatalog, inspectCatalogs, publishCatalog, stageCatalog, transitionLifecycle } from './server/catalogPublication';
+import { inspectEvidenceGraph, proposePlaylistInspection } from './server/evidenceGraphAdapters';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -108,6 +109,8 @@ async function startServer() {
   app.get('/api/research-programs',async(req,res)=>{try{res.json(await inspectPassivePrograms(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/research-programs/price-action-trading',async(req,res)=>{try{res.json(await inspectTopicPilot());}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/research-programs/price-action-trading/coverage',async(req,res)=>{try{res.json(await inspectCoverageLifecycle());}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/evidence-graph',async(req,res)=>{try{res.json(await inspectEvidenceGraph(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/acquisition-adapters/playlist/proposals',async(req,res)=>{try{res.status(201).json(await proposePlaylistInspection({...req.body,programKey:req.body.programKey||'price-action-trading'}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.get('/api/corpus',async(req,res)=>{try{res.json(await inspectCorpus(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/corpus/documents/:id',async(req,res)=>{try{res.json(await inspectDocument(req.params.id));}catch(err:any){res.status(err.message==='Corpus document not found.'?404:500).json({error:err.message,requestId:req.requestId});}});
   app.get('/api/candidate-assertions',async(req,res)=>{try{res.json(await inspectCandidateAssertions(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
