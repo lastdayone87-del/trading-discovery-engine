@@ -1,10 +1,11 @@
 import { getDb } from './db';
 import type { RetrievalLane } from './retrievalLanes';
+import type { SearchOrdering } from './searchOrdering';
 import type { ContinuationDecision } from './continuationPolicy';
 import type { QueryFunnelMetrics } from './queryPerformance';
 
 export interface AutonomousPageObservation {
-  queryRunId:string; pageNumber:number; inputPageToken:string|null; nextPageToken:string|null; retrievalLane:RetrievalLane;
+  queryRunId:string; pageNumber:number; inputPageToken:string|null; nextPageToken:string|null; retrievalLane:RetrievalLane; searchOrdering:SearchOrdering;
   rawResultCount:number; distinctCreatorCount:number; knownCreators:number; newCreators:number; confirmedCreators:number;
   qualityConfirmedCreators:number; averageQualityScore:number; countryPrecision:number; communityDiversity:number;
   noveltyRatio:number; duplicateRatio:number; quotaUnits:number; decision:ContinuationDecision; stoppingReason:string|null;
@@ -12,7 +13,7 @@ export interface AutonomousPageObservation {
 }
 
 export async function recordAutonomousPage(p:AutonomousPageObservation):Promise<boolean>{
-  const db=await getDb(); const r=await db.query(`INSERT INTO autonomous_query_page_observations(query_run_id,page_number,input_page_token,next_page_token,retrieval_lane,raw_result_count,distinct_creator_count,known_creators,new_creators,confirmed_creators,quality_confirmed_creators,average_quality_score,country_precision,community_diversity,novelty_ratio,duplicate_ratio,quota_units,marginal_utility,should_continue,decision_reason_codes,primary_reason,stopping_reason,page_metrics) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT(query_run_id,page_number) DO NOTHING RETURNING id`,[p.queryRunId,p.pageNumber,p.inputPageToken,p.nextPageToken,p.retrievalLane,p.rawResultCount,p.distinctCreatorCount,p.knownCreators,p.newCreators,p.confirmedCreators,p.qualityConfirmedCreators,p.averageQualityScore,p.countryPrecision,p.communityDiversity,p.noveltyRatio,p.duplicateRatio,p.quotaUnits,p.decision.marginalUtility,p.decision.shouldContinue,JSON.stringify(p.decision.reasonCodes),p.decision.primaryReason,p.stoppingReason,JSON.stringify(p.pageMetrics)]); return !!r.rowCount;
+  const db=await getDb(); const r=await db.query(`INSERT INTO autonomous_query_page_observations(query_run_id,page_number,input_page_token,next_page_token,retrieval_lane,search_ordering,raw_result_count,distinct_creator_count,known_creators,new_creators,confirmed_creators,quality_confirmed_creators,average_quality_score,country_precision,community_diversity,novelty_ratio,duplicate_ratio,quota_units,marginal_utility,should_continue,decision_reason_codes,primary_reason,stopping_reason,page_metrics) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT(query_run_id,page_number) DO NOTHING RETURNING id`,[p.queryRunId,p.pageNumber,p.inputPageToken,p.nextPageToken,p.retrievalLane,p.searchOrdering,p.rawResultCount,p.distinctCreatorCount,p.knownCreators,p.newCreators,p.confirmedCreators,p.qualityConfirmedCreators,p.averageQualityScore,p.countryPrecision,p.communityDiversity,p.noveltyRatio,p.duplicateRatio,p.quotaUnits,p.decision.marginalUtility,p.decision.shouldContinue,JSON.stringify(p.decision.reasonCodes),p.decision.primaryReason,p.stoppingReason,JSON.stringify(p.pageMetrics)]); return !!r.rowCount;
 }
 
 export async function autonomousPageExists(runId:string,pageNumber:number):Promise<boolean>{const db=await getDb();const r=await db.query('SELECT 1 FROM autonomous_query_page_observations WHERE query_run_id=$1 AND page_number=$2',[runId,pageNumber]);return !!r.rowCount;}

@@ -4,6 +4,7 @@ import pg from 'pg';
 import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QueryRecord, QueryExecutionLog, ExtractedTermRecord, DiscoverySource } from '../src/types';
 import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
 import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
+import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -246,6 +247,7 @@ export interface ScheduledAutonomousRun {
   jobId: string;
   query: QueryRecord;
   retrievalLane: RetrievalLane;
+  searchOrdering: SearchOrdering;
 }
 
 function queryComponents(query: QueryRecord): Array<{ type: string; term: string; tier: number; position: number }> {
@@ -294,6 +296,8 @@ export async function scheduleAutonomousQueryRuns(
   const db = await getDb();
   const configuredVideoPercent = Number(await getAppSetting('discovery_video_lane_percent', process.env.DISCOVERY_VIDEO_LANE_PERCENT || '70'));
   const videoLanePercent = Math.min(100, Math.max(0, Number.isFinite(configuredVideoPercent) ? configuredVideoPercent : 70));
+  const configuredDatePercent = Number(await getAppSetting('discovery_date_ordering_video_percent', process.env.DISCOVERY_DATE_ORDERING_VIDEO_PERCENT || '10'));
+  const datePercent = Math.min(100, Math.max(0, Number.isFinite(configuredDatePercent) ? configuredDatePercent : 10));
   const client = await db.connect();
   const scheduled: ScheduledAutonomousRun[] = [];
   try {
@@ -323,11 +327,16 @@ export async function scheduleAutonomousQueryRuns(
       const video = laneCounts.rows[0]?.video || 0;
       const total = laneCounts.rows[0]?.total || 0;
       const retrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
+      const orderingCounts = await client.query(
+        `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
+         FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
+      );
+      const searchOrdering = allocateSearchOrdering(retrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
       const run = await client.query(
-        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,quota_reserved,metadata)
-         VALUES($1,$2,'automated_query',$3,$4,$5,100,$6) RETURNING id`,
-        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, JSON.stringify(candidate.query.generation_metadata || {})]
+        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata)
+         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7) RETURNING id`,
+        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify(candidate.query.generation_metadata || {})]
       );
       const runId = run.rows[0].id;
       for (const component of queryComponents(candidate.query)) {
@@ -346,7 +355,8 @@ export async function scheduleAutonomousQueryRuns(
           query: candidate.query.query,
           country: candidate.query.country,
           source: 'automated_query',
-          retrievalLane
+          retrievalLane,
+          searchOrdering
         }), `search-run:${runId}`]
       );
       const jobId = job.rows[0].id;
@@ -356,7 +366,7 @@ export async function scheduleAutonomousQueryRuns(
          VALUES('SEARCH_YOUTUBE',$1,'AUTONOMOUS',100,now()+interval '20 minutes')`,
         [runId]
       );
-      scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane });
+      scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     await client.query('COMMIT');
     return scheduled;

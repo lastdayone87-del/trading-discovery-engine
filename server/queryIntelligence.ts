@@ -424,7 +424,7 @@ export async function generateCandidateQueriesForCountry(
 export async function evaluateQueryPerformance(
   queryRecord: QueryRecord,
   metrics: QueryFunnelMetrics,
-  attribution: { retrievalLane?: string; quotaConsumed?: number } = {}
+  attribution: { retrievalLane?: string; searchOrdering?: string; quotaConsumed?: number } = {}
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
   const performanceScore = metrics.performanceScore;
   const newCollection = selectQueryCollection(queryRecord.collection, queryRecord.times_executed, metrics);
@@ -442,7 +442,8 @@ export async function evaluateQueryPerformance(
     queryRecord,
     metrics,
     attribution.quotaConsumed || 0,
-    attribution.retrievalLane
+    attribution.retrievalLane,
+    attribution.searchOrdering
   );
 
   return {
