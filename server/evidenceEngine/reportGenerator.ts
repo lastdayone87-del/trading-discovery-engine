@@ -51,7 +51,7 @@ export interface FullClassificationReport {
     netScore: number;
   };
   classificationOutcome: {
-    finalStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
+    finalStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
     finalConfidence: number;
     primaryCategory: string;
     multiVideoConsistencyRatio: number;

@@ -1269,7 +1269,7 @@ export async function runRegressionTestSuite(customRunLabel?: string): Promise<R
     channel_name: string;
     country: string;
     ground_truth_trading: 'TRADING_CONFIRMED' | 'NON_TRADING';
-    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
+    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
     ground_truth_discord: 'ACTIVE' | 'NOT_FOUND';
     predicted_discord: string;
     is_correct_trading: boolean;

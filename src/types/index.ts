@@ -6,7 +6,16 @@ export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHIN
 
 export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 
-export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
+export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED' | 'HUMAN_REJECTED';
+
+export type ReviewState = 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'SUPERSEDED';
+export interface ReviewQueueItem {
+  channelId: string; channelName: string; youtubeUrl: string; country: string;
+  state: ReviewState; reviewVersion: number; evidenceSnapshot: Record<string, unknown>;
+  pendingSince?: string; decidedAt?: string; tradingStatus: TradingStatus;
+  scanStatus: ScanStatus; qualityScore?: number; discordStatus: DiscordStatus;
+  history?: Array<{id:string;decision:'APPROVE'|'REJECT'|'FORCE_RESCAN';previous_status:ReviewState;resulting_status:ReviewState;reviewer:string;decided_at:string;reason:string;notes?:string;review_version:number;evidence_snapshot:Record<string,unknown>}>;
+}
 
 export type TradingCategory =
   | 'Futures'
@@ -261,7 +270,7 @@ export interface RegressionRunRecord {
     channel_name: string;
     country: string;
     ground_truth_trading: 'TRADING_CONFIRMED' | 'NON_TRADING';
-    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
+    predicted_trading: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
     ground_truth_discord: 'ACTIVE' | 'NOT_FOUND';
     predicted_discord: string;
     is_correct_trading: boolean;
