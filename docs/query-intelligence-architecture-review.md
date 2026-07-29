@@ -17,6 +17,12 @@ value. Curated terms should remain immutable control arms and a cold-start fallb
 However, the production-readiness blockers already identified—operator authorization,
 staging/restart proof, backups, provider timeouts, and trustworthy observability—come
 first. A self-learning loop magnifies measurement, security, and operational defects.
+After those foundations, this is a strong *discovery-quality* investment because it
+addresses vocabulary coverage rather than merely optimizing a fixed search space. If
+the product objective is maximum ecosystem coverage, however, the higher-order
+investment is the persistent topic-exploration controller described below: it can use
+learned vocabulary while also pursuing graph, website, playlist, relationship, and
+other acquisition paths.
 After those foundations, this is the strongest remaining *discovery-quality*
 investment because it addresses vocabulary coverage rather than merely optimizing a
 fixed search space.
@@ -152,6 +158,13 @@ overwrite them into one label.
 
 ### Strategic answer
 
+It is one of the strongest improvements **after operational readiness**, but it is not
+the strongest if the goal is total discovery coverage. Adaptive pagination, ordering,
+and bandit selection can only search more efficiently within known concepts. A concept
+learning layer expands the reachable search space and can reveal regional language,
+emerging instruments, new platforms, and creator-native content formats. A persistent
+topic-exploration controller goes further by deciding which search and non-search
+branches remain worth pursuing until topic-level marginal coverage is genuinely low.
 Yes, **after operational readiness**, evidence-derived query expansion is the
 strongest remaining improvement to discovery recall. Adaptive pagination, ordering,
 and bandit selection can only search more efficiently within known concepts. A concept
@@ -378,6 +391,325 @@ control share and instant rollback.
    knowledge, experimentation, and catalog repositories before adding more lifecycle
    writes.
 
+## Orthogonal review: from search executor to persistent researcher
+
+### Does the current engine already explore a strong concept deeply?
+
+**No.** It is persistent at executing and resuming individual jobs, but it is not
+persistent about pursuing a research objective.
+
+Today the durable unit of intent is effectively a query run. Adaptive pagination can
+follow that query's provider continuation token while the next page remains productive,
+but it stops at page, creator, or consecutive-low-yield ceilings. Once the run ends,
+its aggregate performance updates the query and terminology records. The scheduler
+then selects another cooldown-eligible query, deliberately rotating countries, intents,
+and primary terms. That is useful portfolio diversification, but it means no durable
+owner asks, “What remains unknown about price action trading, and what is the best next
+way to reduce that uncertainty?”
+
+The engine does preserve discovered channels and some evidence, but a successful
+channel, phrase, website, playlist, or community does not become a typed frontier node
+whose unexplored relationships generate follow-up work. Enrichment exists to classify
+a channel, not to recursively expand the discovery graph. Terminology observations can
+eventually produce another search atom, but that is an indirect vocabulary feedback
+loop rather than a coherent continuation of the originating research path.
+
+The distinction is important:
+
+- **Job durability** answers whether a known action survives a restart.
+- **Pagination** answers whether another page of the same result set is worthwhile.
+- **Query intelligence** answers which search string to execute next.
+- **Persistent research** answers which unresolved hypothesis, relationship, source,
+  or acquisition action has the highest expected marginal coverage for a long-lived
+  topic.
+
+Only the first three exist today.
+
+### The architectural bottleneck
+
+The primary bottleneck is not the query planner or the page ceiling. It is the absence
+of a durable **exploration state above queries**.
+
+There is no first-class object representing a topic/research program with:
+
+- a stable objective and explicit scope;
+- a graph of concepts, creators, content, websites, communities, markets, countries,
+  and the evidence connecting them;
+- a frontier of untried actions and unresolved hypotheses;
+- coverage and saturation estimates by region, language, source, and creator cluster;
+- a topic budget, action costs, and opportunity cost against other topics;
+- a history of attempted strategies, negative results, and cooldowns;
+- stopping, sleeping, and reactivation criteria.
+
+Consequently, useful evidence terminates in a record instead of creating a bounded set
+of new research opportunities. The query is both the planning unit and the attribution
+unit, so paths discovered *inside* a query cannot compete independently for future
+budget. Global cooldown and diversity policies then move the scheduler away even when
+one branch remains highly promising. The current system optimizes the next search run;
+it does not optimize completeness of a topic.
+
+Several secondary bottlenecks reinforce this behavior:
+
+1. Acquisition is predominantly keyword-to-YouTube-search. Related-channel,
+   collaboration, playlist, website, backlink, community, and cross-platform edges are
+   not modeled as interchangeable actions.
+2. Channel identity and query sightings are stored, but there is no general evidence
+   graph or path provenance suitable for recursive expansion and cycle detection.
+3. Immediate page yield dominates continuation. Some valuable actions have delayed or
+   indirect payoff—for example, reading an authoritative website may reveal three new
+   regional terms but no creator immediately.
+4. “Known channel” is treated mainly as duplicate suppression. A known high-quality
+   creator should also be a high-value research seed whose still-unexplored edges can
+   produce new coverage.
+5. Query-level averages hide branch saturation. One language or creator cluster may be
+   exhausted while another regional branch of the same topic is untouched.
+
+### Should the architecture become topic-centric?
+
+**Yes, but not topic-exclusive.** Make a durable `research_program` (or exploration
+campaign) the unit of objective, coverage, and budget. Keep queries as one type of
+action selected within that program. Replacing the query library with a topic table
+would merely move the same problem up one level; the essential addition is a
+stateful frontier and a common action/outcome model.
+
+A topic such as “price action trading” should resolve to a concept, desired countries
+and languages, quality constraints, acquisition sources, and a coverage objective. It
+then owns many hypotheses and actions:
+
+- search global and local surface forms;
+- combine the concept with instruments, formats, sessions, and regional anchors;
+- inspect recent and historical playlists from authoritative creators;
+- traverse featured/related channels and repeated guest/collaboration relationships;
+- crawl approved creator websites for linked educators and communities;
+- follow community and social identities under explicit policy;
+- mine discovered content for source-bound terminology and regional variants;
+- test translations and aliases locally;
+- revisit previously productive branches after freshness or ecosystem-change signals.
+
+Queries remain important because they are cheap to propose, auditable, and often the
+only provider-supported discovery primitive. They should become leaf actions in a
+larger research plan rather than the container for the plan.
+
+### Recommended architecture: a persistent exploration controller
+
+Add a control plane above the existing durable job queue. It should plan and score
+research actions but delegate execution to the current workers and ingestion gates.
+The minimum domain model is:
+
+#### 1. Research program
+
+`research_program` stores the root concept, scope, countries/locales, inclusion and
+quality objectives, priority, lifecycle (`ACTIVE`, `SLEEPING`, `SATURATED`, `PAUSED`,
+`COMPLETE`), policy version, total/daily budgets, and owner/audit metadata. Programs
+may be permanent; “complete” should mean complete relative to an explicit scope and
+freshness horizon, not that the ecosystem can never change.
+
+#### 2. Evidence graph
+
+Use typed relational nodes and edges initially:
+
+- nodes: concept, term surface, creator identity, channel/account, video/content,
+  playlist, website/domain, community, organization, instrument, market, locale;
+- edges: mentions, authors, links-to, member-of, collaborates-with, features,
+  translated-as, related-to, discovered-by, and same-entity-as;
+- every edge carries source, confidence, observed time, extractor version, and the
+  research path that produced it.
+
+Canonical global entities can be shared by programs. Program-specific discovery state
+must remain separate so one campaign's visit does not falsely imply another campaign
+covered the edge. PostgreSQL edge tables are sufficient initially; a graph database is
+not required to implement best-first traversal.
+
+#### 3. Hypothesis and frontier
+
+`research_hypothesis` represents an unresolved, falsifiable opportunity such as
+“French price-action educators use *lecture du prix*” or “creator A's recurring guests
+lead to an independent futures cluster.” `frontier_action` represents one bounded way
+to test it. Each action records:
+
+- action type and normalized target;
+- parent node/action and full lineage;
+- expected new coverage, verified-creator yield, and information gain;
+- estimated YouTube, web, AI, compute, and human-review costs;
+- uncertainty, risk, novelty, depth, and cluster-diversity features;
+- eligibility time, deduplication key, lease, attempt history, and policy version.
+
+Actions should be idempotently materialized before execution. A unique semantic action
+key prevents graph cycles and repeated spend, while a new validity window allows a
+time-sensitive action to be revisited later.
+
+#### 4. Common action adapters
+
+Define a small action interface independent of source:
+
+`propose -> estimate -> reserve -> execute -> observe -> attribute -> expand`
+
+Initial action types could include `SEARCH_TERM`, `SEARCH_COMBINATION`,
+`CONTINUE_RESULT_PAGE`, `INSPECT_CHANNEL_RELATIONS`, `INSPECT_PLAYLIST`,
+`INSPECT_WEBSITE`, `FOLLOW_CREATOR_LINK`, `TEST_LOCAL_SURFACE`, and
+`REVISIT_STALE_BRANCH`. Each adapter declares cost, policy restrictions, provider
+quota class, expected outcome schema, and how observations can safely expand the
+frontier.
+
+This common contract lets a website inspection compete with another YouTube page on
+expected marginal value rather than living in an unrelated pipeline.
+
+#### 5. Coverage model
+
+Raw counts are not coverage. Maintain a topic coverage matrix over dimensions that
+matter to the product, for example:
+
+- country and language;
+- strategy sub-concept and terminology cluster;
+- instrument and market;
+- creator/community cluster;
+- content format and acquisition source;
+- activity/freshness band and quality tier.
+
+The system cannot know absolute ecosystem recall because no complete denominator
+exists. It can estimate saturation from diminishing capture rate, overlap among
+independent acquisition methods, unseen-species estimators, repeated rediscovery, and
+frontier exhaustion. Report coverage as an estimate with uncertainty, never as a
+literal percentage of all creators.
+
+#### 6. Exploration policy
+
+Use budgeted best-first search before attempting sophisticated reinforcement learning.
+Rank eligible actions approximately by:
+
+`(expected incremental coverage value + information gain + freshness value) / expected total cost`
+
+Then apply constraints for country/trading precision, source policy, maximum graph
+depth, per-domain and per-cluster caps, daily provider quotas, review capacity, and a
+minimum portfolio allocation to other topics. Bayesian posteriors can update expected
+yield by action type and context. Contextual bandits become appropriate only after
+randomized exposure data is available.
+
+Critically, do not greedily maximize immediate new-channel yield. Reserve explicit
+budgets for:
+
+- exploitation of productive branches;
+- breadth across uncovered coverage cells;
+- uncertain high-information actions;
+- new acquisition strategies;
+- periodic freshness probes.
+
+That mixture maximizes durable coverage and reduces the rich-get-richer behavior of a
+pure yield policy.
+
+#### 7. Attribution and expansion
+
+Every result must be attributed to its exact action and path, including duplicate and
+negative outcomes. Successful observations may propose child actions, but expansion
+must be bounded by policy: maximum children per event, entity-cluster contribution
+caps, confidence gates, and deduplication. A proposal is not an execution; it enters
+the frontier and competes for budget.
+
+Delayed enrichment and human-review decisions should update the originating action,
+ancestors, and relevant policy posterior. They must not rewrite immutable raw outcomes.
+This separates evidence collection from later judgment while letting verified quality,
+not initial appearance, drive future allocation.
+
+### Quota-efficient deep exploration
+
+Persistent does not mean infinite or continuously busy. A quota-efficient controller
+needs three scheduling levels:
+
+1. **Portfolio allocator:** distributes daily budgets across research programs based on
+   priority, recent marginal coverage, uncertainty, freshness, and fairness floors.
+2. **Program controller:** selects the best eligible frontier action within a topic and
+   can reserve a small multi-step budget for a coherent branch.
+3. **Provider allocator:** enforces YouTube, web, AI, and review capacity independently,
+   using actual cost reservations and releasing them idempotently.
+
+Use cheap actions to qualify expensive ones. For example, mine already-fetched titles
+and links before issuing another 100-unit search; inspect cached channel metadata before
+calling AI; batch provider lookups; and traverse a website only after domain and policy
+checks. Reuse a fetched artifact globally while attributing its evidentiary value to
+each program that consumes it.
+
+Continuation should occur at two levels:
+
+- **Local continuation:** fetch another page or child edge while that branch has strong
+  marginal utility.
+- **Strategic continuation:** keep the topic active because other branches or coverage
+  cells remain promising even after one query saturates.
+
+The present page policy can remain as the local rule. It should no longer be mistaken
+for the topic stopping rule.
+
+### Stopping, sleeping, and reactivation
+
+A topic should sleep—not be permanently discarded—when all of these are true across a
+minimum evidence window:
+
+- the upper confidence bound on the best frontier action is below its cost-aware
+  threshold;
+- independent acquisition methods mostly rediscover known entity clusters;
+- target coverage cells have either adequate evidence or documented unreachable gaps;
+- no high-information hypotheses remain within the current budget and policy;
+- delayed review/enrichment backlog is small enough that the conclusion is stable.
+
+Hard ceilings remain necessary as circuit breakers, but they should cause a checkpoint
+and rescheduling decision rather than imply semantic exhaustion. Reactivate a sleeping
+program on terminology bursts, new creator/content events, stale coverage, provider
+capability changes, human nomination, or a scheduled freshness probe.
+
+This turns “marginal value is low” into a versioned, auditable decision with uncertainty
+instead of an accidental consequence of cooldown or a page limit.
+
+### Failure modes specific to persistent research
+
+| Risk | Consequence | Control |
+| --- | --- | --- |
+| Runaway graph expansion | Quota exhaustion and noisy evidence | bounded fan-out/depth, semantic dedupe, per-branch budgets |
+| Hub domination | Famous creators absorb all exploration | cluster caps and uncovered-cell reward |
+| Cycles and rediscovery | Repeated work without new coverage | canonical entities, action keys, path-aware visit state |
+| Topic drift | “Price action” expands into generic finance | root-concept relevance checks and drift budgets |
+| Premature saturation | Valuable sparse branches are abandoned | uncertainty-aware upper bounds and breadth floor |
+| Endless low-value persistence | Zombie campaigns consume quota | sleeping criteria, opportunity-cost hurdle, freshness-only probes |
+| Cross-topic double charging | Shared artifacts waste provider calls | global artifact cache with per-program evidence attribution |
+| Deep-path trust decay | Weak edges compound into false branches | confidence propagation, depth penalties, human gates |
+| Delayed-outcome bias | Fast but low-quality actions win budget | provisional rewards and verified delayed attribution |
+| Unbounded research storage | Ledgers and snapshots grow indefinitely | artifact retention, compact sufficient statistics, cold archival |
+
+### Migration from the current architecture
+
+Do not rewrite the durable queue or stop query-level measurement. Introduce the new
+control plane incrementally:
+
+1. Add research programs, frontier actions, action outcomes, and lineage while mapping
+   every existing autonomous query run to a `SEARCH_TERM` action.
+2. Build one pilot program—“price action trading”—using current search and pagination
+   adapters only. Prove restart safety, deduplication, budgets, and sleeping behavior.
+3. Add coverage cells and delayed verified attribution before adding recursive edges.
+4. Add terminology and playlist/channel-relation proposals in shadow mode; inspect
+   proposed fan-out and drift without executing it.
+5. Enable one new acquisition adapter at a time behind a separate budget and policy.
+6. Compare topic-level incremental coverage against the current rotating scheduler
+   using randomized country/time blocks and identical quota budgets.
+7. Once superior, let the portfolio allocator own autonomous work while retaining the
+   current query selector as a fallback action proposer.
+
+The go/no-go metric should be **verified incremental coverage per total constrained
+cost at equal country/trading precision**, not searches per day or raw channels found.
+Also report coverage distribution: an approach that finds more creators from the same
+affiliate cluster has not performed deeper research.
+
+### Decision
+
+Adopt a topic-centric exploration layer with a graph-backed, cost-aware frontier. Do
+not replace query-centric execution; subordinate it. The durable research program owns
+the objective and saturation decision, frontier actions own acquisition choices, and
+existing jobs remain the reliable execution mechanism.
+
+This is a higher-order architectural change than vocabulary intelligence. Vocabulary
+and concept learning improve which branches can be proposed; persistent exploration
+decides whether and how long the engine follows them. If maximizing ecosystem coverage
+is the primary product goal, the exploration controller should be designed before
+further optimizing query selection, and it should become the organizing architecture
+into which terminology intelligence and future graph/source adapters plug.
+
 ## Five-year target architecture
 
 If designing from scratch today, the system would be an event-driven learning and
@@ -412,17 +744,17 @@ version every source assertion, feature set, model, policy, catalog, exposure, a
 outcome so that the system can replay decisions and replace components over five
 years.
 
-## Is this the final major evolution?
+## Is vocabulary intelligence the final major evolution?
 
 No. It is probably the final major evolution of **query vocabulary**, but not of the
 discovery engine.
 
-After the evidence-derived concept/catalog layer, the next major architectural frontier
-is **source and graph expansion**: discovering creators through collaboration graphs,
-website/community links, playlist/channel relationships, and additional platforms
-rather than relying predominantly on keyword search. Vocabulary learning still cannot
-find a creator who uses no searchable trading language, is poorly indexed, or lives
-outside YouTube.
+The next major architectural frontier is the **persistent topic-exploration control
+plane** described above, with source and graph expansion as its action portfolio:
+discovering creators through collaboration graphs, website/community links,
+playlist/channel relationships, and additional platforms rather than relying
+predominantly on keyword search. Vocabulary learning still cannot find a creator who
+uses no searchable trading language, is poorly indexed, or lives outside YouTube.
 
 The durable end state is therefore a portfolio of acquisition strategies—keyword
 retrieval, graph traversal, related-content expansion, external web discovery, and
@@ -437,18 +769,22 @@ of the architecture.
    reviewed baseline metrics pass.
 2. **Measurement/replay:** immutable delayed outcomes and an offline benchmark.
    **Gate:** current query policy can be reproduced from logged data.
-3. **Candidate pipeline:** source-bound statistical mining and bounded AI labels in
+3. **Exploration control-plane pilot:** map existing searches and page continuations
+   into one durable topic program with a frontier, budget, coverage cells, and sleeping
+   decision. **Gate:** restart-safe execution reproduces current behavior at equal cost.
+4. **Candidate pipeline:** source-bound statistical mining and bounded AI labels in
    shadow mode. **Gate:** high precision on a multilingual human-labeled set and zero
    untraceable terms.
-4. **Concept/locale model:** migrate Phase F records into concepts, surfaces, and
+5. **Concept/locale model:** migrate Phase F records into concepts, surfaces, and
    overlays; keep compatibility views. **Gate:** reversible merge/split and catalog
    rollback are proven.
-5. **Controlled trials:** randomized, capped exploration with curated controls.
+6. **Controlled trials:** randomized, capped exploration with curated controls.
    **Gate:** sufficient samples and no country/trading precision regression.
-6. **Adaptive policy:** cost-aware contextual bandit with safety constraints.
+7. **Graph/source action adapters:** enable playlist, relationship, website, and other
+   acquisition paths one at a time. **Gate:** each adds verified coverage at acceptable
+   cost and drift.
+8. **Adaptive policy:** cost-aware contextual bandit with safety constraints.
    **Gate:** offline policy evaluation and guarded canary outperform the fixed policy.
-7. **Multi-source discovery:** add graph and external acquisition arms under the same
-   measurement framework.
 
 ## Final recommendation
 
@@ -465,6 +801,7 @@ promote terms with fixed occurrence/yield thresholds. Evolve Phase F into:
 
 This provides the desired continuous learning without surrendering query control to a
 model, fragmenting knowledge by country, or confusing correlation with discovery
-value. It is the best long-term query architecture—but operational integrity and
-measurement validity must precede it, and multi-source/graph discovery remains the
-larger evolution beyond it.
+value. It is the best long-term vocabulary architecture—but operational integrity and
+measurement validity must precede it. For the larger engine, make persistent topic
+exploration the organizing control plane and make vocabulary search, graph traversal,
+and external acquisition competing actions within it.
