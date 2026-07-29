@@ -41,6 +41,7 @@ import {
   setDiscoveryScope
 } from './server/autonomousDiscovery';
 import { generateCandidateQueriesForCountry } from './server/queryIntelligence';
+import { getTerminologyDashboard } from './server/terminologyIntelligence';
 import {
   runRegressionTestSuite,
   getRegressionRuns,
@@ -409,6 +410,15 @@ async function startServer() {
       const country = req.query.country as string | undefined;
       const terms = await getExtractedVocabulary(country);
       res.json(terms);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Canonical Phase F view. The legacy vocabulary endpoint remains compatible.
+  app.get('/api/query-intelligence/terminology', async (req, res) => {
+    try {
+      res.json(await getTerminologyDashboard(req.query.country as string | undefined));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

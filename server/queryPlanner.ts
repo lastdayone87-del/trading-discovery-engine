@@ -23,6 +23,8 @@ export interface PlannedQuery {
   metadata: Record<string, unknown>;
 }
 
+export interface ProvenTerminologyAtom { id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }
+
 const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryIntent]>> = {
   'United States': [['NQ Futures', 'INSTRUMENT', 'futures'], ['ES Futures', 'INSTRUMENT', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Footprint Chart', 'METHOD', 'indicators'], ['ICT', 'METHOD', 'strategy'], ['Volume Profile', 'METHOD', 'indicators'], ['Premarket', 'FORMAT', 'premarket_prep']],
   'United Kingdom': [['FTSE Trading', 'INSTRUMENT', 'stocks'], ['GBPUSD', 'INSTRUMENT', 'forex'], ['Spread Betting', 'METHOD', 'strategy'], ['London Session', 'MARKET', 'session_analysis'], ['Price Action', 'METHOD', 'strategy'], ['Trading Psychology', 'METHOD', 'psychology']],
@@ -129,6 +131,7 @@ export function planDiverseQueries(args: {
   countryVocabulary?: CountryVocabulary;
   learnedVocabulary: ExtractedTermRecord[];
   existingQueries: QueryRecord[];
+  provenTerminology?: ProvenTerminologyAtom[];
   mode?: QueryGenerationMode;
 }): PlannedQuery[] {
   const count = Math.max(1, args.count);
@@ -149,14 +152,20 @@ export function planDiverseQueries(args: {
     .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
   candidates.push(...compatiblePairs);
 
-  const learned = args.learnedVocabulary
+  const proven = (args.provenTerminology || []).map(term => ({
+    atom: atom(term.term, 'LEARNED', 'strategy', term.lifecycle === 'PROVEN_SEARCH_TERM' ? 1 : 2, 'LEARNED'),
+    terminology: term
+  }));
+  const provenByTerm = new Map(proven.map(item => [normalizeQuery(item.atom.term), item.terminology]));
+  const legacyLearned = args.learnedVocabulary
     .filter(term => term.trust_tier === 2 ? (term.validation_count || 0) >= 2 : true)
-    .map(term => atom(term.term, 'LEARNED', 'strategy', term.trust_tier === 2 ? 2 : 3, 'LEARNED'));
-  const learnedCandidates = learned.flatMap((learnedAtom, index) => {
+    .filter(term => !proven.some(item => normalizeQuery(item.atom.term) === normalizeQuery(term.term)))
+    .map(term => ({ atom: atom(term.term, 'LEARNED', 'strategy', term.trust_tier === 2 ? 2 : 3, 'LEARNED'), terminology: undefined }));
+  const learnedCandidates = [...proven, ...legacyLearned].flatMap(({ atom: learnedAtom, terminology }, index) => {
     const rotated = [...anchors.slice(index), ...anchors.slice(0, index)];
     const anchor = rotated.find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${learnedAtom.term}`));
     if (!anchor) return [];
-    return [{ atoms: [anchor, learnedAtom], template: 'ANCHOR_LEARNED' as const }];
+    return [{ atoms: [anchor, learnedAtom], template: 'ANCHOR_LEARNED' as const, terminology }];
   });
   candidates.splice(Math.min(3, candidates.length), 0, ...learnedCandidates);
   candidates.sort((a, b) => (intentUsage.get(a.atoms[0].intent) || 0) - (intentUsage.get(b.atoms[0].intent) || 0));
@@ -193,7 +202,13 @@ export function planDiverseQueries(args: {
         scriptValidated: true,
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,
-        learnedTerm: candidate.atoms.find(item => item.type === 'LEARNED')?.term
+        learnedTerm: candidate.atoms.find(item => item.type === 'LEARNED')?.term,
+        terminologyId: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.id,
+        terminologyLifecycle: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.lifecycle,
+        terminologyDecayedYield: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.score,
+        selectionEvidence: provenByTerm.has(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))
+          ? `Canonical term ${provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))!.id} ranked by time-decayed production yield.`
+          : 'Curated or constrained legacy evidence.'
       }
     });
     generated.add(normalized);

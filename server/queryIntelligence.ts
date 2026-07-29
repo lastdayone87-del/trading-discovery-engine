@@ -16,6 +16,7 @@ import {
 import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { selectQueryCollection, type QueryFunnelMetrics } from './queryPerformance';
+import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -167,7 +168,8 @@ export function calculateCreatorQualityScore(
 export async function extractVocabularyFromCreator(
   channel: ChannelRecord,
   videoTitles: string[] = [],
-  description: string = ''
+  description: string = '',
+  humanApproved = false
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
   const ai = getAIClient();
@@ -183,6 +185,14 @@ export async function extractVocabularyFromCreator(
   for (const inst of potentialInstruments) {
     if (textLower.includes(inst.toLowerCase())) {
       await saveExtractedTerm(channel.country, inst, 'instrument', channel.channel_id);
+      const sources: Array<{ value: string; type: 'CHANNEL_NAME' | 'VIDEO_TITLE' | 'DESCRIPTION' }> = [
+        { value: channel.channel_name, type: 'CHANNEL_NAME' },
+        ...videoTitles.map(value => ({ value, type: 'VIDEO_TITLE' as const })),
+        { value: description, type: 'DESCRIPTION' }
+      ];
+      for (const source of sources.filter(item => item.value.toLocaleLowerCase('en').includes(inst.toLocaleLowerCase('en')))) {
+        await observeTerminology({ term: inst, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : source.type, channelId: channel.channel_id, humanApproved, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: source.type } });
+      }
     }
   }
 
@@ -216,21 +226,25 @@ Return ONLY a valid JSON object with format:
         if (Array.isArray(parsed.terminology)) {
           for (const t of parsed.terminology) {
             await saveExtractedTerm(channel.country, t, 'terminology', channel.channel_id);
+            await observeTerminology({ term: String(t), country: channel.country, termType: 'TERMINOLOGY', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
         if (Array.isArray(parsed.instruments)) {
           for (const i of parsed.instruments) {
             await saveExtractedTerm(channel.country, i, 'instrument', channel.channel_id);
+            await observeTerminology({ term: String(i), country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
         if (Array.isArray(parsed.phrases)) {
           for (const p of parsed.phrases) {
             await saveExtractedTerm(channel.country, p, 'phrase', channel.channel_id);
+            await observeTerminology({ term: String(p), country: channel.country, termType: 'PHRASE', observationType: 'ENRICHMENT', channelId: channel.channel_id, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
         if (Array.isArray(parsed.formats)) {
           for (const f of parsed.formats) {
             await saveExtractedTerm(channel.country, f, 'format', channel.channel_id);
+            await observeTerminology({ term: String(f), country: channel.country, termType: 'FORMAT', observationType: 'ENRICHMENT', channelId: channel.channel_id, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
       }
@@ -358,26 +372,18 @@ export async function selectNextQueryForCountry(country: string): Promise<{
 // 4. CANDIDATE QUERY GENERATOR
 // ==========================================
 
-/**
-<<<<<<< HEAD
- * Generates compact, retrieval-oriented candidates led by typed local trading
- * atoms. Verified learned terms may augment them, while unverified candidates
- * remain rate-limited.
-=======
- * Generates auditable candidates led by curated institutional knowledge. Verified
- * learned terms may augment it, while unverified candidate terms are rate-limited.
->>>>>>> origin/main
- */
+/** Generates auditable, compact candidates led by retrieval atoms and proven terminology. */
 export async function generateCandidateQueriesForCountry(
   country: string,
   count = 3,
   mode: 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START' = 'EXPLORATION'
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
-  const [vocabs, extractedTerms, existingQueries] = await Promise.all([
+  const [vocabs, extractedTerms, existingQueries, provenTerminology] = await Promise.all([
     getCountryVocabularies(),
     getExtractedVocabulary(country),
-    getQueriesByCountry(country)
+    getQueriesByCountry(country),
+    getPlannerTerminology(country)
   ]);
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
   const planned = planDiverseQueries({
@@ -386,6 +392,7 @@ export async function generateCandidateQueriesForCountry(
     countryVocabulary: countryVocab,
     learnedVocabulary: extractedTerms,
     existingQueries,
+    provenTerminology,
     mode
   });
   const newQueries: QueryRecord[] = [];
@@ -430,6 +437,7 @@ export async function evaluateQueryPerformance(
     performanceScore,
     newCollection
   });
+  await attributeTerminologyPerformance(queryRecord, metrics);
 
   return {
     performanceScore,
