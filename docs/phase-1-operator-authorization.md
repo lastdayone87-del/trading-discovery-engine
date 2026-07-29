@@ -16,19 +16,32 @@ admin. The successful API response bodies and paths are unchanged; authorization
 errors add stable `code` and `requestId` fields and every API response carries
 `X-Request-Id`.
 
-The browser sends `OPERATOR_API_TOKEN` from the `operator-token` local-storage key,
-falling back to the existing `review-token` key. Secrets are never compiled into the
-bundle or written to audit metadata. This retains the existing reviewer workflow
-without permitting implicit credentials in production.
+On first production load, the dashboard displays **Operator authentication required**
+with an **API token** password field and **Load dashboard** button. A normal operator
+enters the value configured on the server as `OPERATOR_API_TOKEN`. An administrator
+may instead enter `ADMIN_API_TOKEN`; that credential includes normal operator access
+and is required for admin-only controls such as queue pause/resume, scheduler control,
+configuration writes, backups, and regression/stress execution. During the compatibility
+window, the value of `REVIEW_API_TOKEN` is also accepted with operator (not admin)
+permissions.
+
+After submission, the browser stores the credential under the `operator-token`
+local-storage key and sends it as `Authorization: Bearer <token>` on every same-origin
+API request. Existing browsers with the legacy `review-token` local-storage entry keep
+working because it remains the fallback. Secrets are never compiled into the bundle or
+written to audit metadata. A missing, expired, or rotated credential returns the user
+to the authentication screen rather than rendering an empty dashboard.
 
 ## Deployment and route inventory
 
 Set `OPERATOR_API_TOKEN`, `OPERATOR_IDENTITY`, `ADMIN_API_TOKEN`, and
-`ADMIN_IDENTITY`; configure the dashboard's `operator-token` local-storage value and
-health probe at `GET /api/health`. The legacy review token remains accepted as an
-operator token. `OPERATOR_AUTH_BYPASS=true` is an explicit local-development option;
-production startup rejects it. Production also fails startup when operator/reviewer or
-admin credentials are absent.
+`ADMIN_IDENTITY`, distribute the appropriate token value to authorized operators over
+the deployment's approved secret-sharing channel, and configure the health probe at
+`GET /api/health`. Operators then open the production dashboard and enter that value in
+the authentication screen; they do not enter the environment-variable name. The legacy
+review token remains accepted as an operator token. `OPERATOR_AUTH_BYPASS=true` is an
+explicit local-development option; production startup rejects it. Production also fails
+startup when operator/reviewer or admin credentials are absent.
 
 The executable route inventory is `routePolicyInventory` in
 `server/operatorAuth.ts`. Its ordered policy assigns only `GET /api/health` public
