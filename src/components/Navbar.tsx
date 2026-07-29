@@ -1,10 +1,10 @@
 import React from 'react';
 import { ChannelRecord, QueueStatus, QuotaInfo } from '../types';
-import { Radar, Table, Clock, Cpu, Settings, ShieldCheck, Database, Radio, Brain, UserCheck } from 'lucide-react';
+import { Radar, Table, Clock, Cpu, Settings, ShieldCheck, Database, Radio, Brain } from 'lucide-react';
 
 interface Props {
-  activeTab: 'discovery' | 'results' | 'review' | 'pending' | 'queues' | 'settings' | 'intelligence' | 'regression';
-  setActiveTab: (tab: 'discovery' | 'results' | 'review' | 'pending' | 'queues' | 'settings' | 'intelligence' | 'regression') => void;
+  activeTab: 'discovery' | 'results' | 'pending' | 'queues' | 'settings' | 'intelligence' | 'regression';
+  setActiveTab: (tab: 'discovery' | 'results' | 'pending' | 'queues' | 'settings' | 'intelligence' | 'regression') => void;
   channels: ChannelRecord[];
   queueStatus: QueueStatus | null;
   quotaInfo: QuotaInfo | null;
@@ -19,7 +19,6 @@ export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, channels, que
     { id: 'intelligence', label: 'Query Intelligence', icon: Brain },
     { id: 'regression', label: 'Regression Suite', icon: ShieldCheck },
     { id: 'results', label: `Channels Table (${channels.length})`, icon: Table },
-    { id: 'review', label: 'Human Review', icon: UserCheck },
     { id: 'pending', label: 'Pending & Re-checks', icon: Clock },
     { id: 'queues', label: 'Queue Monitor', icon: Cpu },
     { id: 'settings', label: 'Country & Vocabulary', icon: Settings }
