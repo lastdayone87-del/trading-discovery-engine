@@ -29,15 +29,27 @@ function requireDatabaseUrl(): string {
 }
 
 export async function getDb(): Promise<InstanceType<typeof Pool>> {
-  if (pool) return pool;
+  // `pool` is assigned before connectivity checks, migrations, and default-data
+  // seeding finish. Always join an in-flight initialization before exposing it;
+  // otherwise concurrent HTTP/startup callers can query a partially migrated
+  // database and make readiness fail permanently for an otherwise healthy DB.
   if (initPromise) return initPromise;
+  if (pool) return pool;
   initPromise = (async () => {
     const connectionString = requireDatabaseUrl();
     pool = new Pool({ connectionString, ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
-    await pool.query('SELECT 1');
-    await runMigrations();
-    await seedDefaults();
-    return pool;
+    try {
+      await pool.query('SELECT 1');
+      await runMigrations();
+      await seedDefaults();
+      return pool;
+    } catch (error) {
+      const failedPool = pool;
+      pool = null;
+      initPromise = null;
+      await failedPool.end().catch(() => undefined);
+      throw error;
+    }
   })();
   return initPromise;
 }

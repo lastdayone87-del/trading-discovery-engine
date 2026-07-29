@@ -1,4 +1,4 @@
-import { apiFetch } from './apiClient';
+import { AUTH_REQUIRED_EVENT, apiFetch, operatorToken, setOperatorToken } from './apiClient';
 import React, { useState, useEffect } from 'react';
 import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QuotaInfo } from './types';
 import { Navbar } from './components/Navbar';
@@ -21,6 +21,9 @@ export default function App() {
   const [excludedCountries, setExcludedCountries] = useState<ExcludedCountry[]>([]);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [quotaInfo, setQuotaInfo] = useState<QuotaInfo | null>(null);
+  const [accessToken, setAccessToken] = useState(() => operatorToken());
+  const [tokenDraft, setTokenDraft] = useState(() => operatorToken());
+  const [authError, setAuthError] = useState<'missing' | 'invalid' | 'forbidden' | null>(() => operatorToken() ? null : 'missing');
 
   const [inspectingChannel, setInspectingChannel] = useState<ChannelRecord | null>(null);
 
@@ -38,6 +41,15 @@ export default function App() {
       console.error('Failed to fetch channels:', e);
     }
   };
+
+  useEffect(() => {
+    const onAuthRequired = (event: Event) => {
+      const status = (event as CustomEvent<{ status: number }>).detail?.status;
+      setAuthError(status === 403 ? 'forbidden' : 'invalid');
+    };
+    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
+  }, []);
 
   // Fetch Vocabularies & Exclusions
   const fetchSettings = async () => {
@@ -72,6 +84,7 @@ export default function App() {
 
   // Poll Data
   useEffect(() => {
+    if (!accessToken) return;
     fetchChannels();
     fetchSettings();
     fetchQueueStatus();
@@ -82,7 +95,50 @@ export default function App() {
     }, 3000); // 3-second auto refresh
 
     return () => clearInterval(interval);
-  }, [includeRejected]);
+  }, [includeRejected, accessToken]);
+
+  const authenticateDashboard = (event: React.FormEvent) => {
+    event.preventDefault();
+    const token = tokenDraft.trim();
+    setOperatorToken(token);
+    setAccessToken(token);
+    setAuthError(token ? null : 'missing');
+  };
+
+  if (authError) {
+    const message = authError === 'missing'
+      ? 'Enter the production operator or administrator token to load runtime data.'
+      : authError === 'forbidden'
+        ? 'This action requires an administrator token. Enter an authorized credential and retry.'
+        : 'The API rejected this credential. Verify the deployed operator token and try again.';
+    return (
+      <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
+        <form onSubmit={authenticateDashboard} className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl space-y-4">
+          <div>
+            <p className="text-xs font-bold uppercase tracking-widest text-indigo-400">Trading Discovery Engine</p>
+            <h1 className="mt-2 text-xl font-bold">Operator authentication required</h1>
+            <p className="mt-2 text-sm leading-6 text-slate-400">{message}</p>
+          </div>
+          <label className="block text-xs font-semibold text-slate-300">
+            API token
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={tokenDraft}
+              onChange={event => setTokenDraft(event.target.value)}
+              className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white outline-hidden focus:ring-2 focus:ring-indigo-500"
+              autoFocus
+              required
+            />
+          </label>
+          <button type="submit" className="w-full rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-indigo-500">
+            Load dashboard
+          </button>
+          <p className="text-[11px] leading-5 text-slate-500">The credential stays in this browser and is sent only as a bearer token to same-origin API requests.</p>
+        </form>
+      </main>
+    );
+  }
 
   // Handlers
   const handleManualSearch = async (query: string, country: string) => {
