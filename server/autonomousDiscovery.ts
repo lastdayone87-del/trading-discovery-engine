@@ -9,7 +9,8 @@ import {
   releaseSchedulerLock,
   scheduleAutonomousQueryRuns,
   setAppSetting,
-  updateSchedulerState
+  updateSchedulerState,
+  getDailyYouTubeQuotaBudget
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
 import { selectNextQueryForCountry } from './queryIntelligence';
@@ -71,7 +72,7 @@ async function getDiscoveryConfig(): Promise<DiscoveryConfig> {
     intervalMinutes: await numericSetting('discovery_interval_minutes', 'DISCOVERY_INTERVAL_MINUTES', 5, 1, 60),
     batchSize: await numericSetting('discovery_batch_size', 'DISCOVERY_BATCH_SIZE', 5, 1, 50),
     targetQueueDepth: await numericSetting('discovery_target_queue_depth', 'DISCOVERY_TARGET_QUEUE_DEPTH', 15, 1, 500),
-    dailyQuotaBudget: await numericSetting('daily_youtube_quota_budget', 'DAILY_YOUTUBE_QUOTA_BUDGET', 9000, 100, 1_000_000),
+    dailyQuotaBudget: getDailyYouTubeQuotaBudget(),
     autonomousQuotaPercent: await numericSetting('discovery_autonomous_quota_percent', 'DISCOVERY_AUTONOMOUS_QUOTA_PERCENT', 70, 1, 100)
   };
 }

@@ -4,6 +4,8 @@ import pg from 'pg';
 import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QueryRecord, QueryExecutionLog, ExtractedTermRecord, DiscoverySource } from '../src/types';
 import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
 import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
+import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
+import { calculateYouTubeDailyBudget, quotaAllocationBudget } from './quotaPolicy';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -191,9 +193,10 @@ export async function getQueueStatus(): Promise<QueueStatus> {
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{const db=await getDb(); await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);}
 
 export function getYouTubeKeyPool(): string[] { return [process.env.YOUTUBE_API_KEY,process.env.YOUTUBE_API_KEY_1,process.env.YOUTUBE_API_KEY_2,process.env.YOUTUBE_API_KEY_3,process.env.YOUTUBE_API_KEY_4,process.env.YOUTUBE_API_KEY_5].filter((k):k is string=>!!k&&!!k.trim()&&!k.trim().startsWith('MY_')).map(k=>k.trim()).filter((k,i,a)=>a.indexOf(k)===i); }
+export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);}
 export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; limit:number; isActive:boolean; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
-export async function getQuota():Promise<QuotaInfoExtended>{const db=await getDb(); const today=new Date().toISOString().split('T')[0]; const keys=getYouTubeKeyPool(); const limit=Math.max(1,keys.length)*10000; let res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'"); if(!res.rowCount){await db.query("INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset) VALUES('youtube',0,$1,$2)",[limit,today]); res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'");} let row=res.rows[0]; if(row.last_reset!==today){await db.query("UPDATE quota_tracker SET units_used=0,daily_limit=$1,last_reset=$2 WHERE id='youtube'",[limit,today]); row={...row,units_used:0,daily_limit:limit,last_reset:today};} else await db.query("UPDATE quota_tracker SET daily_limit=$1 WHERE id='youtube'",[limit]); return {unitsUsed:row.units_used||0,dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:keys.map((k,i)=>({keyIndex:i+1,maskedKey:k.length>8?`${k.slice(0,4)}...${k.slice(-4)}`:'****',unitsUsed:Math.max(0,Math.min(10000,(row.units_used||0)-i*10000)),limit:10000,isActive:i===0}))};}
+export async function getQuota():Promise<QuotaInfoExtended>{const db=await getDb(); const today=new Date().toISOString().split('T')[0]; const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey); let res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'"); if(!res.rowCount){await db.query("INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset) VALUES('youtube',0,$1,$2)",[limit,today]); res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'");} let row=res.rows[0]; if(row.last_reset!==today){await db.query("UPDATE quota_tracker SET units_used=0,daily_limit=$1,last_reset=$2 WHERE id='youtube'",[limit,today]); row={...row,units_used:0,daily_limit:limit,last_reset:today};} else await db.query("UPDATE quota_tracker SET daily_limit=$1 WHERE id='youtube'",[limit]); return {unitsUsed:row.units_used||0,dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:keys.map((k,i)=>({keyIndex:i+1,maskedKey:k.length>8?`${k.slice(0,4)}...${k.slice(-4)}`:'****',unitsUsed:Math.max(0,Math.min(perKey,(row.units_used||0)-i*perKey)),limit:perKey,isActive:i===0}))};}
 export async function incrementQuota(units:number):Promise<void>{const db=await getDb(); await getQuota(); await db.query("UPDATE quota_tracker SET units_used=units_used+$1 WHERE id='youtube'",[units]);}
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
@@ -246,6 +249,7 @@ export interface ScheduledAutonomousRun {
   jobId: string;
   query: QueryRecord;
   retrievalLane: RetrievalLane;
+  searchOrdering: SearchOrdering;
 }
 
 function queryComponents(query: QueryRecord): Array<{ type: string; term: string; tier: number; position: number }> {
@@ -294,6 +298,8 @@ export async function scheduleAutonomousQueryRuns(
   const db = await getDb();
   const configuredVideoPercent = Number(await getAppSetting('discovery_video_lane_percent', process.env.DISCOVERY_VIDEO_LANE_PERCENT || '70'));
   const videoLanePercent = Math.min(100, Math.max(0, Number.isFinite(configuredVideoPercent) ? configuredVideoPercent : 70));
+  const configuredDatePercent = Number(await getAppSetting('discovery_date_ordering_video_percent', process.env.DISCOVERY_DATE_ORDERING_VIDEO_PERCENT || '10'));
+  const datePercent = Math.min(100, Math.max(0, Number.isFinite(configuredDatePercent) ? configuredDatePercent : 10));
   const client = await db.connect();
   const scheduled: ScheduledAutonomousRun[] = [];
   try {
@@ -323,11 +329,16 @@ export async function scheduleAutonomousQueryRuns(
       const video = laneCounts.rows[0]?.video || 0;
       const total = laneCounts.rows[0]?.total || 0;
       const retrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
+      const orderingCounts = await client.query(
+        `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
+         FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
+      );
+      const searchOrdering = allocateSearchOrdering(retrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
       const run = await client.query(
-        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,quota_reserved,metadata)
-         VALUES($1,$2,'automated_query',$3,$4,$5,100,$6) RETURNING id`,
-        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, JSON.stringify(candidate.query.generation_metadata || {})]
+        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata)
+         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7) RETURNING id`,
+        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify(candidate.query.generation_metadata || {})]
       );
       const runId = run.rows[0].id;
       for (const component of queryComponents(candidate.query)) {
@@ -346,7 +357,8 @@ export async function scheduleAutonomousQueryRuns(
           query: candidate.query.query,
           country: candidate.query.country,
           source: 'automated_query',
-          retrievalLane
+          retrievalLane,
+          searchOrdering
         }), `search-run:${runId}`]
       );
       const jobId = job.rows[0].id;
@@ -356,7 +368,7 @@ export async function scheduleAutonomousQueryRuns(
          VALUES('SEARCH_YOUTUBE',$1,'AUTONOMOUS',100,now()+interval '20 minutes')`,
         [runId]
       );
-      scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane });
+      scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     await client.query('COMMIT');
     return scheduled;
@@ -512,7 +524,7 @@ export async function tryReserveQuota(args: {
        FROM quota_reservations`, [args.allocation]
     );
     const row = totals.rows[0];
-    const allocationBudget = Math.floor(args.dailyBudget * args.allocationPercent / 100);
+    const allocationBudget = quotaAllocationBudget(args.dailyBudget, args.allocationPercent);
     if (row.actual_used + row.reserved_total + args.units > args.dailyBudget || row.allocation_used + args.units > allocationBudget) {
       await client.query('ROLLBACK');
       return false;

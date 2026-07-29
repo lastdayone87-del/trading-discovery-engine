@@ -19,7 +19,8 @@ import {
   finishQuotaReservation,
   getAppSetting,
   heartbeatJob,
-  recordQueryRunSightings
+  recordQueryRunSightings,
+  getDailyYouTubeQuotaBudget
 } from './db';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
@@ -191,8 +192,8 @@ export async function processNextSearchJob(
       channel.scan_status = 'ENRICHING';
       channel.scan_attempts = job.attempts;
       await upsertChannel(channel);
-      const dailyBudget = Number(await getAppSetting('daily_youtube_quota_budget', process.env.DAILY_YOUTUBE_QUOTA_BUDGET || '9000'));
-      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '20'));
+      const dailyBudget = getDailyYouTubeQuotaBudget();
+      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
         units: 101, dailyBudget, allocationPercent: enrichmentPercent
@@ -210,8 +211,8 @@ export async function processNextSearchJob(
       return true;
     }
 
-    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', pageNumber = 1, pageToken = null } = job.payload as {
-      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; pageNumber?:number; pageToken?:string|null;
+    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null } = job.payload as {
+      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null;
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
@@ -220,8 +221,8 @@ export async function processNextSearchJob(
     if (queryRunId) await startQueryRun(queryRunId);
     if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
-    if(queryRunId&&pageNumber>1){const budget=Number(await getAppSetting('daily_youtube_quota_budget','9000'));const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent})){await failQueryRun(queryRunId,new Error('Autonomous quota allocation exhausted.'),true);await completeJob(job.id);return true;}}
-    const searchPage = queryRunId ? await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken) : null;
+    if(queryRunId&&pageNumber>1){const budget=getDailyYouTubeQuotaBudget();const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent})){await failQueryRun(queryRunId,new Error('Autonomous quota allocation exhausted.'),true);await completeJob(job.id);return true;}}
+    const searchPage = queryRunId ? await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering) : null;
     const extracted = searchPage?.channels || await searchYouTubeChannels(query, country, vocab, retrievalLane);
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
     const observations: QueryObservation[] = [];
@@ -237,7 +238,7 @@ export async function processNextSearchJob(
       sightings.push({
         channelId: outcome.channelId, resultRank: index + 1, searchLane: retrievalLane, wasKnown: outcome.wasKnown, persisted: outcome.persisted,
         countryOutcome: outcome.countryStatus, tradingOutcome: outcome.tradingStatus, funnelOutcome,
-        metadata: { channelName: outcome.channelName, source, retrievalLane }
+        metadata: { channelName: outcome.channelName, source, retrievalLane, searchOrdering }
       });
     }
     if (queryRunId && queryId) {
@@ -250,10 +251,10 @@ export async function processNextSearchJob(
       const prior=await getAutonomousContinuationState(queryRunId);
       const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
       const enabled=await getAppSetting('autonomous_pagination_enabled','false')==='true';
-      await recordAutonomousPage({queryRunId,pageNumber,inputPageToken:pageToken,nextPageToken:searchPage?.nextPageToken||null,retrievalLane,rawResultCount:metrics.rawResults,distinctCreatorCount:metrics.distinctResults,knownCreators:metrics.knownChannels,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,averageQualityScore:metrics.averageQualityScore,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,noveltyRatio:metrics.noveltyRatio,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,quotaUnits:100,decision,stoppingReason:decision.shouldContinue?null:decision.primaryReason,pageMetrics:metrics});
+      await recordAutonomousPage({queryRunId,pageNumber,inputPageToken:pageToken,nextPageToken:searchPage?.nextPageToken||null,retrievalLane,searchOrdering,rawResultCount:metrics.rawResults,distinctCreatorCount:metrics.distinctResults,knownCreators:metrics.knownChannels,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,averageQualityScore:metrics.averageQualityScore,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,noveltyRatio:metrics.noveltyRatio,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,quotaUnits:100,decision,stoppingReason:decision.shouldContinue?null:decision.primaryReason,pageMetrics:metrics});
       if(enabled&&decision.shouldContinue&&searchPage?.nextPageToken){await enqueueJob('SEARCH_YOUTUBE',{...job.payload,pageNumber:pageNumber+1,pageToken:searchPage.nextPageToken},{priority:20,maxAttempts:3,idempotencyKey:`search-run:${queryRunId}:page:${pageNumber+1}`});await completeJob(job.id);return true;}
       const finalMetrics=await getAutonomousRunMetrics(queryRunId);
-      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, quotaConsumed: pageNumber*100 });
+      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed: pageNumber*100 });
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
         uniqueChannels: finalMetrics.newChannels,
@@ -594,8 +595,8 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
   const minNovelty = Math.max(0, Number(await getAppSetting('manual_search_min_new_channel_ratio', '0.20')));
   const maxDuplicate = Math.min(1, Number(await getAppSetting('manual_search_max_duplicate_ratio', '0.80')));
   const maxLowYield = Math.max(1, Number(await getAppSetting('manual_search_max_low_yield_pages', '2')));
-  const dailyBudget = Number(await getAppSetting('daily_youtube_quota_budget', process.env.DAILY_YOUTUBE_QUOTA_BUDGET || '9000'));
-  const quotaPercent = Number(await getAppSetting('manual_search_quota_percent', '20'));
+  const dailyBudget = getDailyYouTubeQuotaBudget();
+  const quotaPercent = Number(await getAppSetting('manual_search_quota_percent', process.env.DISCOVERY_MANUAL_QUOTA_PERCENT || '20'));
   const operationId = `${sessionId}:${pageNumber}`;
   const queryVariant = session.generatedQueryVariants[variantIndex] || session.originalQuery;
   const reserved = await tryReserveQuota({ operationType: 'MANUAL_SEARCH_PAGE', operationId, allocation: 'MANUAL', units: 100, dailyBudget, allocationPercent: quotaPercent });
