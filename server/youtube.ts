@@ -1,6 +1,8 @@
 import { CountryVocabulary } from '../src/types';
 import { incrementQuota, getAppSetting, getYouTubeKeyPool } from './db';
 import { RetrievalLane } from './retrievalLanes';
+import { SearchOrdering, youtubeOrder } from './searchOrdering';
+export type { SearchOrdering } from './searchOrdering';
 export type { RetrievalLane } from './retrievalLanes';
 
 /**
@@ -118,9 +120,10 @@ export async function searchYouTubeChannels(
   query: string,
   countryName: string,
   vocab?: CountryVocabulary,
-  lane: RetrievalLane = 'VIDEO'
+  lane: RetrievalLane = 'VIDEO',
+  ordering: SearchOrdering = 'RELEVANCE'
 ): Promise<DiscoveredChannelRaw[]> {
-  return (await searchYouTubeChannelPage(query, countryName, vocab, lane)).channels;
+  return (await searchYouTubeChannelPage(query, countryName, vocab, lane, null, ordering)).channels;
 }
 
 export interface YouTubeChannelPage {
@@ -135,7 +138,8 @@ export async function searchYouTubeChannelPage(
   countryName: string,
   vocab?: CountryVocabulary,
   lane: RetrievalLane = 'VIDEO',
-  pageToken?: string | null
+  pageToken?: string | null,
+  ordering: SearchOrdering = 'RELEVANCE'
 ): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
@@ -157,7 +161,7 @@ export async function searchYouTubeChannelPage(
       try {
         console.log(`[YouTube API Pool] Attempting search with key #${currentIndex + 1}/${keyPool.length} (${apiKey.slice(0, 6)}...)...`);
         const searchType = lane === 'VIDEO' ? 'video' : 'channel';
-        const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=${searchType}&q=${encodeURIComponent(
+        const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=${searchType}&order=${youtubeOrder(ordering)}&q=${encodeURIComponent(
           sanitizedQuery
         )}&maxResults=${maxResults}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}&key=${apiKey}`;
 
