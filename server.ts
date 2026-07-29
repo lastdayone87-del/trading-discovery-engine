@@ -20,7 +20,7 @@ import {
   getExtractedVocabulary,
   setQueryCollection,
   purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
-  listChannelsPage, getChannelListingRevision
+  listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary
 } from './server/db';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
@@ -168,7 +168,9 @@ async function startServer() {
       res.status(500).json({ error: err.message });
     }
   });
-  app.get('/api/channels-revision',async(req,res)=>{try{res.json(await getChannelListingRevision(req.query.include_rejected==='true'));}catch(err:any){res.status(500).json({error:err.message});}});
+  const channelFilterFromRequest=(req:express.Request)=>({includeRejected:req.query.include_rejected==='true',search:req.query.search as string|undefined,country:req.query.country as string|undefined,countryStatus:req.query.country_status as string|undefined,tradingStatus:req.query.trading_status as string|undefined,discordStatus:req.query.discord_status as string|undefined,scanStatus:req.query.scan_status as string|undefined});
+  app.get('/api/channels-revision',async(req,res)=>{try{res.json(await getChannelListingRevision(channelFilterFromRequest(req)));}catch(err:any){res.status(500).json({error:err.message});}});
+  app.get('/api/dashboard/summary',async(_req,res)=>{try{res.json(await getDashboardOperationalSummary());}catch(err:any){res.status(500).json({error:err.message});}});
 
   // Dedicated diagnostics view for rejected / excluded channels
   app.get('/api/channels/diagnostics/rejected', async (req, res) => {

@@ -1,6 +1,13 @@
 export type CountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
 export type CountryMetadataStatus = 'AVAILABLE_DECLARED' | 'AVAILABLE_NOT_DECLARED' | 'UNAVAILABLE' | 'NOT_REQUESTED';
 export type ChannelActivityBand = 'VERY_ACTIVE' | 'ACTIVE' | 'OCCASIONAL' | 'DORMANT' | 'UNKNOWN';
+export interface DashboardOperationalSummary {
+  storedChannels: number;
+  activeDiscords: number;
+  pendingScans: number;
+  scope: { storedChannels: 'ALL_PERSISTED_CHANNELS'; operationalMetrics: 'ELIGIBLE_NON_REJECTED_CHANNELS' };
+  deployment: { environment: string; service: string; instance: string };
+}
 
 export type DiscordStatus = 'PENDING' | 'NOT_FOUND' | 'ACTIVE' | 'ACTIVE_LOW_VOLUME' | 'NON_TRADING' | 'DEAD' | 'UNCERTAIN';
 

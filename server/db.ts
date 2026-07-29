@@ -194,16 +194,19 @@ export async function getAllChannels(): Promise<ChannelRecord[]> {
   return res.rows.map(rowToChannel);
 }
 
-export async function listChannelsPage(args:{includeRejected:boolean;limit:number;offset:number;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
+export interface ChannelListingFilter {includeRejected:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
+function channelListingWhere(args:ChannelListingFilter):{where:string;values:string[]} {
+  const clauses=[args.includeRejected?'TRUE':`country_status <> 'REJECTED' AND scan_status <> 'SKIPPED_EXCLUDED' AND trading_status <> 'NON_TRADING'`]; const values:string[]=[];
+  const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
+  if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
+  add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
+  add('discord_status',args.discordStatus); add('scan_status',args.scanStatus);
+  return {where:clauses.join(' AND '),values};
+}
+
+export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
-  const clauses=[args.includeRejected?'TRUE':`country_status <> 'REJECTED' AND scan_status <> 'SKIPPED_EXCLUDED' AND trading_status <> 'NON_TRADING'`]; const values:any[]=[];
-  const add=(sql:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(sql.replace('?',`$${values.length}`));}};
-  add(`(channel_name ILIKE '%'||?||'%' OR youtube_url ILIKE '%'||?||'%')`,args.search);
-  // Search has two placeholders but one value; normalize the second reference.
-  if(args.search) clauses[clauses.length-1]=clauses[clauses.length-1].replace('?',`$${values.length}`);
-  add('country=?',args.country); add('country_status=?',args.countryStatus); add('trading_status=?',args.tradingStatus);
-  add('discord_status=?',args.discordStatus); add('scan_status=?',args.scanStatus);
-  const where=clauses.join(' AND ');
+  const {where,values}=channelListingWhere(args);
   const columns=`channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at`;
   const [page,summary]=await Promise.all([
     db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY first_seen DESC,channel_id LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
@@ -212,12 +215,24 @@ export async function listChannelsPage(args:{includeRejected:boolean;limit:numbe
   return {items:page.rows.map(rowToChannel),total:Number(summary.rows[0].total||0),revision:iso(summary.rows[0].revision)};
 }
 
-export async function getChannelListingRevision(includeRejected=false):Promise<{total:number;revision:string|null}> {
-  const db=await getDb(); const where=includeRejected?'TRUE':`country_status <> 'REJECTED' AND scan_status <> 'SKIPPED_EXCLUDED' AND trading_status <> 'NON_TRADING'`;
-  const result=await db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`);
+export async function getChannelListingRevision(args:ChannelListingFilter):Promise<{total:number;revision:string|null}> {
+  const db=await getDb(); const {where,values}=channelListingWhere(args);
+  const result=await db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values);
   return {total:Number(result.rows[0].total||0),revision:iso(result.rows[0].revision)};
 }
 
+export interface DashboardOperationalSummary {storedChannels:number;activeDiscords:number;pendingScans:number;scope:{storedChannels:string;operationalMetrics:string};deployment:{environment:string;service:string;instance:string}}
+export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=process.env):Promise<DashboardOperationalSummary> {
+  const db=await getDb();
+  const result=await db.query(`SELECT COUNT(*)::int stored_channels,
+    COUNT(*) FILTER(WHERE country_status <> 'REJECTED' AND scan_status <> 'SKIPPED_EXCLUDED' AND trading_status <> 'NON_TRADING' AND discord_status IN('ACTIVE','ACTIVE_LOW_VOLUME'))::int active_discords,
+    COUNT(*) FILTER(WHERE country_status <> 'REJECTED' AND scan_status <> 'SKIPPED_EXCLUDED' AND trading_status <> 'NON_TRADING' AND scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW'))::int pending_scans
+    FROM channels`);
+  const row=result.rows[0];
+  return {storedChannels:Number(row.stored_channels||0),activeDiscords:Number(row.active_discords||0),pendingScans:Number(row.pending_scans||0),
+    scope:{storedChannels:'ALL_PERSISTED_CHANNELS',operationalMetrics:'ELIGIBLE_NON_REJECTED_CHANNELS'},
+    deployment:{environment:env.RAILWAY_ENVIRONMENT_NAME||env.DEPLOYMENT_ENVIRONMENT||env.NODE_ENV||'unknown',service:env.RAILWAY_SERVICE_NAME||env.SERVICE_NAME||'trading-discovery-engine',instance:env.RAILWAY_DEPLOYMENT_ID?.slice(0,12)||env.DEPLOYMENT_ID?.slice(0,12)||'local'}};
+}
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {
   const db = await getDb();
   const res = await db.query('SELECT * FROM channels WHERE channel_id=$1', [channelId]);
