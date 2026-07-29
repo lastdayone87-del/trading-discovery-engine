@@ -40,6 +40,7 @@ import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
+import { getActiveCatalogPin } from './catalogPublication';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -49,9 +50,10 @@ const WORKER_ID = `worker_${process.pid}`;
 export interface JobProvenance { actorId: string; requestId?: string }
 export async function addSearchJob(query: string, country: string, source: DiscoverySource, provenance: JobProvenance = {actorId:'system:scheduler'}): Promise<SearchJob> {
   await assertCountryAllowed(country, `queue:${source}`);
+  const catalogPin=await getActiveCatalogPin(country);
   const job = await enqueueJob(
     'SEARCH_YOUTUBE',
-    { query, country, source, provenance },
+    { query, country, source, provenance, catalogPin },
     {
       idempotencyKey: `search:${source}:${country.toLowerCase()}:${query.toLowerCase()}`,
       priority: source === 'manual_search' ? 100 : 20
