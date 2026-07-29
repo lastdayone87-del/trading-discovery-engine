@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { QueryRecord, QueryExecutionLog, ExtractedTermRecord, CountryVocabulary } from '../types';
+import { QueryRecord, QueryExecutionLog, ExtractedTermRecord, CountryVocabulary, CanonicalTradingTerm } from '../types';
 import {
   Brain,
   Sparkles,
@@ -33,6 +33,7 @@ interface Props {
 export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }) => {
   const [queries, setQueries] = useState<QueryRecord[]>([]);
   const [extractedVocabulary, setExtractedVocabulary] = useState<ExtractedTermRecord[]>([]);
+  const [terminology, setTerminology] = useState<CanonicalTradingTerm[]>([]);
   const [logs, setLogs] = useState<QueryExecutionLog[]>([]);
   const [status, setStatus] = useState<{
     isRunning: boolean;
@@ -65,9 +66,10 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
   // Fetch data
   const fetchData = async () => {
     try {
-      const [libRes, vocabRes, logRes, statusRes, scopeRes] = await Promise.all([
+      const [libRes, vocabRes, terminologyRes, logRes, statusRes, scopeRes] = await Promise.all([
         fetch('/api/query-intelligence/library'),
         fetch('/api/query-intelligence/vocabulary'),
+        fetch('/api/query-intelligence/terminology'),
         fetch('/api/query-intelligence/logs'),
         fetch('/api/query-intelligence/status'),
         fetch('/api/query-intelligence/scope')
@@ -75,6 +77,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
 
       if (libRes.ok) setQueries(await libRes.json());
       if (vocabRes.ok) setExtractedVocabulary(await vocabRes.json());
+      if (terminologyRes.ok) setTerminology(await terminologyRes.json());
       if (logRes.ok) setLogs(await logRes.json());
       if (statusRes.ok) {
         const statusData = await statusRes.json();
@@ -458,7 +461,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               }`}
             >
               <BookOpen className="w-3.5 h-3.5" />
-              <span>Extracted Vocabulary ({extractedVocabulary.length})</span>
+              <span>Terminology Intelligence ({terminology.length})</span>
             </button>
 
             <button
@@ -607,26 +610,32 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
         {activeSubTab === 'vocabulary' && (
           <div className="space-y-4">
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              The engine automatically extracts recurring native trading terminology, popular financial instruments, and localized jargon from discovered high-quality creators and feeds it into future search queries.
+              Canonical terminology is learned from durable production evidence. Promotion requires creator and community diversity; search performance is time-decayed and all lifecycle changes remain auditable.
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-              {extractedVocabulary.length === 0 ? (
+              {terminology.length === 0 ? (
                 <div className="col-span-full p-8 text-center text-slate-400 dark:text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl">
-                  No extracted vocabulary yet. Extracted terms will automatically appear here as high-quality trading channels are discovered!
+                  No canonical observations yet. Terms appear after normalized creator, video, enrichment, or human-review evidence is recorded.
                 </div>
               ) : (
-                extractedVocabulary.map(item => (
+                terminology.map(item => (
                   <div key={item.id} className="p-3.5 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/70 rounded-xl space-y-1">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-black text-slate-900 dark:text-white font-mono">{item.term}</span>
+                      <span className="text-xs font-black text-slate-900 dark:text-white font-mono">{item.canonical_term}</span>
                       <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 rounded-md">
-                        {item.category}
+                        {item.lifecycle_status.replaceAll('_', ' ')}
                       </span>
                     </div>
                     <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400 pt-1">
                       <span>Country: <strong className="text-slate-700 dark:text-slate-300">{item.country}</strong></span>
-                      <span className="font-mono">Occurrences: <strong className="text-indigo-600 dark:text-indigo-400">{item.occurrences}</strong></span>
+                      <span className="font-mono">Trust: <strong className="text-indigo-600 dark:text-indigo-400">T{item.trust_tier}</strong></span>
                     </div>
+                    <div className="text-[10px] text-slate-500">{item.language} · {item.script} · {item.term_type} · {item.search_eligible ? 'search eligible' : 'evidence only'}</div>
+                    {item.aliases.length > 0 && <div className="text-[10px] text-slate-500">Aliases: {item.aliases.map(alias => alias.alias).join(', ')}</div>}
+                    <div className="grid grid-cols-3 gap-1 pt-1 text-center text-[10px] font-mono">
+                      <span>{item.distinct_creator_count} creators</span><span>{item.executions} runs</span><span>{Math.round(item.decayed_yield_score * 100)}% yield</span>
+                    </div>
+                    {item.lifecycle_history[0] && <div className="text-[10px] text-slate-400 pt-1" title={item.lifecycle_history[0].reason}>Last {item.lifecycle_history[0].type.toLowerCase()}: {item.lifecycle_history[0].reason}</div>}
                   </div>
                 ))
               )}

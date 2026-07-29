@@ -184,6 +184,31 @@ export interface ExtractedTermRecord {
   validation_count?: number;
 }
 
+export interface CanonicalTradingTerm {
+  id: number;
+  canonical_term: string;
+  normalized_term: string;
+  aliases: Array<{ alias: string; type: string; language: string; script: string }>;
+  country: string;
+  language: string;
+  script: string;
+  term_type: 'TERMINOLOGY' | 'INSTRUMENT' | 'PHRASE' | 'FORMAT' | 'BRAND';
+  trust_tier: 1 | 2 | 3 | 4;
+  search_eligible: boolean;
+  classification_eligible: boolean;
+  country_evidence_eligible: boolean;
+  lifecycle_status: 'CANDIDATE' | 'OBSERVED' | 'MULTI_CREATOR_VALIDATED' | 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' | 'DEMOTED';
+  distinct_creator_count: number;
+  executions: number;
+  new_creators: number;
+  decayed_yield_score: number;
+  retrieval_lanes: Record<string, number>;
+  lifecycle_history: Array<{ type: string; from?: string; to: string; reason: string; at: string }>;
+  created_at: string;
+  first_observed_at?: string;
+  last_observed_at?: string;
+}
+
 export interface CountryVocabulary {
   country: string;
   languages: string[];

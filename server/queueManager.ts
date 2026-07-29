@@ -150,7 +150,7 @@ export async function processNextSearchJob(
         refreshed.quality_score=quality.score; refreshed.quality_breakdown=quality.breakdown;
         await upsertChannel(refreshed);
         if(quality.score>=55) {
-          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text);
+          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true);
           const db=await getDb();
           await db.query(`UPDATE extracted_vocabulary_sources SET provenance='HUMAN_APPROVED',eligible_after_enrichment=true WHERE channel_id=$1`,[channelId]);
         }
