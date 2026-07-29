@@ -5,7 +5,7 @@ export interface DashboardOperationalSummary {
   storedChannels: number;
   activeDiscords: number;
   pendingScans: number;
-  scope: { storedChannels: 'ALL_PERSISTED_CHANNELS'; operationalMetrics: 'ELIGIBLE_NON_REJECTED_CHANNELS' };
+  scope: { storedChannels: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'; operationalMetrics: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS' };
   deployment: { environment: string; service: string; instance: string };
 }
 
