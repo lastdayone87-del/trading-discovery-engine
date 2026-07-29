@@ -1,6 +1,104 @@
 # Production Readiness Report
 
-Date: 2026-07-28
+Date: 2026-07-29
+
+## Phase A-F end-to-end validation
+
+The six phases form a coherent pipeline: measurement-integrity funnel records feed
+the short-query planner; the planner schedules exactly one attributed channel or
+video retrieval lane per autonomous run; professional manual searches use separate
+durable sessions; uncertain results enter immutable human review; and canonical
+terminology consumes diverse creator evidence plus autonomous production yield.
+
+Four integration defects were found and corrected during this validation:
+
+1. **Phase C/F lane and quota attribution:** terminology performance was invoked
+   through the query evaluator without the run's retrieval lane or quota cost, so
+   otherwise valid performance rows were recorded as `UNKNOWN` with zero quota.
+   The worker now passes the authoritative job lane and 100-unit search cost through
+   the evaluator into terminology performance.
+2. **Phase D/F learning isolation:** high-quality channels reached through an
+   operator-directed manual search could enter automatic vocabulary extraction.
+   Manual results are still persisted and measurable, but no longer train autonomous
+   terminology unless the human-approval workflow later provides explicit provenance.
+3. **Phase D durable-page idempotency:** a retry after a page observation committed
+   could apply the session aggregate update again, duplicating quota and progress
+   accounting. The unique observation insert is now the transaction's idempotency
+   gate; a replay returns the durable session without changing aggregates.
+4. **Worker recovery audit integrity:** stale recovery requeued a job but left its
+   abandoned attempt marked `PROCESSING`. Recovery now closes those attempt rows as
+   failed in the same transaction that releases the job lock.
+
+The deterministic suite covers query compactness and script policy, lane allocation,
+measurement math, terminology diversity/decay/demotion, review immutability, country
+policy, and enrichment lifecycle. Type checking and the production build also pass.
+Live PostgreSQL, provider, restart, and deployment validation remains outstanding.
+
+### Subsystem assessment
+
+- **Phase A — Measurement integrity:** raw, distinct, duplicate, known, net-new,
+  country-rejected, classification, quality, and community outcomes are separated.
+  Creator uniqueness is keyed by channel ID and duplicate search hits do not inflate
+  the distinct funnel.
+- **Phase B — Short native planner:** generated queries are compact combinations of
+  native terms and formats with cooldown, primary-term, intent, script, normalization,
+  and country constraints. Tests explicitly reject the former descriptive sentence
+  pattern. Migrated `LEGACY` metadata remains for historical explainability, not as a
+  planner execution path.
+- **Phase C — Dual-lane discovery:** one lane is allocated per run to avoid doubling
+  quota; the run, sighting, worker log, and terminology performance now share the same
+  lane attribution.
+- **Phase D — Manual search:** sessions, pages, continuation tokens, adaptive stop
+  rules, quota reservations, cancellation, and progress are durable. Session updates
+  are idempotent and operator-directed sampling is isolated from automatic learning.
+- **Phase E — Human review:** approval/rejection uses bearer authentication,
+  optimistic versions, idempotency keys, immutable decision rows, and permanent
+  rejection. Force rescan is restricted to rejected reviews. Approved learning is
+  delayed until post-approval enrichment succeeds.
+- **Phase F — Terminology intelligence:** canonical country-scoped normalization,
+  aliases, append-only observations, creator/community diversity, decay, lifecycle
+  history, controlled search eligibility, production yield, demotion, and
+  human-approved provenance are connected. Automatic promotion cannot result from
+  occurrence volume alone, limiting self-reinforcing feedback.
+
+### Dashboard assessment
+
+The channel table, active queue depths, aggregate quota use, scheduler state, query
+library, canonical terminology, review records, active manual-session progress, and
+execution logs are backed by PostgreSQL APIs. Two UI/operational caveats remain:
+
+- The “recently discovered” count is the size of the currently returned unpaginated
+  channel array, not a separately calculated global statistic. This is accurate at
+  current scale but does not scale.
+- The queue monitor retains a `discord_validation` control although Discord inspection
+  currently runs inline in channel ingestion and no `INSPECT_DISCORD` producer exists.
+  Its depth will remain zero and pausing it does not suspend inline inspection. Treat
+  that control as obsolete and remove it in a dedicated compatibility cleanup.
+
+### Configuration assessment
+
+Planner, scheduler, lane allocation, quota allocation, worker concurrency, retrieval
+page size, and manual-search controls use environment defaults and, where documented,
+lowercase `app_settings` overrides. Defaults are conservative. `REVIEW_API_TOKEN` and
+`MANUAL_SEARCH_WORKER_CONCURRENCY` are implemented but were missing from the example
+environment documentation and are now listed below. `APP_URL`, `LOG_LEVEL`, and
+`DAILY_YOUTUBE_QUOTA_LIMIT` remain documented legacy/no-op settings; operators must use
+`DAILY_YOUTUBE_QUOTA_BUDGET` for the application budget.
+
+### Performance and cleanup recommendations
+
+- Push channel filtering and pagination into PostgreSQL before the table grows.
+- Consolidate dense compatibility helpers in `server/db.ts` into domain repositories
+  and archive `server/db.legacy.ts` after migration acceptance.
+- Remove unused `addManualCountrySearch`, the obsolete Discord queue control, the
+  PostgreSQL-incompatible backup endpoint, checked-in debugging/scrape artifacts, and
+  legacy no-op environment settings after confirming no external clients depend on
+  them.
+- Add an index supporting queue claims on `(status, run_after, priority DESC,
+  created_at)` after checking the staging query plan; the current separate indexes may
+  require extra sorting at scale.
+- Batch terminology lifecycle reads/writes and channel lookups only after production
+  traces show material latency; current algorithms are bounded but round-trip heavy.
 
 ## Executive decision
 
@@ -70,8 +168,8 @@ authentication, and Railway backups are not configured by this repository.
   or migrated separately.
 - Autonomous searches are restart-safe durable jobs. Candidate processing within one
   claimed search remains sequential, with a worker heartbeat protecting long claims.
-- Stale queue recovery resets jobs but leaves the corresponding open attempt row
-  unfinished. This affects operational audit quality, not job recovery itself.
+- Stale queue recovery resets jobs and now closes the corresponding abandoned attempt
+  row transactionally, preserving operational audit integrity.
 - `server/db.ts` contains dense one-line compatibility code, increasing review and
   maintenance risk. `saveDb()` remains an intentional no-op compatibility shim.
 - Startup deletes stress-test-prefixed channel records. This is deterministic but a
@@ -137,8 +235,10 @@ existing incompatible legacy operation: it returns an error by design.
 | `DISCOVERY_ENRICHMENT_QUOTA_PERCENT` | Enrichment allocation; default 20. |
 | `DISCOVERY_MANUAL_QUOTA_PERCENT` | Manual reserve; default 10. |
 | `SEARCH_WORKER_CONCURRENCY` | Search worker count; default 1. |
+| `MANUAL_SEARCH_WORKER_CONCURRENCY` | Manual continuation worker count; default 1. |
 | `ENRICHMENT_WORKER_CONCURRENCY` | Enrichment worker count; default 1. |
 | `YOUTUBE_DISCOVERY_MAX_RESULTS` | Results requested per search, clamped 10–50; default 25. |
+| `REVIEW_API_TOKEN` | Required bearer secret for review reads and decisions. |
 
 `APP_URL` and legacy `DAILY_YOUTUBE_QUOTA_LIMIT` are currently documented but not consumed by
 the audited server runtime. Remove or wire them in a separate, reviewed change.
@@ -187,9 +287,8 @@ the audited server runtime. Remove or wire them in a separate, reviewed change.
   deployment configuration, and environment usage.
 - Live PostgreSQL/Railway restart and external YouTube/Gemini validations were **not
   performed** because this workspace has no configured staging database/project or
-  credentials, and its pre-existing `node_modules` does not contain the declared `pg`
-  package. Both migration and queue-smoke commands therefore remain mandatory release
-  gates after a clean dependency install.
+  provider credentials. Migration and queue-smoke commands therefore remain mandatory
+  release gates in the staging environment.
 
 The recommendation changes to **GO** only after all release blockers and staging
 checklist items pass with retained logs, row-count reports, and backup-restore proof.

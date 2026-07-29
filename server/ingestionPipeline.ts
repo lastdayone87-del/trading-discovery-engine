@@ -336,7 +336,10 @@ export async function processChannelThroughPipeline(
   finalChannel.quality_breakdown = qualityResult.breakdown;
   await upsertChannel(finalChannel);
 
-  if (qualityResult.score >= 55) {
+  // Professional manual search is an operator-directed measurement lane. Its
+  // discoveries are persisted, but must not train autonomous terminology until
+  // an explicit human approval supplies independent provenance.
+  if (qualityResult.score >= 55 && source !== 'manual_search') {
     await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description);
   }
 

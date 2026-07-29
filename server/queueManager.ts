@@ -239,7 +239,7 @@ export async function processNextSearchJob(
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(extracted.length, observations);
       await recordQueryRunSightings(queryRunId, queryId, sightings);
-      const performance = await evaluateQueryPerformance(queryRecord, metrics);
+      const performance = await evaluateQueryPerformance(queryRecord, metrics, { retrievalLane, quotaConsumed: 100 });
       await completeQueryRun(queryRunId, {
         ...metrics,
         uniqueChannels: metrics.newChannels,
