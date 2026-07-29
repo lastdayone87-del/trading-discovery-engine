@@ -32,6 +32,7 @@ import { createExperiment, inspectExperiments, transitionExperiment } from './se
 import { approveCatalog, inspectCatalogs, publishCatalog, stageCatalog, transitionLifecycle } from './server/catalogPublication';
 import { configurePlaylistCanary, enqueuePlaylistCanary, inspectEvidenceGraph, proposePlaylistInspection } from './server/evidenceGraphAdapters';
 import { allocateBestFirst, createPolicy, inspectPortfolio, transitionPolicy } from './server/portfolioAllocator';
+import { inspectAdaptiveClassifier } from './server/adaptiveTradingClassifier';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -108,6 +109,7 @@ async function startServer() {
   app.get('/api/research-programs/price-action-trading',async(req,res)=>{try{res.json(await inspectTopicPilot());}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/research-programs/price-action-trading/coverage',async(req,res)=>{try{res.json(await inspectCoverageLifecycle());}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/evidence-graph',async(req,res)=>{try{res.json(await inspectEvidenceGraph(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/adaptive-classifier/shadow',async(req,res)=>{try{res.json(await inspectAdaptiveClassifier(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/acquisition-adapters/playlist/proposals',async(req,res)=>{try{res.status(201).json(await proposePlaylistInspection({...req.body,programKey:req.body.programKey||'price-action-trading'}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/control',async(req,res)=>{try{res.json(await configurePlaylistCanary({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='ADAPTER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/actions/:id/enqueue',async(req,res)=>{try{const result=await enqueuePlaylistCanary(req.params.id,String(req.body.targetCountry||''));res.status(result.queued?202:409).json(result);}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});

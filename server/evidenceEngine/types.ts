@@ -6,6 +6,8 @@ export type EvidenceSourceType =
   | 'external_links'
   | 'country_knowledge'
   | 'multilingual_context'
+  | 'adaptive_catalog'
+  | 'evidence_graph'
   | 'gemini_semantic'
   | 'discord_metadata';
 

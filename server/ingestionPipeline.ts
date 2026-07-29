@@ -1,7 +1,8 @@
 import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
 import { DiscoveredChannelRaw } from './youtube';
 import { validateChannelCountry } from './countryValidator';
-import { classifyTradingRelevance } from './tradingRelevanceClassifier';
+import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
+import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
 import { inspectAndValidateChannel } from './queueManager';
 import {
   getChannelById,
@@ -154,7 +155,7 @@ export async function processChannelThroughPipeline(
   }
 
   // Step 2: GATE 2 - Evidence-Based Trading Verification Engine
-  const tradingVal = await classifyTradingRelevance(
+  const productionClassification = await classifyTradingRelevanceDetailed(
     candidate.channelName,
     candidate.description,
     candidate.videoTitles,
@@ -163,6 +164,11 @@ export async function processChannelThroughPipeline(
     candidate.channelLinks,
     undefined
   );
+  const tradingVal = productionClassification.result;
+  // Deliberately detached: shadow I/O is never awaited by the production gate.
+  // Failures are observable but cannot delay or alter ingestion.
+  void runAndRecordAdaptiveShadow(candidate.channelId, productionClassification.input, productionClassification.decision)
+    .catch(error => console.warn(`[AdaptiveClassifier] Shadow evaluation failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error));
 
   if (tradingVal.status === 'NON_TRADING') {
     console.log(

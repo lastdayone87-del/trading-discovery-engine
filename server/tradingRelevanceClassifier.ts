@@ -17,6 +17,19 @@ export async function classifyTradingRelevance(
   externalLinks: string[] = [],
   discordInvite?: string | null
 ): Promise<TradingClassificationResult> {
+  return (await classifyTradingRelevanceDetailed(channelName, description, videoTitles, videoDescriptions, country, externalLinks, discordInvite)).result;
+}
+
+/** Exposes the immutable evidence decision to the shadow path without rerunning providers. */
+export async function classifyTradingRelevanceDetailed(
+  channelName: string,
+  description: string,
+  videoTitles: string[] = [],
+  videoDescriptions: string = '',
+  country: string = 'UNKNOWN',
+  externalLinks: string[] = [],
+  discordInvite?: string | null
+): Promise<{result: TradingClassificationResult; decision: VerificationDecision; input: RawChannelInput}> {
   const input: RawChannelInput = {
     channel_name: channelName,
     description,
@@ -64,10 +77,11 @@ export async function classifyTradingRelevance(
     reasoning: reasoningLogs
   };
 
-  return {
+  const result: TradingClassificationResult = {
     status: decision.status,
     confidenceScore: decision.confidenceScore,
     category: decision.category,
     breakdown
   };
+  return {result, decision, input};
 }
