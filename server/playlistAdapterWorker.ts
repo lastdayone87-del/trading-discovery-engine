@@ -1,0 +1,18 @@
+import { completeJob, finishQuotaReservation, getAppSetting, getDailyYouTubeQuotaBudget, getDb, tryReserveQuota, type DurableJob } from './db';
+import { normalizePlaylistObservations, PLAYLIST_PROVIDER_COST } from './evidenceGraphAdapters';
+import { fetchYouTubePlaylistChannels } from './youtube';
+import type { DiscoveredChannelRaw } from './youtube';
+
+export async function processPlaylistInspectionJob(job:DurableJob,ingest:(raw:DiscoveredChannelRaw,country:string,source:'automated_query')=>Promise<unknown>):Promise<void>{
+  const db=await getDb();const actionId=String(job.payload.actionId||'');
+  const state=await db.query(`SELECT f.*,c.*,p.id program_id FROM frontier_actions f JOIN research_programs p ON p.id=f.program_id JOIN acquisition_adapter_controls c ON c.adapter_type='INSPECT_PLAYLIST' WHERE f.id=$1`,[actionId]);
+  const row=state.rows[0];if(!row||row.mode!=='CANARY'||row.paused||row.kill_switch||job.payload.payloadSchemaVersion!==1||job.payload.policyVersion!==row.policy_version)throw new Error('PLAYLIST_CANARY_POLICY_REJECTED');
+  const budget=getDailyYouTubeQuotaBudget(),percent=Number(await getAppSetting('playlist_canary_quota_percent','1'));
+  if(!await tryReserveQuota({operationType:'INSPECT_PLAYLIST',operationId:actionId,allocation:'AUTONOMOUS',units:PLAYLIST_PROVIDER_COST,dailyBudget:budget,allocationPercent:percent}))throw new Error('PLAYLIST_CANARY_GLOBAL_QUOTA_EXHAUSTED');
+  try{const observations=normalizePlaylistObservations(await fetchYouTubePlaylistChannels(String(job.payload.playlistId),row.max_fanout),row.max_fanout);
+    for(const item of observations)await ingest({channelId:item.channelId,channelName:item.channelName,youtubeUrl:`https://www.youtube.com/channel/${item.channelId}`,description:item.description,videoTitles:item.videoTitles},String(job.payload.targetCountry),'automated_query');
+    const client=await db.connect();try{await client.query('BEGIN');for(const item of observations){const n=await client.query(`INSERT INTO evidence_nodes(node_type,canonical_key,attributes,first_observed_at) VALUES('CHANNEL',$1,$2,$3) ON CONFLICT(node_type,canonical_key) DO UPDATE SET canonical_key=excluded.canonical_key RETURNING id`,[item.canonicalKey,JSON.stringify({channelId:item.channelId}),item.observedAt]);await client.query(`INSERT INTO evidence_program_visits(program_id,node_id,action_id,visit_key,depth,attribution_path,status,policy_version) VALUES($1,$2,$3,$4,$5,$6,'VISITED',$7) ON CONFLICT(program_id,visit_key) DO NOTHING`,[row.program_id,n.rows[0].id,actionId,`${row.semantic_action_key}:${item.canonicalKey}`,1,JSON.stringify([actionId,n.rows[0].id]),row.policy_version]);}
+      await client.query(`INSERT INTO acquisition_adapter_runs(adapter_type,action_id,job_id,program_id,semantic_action_key,status,quota_reserved,quota_consumed,provider_request_key,policy_version,payload_schema_version,observed_at,outcome) VALUES('INSPECT_PLAYLIST',$1,$2,$3,$4,'SUCCEEDED',1,1,$5,$6,1,now(),$7) ON CONFLICT(adapter_type,action_id) DO NOTHING`,[actionId,job.id,row.program_id,row.semantic_action_key,`playlist:${row.semantic_action_key}`,row.policy_version,JSON.stringify({channels:observations.map(x=>x.canonicalKey),fanout:observations.length})]);await client.query(`UPDATE frontier_actions SET lifecycle='COMPLETED' WHERE id=$1`,[actionId]);await client.query('COMMIT');}catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+    await finishQuotaReservation('INSPECT_PLAYLIST',actionId,true);await completeJob(job.id);
+  }catch(e){await finishQuotaReservation('INSPECT_PLAYLIST',actionId,false);throw e;}
+}
