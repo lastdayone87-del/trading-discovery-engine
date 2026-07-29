@@ -1,18 +1,19 @@
 export interface ReadinessState {
   status: 'starting' | 'ok';
   readiness: 'not_ready' | 'ready';
+  database: 'initializing' | 'ready';
 }
 
 export function createReadinessState(): {
   snapshot: () => ReadinessState;
-  markListening: () => void;
+  markDatabaseReady: () => void;
 } {
-  let listening = false;
+  let databaseReady = false;
   return {
-    snapshot: () => listening
-      ? { status: 'ok', readiness: 'ready' }
-      : { status: 'starting', readiness: 'not_ready' },
-    markListening: () => { listening = true; }
+    snapshot: () => databaseReady
+      ? { status: 'ok', readiness: 'ready', database: 'ready' }
+      : { status: 'starting', readiness: 'not_ready', database: 'initializing' },
+    markDatabaseReady: () => { databaseReady = true; }
   };
 }
 

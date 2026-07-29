@@ -637,14 +637,22 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    readiness.markListening();
     console.log(`Trading Community Discovery Engine running on http://0.0.0.0:${PORT}`);
-    launchAfterReadiness([
-      { name: 'startup maintenance purge', run: async () => { await purgeSyntheticTestChannels(); } },
-      { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } },
-      { name: 'durable queue workers', run: () => { startSearchWorkers(); } },
-      { name: 'autonomous discovery scheduler', run: () => { startAutonomousDiscoveryScheduler(); } }
-    ]);
+    // Bind promptly for the platform, but do not advertise readiness or launch
+    // database-backed workers until the configured PostgreSQL database has been
+    // reached and fully migrated. Provider work remains outside readiness.
+    Promise.all([getSchemaInfo(), getQueueStatus()]).then(([schema]) => {
+      readiness.markDatabaseReady();
+      console.log(`[Startup] PostgreSQL ready at schema version ${schema.currentVersion}; ${schema.channelCount} channels available.`);
+      launchAfterReadiness([
+        { name: 'startup maintenance purge', run: async () => { await purgeSyntheticTestChannels(); } },
+        { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } },
+        { name: 'durable queue workers', run: () => { startSearchWorkers(); } },
+        { name: 'autonomous discovery scheduler', run: () => { startAutonomousDiscoveryScheduler(); } }
+      ]);
+    }).catch(error => {
+      console.error('[Startup] PostgreSQL initialization failed; service remains not ready:', error);
+    });
   });
 
   // Development UI middleware is intentionally initialized after the listener.
