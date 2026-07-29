@@ -485,7 +485,7 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
 export async function tryReserveQuota(args: {
   operationType: string;
   operationId: string;
-  allocation: 'MANUAL' | 'ENRICHMENT';
+  allocation: 'MANUAL' | 'ENRICHMENT' | 'AUTONOMOUS';
   units: number;
   dailyBudget: number;
   allocationPercent: number;

@@ -126,6 +126,7 @@ export async function searchYouTubeChannels(
 export interface YouTubeChannelPage {
   channels: DiscoveredChannelRaw[];
   nextPageToken: string | null;
+  rawResultCount: number;
 }
 
 /** Fetch one explicit result page so durable callers can resume without replaying pages. */
@@ -137,7 +138,7 @@ export async function searchYouTubeChannelPage(
   pageToken?: string | null
 ): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
-  if (!sanitizedQuery) return { channels: [], nextPageToken: null };
+  if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
 
   const keyPool = getYouTubeKeyPool();
   const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));
@@ -171,7 +172,7 @@ export async function searchYouTubeChannelPage(
           console.log(`[YouTube API Pool] Key #${currentIndex + 1} succeeded. ${lane} lane discovered ${results.length} unique channels.`);
           // An empty successful response is authoritative. Retrying the same
           // query against every key would multiply quota cost without changing it.
-          return { channels: results, nextPageToken: data.nextPageToken || null };
+          return { channels: results, nextPageToken: data.nextPageToken || null, rawResultCount: (data.items || []).length };
         } else {
           const errBody = await res.json().catch(() => ({}));
           const reason = errBody?.error?.errors?.[0]?.reason || errBody?.error?.message || `HTTP ${res.status}`;
