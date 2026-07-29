@@ -15,7 +15,8 @@
     "test": "find server -name '*.test.ts' -exec node --import tsx --test {} +",
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
-    "queue:smoke": "tsx scripts/queueSmokeTest.ts"
+    "queue:smoke": "tsx scripts/queueSmokeTest.ts",
+    "phase3:baseline": "tsx scripts/phase3Baseline.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
