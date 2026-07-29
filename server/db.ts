@@ -10,6 +10,7 @@ import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import type { ValidationKind, ValidationStatus } from './phase3Validation';
 import { validateLedgerInput } from './phase3Validation';
+import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -52,6 +53,24 @@ export async function getProviderOperationalMetrics(hours=24):Promise<any>{const
 
 export async function appendValidationRun(run:{id:string;kind:ValidationKind;environment:string;status:ValidationStatus;policyVersion?:string;datasetVersion?:string;artifactChecksum:string;summary:unknown;startedAt:string;completedAt:string}):Promise<void>{validateLedgerInput(run);const db=await getDb();await db.query(`INSERT INTO validation_runs(id,kind,environment,status,policy_version,dataset_version,artifact_checksum,summary,started_at,completed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO NOTHING`,[run.id,run.kind,run.environment,run.status,run.policyVersion||null,run.datasetVersion||null,run.artifactChecksum,JSON.stringify(run.summary),run.startedAt,run.completedAt]);}
 export async function getValidationRuns(limit=100):Promise<any[]>{const db=await getDb();const res=await db.query(`SELECT id,kind,environment,status,policy_version,dataset_version,artifact_checksum,summary,started_at,completed_at,created_at FROM validation_runs ORDER BY created_at DESC LIMIT $1`,[Math.min(Math.max(limit,1),500)]);return res.rows;}
+
+type EventClient={query:(sql:string,values?:any[])=>Promise<any>};
+export interface MeasurementLineage {eventKey:string;subjectType:string;subjectId:string;eventType:string;sourceEventKey?:string;queryId?:number;queryRunId?:string;jobId?:string;country?:string;retrievalLane?:string;eventTime?:string;payload:Record<string,unknown>}
+async function appendDecisionWith(client:EventClient,event:MeasurementLineage):Promise<void>{assertMinimalPayload(event.payload);await client.query(`INSERT INTO decision_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,policy_version,feature_version,event_time,payload) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(event_key) DO NOTHING`,[event.eventKey,event.subjectType,event.subjectId,event.eventType,event.sourceEventKey||null,event.queryId||null,event.queryRunId||null,event.jobId||null,event.country||null,event.retrievalLane||null,REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,event.eventTime||new Date().toISOString(),JSON.stringify(event.payload)]);}
+async function appendOutcomeWith(client:EventClient,event:MeasurementLineage&{eventType:OutcomeEventType;verificationStatus:VerificationStatus}):Promise<void>{assertMinimalPayload(event.payload);await client.query(`INSERT INTO outcome_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,verification_status,policy_version,feature_version,event_time,payload) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(event_key) DO NOTHING`,[event.eventKey,event.subjectType,event.subjectId,event.eventType,event.sourceEventKey||null,event.queryId||null,event.queryRunId||null,event.jobId||null,event.country||null,event.retrievalLane||null,event.verificationStatus,REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,event.eventTime||new Date().toISOString(),JSON.stringify(event.payload)]);}
+export async function appendDecisionEvent(event:MeasurementLineage):Promise<void>{return appendDecisionWith(await getDb(),event);}
+export async function appendOutcomeEvent(event:MeasurementLineage&{eventType:OutcomeEventType;verificationStatus:VerificationStatus}):Promise<void>{return appendOutcomeWith(await getDb(),event);}
+
+/** Authorized report only; it is read-only and never invokes a provider. Legacy aggregates remain authoritative. */
+export async function getReplayReport(from:string,to:string,tolerance=0):Promise<any>{
+  const start=new Date(from),end=new Date(to);if(!Number.isFinite(start.getTime())||!Number.isFinite(end.getTime())||end<start)throw new Error('Replay window is invalid.');
+  const db=await getDb();const [events,legacy]=await Promise.all([
+    db.query(`SELECT event_key,subject_id,event_type,verification_status,event_time,recorded_at,country,retrieval_lane,payload FROM outcome_events WHERE event_time >= $1 AND event_time < $2 ORDER BY recorded_at,event_key`,[start.toISOString(),end.toISOString()]),
+    db.query(`SELECT COALESCE(SUM(raw_results),0)::int "rawResults",COALESCE(SUM(distinct_results),0)::int "distinctResults",COALESCE(SUM(duplicate_results),0)::int "duplicateResults",COALESCE(SUM(known_channels),0)::int "knownChannels",COALESCE(SUM(new_channels),0)::int "newChannels",COALESCE(SUM(country_rejected),0)::int "countryRejected",COALESCE(SUM(non_trading),0)::int "nonTrading",COALESCE(SUM(uncertain),0)::int uncertain,COALESCE(SUM(needs_review),0)::int "needsReview",COALESCE(SUM(trading_confirmed),0)::int "tradingConfirmed",COALESCE(SUM(unique_channels),0)::int "uniqueChannels",COALESCE(SUM(quality_channels),0)::int "qualityChannels",COALESCE(SUM(communities_discovered),0)::int "communitiesDiscovered",COALESCE(SUM(quota_used),0)::int "quotaUsed" FROM query_runs WHERE status='COMPLETED' AND completed_at >= $1 AND completed_at < $2`,[start.toISOString(),end.toISOString()])
+  ]);
+  const replayed=replayFunnel(events.rows.map((r:any)=>({eventKey:r.event_key,subjectId:r.subject_id,eventType:r.event_type,verificationStatus:r.verification_status,eventTime:iso(r.event_time)!,recordedAt:iso(r.recorded_at)!,country:r.country,retrievalLane:r.retrieval_lane,payload:parseJson(r.payload,{})})));
+  return {mode:'SHADOW',authoritativeSource:'legacy-query-aggregates',networkAccess:false,policyVersion:REPLAY_POLICY_VERSION,featureVersion:REPLAY_FEATURE_VERSION,window:{from:start.toISOString(),to:end.toISOString()},replay:replayed,reconciliation:compareMetrics(replayed.totals,legacy.rows[0] as FunnelMetrics,tolerance)};
+}
 
 function parseJson<T>(value: any, fallback: T): T {
   if (value == null) return fallback;
@@ -375,6 +394,7 @@ export async function scheduleAutonomousQueryRuns(
       );
       const jobId = job.rows[0].id;
       await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
+      await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,generationMode:candidate.query.generation_mode}});
       await client.query(
         `INSERT INTO quota_reservations(operation_type,operation_id,allocation,units,expires_at)
          VALUES('SEARCH_YOUTUBE',$1,'AUTONOMOUS',100,now()+interval '20 minutes')`,
@@ -442,6 +462,7 @@ export async function completeQueryRun(runId: string, metrics: {
          WHERE id=$1`, [run.rows[0].query_id]
       );
     }
+    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});}
     await client.query(
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
@@ -484,6 +505,7 @@ export async function recordQueryRunSightings(runId: string, queryId: number, si
          sighting.wasKnown, sighting.persisted, sighting.countryOutcome, sighting.tradingOutcome, sighting.funnelOutcome,
          JSON.stringify(sighting.metadata || {})]
       );
+      await appendOutcomeWith(client,{eventKey:`query-run:${runId}:page:${sighting.pageNumber||1}:lane:${sighting.searchLane||'CHANNEL'}:channel:${sighting.channelId}:v1`,subjectType:'CHANNEL',subjectId:sighting.channelId,eventType:'CHANNEL_OBSERVED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId,queryRunId:runId,country:typeof sighting.metadata?.country==='string'?sighting.metadata.country:undefined,retrievalLane:sighting.searchLane,eventTime:new Date().toISOString(),payload:{resultRank:sighting.resultRank,pageNumber:sighting.pageNumber||1,wasKnown:sighting.wasKnown,persisted:sighting.persisted,countryOutcome:sighting.countryOutcome,tradingOutcome:sighting.tradingOutcome,funnelOutcome:sighting.funnelOutcome}});
     }
     await client.query('COMMIT');
   } catch (error) {

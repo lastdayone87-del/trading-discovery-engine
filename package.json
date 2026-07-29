@@ -17,6 +17,7 @@
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts"
+    ,"phase4:replay": "tsx scripts/phase4Replay.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

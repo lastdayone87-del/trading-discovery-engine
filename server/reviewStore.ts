@@ -1,4 +1,5 @@
 import { getDb } from './db';
+import { REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION } from './replayMeasurement';
 
 export type ReviewState = 'NOT_REQUIRED'|'PENDING'|'APPROVED'|'REJECTED'|'SUPERSEDED';
 export type ReviewAction = 'APPROVE'|'REJECT'|'FORCE_RESCAN';
@@ -62,6 +63,9 @@ export async function decideReview(input:DecideInput) {
       await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('FORCE_REVIEW_RESCAN',$1,1000,4,$2) ON CONFLICT(idempotency_key) DO NOTHING`,[JSON.stringify({channelId:input.channelId,reviewVersion:nextVersion}),`force-review-rescan:${input.channelId}:${nextVersion}`]);
     }
     const inserted=await client.query(`INSERT INTO channel_review_decisions(channel_id,decision,previous_status,resulting_status,reviewer,reason,notes,review_version,evidence_snapshot,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[input.channelId,input.action,row.state,resulting,input.reviewer.trim(),input.reason.trim(),input.notes?.trim()||null,nextVersion,JSON.stringify(evidence),input.idempotencyKey]);
+    const lineage=await client.query(`SELECT s.query_run_id,s.query_id,r.job_id,r.country,r.retrieval_lane FROM channel_sightings s JOIN query_runs r ON r.id=s.query_run_id WHERE s.channel_id=$1 ORDER BY s.observed_at DESC LIMIT 1`,[input.channelId]);
+    const origin=lineage.rows[0];
+    await client.query(`INSERT INTO outcome_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,verification_status,policy_version,feature_version,event_time,payload) VALUES($1,'CHANNEL',$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13) ON CONFLICT(event_key) DO NOTHING`,[`review:${input.channelId}:version:${nextVersion}:v1`,input.channelId,input.action==='FORCE_RESCAN'?'REVIEW_CORRECTED':'REVIEW_VERIFIED',origin?`query-run:${origin.query_run_id}:selected:v1`:null,origin?.query_id||null,origin?.query_run_id||null,origin?.job_id||null,origin?.country||row.channel_snapshot?.country||null,origin?.retrieval_lane||null,input.action==='FORCE_RESCAN'?'CORRECTIVE':'VERIFIED',REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,JSON.stringify({action:input.action,previousStatus:row.state,resultingStatus:resulting,reviewVersion:nextVersion,reasonCode:input.reason.trim()})]);
     await client.query(`UPDATE channel_reviews SET state=$2,review_version=$3,evidence_snapshot=$4,decided_at=CASE WHEN $2='PENDING' THEN NULL ELSE now() END,pending_since=CASE WHEN $2='PENDING' THEN now() ELSE pending_since END,updated_at=now() WHERE channel_id=$1`,[input.channelId,resulting,nextVersion,JSON.stringify(evidence)]);
     await client.query('COMMIT'); return {decision:inserted.rows[0],idempotent:false};
   } catch(e){await client.query('ROLLBACK'); throw e;} finally {client.release();}
