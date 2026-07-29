@@ -1,3 +1,4 @@
+import { apiFetch } from '../apiClient';
 import React, { useEffect, useState } from 'react';
 import { ChannelRecord, ReviewQueueItem } from '../types';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
@@ -36,7 +37,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   useEffect(() => {
     if (!reviewEnabled) return;
     let active = true;
-    fetch('/api/reviewer-credentials')
+    apiFetch('/api/reviewer-credentials')
       .then(response => response.ok ? response.json() : Promise.reject())
       .then(({ defaultsAvailable }) => { if (active) setReviewerDefaultsAvailable(Boolean(defaultsAvailable)); })
       .catch(() => { if (active) setReviewerDefaultsAvailable(false); });
@@ -74,7 +75,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
 
   const loadReviewDetails = async (channelId: string) => {
     setReviewError('');
-    const response = await fetch(`/api/reviews/${encodeURIComponent(channelId)}`, { headers: reviewHeaders() });
+    const response = await apiFetch(`/api/reviews/${encodeURIComponent(channelId)}`, { headers: reviewHeaders() });
     if (!response.ok) throw new Error(await parseError(response));
     return response.json() as Promise<ReviewQueueItem>;
   };
@@ -108,7 +109,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
 
     try {
       const details = currentDetails || await loadReviewDetails(channelId);
-      const response = await fetch(`/api/reviews/${encodeURIComponent(channelId)}/${action}`, {
+      const response = await apiFetch(`/api/reviews/${encodeURIComponent(channelId)}/${action}`, {
         method: 'POST',
         headers: {
           ...reviewHeaders(),

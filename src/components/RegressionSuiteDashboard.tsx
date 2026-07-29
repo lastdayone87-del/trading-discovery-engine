@@ -1,3 +1,4 @@
+import { apiFetch } from '../apiClient';
 import React, { useState, useEffect } from 'react';
 import {
   RegressionRunRecord,
@@ -33,8 +34,8 @@ export const RegressionSuiteDashboard: React.FC = () => {
     setIsLoading(true);
     try {
       const [latestRes, runsRes] = await Promise.all([
-        fetch('/api/regression/latest'),
-        fetch('/api/regression/runs')
+        apiFetch('/api/regression/latest'),
+        apiFetch('/api/regression/runs')
       ]);
 
       if (latestRes.ok) {
@@ -62,7 +63,7 @@ export const RegressionSuiteDashboard: React.FC = () => {
   const handleRunRegression = async () => {
     setIsRunningTest(true);
     try {
-      const res = await fetch('/api/regression/run', {
+      const res = await apiFetch('/api/regression/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ runLabel: customRunLabel || undefined })

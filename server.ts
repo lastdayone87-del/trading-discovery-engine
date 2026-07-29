@@ -19,7 +19,7 @@ import {
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
-  purgeSyntheticTestChannels
+  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents
 } from './server/db';
 import {
   addSearchJob,
@@ -53,18 +53,21 @@ import { assertCountryAllowed, ExcludedCountryError } from './server/countryExcl
 import { getManualSearchSession, listManualSearchSessions, requestManualSearchCancellation } from './server/manualSearchStore';
 import { decideReview, getReviewDetails, listReviewQueue, ReviewConflictError, ReviewNotFoundError } from './server/reviewStore';
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
+import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
 
 
 async function startServer() {
+  validateOperatorConfiguration();
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
 
   app.use(express.json());
+  app.use('/api', operatorAuthorization(appendOperatorAuditEvent));
 
   const requireReviewer: express.RequestHandler = (req,res,next) => {
-    const supplied=req.header('authorization')?.replace(/^Bearer\s+/i,'')||'';
-    if(!process.env.REVIEW_API_TOKEN && !process.env.DEFAULT_REVIEWER_API_TOKEN) return res.status(503).json({error:'A reviewer API token is not configured.'});
-    if(!reviewerTokenIsValid(supplied)) return res.status(401).json({error:'Valid reviewer bearer token required.'});
+    // The central operator boundary has authenticated this request. Keeping this
+    // named middleware preserves the review route structure during transition.
+    if (!req.operator) return res.status(401).json({error:'Bearer authentication required.',code:'UNAUTHENTICATED',requestId:req.requestId});
     next();
   };
 
@@ -89,10 +92,12 @@ async function startServer() {
 
   // --- API ROUTES ---
 
+  app.get('/api/operator-audit-events', async(req,res)=>{try{res.json(await getOperatorAuditEvents(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+
   app.get('/api/reviewer-credentials', (_req,res)=>res.json({defaultsAvailable:reviewerDefaultsAvailable()}));
   app.get('/api/reviews', requireReviewer, async(req,res)=>{try{res.json(await listReviewQueue({country:req.query.country as string|undefined,search:req.query.search as string|undefined,limit:Number(req.query.limit||50),offset:Number(req.query.offset||0)}));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/reviews/:channelId', requireReviewer, async(req,res)=>{try{res.json(await getReviewDetails(req.params.channelId));}catch(err:any){res.status(err instanceof ReviewNotFoundError?404:500).json({error:err.message});}});
-  const reviewAction=(action:'APPROVE'|'REJECT'|'FORCE_RESCAN'):express.RequestHandler=>async(req,res)=>{try{const reviewer=resolveReviewerIdentity(req.header('x-reviewer-id'));if(!reviewer)return res.status(400).json({error:'X-Reviewer-Id header is required.'});const result=await decideReview({channelId:req.params.channelId,action,expectedVersion:Number(req.body.reviewVersion),reviewer,reason:String(req.body.reason||''),notes:req.body.notes,idempotencyKey:req.header('idempotency-key')||''});res.json(result);}catch(err:any){res.status(err instanceof ReviewConflictError?409:err instanceof ReviewNotFoundError?404:400).json({error:err.message});}};
+  const reviewAction=(action:'APPROVE'|'REJECT'|'FORCE_RESCAN'):express.RequestHandler=>async(req,res)=>{try{const reviewer=resolveReviewerIdentity(req.header('x-reviewer-id'))||req.operator?.actorId;if(!reviewer)return res.status(400).json({error:'Reviewer identity is required.'});const result=await decideReview({channelId:req.params.channelId,action,expectedVersion:Number(req.body.reviewVersion),reviewer,reason:String(req.body.reason||''),notes:req.body.notes,idempotencyKey:req.header('idempotency-key')||''});res.json(result);}catch(err:any){res.status(err instanceof ReviewConflictError?409:err instanceof ReviewNotFoundError?404:400).json({error:err.message});}};
   app.post('/api/reviews/:channelId/approve',requireReviewer,reviewAction('APPROVE'));
   app.post('/api/reviews/:channelId/reject',requireReviewer,reviewAction('REJECT'));
   app.post('/api/reviews/:channelId/force-rescan',requireReviewer,reviewAction('FORCE_RESCAN'));
@@ -102,9 +107,9 @@ async function startServer() {
     try {
       const schema = await getSchemaInfo();
       const queues = await getQueueStatus();
-      res.json({ status: 'ok', database: 'ok', schemaVersion: schema.currentVersion, channelCount: schema.channelCount, queues });
+      res.json({ status: 'ok' });
     } catch (err: any) {
-      res.status(503).json({ status: 'error', database: 'unavailable', error: err.message });
+      res.status(503).json({ status: 'error' });
     }
   });
 
@@ -277,7 +282,7 @@ async function startServer() {
         return res.status(400).json({ error: 'Missing country parameter.' });
       }
 
-      const queries = await addAutomatedCountrySearch(country);
+      const queries = await addAutomatedCountrySearch(country, { actorId: req.operator!.actorId, requestId: req.requestId });
       
       // Kick off processing
       processNextSearchJob().catch(() => {});

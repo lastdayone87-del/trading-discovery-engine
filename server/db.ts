@@ -6,6 +6,7 @@ import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src
 import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 import { calculateYouTubeDailyBudget, quotaAllocationBudget } from './quotaPolicy';
+import type { AuditEvent } from './operatorAuth';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -40,6 +41,9 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
 export function saveDb(): void {
   // PostgreSQL commits writes transactionally; retained as no-op compatibility shim.
 }
+
+export async function appendOperatorAuditEvent(event: AuditEvent): Promise<void> { const db=await getDb(); await db.query(`INSERT INTO operator_audit_events(actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(request_id,action,target,outcome) DO NOTHING`,[event.actorId||null,event.actorHash||null,event.role||null,event.action,event.target,event.requestId,event.outcome,JSON.stringify(event.metadata||{})]); }
+export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=await getDb();const res=await db.query(`SELECT id,actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata,created_at FROM operator_audit_events ORDER BY created_at DESC LIMIT $1`,[Math.min(Math.max(limit,1),500)]);return res.rows;}
 
 function parseJson<T>(value: any, fallback: T): T {
   if (value == null) return fallback;

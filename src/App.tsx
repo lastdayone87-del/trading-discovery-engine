@@ -1,3 +1,4 @@
+import { apiFetch } from './apiClient';
 import React, { useState, useEffect } from 'react';
 import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QuotaInfo } from './types';
 import { Navbar } from './components/Navbar';
@@ -27,7 +28,7 @@ export default function App() {
   const fetchChannels = async (overrideInclude?: boolean) => {
     try {
       const showAll = overrideInclude !== undefined ? overrideInclude : includeRejected;
-      const res = await fetch(`/api/channels${showAll ? '?include_rejected=true' : ''}`);
+      const res = await apiFetch(`/api/channels${showAll ? '?include_rejected=true' : ''}`);
       const cType = res.headers.get('content-type');
       if (res.ok && cType && cType.includes('application/json')) {
         const data = await res.json();
@@ -42,8 +43,8 @@ export default function App() {
   const fetchSettings = async () => {
     try {
       const [vRes, eRes] = await Promise.all([
-        fetch('/api/country-vocabularies'),
-        fetch('/api/excluded-countries')
+        apiFetch('/api/country-vocabularies'),
+        apiFetch('/api/excluded-countries')
       ]);
       const vType = vRes.headers.get('content-type');
       const eType = eRes.headers.get('content-type');
@@ -57,7 +58,7 @@ export default function App() {
   // Fetch Queue & Quota Status
   const fetchQueueStatus = async () => {
     try {
-      const res = await fetch('/api/queues/status');
+      const res = await apiFetch('/api/queues/status');
       const cType = res.headers.get('content-type');
       if (res.ok && cType && cType.includes('application/json')) {
         const data = await res.json();
@@ -85,7 +86,7 @@ export default function App() {
 
   // Handlers
   const handleManualSearch = async (query: string, country: string) => {
-    const res = await fetch('/api/search/manual', {
+    const res = await apiFetch('/api/search/manual', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, country })
@@ -100,7 +101,7 @@ export default function App() {
   };
 
   const handleAutomatedSearch = async (country: string) => {
-    const res = await fetch('/api/search/automated', {
+    const res = await apiFetch('/api/search/automated', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ country })
@@ -115,7 +116,7 @@ export default function App() {
 
   const handleRecheck = async (channelId: string) => {
     try {
-      const res = await fetch(`/api/channels/${channelId}/recheck`, {
+      const res = await apiFetch(`/api/channels/${channelId}/recheck`, {
         method: 'POST'
       });
       const data = await res.json();
@@ -133,7 +134,7 @@ export default function App() {
   };
 
   const handleSaveVocabulary = async (vocab: CountryVocabulary) => {
-    await fetch('/api/country-vocabularies', {
+    await apiFetch('/api/country-vocabularies', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(vocab)
@@ -142,7 +143,7 @@ export default function App() {
   };
 
   const handleAddExcluded = async (country: ExcludedCountry) => {
-    await fetch('/api/excluded-countries', {
+    await apiFetch('/api/excluded-countries', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(country)
@@ -151,14 +152,14 @@ export default function App() {
   };
 
   const handleRemoveExcluded = async (countryName: string) => {
-    await fetch(`/api/excluded-countries/${encodeURIComponent(countryName)}`, {
+    await apiFetch(`/api/excluded-countries/${encodeURIComponent(countryName)}`, {
       method: 'DELETE'
     });
     await fetchSettings();
   };
 
   const handleTogglePauseQueue = async (queueName: string, isPaused: boolean) => {
-    await fetch('/api/queues/pause', {
+    await apiFetch('/api/queues/pause', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ queueName, isPaused })

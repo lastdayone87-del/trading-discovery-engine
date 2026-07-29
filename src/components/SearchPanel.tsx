@@ -1,3 +1,4 @@
+import { apiFetch } from '../apiClient';
 import React, { useEffect, useState } from 'react';
 import { CountryVocabulary } from '../types';
 import { Search, Sparkles, Play, CheckCircle2, ShieldAlert, Terminal, Check, ArrowRight, Loader2, XCircle } from 'lucide-react';
@@ -23,7 +24,7 @@ export const SearchPanel: React.FC<Props> = ({ vocabularies, onManualSearch, onA
   useEffect(() => {
     if (!session?.id || !['RUNNING', 'CANCEL_REQUESTED'].includes(session.status)) return;
     const timer = setInterval(async () => {
-      const response = await fetch(`/api/search/manual/sessions/${session.id}`);
+      const response = await apiFetch(`/api/search/manual/sessions/${session.id}`);
       if (response.ok) { const updatedSession = await response.json(); setExecutionResult((current: any) => ({ ...current, session: updatedSession })); }
     }, 2000);
     return () => clearInterval(timer);
@@ -31,7 +32,7 @@ export const SearchPanel: React.FC<Props> = ({ vocabularies, onManualSearch, onA
 
   const cancelManualSearch = async () => {
     if (!session?.id) return;
-    const response = await fetch(`/api/search/manual/sessions/${session.id}/cancel`, { method: 'POST' });
+    const response = await apiFetch(`/api/search/manual/sessions/${session.id}/cancel`, { method: 'POST' });
     if (response.ok) { const updatedSession = await response.json(); setExecutionResult((current: any) => ({ ...current, session: updatedSession })); }
   };
 
