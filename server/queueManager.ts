@@ -531,9 +531,6 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
   }
 }
 
-// Run database channel audit asynchronously on module load
-auditExistingChannelsWithExclusionEngine().catch(e => console.error('Database exclusion audit startup error:', e));
-
 /**
  * Triggers a manual re-scan for a specific channel.
  * Runs 4-step inspection synchronously with force live YouTube scraping.
@@ -707,6 +704,17 @@ function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEA
   }
 }
 
-startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)));
-startWorkerPool('MANUAL_SEARCH_PAGE', Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1)));
-startWorkerPool('ENRICH_CHANNEL', Math.max(1, Number(process.env.ENRICHMENT_WORKER_CONCURRENCY || 1)));
+let workersStarted = false;
+
+/**
+ * Start the durable queue consumers explicitly, after HTTP readiness. Keeping
+ * this idempotent prevents duplicate consumers if startup orchestration is
+ * retried; individual ticks already preserve the existing claim/retry rules.
+ */
+export function startSearchWorkers(): void {
+  if (workersStarted) return;
+  workersStarted = true;
+  startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)));
+  startWorkerPool('MANUAL_SEARCH_PAGE', Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1)));
+  startWorkerPool('ENRICH_CHANNEL', Math.max(1, Number(process.env.ENRICHMENT_WORKER_CONCURRENCY || 1)));
+}

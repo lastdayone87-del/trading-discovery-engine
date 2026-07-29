@@ -54,7 +54,8 @@ export function authenticate(token: string|undefined, env: NodeJS.ProcessEnv = p
   return undefined;
 }
 
-function matchPolicy(req:Request) { return ROUTES.find(r => r.method===req.method && r.pattern.test(req.path)); }
+function policyPath(req:Request): string { return `${req.baseUrl || ''}${req.path}`; }
+function matchPolicy(req:Request) { return ROUTES.find(r => r.method===req.method && r.pattern.test(policyPath(req))); }
 const bearer=(req:Request) => req.header('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
 const safeMetadata=(req:Request) => ({ method:req.method, queryKeys:Object.keys(req.query).sort() });
 
