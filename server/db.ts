@@ -233,7 +233,6 @@ export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=proce
     scope:{storedChannels:'ALL_PERSISTED_CHANNELS',operationalMetrics:'ELIGIBLE_NON_REJECTED_CHANNELS'},
     deployment:{environment:env.RAILWAY_ENVIRONMENT_NAME||env.DEPLOYMENT_ENVIRONMENT||env.NODE_ENV||'unknown',service:env.RAILWAY_SERVICE_NAME||env.SERVICE_NAME||'trading-discovery-engine',instance:env.RAILWAY_DEPLOYMENT_ID?.slice(0,12)||env.DEPLOYMENT_ID?.slice(0,12)||'local'}};
 }
-
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {
   const db = await getDb();
   const res = await db.query('SELECT * FROM channels WHERE channel_id=$1', [channelId]);
