@@ -25,6 +25,7 @@ import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
 import { inspectCoverageLifecycle, recordLifecycleEvent } from './server/coverageLifecycle';
 import { inspectCorpus, inspectDocument } from './server/candidateCorpus';
+import { inspectCandidateAssertions } from './server/candidateScoring';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -105,6 +106,7 @@ async function startServer() {
   app.get('/api/research-programs/price-action-trading/coverage',async(req,res)=>{try{res.json(await inspectCoverageLifecycle());}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/corpus',async(req,res)=>{try{res.json(await inspectCorpus(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/corpus/documents/:id',async(req,res)=>{try{res.json(await inspectDocument(req.params.id));}catch(err:any){res.status(err.message==='Corpus document not found.'?404:500).json({error:err.message,requestId:req.requestId});}});
+  app.get('/api/candidate-assertions',async(req,res)=>{try{res.json(await inspectCandidateAssertions(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/research-programs/price-action-trading/pause',async(req,res)=>{try{res.json(await updatePilotControl({paused:true,killSwitch:true},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/resume',async(req,res)=>{try{res.json(await updatePilotControl({paused:false},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/budget',async(req,res)=>{try{res.json(await updatePilotControl({mode:req.body.mode,dailyYoutubeCap:req.body.dailyYoutubeCap,totalYoutubeCap:req.body.totalYoutubeCap},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});

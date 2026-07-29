@@ -37,6 +37,7 @@ import { evaluateContinuation } from './continuationPolicy';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
+import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -119,7 +120,7 @@ export async function addAutomatedCountrySearch(countryName: string, provenance?
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -134,6 +135,11 @@ export async function processNextSearchJob(
     const db=await getDb();const control=await db.query(`SELECT paused FROM corpus_controls WHERE singleton=true`);
     if(control.rowCount&&!control.rows[0].paused)claimableTypes.push('TERM_HARVEST');
   }
+  if (!claimableOverride || claimableOverride.includes('SCORE_CANDIDATES') || claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')) {
+    const db=await getDb();const control=await db.query(`SELECT scoring_paused,ai_paused FROM candidate_scoring_controls WHERE singleton=true`);
+    if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES')))claimableTypes.push('SCORE_CANDIDATES');
+    if(control.rowCount&&!control.rows[0].ai_paused&&(!claimableOverride||claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')))claimableTypes.push('AI_ADJUDICATE_CANDIDATE');
+  }
   if (claimableTypes.length === 0) return false;
 
   const job = await claimNextJob(workerId, claimableTypes);
@@ -145,6 +151,8 @@ export async function processNextSearchJob(
 
   try {
     if(job.type==='TERM_HARVEST'){await processTermHarvestJob(job);return true;}
+    if(job.type==='SCORE_CANDIDATES'){await processCandidateScoringJob(job);return true;}
+    if(job.type==='AI_ADJUDICATE_CANDIDATE'){await processAiAdjudicationJob(job);return true;}
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
       const channelId=String(job.payload.channelId||'');
       const before=await getChannelById(channelId);
