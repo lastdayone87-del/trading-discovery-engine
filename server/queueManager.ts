@@ -240,7 +240,7 @@ export async function processNextSearchJob(
       sightings.push({
         channelId: outcome.channelId, resultRank: index + 1, searchLane: retrievalLane, wasKnown: outcome.wasKnown, persisted: outcome.persisted,
         countryOutcome: outcome.countryStatus, tradingOutcome: outcome.tradingStatus, funnelOutcome,
-        metadata: { channelName: outcome.channelName, source, retrievalLane, searchOrdering }
+        metadata: { channelName: outcome.channelName, source, country, retrievalLane, searchOrdering }
       });
     }
     if (queryRunId && queryId) {
