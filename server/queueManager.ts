@@ -25,7 +25,7 @@ import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
-import { evaluateQueryPerformance } from './queryIntelligence';
+import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
@@ -113,7 +113,7 @@ export async function addAutomatedCountrySearch(countryName: string): Promise<st
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -122,6 +122,8 @@ export async function processNextSearchJob(
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('POST_APPROVAL_ENRICH'))) claimableTypes.push('POST_APPROVAL_ENRICH');
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('FORCE_REVIEW_RESCAN'))) claimableTypes.push('FORCE_REVIEW_RESCAN');
   if (claimableTypes.length === 0) return false;
 
   const job = await claimNextJob(workerId, claimableTypes);
@@ -132,6 +134,29 @@ export async function processNextSearchJob(
   heartbeat.unref?.();
 
   try {
+    if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
+      const channelId=String(job.payload.channelId||'');
+      const before=await getChannelById(channelId);
+      if(!before) { await completeJob(job.id); return true; }
+      const result=await triggerManualRecheck(channelId, true);
+      if(!result.success) throw new Error(result.message);
+      const refreshed=await getChannelById(channelId);
+      if(refreshed && job.type==='POST_APPROVAL_ENRICH') {
+        // Human approval remains authoritative; learning is delayed until this
+        // post-approval metadata/Discord inspection has completed successfully.
+        refreshed.trading_status='TRADING_CONFIRMED';
+        const text=refreshed.inspection_trail?.map(step=>step.details||'').join(' ')||'';
+        const quality=calculateCreatorQualityScore(refreshed,[refreshed.channel_name],text);
+        refreshed.quality_score=quality.score; refreshed.quality_breakdown=quality.breakdown;
+        await upsertChannel(refreshed);
+        if(quality.score>=55) {
+          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text);
+          const db=await getDb();
+          await db.query(`UPDATE extracted_vocabulary_sources SET provenance='HUMAN_APPROVED',eligible_after_enrichment=true WHERE channel_id=$1`,[channelId]);
+        }
+      }
+      await completeJob(job.id); return true;
+    }
     if (job.type === 'MANUAL_SEARCH_PAGE') {
       const sessionId = String(job.payload.sessionId || '');
       try {
@@ -199,7 +224,7 @@ export async function processNextSearchJob(
       const outcome = await processDiscoveredChannel(raw, country, source);
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
-        : outcome.tradingStatus;
+        : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
       const qualityScore = outcome.channelRecord?.quality_score || 0;
       const hasCommunity = outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME';
       observations.push({ channelId: outcome.channelId, wasKnown: outcome.wasKnown, persisted: outcome.persisted, funnelOutcome, qualityScore, hasCommunity });
@@ -268,7 +293,7 @@ export interface ProcessDiscoveredChannelOutcome {
   wasKnown: boolean;
   persisted: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
-  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
+  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
   discordStatus: DiscordStatus;
   discordInvite: string | null;
   channelRecord?: ChannelRecord;
@@ -472,6 +497,10 @@ export async function triggerManualRecheck(channelId: string, enableDebug?: bool
   const channel = await getChannelById(channelId);
   if (!channel) {
     return { success: false, message: 'Channel not found in database.' };
+  }
+
+  if (channel.trading_status === 'HUMAN_REJECTED') {
+    return { success: false, message: 'Human-rejected channels require the authenticated, audited force-rescan review action.', channel };
   }
 
   const exclusion = await getCountryExclusion(channel.country);

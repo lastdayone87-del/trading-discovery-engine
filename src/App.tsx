@@ -9,9 +9,10 @@ import { CountrySettings } from './components/CountrySettings';
 import { InspectionModal } from './components/InspectionModal';
 import { QueryIntelligenceEngine } from './components/QueryIntelligenceEngine';
 import { RegressionSuiteDashboard } from './components/RegressionSuiteDashboard';
+import { ReviewDashboard } from './components/ReviewDashboard';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'discovery' | 'intelligence' | 'regression' | 'results' | 'pending' | 'queues' | 'settings'>('discovery');
+  const [activeTab, setActiveTab] = useState<'discovery' | 'intelligence' | 'regression' | 'results' | 'review' | 'pending' | 'queues' | 'settings'>('discovery');
 
 
   const [channels, setChannels] = useState<ChannelRecord[]>([]);
@@ -259,6 +260,8 @@ export default function App() {
             onInspect={channel => setInspectingChannel(channel)}
           />
         )}
+
+        {activeTab === 'review' && <ReviewDashboard />}
 
         {activeTab === 'queues' && (
           <QueueMonitor

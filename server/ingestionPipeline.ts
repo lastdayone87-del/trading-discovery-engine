@@ -22,7 +22,7 @@ export interface IngestionPipelineOutcome {
   wasKnown: boolean;
   persisted: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
-  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW';
+  tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
   discordStatus: DiscordStatus;
   discordInvite: string | null;
   channelRecord?: ChannelRecord;
@@ -37,6 +37,7 @@ export function isTerminalState(channel: ChannelRecord): boolean {
   return (
     channel.country_status === 'REJECTED' ||
     channel.trading_status === 'NON_TRADING' ||
+    channel.trading_status === 'HUMAN_REJECTED' ||
     channel.scan_status === 'SKIPPED_EXCLUDED' ||
     channel.scan_status === 'SKIPPED_NON_TRADING' ||
     channel.scan_status === 'NEEDS_REVIEW' ||
