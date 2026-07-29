@@ -17,6 +17,8 @@ import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { selectQueryCollection, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
+import { executeProviderCall } from './providerResilience';
+import { appendProviderCallEvent } from './db';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -214,10 +216,10 @@ Return ONLY a valid JSON object with format:
   "formats": ["format1"]
 }`;
 
-      const response = await callGeminiSafe(() => ai.models.generateContent({
+      const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction'},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
         model: 'gemini-3.6-flash',
         contents: prompt
-      }));
+      })}));
 
       const resText = response.text || '';
       const jsonMatch = resText.match(/\{[\s\S]*\}/);

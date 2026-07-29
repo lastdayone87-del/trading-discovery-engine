@@ -11,6 +11,7 @@ declare global { namespace Express { interface Request { requestId: string; oper
 
 const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; action: string }> = [
   { method:'GET', pattern:/^\/api\/health$/, policy:'public', action:'health.read' },
+  { method:'GET', pattern:/^\/api\/provider-metrics$/, policy:'operator', action:'providers.metrics.read' },
   { method:'GET', pattern:/^\/api\/operator-audit-events$/, policy:'admin', action:'audit.read' },
   { method:'POST', pattern:/^\/api\/(database\/backup|db\/stress-test|db\/clean-stress-tests|queues\/pause|query-intelligence\/(pause|resume|scope|run-cycle)|regression\/run)$/, policy:'admin', action:'administration.execute' },
   { method:'POST', pattern:/^\/api\/(country-vocabularies|excluded-countries)$/, policy:'admin', action:'configuration.write' },

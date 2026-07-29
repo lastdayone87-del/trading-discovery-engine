@@ -7,6 +7,7 @@ import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 import { calculateYouTubeDailyBudget, quotaAllocationBudget } from './quotaPolicy';
 import type { AuditEvent } from './operatorAuth';
+import type { ProviderCallEvent } from './providerResilience';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -44,6 +45,8 @@ export function saveDb(): void {
 
 export async function appendOperatorAuditEvent(event: AuditEvent): Promise<void> { const db=await getDb(); await db.query(`INSERT INTO operator_audit_events(actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(request_id,action,target,outcome) DO NOTHING`,[event.actorId||null,event.actorHash||null,event.role||null,event.action,event.target,event.requestId,event.outcome,JSON.stringify(event.metadata||{})]); }
 export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=await getDb();const res=await db.query(`SELECT id,actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata,created_at FROM operator_audit_events ORDER BY created_at DESC LIMIT $1`,[Math.min(Math.max(limit,1),500)]);return res.rows;}
+export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);}
+export async function getProviderOperationalMetrics(hours=24):Promise<any>{const db=await getDb();const bounded=Math.min(Math.max(hours,1),720);const [summary,queue]=await Promise.all([db.query(`SELECT provider,operation,COUNT(*)::int calls,COUNT(*) FILTER(WHERE status='SUCCESS')::int successes,COUNT(*) FILTER(WHERE status='TIMEOUT')::int timeouts,COUNT(*) FILTER(WHERE status NOT IN('SUCCESS','TIMEOUT'))::int errors,ROUND(AVG(latency_ms))::int average_latency_ms,COALESCE(SUM(reserved_cost),0)::float reserved_cost,COALESCE(SUM(actual_cost),0)::float actual_cost FROM provider_call_events WHERE occurred_at>=now()-($1||' hours')::interval GROUP BY provider,operation ORDER BY provider,operation`,[String(bounded)]),db.query(`SELECT type,COUNT(*)::int depth,COALESCE(ROUND(AVG(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint average_age_ms,COALESCE(ROUND(MAX(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint oldest_age_ms FROM jobs WHERE status='PENDING' GROUP BY type ORDER BY type`)]);return {windowHours:bounded,policyVersion:'provider-resilience-v1',providers:summary.rows,queueLatency:queue.rows,alertThresholds:{timeoutRate:Number(process.env.PROVIDER_TIMEOUT_ALERT_RATE||'0.05'),errorRate:Number(process.env.PROVIDER_ERROR_ALERT_RATE||'0.10')},runbook:'docs/phase-2-provider-resilience.md'};}
 
 function parseJson<T>(value: any, fallback: T): T {
   if (value == null) return fallback;

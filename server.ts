@@ -19,7 +19,7 @@ import {
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
-  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents
+  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics
 } from './server/db';
 import {
   addSearchJob,
@@ -93,6 +93,7 @@ async function startServer() {
   // --- API ROUTES ---
 
   app.get('/api/operator-audit-events', async(req,res)=>{try{res.json(await getOperatorAuditEvents(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/provider-metrics', async(req,res)=>{try{res.json(await getProviderOperationalMetrics(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
 
   app.get('/api/reviewer-credentials', (_req,res)=>res.json({defaultsAvailable:reviewerDefaultsAvailable()}));
   app.get('/api/reviews', requireReviewer, async(req,res)=>{try{res.json(await listReviewQueue({country:req.query.country as string|undefined,search:req.query.search as string|undefined,limit:Number(req.query.limit||50),offset:Number(req.query.offset||0)}));}catch(err:any){sendOperationError(res,err);}});
@@ -107,9 +108,9 @@ async function startServer() {
     try {
       const schema = await getSchemaInfo();
       const queues = await getQueueStatus();
-      res.json({ status: 'ok' });
+      res.json({ status: 'ok', readiness: 'ready' });
     } catch (err: any) {
-      res.status(503).json({ status: 'error' });
+      res.status(503).json({ status: 'error', readiness: 'not_ready' });
     }
   });
 
