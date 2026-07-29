@@ -23,6 +23,7 @@ import {
 } from './server/db';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
+import { inspectCoverageLifecycle, recordLifecycleEvent } from './server/coverageLifecycle';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -100,10 +101,13 @@ async function startServer() {
   app.get('/api/measurement/replay',async(req,res)=>{try{const to=String(req.query.to||new Date().toISOString());const from=String(req.query.from||new Date(Date.now()-24*60*60*1000).toISOString());res.json(await getReplayReport(from,to,Number(req.query.tolerance||0)));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_REPLAY_REQUEST',requestId:req.requestId});}});
   app.get('/api/research-programs',async(req,res)=>{try{res.json(await inspectPassivePrograms(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/research-programs/price-action-trading',async(req,res)=>{try{res.json(await inspectTopicPilot());}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/research-programs/price-action-trading/coverage',async(req,res)=>{try{res.json(await inspectCoverageLifecycle());}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/research-programs/price-action-trading/pause',async(req,res)=>{try{res.json(await updatePilotControl({paused:true,killSwitch:true},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/resume',async(req,res)=>{try{res.json(await updatePilotControl({paused:false},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/budget',async(req,res)=>{try{res.json(await updatePilotControl({mode:req.body.mode,dailyYoutubeCap:req.body.dailyYoutubeCap,totalYoutubeCap:req.body.totalYoutubeCap},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/kill-switch',async(req,res)=>{try{res.json(await updatePilotControl({killSwitch:req.body.enabled!==false,paused:req.body.enabled!==false?true:undefined},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
+  app.post('/api/research-programs/price-action-trading/lifecycle/pause',async(req,res)=>{try{res.json(await recordLifecycleEvent({to:'PAUSED',reason:req.body.reason,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_LIFECYCLE_DECISION',requestId:req.requestId});}});
+  app.post('/api/research-programs/price-action-trading/lifecycle/reactivate',async(req,res)=>{try{res.json(await recordLifecycleEvent({to:'ACTIVE',reason:req.body.reason,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,trigger:req.body.trigger,providerCostCap:req.body.providerCostCap,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_LIFECYCLE_DECISION',requestId:req.requestId});}});
 
   app.get('/api/reviewer-credentials', (_req,res)=>res.json({defaultsAvailable:reviewerDefaultsAvailable()}));
   app.get('/api/reviews', requireReviewer, async(req,res)=>{try{res.json(await listReviewQueue({country:req.query.country as string|undefined,search:req.query.search as string|undefined,limit:Number(req.query.limit||50),offset:Number(req.query.offset||0)}));}catch(err:any){sendOperationError(res,err);}});
