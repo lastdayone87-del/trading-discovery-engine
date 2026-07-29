@@ -31,6 +31,7 @@ import { buildCatalog, createEvaluation, inspectEvaluations, reviewCatalog } fro
 import { createExperiment, inspectExperiments, transitionExperiment } from './server/terminologyTrials';
 import { approveCatalog, inspectCatalogs, publishCatalog, stageCatalog, transitionLifecycle } from './server/catalogPublication';
 import { configurePlaylistCanary, enqueuePlaylistCanary, inspectEvidenceGraph, proposePlaylistInspection } from './server/evidenceGraphAdapters';
+import { allocateBestFirst, createPolicy, inspectPortfolio, transitionPolicy } from './server/portfolioAllocator';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -113,6 +114,10 @@ async function startServer() {
   app.post('/api/acquisition-adapters/playlist/proposals',async(req,res)=>{try{res.status(201).json(await proposePlaylistInspection({...req.body,programKey:req.body.programKey||'price-action-trading'}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/control',async(req,res)=>{try{res.json(await configurePlaylistCanary({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='ADAPTER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/actions/:id/enqueue',async(req,res)=>{try{const result=await enqueuePlaylistCanary(req.params.id,String(req.body.targetCountry||''));res.status(result.queued?202:409).json(result);}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  app.get('/api/portfolio',async(req,res)=>{try{res.json(await inspectPortfolio(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/portfolio/simulate',async(req,res)=>{try{res.json({networkAccess:false,materialized:false,choices:allocateBestFirst(req.body.candidates||[],req.body.configuration)});}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  app.post('/api/portfolio/policies',async(req,res)=>{try{res.status(201).json(await createPolicy({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  app.post('/api/portfolio/policies/:id/:action',async(req,res)=>{try{const action=String(req.params.action).toUpperCase();if(!['APPROVE','CANARY','PAUSE','ROLLBACK'].includes(action))throw new Error('INVALID_POLICY_ACTION');res.json(await transitionPolicy({id:req.params.id,action:action as any,reason:req.body.reason,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='PORTFOLIO_POLICY_NOT_FOUND'?404:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.get('/api/corpus',async(req,res)=>{try{res.json(await inspectCorpus(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/corpus/documents/:id',async(req,res)=>{try{res.json(await inspectDocument(req.params.id));}catch(err:any){res.status(err.message==='Corpus document not found.'?404:500).json({error:err.message,requestId:req.requestId});}});
   app.get('/api/candidate-assertions',async(req,res)=>{try{res.json(await inspectCandidateAssertions(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
