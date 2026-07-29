@@ -27,6 +27,7 @@ import { inspectCoverageLifecycle, recordLifecycleEvent } from './server/coverag
 import { inspectCorpus, inspectDocument } from './server/candidateCorpus';
 import { inspectCandidateAssertions } from './server/candidateScoring';
 import { inspectConceptGraph, moderateConcept } from './server/conceptGraph';
+import { buildCatalog, createEvaluation, inspectEvaluations, reviewCatalog } from './server/offlineEvaluation';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -110,6 +111,10 @@ async function startServer() {
   app.get('/api/candidate-assertions',async(req,res)=>{try{res.json(await inspectCandidateAssertions(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/concepts',async(req,res)=>{try{res.json(await inspectConceptGraph(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/concepts/:id/moderate',async(req,res)=>{try{res.json(await moderateConcept({action:req.body.action,targetId:req.params.id,expectedVersion:Number(req.body.expectedVersion),idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId,reason:req.body.reason,payload:req.body.payload}));}catch(err:any){res.status(err.message==='MODERATION_VERSION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  app.get('/api/offline-evaluations',async(req,res)=>{try{res.json(await inspectEvaluations(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/offline-evaluations',async(req,res)=>{try{res.status(202).json(await createEvaluation({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_OFFLINE_EVALUATION',requestId:req.requestId});}});
+  app.post('/api/offline-evaluations/:id/catalogs',async(req,res)=>{try{res.status(201).json(await buildCatalog(req.params.id,req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_CATALOG',requestId:req.requestId});}});
+  app.post('/api/candidate-catalogs/:id/review',async(req,res)=>{try{res.json(await reviewCatalog({catalogId:req.params.id,decision:req.body.decision,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId,reason:req.body.reason}));}catch(err:any){res.status(err.message==='CATALOG_REVIEW_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/pause',async(req,res)=>{try{res.json(await updatePilotControl({paused:true,killSwitch:true},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/resume',async(req,res)=>{try{res.json(await updatePilotControl({paused:false},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
   app.post('/api/research-programs/price-action-trading/budget',async(req,res)=>{try{res.json(await updatePilotControl({mode:req.body.mode,dailyYoutubeCap:req.body.dailyYoutubeCap,totalYoutubeCap:req.body.totalYoutubeCap},req.operator!.actorId));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PILOT_CONTROL',requestId:req.requestId});}});
