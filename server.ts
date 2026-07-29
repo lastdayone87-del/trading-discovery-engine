@@ -38,7 +38,9 @@ import {
   addAutomatedCountrySearch,
   triggerManualRecheck,
   processNextSearchJob,
-  executeFullManualSearch
+  executeFullManualSearch,
+  startSearchWorkers,
+  auditExistingChannelsWithExclusionEngine
 } from './server/queueManager';
 import { sanitizeSearchQuery } from './server/youtube';
 import {
@@ -65,12 +67,14 @@ import { getManualSearchSession, listManualSearchSessions, requestManualSearchCa
 import { decideReview, getReviewDetails, listReviewQueue, ReviewConflictError, ReviewNotFoundError } from './server/reviewStore';
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
+import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
 
 
 async function startServer() {
   validateOperatorConfiguration();
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
+  const readiness = createReadinessState();
 
   app.use(express.json());
   app.use('/api', operatorAuthorization(appendOperatorAuditEvent));
@@ -93,13 +97,6 @@ async function startServer() {
     }
     return res.status(500).json({ error: err.message });
   };
-
-  // Purge synthetic test records on startup
-  try {
-    await purgeSyntheticTestChannels();
-  } catch (err) {
-    console.warn('Startup purge failed:', err);
-  }
 
   // --- API ROUTES ---
 
@@ -154,14 +151,9 @@ async function startServer() {
   app.post('/api/reviews/:channelId/force-rescan',requireReviewer,reviewAction('FORCE_RESCAN'));
 
   // Health check
-  app.get('/api/health', async (req, res) => {
-    try {
-      const schema = await getSchemaInfo();
-      const queues = await getQueueStatus();
-      res.json({ status: 'ok', readiness: 'ready' });
-    } catch (err: any) {
-      res.status(503).json({ status: 'error', readiness: 'not_ready' });
-    }
+  app.get('/api/health', (_req, res) => {
+    const state = readiness.snapshot();
+    res.status(state.readiness === 'ready' ? 200 : 503).json(state);
   });
 
   // 1. Get all channels (returns active validated channels by default; include_rejected=true returns all)
@@ -636,13 +628,7 @@ async function startServer() {
   });
 
   // --- VITE / STATIC SERVING ---
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
+  if (process.env.NODE_ENV === 'production') {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -651,9 +637,25 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
+    readiness.markListening();
     console.log(`Trading Community Discovery Engine running on http://0.0.0.0:${PORT}`);
-    startAutonomousDiscoveryScheduler();
+    launchAfterReadiness([
+      { name: 'startup maintenance purge', run: async () => { await purgeSyntheticTestChannels(); } },
+      { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } },
+      { name: 'durable queue workers', run: () => { startSearchWorkers(); } },
+      { name: 'autonomous discovery scheduler', run: () => { startAutonomousDiscoveryScheduler(); } }
+    ]);
   });
+
+  // Development UI middleware is intentionally initialized after the listener.
+  // API readiness must not wait for tooling initialization.
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
 }
 
 startServer().catch(err => {

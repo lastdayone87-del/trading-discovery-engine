@@ -253,9 +253,14 @@ export function startAutonomousDiscoveryScheduler(): void {
       } catch (error) {
         console.error('[Autonomous Producer] Cycle failed:', error);
       } finally {
-        const config = await getDiscoveryConfig();
-        console.log(`[Autonomous Producer] Next wake scheduled in ${config.intervalMinutes} minute(s).`);
-        void schedule(config.intervalMinutes * 60_000);
+        const intervalMinutes = await getDiscoveryConfig()
+          .then(config => config.intervalMinutes)
+          .catch(error => {
+            console.error('[Autonomous Producer] Configuration unavailable; using retry interval:', error);
+            return 5;
+          });
+        console.log(`[Autonomous Producer] Next wake scheduled in ${intervalMinutes} minute(s).`);
+        void schedule(intervalMinutes * 60_000);
       }
     }, delayMs);
   };
