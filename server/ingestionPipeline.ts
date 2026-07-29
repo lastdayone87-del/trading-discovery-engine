@@ -9,6 +9,7 @@ import {
   enqueueJob
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
+import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
@@ -341,6 +342,7 @@ export async function processChannelThroughPipeline(
   // an explicit human approval supplies independent provenance.
   if (qualityResult.score >= 55 && source !== 'manual_search') {
     await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description);
+    await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
   }
 
   return {
