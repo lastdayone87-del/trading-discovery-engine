@@ -19,7 +19,7 @@ import {
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
-  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics
+  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns
 } from './server/db';
 import {
   addSearchJob,
@@ -94,6 +94,7 @@ async function startServer() {
 
   app.get('/api/operator-audit-events', async(req,res)=>{try{res.json(await getOperatorAuditEvents(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/provider-metrics', async(req,res)=>{try{res.json(await getProviderOperationalMetrics(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/validation-status', async(req,res)=>{try{res.json({policyVersion:'phase-3-baseline-v1',runs:await getValidationRuns(Number(req.query.limit||100))});}catch(err:any){sendOperationError(res,err);}});
 
   app.get('/api/reviewer-credentials', (_req,res)=>res.json({defaultsAvailable:reviewerDefaultsAvailable()}));
   app.get('/api/reviews', requireReviewer, async(req,res)=>{try{res.json(await listReviewQueue({country:req.query.country as string|undefined,search:req.query.search as string|undefined,limit:Number(req.query.limit||50),offset:Number(req.query.offset||0)}));}catch(err:any){sendOperationError(res,err);}});
