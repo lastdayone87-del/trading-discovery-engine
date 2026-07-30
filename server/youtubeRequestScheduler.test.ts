@@ -53,3 +53,10 @@ test('youtubeFetch always bounds the scheduler head request', () => {
   assert.match(youtubeFetch, /timeoutMs:timeout,enabled:true/);
   assert.doesNotMatch(youtubeFetch, /provider_deadlines_enabled|PROVIDER_DEADLINES_ENABLED/);
 });
+
+test('search provider loop retains key failover after a rate-limited attempt', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const search = source.slice(source.indexOf('export async function searchYouTubeChannelPage'), source.indexOf('/**\n * Fetches recent video titles'));
+  assert.match(search, /for \(let attempt = 0; attempt < attemptsCount; attempt\+\+\)/);
+  assert.doesNotMatch(search, /isYouTubeRateLimited\(e\)[\s\S]*?throw e/);
+});
