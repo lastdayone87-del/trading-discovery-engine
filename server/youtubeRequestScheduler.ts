@@ -18,13 +18,21 @@ export class YouTubeRequestScheduler {
 
   constructor(private readonly options: YouTubeRequestSchedulerOptions) {}
 
-  run<T>(call: () => Promise<T>): Promise<T> {
+  run<T>(call: () => Promise<T>, trace?: (stage: string) => void): Promise<T> {
     const scheduled = this.tail.then(async () => {
+      trace?.('scheduler-tail-released');
       const now = (this.options.now ?? Date.now)();
       const waitMs = Math.max(0, this.nextStartAt - now);
-      if (waitMs) await (this.options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))))(waitMs);
+      if (waitMs) {
+        trace?.(`before scheduler-delay (${waitMs}ms) at server/youtubeRequestScheduler.ts:28`);
+        await (this.options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))))(waitMs);
+        trace?.('after scheduler-delay at server/youtubeRequestScheduler.ts:28');
+      }
       this.nextStartAt = (this.options.now ?? Date.now)() + Math.max(0, this.options.minIntervalMs);
-      return call();
+      trace?.('before scheduled-call at server/youtubeRequestScheduler.ts:33');
+      const value = await call();
+      trace?.('after scheduled-call at server/youtubeRequestScheduler.ts:33');
+      return value;
     });
     this.tail = scheduled.then(() => undefined, () => undefined);
     return scheduled;

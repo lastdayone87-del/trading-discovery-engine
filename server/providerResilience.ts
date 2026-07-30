@@ -37,17 +37,26 @@ const statusFor=(e:ProviderCallError):ProviderStatus => e.errorClass==='TIMEOUT'
 export type ProviderEventSink=(event:ProviderCallEvent)=>Promise<void>;
 
 /** Bounds the caller, propagates cancellation, and emits metadata only (never payloads). */
-export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink}):Promise<T>{
+export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
   const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
   let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
   if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
   const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1',occurredAt:new Date().toISOString()};
   try{
+    args.trace?.('before provider-call at server/providerResilience.ts:48');
     const value=await args.call(controller.signal);
-    await args.emit({...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0}); return value;
+    args.trace?.('after provider-call at server/providerResilience.ts:48');
+    args.trace?.('before success-event-write at server/providerResilience.ts:51');
+    await args.emit({...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0});
+    args.trace?.('after success-event-write at server/providerResilience.ts:51');
+    return value;
   }catch(error){
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
-    await args.emit({...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass}).catch(()=>undefined); throw typed;
+    args.trace?.(`provider-call-caught (${typed.errorClass})`);
+    args.trace?.('before failure-event-write at server/providerResilience.ts:58');
+    await args.emit({...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass}).catch(()=>undefined);
+    args.trace?.('after failure-event-write at server/providerResilience.ts:58');
+    throw typed;
   }finally{ if(timer)clearTimeout(timer); args.signal?.removeEventListener('abort',abort); }
 }
