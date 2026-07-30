@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { routePolicyInventory } from './operatorAuth';
+import { persistExecutionStage } from './executionTrace';
 
 test('manual discovery persists evidence for every pre-provider execution boundary',()=>{
   const queue=fs.readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
@@ -26,4 +27,21 @@ test('a forbidden action does not invalidate the authenticated dashboard session
   const client=fs.readFileSync(new URL('../src/apiClient.ts',import.meta.url),'utf8');
   assert.match(client,/response\.status === 401/);
   assert.doesNotMatch(client,/response\.status === 401 \|\| response\.status === 403/);
+});
+
+test('execution tracing degrades gracefully only when its table is missing',async()=>{
+  const missing={query:async()=>{throw Object.assign(new Error('relation does not exist'),{code:'42P01'});}};
+  assert.equal(await persistExecutionStage(missing,'00000000-0000-0000-0000-000000000001','HTTP_HANDLER','REACHED',{}),false);
+
+  const unavailable={query:async()=>{throw Object.assign(new Error('database unavailable'),{code:'08006'});}};
+  await assert.rejects(()=>persistExecutionStage(unavailable,'00000000-0000-0000-0000-000000000001','HTTP_HANDLER','REACHED',{}),/database unavailable/);
+});
+
+test('migration versions are unique and Railway runs them before application startup',()=>{
+  const migrationNames=fs.readdirSync(new URL('./db/migrations/',import.meta.url)).filter(name=>name.endsWith('.sql'));
+  const versions=migrationNames.map(name=>name.split('_')[0]);
+  assert.equal(new Set(versions).size,versions.length);
+  assert.ok(migrationNames.includes('034_discovery_execution_trace.sql'));
+  const railway=JSON.parse(fs.readFileSync(new URL('../railway.json',import.meta.url),'utf8'));
+  assert.equal(railway.deploy.startCommand,'npm run migrate && npm run start');
 });
