@@ -634,17 +634,22 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Trading Community Discovery Engine running on http://0.0.0.0:${PORT}`);
+    // Queue consumption is core execution, not a diagnostic-readiness task.
+    // Start consumers immediately: their first database call already joins the
+    // single getDb() initialization promise. Previously these launches lived
+    // behind the schema/status Promise.all below, so a slow or stuck diagnostic
+    // left newly-created jobs PENDING forever and no provider call was reached.
+    startSearchWorkers();
+    startAutonomousDiscoveryScheduler();
     // Bind promptly for the platform, but do not advertise readiness or launch
-    // database-backed workers until the configured PostgreSQL database has been
-    // reached and fully migrated. Provider work remains outside readiness.
+    // database-backed maintenance until the configured PostgreSQL database has
+    // been reached and fully migrated. Provider work remains outside readiness.
     Promise.all([getSchemaInfo(), getQueueStatus()]).then(([schema]) => {
       readiness.markDatabaseReady();
       console.log(`[Startup] PostgreSQL ready at schema version ${schema.currentVersion}; ${schema.channelCount} channels available.`);
       launchAfterReadiness([
         { name: 'startup maintenance purge', run: async () => { await purgeSyntheticTestChannels(); } },
-        { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } },
-        { name: 'durable queue workers', run: () => { startSearchWorkers(); } },
-        { name: 'autonomous discovery scheduler', run: () => { startAutonomousDiscoveryScheduler(); } }
+        { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } }
       ]);
     }).catch(error => {
       console.error('[Startup] PostgreSQL initialization failed; service remains not ready:', error);
