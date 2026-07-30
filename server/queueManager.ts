@@ -42,7 +42,7 @@ import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
 import { getActiveCatalogPin } from './catalogPublication';
 import { processPlaylistInspectionJob } from './playlistAdapterWorker';
-import { isQuotaCapacityError, QuotaAllocationExhaustedError } from './quotaCapacity';
+import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 
 const WORKER_ID = `worker_${process.pid}`;
@@ -205,8 +205,6 @@ export async function processNextSearchJob(
         await executeManualSearchPage(sessionId, Number(job.payload.pageNumber), String(job.payload.pageToken || '') || null, Number(job.payload.variantIndex || 0));
         await completeJob(job.id);
       } catch (error) {
-        const providerRetryAt=Number((error as any)?.retryAt);
-        if (job.attempts >= job.max_attempts && !(Number.isFinite(providerRetryAt)&&providerRetryAt>Date.now())) await failManualSearch(sessionId, error);
         throw error;
       }
       return true;
@@ -319,7 +317,10 @@ export async function processNextSearchJob(
       await completeJob(job.id);
       return true;
     }
-    if (job.type === 'ENRICH_CHANNEL' && job.attempts >= job.max_attempts && !isQuotaCapacityError(err)) {
+    const disposition=await failJob(job.id, err);
+    const terminal=disposition==='FAILED';
+    if (job.type === 'MANUAL_SEARCH_PAGE' && terminal) await failManualSearch(String(job.payload.sessionId||''), err);
+    if (job.type === 'ENRICH_CHANNEL' && terminal) {
       const channelId = String(job.payload?.channelId || '');
       const channel = channelId ? await getChannelById(channelId) : null;
       if (channel && channel.trading_status === 'UNCERTAIN') {
@@ -330,10 +331,8 @@ export async function processNextSearchJob(
         await upsertChannel(channel);
       }
     }
-    await failJob(job.id, err);
     const runId = String(job.payload?.queryRunId || '');
-    const providerRetryAt=Number(err?.retryAt);
-    if (runId) await failQueryRun(runId, err, job.attempts >= job.max_attempts && !(Number.isFinite(providerRetryAt)&&providerRetryAt>Date.now()));
+    if (runId) await failQueryRun(runId, err, terminal);
     return false;
   } finally {
     clearInterval(heartbeat);

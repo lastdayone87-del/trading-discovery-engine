@@ -40,6 +40,11 @@ export class YouTubeProviderCooldown {
 
   succeeded(key: string): void { this.providers.delete(key); }
   retryAt(key: string): number { return this.providers.get(key)?.retryAt ?? 0; }
+
+  earliestRetryAtIfAllCooling(keys: string[]): number | null {
+    if (!keys.length || keys.some(key => this.eligible(key))) return null;
+    return Math.min(...keys.map(key => this.retryAt(key)).filter(retryAt => retryAt > 0));
+  }
 }
 
 export class YouTubeProvidersCoolingDownError extends Error {
