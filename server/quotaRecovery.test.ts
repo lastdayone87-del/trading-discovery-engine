@@ -25,6 +25,20 @@ test('quota reservation admission performs race-safe UTC rollover before reading
   assert.match(reservation, /last_reset<>excluded\.last_reset THEN 0/);
 });
 
+test('shared capacity is not stranded behind hard allocation partitions', () => {
+  const source = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  const reservation = source.slice(source.indexOf('export async function tryReserveQuota'), source.indexOf('export async function finishQuotaReservation'));
+  assert.match(reservation, /actual_used \+ row\.reserved_total \+ args\.units > args\.dailyBudget/);
+  assert.doesNotMatch(reservation, /allocation_used \+ args\.units/);
+});
+
+test('every autonomous page reserves at worker execution rather than producer scheduling', () => {
+  const queue = fs.readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const db = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  assert.match(queue, /if\(queryRunId\)\{[^\n]+tryReserveQuota\(\{operationType:'AUTONOMOUS_QUERY_PAGE'/);
+  assert.doesNotMatch(db, /VALUES\('SEARCH_YOUTUBE',\$1,'AUTONOMOUS',100/);
+});
+
 test('manual and enrichment allocation capacity uses retryAt while genuine enrichment failures remain terminal', () => {
   const source = fs.readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(source, /throw new QuotaAllocationExhaustedError\('MANUAL'\)/);

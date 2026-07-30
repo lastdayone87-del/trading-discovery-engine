@@ -5,7 +5,7 @@ import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QueryRe
 import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
 import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
-import { calculateYouTubeDailyBudget, quotaAllocationBudget } from './quotaPolicy';
+import { calculateYouTubeDailyBudget } from './quotaPolicy';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import type { ValidationKind, ValidationStatus } from './phase3Validation';
@@ -472,11 +472,6 @@ export async function scheduleAutonomousQueryRuns(
       const jobId = job.rows[0].id;
       await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
       await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,generationMode:candidate.query.generation_mode}});
-      await client.query(
-        `INSERT INTO quota_reservations(operation_type,operation_id,allocation,units,expires_at)
-         VALUES('SEARCH_YOUTUBE',$1,'AUTONOMOUS',100,now()+interval '20 minutes')`,
-        [runId]
-      );
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     await client.query('COMMIT');
@@ -640,13 +635,14 @@ export async function tryReserveQuota(args: {
     const totals = await client.query(
       `SELECT
          COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
-         COALESCE(SUM(units) FILTER (WHERE status='RESERVED'),0)::int AS reserved_total,
-         COALESCE(SUM(units) FILTER (WHERE allocation=$1 AND status IN ('RESERVED','CONSUMED') AND reserved_at>=date_trunc('day',now() AT TIME ZONE 'UTC')),0)::int AS allocation_used
-       FROM quota_reservations`, [args.allocation]
+         COALESCE(SUM(units) FILTER (WHERE status='RESERVED'),0)::int AS reserved_total
+       FROM quota_reservations`
     );
     const row = totals.rows[0];
-    const allocationBudget = quotaAllocationBudget(args.dailyBudget, args.allocationPercent);
-    if (row.actual_used + row.reserved_total + args.units > args.dailyBudget || row.allocation_used + args.units > allocationBudget) {
+    // Allocation percentages are scheduling preferences, not hard partitions.
+    // Hard partitions strand usable provider capacity and can defer executable
+    // work until the next UTC day while the shared pool still has quota.
+    if (row.actual_used + row.reserved_total + args.units > args.dailyBudget) {
       await client.query('ROLLBACK');
       return false;
     }
