@@ -2,6 +2,17 @@
 
 ## YouTube quota exhaustion
 
+Each configured API key represents an independently failover-capable provider.
+`rateLimitExceeded` marks only the reporting provider unavailable with exponential
+cooldown (`YOUTUBE_RATE_LIMIT_BACKOFF_MS` through
+`YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS`); the next healthy provider is attempted in
+the same operation. A provider reporting `quotaExceeded` or `dailyLimitExceeded`
+is skipped until the next UTC day. Expired entries are removed on the next
+acquisition, and the state is process-local, so a restart also makes every
+configured provider eligible again. If every provider is cooling down, durable
+Manual Search and autonomous jobs are returned to pending until the earliest
+retry time without consuming an attempt.
+
 YouTube acquisition uses a process-local pool circuit breaker. Individual project
 rotation is unchanged. The breaker opens only when **every** configured project
 returns Google's `quotaExceeded` (including `dailyLimitExceeded`) reason. Mixed
