@@ -113,7 +113,18 @@ let activeKeyIndex = 0;
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition):Promise<Response>{
   const enabled=(await getAppSetting('provider_deadlines_enabled',process.env.PROVIDER_DEADLINES_ENABLED||'false'))==='true';
   const timeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
-  return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok){const body=await response.clone().json().catch(()=>null) as any;const reasons=(body?.error?.errors||[]).map((item:any)=>item?.reason).filter(Boolean);const quotaExceeded=reasons.some((reason:string)=>/^(quotaExceeded|dailyLimitExceeded)$/i.test(reason));const error=Object.assign(new Error(`YouTube HTTP ${response.status}${reasons.length?` (${reasons.join(', ')})`:''}`),{status:response.status,quotaExceeded});throw error;}acquisition?.providerSucceeded();return response;}});
+  return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok)throw await youtubeHttpError(response);acquisition?.providerSucceeded();return response;}});
+}
+
+/** Preserve both legacy and google.rpc ErrorInfo reasons for actionable runtime diagnostics. */
+export async function youtubeHttpError(response:Response):Promise<Error>{
+  const body=await response.clone().json().catch(()=>null) as any;
+  const legacy=(body?.error?.errors||[]).map((item:any)=>item?.reason);
+  const detailed=(body?.error?.details||[]).map((item:any)=>item?.reason);
+  const providerReasons=Array.from(new Set([...legacy,...detailed].filter((reason):reason is string=>typeof reason==='string'&&reason.length>0)));
+  const quotaExceeded=providerReasons.some(reason=>/^(quotaExceeded|dailyLimitExceeded)$/i.test(reason));
+  const providerStatus=typeof body?.error?.status==='string'?body.error.status:'';
+  return Object.assign(new Error(`YouTube HTTP ${response.status}${providerStatus?` ${providerStatus}`:''}${providerReasons.length?` (${providerReasons.join(', ')})`:''}`),{status:response.status,quotaExceeded,providerReasons});
 }
 
 export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, sanitizedQuery: string): DiscoveredChannelRaw[] {

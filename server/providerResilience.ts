@@ -14,8 +14,12 @@ export interface ProviderCallEvent extends Required<Pick<ProviderCallContext,'pr
 }
 
 export class ProviderCallError extends Error {
-  constructor(message: string, public readonly errorClass: ProviderErrorClass, public readonly retryable: boolean, options?: { cause?: unknown }) {
+  readonly status?: number;
+  readonly quotaExceeded?: boolean;
+  readonly providerReasons?: string[];
+  constructor(message: string, public readonly errorClass: ProviderErrorClass, public readonly retryable: boolean, options?: { cause?: unknown; status?: number; quotaExceeded?: boolean; providerReasons?: string[] }) {
     super(message, options); this.name='ProviderCallError';
+    this.status=options?.status; this.quotaExceeded=options?.quotaExceeded; this.providerReasons=options?.providerReasons;
   }
 }
 
@@ -23,7 +27,7 @@ export function classifyProviderError(error: unknown): ProviderCallError {
   if (error instanceof ProviderCallError) return error;
   const value=error as any; const message=String(value?.message||value||'Provider call failed');
   if (value?.name==='AbortError') return new ProviderCallError('Provider call was cancelled.','CANCELLED',true,{cause:error});
-  if (value?.status===429 || value?.code===429 || /429|RESOURCE_EXHAUSTED|rate.?limit|quota/i.test(message)) return new ProviderCallError('Provider rate limit reached.','RATE_LIMIT',true,{cause:error});
+  if (value?.status===429 || value?.code===429 || /429|RESOURCE_EXHAUSTED|rate.?limit|quota/i.test(message)) return new ProviderCallError('Provider rate limit reached.','RATE_LIMIT',true,{cause:error,status:Number(value?.status||value?.code)||undefined,quotaExceeded:value?.quotaExceeded,providerReasons:value?.providerReasons});
   if ([408,500,502,503,504].includes(Number(value?.status||value?.code)) || /ECONNRESET|ETIMEDOUT|high demand|temporar/i.test(message)) return new ProviderCallError('Transient provider failure.','TRANSIENT',true,{cause:error});
   if ([400,404,422].includes(Number(value?.status||value?.code))) return new ProviderCallError('Permanent provider input failure.','PERMANENT_INPUT',false,{cause:error});
   return new ProviderCallError('Provider call failed.','TRANSIENT',true,{cause:error});
