@@ -98,7 +98,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
   const maxResults=Math.min(50,Math.max(1,Math.trunc(limit)));const observedAt=new Date().toISOString();
   try {
     for(let attempt=0;attempt<keys.length;attempt++){const index=(activeKeyIndex+attempt)%keys.length;
-      try{const url=`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${encodeURIComponent(playlistId)}&maxResults=${maxResults}&key=${keys[index]}`;const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition);const data=await response.json();await incrementQuota(1);activeKeyIndex=index;
+      try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition);const data=await response.json();await incrementQuota(1);activeKeyIndex=index;
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
       }catch(error){if(isYouTubeRateLimited(error)){acquisition.providerFailed('INDETERMINATE');throw error;}if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===keys.length-1){acquisition.providerFailed(quotaExceededCount===keys.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
@@ -111,6 +111,30 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
  */
 let activeKeyIndex = 0;
 let outboundTraceSequence = 0;
+
+const YOUTUBE_API_ROOT = 'https://youtube.googleapis.com/youtube/v3';
+
+/**
+ * Build a canonical YouTube Data API request without hand-concatenating query
+ * parameters. `quotaUser` gives Google a stable caller identity for per-user
+ * rate accounting instead of relying on the runtime's shared egress IP.
+ */
+export function buildYouTubeApiUrl(
+  resource: 'search' | 'videos' | 'channels' | 'playlistItems',
+  apiKey: string,
+  parameters: Record<string, string | number | undefined>
+): string {
+  const url = new URL(`${YOUTUBE_API_ROOT}/${resource}`);
+  for (const [name, value] of Object.entries(parameters)) {
+    if (value !== undefined) url.searchParams.set(name, String(value));
+  }
+  const configuredQuotaUser = (process.env.YOUTUBE_QUOTA_USER || 'trading-discovery-engine').trim();
+  const quotaUser = configuredQuotaUser || 'trading-discovery-engine';
+  url.searchParams.set('quotaUser', quotaUser.slice(0, 40));
+  url.searchParams.set('prettyPrint', 'false');
+  url.searchParams.set('key', apiKey);
+  return url.toString();
+}
 
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition):Promise<Response>{
   const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
@@ -247,9 +271,10 @@ export async function searchYouTubeChannelPage(
         console.log(`[YouTube API Pool] Attempting search with key #${currentIndex + 1}/${keyPool.length} (${apiKey.slice(0, 6)}...)...`);
         console.log(`[YouTube Outbound Trace] search attempt log returned; constructing request for key #${currentIndex + 1}, attempt ${attempt + 1}`);
         const searchType = lane === 'VIDEO' ? 'video' : 'channel';
-        const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=${searchType}&order=${youtubeOrder(ordering)}&q=${encodeURIComponent(
-          sanitizedQuery
-        )}&maxResults=${maxResults}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}&key=${apiKey}`;
+        const searchUrl = buildYouTubeApiUrl('search', apiKey, {
+          part: 'snippet', type: searchType, order: youtubeOrder(ordering),
+          q: sanitizedQuery, maxResults, pageToken: pageToken || undefined
+        });
 
         console.log(`[YouTube Outbound Trace] search-${attempt + 1} before youtubeFetch at server/youtube.ts:255`);
         const res = await youtubeFetch(searchUrl,'search',100,attempt+1,acquisition);
@@ -302,7 +327,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
     const apiKey = keyPool[currentIndex];
 
     try {
-      const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&order=date&type=video&maxResults=5&key=${apiKey}`;
+      const searchUrl = buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,order:'date',type:'video',maxResults:5});
       const res = await youtubeFetch(searchUrl,'recent-videos-search',100,attempt+1,acquisition);
 
       if (res.ok) {
@@ -321,7 +346,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
         }
 
         if (videoIds.length > 0) {
-          const videosUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoIds.join(',')}&key=${apiKey}`;
+          const videosUrl = buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:videoIds.join(',')});
           const vRes = await youtubeFetch(videosUrl,'video-details',1,1,acquisition);
           if (vRes.ok) {
             await incrementQuota(1);
@@ -376,8 +401,8 @@ export async function fetchYouTubeChannelEnrichment(
     const currentIndex = (activeKeyIndex + attempt) % keyPool.length;
     const apiKey = keyPool[currentIndex];
     try {
-      const channelUrl = `https://www.googleapis.com/youtube/v3/channels?part=snippet,brandingSettings,statistics&id=${encodeURIComponent(channelId)}&key=${apiKey}`;
-      const recentUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${encodeURIComponent(channelId)}&order=date&type=video&maxResults=10&key=${apiKey}`;
+      const channelUrl = buildYouTubeApiUrl('channels',apiKey,{part:'snippet,brandingSettings,statistics',id:channelId});
+      const recentUrl = buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,order:'date',type:'video',maxResults:10});
       const [channelResponse, recentResponse] = await Promise.all([youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition),youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition)]);
 
       activeKeyIndex = currentIndex;
@@ -444,7 +469,7 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
   try { for (let attempt = 0; attempt < keys.length; attempt++) {
     const index = (activeKeyIndex + attempt) % keys.length;
     try {
-      const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,brandingSettings&id=${encodeURIComponent(channelId)}&key=${keys[index]}`;
+      const url = buildYouTubeApiUrl('channels',keys[index],{part:'snippet,brandingSettings',id:channelId});
       const response = await youtubeFetch(url, 'channel-country-metadata', 1, attempt + 1, acquisition);
       const data = await response.json();
       const channel = data.items?.[0];
