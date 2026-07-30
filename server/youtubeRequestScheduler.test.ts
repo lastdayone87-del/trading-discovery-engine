@@ -57,6 +57,8 @@ test('youtubeFetch always bounds the scheduler head request', () => {
 test('search provider loop retains key failover after a rate-limited attempt', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const search = source.slice(source.indexOf('export async function searchYouTubeChannelPage'), source.indexOf('/**\n * Fetches recent video titles'));
-  assert.match(search, /for \(let attempt = 0; attempt < attemptsCount; attempt\+\+\)/);
+  assert.match(search, /const providerIndexes = availableKeyIndexes\(keyPool\)/);
+  assert.match(search, /for \(let attempt = 0; attempt < providerIndexes\.length; attempt\+\+\)/);
+  assert.match(search, /recordProviderFailure\(apiKey, e\)/);
   assert.doesNotMatch(search, /isYouTubeRateLimited\(e\)[\s\S]*?throw e/);
 });
