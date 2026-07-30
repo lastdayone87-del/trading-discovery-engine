@@ -5,43 +5,73 @@ export interface YouTubePoolBackoffOptions {
   log?: (level: 'warn' | 'info', message: string) => void;
 }
 
+export type YouTubeProviderFailure = 'QUOTA_EXHAUSTED' | 'INDETERMINATE';
+
+/** An acquisition-scoped view of one breaker generation. */
+export interface YouTubePoolAcquisition {
+  readonly generation: number;
+  providerSucceeded(): void;
+  providerFailed(failure: YouTubeProviderFailure): void;
+  release(): void;
+}
+
 /** A process-local circuit breaker for the shared YouTube API-project pool. */
 export class YouTubePoolBackoff {
   private retryAt = 0;
   private backoffMs = 0;
-  private probeInFlight = false;
+  private probeInFlight: symbol | null = null;
   private exhausted = false;
+  private generation = 0;
 
   constructor(private readonly options: YouTubePoolBackoffOptions) {}
 
-  beginAcquisition(): void {
+  beginAcquisition(): YouTubePoolAcquisition {
     const now = (this.options.now ?? Date.now)();
-    if (!this.exhausted) return;
-    if (now < this.retryAt || this.probeInFlight) throw new YouTubePoolExhaustedError(this.retryAt);
-    // Only one caller may probe after the window. Other callers remain deferred.
-    this.probeInFlight = true;
-  }
+    let probeId: symbol | null = null;
+    if (this.exhausted) {
+      if (now < this.retryAt || this.probeInFlight) throw new YouTubePoolExhaustedError(this.retryAt);
+      // Only one caller may probe after the window. The scoped handle releases
+      // this lease even when the caller exits before it can classify an outcome.
+      probeId = Symbol('youtube-pool-probe');
+      this.probeInFlight = probeId;
+    }
 
-  reportSuccess(): void {
-    this.probeInFlight = false;
-    if (!this.exhausted) return;
-    this.exhausted = false;
-    this.retryAt = 0;
-    this.backoffMs = 0;
-    this.options.log?.('info', '[YouTube API Pool] Quota probe succeeded; YouTube acquisition resumed.');
-  }
+    const acquisitionGeneration = this.generation;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (probeId && this.probeInFlight === probeId) this.probeInFlight = null;
+    };
 
-  reportFailure(allProjectsQuotaExceeded: boolean): void {
-    this.probeInFlight = false;
-    // Only complete quota exhaustion opens the breaker. Once open, however, a
-    // failed/indeterminate probe must not create an immediate retry storm.
-    if (!allProjectsQuotaExceeded && !this.exhausted) return;
-    const first = !this.exhausted;
-    this.exhausted = true;
-    const initial = Math.max(1, this.options.initialBackoffMs);
-    this.backoffMs = first ? initial : Math.min(Math.max(initial, this.options.maxBackoffMs), Math.max(initial, this.backoffMs * 2));
-    this.retryAt = (this.options.now ?? Date.now)() + this.backoffMs;
-    if (first) this.options.log?.('warn', `[YouTube API Pool] Every configured API project reported quotaExceeded; acquisition suspended until ${new Date(this.retryAt).toISOString()}.`);
+    return {
+      generation: acquisitionGeneration,
+      providerSucceeded: () => {
+        if (released || acquisitionGeneration !== this.generation) return;
+        const wasExhausted = this.exhausted;
+        // Advancing the generation makes every older concurrent failure stale.
+        this.generation++;
+        this.exhausted = false;
+        this.retryAt = 0;
+        this.backoffMs = 0;
+        release();
+        if (wasExhausted) this.options.log?.('info', '[YouTube API Pool] Quota probe succeeded; YouTube acquisition resumed.');
+      },
+      providerFailed: failure => {
+        if (released || acquisitionGeneration !== this.generation) return;
+        // Generic failures open/extend the breaker only for an admitted recovery
+        // probe. Normal closed-state transport failures retain the retry path.
+        if (failure !== 'QUOTA_EXHAUSTED' && !this.exhausted) return;
+        const first = !this.exhausted;
+        this.exhausted = true;
+        const initial = Math.max(1, this.options.initialBackoffMs);
+        this.backoffMs = first ? initial : Math.min(Math.max(initial, this.options.maxBackoffMs), Math.max(initial, this.backoffMs * 2));
+        this.retryAt = (this.options.now ?? Date.now)() + this.backoffMs;
+        release();
+        if (first) this.options.log?.('warn', `[YouTube API Pool] Every configured API project reported quotaExceeded; acquisition suspended until ${new Date(this.retryAt).toISOString()}.`);
+      },
+      release
+    };
   }
 
   getRetryAt(): number { return this.retryAt; }
