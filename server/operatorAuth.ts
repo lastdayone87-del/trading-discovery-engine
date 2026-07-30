@@ -21,13 +21,14 @@ const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; acti
   { method:'GET', pattern:/^\/api\/corpus(?:\/documents\/[^/]+)?$/, policy:'operator', action:'corpus.read' },
   { method:'GET', pattern:/^\/api\/candidate-assertions$/, policy:'operator', action:'candidate.assertions.read' },
   { method:'GET', pattern:/^\/api\/operator-audit-events$/, policy:'admin', action:'audit.read' },
-  { method:'POST', pattern:/^\/api\/(database\/backup|db\/stress-test|db\/clean-stress-tests|queues\/pause|query-intelligence\/(pause|resume|scope|run-cycle)|regression\/run)$/, policy:'admin', action:'administration.execute' },
+  { method:'POST', pattern:/^\/api\/(database\/backup|db\/stress-test|db\/clean-stress-tests)$/, policy:'admin', action:'administration.execute' },
+  { method:'POST', pattern:/^\/api\/(queues\/pause|query-intelligence\/(pause|resume|scope|run-cycle)|regression\/run)$/, policy:'operator', action:'operation.execute' },
   { method:'POST', pattern:/^\/api\/research-programs\/price-action-trading\/(pause|resume|budget|kill-switch)$/, policy:'admin', action:'research.control' },
   { method:'POST', pattern:/^\/api\/research-programs\/price-action-trading\/lifecycle\/(pause|reactivate)$/, policy:'admin', action:'research.lifecycle.control' },
   { method:'POST', pattern:/^\/api\/(country-vocabularies|excluded-countries)$/, policy:'admin', action:'configuration.write' },
   { method:'DELETE', pattern:/^\/api\/excluded-countries\/[^/]+$/, policy:'admin', action:'configuration.write' },
   { method:'POST', pattern:/^\/api\/(reviews\/[^/]+\/(approve|reject|force-rescan)|relevance\/(verify|report)|search\/manual|search\/manual\/sessions\/[^/]+\/cancel|search\/automated|channels\/[^/]+\/recheck|query-intelligence\/(generate-candidates|queries\/[^/]+\/collection))$/, policy:'operator', action:'operation.execute' },
-  { method:'GET', pattern:/^\/api\/(reviewer-credentials|reviews|reviews\/[^/]+|channels|channels-revision|channels\/diagnostics\/rejected|channels\/[^/]+|channels\/[^/]+\/report|dashboard\/summary|search\/manual\/sessions|search\/manual\/sessions\/[^/]+|country-vocabularies|excluded-countries|queues\/status|database\/schema-info|query-intelligence\/(library|vocabulary|terminology|logs|status|scope)|regression\/(runs|latest))$/, policy:'operator', action:'administration.read' }
+  { method:'GET', pattern:/^\/api\/(reviewer-credentials|reviews|reviews\/[^/]+|channels|channels-revision|channels\/diagnostics\/rejected|channels\/[^/]+|channels\/[^/]+\/report|dashboard\/summary|search\/manual\/sessions|search\/manual\/sessions\/[^/]+|execution-traces\/[^/]+|country-vocabularies|excluded-countries|queues\/status|database\/schema-info|query-intelligence\/(library|vocabulary|terminology|logs|status|scope)|regression\/(runs|latest))$/, policy:'operator', action:'administration.read' }
 ];
 
 export const routePolicyInventory = ROUTES.map(({method, pattern, policy, action}) => ({method, pattern:pattern.source, policy, action}));

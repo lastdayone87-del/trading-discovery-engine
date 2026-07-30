@@ -43,6 +43,7 @@ import { processOfflineEvaluationJob } from './offlineEvaluation';
 import { getActiveCatalogPin } from './catalogPublication';
 import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { isQuotaCapacityError, QuotaAllocationExhaustedError } from './quotaCapacity';
+import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -53,14 +54,16 @@ export interface JobProvenance { actorId: string; requestId?: string }
 export async function addSearchJob(query: string, country: string, source: DiscoverySource, provenance: JobProvenance = {actorId:'system:scheduler'}): Promise<SearchJob> {
   await assertCountryAllowed(country, `queue:${source}`);
   const catalogPin=await getActiveCatalogPin(country);
+  await recordExecutionStage('JOB_CREATION','REACHED',{type:'SEARCH_YOUTUBE',source},provenance.requestId);
   const job = await enqueueJob(
     'SEARCH_YOUTUBE',
-    { query, country, source, provenance, catalogPin },
+    { query, country, source, provenance, catalogPin, traceId:provenance.requestId },
     {
       idempotencyKey: `search:${source}:${country.toLowerCase()}:${query.toLowerCase()}`,
       priority: source === 'manual_search' ? 100 : 20
     }
   );
+  await recordExecutionStage('QUEUE_PERSISTENCE','REACHED',{jobId:job.id,type:'SEARCH_YOUTUBE',source},provenance.requestId);
   return {
     id: job.id,
     query,
@@ -153,12 +156,15 @@ export async function processNextSearchJob(
 
   const job = await claimNextJob(workerId, claimableTypes);
   if (!job) return false;
+  const traceId=String(job.payload?.traceId||'');
+  return withExecutionTrace(traceId,async()=>{
   const heartbeat = setInterval(() => {
     heartbeatJob(job.id, workerId).catch(error => console.error(`[Queue Worker:${workerId}] Heartbeat failed:`, error));
   }, 60_000);
   heartbeat.unref?.();
 
   try {
+    await recordExecutionStage('DISPATCHER','REACHED',{jobId:job.id,type:job.type});
     if(job.type==='TERM_HARVEST'){await processTermHarvestJob(job);return true;}
     if(job.type==='SCORE_CANDIDATES'){await processCandidateScoringJob(job);return true;}
     if(job.type==='AI_ADJUDICATE_CANDIDATE'){await processAiAdjudicationJob(job);return true;}
@@ -330,6 +336,7 @@ export async function processNextSearchJob(
   } finally {
     clearInterval(heartbeat);
   }
+  });
 }
 
 export interface ProcessDiscoveredChannelOutcome {
@@ -691,12 +698,14 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
 }
 
 /** Starts a durable session and atomically queues its first page. */
-export async function executeFullManualSearch(userQuery: string, countryName: string): Promise<any> {
+export async function executeFullManualSearch(userQuery: string, countryName: string, traceId?:string): Promise<any> {
   await assertCountryAllowed(countryName, 'manual_search_session');
   const vocabs = await getCountryVocabularies();
   const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
-  const session = await createManualSearchSession({ id: randomUUID(), query: userQuery, country: countryName, variants: manualVariants(userQuery, vocab), lane: 'VIDEO' });
-  return { session, message: 'Manual discovery is queued; page 1 and all continuation pages will run in the high-priority durable queue.' };
+  await recordExecutionStage('JOB_CREATION','REACHED',{type:'MANUAL_SEARCH_PAGE'},traceId);
+  const session = await createManualSearchSession({ id: randomUUID(), query: userQuery, country: countryName, variants: manualVariants(userQuery, vocab), lane: 'VIDEO', traceId });
+  await recordExecutionStage('QUEUE_PERSISTENCE','REACHED',{sessionId:session.id,type:'MANUAL_SEARCH_PAGE'},traceId);
+  return { session, traceId, message: 'Manual discovery is queued; page 1 and all continuation pages will run in the high-priority durable queue.' };
 }
 
 function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number): void {

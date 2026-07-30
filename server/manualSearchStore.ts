@@ -22,7 +22,7 @@ function mapSession(row: any): ManualSearchSession {
     status: row.status, error: row.error, createdAt: date(row.created_at)!, updatedAt: date(row.updated_at)!, completedAt: date(row.completed_at) };
 }
 
-export async function createManualSearchSession(args: { id: string; query: string; country: string; variants: string[]; lane: RetrievalLane }): Promise<ManualSearchSession> {
+export async function createManualSearchSession(args: { id: string; query: string; country: string; variants: string[]; lane: RetrievalLane; traceId?: string }): Promise<ManualSearchSession> {
   const db = await getDb(); const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -32,7 +32,7 @@ export async function createManualSearchSession(args: { id: string; query: strin
     // replay/restart unable to materialize a duplicate page-one job.
     await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key)
       VALUES('MANUAL_SEARCH_PAGE',$1,200,3,$2) ON CONFLICT(idempotency_key) DO NOTHING`,
-      [JSON.stringify({sessionId:args.id,pageNumber:1,pageToken:null,variantIndex:0}),`manual-page:${args.id}:1`]);
+      [JSON.stringify({sessionId:args.id,pageNumber:1,pageToken:null,variantIndex:0,traceId:args.traceId}),`manual-page:${args.id}:1`]);
     await client.query('COMMIT');
     return mapSession(result.rows[0]);
   } catch (error) {

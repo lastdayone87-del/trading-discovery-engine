@@ -18,7 +18,9 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
   if (token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
   if (!headers.has('X-Request-Id')) headers.set('X-Request-Id', crypto.randomUUID());
   const response = await fetch(input, { ...init, headers });
-  if (response.status === 401 || response.status === 403) {
+  // A 403 proves the stored credential was authenticated but lacks the role for
+  // one action. Do not tear down an otherwise valid dashboard session.
+  if (response.status === 401) {
     window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT, {
       detail: { status: response.status, hasToken: Boolean(token) }
     }));
