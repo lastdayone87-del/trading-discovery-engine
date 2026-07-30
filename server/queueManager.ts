@@ -250,8 +250,9 @@ export async function processNextSearchJob(
     if (queryRunId) await startQueryRun(queryRunId);
     if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
-    if(queryRunId&&pageNumber>1){const budget=getDailyYouTubeQuotaBudget();const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');}
+    if(queryRunId){const budget=getDailyYouTubeQuotaBudget();const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');}
     const searchPage = queryRunId ? await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering) : null;
+    if(queryRunId) await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
     const extracted = searchPage?.channels || await searchYouTubeChannels(query, country, vocab, retrievalLane);
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
     const observations: QueryObservation[] = [];
@@ -275,7 +276,6 @@ export async function processNextSearchJob(
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
-      if(pageNumber>1) await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
       const maxPages=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_pages','3')));const maxLow=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_low_yield_pages','2')));
       const prior=await getAutonomousContinuationState(queryRunId);
       const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
