@@ -102,7 +102,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
     for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];
       try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition);const data=await response.json();await incrementQuota(1);activeKeyIndex=index;
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
-      }catch(error){recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throw error;}}
+      }catch(error){recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
   } finally { acquisition.release(); }
 }
@@ -118,8 +118,13 @@ function availableKeyIndexes(keys: string[]): number[] {
   const indexes = keys.map((_key, index) => (activeKeyIndex + index) % keys.length)
     .filter(index => youtubeProviderCooldown.eligible(keys[index]));
   if (indexes.length) return indexes;
-  const retryAt = Math.min(...keys.map(key => youtubeProviderCooldown.retryAt(key)).filter(Boolean));
-  throw new YouTubeProvidersCoolingDownError(retryAt);
+  throwIfAllProvidersCoolingDown(keys);
+  return [];
+}
+
+function throwIfAllProvidersCoolingDown(keys: string[]): void {
+  const retryAt = youtubeProviderCooldown.earliestRetryAtIfAllCooling(keys);
+  if (retryAt !== null) throw new YouTubeProvidersCoolingDownError(retryAt);
 }
 
 function recordProviderFailure(key: string, error: unknown): void {
@@ -312,6 +317,7 @@ export async function searchYouTubeChannelPage(
       }
     }
     acquisition.providerFailed(quotaExceededCount === providerIndexes.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
+    throwIfAllProvidersCoolingDown(keyPool);
     console.warn('[YouTube API Pool] All API keys in pool encountered quotaExceeded or error or returned no results.');
   }
 
@@ -453,6 +459,7 @@ export async function fetchYouTubeChannelEnrichment(
   }
 
   acquisition.providerFailed(quotaExceededCount === keyPool.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
+  throwIfAllProvidersCoolingDown(keyPool);
 
   throw lastError || new Error(`YouTube enrichment failed for '${channelId}'.`);
   } finally { acquisition.release(); }

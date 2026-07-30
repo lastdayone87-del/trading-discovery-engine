@@ -62,3 +62,9 @@ test('search provider loop retains key failover after a rate-limited attempt', (
   assert.match(search, /recordProviderFailure\(apiKey, e\)/);
   assert.doesNotMatch(search, /isYouTubeRateLimited\(e\)[\s\S]*?throw e/);
 });
+
+test('search propagates the earliest retry when its final eligible provider enters cooldown', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const search = source.slice(source.indexOf('export async function searchYouTubeChannelPage'), source.indexOf('/**\n * Fetches recent video titles'));
+  assert.match(search, /recordProviderFailure\(apiKey, e\)[\s\S]*throwIfAllProvidersCoolingDown\(keyPool\)/);
+});

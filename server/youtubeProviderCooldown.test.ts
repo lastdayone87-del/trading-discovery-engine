@@ -21,3 +21,12 @@ test('daily quota exhaustion cools only that provider until the next UTC day', (
   now = Date.parse('2026-07-31T00:00:00Z');
   assert.equal(providers.eligible('project-a'), true);
 });
+
+test('final eligible provider failure exposes the earliest pool retry time', () => {
+  const now = Date.parse('2026-07-30T12:00:00Z');
+  const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,now:()=>now});
+  providers.failed('project-a', 'DAILY_QUOTA_EXHAUSTED');
+  assert.equal(providers.earliestRetryAtIfAllCooling(['project-a', 'project-b']), null);
+  providers.failed('project-b', 'RATE_LIMITED');
+  assert.equal(providers.earliestRetryAtIfAllCooling(['project-a', 'project-b']), now + 100);
+});

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { nextUtcQuotaReset, QuotaAllocationExhaustedError } from './quotaCapacity';
+import { decideJobFailure } from './db';
 
 test('allocation exhaustion carries a next-UTC-reset retry without consuming queue attempts', () => {
   const now = new Date('2026-07-29T23:59:59.000Z');
@@ -39,18 +40,26 @@ test('every autonomous page reserves at worker execution rather than producer sc
   assert.doesNotMatch(db, /VALUES\('SEARCH_YOUTUBE',\$1,'AUTONOMOUS',100/);
 });
 
-test('manual and enrichment allocation capacity uses retryAt while genuine enrichment failures remain terminal', () => {
+test('manual, enrichment, and autonomous state transitions reuse the durable job disposition', () => {
   const source = fs.readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(source, /throw new QuotaAllocationExhaustedError\('MANUAL'\)/);
   assert.match(source, /throw new QuotaAllocationExhaustedError\('ENRICHMENT'\)/);
   assert.match(source, /throw new QuotaAllocationExhaustedError\('AUTONOMOUS'\)/);
-  assert.match(source, /job\.attempts >= job\.max_attempts && !isQuotaCapacityError\(err\)/);
+  assert.match(source, /const disposition=await failJob\(job\.id, err\);[\s\S]*const terminal=disposition==='FAILED'/);
+  assert.match(source, /MANUAL_SEARCH_PAGE' && terminal[\s\S]*ENRICH_CHANNEL' && terminal[\s\S]*failQueryRun\(runId, err, terminal\)/);
+});
+
+test('an expired provider retryAt remains retryable without consuming the final attempt', () => {
+  const now = 10_000;
+  const decision = decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt:now-1},3,3,now);
+  assert.deepEqual(decision,{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:now});
+  assert.deepEqual(decideJobFailure(new Error('genuine enrichment failure'),3,3,now),{disposition:'FAILED'});
 });
 
 test('capacity retryAt returns durable work to pending without spending its retry budget', () => {
   const source = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
   const failJob = source.slice(source.indexOf('export async function failJob'), source.indexOf('export async function recoverStaleJobs'));
-  assert.match(failJob, /providerRetryAt/);
+  assert.match(failJob, /decideJobFailure/);
   assert.match(failJob, /status='PENDING'/);
   assert.match(failJob, /attempts=GREATEST\(0,attempts-1\)/);
   assert.match(failJob, /run_after=\$3/);
