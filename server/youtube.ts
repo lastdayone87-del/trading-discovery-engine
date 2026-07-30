@@ -112,9 +112,12 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
 let activeKeyIndex = 0;
 
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition):Promise<Response>{
-  const enabled=(await getAppSetting('provider_deadlines_enabled',process.env.PROVIDER_DEADLINES_ENABLED||'false'))==='true';
-  const timeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
-  return youtubeRequestScheduler.run(()=>executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok){const error=await youtubeHttpError(response);if(isYouTubeRateLimited(error))youtubeRequestScheduler.rateLimited();throw error;}youtubeRequestScheduler.succeeded();acquisition?.providerSucceeded();return response;}}));
+  const configuredTimeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
+  const timeout=Number.isFinite(configuredTimeout)&&configuredTimeout>0?configuredTimeout:30_000;
+  // A scheduler can only advance once its head call settles. YouTube requests
+  // therefore always need a deadline; the general provider feature flag must
+  // not be allowed to leave this process-wide request lane blocked forever.
+  return youtubeRequestScheduler.run(()=>executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok){const error=await youtubeHttpError(response);if(isYouTubeRateLimited(error))youtubeRequestScheduler.rateLimited();throw error;}youtubeRequestScheduler.succeeded();acquisition?.providerSucceeded();return response;}}));
 }
 
 /** Preserve both legacy and google.rpc ErrorInfo reasons for actionable runtime diagnostics. */
