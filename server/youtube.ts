@@ -5,6 +5,7 @@ import { RetrievalLane } from './retrievalLanes';
 import { SearchOrdering, youtubeOrder } from './searchOrdering';
 import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from './youtubePoolBackoff';
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
+import { youtubeRequestScheduler } from './youtubeRequestScheduler';
 export type { SearchOrdering } from './searchOrdering';
 export type { RetrievalLane } from './retrievalLanes';
 
@@ -99,7 +100,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
     for(let attempt=0;attempt<keys.length;attempt++){const index=(activeKeyIndex+attempt)%keys.length;
       try{const url=`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${encodeURIComponent(playlistId)}&maxResults=${maxResults}&key=${keys[index]}`;const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition);const data=await response.json();await incrementQuota(1);activeKeyIndex=index;
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
-      }catch(error){if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===keys.length-1){acquisition.providerFailed(quotaExceededCount===keys.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throw error;}}
+      }catch(error){if(isYouTubeRateLimited(error)){acquisition.providerFailed('INDETERMINATE');throw error;}if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===keys.length-1){acquisition.providerFailed(quotaExceededCount===keys.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
   } finally { acquisition.release(); }
 }
@@ -113,7 +114,7 @@ let activeKeyIndex = 0;
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition):Promise<Response>{
   const enabled=(await getAppSetting('provider_deadlines_enabled',process.env.PROVIDER_DEADLINES_ENABLED||'false'))==='true';
   const timeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
-  return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok)throw await youtubeHttpError(response);acquisition?.providerSucceeded();return response;}});
+  return youtubeRequestScheduler.run(()=>executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok){const error=await youtubeHttpError(response);if(isYouTubeRateLimited(error))youtubeRequestScheduler.rateLimited();throw error;}youtubeRequestScheduler.succeeded();acquisition?.providerSucceeded();return response;}}));
 }
 
 /** Preserve both legacy and google.rpc ErrorInfo reasons for actionable runtime diagnostics. */
@@ -125,6 +126,16 @@ export async function youtubeHttpError(response:Response):Promise<Error>{
   const quotaExceeded=providerReasons.some(reason=>/^(quotaExceeded|dailyLimitExceeded)$/i.test(reason));
   const providerStatus=typeof body?.error?.status==='string'?body.error.status:'';
   return Object.assign(new Error(`YouTube HTTP ${response.status}${providerStatus?` ${providerStatus}`:''}${providerReasons.length?` (${providerReasons.join(', ')})`:''}`),{status:response.status,quotaExceeded,providerReasons});
+}
+
+/** A request-rate limit is common to this runtime; changing project keys cannot clear it. */
+export function isYouTubeRateLimited(error: unknown): boolean {
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    if (current.quotaExceeded === true) return false;
+    if (current.status === 429 || current.providerReasons?.some((reason: unknown) => /^rateLimitExceeded$/i.test(String(reason)))) return true;
+  }
+  return false;
 }
 
 export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, sanitizedQuery: string): DiscoveredChannelRaw[] {
@@ -227,6 +238,10 @@ export async function searchYouTubeChannelPage(
           return { channels: results, nextPageToken: data.nextPageToken || null, rawResultCount: (data.items || []).length };
         }
       } catch (e) {
+        if (isYouTubeRateLimited(e)) {
+          acquisition.providerFailed('INDETERMINATE');
+          throw e;
+        }
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
       }
@@ -291,6 +306,11 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
         if (snippets.length > 0) return snippets;
       }
     } catch (e) {
+      if (isYouTubeRateLimited(e)) {
+        acquisition.providerFailed('INDETERMINATE');
+        console.warn(`[YouTube API] Runtime request rate limited while fetching ${channelId}; key rotation skipped.`);
+        return [];
+      }
       if (isQuotaExceeded(e)) quotaExceededCount++;
       console.warn(`[YouTube API] Failed to fetch video descriptions for ${channelId}:`, e);
     }
@@ -365,6 +385,10 @@ export async function fetchYouTubeChannelEnrichment(
         activityBand, activityScore, activityObservedAt: observedAt.toISOString()
       };
     } catch (error: any) {
+      if (isYouTubeRateLimited(error)) {
+        acquisition.providerFailed('INDETERMINATE');
+        throw error;
+      }
       if (isQuotaExceeded(error)) quotaExceededCount++;
       lastError = error instanceof Error ? error : new Error(String(error));
     }
@@ -397,7 +421,7 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
       return { ...fallback, description: channel.snippet?.description || fallback.description,
         locationTag: officialCountry || fallback.locationTag,
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
-    } catch (error) { if (isQuotaExceeded(error)) quotaExceededCount++; }
+    } catch (error) { if (isYouTubeRateLimited(error)){acquisition.providerFailed('INDETERMINATE');break;}if (isQuotaExceeded(error)) quotaExceededCount++; }
   }
   acquisition.providerFailed(quotaExceededCount === keys.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
   return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
