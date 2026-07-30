@@ -23,10 +23,22 @@ function mapSession(row: any): ManualSearchSession {
 }
 
 export async function createManualSearchSession(args: { id: string; query: string; country: string; variants: string[]; lane: RetrievalLane }): Promise<ManualSearchSession> {
-  const db = await getDb();
-  const result = await db.query(`INSERT INTO manual_search_sessions(id,original_query,country,generated_query_variants,retrieval_lane,status,current_page)
-    VALUES($1,$2,$3,$4,$5,'RUNNING',1) RETURNING *`, [args.id, args.query, args.country, JSON.stringify(args.variants), args.lane]);
-  return mapSession(result.rows[0]);
+  const db = await getDb(); const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(`INSERT INTO manual_search_sessions(id,original_query,country,generated_query_variants,retrieval_lane,status,current_page)
+      VALUES($1,$2,$3,$4,$5,'RUNNING',1) RETURNING *`, [args.id, args.query, args.country, JSON.stringify(args.variants), args.lane]);
+    // Session and first-page work share one commit. The stable key makes a
+    // replay/restart unable to materialize a duplicate page-one job.
+    await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key)
+      VALUES('MANUAL_SEARCH_PAGE',$1,200,3,$2) ON CONFLICT(idempotency_key) DO NOTHING`,
+      [JSON.stringify({sessionId:args.id,pageNumber:1,pageToken:null,variantIndex:0}),`manual-page:${args.id}:1`]);
+    await client.query('COMMIT');
+    return mapSession(result.rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
 }
 export async function getManualSearchSession(id: string): Promise<ManualSearchSession | null> { const db = await getDb(); const r = await db.query('SELECT * FROM manual_search_sessions WHERE id=$1',[id]); return r.rows[0] ? mapSession(r.rows[0]) : null; }
 export async function listManualSearchSessions(limit = 20): Promise<ManualSearchSession[]> { const db = await getDb(); const r = await db.query('SELECT * FROM manual_search_sessions ORDER BY created_at DESC LIMIT $1',[Math.min(100,Math.max(1,limit))]); return r.rows.map(mapSession); }

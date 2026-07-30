@@ -42,6 +42,7 @@ import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
 import { getActiveCatalogPin } from './catalogPublication';
 import { processPlaylistInspectionJob } from './playlistAdapterWorker';
+import { isQuotaCapacityError, QuotaAllocationExhaustedError } from './quotaCapacity';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -226,7 +227,7 @@ export async function processNextSearchJob(
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
         units: 101, dailyBudget, allocationPercent: enrichmentPercent
       });
-      if (!quotaReserved) throw new Error('Enrichment quota allocation is currently exhausted.');
+      if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
         const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate);
         await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
@@ -249,8 +250,7 @@ export async function processNextSearchJob(
     if (queryRunId) await startQueryRun(queryRunId);
     if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
-    if(queryRunId&&pageNumber>1){const budget=getDailyYouTubeQuotaBudget();const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent})){await failQueryRun(queryRunId,new Error('Autonomous quota allocation exhausted.'),true);await completeJob(job.id);return true;}}
-    if(queryRunId&&pageNumber>1){const budget=Number(await getAppSetting('daily_youtube_quota_budget','9000'));const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent})){await failQueryRun(queryRunId,new Error('Autonomous quota allocation exhausted.'),true);await completeJob(job.id);return true;}}
+    if(queryRunId&&pageNumber>1){const budget=getDailyYouTubeQuotaBudget();const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:100,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');}
     const searchPage = queryRunId ? await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering) : null;
     const extracted = searchPage?.channels || await searchYouTubeChannels(query, country, vocab, retrievalLane);
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
@@ -312,7 +312,7 @@ export async function processNextSearchJob(
       await completeJob(job.id);
       return true;
     }
-    if (job.type === 'ENRICH_CHANNEL' && job.attempts >= job.max_attempts) {
+    if (job.type === 'ENRICH_CHANNEL' && job.attempts >= job.max_attempts && !isQuotaCapacityError(err)) {
       const channelId = String(job.payload?.channelId || '');
       const channel = channelId ? await getChannelById(channelId) : null;
       if (channel && channel.trading_status === 'UNCERTAIN') {
@@ -644,9 +644,7 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
   const operationId = `${sessionId}:${pageNumber}`;
   const queryVariant = session.generatedQueryVariants[variantIndex] || session.originalQuery;
   const reserved = await tryReserveQuota({ operationType: 'MANUAL_SEARCH_PAGE', operationId, allocation: 'MANUAL', units: 100, dailyBudget, allocationPercent: quotaPercent });
-  if (!reserved) {
-    return recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: null, rawResultCount:0, rawIds: [], uniqueIds: [], knownIds: [], acceptedIds: [], confirmedIds:[], qualityConfirmedIds:[], averageQualityScore:0, countryPrecision:0, communityDiversity:0, noveltyRatio: 0, duplicateRatio: 0, quotaUnits: 0, quotaEfficiency: 0, creatorYield: 0, lowYield: true, marginalUtility:0, shouldContinue:false, primaryReason:'QUOTA_ALLOCATION_EXHAUSTED', reasonCodes:['QUOTA_ALLOCATION_EXHAUSTED'], maxPages, stopReason: 'QUOTA_ALLOCATION_EXHAUSTED' });
-  }
+  if (!reserved) throw new QuotaAllocationExhaustedError('MANUAL');
   try {
     const vocabs = await getCountryVocabularies();
     const vocab = vocabs.find(v => v.country.toLowerCase() === session.country.toLowerCase());
@@ -692,14 +690,13 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
   } catch (error) { await finishQuotaReservation('MANUAL_SEARCH_PAGE', operationId, false); throw error; }
 }
 
-/** Starts a durable session, returning only after its first page has been processed. */
+/** Starts a durable session and atomically queues its first page. */
 export async function executeFullManualSearch(userQuery: string, countryName: string): Promise<any> {
   await assertCountryAllowed(countryName, 'manual_search_session');
   const vocabs = await getCountryVocabularies();
   const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
   const session = await createManualSearchSession({ id: randomUUID(), query: userQuery, country: countryName, variants: manualVariants(userQuery, vocab), lane: 'VIDEO' });
-  const firstPage = await executeManualSearchPage(session.id, 1, null, 0);
-  return { session: firstPage, message: firstPage.status === 'RUNNING' ? 'First page complete; deep discovery is continuing in the high-priority queue.' : 'Manual discovery completed on the first page.' };
+  return { session, message: 'Manual discovery is queued; page 1 and all continuation pages will run in the high-priority durable queue.' };
 }
 
 function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number): void {

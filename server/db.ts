@@ -617,6 +617,16 @@ export async function tryReserveQuota(args: {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+    const quotaDay = new Date().toISOString().slice(0, 10);
+    // Rollover belongs to admission so the first worker after UTC midnight can
+    // recover without relying on a dashboard/read request. The upsert holds the
+    // tracker row lock for the rest of this reservation transaction.
+    await client.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
+      VALUES('youtube',0,$1,$2)
+      ON CONFLICT(id) DO UPDATE SET
+        units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
+        daily_limit=excluded.daily_limit,
+        last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
     await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
     await client.query(`UPDATE quota_reservations SET status='EXPIRED' WHERE status='RESERVED' AND expires_at<=now()`);
     const existing = await client.query(
