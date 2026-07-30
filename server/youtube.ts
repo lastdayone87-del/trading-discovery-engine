@@ -296,10 +296,6 @@ export async function searchYouTubeChannelPage(
           return { channels: results, nextPageToken: data.nextPageToken || null, rawResultCount: (data.items || []).length };
         }
       } catch (e) {
-        if (isYouTubeRateLimited(e)) {
-          acquisition.providerFailed('INDETERMINATE');
-          throw e;
-        }
         if (isQuotaExceeded(e)) quotaExceededCount++;
         console.warn(`[YouTube API Pool] Key #${currentIndex + 1} fetch error:`, e);
       }
