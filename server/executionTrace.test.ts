@@ -37,6 +37,13 @@ test('execution tracing degrades gracefully only when its table is missing',asyn
   await assert.rejects(()=>persistExecutionStage(unavailable,'00000000-0000-0000-0000-000000000001','HTTP_HANDLER','REACHED',{}),/database unavailable/);
 });
 
+test('claim tracing cannot participate in or roll back the durable job claim',()=>{
+  const db=fs.readFileSync(new URL('./db.ts',import.meta.url),'utf8');
+  const claim=db.slice(db.indexOf('export async function claimNextJob'),db.indexOf('export async function completeJob'));
+  assert.ok(claim.indexOf("await client.query('COMMIT')") < claim.indexOf("INSERT INTO discovery_execution_trace"));
+  assert.match(claim,/Claim trace unavailable; discovery claim remains committed/);
+});
+
 test('migration versions are unique and Railway runs them before application startup',()=>{
   const migrationNames=fs.readdirSync(new URL('./db/migrations/',import.meta.url)).filter(name=>name.endsWith('.sql'));
   const versions=migrationNames.map(name=>name.split('_')[0]);
