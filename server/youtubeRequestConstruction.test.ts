@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildYouTubeApiUrl } from './youtube';
 
-test('buildYouTubeApiUrl constructs a canonical and fully encoded request', () => {
+test('buildYouTubeApiUrl constructs a canonical request without quotaUser identity', () => {
   const previous = process.env.YOUTUBE_QUOTA_USER;
   process.env.YOUTUBE_QUOTA_USER = 'railway discovery/production';
   try {
@@ -20,22 +20,10 @@ test('buildYouTubeApiUrl constructs a canonical and fully encoded request', () =
       q: 'DAX Analyse & Börse',
       maxResults: '25',
       pageToken: 'next/token+',
-      quotaUser: 'railway discovery/production',
       prettyPrint: 'false',
       key: 'key+with/&symbols'
     });
-  } finally {
-    if (previous === undefined) delete process.env.YOUTUBE_QUOTA_USER;
-    else process.env.YOUTUBE_QUOTA_USER = previous;
-  }
-});
-
-test('buildYouTubeApiUrl applies a non-empty, 40-character quotaUser bound', () => {
-  const previous = process.env.YOUTUBE_QUOTA_USER;
-  process.env.YOUTUBE_QUOTA_USER = ' '.repeat(3) + 'x'.repeat(50);
-  try {
-    const request = new URL(buildYouTubeApiUrl('videos', 'api-key', { part: 'snippet', id: 'a,b' }));
-    assert.equal(request.searchParams.get('quotaUser'), 'x'.repeat(40));
+    assert.equal(request.searchParams.has('quotaUser'), false);
   } finally {
     if (previous === undefined) delete process.env.YOUTUBE_QUOTA_USER;
     else process.env.YOUTUBE_QUOTA_USER = previous;

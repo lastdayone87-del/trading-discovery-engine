@@ -116,8 +116,7 @@ const YOUTUBE_API_ROOT = 'https://youtube.googleapis.com/youtube/v3';
 
 /**
  * Build a canonical YouTube Data API request without hand-concatenating query
- * parameters. `quotaUser` gives Google a stable caller identity for per-user
- * rate accounting instead of relying on the runtime's shared egress IP.
+ * parameters.
  */
 export function buildYouTubeApiUrl(
   resource: 'search' | 'videos' | 'channels' | 'playlistItems',
@@ -128,9 +127,6 @@ export function buildYouTubeApiUrl(
   for (const [name, value] of Object.entries(parameters)) {
     if (value !== undefined) url.searchParams.set(name, String(value));
   }
-  const configuredQuotaUser = (process.env.YOUTUBE_QUOTA_USER || 'trading-discovery-engine').trim();
-  const quotaUser = configuredQuotaUser || 'trading-discovery-engine';
-  url.searchParams.set('quotaUser', quotaUser.slice(0, 40));
   url.searchParams.set('prettyPrint', 'false');
   url.searchParams.set('key', apiKey);
   return url.toString();
