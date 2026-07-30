@@ -30,7 +30,7 @@ export default function App() {
   const [operationalSummary,setOperationalSummary]=useState<DashboardOperationalSummary|null>(null);
   const [accessToken, setAccessToken] = useState(() => operatorToken());
   const [tokenDraft, setTokenDraft] = useState(() => operatorToken());
-  const [authError, setAuthError] = useState<'missing' | 'invalid' | 'forbidden' | null>(() => operatorToken() ? null : 'missing');
+  const [authError, setAuthError] = useState<'missing' | 'invalid' | null>(() => operatorToken() ? null : 'missing');
 
   const [inspectingChannel, setInspectingChannel] = useState<ChannelRecord | null>(null);
 
@@ -54,7 +54,7 @@ export default function App() {
   useEffect(() => {
     const onAuthRequired = (event: Event) => {
       const status = (event as CustomEvent<{ status: number }>).detail?.status;
-      setAuthError(status === 403 ? 'forbidden' : 'invalid');
+      setAuthError('invalid');
     };
     window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
     return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
@@ -127,9 +127,7 @@ export default function App() {
   if (authError) {
     const message = authError === 'missing'
       ? 'Enter the production operator or administrator token to load runtime data.'
-      : authError === 'forbidden'
-        ? 'This action requires an administrator token. Enter an authorized credential and retry.'
-        : 'The API rejected this credential. Verify the deployed operator token and try again.';
+      : 'The API rejected this credential. Verify the deployed operator token and try again.';
     return (
       <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
         <form onSubmit={authenticateDashboard} className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl space-y-4">

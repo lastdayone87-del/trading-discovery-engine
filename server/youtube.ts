@@ -4,6 +4,7 @@ import { executeProviderCall } from './providerResilience';
 import { RetrievalLane } from './retrievalLanes';
 import { SearchOrdering, youtubeOrder } from './searchOrdering';
 import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from './youtubePoolBackoff';
+import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 export type { SearchOrdering } from './searchOrdering';
 export type { RetrievalLane } from './retrievalLanes';
 
@@ -112,7 +113,7 @@ let activeKeyIndex = 0;
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition):Promise<Response>{
   const enabled=(await getAppSetting('provider_deadlines_enabled',process.env.PROVIDER_DEADLINES_ENABLED||'false'))==='true';
   const timeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
-  return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{const response=await fetch(url,{signal});if(!response.ok){const body=await response.clone().json().catch(()=>null) as any;const reasons=(body?.error?.errors||[]).map((item:any)=>item?.reason).filter(Boolean);const quotaExceeded=reasons.some((reason:string)=>/^(quotaExceeded|dailyLimitExceeded)$/i.test(reason));const error=Object.assign(new Error(`YouTube HTTP ${response.status}${reasons.length?` (${reasons.join(', ')})`:''}`),{status:response.status,quotaExceeded});throw error;}acquisition?.providerSucceeded();return response;}});
+  return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok){const body=await response.clone().json().catch(()=>null) as any;const reasons=(body?.error?.errors||[]).map((item:any)=>item?.reason).filter(Boolean);const quotaExceeded=reasons.some((reason:string)=>/^(quotaExceeded|dailyLimitExceeded)$/i.test(reason));const error=Object.assign(new Error(`YouTube HTTP ${response.status}${reasons.length?` (${reasons.join(', ')})`:''}`),{status:response.status,quotaExceeded});throw error;}acquisition?.providerSucceeded();return response;}});
 }
 
 export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, sanitizedQuery: string): DiscoveredChannelRaw[] {
@@ -184,6 +185,7 @@ export async function searchYouTubeChannelPage(
   if (keyPool.length === 0) {
     throw new Error('YouTube discovery requires at least one configured YouTube API key.');
   }
+  await recordExecutionStage('PROVIDER_ACQUISITION','REACHED',{provider:'youtube',configuredKeys:keyPool.length});
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
 

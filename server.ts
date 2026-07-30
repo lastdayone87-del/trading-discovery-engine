@@ -70,6 +70,7 @@ import { decideReview, getReviewDetails, listReviewQueue, ReviewConflictError, R
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
 import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
+import { inspectExecutionTrace, recordExecutionStage, withExecutionTrace } from './server/executionTrace';
 
 
 async function startServer() {
@@ -104,6 +105,7 @@ async function startServer() {
 
   app.get('/api/operator-audit-events', async(req,res)=>{try{res.json(await getOperatorAuditEvents(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/provider-metrics', async(req,res)=>{try{res.json(await getProviderOperationalMetrics(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/execution-traces/:id',async(req,res)=>{try{res.json(await inspectExecutionTrace(req.params.id));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/validation-status', async(req,res)=>{try{res.json({policyVersion:'phase-3-baseline-v1',runs:await getValidationRuns(Number(req.query.limit||100))});}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/measurement/replay',async(req,res)=>{try{const to=String(req.query.to||new Date().toISOString());const from=String(req.query.from||new Date(Date.now()-24*60*60*1000).toISOString());res.json(await getReplayReport(from,to,Number(req.query.tolerance||0)));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_REPLAY_REQUEST',requestId:req.requestId});}});
   app.get('/api/research-programs',async(req,res)=>{try{res.json(await inspectPassivePrograms(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
@@ -272,6 +274,7 @@ async function startServer() {
   // 3. Execute manual search with full pipeline execution & stage tracing
   app.post('/api/search/manual', async (req, res) => {
     try {
+      await recordExecutionStage('HTTP_HANDLER','REACHED',{route:'/api/search/manual'},req.requestId);
       const { query, country } = req.body;
       if (!query || !country) {
         return res.status(400).json({ error: 'Missing required query or country parameter.' });
@@ -285,7 +288,7 @@ async function startServer() {
 
       console.log(`[Manual Search Requested] Query: "${sanitized}", Country: "${country}"`);
 
-      const executionResult = await executeFullManualSearch(sanitized, country);
+      const executionResult = await withExecutionTrace(req.requestId,()=>executeFullManualSearch(sanitized, country, req.requestId));
 
       res.json({
         message: `Manual search completed for '${sanitized}' (${country}).`,
@@ -316,6 +319,7 @@ async function startServer() {
   // 4. Generate & Run Automated Country Search
   app.post('/api/search/automated', async (req, res) => {
     try {
+      await recordExecutionStage('HTTP_HANDLER','REACHED',{route:'/api/search/automated'},req.requestId);
       const { country } = req.body;
       if (!country) {
         return res.status(400).json({ error: 'Missing country parameter.' });
