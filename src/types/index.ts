@@ -253,6 +253,8 @@ export interface KeyQuotaUsage {
   unitsUsed: number;
   limit: number;
   isActive: boolean;
+  status: 'Active' | 'Cooling Down' | 'Daily Quota Exhausted' | 'Unavailable';
+  retryAt: string | null;
 }
 
 export interface QuotaInfo {

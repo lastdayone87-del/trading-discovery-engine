@@ -1,4 +1,5 @@
 export type YouTubeProviderFailureKind = 'RATE_LIMITED' | 'DAILY_QUOTA_EXHAUSTED';
+export type YouTubeProviderOperationalStatus = 'Active' | 'Cooling Down' | 'Daily Quota Exhausted';
 
 export interface YouTubeProviderCooldownOptions {
   initialRateLimitCooldownMs: number;
@@ -8,7 +9,7 @@ export interface YouTubeProviderCooldownOptions {
 
 /** Process-local availability state for each configured API key/project. */
 export class YouTubeProviderCooldown {
-  private readonly providers = new Map<string, { retryAt: number; rateLimitCooldownMs: number }>();
+  private readonly providers = new Map<string, { retryAt: number; rateLimitCooldownMs: number; kind: YouTubeProviderFailureKind }>();
 
   constructor(private readonly options: YouTubeProviderCooldownOptions) {}
 
@@ -26,7 +27,7 @@ export class YouTubeProviderCooldown {
     if (kind === 'DAILY_QUOTA_EXHAUSTED') {
       const date = new Date(now);
       const retryAt = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1);
-      this.providers.set(key, { retryAt, rateLimitCooldownMs: 0 });
+      this.providers.set(key, { retryAt, rateLimitCooldownMs: 0, kind });
       return retryAt;
     }
     const initial = Math.max(1, this.options.initialRateLimitCooldownMs);
@@ -34,12 +35,21 @@ export class YouTubeProviderCooldown {
       ? Math.min(Math.max(initial, this.options.maxRateLimitCooldownMs), previous.rateLimitCooldownMs * 2)
       : initial;
     const retryAt = now + cooldown;
-    this.providers.set(key, { retryAt, rateLimitCooldownMs: cooldown });
+    this.providers.set(key, { retryAt, rateLimitCooldownMs: cooldown, kind });
     return retryAt;
   }
 
   succeeded(key: string): void { this.providers.delete(key); }
   retryAt(key: string): number { return this.providers.get(key)?.retryAt ?? 0; }
+
+  status(key: string): { status: YouTubeProviderOperationalStatus; retryAt: number | null } {
+    if (this.eligible(key)) return { status: 'Active', retryAt: null };
+    const state = this.providers.get(key)!;
+    return {
+      status: state.kind === 'DAILY_QUOTA_EXHAUSTED' ? 'Daily Quota Exhausted' : 'Cooling Down',
+      retryAt: state.retryAt
+    };
+  }
 
   earliestRetryAtIfAllCooling(keys: string[]): number | null {
     if (!keys.length || keys.some(key => this.eligible(key))) return null;

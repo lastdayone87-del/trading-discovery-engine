@@ -34,6 +34,12 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
   ];
 
   const quotaPercent = quotaInfo ? Math.min(100, Math.round((quotaInfo.unitsUsed / quotaInfo.dailyLimit) * 100)) : 0;
+  const providerStatusStyle = (status: string) => {
+    if (status === 'Active') return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300';
+    if (status === 'Daily Quota Exhausted') return 'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300';
+    if (status === 'Cooling Down') return 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300';
+    return 'bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300';
+  };
 
   return (
     <div className="space-y-6">
@@ -73,14 +79,19 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
             {quotaInfo.keyUsage && quotaInfo.keyUsage.length > 0 && (
               <div className="mt-2.5 pt-2 border-t border-slate-200/60 dark:border-slate-700/60 space-y-1.5">
                 <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Per-Key Rotation Breakdown:</div>
-                <div className="max-h-28 overflow-y-auto space-y-1 pr-1">
+                <div className="max-h-52 overflow-y-auto space-y-1 pr-1">
                   {quotaInfo.keyUsage.map((ku) => (
                     <div key={ku.keyIndex} className="flex items-center justify-between text-[11px] bg-white dark:bg-slate-900 px-2 py-1 rounded border border-slate-200/80 dark:border-slate-800">
                       <div className="flex items-center gap-1.5">
                         <span className={`w-1.5 h-1.5 rounded-full ${ku.isActive ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
                         <span className="font-mono font-medium text-slate-700 dark:text-slate-300">Key #{ku.keyIndex} ({ku.maskedKey})</span>
                       </div>
-                      <span className="font-mono text-slate-500 dark:text-slate-400">{ku.unitsUsed} / {ku.limit}</span>
+                      <div className="flex items-center gap-2">
+                        <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${providerStatusStyle(ku.status)}`} title={ku.retryAt ? `Recovery scheduled for ${ku.retryAt}` : undefined}>
+                          {ku.status}
+                        </span>
+                        <span className="font-mono text-slate-500 dark:text-slate-400">{ku.unitsUsed} / {ku.limit}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -88,7 +99,7 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
             )}
 
             <div className="flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400 mt-2 pt-1 border-t border-slate-200/40 dark:border-slate-700/40">
-              <span>Pool Capacity: {quotaInfo.totalKeys || 1} × 10k</span>
+              <span>Pool Capacity: {quotaInfo.dailyLimit.toLocaleString()} units ({quotaInfo.totalKeys || 0} × 10k)</span>
               <span>Reset: {quotaInfo.lastReset}</span>
             </div>
           </div>

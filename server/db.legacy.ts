@@ -4,6 +4,8 @@ import path from 'path';
 import { createRequire } from 'module';
 import { ChannelRecord, CountryVocabulary, ExcludedCountry, SearchJob, QueueStatus, QueryRecord, QueryExecutionLog, ExtractedTermRecord } from '../src/types';
 import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
+import { getConfiguredYouTubeKeys } from './youtubeKeyPool';
+import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 
 const requireFn = typeof require !== 'undefined' ? require : createRequire(import.meta.url);
 
@@ -698,26 +700,7 @@ export async function toggleQueuePause(queueName: string, isPaused: boolean): Pr
 }
 
 export function getYouTubeKeyPool(): string[] {
-  const candidates = [
-    process.env.YOUTUBE_API_KEY,
-    process.env.YOUTUBE_API_KEY_1,
-    process.env.YOUTUBE_API_KEY_2,
-    process.env.YOUTUBE_API_KEY_3,
-    process.env.YOUTUBE_API_KEY_4,
-    process.env.YOUTUBE_API_KEY_5,
-    process.env.GEMINI_API_KEY
-  ];
-
-  const pool: string[] = [];
-  for (const raw of candidates) {
-    if (raw && typeof raw === 'string') {
-      const trimmed = raw.trim();
-      if (trimmed && !trimmed.startsWith('MY_') && !pool.includes(trimmed)) {
-        pool.push(trimmed);
-      }
-    }
-  }
-  return pool;
+  return getConfiguredYouTubeKeys();
 }
 
 export interface KeyQuotaUsage {
@@ -726,6 +709,8 @@ export interface KeyQuotaUsage {
   unitsUsed: number;
   limit: number;
   isActive: boolean;
+  status: YouTubeProviderOperationalStatus;
+  retryAt: string | null;
 }
 
 export interface QuotaInfoExtended {
@@ -774,12 +759,15 @@ export async function getQuota(): Promise<QuotaInfoExtended> {
     const startShare = index * quotaPerKey;
     const keyUnitsUsed = Math.max(0, Math.min(quotaPerKey, unitsUsed - startShare));
     const maskedKey = k.length > 8 ? `${k.slice(0, 4)}...${k.slice(-4)}` : '****';
+    const provider = youtubeProviderCooldown.status(k);
     return {
       keyIndex: index + 1,
       maskedKey,
       unitsUsed: keyUnitsUsed,
       limit: quotaPerKey,
-      isActive: index === 0
+      isActive: provider.status === 'Active',
+      status: provider.status,
+      retryAt: provider.retryAt === null ? null : new Date(provider.retryAt).toISOString()
     };
   });
 
@@ -1148,4 +1136,3 @@ export async function purgeSyntheticTestChannels(): Promise<number> {
   saveDb();
   return count;
 }
-
