@@ -110,19 +110,42 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
  * Checks YOUTUBE_API_KEY and YOUTUBE_API_KEY_1..5.
  */
 let activeKeyIndex = 0;
+let outboundTraceSequence = 0;
 
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition):Promise<Response>{
+  const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
+  const trace = (stage: string) => console.log(`[YouTube Outbound Trace] ${traceId} ${stage}`);
+  trace('entered youtubeFetch; before timeout-setting-read at server/youtube.ts:119');
   const configuredTimeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
+  trace('after timeout-setting-read at server/youtube.ts:119');
   const timeout=Number.isFinite(configuredTimeout)&&configuredTimeout>0?configuredTimeout:30_000;
   // A scheduler can only advance once its head call settles. YouTube requests
   // therefore always need a deadline; the general provider feature flag must
   // not be allowed to leave this process-wide request lane blocked forever.
-  return youtubeRequestScheduler.run(()=>executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,call:async signal=>{await recordFirstYouTubeRequest(operation);const response=await fetch(url,{signal});if(!response.ok){const error=await youtubeHttpError(response);if(isYouTubeRateLimited(error))youtubeRequestScheduler.rateLimited();throw error;}youtubeRequestScheduler.succeeded();acquisition?.providerSucceeded();return response;}}));
+  trace('before scheduler-run at server/youtube.ts:126');
+  return youtubeRequestScheduler.run(()=>executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
+    trace('before first-request-record at server/youtube.ts:128');
+    await recordFirstYouTubeRequest(operation);
+    trace('after first-request-record at server/youtube.ts:128');
+    trace('before HTTP fetch at server/youtube.ts:131');
+    const response=await fetch(url,{signal});
+    trace(`after HTTP fetch at server/youtube.ts:131 (status=${response.status})`);
+    if(!response.ok){
+      trace('before HTTP-error-body-read at server/youtube.ts:135');
+      const error=await youtubeHttpError(response,trace);
+      trace('after HTTP-error-body-read at server/youtube.ts:135');
+      if(isYouTubeRateLimited(error))youtubeRequestScheduler.rateLimited();
+      throw error;
+    }
+    youtubeRequestScheduler.succeeded();acquisition?.providerSucceeded();return response;
+  }}), trace);
 }
 
 /** Preserve both legacy and google.rpc ErrorInfo reasons for actionable runtime diagnostics. */
-export async function youtubeHttpError(response:Response):Promise<Error>{
+export async function youtubeHttpError(response:Response,trace?:(stage:string)=>void):Promise<Error>{
+  trace?.('before response-body-json-read at server/youtube.ts:147');
   const body=await response.clone().json().catch(()=>null) as any;
+  trace?.('after response-body-json-read at server/youtube.ts:147');
   const legacy=(body?.error?.errors||[]).map((item:any)=>item?.reason);
   const detailed=(body?.error?.details||[]).map((item:any)=>item?.reason);
   const providerReasons=Array.from(new Set([...legacy,...detailed].filter((reason):reason is string=>typeof reason==='string'&&reason.length>0)));
@@ -222,17 +245,24 @@ export async function searchYouTubeChannelPage(
 
       try {
         console.log(`[YouTube API Pool] Attempting search with key #${currentIndex + 1}/${keyPool.length} (${apiKey.slice(0, 6)}...)...`);
+        console.log(`[YouTube Outbound Trace] search attempt log returned; constructing request for key #${currentIndex + 1}, attempt ${attempt + 1}`);
         const searchType = lane === 'VIDEO' ? 'video' : 'channel';
         const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=${searchType}&order=${youtubeOrder(ordering)}&q=${encodeURIComponent(
           sanitizedQuery
         )}&maxResults=${maxResults}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}&key=${apiKey}`;
 
+        console.log(`[YouTube Outbound Trace] search-${attempt + 1} before youtubeFetch at server/youtube.ts:255`);
         const res = await youtubeFetch(searchUrl,'search',100,attempt+1,acquisition);
+        console.log(`[YouTube Outbound Trace] search-${attempt + 1} after youtubeFetch at server/youtube.ts:255`);
 
         if (res.ok) {
           activeKeyIndex = currentIndex; // Pin working key as preferred
+          console.log(`[YouTube Outbound Trace] search-${attempt + 1} before quota-write at server/youtube.ts:261`);
           await incrementQuota(100); // 100 units for YouTube Search call
+          console.log(`[YouTube Outbound Trace] search-${attempt + 1} after quota-write at server/youtube.ts:261`);
+          console.log(`[YouTube Outbound Trace] search-${attempt + 1} before success-body-read at server/youtube.ts:264`);
           const data = await res.json();
+          console.log(`[YouTube Outbound Trace] search-${attempt + 1} after success-body-read at server/youtube.ts:264`);
           const results = extractDiscoveredChannels(data.items || [], lane, sanitizedQuery);
 
           console.log(`[YouTube API Pool] Key #${currentIndex + 1} succeeded. ${lane} lane discovered ${results.length} unique channels.`);
