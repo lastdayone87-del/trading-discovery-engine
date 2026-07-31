@@ -3,7 +3,7 @@ import type {
   LifecycleAction, RawChannelInput, StagedClassificationReport
 } from './types';
 
-export const STAGED_CLASSIFICATION_VERSION = '2.0.0';
+export const STAGED_CLASSIFICATION_VERSION = '2.1.0';
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
   if (item.provenance?.fields?.length) return item.provenance.fields;

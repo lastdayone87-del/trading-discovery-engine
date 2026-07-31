@@ -1,6 +1,6 @@
 # Classification Pipeline
 
-**Status:** Production specification for evidence engine v2.0
+**Status:** Production specification for evidence engine v2.1
 **Related:** [Architecture Overview](./ARCHITECTURE_OVERVIEW.md) · [Learning Pipeline](./LEARNING_PIPELINE.md) · [Roadmap](./ROADMAP.md)
 
 ## Purpose
@@ -62,10 +62,35 @@ Production runs these providers concurrently:
 | External links | Official channel links | Recognized trading platforms and prop-firm resources | None | Fixed domains; linked content is not fetched semantically |
 | Country knowledge | Name, bio, titles, country pack | Exchanges, local instruments, native terms | Regional irrelevant domains | Static country/language packs |
 | Multilingual context | Complete available text | Execution and education phrases | Adjacent finance, hype, motivation when practice is absent | Phrase packs cover only known languages and expressions |
-| Gemini semantic | Bounded name, bio, titles, video snippet | Semantic trading concepts | Semantic irrelevant-domain conclusion | Optional dependency, bounded context, medium reliability |
+| Multilingual semantic (Gemini) | Field-preserved channel, video, playlist, transcript, and language hints | Active trading and investing-education meaning | News, personal finance, hype, and unrelated meaning | Optional cost-tiered dependency; structured evidence only; cannot make a terminal decision alone |
 | Discord | Invite, when already known | Community resource | None | Usually not applicable before downstream inspection |
 
 Providers create evidence items with polarity, category, confidence, reliability, final weight, and provenance. Provider failure boundaries prevent one provider from aborting the full classification.
+
+### Multilingual semantic boundary (v2.1)
+
+The compact multilingual model is the primary generalization provider for
+meaning not represented in static packs. It receives separately identified
+fields rather than flattened text and must return a closed taxonomy:
+`ACTIVE_TRADING`, `INVESTING_EDUCATION`, `FINANCIAL_NEWS`,
+`PERSONAL_FINANCE`, `HYPE`, `UNRELATED`, or `AMBIGUOUS`. Its assertion includes
+field citations, detected language and script per field, concepts, reason codes,
+and pinned model, prompt, feature, and calibration versions. Unsupported language,
+missing citations, ambiguity, and confidence below policy threshold produce a
+zero-weight `SEMANTIC_ABSTENTION`; they never fall back to English certainty.
+
+Ambiguous cases may use a separately versioned adjudicator when enabled. The
+semantic assertion remains medium-reliability evidence: positive assertions need
+independent deterministic, entity, dimension, or repeated-video corroboration,
+and one semantic negative assertion cannot cross the dominant-contradiction
+threshold. This preserves the v2 staged architecture and makes explanations
+inspectable while allowing unseen terminology, transliterations, loanwords, and
+code-switching to enter candidate detection.
+
+The `multilingual-semantic-calibration-bootstrap-1` artifact maps raw model
+confidence into conservative policy bands. These scores are explicitly not yet
+probabilities; production probability calibration awaits fitting and validation
+on time-split human-reviewed multilingual outcomes.
 
 ## Provider availability semantics
 

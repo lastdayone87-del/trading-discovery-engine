@@ -1,11 +1,11 @@
 import { ScoringEngineConfig, VerificationEngineVersions } from './types';
 
 export const ENGINE_VERSIONS: VerificationEngineVersions = {
-  evidenceEngineVersion: '2.0.0',
-  decisionEngineVersion: '2.0.0',
-  scoringEngineVersion: '2.0.0',
+  evidenceEngineVersion: '2.1.0',
+  decisionEngineVersion: '2.1.0',
+  scoringEngineVersion: '2.1.0',
   knowledgePackVersion: '1.2.0',
-  geminiModelVersion: 'gemini-3.6-flash'
+  geminiModelVersion: 'gemini-2.5-flash-lite / gemini-2.5-flash adjudicator'
 };
 
 export const EXTERNAL_SCORING_CONFIG: ScoringEngineConfig = {

@@ -92,7 +92,7 @@ transcript excerpts, and visual model provenance. Existing legacy arrays remain
 accepted while ingestion migrates to richer inputs. Machine-readable field
 references are carried in evidence provenance and stage diagnostics.
 
-## Priority 2: multilingual semantic understanding and calibration
+## In progress — Priority 2: multilingual semantic understanding and calibration
 
 ### Objective
 
@@ -139,6 +139,25 @@ Report precision, recall, calibration, abstention, and review rate per country, 
 - calibrated or explicitly non-probabilistic score semantics;
 - predictable cost and latency budgets;
 - safe fallback to deterministic evidence plus `UNCERTAIN` during model unavailability.
+
+### Implemented foundation
+
+Evidence engine v2.1 introduces the production boundary for this priority. A
+cost-tiered multilingual semantic provider now returns a closed domain taxonomy,
+per-field language/script observations, source-field citations, reason codes,
+explicit unsupported-language abstention, and versioned model, prompt, feature,
+and calibration metadata. A compact model handles candidate detection and an
+opt-in adjudicator handles low-confidence or ambiguous cases. Semantic evidence
+can generalize beyond configured vocabulary, but remains subject to the existing
+independent-corroboration and contradiction stages; it cannot confirm or reject a
+creator by itself. Deterministic providers therefore remain high-precision
+anchors and the entire path safely degrades to `UNCERTAIN` when unavailable.
+
+The checked-in bootstrap calibration is intentionally conservative and is not a
+claim of calibrated probability. Completing Priority 2 still requires a
+representative, time-split reviewed corpus, fitted calibration artifacts,
+confidence intervals by language/country/script/evidence band, latency and cost
+budgets, and an observed rollout that meets the acceptance criteria above.
 
 ## Priority 7: organic, multisource query expansion
 

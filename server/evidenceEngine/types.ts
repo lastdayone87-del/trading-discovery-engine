@@ -22,7 +22,8 @@ export type EvidenceCategory =
   | 'EXTERNAL_RESOURCE'
   | 'NON_TRADING_ADJACENT'
   | 'HYPE_SPECULATION'
-  | 'IRRELEVANT_DOMAIN';
+  | 'IRRELEVANT_DOMAIN'
+  | 'SEMANTIC_ABSTENTION';
 
 export type EvidenceReliability = 'VERY_HIGH' | 'HIGH' | 'MEDIUM' | 'LOWER';
 
@@ -33,6 +34,18 @@ export interface EvidenceProvenance {
   sourceRef: string;
   /** Machine-readable input fields that support this assertion. */
   fields?: EvidenceFieldRef[];
+  /** Versioned semantic-model details. Deterministic providers omit this. */
+  semantic?: {
+    modelVersion: string;
+    promptVersion: string;
+    featureVersion: string;
+    calibrationVersion: string;
+    taxonomyLabel: string;
+    rawConfidence: number;
+    calibratedConfidence: number;
+    detectedLanguages: Array<{ language: string; script: string; confidence: number; field: EvidenceFieldType }>;
+    reasonCodes: string[];
+  };
 }
 
 export type EvidenceFieldType =
