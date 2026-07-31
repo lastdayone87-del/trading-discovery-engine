@@ -34,6 +34,22 @@ CREATE TABLE IF NOT EXISTS knowledge_consumption_records (
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_scope ON knowledge_publications(country,locale,lane,status,version DESC);
 CREATE INDEX IF NOT EXISTS idx_knowledge_concept_contributions ON knowledge_contributions(concept_id,subsystem,observed_at DESC);
+CREATE OR REPLACE FUNCTION protect_knowledge_publication() RETURNS trigger AS $$
+BEGIN
+ IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'knowledge publications are immutable'; END IF;
+ IF NEW.id IS DISTINCT FROM OLD.id OR NEW.version IS DISTINCT FROM OLD.version OR NEW.schema_version IS DISTINCT FROM OLD.schema_version
+    OR NEW.country IS DISTINCT FROM OLD.country OR NEW.locale IS DISTINCT FROM OLD.locale OR NEW.lane IS DISTINCT FROM OLD.lane
+    OR NEW.policy_version IS DISTINCT FROM OLD.policy_version OR NEW.checksum IS DISTINCT FROM OLD.checksum OR NEW.artifact IS DISTINCT FROM OLD.artifact
+    OR NEW.created_by IS DISTINCT FROM OLD.created_by OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+   RAISE EXCEPTION 'knowledge publication payload is immutable';
+ END IF;
+ IF NEW.status IS DISTINCT FROM OLD.status AND NOT (
+   (OLD.status = 'DRAFT' AND NEW.status = 'APPROVED') OR (OLD.status = 'APPROVED' AND NEW.status = 'RETIRED')
+ ) THEN RAISE EXCEPTION 'invalid knowledge publication status transition'; END IF;
+ RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER knowledge_publications_immutable BEFORE UPDATE OR DELETE ON knowledge_publications
+ FOR EACH ROW EXECUTE FUNCTION protect_knowledge_publication();
 DO $$ DECLARE t TEXT; BEGIN FOREACH t IN ARRAY ARRAY['knowledge_publication_approvals','knowledge_publication_events','knowledge_contributions','knowledge_consumption_records'] LOOP
  EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_immutable_event_mutation()',t||'_immutable',t);
 END LOOP; END $$;

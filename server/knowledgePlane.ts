@@ -48,7 +48,7 @@ export function buildKnowledgeArtifact(input: Omit<KnowledgeArtifact, 'schemaVer
   if (!input.publicationId || input.publicationVersion < 1 || !input.policyVersion) throw new Error('INVALID_KNOWLEDGE_PUBLICATION');
   const concepts = input.concepts.map(sortedConcept).sort((a, b) => a.conceptId.localeCompare(b.conceptId));
   for (const concept of concepts) {
-    if (concept.conceptVersion < 1 || concept.policy.status !== 'APPROVED' || !concept.policy.lanes.includes(input.scope.lane)) throw new Error('CONCEPT_NOT_ELIGIBLE_FOR_SCOPE');
+    if (concept.conceptVersion < 1 || concept.policy.status !== 'APPROVED' || !concept.policy.lanes.includes(input.scope.lane) || !concept.policy.countries.includes(input.scope.country) || !concept.policy.locales.includes(input.scope.locale)) throw new Error('CONCEPT_NOT_ELIGIBLE_FOR_SCOPE');
     if (!concept.provenance.length || !concept.surfaces.length || concept.provenance.some(p => !p.evidenceId || !p.sourceEntityId || !/^[a-f0-9]{64}$/i.test(p.checksum))) throw new Error('INCOMPLETE_CONCEPT_PROVENANCE');
   }
   const unsigned = { ...input, concepts, schemaVersion: KNOWLEDGE_SCHEMA_VERSION } as Omit<KnowledgeArtifact, 'checksum'>;
@@ -78,7 +78,8 @@ export async function activateKnowledgePublication(input: { publicationId: strin
     if (!publication.rowCount) throw new Error('KNOWLEDGE_PUBLICATION_NOT_SERVABLE');
     const pointer = await client.query('SELECT * FROM active_knowledge_pointers WHERE scope_key=$1 FOR UPDATE', [scopeKey]); const current = pointer.rows[0], version = current?.pointer_version ?? 0;
     if (version !== input.expectedPointerVersion) throw new Error('KNOWLEDGE_POINTER_CONFLICT');
-    await client.query(`INSERT INTO active_knowledge_pointers(scope_key,country,locale,lane,publication_id,pointer_version) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(scope_key) DO UPDATE SET publication_id=excluded.publication_id,pointer_version=excluded.pointer_version,updated_at=now()`, [scopeKey, input.scope.country, input.scope.locale, input.scope.lane, input.publicationId, version + 1]);
+    const activated = await client.query(`INSERT INTO active_knowledge_pointers(scope_key,country,locale,lane,publication_id,pointer_version) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(scope_key) DO UPDATE SET publication_id=excluded.publication_id,pointer_version=excluded.pointer_version,updated_at=now() WHERE active_knowledge_pointers.pointer_version=$7 RETURNING *`, [scopeKey, input.scope.country, input.scope.locale, input.scope.lane, input.publicationId, version + 1, input.expectedPointerVersion]);
+    if (!activated.rowCount) throw new Error('KNOWLEDGE_POINTER_CONFLICT');
     const event = await client.query(`INSERT INTO knowledge_publication_events(id,idempotency_key,scope_key,from_publication_id,to_publication_id,from_pointer_version,to_pointer_version,action,checksum,actor,reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [randomUUID(), input.idempotencyKey, scopeKey, current?.publication_id ?? null, input.publicationId, version, version + 1, input.action ?? 'PUBLISH', publication.rows[0].checksum, input.actor, input.reason]);
     await client.query('COMMIT'); return event.rows[0];
   } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
