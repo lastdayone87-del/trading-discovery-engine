@@ -1,4 +1,4 @@
-import { RawChannelInput, VerificationDecision, EvidenceItem } from './types';
+import { RawChannelInput, VerificationDecision, EvidenceItem, StagedClassificationReport } from './types';
 import { getLayeredKnowledgeContext } from './knowledgePacks';
 import { verifyChannelTradingRelevance } from './index';
 
@@ -62,6 +62,7 @@ export interface FullClassificationReport {
       modelUsed?: string;
     };
   };
+  stagedClassification?: StagedClassificationReport;
   completeReasoningPath: string[];
 }
 
@@ -117,6 +118,7 @@ export async function generateClassificationReport(
     `[Step 2 - Knowledge Pack Loading] Loaded Global Pack (${knowledgeContext.globalInstruments.length} instruments, ${knowledgeContext.globalPlatformsPropFirms.length} platforms) + Language Pack '${knowledgeContext.languageKnowledge.languageName}' + Country Pack '${knowledgeContext.countryKnowledge.countryName}'`,
     `[Step 3 - Independent Provider Evidence Collection] Collected ${allItems.length} evidence items across ${Object.keys(evidenceByProvider).length} active providers`,
     `[Step 4 - Weight Aggregation] Total Positive Weight: +${decision.totalPositiveWeight} | Total Negative Weight: -${decision.totalNegativeWeight} | Multi-Video Topic Consistency: ${Math.round(decision.multiVideoConsistencyRatio * 100)}%`,
+    ...(decision.stagedClassification?.stages.map(stage => `[Stage ${stage.stage}] ${stage.disposition}: ${stage.reasonCodes.join(', ')} | Fields: ${stage.fields.map(field => field.field).join(', ') || 'none'}`) || []),
     `[Step 5 - Final Decision Rule] Classification: ${decision.status} (Confidence: ${decision.confidenceScore}%, Category: ${decision.category})`,
     `[Detailed Justification] ${decision.mathematicalJustification}`
   ];
@@ -170,6 +172,7 @@ export async function generateClassificationReport(
       multiVideoConsistencyRatio: decision.multiVideoConsistencyRatio,
       geminiAudit: decision.geminiSemanticSummary
     },
+    stagedClassification: decision.stagedClassification,
     completeReasoningPath: reasoningPath
   };
 }

@@ -33,7 +33,9 @@ The previous classifier could infer `NON_TRADING` from zero recognized positive 
 - missing/insufficient/degraded distinctions remain in diagnostics;
 - replay coverage includes multilingual reviewed false negatives.
 
-## Priority 1: staged, field-aware classification
+## Completed — Priority 1: staged, field-aware classification
+
+**Status:** Implemented in evidence/decision/scoring engine v2.0.
 
 ### Objective
 
@@ -72,6 +74,23 @@ A term in a channel title is not equivalent to an incidental phrase in one old d
 - no regression in `TRADING_CONFIRMED` precision;
 - material reduction in reviewed false-negative rate;
 - bounded review-rate increase with quota/cost measurement.
+
+### Implemented boundary
+
+The production decision now emits five versioned stage reports. Availability can
+abstain independently of semantics; candidate detection uses semantic and
+methodology evidence; corroboration requires repeated-video evidence, multiple
+providers, or multiple evidence dimensions; contradiction requires affirmative,
+dominant negative evidence; and lifecycle policy maps the stage outcome to
+confirm, reject, enrich, or review. The arithmetic score remains available for
+compatibility and diagnostics but can no longer create a terminal state when the
+corresponding stages abstain.
+
+The input contract now preserves structured videos (including publication time
+and content type), playlists, resolved external links, detected languages,
+transcript excerpts, and visual model provenance. Existing legacy arrays remain
+accepted while ingestion migrates to richer inputs. Machine-readable field
+references are carried in evidence provenance and stage diagnostics.
 
 ## Priority 2: multilingual semantic understanding and calibration
 

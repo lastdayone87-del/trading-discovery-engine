@@ -5,6 +5,8 @@ import {
   VerificationDecision,
   LayeredKnowledgeContext
 } from './types';
+import type { StagedClassificationReport } from './types';
+import { evaluateClassificationStages, stage } from './stagedClassification';
 import { ENGINE_VERSIONS, getScoringConfig } from './config';
 import { TradingCategory } from '../../src/types';
 
@@ -19,9 +21,11 @@ export class ConfigurableWeightedStrategy {
     evidenceItems: EvidenceItem[],
     knowledgeContext: LayeredKnowledgeContext,
     country: string,
-    evidenceCollection: EvidenceCollectionReport = { sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false, fieldsPresent: [], reasonCodes: [], providers: [] }
+    evidenceCollection: EvidenceCollectionReport = { sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false, fieldsPresent: [], reasonCodes: [], providers: [] },
+    stagedClassification?: StagedClassificationReport
   ): VerificationDecision {
     const now = new Date().toISOString();
+    const stages = stagedClassification || evaluateClassificationStages({ channel_name: '', description: '' }, evidenceItems, evidenceCollection);
 
     const positiveItems = evidenceItems.filter(i => i.polarity === 'POSITIVE');
     const negativeItems = evidenceItems.filter(i => i.polarity === 'NEGATIVE');
@@ -104,6 +108,19 @@ export class ConfigurableWeightedStrategy {
       justifications.push(`DECISION: UNCERTAIN. ${suffix} Preserving for enrichment or review.`);
     }
 
+    // Scores are evidence summaries, not lifecycle states. A positive score may
+    // only confirm after availability, candidate, corroboration and contradiction
+    // gates agree. Priority 0 negative behavior remains affirmative-evidence-only.
+    if (status === 'TRADING_CONFIRMED' && stages.lifecycleAction !== 'CONFIRM') {
+      status = 'UNCERTAIN';
+      confidenceScore = Math.min(confidenceScore, 79);
+      justifications.push(`STAGED POLICY: confirmation abstained (${stage(stages, 'CORROBORATION').reasonCodes.join(', ')}).`);
+    } else if (status === 'NON_TRADING' && stages.lifecycleAction !== 'REJECT') {
+      status = 'UNCERTAIN';
+      confidenceScore = Math.max(confidenceScore, 23);
+      justifications.push('STAGED POLICY: rejection abstained because contradiction was not dominant.');
+    }
+
     // Extract Gemini semantic summary if available
     const geminiItem = evidenceItems.find(i => i.source === 'gemini_semantic');
     let geminiSemanticSummary = undefined;
@@ -136,6 +153,7 @@ export class ConfigurableWeightedStrategy {
       versions: ENGINE_VERSIONS,
       mathematicalJustification: justifications.join(' | '),
       evidenceCollection,
+      stagedClassification: stages,
       timestamp: now
     };
   }

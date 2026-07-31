@@ -31,6 +31,22 @@ export interface EvidenceProvenance {
   type: string;
   matchedTerm: string;
   sourceRef: string;
+  /** Machine-readable input fields that support this assertion. */
+  fields?: EvidenceFieldRef[];
+}
+
+export type EvidenceFieldType =
+  | 'channel_title' | 'channel_bio' | 'video_title' | 'video_description'
+  | 'playlist_name' | 'playlist_description' | 'external_link_label'
+  | 'external_link_domain' | 'country' | 'language' | 'transcript_excerpt'
+  | 'visual_evidence' | 'discord_invite';
+
+export interface EvidenceFieldRef {
+  field: EvidenceFieldType;
+  index?: number;
+  sourceId?: string;
+  publishedAt?: string;
+  contentType?: string;
 }
 
 export interface EvidenceItem {
@@ -59,6 +75,12 @@ export interface RawChannelInput {
   external_links?: string[];
   location_tag?: string;
   discord_invite?: string | null;
+  videos?: Array<{ id?: string; title: string; description?: string; published_at?: string; content_type?: string }>;
+  playlists?: Array<{ id?: string; name: string; description?: string }>;
+  external_link_details?: Array<{ label?: string; url: string; domain?: string; resolved_entity_type?: string }>;
+  detected_languages?: Array<{ language: string; confidence?: number; field?: EvidenceFieldType }>;
+  transcript_excerpts?: Array<{ video_id?: string; text: string; language?: string }>;
+  visual_evidence?: Array<{ source_ref: string; description: string; model_provenance: string }>;
 }
 
 export interface LanguageKnowledge {
@@ -131,6 +153,8 @@ export interface VerificationDecision {
   versions: VerificationEngineVersions;
   mathematicalJustification: string;
   evidenceCollection: EvidenceCollectionReport;
+  /** Present on production v2 decisions; optional for replaying pre-v2 fixtures. */
+  stagedClassification?: StagedClassificationReport;
   timestamp: string;
 }
 
@@ -151,6 +175,25 @@ export interface EvidenceCollectionReport {
   fieldsPresent: string[];
   reasonCodes: string[];
   providers: ProviderExecutionReport[];
+}
+
+export type ClassificationStageName = 'AVAILABILITY' | 'CANDIDATE_DETECTION' | 'CORROBORATION' | 'CONTRADICTION' | 'LIFECYCLE';
+export type StageDisposition = 'PASS' | 'ABSTAIN' | 'FAIL';
+export type LifecycleAction = 'CONFIRM' | 'REJECT' | 'ENRICH' | 'REVIEW';
+
+export interface ClassificationStageResult {
+  stage: ClassificationStageName;
+  disposition: StageDisposition;
+  reasonCodes: string[];
+  evidenceIds: string[];
+  fields: EvidenceFieldRef[];
+  metrics: Record<string, number | string | boolean>;
+}
+
+export interface StagedClassificationReport {
+  pipelineVersion: string;
+  stages: ClassificationStageResult[];
+  lifecycleAction: LifecycleAction;
 }
 
 export interface EvidenceProvider {
