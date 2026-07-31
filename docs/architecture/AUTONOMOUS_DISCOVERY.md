@@ -224,3 +224,7 @@ The next discovery architecture should generate candidates from:
 - explicit coverage gaps by country, language, market, and strategy.
 
 Candidates should enter bounded randomized trials, be measured on quality-adjusted confirmed yield and cost, and transition through versioned lifecycle states. Details appear in the [Roadmap](./ROADMAP.md).
+
+## Priority 10 knowledge-plane consumption
+
+The planner may consume only the deterministic discovery projection of an immutable pinned knowledge publication. Every atom carries concept and surface identity, concept version, language/script/locale, policy version, publication checksum, and pointer version. Query outcomes return as append-only contributions and never mutate the active artifact. Existing proven catalogs and curated atoms remain compatibility controls until shadow replay, bounded canaries, and rollback proof permit migration.

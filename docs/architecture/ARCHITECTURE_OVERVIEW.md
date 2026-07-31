@@ -199,3 +199,18 @@ Before changing an authoritative path, answer:
 6. Is learning lineage preserved and protected against correlated sources?
 7. Is promotion explicit, measurable, and reversible?
 8. Have these architecture documents been updated?
+
+## Priority 10 unified governed knowledge plane
+
+Priority 10 places a unified governed knowledge plane above the independent learning systems. Discovery, classification, semantic, language, terminology, and query-generation subsystems submit source-bound append-only contributions but consume only compact immutable publications.
+
+```text
+mutable observations -> contributions -> review/evaluation -> immutable publication
+                                                             -> atomic lane pointer
+                                                             -> pinned consumers
+                                                             -> rollback
+```
+
+The canonical concept is independent of its producer and contains a stable identity and version, class, meaning, localized surfaces and senses, immutable provenance, and explicit policy scope. Publications are scoped independently by country, locale, and lane, so discovery approval never silently authorizes a classification feature. Classifier features and discovery atoms are deterministic projections of the same concepts rather than dependencies on one another.
+
+Every consumer pins publication ID/version/checksum, policy version, and pointer version. Atomic compare-and-swap pointer updates and immutable publish/rollback events make changes reversible and replayable. The mutable concept graph remains offline. Existing catalogs and curated controls remain last-known-good compatibility paths throughout shadow and canary migration.
