@@ -237,18 +237,19 @@ export async function getChannelListingRevision(args:ChannelListingFilter):Promi
   return {total:Number(result.rows[0].total||0),revision:iso(result.rows[0].revision)};
 }
 
-export interface DashboardOperationalSummary {storedChannels:number;activeDiscords:number;pendingScans:number;scope:{storedChannels:string;operationalMetrics:string};deployment:{environment:string;service:string;instance:string}}
+export interface DashboardOperationalSummary {storedChannels:number;activeDiscords:number;pendingScans:number;pendingReviews:number;scope:{storedChannels:string;operationalMetrics:string;pendingReviews:string};deployment:{environment:string;service:string;instance:string}}
 export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=process.env):Promise<DashboardOperationalSummary> {
   const db=await getDb();
   // One aggregate query preserves the summary-endpoint optimization while the
   // shared eligibility predicate prevents KPI/listing population drift.
   const result=await db.query(`SELECT COUNT(*)::int stored_channels,
     COUNT(*) FILTER(WHERE discord_status IN('ACTIVE','ACTIVE_LOW_VOLUME'))::int active_discords,
-    COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW'))::int pending_scans
+    COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW'))::int pending_scans,
+    (SELECT COUNT(*)::int FROM channel_reviews WHERE state='PENDING') pending_reviews
     FROM channels WHERE ${OPERATOR_VISIBLE_CHANNEL_SQL}`);
   const row=result.rows[0];
-  return {storedChannels:Number(row.stored_channels||0),activeDiscords:Number(row.active_discords||0),pendingScans:Number(row.pending_scans||0),
-    scope:{storedChannels:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS',operationalMetrics:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'},
+  return {storedChannels:Number(row.stored_channels||0),activeDiscords:Number(row.active_discords||0),pendingScans:Number(row.pending_scans||0),pendingReviews:Number(row.pending_reviews||0),
+    scope:{storedChannels:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS',operationalMetrics:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS',pendingReviews:'DURABLE_REVIEW_QUEUE'},
     deployment:{environment:env.RAILWAY_ENVIRONMENT_NAME||env.DEPLOYMENT_ENVIRONMENT||env.NODE_ENV||'unknown',service:env.RAILWAY_SERVICE_NAME||env.SERVICE_NAME||'trading-discovery-engine',instance:env.RAILWAY_DEPLOYMENT_ID?.slice(0,12)||env.DEPLOYMENT_ID?.slice(0,12)||'local'}};
 }
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {

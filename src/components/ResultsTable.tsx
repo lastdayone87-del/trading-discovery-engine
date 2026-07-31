@@ -9,13 +9,14 @@ interface Props {
   onInspect: (channel: ChannelRecord) => void;
   onReviewCompleted?: () => Promise<void>;
   reviewEnabled?: boolean;
+  pendingReviewCount?: number;
   onFiltersChange?: (filters:DashboardChannelFilters)=>void;
 }
 export interface DashboardChannelFilters {search:string;country:string;countryStatus:string;tradingStatus:string;discordStatus:string;scanStatus:string}
 
 type ReviewAction = 'approve' | 'reject' | 'force-rescan';
 
-export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, onReviewCompleted, reviewEnabled = false, onFiltersChange }) => {
+export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, onReviewCompleted, reviewEnabled = false, pendingReviewCount, onFiltersChange }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCountry, setSelectedCountry] = useState('ALL');
   const [selectedCountryStatus, setSelectedCountryStatus] = useState('ALL');
@@ -190,7 +191,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                 onClick={() => setPendingReviewOnly(value => !value)}
                 className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${pendingReviewOnly ? 'bg-violet-600 border-violet-600 text-white' : 'border-violet-200 dark:border-violet-800 text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-950'}`}
               >
-                Pending review ({channels.filter(channel => channel.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(channel.channel_id)).length})
+                Pending review ({pendingReviewCount ?? '—'})
               </button>
             </div>
           </div>

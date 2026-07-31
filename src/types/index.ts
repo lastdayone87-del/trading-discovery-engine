@@ -5,7 +5,8 @@ export interface DashboardOperationalSummary {
   storedChannels: number;
   activeDiscords: number;
   pendingScans: number;
-  scope: { storedChannels: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'; operationalMetrics: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS' };
+  pendingReviews: number;
+  scope: { storedChannels: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'; operationalMetrics: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'; pendingReviews: 'DURABLE_REVIEW_QUEUE' };
   deployment: { environment: string; service: string; instance: string };
 }
 

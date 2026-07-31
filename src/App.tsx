@@ -91,6 +91,7 @@ export default function App() {
     }
   };
   const fetchOperationalSummary=async()=>{try{const response=await apiFetch('/api/dashboard/summary');if(response.ok)setOperationalSummary(await response.json());}catch(error){console.error('Failed to fetch dashboard summary:',error);}};
+  const refreshAfterReview=async()=>{await Promise.all([fetchChannels(),fetchOperationalSummary()]);};
 
   // Poll Data
   useEffect(() => {
@@ -324,8 +325,9 @@ export default function App() {
               channels={channels}
               onRecheck={handleRecheck}
               onInspect={inspectChannel}
-              onReviewCompleted={fetchChannels}
+              onReviewCompleted={refreshAfterReview}
               reviewEnabled
+              pendingReviewCount={operationalSummary?.pendingReviews}
               onFiltersChange={updateChannelFilters}
             />
             {channelTotal>100&&<div className="flex items-center justify-end gap-2 text-xs"><button disabled={channelOffset===0} onClick={()=>changeChannelPage(Math.max(0,channelOffset-100))} className="rounded border px-3 py-1.5 disabled:opacity-40">Previous</button><span>{channelOffset+1}–{Math.min(channelOffset+100,channelTotal)} of {channelTotal}</span><button disabled={channelOffset+100>=channelTotal} onClick={()=>changeChannelPage(channelOffset+100)} className="rounded border px-3 py-1.5 disabled:opacity-40">Next</button></div>}

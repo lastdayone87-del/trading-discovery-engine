@@ -15,3 +15,9 @@ test('dashboard summary and channel listing share one eligibility policy', async
   assert.match(source, /clauses=\[args\.includeRejected\?'TRUE':OPERATOR_VISIBLE_CHANNEL_SQL\]/);
   assert.match(source, /FROM channels WHERE \$\{OPERATOR_VISIBLE_CHANNEL_SQL\}/);
 });
+
+test('dashboard pending review count uses the durable review queue', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./db.ts', import.meta.url), 'utf8'));
+  assert.match(source, /SELECT COUNT\(\*\)::int FROM channel_reviews WHERE state='PENDING'/);
+  assert.match(source, /pendingReviews:'DURABLE_REVIEW_QUEUE'/);
+});
