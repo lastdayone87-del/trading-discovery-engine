@@ -57,6 +57,8 @@ Unified ingestion pipeline
             └──► terminology and candidate-learning pipelines
 ```
 
+The planner's Priority 7 boundary also consumes governed multisource query candidates. Trial candidates carry reversible quota controls; proven candidates come only from the active immutable catalog pointer. Both retain concept and source provenance in the durable query record, while curated country atoms stay available as controls and last-known-good fallback.
+
 ### Authoritative versus shadow paths
 
 The production evidence-based classifier remains authoritative. The adaptive classifier, candidate corpus, bounded semantic candidate adjudication, concept graph, offline evaluation, and catalog systems contain advanced learning primitives, but several operate in shadow, proposal-only, or governed publication modes. A shadow result must never mutate a production decision merely because it exists.

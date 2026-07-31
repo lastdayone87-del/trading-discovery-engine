@@ -86,6 +86,8 @@ This newer stack addresses important weaknesses:
 
 Several of these components remain shadow, proposal-only, offline, or not yet wired into the authoritative query planner and classifier.
 
+Priority 7 wires the **published, proven search catalog** into the authoritative planner through a fail-closed compact serving contract. It does not read the mutable concept graph online. Catalog entries without concept identity, source-bound provenance, independent corroboration, and the versioned validation record remain inert. Quota-limited trial candidates can use the same contract when supplied by the controlled experiment coordinator; validation alone is never serving eligibility.
+
 ## Learning admission boundary
 
 A channel does not automatically train the engine merely because it was discovered.

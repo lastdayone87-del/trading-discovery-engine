@@ -161,6 +161,8 @@ budgets, and an observed rollout that meets the acceptance criteria above.
 
 ## Priority 7: organic, multisource query expansion
 
+**Status:** Implemented production serving boundary; source adapters continue to expand.
+
 ### Objective
 
 Allow discovery knowledge to expand beyond the original country seed ontology without uncontrolled AI-authored search.
@@ -208,6 +210,12 @@ confirmed new trading creators
 - performance is attributable against a control;
 - harmful and saturated candidates automatically leave active allocation;
 - curated fallback remains available.
+
+### Implemented boundary
+
+The planner now accepts source-bound candidates from the approved multisource taxonomy and admits only independently corroborated candidates whose language, script, safety, and retrieval-shape checks were recorded under the pinned Priority 7 policy. `SEARCH_TRIAL` candidates require explicit experiment, assignment-cap, and quota-cap provenance and remain anchored to a curated local control. `PROVEN` candidates may run as compact standalone queries only after publication in the immutable catalog currently pinned for the search scope.
+
+Every emitted organic query records candidate and concept identities, exact source references, independent source identities, language/script/locale, lifecycle, validation policy, trial or catalog pin, and a deterministic provenance checksum. The production loader fails closed for older catalog entries without that contract. Existing terminology and country-seed behavior is unchanged and remains the curated fallback. This creates the serving seam for Priority 8 locale/script policy and Priority 10's unified concept catalog without putting the mutable graph on the online path.
 
 ## Priority 8: global language, script, and market model
 
