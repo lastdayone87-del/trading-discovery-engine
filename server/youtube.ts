@@ -89,6 +89,13 @@ export interface DiscoveredChannelRaw {
   activityBand?: ChannelActivityBand;
   activityScore?: number;
   activityObservedAt?: string;
+  videos?: Array<{id?:string;title:string;description?:string;published_at?:string;content_type?:string;language?:string;script?:string}>;
+  playlists?: Array<{id?:string;name:string;description?:string}>;
+  transcriptExcerpts?: Array<{video_id?:string;text:string;language?:string}>;
+  detectedLanguages?: Array<{language:string;confidence?:number;field?:import('./evidenceEngine').EvidenceFieldType}>;
+  externalLinkDetails?: Array<{label?:string;url:string;domain?:string;resolved_entity_type?:string}>;
+  visualEvidence?: Array<{source_ref:string;description:string;model_provenance:string}>;
+  enrichmentStage?: number;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
@@ -396,7 +403,8 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
  */
 export async function fetchYouTubeChannelEnrichment(
   channelId: string,
-  fallback: DiscoveredChannelRaw
+  fallback: DiscoveredChannelRaw,
+  stage:1|2|3=1
 ): Promise<DiscoveredChannelRaw> {
   const keyPool = getYouTubeKeyPool();
   if (keyPool.length === 0) {
@@ -433,6 +441,16 @@ export async function fetchYouTubeChannelEnrichment(
       const activityScore = !latestUploadAt ? 50 : Math.max(5, Math.round(100 * Math.exp(-ageDays / 365)));
       const officialCountry = channel.brandingSettings?.channel?.country;
       const extractedLinks = description.match(/https?:\/\/[^\s)\]}]+/g) || [];
+      let videos=recentItems.map((item:any)=>({id:item.id?.videoId,title:String(item.snippet?.title||''),description:String(item.snippet?.description||''),published_at:item.snippet?.publishedAt,content_type:'youtube_video'})).filter((video:any)=>video.title);
+      let playlists=fallback.playlists||[];
+      if(stage>=2){
+        const ids=videos.map(video=>video.id).filter(Boolean).join(',');
+        const requests:Promise<Response>[]=[];
+        if(ids)requests.push(youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition));
+        requests.push(youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition));
+        const detailResponses=await Promise.all(requests);await incrementQuota(requests.length===2?101:100);
+        for(const response of detailResponses){const payload=await response.json();if(payload.items?.some((item:any)=>item.id?.kind==='youtube#playlist'||typeof item.id==='object'))playlists=payload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);else{const byId=new Map(payload.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}}
+      }
 
       return {
         ...fallback,
@@ -440,8 +458,8 @@ export async function fetchYouTubeChannelEnrichment(
         channelName: channel.snippet?.title || fallback.channelName,
         youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
         description,
-        videoTitles: recentItems.map((item: any) => item.snippet?.title).filter(Boolean),
-        videoDescriptions: recentItems.map((item: any) => item.snippet?.description).filter(Boolean),
+        videoTitles: recentItems.map((item: any) => item.snippet?.title || ''),
+        videos,playlists,videoDescriptions:videos.map(video=>video.description||''),
         locationTag: officialCountry || fallback.locationTag,
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED',
         countryMetadataCheckedAt: observedAt.toISOString(),
@@ -449,7 +467,8 @@ export async function fetchYouTubeChannelEnrichment(
         subscriberCount: channel.statistics?.subscriberCount || fallback.subscriberCount,
         channelThumbnailUrl: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.default?.url || fallback.channelThumbnailUrl,
         uploadTimestamps, latestUploadAt, uploadsLast30Days, uploadsLast90Days, uploadsLast365Days,
-        activityBand, activityScore, activityObservedAt: observedAt.toISOString()
+        activityBand, activityScore, activityObservedAt: observedAt.toISOString(), enrichmentStage:stage,
+        externalLinkDetails:extractedLinks.map(url=>{try{return {url,domain:new URL(url).hostname.toLowerCase()};}catch{return {url};}})
       };
     } catch (error: any) {
       recordProviderFailure(apiKey,error);

@@ -12,6 +12,9 @@ import {
 import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
+import type { RawChannelInput } from './evidenceEngine';
+import { getAppSetting } from './db';
+import {recordProductionClassification} from './classificationDiagnostics';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -166,20 +169,28 @@ export async function processChannelThroughPipeline(
   }
 
   // Step 2: GATE 2 - Evidence-Based Trading Verification Engine
-  const productionClassification = await classifyTradingRelevanceDetailed(
-    candidate.channelName,
-    candidate.description,
-    candidate.videoTitles,
-    candidate.videoDescriptions?.join(' ') || '',
-    resolvedCountry,
-    candidate.channelLinks,
-    undefined
-  );
-  const tradingVal = productionClassification.result;
-  // Deliberately detached: shadow I/O is never awaited by the production gate.
-  // Failures are observable but cannot delay or alter ingestion.
-  void runAndRecordAdaptiveShadow(candidate.channelId, productionClassification.input, productionClassification.decision)
-    .catch(error => console.warn(`[AdaptiveClassifier] Shadow evaluation failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error));
+  const classifierInput:RawChannelInput={
+    channel_id:candidate.channelId,channel_name:candidate.channelName,description:candidate.description||'',country:resolvedCountry,
+    location_tag:candidate.locationTag,external_links:candidate.channelLinks||[],external_link_details:candidate.externalLinkDetails,
+    videos:candidate.videos || candidate.videoTitles.map((title,index)=>({title,description:candidate.videoDescriptions?.[index],published_at:candidate.uploadTimestamps?.[index]})),
+    video_titles:candidate.videoTitles,video_descriptions:candidate.videoDescriptions||[],playlists:candidate.playlists,
+    transcript_excerpts:candidate.transcriptExcerpts,detected_languages:candidate.detectedLanguages,visual_evidence:candidate.visualEvidence,
+    pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
+    activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
+  };
+  const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
+  await recordProductionClassification({channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision})
+    .catch(error=>console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+  let tradingVal = productionClassification.result;
+  // Governed evidence remains independently observable and is rollout-gated. It
+  // may corroborate existing production-positive evidence, never confirm alone.
+  try {
+    const shadow=await runAndRecordAdaptiveShadow(candidate.channelId,productionClassification.input,productionClassification.decision);
+    const governedEnabled=await getAppSetting('governed_classifier_production_enabled','false')==='true';
+    if(governedEnabled&&tradingVal.status==='UNCERTAIN'&&shadow.status==='TRADING_CONFIRMED'&&productionClassification.decision.positiveEvidence.length>0&&productionClassification.decision.negativeEvidence.length===0&&shadow.evidence.length>0){
+      tradingVal={...tradingVal,status:'TRADING_CONFIRMED',confidenceScore:Math.max(82,shadow.confidenceScore),breakdown:{...tradingVal.breakdown,reasoning:[...(tradingVal.breakdown.reasoning||[]),'GOVERNED ROLLOUT: approved concepts corroborated existing production-positive evidence; no negative veto present.']}};
+    }
+  } catch(error) { console.warn(`[AdaptiveClassifier] Shadow evaluation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error); }
 
   if (tradingVal.status === 'NON_TRADING') {
     console.log(
@@ -243,7 +254,8 @@ export async function processChannelThroughPipeline(
       `[Unified Ingestion Pipeline - Gate 2] Channel '${candidate.channelName}' classified as UNCERTAIN (${tradingVal.confidenceScore}/100). ${isEnrichmentPass ? 'Routing to human review.' : 'Scheduling durable enrichment.'}`
     );
 
-    const lifecycle = resolveUncertainLifecycle(isEnrichmentPass);
+    const hasAnotherEnrichmentStage=isEnrichmentPass&&(candidate.enrichmentStage||0)<2;
+    const lifecycle = resolveUncertainLifecycle(isEnrichmentPass&&!hasAnotherEnrichmentStage);
     const finalUncertainStatus = lifecycle.tradingStatus;
     const finalScanStatus = lifecycle.scanStatus;
 
@@ -287,8 +299,8 @@ export async function processChannelThroughPipeline(
     if (lifecycle.shouldEnqueue) {
       await enqueueJob(
         'ENRICH_CHANNEL',
-        { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate },
-        { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}` }
+        { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate, enrichmentStage:Math.min(2,(candidate.enrichmentStage||0)+1) },
+        { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}:stage:${Math.min(2,(candidate.enrichmentStage||0)+1)}` }
       );
     }
 

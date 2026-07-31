@@ -8,6 +8,10 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     const items: EvidenceItem[] = [];
     const textBlob = `${input.channel_name} ${input.description || ''}`;
     const now = new Date().toISOString();
+    const fieldsFor=(terms:string[])=>[
+      ...(terms.some(term=>textMatchesTerm(input.channel_name,term))?[{field:'channel_title' as const}]:[]),
+      ...(terms.some(term=>textMatchesTerm(input.description||'',term))?[{field:'channel_bio' as const}]:[])
+    ];
 
     // 1. Match Global & Country Instruments in Channel Name/Description
     const matchedInstruments: string[] = [];
@@ -39,7 +43,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
           provider: 'channel_metadata',
           type: 'INSTRUMENT',
           matchedTerm: matchedInstruments.join(', '),
-          sourceRef: 'Channel Description'
+          sourceRef: 'Channel Title / About Description', fields:fieldsFor(matchedInstruments)
         },
         timestamp: now
       });
@@ -76,7 +80,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
           provider: 'channel_metadata',
           type: 'PLATFORM_BROKER_PROPFIRM',
           matchedTerm: matchedPlatforms.join(', '),
-          sourceRef: 'Channel Description'
+          sourceRef: 'Channel Title / About Description', fields:fieldsFor(matchedPlatforms)
         },
         timestamp: now
       });
@@ -114,7 +118,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
           provider: 'channel_metadata',
           type: 'METHODOLOGY_CONCEPT',
           matchedTerm: matchedConcepts.join(', '),
-          sourceRef: 'Channel Description'
+          sourceRef: 'Channel Title / About Description', fields:fieldsFor(matchedConcepts)
         },
         timestamp: now
       });
@@ -151,7 +155,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
           provider: 'channel_metadata',
           type: 'IRRELEVANT_DOMAIN',
           matchedTerm: matchedNegative.join(', '),
-          sourceRef: 'Channel Description'
+          sourceRef: 'Channel Title / About Description', fields:fieldsFor(matchedNegative)
         },
         timestamp: now
       });

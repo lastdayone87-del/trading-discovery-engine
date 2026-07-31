@@ -52,7 +52,7 @@ export type EvidenceFieldType =
   | 'channel_title' | 'channel_bio' | 'video_title' | 'video_description'
   | 'playlist_name' | 'playlist_description' | 'external_link_label'
   | 'external_link_domain' | 'country' | 'language' | 'transcript_excerpt'
-  | 'visual_evidence' | 'discord_invite';
+  | 'visual_evidence' | 'discord_invite' | 'pinned_comment' | 'activity_metadata' | 'location';
 
 export interface EvidenceFieldRef {
   field: EvidenceFieldType;
@@ -88,12 +88,15 @@ export interface RawChannelInput {
   external_links?: string[];
   location_tag?: string;
   discord_invite?: string | null;
-  videos?: Array<{ id?: string; title: string; description?: string; published_at?: string; content_type?: string }>;
+  videos?: Array<{ id?: string; title: string; description?: string; published_at?: string; content_type?: string; language?: string; script?: string }>;
   playlists?: Array<{ id?: string; name: string; description?: string }>;
   external_link_details?: Array<{ label?: string; url: string; domain?: string; resolved_entity_type?: string }>;
   detected_languages?: Array<{ language: string; confidence?: number; field?: EvidenceFieldType }>;
   transcript_excerpts?: Array<{ video_id?: string; text: string; language?: string }>;
   visual_evidence?: Array<{ source_ref: string; description: string; model_provenance: string }>;
+  pinned_comment?: string;
+  activity_metadata?: { latest_upload_at?: string; uploads_last_30_days?: number; uploads_last_90_days?: number; uploads_last_365_days?: number; activity_band?: string; activity_score?: number; observed_at?: string };
+  enrichment_stage?: number;
 }
 
 export interface LanguageKnowledge {
@@ -172,12 +175,20 @@ export interface VerificationDecision {
 }
 
 export type ProviderAvailability = 'AVAILABLE' | 'NOT_APPLICABLE' | 'UNAVAILABLE' | 'FAILED';
+export type ProviderExecutionOutcome =
+  | 'EXECUTED_WITH_EVIDENCE' | 'EXECUTED_NO_MATCH'
+  | 'ABSTAINED_UNSUPPORTED_LANGUAGE' | 'ABSTAINED_LOW_CONFIDENCE'
+  | 'NOT_APPLICABLE' | 'UNAVAILABLE_CONFIGURATION'
+  | 'FAILED_TIMEOUT' | 'FAILED_PROVIDER' | 'SUPPRESSED_BY_POLICY';
 export type EvidenceSufficiency = 'MISSING' | 'INSUFFICIENT' | 'SUFFICIENT';
 
 export interface ProviderExecutionReport {
   provider: EvidenceSourceType;
   availability: ProviderAvailability;
   evidenceCount: number;
+  outcome: ProviderExecutionOutcome;
+  reasonCodes: string[];
+  durationMs?: number;
   reason?: string;
 }
 

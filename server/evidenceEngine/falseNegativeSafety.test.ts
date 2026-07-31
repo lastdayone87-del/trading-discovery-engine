@@ -104,7 +104,8 @@ test('not-applicable and unavailable providers are reported separately from fail
     assert.equal(states.external_links, 'NOT_APPLICABLE');
     assert.equal(states.discord_metadata, 'NOT_APPLICABLE');
     assert.equal(states.gemini_semantic, 'UNAVAILABLE');
-    assert.equal(decision.evidenceCollection.degraded, true);
+    assert.equal(decision.evidenceCollection.degraded, false);
+    assert.equal(decision.evidenceCollection.providers.find(item=>item.provider==='gemini_semantic')?.outcome,'UNAVAILABLE_CONFIGURATION');
   } finally {
     if (priorKey === undefined) delete process.env.GEMINI_API_KEY;
     else process.env.GEMINI_API_KEY = priorKey;
