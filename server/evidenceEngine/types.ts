@@ -130,10 +130,31 @@ export interface VerificationDecision {
   };
   versions: VerificationEngineVersions;
   mathematicalJustification: string;
+  evidenceCollection: EvidenceCollectionReport;
   timestamp: string;
+}
+
+export type ProviderAvailability = 'AVAILABLE' | 'NOT_APPLICABLE' | 'UNAVAILABLE' | 'FAILED';
+export type EvidenceSufficiency = 'MISSING' | 'INSUFFICIENT' | 'SUFFICIENT';
+
+export interface ProviderExecutionReport {
+  provider: EvidenceSourceType;
+  availability: ProviderAvailability;
+  evidenceCount: number;
+  reason?: string;
+}
+
+export interface EvidenceCollectionReport {
+  sufficiency: EvidenceSufficiency;
+  sparseMetadata: boolean;
+  degraded: boolean;
+  fieldsPresent: string[];
+  reasonCodes: string[];
+  providers: ProviderExecutionReport[];
 }
 
 export interface EvidenceProvider {
   name: EvidenceSourceType;
   collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]>;
+  availability?(input: RawChannelInput): { availability: Exclude<ProviderAvailability, 'FAILED'>; reason?: string };
 }

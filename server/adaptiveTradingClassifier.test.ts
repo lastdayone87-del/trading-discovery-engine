@@ -5,7 +5,7 @@ import type { VerificationDecision } from './evidenceEngine';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const production=(status:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN'):VerificationDecision=>({status,confidenceScore:50,category:'General Trading',multiVideoConsistencyRatio:.5,positiveEvidence:[],negativeEvidence:[],totalPositiveWeight:0,totalNegativeWeight:0,countryContextUsed:{country:'US',language:'English',matchedTerms:[],matchedNegativeTerms:[]},versions:{evidenceEngineVersion:'p',decisionEngineVersion:'p',scoringEngineVersion:'p',knowledgePackVersion:'p',geminiModelVersion:'p'},mathematicalJustification:'fixture',timestamp:'2026-01-01T00:00:00Z'});
+const production=(status:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN'):VerificationDecision=>({status,confidenceScore:50,category:'General Trading',multiVideoConsistencyRatio:.5,positiveEvidence:[],negativeEvidence:[],totalPositiveWeight:0,totalNegativeWeight:0,countryContextUsed:{country:'US',language:'English',matchedTerms:[],matchedNegativeTerms:[]},versions:{evidenceEngineVersion:'p',decisionEngineVersion:'p',scoringEngineVersion:'p',knowledgePackVersion:'p',geminiModelVersion:'p'},mathematicalJustification:'fixture',evidenceCollection:{sufficiency:'INSUFFICIENT',sparseMetadata:true,degraded:false,fieldsPresent:['channel_name'],reasonCodes:['INSUFFICIENT_CLASSIFICATION_EVIDENCE'],providers:[]},timestamp:'2026-01-01T00:00:00Z'});
 const term=(id:string,literal:string):AdaptiveTerm=>({surfaceId:`s-${id}`,conceptId:`c-${id}`,literal,normalized:literal.toLowerCase(),conceptClass:'STRATEGY',origin:'HUMAN_APPROVED_TERMINOLOGY',catalogVersion:'7'});
 
 test('learned terminology without governance contributes no adaptive evidence',()=>{

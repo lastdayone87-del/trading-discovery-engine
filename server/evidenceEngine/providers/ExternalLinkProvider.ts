@@ -3,6 +3,12 @@ import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContex
 export class ExternalLinkProvider implements EvidenceProvider {
   name = 'external_links' as const;
 
+  availability(input: RawChannelInput) {
+    return input.external_links?.length
+      ? { availability: 'AVAILABLE' as const }
+      : { availability: 'NOT_APPLICABLE' as const, reason: 'No external links were supplied.' };
+  }
+
   async collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const items: EvidenceItem[] = [];
     const links = input.external_links || [];

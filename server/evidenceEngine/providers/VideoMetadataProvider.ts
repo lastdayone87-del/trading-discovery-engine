@@ -5,6 +5,12 @@ import { isTradingFocusedText } from '../multilingualTerminology';
 export class VideoMetadataProvider implements EvidenceProvider {
   name = 'video_metadata' as const;
 
+  availability(input: RawChannelInput) {
+    return input.video_titles?.length
+      ? { availability: 'AVAILABLE' as const }
+      : { availability: 'NOT_APPLICABLE' as const, reason: 'No recent video titles were supplied.' };
+  }
+
   async collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const items: EvidenceItem[] = [];
     const titles = input.video_titles || [];
@@ -79,32 +85,6 @@ export class VideoMetadataProvider implements EvidenceProvider {
         reliabilityMultiplier,
         rawWeight: Math.round(30 * consistencyRatio),
         finalWeight: Math.round(30 * consistencyRatio) * reliabilityMultiplier,
-        provenance: {
-          provider: 'video_metadata',
-          type: 'MULTI_VIDEO_CONSISTENCY',
-          matchedTerm: `${tradingFocusedCount}/${titles.length} videos matching trading terms`,
-          sourceRef: 'Sample Video Titles'
-        },
-        timestamp: now
-      });
-    } else {
-      // Inconsistent video uploads penalty scaled by sample size and negative term presence
-      const sampleScaleFactor = Math.min(1.0, titles.length / 5);
-      const rawPenalty = Math.round(12 * (1 - consistencyRatio) * sampleScaleFactor);
-      const calculatedWeight = -1 * Math.max(2, Math.round(rawPenalty * 0.85 * (1 - consistencyRatio)));
-
-      items.push({
-        id: `vid_meta_inconsist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        source: 'video_metadata',
-        polarity: 'NEGATIVE',
-        category: 'MULTI_VIDEO_CONSISTENCY',
-        fact: `Sample video terminology check: ${tradingFocusedCount}/${titles.length} recent videos matched financial keywords (${Math.round(consistencyRatio * 100)}%)`,
-        rawMatches: titles.slice(0, 5),
-        confidence: Math.round((1 - consistencyRatio) * 100),
-        reliability: titles.length >= 4 ? 'HIGH' : 'LOWER',
-        reliabilityMultiplier: sampleScaleFactor,
-        rawWeight: rawPenalty,
-        finalWeight: calculatedWeight,
         provenance: {
           provider: 'video_metadata',
           type: 'MULTI_VIDEO_CONSISTENCY',
