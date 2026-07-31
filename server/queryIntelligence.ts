@@ -19,6 +19,7 @@ import { selectQueryCollection, type QueryFunnelMetrics } from './queryPerforman
 import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
 import { executeProviderCall } from './providerResilience';
 import { appendProviderCallEvent } from './db';
+import { getPublishedOrganicQueryCandidates } from './organicQueryExpansion';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -381,11 +382,12 @@ export async function generateCandidateQueriesForCountry(
   mode: 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START' = 'EXPLORATION'
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
-  const [vocabs, extractedTerms, existingQueries, provenTerminology] = await Promise.all([
+  const [vocabs, extractedTerms, existingQueries, provenTerminology, organicCandidates] = await Promise.all([
     getCountryVocabularies(),
     getExtractedVocabulary(country),
     getQueriesByCountry(country),
-    getPlannerTerminology(country)
+    getPlannerTerminology(country),
+    getPublishedOrganicQueryCandidates(country)
   ]);
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
   const planned = planDiverseQueries({
@@ -395,6 +397,7 @@ export async function generateCandidateQueriesForCountry(
     learnedVocabulary: extractedTerms,
     existingQueries,
     provenTerminology,
+    organicCandidates,
     mode
   });
   const newQueries: QueryRecord[] = [];

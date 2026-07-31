@@ -63,6 +63,10 @@ Confirmed, sufficiently high-quality autonomous discoveries can contribute extra
 
 Canonical terminology in `SEARCH_TRIAL` or `PROVEN_SEARCH_TERM` state can enter candidate planning, with lifecycle and performance metadata retained in the query record.
 
+### 5. Governed multisource concepts
+
+Priority 7 adds a typed candidate boundary for validated concepts, multilingual surfaces, related and external entities, playlist or transcript topics, creator neighborhoods, cross-language concepts, and explicit coverage gaps. A generator cannot activate its own proposal. Admission requires exact source references, a stable concept identity, two independent source entities, all deterministic validation gates, and either a quota-capped controlled trial or a proven entry from the active immutable serving catalog.
+
 Manual searches are an operator-directed measurement lane. Their discoveries are persisted, but they do not train autonomous terminology without explicit human approval and post-approval enrichment. This prevents an arbitrary operator query from silently steering production.
 
 ## Query generation
@@ -72,8 +76,12 @@ The planner emits short retrieval atoms rather than generative prose. Current te
 - one curated or country-vocabulary atom;
 - one local instrument/market plus one compatible method;
 - one Tier 1 local anchor plus one constrained learned modifier.
+- one local control anchor plus one governed multisource trial surface;
+- one compact standalone multisource surface after proven catalog publication.
 
 Generated queries are normalized, deduplicated against existing country queries, checked for token and length bounds, attributed to their atoms, and inserted as `EXPERIMENTAL`.
+
+Organic metadata additionally pins the candidate, concept, sources, language/script/locale, lifecycle, validation policy, controlled-trial limits or catalog pointer, and deterministic provenance checksum. Thus query-performance tracking and the existing exploration/exploitation selector operate unchanged, while outcomes remain attributable to the new origin.
 
 This is safer and more measurable than allowing an LLM to author arbitrary searches, but it also constrains organic expansion.
 

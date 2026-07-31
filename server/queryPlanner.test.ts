@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
 import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 
 function query(overrides: Partial<QueryRecord>): QueryRecord {
   return {
@@ -123,4 +124,18 @@ test('planner never recreates an existing normalized query', () => {
   const baseline = planDiverseQueries({ country: 'France', count: 1, learnedVocabulary: [], existingQueries: [] })[0];
   const next = planDiverseQueries({ country: 'France', count: 3, learnedVocabulary: [], existingQueries: [query({ query: `  ${baseline.query.toUpperCase()}  `, country: 'France' })] });
   assert.ok(next.every(item => normalizeQuery(item.query) !== normalizeQuery(baseline.query)));
+});
+
+test('planner expands from governed multisource concepts with complete provenance', () => {
+  const planned = planDiverseQueries({ country: 'Spain', count: 4, learnedVocabulary: [], existingQueries: [], organicCandidates: [{
+    candidateId: 'playlist-topic-1', conceptId: 'concept-market-profile', surface: 'Perfil de mercado', sourceType: 'PLAYLIST_TOPIC',
+    sourceRefs: ['playlist:PL1:title:0-17', 'video:V2:title:5-22'], independentSourceIds: ['creator:A', 'creator:B'],
+    language: 'es', script: 'Latn', locale: 'es-ES', intent: 'strategy', lifecycle: 'PROVEN',
+    validation: { language: true, script: true, safety: true, retrievalShape: true, policyVersion: ORGANIC_QUERY_POLICY_VERSION },
+    catalog: { versionId: 'catalog-v7', checksum: 'catalog-checksum', pointerVersion: 3 }
+  }] });
+  const organic = planned.find(item => item.metadata.queryTemplate === 'ORGANIC_STANDALONE');
+  assert.equal(organic?.query, 'Perfil de mercado');
+  assert.deepEqual((organic?.metadata.organicProvenance as any).sourceRefs, ['playlist:PL1:title:0-17', 'video:V2:title:5-22']);
+  assert.equal((organic?.metadata.organicProvenance as any).conceptId, 'concept-market-profile');
 });

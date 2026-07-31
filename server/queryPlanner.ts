@@ -1,15 +1,16 @@
 import type { CountryVocabulary, ExtractedTermRecord, QueryIntent, QueryRecord } from '../src/types';
+import { admitOrganicQueryCandidates, type OrganicQueryCandidate } from './organicQueryExpansion';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
-export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'FORMAT' | 'LEARNED';
+export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'FORMAT' | 'LEARNED' | 'CONCEPT' | 'ENTITY' | 'TOPIC' | 'NEIGHBORHOOD' | 'COVERAGE';
 
 export interface SearchAtom {
   term: string;
   type: SearchAtomType;
   intent: QueryIntent;
   tier: QueryKnowledgeTier;
-  origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED';
+  origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED' | 'ORGANIC';
 }
 
 export interface PlannedQuery {
@@ -132,6 +133,7 @@ export function planDiverseQueries(args: {
   learnedVocabulary: ExtractedTermRecord[];
   existingQueries: QueryRecord[];
   provenTerminology?: ProvenTerminologyAtom[];
+  organicCandidates?: OrganicQueryCandidate[];
   mode?: QueryGenerationMode;
 }): PlannedQuery[] {
   const count = Math.max(1, args.count);
@@ -141,7 +143,7 @@ export function planDiverseQueries(args: {
   const anchors = countryAtoms(args.country, args.countryVocabulary);
   const intentUsage = new Map<QueryIntent, number>();
   args.existingQueries.forEach(query => intentUsage.set(query.intent, (intentUsage.get(query.intent) || 0) + 1));
-  const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'ANCHOR_LEARNED' }> = anchors.map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
+  const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic?: ReturnType<typeof admitOrganicQueryCandidates>[number] }> = anchors.map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
 
   // Only combine semantically compatible atoms: a concrete instrument/market
   // anchor plus one trading method. Formats and unrelated concepts never mix.
@@ -168,6 +170,16 @@ export function planDiverseQueries(args: {
     return [{ atoms: [anchor, learnedAtom], template: 'ANCHOR_LEARNED' as const, terminology }];
   });
   candidates.splice(Math.min(3, candidates.length), 0, ...learnedCandidates);
+  const organic = admitOrganicQueryCandidates(args.organicCandidates || []);
+  type OrganicPlanCandidate = { atoms: SearchAtom[]; template: 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic: ReturnType<typeof admitOrganicQueryCandidates>[number] };
+  const organicCandidates = organic.flatMap<OrganicPlanCandidate>((candidate, index) => {
+    const organicAtom = atom(candidate.surface, candidate.sourceType === 'RELATED_ENTITY' || candidate.sourceType === 'EXTERNAL_ENTITY' ? 'ENTITY' : candidate.sourceType === 'CREATOR_NEIGHBORHOOD' ? 'NEIGHBORHOOD' : candidate.sourceType === 'COVERAGE_GAP' ? 'COVERAGE' : candidate.sourceType === 'PLAYLIST_TOPIC' || candidate.sourceType === 'TRANSCRIPT_KEYPHRASE' ? 'TOPIC' : 'CONCEPT', candidate.intent, candidate.lifecycle === 'PROVEN' ? 1 : 2, 'ORGANIC');
+    if (candidate.lifecycle === 'PROVEN' && isRetrievalOrientedQuery(args.country, organicAtom.term)) return [{ atoms: [organicAtom], template: 'ORGANIC_STANDALONE' as const, organic: candidate }];
+    const rotated = [...anchors.slice(index), ...anchors.slice(0, index)];
+    const anchor = rotated.find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${organicAtom.term}`));
+    return anchor ? [{ atoms: [anchor, organicAtom], template: 'ANCHOR_ORGANIC' as const, organic: candidate }] : [];
+  });
+  candidates.splice(Math.min(2, candidates.length), 0, ...organicCandidates);
   candidates.sort((a, b) => (intentUsage.get(a.atoms[0].intent) || 0) - (intentUsage.get(b.atoms[0].intent) || 0));
 
   const planned: PlannedQuery[] = [];
@@ -192,7 +204,11 @@ export function planDiverseQueries(args: {
         ? `Selected a compact ${primary.origin.toLowerCase()} ${primary.type.toLowerCase()} atom for YouTube retrieval.`
         : candidate.template === 'COMPACT_PAIR'
           ? 'Combined one concrete local instrument or market with one compatible trading method.'
-          : `Combined one compact Tier 1 local anchor with constrained Tier ${candidate.atoms[1].tier} learned vocabulary.`,
+          : candidate.template === 'ANCHOR_LEARNED'
+            ? `Combined one compact Tier 1 local anchor with constrained Tier ${candidate.atoms[1].tier} learned vocabulary.`
+            : candidate.template === 'ORGANIC_STANDALONE'
+              ? `Selected a published proven ${candidate.organic!.sourceType.toLowerCase()} surface with governed concept identity.`
+              : `Combined a local control anchor with a quota-limited governed ${candidate.organic!.sourceType.toLowerCase()} trial surface.`,
       discoveryObjective: OBJECTIVES[primary.intent] || 'Find relevant trading creators using authentic local search vocabulary.',
       metadata: {
         country: args.country,
@@ -208,7 +224,18 @@ export function planDiverseQueries(args: {
         terminologyDecayedYield: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.score,
         selectionEvidence: provenByTerm.has(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))
           ? `Canonical term ${provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))!.id} ranked by time-decayed production yield.`
-          : 'Curated or constrained legacy evidence.'
+          : candidate.organic
+            ? `${candidate.organic.eligibilityReason}; independently corroborated by ${new Set(candidate.organic.independentSourceIds).size} sources.`
+            : 'Curated or constrained legacy evidence.',
+        organicProvenance: candidate.organic ? {
+          candidateId: candidate.organic.candidateId, conceptId: candidate.organic.conceptId,
+          sourceType: candidate.organic.sourceType, sourceRefs: candidate.organic.sourceRefs,
+          independentSourceIds: [...new Set(candidate.organic.independentSourceIds)].sort(),
+          language: candidate.organic.language, script: candidate.organic.script, locale: candidate.organic.locale,
+          lifecycle: candidate.organic.lifecycle, validation: candidate.organic.validation,
+          catalog: candidate.organic.catalog, trial: candidate.organic.trial,
+          provenanceChecksum: candidate.organic.provenanceChecksum
+        } : undefined
       }
     });
     generated.add(normalized);
