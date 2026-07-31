@@ -29,3 +29,11 @@ test('requires an immutable published catalog pin for proven candidates', () => 
   const admitted = admitOrganicQueryCandidates([candidate({ lifecycle: 'PROVEN', trial: undefined, catalog: { versionId: 'catalog-1', checksum: 'abc', pointerVersion: 2 } })]);
   assert.equal(admitted[0].eligibilityReason, 'PUBLISHED_PROVEN_CANDIDATE');
 });
+
+test('admits governed new-script trials and abstains on falsified script metadata', () => {
+  const arabic = candidate({ surface: 'تداول يومي', language: 'ar', script: 'Arab', locale: 'ar-EG' });
+  const [admitted] = admitOrganicQueryCandidates([arabic]);
+  assert.equal(admitted.languageCapability.disposition, 'CONTROLLED_TRIAL');
+  assert.deepEqual(admitted.languageCapability.observations[0].scripts, ['Arab']);
+  assert.equal(admitOrganicQueryCandidates([candidate({ surface: 'трейдинг', language: 'ru', script: 'Latn', locale: 'ru-RU' })]).length, 0);
+});

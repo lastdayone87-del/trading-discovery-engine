@@ -67,6 +67,13 @@ Canonical terminology in `SEARCH_TRIAL` or `PROVEN_SEARCH_TERM` state can enter 
 
 Priority 7 adds a typed candidate boundary for validated concepts, multilingual surfaces, related and external entities, playlist or transcript topics, creator neighborhoods, cross-language concepts, and explicit coverage gaps. A generator cannot activate its own proposal. Admission requires exact source references, a stable concept identity, two independent source entities, all deterministic validation gates, and either a quota-capped controlled trial or a proven entry from the active immutable serving catalog.
 
+Priority 8 replaces the legacy country-to-script allowlist for this governed
+path with `global-language-capability-v1`. Literal surfaces are Unicode-observed
+against canonical language, script, and query-locale metadata. New scripts need
+the existing quota-capped trial contract; proven standalone surfaces need the
+immutable catalog pin. An unknown language or declared/detected mismatch
+abstains, while curated country atoms retain the legacy deterministic fallback.
+
 Manual searches are an operator-directed measurement lane. Their discoveries are persisted, but they do not train autonomous terminology without explicit human approval and post-approval enrichment. This prevents an arbitrary operator query from silently steering production.
 
 ## Query generation

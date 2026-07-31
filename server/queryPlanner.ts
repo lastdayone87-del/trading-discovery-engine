@@ -1,5 +1,6 @@
 import type { CountryVocabulary, ExtractedTermRecord, QueryIntent, QueryRecord } from '../src/types';
 import { admitOrganicQueryCandidates, type OrganicQueryCandidate } from './organicQueryExpansion';
+import { assessLanguageCapability, type GlobalLanguageContext } from './globalLanguageModel';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
@@ -67,10 +68,13 @@ export function isCountryScriptCompatible(country: string, query: string): boole
   return /^[A-Z0-9./ -]{1,12}$/.test(query.trim());
 }
 
-export function isRetrievalOrientedQuery(country: string, query: string): boolean {
+export function isRetrievalOrientedQuery(country: string, query: string, languageContext?: GlobalLanguageContext & { governed?: boolean }): boolean {
   const normalized = query.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  const scriptCompatible = languageContext?.governed
+    ? assessLanguageCapability([{ field: 'query', text: normalized, language: languageContext.contentLanguage }], languageContext).disposition !== 'ABSTAIN'
+    : isCountryScriptCompatible(country, normalized);
   return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= 3 &&
-    !FORBIDDEN_PROSE.test(normalized) && isCountryScriptCompatible(country, normalized);
+    !FORBIDDEN_PROSE.test(normalized) && scriptCompatible;
 }
 
 export function queriesOutsideCooldown(queries: QueryRecord[], now: Date, cooldownMinutes: number): QueryRecord[] {
@@ -174,9 +178,10 @@ export function planDiverseQueries(args: {
   type OrganicPlanCandidate = { atoms: SearchAtom[]; template: 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic: ReturnType<typeof admitOrganicQueryCandidates>[number] };
   const organicCandidates = organic.flatMap<OrganicPlanCandidate>((candidate, index) => {
     const organicAtom = atom(candidate.surface, candidate.sourceType === 'RELATED_ENTITY' || candidate.sourceType === 'EXTERNAL_ENTITY' ? 'ENTITY' : candidate.sourceType === 'CREATOR_NEIGHBORHOOD' ? 'NEIGHBORHOOD' : candidate.sourceType === 'COVERAGE_GAP' ? 'COVERAGE' : candidate.sourceType === 'PLAYLIST_TOPIC' || candidate.sourceType === 'TRANSCRIPT_KEYPHRASE' ? 'TOPIC' : 'CONCEPT', candidate.intent, candidate.lifecycle === 'PROVEN' ? 1 : 2, 'ORGANIC');
-    if (candidate.lifecycle === 'PROVEN' && isRetrievalOrientedQuery(args.country, organicAtom.term)) return [{ atoms: [organicAtom], template: 'ORGANIC_STANDALONE' as const, organic: candidate }];
+    const globalContext = { ...candidate.languageCapability.context, governed: true };
+    if (candidate.lifecycle === 'PROVEN' && isRetrievalOrientedQuery(args.country, organicAtom.term, globalContext)) return [{ atoms: [organicAtom], template: 'ORGANIC_STANDALONE' as const, organic: candidate }];
     const rotated = [...anchors.slice(index), ...anchors.slice(0, index)];
-    const anchor = rotated.find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${organicAtom.term}`));
+    const anchor = rotated.find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${organicAtom.term}`, globalContext));
     return anchor ? [{ atoms: [anchor, organicAtom], template: 'ANCHOR_ORGANIC' as const, organic: candidate }] : [];
   });
   candidates.splice(Math.min(2, candidates.length), 0, ...organicCandidates);
@@ -189,7 +194,8 @@ export function planDiverseQueries(args: {
     const query = candidate.atoms.map(item => item.term).join(' ');
     const normalized = normalizeQuery(query);
     const hasTier3 = candidate.atoms.some(item => item.tier === 3);
-    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query)) continue;
+    const globalContext = candidate.organic ? { ...candidate.organic.languageCapability.context, governed: true } : undefined;
+    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query, globalContext)) continue;
     if (hasTier3 && tier3Used >= Math.ceil(count / 5)) continue;
     if (hasTier3) tier3Used++;
     const tiers = [...new Set(candidate.atoms.map(item => item.tier))] as QueryKnowledgeTier[];
@@ -234,7 +240,8 @@ export function planDiverseQueries(args: {
           language: candidate.organic.language, script: candidate.organic.script, locale: candidate.organic.locale,
           lifecycle: candidate.organic.lifecycle, validation: candidate.organic.validation,
           catalog: candidate.organic.catalog, trial: candidate.organic.trial,
-          provenanceChecksum: candidate.organic.provenanceChecksum
+          provenanceChecksum: candidate.organic.provenanceChecksum,
+          languageCapability: candidate.organic.languageCapability
         } : undefined
       }
     });

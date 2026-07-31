@@ -149,6 +149,12 @@ The desired knowledge model separates:
 
 This model supports multilingual aliases and homonyms without pretending normalized strings are universal identity.
 
+Language capability is now a reusable governed value rather than a country
+proxy. A serving surface can retain canonical language and locale, one or
+several observed scripts, transliteration and code-switching flags, and the
+exact policy decision that made it eligible. This is a compact Priority 10 seam:
+the mutable graph remains offline while consumers reconstruct pinned decisions.
+
 ## Catalog governance
 
 Learned knowledge must not enter production simply because it scored well once.

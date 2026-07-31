@@ -69,6 +69,14 @@ Providers create evidence items with polarity, category, confidence, reliability
 
 ### Multilingual semantic boundary (v2.1)
 
+Language/script observations are conceptually governed by the shared Priority 8
+capability model: declared country is not a language assertion, fields may be
+multiscript or transliterated, and unsupported or contradictory metadata must
+abstain. The semantic provider already emits field observations; adopting the
+compact `global-language-capability-v1` decision throughout extraction and
+classification will pin the same normalization, reason codes, and provenance
+used by discovery.
+
 The compact multilingual model is the primary generalization provider for
 meaning not represented in static packs. It receives separately identified
 fields rather than flattened text and must return a closed taxonomy:
