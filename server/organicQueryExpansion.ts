@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { QueryIntent } from '../src/types';
 import { getDb } from './db';
+import { assessLanguageCapability, type LanguageCapabilityDecision } from './globalLanguageModel';
 
-export const ORGANIC_QUERY_POLICY_VERSION = 'organic-query-expansion-v1';
+export const ORGANIC_QUERY_POLICY_VERSION = 'organic-query-expansion-v2-global-language';
 
 export type OrganicQuerySource =
   | 'VALIDATED_CONCEPT' | 'MULTILINGUAL_SURFACE' | 'RELATED_ENTITY'
@@ -31,6 +32,7 @@ export interface GovernedOrganicCandidate extends OrganicQueryCandidate {
   normalizedSurface: string;
   provenanceChecksum: string;
   eligibilityReason: string;
+  languageCapability: LanguageCapabilityDecision;
 }
 
 function stable(value: unknown): string {
@@ -56,12 +58,18 @@ export function admitOrganicQueryCandidates(candidates: OrganicQueryCandidate[])
     const isProven = candidate.lifecycle === 'PROVEN';
     const governedTrial = !!candidate.trial && candidate.trial.assignmentCap > 0 && candidate.trial.quotaCap > 0;
     const published = !!candidate.catalog?.versionId && !!candidate.catalog.checksum && (candidate.catalog.pointerVersion || 0) > 0;
+    const languageCapability = assessLanguageCapability(
+      [{ field: 'query_surface', text: candidate.surface, language: candidate.language }],
+      { contentLanguage: candidate.language, contentScript: candidate.script, queryLocale: candidate.locale, targetAudienceLocale: candidate.locale },
+      { controlledTrial: isTrial }
+    );
     if (!candidate.candidateId || !candidate.conceptId || !normalizedSurface || !candidate.sourceRefs.length || !validations) continue;
     if (validations.policyVersion !== ORGANIC_QUERY_POLICY_VERSION || !validations.language || !validations.script || !validations.safety || !validations.retrievalShape) continue;
+    if (languageCapability.disposition === 'ABSTAIN') continue;
     if (!independentlyCorroborated || (!isTrial && !isProven) || (isTrial && !governedTrial) || (isProven && !published)) continue;
     const provenanceChecksum = createHash('sha256').update(stable({ ...candidate, independentSourceIds: [...new Set(candidate.independentSourceIds)].sort(), sourceRefs: [...new Set(candidate.sourceRefs)].sort() })).digest('hex');
     const key = `${candidate.conceptId}\u001f${normalizedSurface}`;
-    if (!admitted.has(key)) admitted.set(key, { ...candidate, normalizedSurface, provenanceChecksum, eligibilityReason: isProven ? 'PUBLISHED_PROVEN_CANDIDATE' : 'QUOTA_LIMITED_CONTROLLED_TRIAL' });
+    if (!admitted.has(key)) admitted.set(key, { ...candidate, normalizedSurface, provenanceChecksum, languageCapability, eligibilityReason: isProven ? 'PUBLISHED_PROVEN_CANDIDATE' : 'QUOTA_LIMITED_CONTROLLED_TRIAL' });
   }
   return [...admitted.values()];
 }

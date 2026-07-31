@@ -219,6 +219,8 @@ Every emitted organic query records candidate and concept identities, exact sour
 
 ## Priority 8: global language, script, and market model
 
+**Status:** Production foundation implemented; broader provider and corpus coverage continues.
+
 ### Objective
 
 Remove hard-coded country-anchor and script restrictions while preserving retrieval safety.
@@ -260,6 +262,24 @@ They should not always require an original Tier 1 country anchor.
 - unsupported scripts never silently fall back to English reasoning;
 - country and language evidence remain independent and auditable;
 - new country enablement does not require a complete manual vocabulary pack.
+
+### Implemented foundation
+
+The shared `global-language-capability-v1` boundary now separates creator and
+platform country, content language/script, audience and query locale,
+market/instrument regions, and provider region. It performs deterministic NFKC
+normalization, BCP 47 canonicalization, Unicode script observation, and explicit
+multiscript/transliteration reporting. Every decision carries reason codes,
+policy/normalization versions, field observations, and a stable provenance
+checksum. Unknown language/script and declared/detected mismatches abstain.
+
+Priority 7 organic admission and planning now consume this shared decision.
+Arabic, Cyrillic, Devanagari, Hangul, and other Unicode scripts can enter only
+through independently corroborated, quota-capped controlled trials or a pinned
+published catalog; legacy curated country queries retain their existing safety
+behavior. This removes static non-Latin rejection from the governed path without
+weakening the last-known-good country-scoped fallback and creates the compact
+decision seam intended for Priority 10's serving catalog.
 
 ## Priority 10: unify concepts, catalogs, classification, and planning
 

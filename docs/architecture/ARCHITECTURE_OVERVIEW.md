@@ -59,6 +59,14 @@ Unified ingestion pipeline
 
 The planner's Priority 7 boundary also consumes governed multisource query candidates. Trial candidates carry reversible quota controls; proven candidates come only from the active immutable catalog pointer. Both retain concept and source provenance in the durable query record, while curated country atoms stay available as controls and last-known-good fallback.
 
+Priority 8 adds a shared language capability boundary ahead of governed query
+admission. Country, language, script, audience locale, traded market, query
+locale, and provider region are distinct facts. Unicode field observations,
+code-switching and transliteration flags, capability disposition, reason codes,
+policy versions, and a deterministic checksum are persisted in organic query
+provenance. Unsupported or contradictory metadata abstains instead of borrowing
+English or country-derived certainty.
+
 ### Authoritative versus shadow paths
 
 The production evidence-based classifier remains authoritative. The adaptive classifier, candidate corpus, bounded semantic candidate adjudication, concept graph, offline evaluation, and catalog systems contain advanced learning primitives, but several operate in shadow, proposal-only, or governed publication modes. A shadow result must never mutate a production decision merely because it exists.
@@ -160,7 +168,9 @@ Execution outcomes, review corrections, shadow decisions, and experiment assignm
 - Playlists, transcripts, external-site content, and visual branding are underused.
 - Discord evidence is generally unavailable before the trading gate.
 - Learned terminology is admitted only after channels are already confirmed, creating selection bias.
-- Query generation remains constrained by curated country anchors and hard-coded script rules.
+- Curated fallback query generation remains country-anchored; governed organic
+  queries use the global capability model, but provider-wide migration and
+  representative global calibration are still incomplete.
 - The adaptive classifier and newer catalog stack are not the authoritative production path.
 - Query reward emphasizes novelty more strongly than calibrated, quality-adjusted trading yield.
 
