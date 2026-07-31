@@ -1,6 +1,6 @@
 # Classification Pipeline
 
-**Status:** Production specification for evidence engine v1.4
+**Status:** Production specification for evidence engine v2.0
 **Related:** [Architecture Overview](./ARCHITECTURE_OVERVIEW.md) · [Learning Pipeline](./LEARNING_PIPELINE.md) · [Roadmap](./ROADMAP.md)
 
 ## Purpose
@@ -38,7 +38,12 @@ Evidence collection report
   - reason codes
         │
         ▼
-Deterministic weighted decision policy
+Staged field-aware policy
+  - availability and sufficiency
+  - semantic candidate detection
+  - independent corroboration
+  - dominant contradiction analysis
+  - lifecycle routing
         ├── TRADING_CONFIRMED ─► community inspection and quality analysis
         ├── NON_TRADING ───────► terminal skip with diagnostics
         └── UNCERTAIN ─────────► durable enrichment, then review if unresolved
@@ -108,7 +113,8 @@ The report also records:
 
 ## Scoring and decision policy
 
-The weighted strategy retains a neutral arithmetic baseline:
+The weighted strategy retains a neutral arithmetic baseline for compatibility
+and explainability:
 
 ```text
 positiveWeight = sum of absolute final weights for positive items
@@ -117,7 +123,37 @@ netWeight      = positiveWeight - negativeWeight
 confidence     = clamp(round(50 + netWeight), 0, 100)
 ```
 
-This confidence is a policy score, not yet a calibrated probability. Terminal results are moved into reporting bands after a rule passes.
+This confidence is a policy score, not yet a calibrated probability. It cannot
+directly select a workflow state. Terminal results are moved into reporting bands
+only after the applicable stages pass.
+
+## Staged decision policy (v2.0)
+
+Every production decision includes a `stagedClassification` report with a
+pipeline version, five ordered stage results, evidence identifiers,
+machine-readable field references, metrics, and reason codes. Every semantic
+stage supports `ABSTAIN`.
+
+1. **Availability** passes only with sufficient, non-degraded evidence. Missing
+   or insufficient cases route to enrichment; degraded cases route to review.
+2. **Candidate detection** requires affirmative semantic, methodology,
+   terminology, or instrument evidence. No recognized candidate is an
+   abstention, never a negative assertion.
+3. **Corroboration** requires a strong signal plus repetition across videos,
+   independent providers, or independent evidence dimensions. Repetition inside
+   one incidental field is insufficient.
+4. **Contradiction** fails only for affirmative negative evidence that is
+   dominant by configured policy weight. A non-dominant conflict remains
+   diagnosable without becoming a rejection.
+5. **Lifecycle** emits `CONFIRM`, `REJECT`, `ENRICH`, or `REVIEW`. A legacy
+   positive score is downgraded to `UNCERTAIN` unless the lifecycle action is
+   `CONFIRM`; a legacy negative score is likewise downgraded unless the action is
+   `REJECT`.
+
+The field-aware input supports structured videos, playlists, resolved external
+links, independently detected languages, transcript excerpts, and visual
+evidence with model provenance. Legacy title, description, and URL arrays remain
+supported and are normalized at the engine boundary during migration.
 
 ### `TRADING_CONFIRMED`
 

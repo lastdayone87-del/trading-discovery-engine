@@ -48,6 +48,7 @@ export async function classifyTradingRelevanceDetailed(
     `Country Context Used: ${decision.countryContextUsed.country} (${decision.countryContextUsed.language})`,
     `Evidence Sufficiency: ${decision.evidenceCollection.sufficiency} | Sparse Metadata: ${decision.evidenceCollection.sparseMetadata} | Degraded Providers: ${decision.evidenceCollection.degraded}`,
     `Provider Availability: ${decision.evidenceCollection.providers.map(provider => `${provider.provider}=${provider.availability}`).join(', ')}`,
+    ...(decision.stagedClassification?.stages.map(stage => `Classification Stage ${stage.stage}: ${stage.disposition} (${stage.reasonCodes.join(', ')}) | Fields: ${stage.fields.map(field => field.field).join(', ') || 'none'}`) || []),
     decision.mathematicalJustification
   ];
 

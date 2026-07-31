@@ -8,6 +8,7 @@ import { GeminiSemanticProvider } from './providers/GeminiSemanticProvider';
 import { DiscordProvider } from './providers/DiscordProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { ConfigurableWeightedStrategy } from './scoringEngine';
+import { evaluateClassificationStages } from './stagedClassification';
 
 export class EvidenceBasedTradingEngine {
   private providers: EvidenceProvider[];
@@ -27,6 +28,14 @@ export class EvidenceBasedTradingEngine {
   }
 
   public async evaluateChannel(input: RawChannelInput): Promise<VerificationDecision> {
+    // Accept the field-aware schema while retaining the legacy parallel arrays at
+    // the provider boundary during the migration.
+    input = {
+      ...input,
+      video_titles: input.video_titles?.length ? input.video_titles : input.videos?.map(video => video.title),
+      video_descriptions: input.video_descriptions?.length ? input.video_descriptions : input.videos?.map(video => video.description || ''),
+      external_links: input.external_links?.length ? input.external_links : input.external_link_details?.map(link => link.url)
+    };
     const country = input.country || 'UNKNOWN';
     const knowledgeContext = getLayeredKnowledgeContext(country);
 
@@ -51,11 +60,13 @@ export class EvidenceBasedTradingEngine {
       input.channel_name?.trim() && 'channel_name', input.description?.trim() && 'description',
       input.video_titles?.length && 'video_titles', input.video_descriptions?.length && 'video_descriptions',
       input.external_links?.length && 'external_links', input.location_tag?.trim() && 'location_tag', input.discord_invite && 'discord_invite'
+      , input.playlists?.length && 'playlists', input.detected_languages?.length && 'detected_languages'
+      , input.transcript_excerpts?.length && 'transcript_excerpts', input.visual_evidence?.length && 'visual_evidence'
     ].filter(Boolean) as string[];
     const sparseMetadata = !input.description?.trim() && !(input.video_titles?.length) && !(input.video_descriptions?.length) && !(input.external_links?.length);
     const degraded = providerResults.some(result => result.report.availability === 'FAILED' || result.report.availability === 'UNAVAILABLE');
     const explicitNegative = allEvidence.some(item => item.polarity === 'NEGATIVE' && item.category !== 'MULTI_VIDEO_CONSISTENCY');
-    const hasSubstantiveContext = (input.description?.trim().length || 0) >= 40 || (input.video_titles?.length || 0) >= 2 || (input.external_links?.length || 0) > 0;
+    const hasSubstantiveContext = (input.description?.trim().length || 0) >= 40 || (input.video_titles?.length || 0) >= 2 || (input.external_links?.length || 0) > 0 || (input.playlists?.length || 0) > 0 || (input.transcript_excerpts?.length || 0) > 0;
     const sufficiency = fieldsPresent.length === 0 ? 'MISSING' : (allEvidence.length > 0 || explicitNegative || hasSubstantiveContext) ? 'SUFFICIENT' : 'INSUFFICIENT';
     const reasonCodes = [
       sparseMetadata && 'SPARSE_METADATA', degraded && 'PROVIDER_COVERAGE_DEGRADED',
@@ -64,7 +75,8 @@ export class EvidenceBasedTradingEngine {
     const collection: EvidenceCollectionReport = { sufficiency, sparseMetadata, degraded, fieldsPresent, reasonCodes, providers: providerResults.map(result => result.report) };
 
     // Evaluate decision deterministically via Scoring Strategy
-    return this.decisionStrategy.evaluateDecision(allEvidence, knowledgeContext, country, collection);
+    const stages = evaluateClassificationStages(input, allEvidence, collection);
+    return this.decisionStrategy.evaluateDecision(allEvidence, knowledgeContext, country, collection, stages);
   }
 }
 
@@ -80,3 +92,4 @@ export * from './config';
 export * from './knowledgePacks';
 export * from './scoringEngine';
 export * from './reportGenerator';
+export * from './stagedClassification';
