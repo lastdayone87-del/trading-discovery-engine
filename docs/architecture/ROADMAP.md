@@ -283,6 +283,8 @@ decision seam intended for Priority 10's serving catalog.
 
 ## Priority 10: unify concepts, catalogs, classification, and planning
 
+**Status:** Production governed knowledge-plane foundation implemented; consumer canaries and legacy-store retirement remain rollout work.
+
 ### Objective
 
 Make one governed knowledge plane serve both semantic classification and adaptive retrieval.
@@ -335,6 +337,10 @@ Classifier features     Query planner atoms
 - no ungoverned learned term reaches production;
 - catalog behavior is deterministic, pinned, and reversible;
 - production improves coverage without losing precision or operational resilience.
+
+### Implemented foundation
+
+The `governed-knowledge-v1` contract is the common publication boundary for classification, discovery, semantics, language capability, and terminology. Versioned concepts contain localized surfaces, approved senses, explicit lane scopes, and immutable source provenance. Mutable output enters only as append-only contributions and cannot be served until review creates a checksummed publication. Atomic scoped pointers retain publish and rollback history, while consumer records pin the artifact and policy for exact replay. Existing serving catalogs remain compatible fallback paths and the mutable graph never enters an online path.
 
 ## Cross-cutting work required by every priority
 

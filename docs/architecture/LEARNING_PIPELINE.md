@@ -254,3 +254,19 @@ The loop continuously expands what the engine can recognize and retrieve while r
 - No optimization solely for raw or novel result count.
 - No unsupported language treated as negative evidence.
 - No adaptive classifier promotion without multilingual precision/recall evidence and review-cost analysis.
+
+## Priority 10 unified governed knowledge lifecycle
+
+Governed knowledge is now the integration boundary rather than a new learning subsystem. Discovery, classification, multilingual semantics, language capability, terminology, and organic query generation contribute through immutable source-bound proposal records. Contribution never grants serving eligibility.
+
+Production consumption follows this lifecycle:
+
+1. offline systems reconcile and evaluate mutable proposals;
+2. review selects approved concepts and policy scopes;
+3. the publisher canonicalizes ordering and creates a checksummed immutable `governed-knowledge-v1` artifact;
+4. approval is recorded independently of creation;
+5. an atomic compare-and-swap pointer activates the artifact for exactly one country/locale/lane scope;
+6. each decision or query run records publication ID/version/checksum, policy version, and pointer version;
+7. rollback points to a prior approved artifact without modifying either artifact.
+
+Classification consumes a deterministic feature projection and discovery consumes a deterministic query-atom projection. Both retain the same concept and surface identities without importing the other's internal model. Missing or invalid publications fail closed to the existing curated last-known-good path. The mutable graph is never read online.

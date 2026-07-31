@@ -300,3 +300,7 @@ Any classifier change must retain cases for:
 - authentic educators in each supported language;
 - mixed positive and negative evidence;
 - invariant behavior during provider outages.
+
+## Priority 10 governed knowledge input
+
+The classifier may consume an immutable classification-lane feature projection. Every feature retains concept and surface identity, concept version, publication version/checksum, and policy version. Governed features may add explainable candidate or corroboration evidence, but cannot bypass availability, sufficiency, independent corroboration, contradiction, or lifecycle stages. Missing or invalid knowledge abstains and uses the existing deterministic path; it is never negative evidence. Mutable graph, terminology, semantic, and discovery state are not classifier dependencies.
