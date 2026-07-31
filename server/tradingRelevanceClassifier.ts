@@ -46,6 +46,8 @@ export async function classifyTradingRelevanceDetailed(
   const reasoningLogs: string[] = [
     `Evidence Engine Version: ${decision.versions.evidenceEngineVersion} | Scoring Engine: ${decision.versions.scoringEngineVersion}`,
     `Country Context Used: ${decision.countryContextUsed.country} (${decision.countryContextUsed.language})`,
+    `Evidence Sufficiency: ${decision.evidenceCollection.sufficiency} | Sparse Metadata: ${decision.evidenceCollection.sparseMetadata} | Degraded Providers: ${decision.evidenceCollection.degraded}`,
+    `Provider Availability: ${decision.evidenceCollection.providers.map(provider => `${provider.provider}=${provider.availability}`).join(', ')}`,
     decision.mathematicalJustification
   ];
 

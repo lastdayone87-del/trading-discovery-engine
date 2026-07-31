@@ -1,5 +1,6 @@
 import {
   EvidenceItem,
+  EvidenceCollectionReport,
   ScoringEngineConfig,
   VerificationDecision,
   LayeredKnowledgeContext
@@ -17,7 +18,8 @@ export class ConfigurableWeightedStrategy {
   public evaluateDecision(
     evidenceItems: EvidenceItem[],
     knowledgeContext: LayeredKnowledgeContext,
-    country: string
+    country: string,
+    evidenceCollection: EvidenceCollectionReport = { sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false, fieldsPresent: [], reasonCodes: [], providers: [] }
   ): VerificationDecision {
     const now = new Date().toISOString();
 
@@ -26,6 +28,9 @@ export class ConfigurableWeightedStrategy {
 
     const totalPositiveWeight = positiveItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
     const totalNegativeWeight = negativeItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
+    const explicitNegativeWeight = negativeItems
+      .filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY')
+      .reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
 
     // Multi-video consistency ratio check
     const consistencyItem = evidenceItems.find(i => i.category === 'MULTI_VIDEO_CONSISTENCY');
@@ -80,20 +85,23 @@ export class ConfigurableWeightedStrategy {
       // Non-trading condition: Explicit negative domain match with low positive trading signals
       (hasIrrelevantDomainNegative && totalPositiveWeight < 10) ||
       // Heavy negative evidence with negligible positive weight
-      (totalNegativeWeight >= 25 && totalPositiveWeight <= 5) ||
+      (explicitNegativeWeight >= 25 && totalPositiveWeight <= 5) ||
       // Low confidence score with negative domain presence
       (confidenceScore <= 30 && hasIrrelevantDomainNegative) ||
       // Adjacent finance/news and hype are not trading channels without methodology evidence
-      ((hasAdjacentFinanceNegative || hasSevereHypeNegative) && totalPositiveWeight < 15) ||
-      // Zero positive trading weight (no financial terms found anywhere in metadata or videos)
-      (totalPositiveWeight === 0 && (hasIrrelevantDomainNegative || totalNegativeWeight > 0 || confidenceScore <= 50))
+      ((hasAdjacentFinanceNegative || hasSevereHypeNegative) && totalPositiveWeight < 15)
     ) {
       status = 'NON_TRADING';
       confidenceScore = Math.min(22, confidenceScore);
-      justifications.push(`DECISION: VERIFIED_NON_TRADING. Zero or negative financial signals confirm non-trading focus.`);
+      justifications.push(`DECISION: VERIFIED_NON_TRADING. Explicit negative-domain evidence confirms a non-trading focus.`);
     } else {
       status = 'UNCERTAIN';
-      justifications.push(`DECISION: UNCERTAIN. Evidence is ambiguous or insufficient to meet verification thresholds. Preserving in dormant state.`);
+      const suffix = evidenceCollection.sufficiency === 'MISSING'
+        ? 'Required classification metadata is missing.'
+        : evidenceCollection.sufficiency === 'INSUFFICIENT'
+          ? 'Available metadata is insufficient; absence of a vocabulary match is not negative evidence.'
+          : 'Evidence is ambiguous or does not meet a terminal threshold.';
+      justifications.push(`DECISION: UNCERTAIN. ${suffix} Preserving for enrichment or review.`);
     }
 
     // Extract Gemini semantic summary if available
@@ -127,6 +135,7 @@ export class ConfigurableWeightedStrategy {
       geminiSemanticSummary,
       versions: ENGINE_VERSIONS,
       mathematicalJustification: justifications.join(' | '),
+      evidenceCollection,
       timestamp: now
     };
   }

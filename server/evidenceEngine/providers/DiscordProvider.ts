@@ -3,6 +3,12 @@ import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContex
 export class DiscordProvider implements EvidenceProvider {
   name = 'discord_metadata' as const;
 
+  availability(input: RawChannelInput) {
+    return input.discord_invite
+      ? { availability: 'AVAILABLE' as const }
+      : { availability: 'NOT_APPLICABLE' as const, reason: 'Discord inspection has not supplied an invite.' };
+  }
+
   async collectEvidence(input: RawChannelInput, _knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const items: EvidenceItem[] = [];
     const invite = input.discord_invite;

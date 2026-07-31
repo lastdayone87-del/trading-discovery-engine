@@ -32,6 +32,12 @@ async function callGeminiSafe<T>(promptFn: () => Promise<T>): Promise<T> {
 export class GeminiSemanticProvider implements EvidenceProvider {
   name = 'gemini_semantic' as const;
 
+  availability() {
+    return process.env.GEMINI_API_KEY
+      ? { availability: 'AVAILABLE' as const }
+      : { availability: 'UNAVAILABLE' as const, reason: 'GEMINI_API_KEY is not configured.' };
+  }
+
   async collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const items: EvidenceItem[] = [];
     const ai = getGenAI();
