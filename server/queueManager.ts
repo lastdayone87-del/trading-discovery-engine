@@ -215,7 +215,9 @@ export async function processNextSearchJob(
         targetCountry: string;
         source: DiscoverySource;
         candidate: DiscoveredChannelRaw;
+        enrichmentStage?:number;
       };
+      const enrichmentStage=Math.min(3,Math.max(1,Number(job.payload.enrichmentStage||1))) as 1|2|3;
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
       const channel = await getChannelById(channelId);
       if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
@@ -230,11 +232,11 @@ export async function processNextSearchJob(
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-        units: 101, dailyBudget, allocationPercent: enrichmentPercent
+        units: enrichmentStage>=2?202:101, dailyBudget, allocationPercent: enrichmentPercent
       });
       if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
-        const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate);
+        const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage);
         await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
         await completeJob(job.id);

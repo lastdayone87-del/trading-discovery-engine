@@ -1,6 +1,7 @@
 import type { CountryVocabulary, ExtractedTermRecord, QueryIntent, QueryRecord } from '../src/types';
 import { admitOrganicQueryCandidates, type OrganicQueryCandidate } from './organicQueryExpansion';
 import { assessLanguageCapability, type GlobalLanguageContext } from './globalLanguageModel';
+import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
@@ -12,6 +13,7 @@ export interface SearchAtom {
   intent: QueryIntent;
   tier: QueryKnowledgeTier;
   origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED' | 'ORGANIC';
+  retrievalPolicy:RetrievalSpecificityDecision;
 }
 
 export interface PlannedQuery {
@@ -73,7 +75,7 @@ export function isRetrievalOrientedQuery(country: string, query: string, languag
   const scriptCompatible = languageContext?.governed
     ? assessLanguageCapability([{ field: 'query', text: normalized, language: languageContext.contentLanguage }], languageContext).disposition !== 'ABSTAIN'
     : isCountryScriptCompatible(country, normalized);
-  return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= 3 &&
+  return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= (languageContext?.governed?4:3) &&
     !FORBIDDEN_PROSE.test(normalized) && scriptCompatible;
 }
 
@@ -112,7 +114,8 @@ function inferIntent(term: string, fallback: QueryIntent): QueryIntent {
 }
 
 function atom(term: string, type: SearchAtomType, intent: QueryIntent, tier: QueryKnowledgeTier, origin: SearchAtom['origin']): SearchAtom {
-  return { term: term.normalize('NFKC').trim().replace(/\s+/g, ' '), type, intent: inferIntent(term, intent), tier, origin };
+  return { term: term.normalize('NFKC').trim().replace(/\s+/g, ' '), type, intent: inferIntent(term, intent), tier, origin,
+    retrievalPolicy:evaluateRetrievalSpecificity({semanticClass:type,governed:origin==='CURATED'||origin==='ORGANIC'}) };
 }
 
 function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAtom[] {
@@ -147,7 +150,7 @@ export function planDiverseQueries(args: {
   const anchors = countryAtoms(args.country, args.countryVocabulary);
   const intentUsage = new Map<QueryIntent, number>();
   args.existingQueries.forEach(query => intentUsage.set(query.intent, (intentUsage.get(query.intent) || 0) + 1));
-  const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic?: ReturnType<typeof admitOrganicQueryCandidates>[number] }> = anchors.map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
+  const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic?: ReturnType<typeof admitOrganicQueryCandidates>[number] }> = anchors.filter(searchAtom=>searchAtom.retrievalPolicy.eligibility==='STANDALONE'||searchAtom.retrievalPolicy.eligibility==='ANCHOR_ONLY').map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
 
   // Only combine semantically compatible atoms: a concrete instrument/market
   // anchor plus one trading method. Formats and unrelated concepts never mix.
@@ -169,7 +172,7 @@ export function planDiverseQueries(args: {
     .map(term => ({ atom: atom(term.term, 'LEARNED', 'strategy', term.trust_tier === 2 ? 2 : 3, 'LEARNED'), terminology: undefined }));
   const learnedCandidates = [...proven, ...legacyLearned].flatMap(({ atom: learnedAtom, terminology }, index) => {
     const rotated = [...anchors.slice(index), ...anchors.slice(0, index)];
-    const anchor = rotated.find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${learnedAtom.term}`));
+    const anchor = rotated.find(item => ['STANDALONE','ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility) && isRetrievalOrientedQuery(args.country, `${item.term} ${learnedAtom.term}`));
     if (!anchor) return [];
     return [{ atoms: [anchor, learnedAtom], template: 'ANCHOR_LEARNED' as const, terminology }];
   });
@@ -178,10 +181,11 @@ export function planDiverseQueries(args: {
   type OrganicPlanCandidate = { atoms: SearchAtom[]; template: 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic: ReturnType<typeof admitOrganicQueryCandidates>[number] };
   const organicCandidates = organic.flatMap<OrganicPlanCandidate>((candidate, index) => {
     const organicAtom = atom(candidate.surface, candidate.sourceType === 'RELATED_ENTITY' || candidate.sourceType === 'EXTERNAL_ENTITY' ? 'ENTITY' : candidate.sourceType === 'CREATOR_NEIGHBORHOOD' ? 'NEIGHBORHOOD' : candidate.sourceType === 'COVERAGE_GAP' ? 'COVERAGE' : candidate.sourceType === 'PLAYLIST_TOPIC' || candidate.sourceType === 'TRANSCRIPT_KEYPHRASE' ? 'TOPIC' : 'CONCEPT', candidate.intent, candidate.lifecycle === 'PROVEN' ? 1 : 2, 'ORGANIC');
+    organicAtom.retrievalPolicy=evaluateRetrievalSpecificity({semanticClass:organicAtom.type,governed:true,proven:candidate.lifecycle==='PROVEN',validated:Object.values(candidate.validation).every(Boolean),independentSources:new Set(candidate.independentSourceIds).size});
     const globalContext = { ...candidate.languageCapability.context, governed: true };
-    if (candidate.lifecycle === 'PROVEN' && isRetrievalOrientedQuery(args.country, organicAtom.term, globalContext)) return [{ atoms: [organicAtom], template: 'ORGANIC_STANDALONE' as const, organic: candidate }];
+    if (candidate.lifecycle === 'PROVEN' && organicAtom.retrievalPolicy.eligibility==='STANDALONE' && isRetrievalOrientedQuery(args.country, organicAtom.term, globalContext)) return [{ atoms: [organicAtom], template: 'ORGANIC_STANDALONE' as const, organic: candidate }];
     const rotated = [...anchors.slice(index), ...anchors.slice(0, index)];
-    const anchor = rotated.find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${organicAtom.term}`, globalContext));
+    const anchor = rotated.find(item => ['STANDALONE','ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility) && isRetrievalOrientedQuery(args.country, `${item.term} ${organicAtom.term}`, globalContext));
     return anchor ? [{ atoms: [anchor, organicAtom], template: 'ANCHOR_ORGANIC' as const, organic: candidate }] : [];
   });
   candidates.splice(Math.min(2, candidates.length), 0, ...organicCandidates);
@@ -222,6 +226,7 @@ export function planDiverseQueries(args: {
         retrievalOptimized: true,
         tokenCount: queryTokenCount(query),
         scriptValidated: true,
+        retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes},
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,
         learnedTerm: candidate.atoms.find(item => item.type === 'LEARNED')?.term,

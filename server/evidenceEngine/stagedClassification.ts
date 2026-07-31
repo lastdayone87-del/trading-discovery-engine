@@ -45,6 +45,9 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const corroborating = strongPositive.filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY');
   const sources = new Set(corroborating.map(item => item.source));
   const fields = uniqueFields(corroborating);
+  const attributableFields=corroborating.flatMap(item=>item.provenance?.fields||[]);
+  const observations=new Set(attributableFields.map(ref=>`${ref.field}:${ref.sourceId || ref.index || ''}`));
+  const observationFamilies=new Set(attributableFields.map(ref=>ref.field==='video_title'||ref.field==='video_description'?'video':ref.field==='playlist_name'||ref.field==='playlist_description'?'playlist':ref.field));
   const repeated = evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY' && item.polarity === 'POSITIVE');
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
@@ -57,10 +60,14 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const candidate = semantic.length > 0
     ? result('CANDIDATE_DETECTION', 'PASS', ['SEMANTIC_CANDIDATE_FOUND'], semantic, { candidateSignals: semantic.length })
     : result('CANDIDATE_DETECTION', 'ABSTAIN', ['NO_SEMANTIC_CANDIDATE'], [], { candidateSignals: 0 });
-  const corroborated = corroborating.length > 0 && (repeated || sources.size >= 2 || independentDimensions.size >= 2);
+  // Independence is established by separately attributable observations, not by
+  // duplicate provider emissions of the same lexical match. Multiple videos,
+  // an About page plus a video, or another distinct document family qualify.
+  const independentObservations=observations.size>=2 && (observationFamilies.size>=2 || attributableFields.filter(f=>f.field==='video_title'||f.field==='video_description').length>=2);
+  const corroborated = corroborating.length > 0 && (repeated || independentObservations || sources.size >= 2 || independentDimensions.size >= 2);
   const corroboration = corroborated
-    ? result('CORROBORATION', 'PASS', ['INDEPENDENT_CORROBORATION'], corroborating, { sources: sources.size, fields: fields.length, dimensions: independentDimensions.size, repeatedVideos: repeated })
-    : result('CORROBORATION', 'ABSTAIN', ['CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: fields.length, dimensions: independentDimensions.size, repeatedVideos: repeated });
+    ? result('CORROBORATION', 'PASS', ['INDEPENDENT_OBSERVATION_CORROBORATION'], corroborating, { sources: sources.size, fields: observations.size, dimensions: independentDimensions.size, repeatedVideos: repeated })
+    : result('CORROBORATION', 'ABSTAIN', ['CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, dimensions: independentDimensions.size, repeatedVideos: repeated });
   const contradiction = dominantContradiction
     ? result('CONTRADICTION', 'FAIL', ['DOMINANT_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight })
     : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight });

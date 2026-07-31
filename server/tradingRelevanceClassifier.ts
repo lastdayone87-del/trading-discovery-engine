@@ -1,5 +1,5 @@
-import { RawChannelInput, TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
-import { verifyChannelTradingRelevance, VerificationDecision } from './evidenceEngine';
+import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
+import { verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
 
 /**
  * Main Entry Point: Classifies a YouTube Channel's Trading Relevance
@@ -22,15 +22,15 @@ export async function classifyTradingRelevance(
 
 /** Exposes the immutable evidence decision to the shadow path without rerunning providers. */
 export async function classifyTradingRelevanceDetailed(
-  channelName: string,
-  description: string,
+  channelName: string | RawChannelInput,
+  description: string = '',
   videoTitles: string[] = [],
   videoDescriptions: string = '',
   country: string = 'UNKNOWN',
   externalLinks: string[] = [],
   discordInvite?: string | null
 ): Promise<{result: TradingClassificationResult; decision: VerificationDecision; input: RawChannelInput}> {
-  const input: RawChannelInput = {
+  const input: RawChannelInput = typeof channelName === 'object' ? normalizeFieldAwareInput(channelName) : {
     channel_name: channelName,
     description,
     video_titles: videoTitles,
@@ -47,7 +47,7 @@ export async function classifyTradingRelevanceDetailed(
     `Evidence Engine Version: ${decision.versions.evidenceEngineVersion} | Scoring Engine: ${decision.versions.scoringEngineVersion}`,
     `Country Context Used: ${decision.countryContextUsed.country} (${decision.countryContextUsed.language})`,
     `Evidence Sufficiency: ${decision.evidenceCollection.sufficiency} | Sparse Metadata: ${decision.evidenceCollection.sparseMetadata} | Degraded Providers: ${decision.evidenceCollection.degraded}`,
-    `Provider Availability: ${decision.evidenceCollection.providers.map(provider => `${provider.provider}=${provider.availability}`).join(', ')}`,
+    `Provider Execution: ${decision.evidenceCollection.providers.map(provider => `${provider.provider}=${provider.outcome}[${provider.reasonCodes.join('|')}](${provider.durationMs||0}ms)`).join(', ')}`,
     ...(decision.stagedClassification?.stages.map(stage => `Classification Stage ${stage.stage}: ${stage.disposition} (${stage.reasonCodes.join(', ')}) | Fields: ${stage.fields.map(field => field.field).join(', ') || 'none'}`) || []),
     decision.mathematicalJustification
   ];
@@ -87,4 +87,18 @@ export async function classifyTradingRelevanceDetailed(
     breakdown
   };
   return {result, decision, input};
+}
+
+/** Preserves the complete field-aware schema at the production boundary. */
+function normalizeFieldAwareInput(value: RawChannelInput): RawChannelInput {
+  const videos=value.videos?.map(video=>({...video})) || (value.video_titles||[]).map((title,index)=>({title,description:value.video_descriptions?.[index]}));
+  return {
+    ...value,
+    channel_name:value.channel_name.normalize('NFKC').trim(),
+    description:value.description || '',
+    videos,
+    video_titles:videos.map(video=>video.title),
+    video_descriptions:videos.map(video=>video.description || ''),
+    external_links:value.external_links || value.external_link_details?.map(link=>link.url) || []
+  };
 }

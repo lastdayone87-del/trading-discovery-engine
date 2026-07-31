@@ -89,7 +89,8 @@ export class VideoMetadataProvider implements EvidenceProvider {
           provider: 'video_metadata',
           type: 'MULTI_VIDEO_CONSISTENCY',
           matchedTerm: `${tradingFocusedCount}/${titles.length} videos matching trading terms`,
-          sourceRef: 'Sample Video Titles'
+          sourceRef: 'Sample Video Titles',
+          fields:titles.map((_title,index)=>({field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}))
         },
         timestamp: now
       });
@@ -113,7 +114,8 @@ export class VideoMetadataProvider implements EvidenceProvider {
           provider: 'video_metadata',
           type: 'INSTRUMENT',
           matchedTerm: matchedInstrumentsInVideos.join(', '),
-          sourceRef: 'Sample Video Titles & Descriptions'
+          sourceRef: 'Sample Video Titles & Descriptions',
+          fields:titles.flatMap((title,index)=>matchedInstrumentsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[{field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}]:[])
         },
         timestamp: now
       });
@@ -137,7 +139,8 @@ export class VideoMetadataProvider implements EvidenceProvider {
           provider: 'video_metadata',
           type: 'PLATFORM_BROKER_PROPFIRM',
           matchedTerm: matchedPlatformsInVideos.join(', '),
-          sourceRef: 'Sample Video Titles & Descriptions'
+          sourceRef: 'Sample Video Titles & Descriptions',
+          fields:titles.flatMap((title,index)=>matchedPlatformsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[{field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}]:[])
         },
         timestamp: now
       });
@@ -161,7 +164,8 @@ export class VideoMetadataProvider implements EvidenceProvider {
           provider: 'video_metadata',
           type: 'METHODOLOGY_CONCEPT',
           matchedTerm: matchedConceptsInVideos.join(', '),
-          sourceRef: 'Sample Video Titles & Descriptions'
+          sourceRef: 'Sample Video Titles & Descriptions',
+          fields:titles.flatMap((title,index)=>matchedConceptsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[{field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}]:[])
         },
         timestamp: now
       });

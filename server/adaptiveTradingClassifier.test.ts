@@ -24,10 +24,10 @@ test('production non-trading decision vetoes an adaptive confirmation',()=>{
   assert.notEqual(r.status,'TRADING_CONFIRMED');
 });
 
-test('shadow observers are detached from ingestion and review transactions',()=>{
+test('governed rollout is explicit, reversible, and cannot bypass production-positive evidence',()=>{
   const ingestion=fs.readFileSync(path.join(process.cwd(),'server/ingestionPipeline.ts'),'utf8');
   const reviews=fs.readFileSync(path.join(process.cwd(),'server/reviewStore.ts'),'utf8');
-  assert.match(ingestion,/void runAndRecordAdaptiveShadow/);assert.doesNotMatch(ingestion,/await runAndRecordAdaptiveShadow/);
+  assert.match(ingestion,/governed_classifier_production_enabled/);assert.match(ingestion,/productionClassification\.decision\.positiveEvidence\.length>0/);assert.match(ingestion,/negativeEvidence\.length===0/);
   assert.match(reviews,/await client\.query\('COMMIT'\);[\s\S]*void recordAdaptiveShadowLabel/);
   assert.doesNotMatch(reviews,/await recordAdaptiveShadowLabel/);
 });
