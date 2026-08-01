@@ -14,6 +14,7 @@ The documents are divided by concern:
 - [Autonomous Discovery](./AUTONOMOUS_DISCOVERY.md) — query origins, scheduling, selection, execution, and measurement.
 - [Learning Pipeline](./LEARNING_PIPELINE.md) — terminology observations, candidate corpus, concepts, evaluation, and governed publication.
 - [Roadmap](./ROADMAP.md) — remaining priorities and the desired end state.
+- [Post-roadmap principal review](./PRINCIPAL_ARCHITECTURE_REVIEW.md) — critical assessment of the few remaining investments that can materially move the engine's precision, recall, autonomy, and operating scale.
 
 Historical phase documents under `docs/` remain useful implementation records, but this section is the living specification of the assembled system.
 
