@@ -39,7 +39,16 @@ const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryI
   Italy: [['FTSE MIB', 'INSTRUMENT', 'stocks'], ['Analisi Tecnica', 'METHOD', 'education'], ['Trading Futures', 'METHOD', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Diario Trading', 'FORMAT', 'trading_journals'], ['Trading Intraday', 'METHOD', 'live_trading']],
   Australia: [['ASX Trading', 'INSTRUMENT', 'stocks'], ['ASX 200', 'INSTRUMENT', 'stocks'], ['AUDUSD', 'INSTRUMENT', 'forex'], ['Sydney Session', 'MARKET', 'session_analysis'], ['Price Action', 'METHOD', 'strategy'], ['Order Flow', 'METHOD', 'strategy']],
   Canada: [['TSX Trading', 'INSTRUMENT', 'stocks'], ['TSX 60', 'INSTRUMENT', 'stocks'], ['USDCAD', 'INSTRUMENT', 'forex'], ['Oil Trading', 'INSTRUMENT', 'futures'], ['Toronto Open', 'MARKET', 'premarket_prep'], ['Technical Analysis', 'METHOD', 'education']],
-  Japan: [['日経225', 'INSTRUMENT', 'futures'], ['FX トレード', 'INSTRUMENT', 'forex'], ['オーダーフロー', 'METHOD', 'strategy'], ['テクニカル分析', 'METHOD', 'education'], ['板読み', 'METHOD', 'strategy'], ['デイトレード', 'METHOD', 'live_trading'], ['東京セッション', 'MARKET', 'session_analysis']]
+  Japan: [['日経225', 'INSTRUMENT', 'futures'], ['FX トレード', 'INSTRUMENT', 'forex'], ['オーダーフロー', 'METHOD', 'strategy'], ['テクニカル分析', 'METHOD', 'education'], ['板読み', 'METHOD', 'strategy'], ['デイトレード', 'METHOD', 'live_trading'], ['東京セッション', 'MARKET', 'session_analysis']],
+  Switzerland: [['SMI Analyse', 'INSTRUMENT', 'market_analysis'], ['USDCHF', 'INSTRUMENT', 'forex'], ['Börsenanalyse Schweiz', 'METHOD', 'education']],
+  Denmark: [['OMXC25', 'INSTRUMENT', 'stocks'], ['Teknisk Analyse', 'METHOD', 'education'], ['Aktiehandel', 'METHOD', 'strategy']],
+  Sweden: [['OMXS30', 'INSTRUMENT', 'stocks'], ['Teknisk Analys', 'METHOD', 'education'], ['Börsanalys', 'MARKET', 'market_analysis']],
+  'United Arab Emirates': [['DFM Trading', 'INSTRUMENT', 'stocks'], ['ADX Trading', 'INSTRUMENT', 'stocks'], ['Dubai Market', 'MARKET', 'market_analysis']],
+  Singapore: [['STI Trading', 'INSTRUMENT', 'stocks'], ['SGX Trading', 'MARKET', 'market_analysis'], ['USDSGD', 'INSTRUMENT', 'forex']],
+  'New Zealand': [['NZX50', 'INSTRUMENT', 'stocks'], ['NZDUSD', 'INSTRUMENT', 'forex'], ['NZX Trading', 'MARKET', 'market_analysis']],
+  Belgium: [['BEL20', 'INSTRUMENT', 'stocks'], ['Beursanalyse', 'METHOD', 'education'], ['Euronext Brussels', 'MARKET', 'market_analysis']],
+  Luxembourg: [['LuxX', 'INSTRUMENT', 'stocks'], ['Bourse Luxembourg', 'MARKET', 'market_analysis'], ['Börsenanalyse', 'METHOD', 'education']],
+  Ireland: [['ISEQ20', 'INSTRUMENT', 'stocks'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Irish Trading', 'METHOD', 'strategy']]
 };
 
 const OBJECTIVES: Partial<Record<QueryIntent, string>> = {
@@ -64,6 +73,8 @@ export function queryTokenCount(query: string): number {
 }
 
 export function isCountryScriptCompatible(country: string, query: string): boolean {
+  if (country === 'United Arab Emirates') return !/[\p{Script=Cyrillic}\p{Script=Devanagari}\p{Script=Hangul}]/u.test(query) && !JAPANESE.test(query);
+  if (country === 'Singapore') return !NON_LATIN.test(query);
   if (NON_LATIN.test(query)) return false;
   if (country !== 'Japan') return !JAPANESE.test(query);
   if (JAPANESE.test(query)) return true;

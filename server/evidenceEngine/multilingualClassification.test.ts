@@ -74,8 +74,8 @@ for (const example of adjacentCases) {
   });
 }
 
-test('classification knowledge is restricted to the ten supported countries', () => {
-  assert.deepEqual([...SUPPORTED_CLASSIFICATION_COUNTRIES], ['United States', 'United Kingdom', 'Germany', 'France', 'Spain', 'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan']);
+test('classification knowledge covers every production country', () => {
+  assert.deepEqual([...SUPPORTED_CLASSIFICATION_COUNTRIES], ['United States', 'United Kingdom', 'Germany', 'France', 'Spain', 'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland', 'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand', 'Belgium', 'Luxembourg', 'Ireland']);
   assert.equal(getLayeredKnowledgeContext('Brazil').countryKnowledge, undefined);
   assert.equal(getLayeredKnowledgeContext('India').countryKnowledge, undefined);
 });

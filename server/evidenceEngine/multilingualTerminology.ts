@@ -3,11 +3,13 @@ import { textMatchesTerm } from './utils/textMatching';
 
 export const SUPPORTED_CLASSIFICATION_COUNTRIES = [
   'United States', 'United Kingdom', 'Germany', 'France', 'Spain',
-  'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan'
+  'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland',
+  'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand',
+  'Belgium', 'Luxembourg', 'Ireland'
 ] as const;
 
 export interface MultilingualClassificationPack {
-  languageCode: 'en' | 'de' | 'fr' | 'es' | 'it' | 'nl' | 'ja';
+  languageCode: 'en' | 'de' | 'fr' | 'es' | 'it' | 'nl' | 'ja' | 'da' | 'sv' | 'ar';
   executionTerms: string[];
   educationalTerms: string[];
   businessNewsTerms: string[];
@@ -70,6 +72,15 @@ export const MULTILINGUAL_CLASSIFICATION_PACKS: Record<MultilingualClassificatio
     genericFinanceTerms: ['persoonlijke financiën', 'passief inkomen', 'dividendportefeuille', 'lange termijn beleggen', 'pensioenbeleggen'],
     hypeTerms: ['crypto 100x', 'gegarandeerde winst', 'volgende crypto parel', 'snel rijk'],
     motivationTerms: ['miljonairsmentaliteit', 'succesmotivatie', 'financiële vrijheid motivatie']
+  },
+  da: {
+    languageCode: 'da', executionTerms: ['handelsplan', 'risikostyring', 'indgangspunkt', 'stop loss', 'aktiehandel', 'strategi backtest'], educationalTerms: ['lær trading', 'teknisk analyse', 'handelsstrategi'], businessNewsTerms: ['erhvervsnyheder', 'markedsnyheder'], genericFinanceTerms: ['privatøkonomi', 'passiv indkomst', 'langsigtet investering'], hypeTerms: ['garanteret gevinst', 'bliv rig hurtigt'], motivationTerms: ['millionær tankegang']
+  },
+  sv: {
+    languageCode: 'sv', executionTerms: ['handelsplan', 'riskhantering', 'ingångspunkt', 'stop loss', 'aktiehandel', 'strategi backtest'], educationalTerms: ['lär dig trading', 'teknisk analys', 'handelsstrategi'], businessNewsTerms: ['ekonominyheter', 'marknadsnyheter'], genericFinanceTerms: ['privatekonomi', 'passiv inkomst', 'långsiktigt sparande'], hypeTerms: ['garanterad vinst', 'bli rik snabbt'], motivationTerms: ['miljonärstänkande']
+  },
+  ar: {
+    languageCode: 'ar', executionTerms: ['خطة التداول', 'إدارة المخاطر', 'نقطة الدخول', 'وقف الخسارة', 'تداول الأسهم'], educationalTerms: ['تعليم التداول', 'تحليل فني', 'استراتيجية التداول'], businessNewsTerms: ['أخبار اقتصادية', 'أخبار السوق'], genericFinanceTerms: ['التمويل الشخصي', 'دخل سلبي', 'استثمار طويل الأجل'], hypeTerms: ['ربح مضمون', 'ثراء سريع'], motivationTerms: ['عقلية المليونير']
   },
   ja: {
     languageCode: 'ja',

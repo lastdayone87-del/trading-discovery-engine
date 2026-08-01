@@ -87,7 +87,10 @@ export const LANGUAGE_KNOWLEDGE_PACKS: Record<string, LanguageKnowledge> = {
     positiveTerms: ['beurs', 'beursanalyse', 'aex', 'aex-index', 'technische analyse', 'handelen in opties', 'beleggen', 'daghandel', 'marktanalyse', 'aandelen', 'beursvideos', 'optiestrategie', 'ochtendupdate', 'beursnieuws', 'beleggingsforum'],
     negativeTerms: ['voetbal', 'recepten', 'amsterdam vlog', 'gaming', 'make-up', 'vlog'],
     commonPhrases: ['opening amsterdamse beurs', 'weekoverzicht beurs', 'analyse van de dag', 'beurs update']
-  }
+  },
+  da: { languageCode: 'da', languageName: 'Danish', positiveTerms: ['aktiehandel', 'teknisk analyse', 'børsanalyse', 'risikostyring'], negativeTerms: ['gaming', 'madopskrift', 'fodbold'], commonPhrases: ['daglig markedsanalyse', 'handelsstrategi'] },
+  sv: { languageCode: 'sv', languageName: 'Swedish', positiveTerms: ['aktiehandel', 'teknisk analys', 'börsanalys', 'riskhantering'], negativeTerms: ['gaming', 'matrecept', 'fotboll'], commonPhrases: ['daglig marknadsanalys', 'handelsstrategi'] },
+  ar: { languageCode: 'ar', languageName: 'Arabic', positiveTerms: ['تداول الأسهم', 'تحليل فني', 'إدارة المخاطر', 'خطة التداول'], negativeTerms: ['ألعاب', 'طبخ', 'سياحة'], commonPhrases: ['تحليل السوق اليومي', 'استراتيجية التداول'] }
 };
 
 // ============================================================================
@@ -194,9 +197,18 @@ export const COUNTRY_KNOWLEDGE_PACKS: Record<string, CountryKnowledgePack> = {
     nativeTradingTerminology: ['beurs analyse', 'AEX trading', 'technische analyse', 'handelen in opties', 'marktanalyse', 'beleggen en trading', 'daghandel strategie', 'beursvideos'],
     regionalNegativeTerms: ['Voetbal', 'Amsterdam vlog', 'Recepten']
   },
+  'Switzerland': { countryName: 'Switzerland', primaryLanguage: 'de', regionalExchanges: ['SIX Swiss Exchange'], localBrokers: ['Swissquote', 'Saxo Switzerland'], popularInstruments: ['SMI', 'USDCHF'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['Börsenanalyse Schweiz', 'SMI Analyse'], regionalNegativeTerms: ['Swiss travel vlog'] },
+  'Denmark': { countryName: 'Denmark', primaryLanguage: 'da', regionalExchanges: ['Nasdaq Copenhagen'], localBrokers: ['Saxo Bank', 'Nordnet Denmark'], popularInstruments: ['OMXC25', 'EURDKK'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['aktiehandel', 'teknisk analyse'], regionalNegativeTerms: ['Danish football'] },
+  'Sweden': { countryName: 'Sweden', primaryLanguage: 'sv', regionalExchanges: ['Nasdaq Stockholm'], localBrokers: ['Avanza', 'Nordnet Sweden'], popularInstruments: ['OMXS30', 'SEK'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['aktiehandel', 'teknisk analys'], regionalNegativeTerms: ['Swedish hockey'] },
+  'United Arab Emirates': { countryName: 'United Arab Emirates', primaryLanguage: 'ar', regionalExchanges: ['Dubai Financial Market', 'ADX'], localBrokers: ['Sarwa', 'ADSS'], popularInstruments: ['DFM General Index', 'FTSE ADX'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['تداول الأسهم', 'تحليل فني'], regionalNegativeTerms: ['desert safari'] },
+  'Singapore': { countryName: 'Singapore', primaryLanguage: 'en', regionalExchanges: ['Singapore Exchange', 'SGX'], localBrokers: ['DBS Vickers', 'Phillip Securities'], popularInstruments: ['Straits Times Index', 'USDSGD'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['SGX trading', 'Singapore market open'], regionalNegativeTerms: ['hawker food'] },
+  'New Zealand': { countryName: 'New Zealand', primaryLanguage: 'en', regionalExchanges: ['NZX'], localBrokers: ['Sharesies', 'Jarden'], popularInstruments: ['NZX 50', 'NZDUSD'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['NZX trading', 'RBNZ rate decision'], regionalNegativeTerms: ['rugby highlights'] },
+  'Belgium': { countryName: 'Belgium', primaryLanguage: 'nl', regionalExchanges: ['Euronext Brussels'], localBrokers: ['Bolero', 'Keytrade Bank'], popularInstruments: ['BEL 20', 'EURUSD'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['beursanalyse België', 'analyse boursière belge'], regionalNegativeTerms: ['Belgian travel vlog'] },
+  'Luxembourg': { countryName: 'Luxembourg', primaryLanguage: 'fr', regionalExchanges: ['Luxembourg Stock Exchange'], localBrokers: ['Swissquote Luxembourg', 'BGL BNP Paribas'], popularInstruments: ['LuxX', 'Eurobonds'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['Bourse de Luxembourg', 'Börsenanalyse'], regionalNegativeTerms: ['Luxembourg tourism'] },
+  'Ireland': { countryName: 'Ireland', primaryLanguage: 'en', regionalExchanges: ['Euronext Dublin'], localBrokers: ['Davy Select', 'Goodbody'], popularInstruments: ['ISEQ 20', 'EURUSD'], localPropFirms: ['FTMO'], nativeTradingTerminology: ['Irish stock trading', 'Euronext Dublin'], regionalNegativeTerms: ['Irish travel vlog'] }
 };
 
-/** Resolve classification knowledge only for the ten supported discovery countries. */
+/** Resolve classification knowledge for every supported production discovery country. */
 export function getLayeredKnowledgeContext(countryName?: string): LayeredKnowledgeContext {
   const cName = countryName && countryName !== 'UNKNOWN' ? countryName : 'UNKNOWN';
   const supported = (SUPPORTED_CLASSIFICATION_COUNTRIES as readonly string[]).includes(cName);
