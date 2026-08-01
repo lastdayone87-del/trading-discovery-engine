@@ -1,6 +1,12 @@
 import type { LayeredKnowledgeContext, RawChannelInput } from './types';
 import { textMatchesTerm } from './utils/textMatching';
+import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries';
 
+/** Backward-compatible export backed by the single production-country registry. */
+export const SUPPORTED_CLASSIFICATION_COUNTRIES = SUPPORTED_PRODUCTION_COUNTRIES;
+
+export interface MultilingualClassificationPack {
+  languageCode: 'en' | 'de' | 'fr' | 'es' | 'it' | 'nl' | 'ja' | 'da' | 'sv' | 'ar' | 'zh' | 'ms';
 export const SUPPORTED_CLASSIFICATION_COUNTRIES = [
   'United States', 'United Kingdom', 'Germany', 'France', 'Spain',
   'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland',
@@ -82,6 +88,12 @@ export const MULTILINGUAL_CLASSIFICATION_PACKS: Record<MultilingualClassificatio
   ar: {
     languageCode: 'ar', executionTerms: ['خطة التداول', 'إدارة المخاطر', 'نقطة الدخول', 'وقف الخسارة', 'تداول الأسهم'], educationalTerms: ['تعليم التداول', 'تحليل فني', 'استراتيجية التداول'], businessNewsTerms: ['أخبار اقتصادية', 'أخبار السوق'], genericFinanceTerms: ['التمويل الشخصي', 'دخل سلبي', 'استثمار طويل الأجل'], hypeTerms: ['ربح مضمون', 'ثراء سريع'], motivationTerms: ['عقلية المليونير']
   },
+  zh: {
+    languageCode: 'zh', executionTerms: ['交易计划', '风险管理', '入场点', '止损', '股票交易', '策略回测'], educationalTerms: ['交易教学', '技术分析', '交易策略'], businessNewsTerms: ['财经新闻', '市场新闻'], genericFinanceTerms: ['个人理财', '被动收入', '长期投资'], hypeTerms: ['保证盈利', '快速致富'], motivationTerms: ['百万富翁思维']
+  },
+  ms: {
+    languageCode: 'ms', executionTerms: ['pelan dagangan', 'pengurusan risiko', 'titik masuk', 'henti rugi', 'dagangan saham'], educationalTerms: ['belajar berdagang', 'analisis teknikal', 'strategi dagangan'], businessNewsTerms: ['berita ekonomi', 'berita pasaran'], genericFinanceTerms: ['kewangan peribadi', 'pendapatan pasif', 'pelaburan jangka panjang'], hypeTerms: ['untung dijamin', 'cepat kaya'], motivationTerms: ['minda jutawan']
+  },
   ja: {
     languageCode: 'ja',
     executionTerms: ['エントリーポイント', '損切り', '資金管理', 'トレード日誌', '板読み', '注文フロー', 'ストラテジー検証'],
@@ -102,10 +114,10 @@ export function matchedTerms(text: string, terms: string[]): string[] {
 }
 
 export function isTradingFocusedText(text: string, context: LayeredKnowledgeContext): boolean {
-  const languageCode = (context.languageKnowledge?.languageCode || 'en') as keyof typeof MULTILINGUAL_CLASSIFICATION_PACKS;
-  const pack = MULTILINGUAL_CLASSIFICATION_PACKS[languageCode] || MULTILINGUAL_CLASSIFICATION_PACKS.en;
-  const hasExecution = matchedTerms(text, pack.executionTerms).length > 0;
-  const hasEducation = matchedTerms(text, pack.educationalTerms).length > 0;
+  const languagePacks = (context.languageKnowledgePacks || [context.languageKnowledge]).filter(Boolean)
+    .map(item => MULTILINGUAL_CLASSIFICATION_PACKS[item!.languageCode as keyof typeof MULTILINGUAL_CLASSIFICATION_PACKS] || MULTILINGUAL_CLASSIFICATION_PACKS.en);
+  const hasExecution = languagePacks.some(pack => matchedTerms(text, pack.executionTerms).length > 0);
+  const hasEducation = languagePacks.some(pack => matchedTerms(text, pack.educationalTerms).length > 0);
   const hasMethodology = context.globalAdvancedConcepts.some(term => textMatchesTerm(text, term));
   const hasPlatform = context.globalPlatformsPropFirms.some(term => textMatchesTerm(text, term));
   const instruments = [...context.globalInstruments, ...(context.countryKnowledge?.popularInstruments || [])];

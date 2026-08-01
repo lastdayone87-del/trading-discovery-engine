@@ -90,7 +90,9 @@ export const LANGUAGE_KNOWLEDGE_PACKS: Record<string, LanguageKnowledge> = {
   },
   da: { languageCode: 'da', languageName: 'Danish', positiveTerms: ['aktiehandel', 'teknisk analyse', 'børsanalyse', 'risikostyring'], negativeTerms: ['gaming', 'madopskrift', 'fodbold'], commonPhrases: ['daglig markedsanalyse', 'handelsstrategi'] },
   sv: { languageCode: 'sv', languageName: 'Swedish', positiveTerms: ['aktiehandel', 'teknisk analys', 'börsanalys', 'riskhantering'], negativeTerms: ['gaming', 'matrecept', 'fotboll'], commonPhrases: ['daglig marknadsanalys', 'handelsstrategi'] },
-  ar: { languageCode: 'ar', languageName: 'Arabic', positiveTerms: ['تداول الأسهم', 'تحليل فني', 'إدارة المخاطر', 'خطة التداول'], negativeTerms: ['ألعاب', 'طبخ', 'سياحة'], commonPhrases: ['تحليل السوق اليومي', 'استراتيجية التداول'] }
+  ar: { languageCode: 'ar', languageName: 'Arabic', positiveTerms: ['تداول الأسهم', 'تحليل فني', 'إدارة المخاطر', 'خطة التداول'], negativeTerms: ['ألعاب', 'طبخ', 'سياحة'], commonPhrases: ['تحليل السوق اليومي', 'استراتيجية التداول'] },
+  zh: { languageCode: 'zh', languageName: 'Mandarin Chinese', positiveTerms: ['股票交易', '技术分析', '风险管理', '交易策略'], negativeTerms: ['游戏', '烹饪', '旅游'], commonPhrases: ['每日市场分析', '新加坡股市'] },
+  ms: { languageCode: 'ms', languageName: 'Malay', positiveTerms: ['dagangan saham', 'analisis teknikal', 'pengurusan risiko'], negativeTerms: ['permainan', 'masakan', 'pelancongan'], commonPhrases: ['analisis pasaran harian', 'strategi dagangan'] }
 };
 
 // ============================================================================
@@ -170,6 +172,7 @@ export const COUNTRY_KNOWLEDGE_PACKS: Record<string, CountryKnowledgePack> = {
   'Canada': {
     countryName: 'Canada',
     primaryLanguage: 'en',
+    languageCodes: ['en', 'fr'],
     regionalExchanges: ['TSX', 'TSX Venture', 'MX'],
     localBrokers: ['Questrade', 'Wealthsimple', 'TD Direct Investing'],
     popularInstruments: ['TSX 60', 'USDCAD', 'Crude Oil', 'Gold'],
@@ -214,13 +217,15 @@ export function getLayeredKnowledgeContext(countryName?: string): LayeredKnowled
   const supported = (SUPPORTED_CLASSIFICATION_COUNTRIES as readonly string[]).includes(cName);
   const countryPack = supported ? COUNTRY_KNOWLEDGE_PACKS[cName] : undefined;
   const langCode = countryPack?.primaryLanguage || 'en';
-  const languagePack = LANGUAGE_KNOWLEDGE_PACKS[langCode] || LANGUAGE_KNOWLEDGE_PACKS.en;
+  const languageKnowledgePacks = [...new Set(countryPack?.languageCodes || [langCode])].map(code => LANGUAGE_KNOWLEDGE_PACKS[code]).filter((pack): pack is LanguageKnowledge => Boolean(pack));
+  const languagePack = languageKnowledgePacks[0] || LANGUAGE_KNOWLEDGE_PACKS.en;
   return {
     globalInstruments: GLOBAL_INSTRUMENTS,
     globalPlatformsPropFirms: GLOBAL_PLATFORMS_BROKERS_PROPFIRMS,
     globalAdvancedConcepts: GLOBAL_ADVANCED_CONCEPTS,
     globalNegativeTerms: GLOBAL_NEGATIVE_TERMS,
     languageKnowledge: languagePack,
+    languageKnowledgePacks,
     countryKnowledge: countryPack
   };
 }

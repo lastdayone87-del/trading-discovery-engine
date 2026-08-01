@@ -16,6 +16,7 @@ The documents are divided by concern:
 - [Roadmap](./ROADMAP.md) — remaining priorities and the desired end state.
 - [Post-roadmap principal review](./PRINCIPAL_ARCHITECTURE_REVIEW.md) — critical assessment of the few remaining investments that can materially move the engine's precision, recall, autonomy, and operating scale.
 - [Final evolution review](./FINAL_EVOLUTION_REVIEW.md) — proposal-by-proposal decisions and a dependency-ordered roadmap for the next major architectural evolution.
+- [Final production-readiness review](./FINAL_PRODUCTION_READINESS_REVIEW.md) — repository-wide implementation disposition, country invariants, provider-pool audit, and deployment verification boundary.
 
 Historical phase documents under `docs/` remain useful implementation records, but this section is the living specification of the assembled system.
 

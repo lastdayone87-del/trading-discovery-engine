@@ -22,5 +22,6 @@ test('new production countries have vocabulary, query, classification, and valid
 test('Arabic and Singapore Han queries use their governed scripts', () => {
   assert.equal(isCountryScriptCompatible('United Arab Emirates', 'تحليل فني'), true);
   assert.equal(isCountryScriptCompatible('Singapore', '股票交易'), true);
+  assert.equal(isCountryScriptCompatible('Singapore', 'テクニカル分析'), false);
   assert.equal(isCountryScriptCompatible('Sweden', '股票交易'), false);
 });

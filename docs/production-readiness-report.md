@@ -1,5 +1,7 @@
 # Production Readiness Report
 
+> **Historical snapshot:** This report predates phases 16–21 and the final 2026-08-01 audit. Findings superseded by later implementation are retained for history; use [Final production-readiness review](./architecture/FINAL_PRODUCTION_READINESS_REVIEW.md) for the current decision.
+
 Date: 2026-07-29
 
 ## Phase A-F end-to-end validation

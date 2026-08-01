@@ -76,10 +76,12 @@ import { decideReview, getReviewDetails, listReviewQueue, ReviewConflictError, R
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
 import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
+import { assertProductionCountryArchitecture } from './server/productionCountryArchitecture';
 import { inspectExecutionTrace, recordExecutionStage, withExecutionTrace } from './server/executionTrace';
 
 
 async function startServer() {
+  assertProductionCountryArchitecture();
   validateOperatorConfiguration();
   const app = express();
   const PORT = Number(process.env.PORT || 3000);

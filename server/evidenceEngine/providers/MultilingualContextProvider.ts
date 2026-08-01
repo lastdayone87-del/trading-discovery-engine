@@ -5,15 +5,16 @@ export class MultilingualContextProvider implements EvidenceProvider {
   name = 'multilingual_context' as const;
 
   async collectEvidence(input: RawChannelInput, context: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
-    const languageCode = (context.languageKnowledge?.languageCode || 'en') as keyof typeof MULTILINGUAL_CLASSIFICATION_PACKS;
-    const pack = MULTILINGUAL_CLASSIFICATION_PACKS[languageCode] || MULTILINGUAL_CLASSIFICATION_PACKS.en;
+    const packs = (context.languageKnowledgePacks || [context.languageKnowledge]).filter(Boolean)
+      .map(language => MULTILINGUAL_CLASSIFICATION_PACKS[language!.languageCode as keyof typeof MULTILINGUAL_CLASSIFICATION_PACKS] || MULTILINGUAL_CLASSIFICATION_PACKS.en);
     const text = completeChannelText(input);
-    const execution = matchedTerms(text, pack.executionTerms);
-    const education = matchedTerms(text, pack.educationalTerms);
-    const news = matchedTerms(text, pack.businessNewsTerms);
-    const genericFinance = matchedTerms(text, pack.genericFinanceTerms);
-    const hype = matchedTerms(text, pack.hypeTerms);
-    const motivation = matchedTerms(text, pack.motivationTerms);
+    const matches = (key: 'executionTerms' | 'educationalTerms' | 'businessNewsTerms' | 'genericFinanceTerms' | 'hypeTerms' | 'motivationTerms') => [...new Set(packs.flatMap(pack => matchedTerms(text, pack[key])))];
+    const execution = matches('executionTerms');
+    const education = matches('educationalTerms');
+    const news = matches('businessNewsTerms');
+    const genericFinance = matches('genericFinanceTerms');
+    const hype = matches('hypeTerms');
+    const motivation = matches('motivationTerms');
     const hasCreatorTradingPractice = execution.length > 0 || education.length > 0;
     const items: EvidenceItem[] = [];
     const now = new Date().toISOString();
@@ -26,7 +27,7 @@ export class MultilingualContextProvider implements EvidenceProvider {
         source: this.name,
         polarity: 'POSITIVE',
         category: 'METHODOLOGY_CONCEPT',
-        fact: `Authentic ${context.languageKnowledge?.languageName || 'English'} trading education/execution terminology appears across the complete channel context: ${matches.join(', ')}`,
+        fact: `Authentic ${(context.languageKnowledgePacks || [context.languageKnowledge]).filter(Boolean).map(item => item!.languageName).join('/') || 'English'} trading education/execution terminology appears across the complete channel context: ${matches.join(', ')}`,
         rawMatches: matches,
         confidence: execution.length >= 2 || (execution.length && education.length) ? 94 : 86,
         reliability: 'VERY_HIGH',

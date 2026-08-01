@@ -9,6 +9,7 @@ import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { getLayeredKnowledgeContext } from './knowledgePacks';
 import { SUPPORTED_CLASSIFICATION_COUNTRIES } from './multilingualTerminology';
+import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries';
 
 const engine = new EvidenceBasedTradingEngine([
   new ChannelMetadataProvider(),

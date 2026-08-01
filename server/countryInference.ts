@@ -102,7 +102,7 @@ const COUNTRY_SIGNALS: Record<string, {
 
 const SOCIAL_HOSTS = ['instagram.com', 'x.com', 'twitter.com', 'facebook.com', 'linkedin.com', 'tiktok.com'];
 
-function canonicalCountry(value: string): string {
+export function canonicalCountry(value: string): string {
   const normalized = normalizeCountryName(value);
   return COUNTRY_ALIASES[normalized] || Object.keys(COUNTRY_SIGNALS).find(country => normalizeCountryName(country) === normalized) || value.trim();
 }

@@ -51,6 +51,10 @@ const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryI
   Ireland: [['ISEQ20', 'INSTRUMENT', 'stocks'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Irish Trading', 'METHOD', 'strategy']]
 };
 
+export function getCuratedQueryCountries(): string[] {
+  return Object.keys(COUNTRY_SEARCH_ATOMS);
+}
+
 const OBJECTIVES: Partial<Record<QueryIntent, string>> = {
   futures: 'Find active futures trading creators.', forex: 'Find foreign-exchange trading creators.', stocks: 'Find active equity-market creators.',
   options: 'Find options trading creators.', strategy: 'Find creators demonstrating trading methods.', indicators: 'Find creators using technical market tools.',
@@ -74,7 +78,7 @@ export function queryTokenCount(query: string): number {
 
 export function isCountryScriptCompatible(country: string, query: string): boolean {
   if (country === 'United Arab Emirates') return !/[\p{Script=Cyrillic}\p{Script=Devanagari}\p{Script=Hangul}]/u.test(query) && !JAPANESE.test(query);
-  if (country === 'Singapore') return !NON_LATIN.test(query);
+  if (country === 'Singapore') return !NON_LATIN.test(query) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(query);
   if (NON_LATIN.test(query)) return false;
   if (country !== 'Japan') return !JAPANESE.test(query);
   if (JAPANESE.test(query)) return true;

@@ -1,4 +1,4 @@
-import { CountryVocabulary, ExcludedCountry } from '../types';
+import type { CountryVocabulary, ExcludedCountry } from '../types';
 
 export const INITIAL_COUNTRY_VOCABULARIES: CountryVocabulary[] = [
   {
@@ -184,6 +184,9 @@ export const INITIAL_COUNTRY_VOCABULARIES: CountryVocabulary[] = [
   { country: 'Luxembourg', languages: ['Luxembourgish', 'French', 'German'], native_trading_terminology: ['Bourse Luxembourg', 'analyse technique', 'Börsenanalyse', 'Aktienhandel'], popular_instruments: ['LuxX Index', 'EURUSD', 'Eurobonds'], local_market_phrases: ['Bourse de Luxembourg', 'Luxemburger Börse'], common_content_format_names: ['marché hebdomadaire', 'Maartupdate'] },
   { country: 'Ireland', languages: ['English', 'Irish'], native_trading_terminology: ['Irish stock trading', 'technical analysis Ireland', 'forex trading Ireland', 'trádáil scaireanna'], popular_instruments: ['ISEQ 20', 'EURUSD', 'Irish equities'], local_market_phrases: ['Euronext Dublin', 'Dublin market open'], common_content_format_names: ['Irish market wrap', 'weekly trading outlook'] },
 ];
+
+/** Authoritative production-country registry; all server layers validate against it. */
+export const SUPPORTED_PRODUCTION_COUNTRIES = Object.freeze(INITIAL_COUNTRY_VOCABULARIES.map(item => item.country));
 
 export const INITIAL_EXCLUDED_COUNTRIES: ExcludedCountry[] = [
   { country_name: 'South Africa', reason: 'African Region Exclusion' },
