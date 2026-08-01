@@ -353,6 +353,15 @@ The `governed-knowledge-v1` contract is the common publication boundary for clas
 - explicit review workload budgets;
 - documentation updates in `docs/architecture/`.
 
+## Active implementation — Phase 16 decision evaluation control plane
+
+The post-roadmap implementation begins with the measurement dependency shared by
+all later adaptive work. Phase 16 adds immutable cohort assignments with known
+inclusion propensity, ground-truth lineage, sealed evaluation datasets,
+propensity-weighted benchmarking and calibration diagnostics, and evidence-based
+promotion gates. These records are observational and cannot activate production.
+See [the Phase 16 decision record](../phase-16-decision-evaluation-control-plane.md).
+
 ## What not to do
 
 - Do not fix global recall by continually appending static keywords.
