@@ -15,6 +15,7 @@ import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import type { RawChannelInput } from './evidenceEngine';
 import { getAppSetting } from './db';
 import {recordProductionClassification} from './classificationDiagnostics';
+import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport} from './evidenceEngine';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -44,9 +45,7 @@ export function isTerminalState(channel: ChannelRecord): boolean {
     channel.trading_status === 'NON_TRADING' ||
     channel.trading_status === 'HUMAN_REJECTED' ||
     channel.scan_status === 'SKIPPED_EXCLUDED' ||
-    channel.scan_status === 'SKIPPED_NON_TRADING' ||
-    channel.scan_status === 'NEEDS_REVIEW' ||
-    channel.trading_status === 'NEEDS_REVIEW'
+    channel.scan_status === 'SKIPPED_NON_TRADING'
   );
 }
 
@@ -187,8 +186,16 @@ export async function processChannelThroughPipeline(
   try {
     const shadow=await runAndRecordAdaptiveShadow(candidate.channelId,productionClassification.input,productionClassification.decision);
     const governedEnabled=await getAppSetting('governed_classifier_production_enabled','false')==='true';
-    if(governedEnabled&&tradingVal.status==='UNCERTAIN'&&shadow.status==='TRADING_CONFIRMED'&&productionClassification.decision.positiveEvidence.length>0&&productionClassification.decision.negativeEvidence.length===0&&shadow.evidence.length>0){
-      tradingVal={...tradingVal,status:'TRADING_CONFIRMED',confidenceScore:Math.max(82,shadow.confidenceScore),breakdown:{...tradingVal.breakdown,reasoning:[...(tradingVal.breakdown.reasoning||[]),'GOVERNED ROLLOUT: approved concepts corroborated existing production-positive evidence; no negative veto present.']}};
+    if(governedEnabled&&shadow.evidence.length>0&&productionClassification.decision.positiveEvidence.length>0&&productionClassification.decision.negativeEvidence.length===0){
+      // Governed knowledge is an evidence provider, not a post-classification
+      // status override. Transport it through the same scoring, corroboration,
+      // contradiction and lifecycle gates as every other provider.
+      const evidence=[...productionClassification.decision.positiveEvidence,...productionClassification.decision.negativeEvidence,...shadow.evidence];
+      const governedReports=shadow.evidence.map(item=>item.source).filter((source,index,all)=>all.indexOf(source)===index).map(provider=>({provider,availability:'AVAILABLE' as const,evidenceCount:shadow.evidence.filter(item=>item.source===provider).length,outcome:'EXECUTED_WITH_EVIDENCE' as const,reasonCodes:['GOVERNED_PRODUCTION_EVIDENCE_TRANSPORTED']}));
+      const collection:EvidenceCollectionReport={...productionClassification.decision.evidenceCollection,providers:[...productionClassification.decision.evidenceCollection.providers,...governedReports]};
+      const stages=evaluateClassificationStages(productionClassification.input,evidence,collection);
+      const governedDecision=new ConfigurableWeightedStrategy().evaluateDecision(evidence,{globalInstruments:[],globalPlatformsPropFirms:[],globalAdvancedConcepts:[],globalNegativeTerms:[]},resolvedCountry,collection,stages);
+      tradingVal={...tradingVal,status:governedDecision.status,confidenceScore:governedDecision.confidenceScore,category:governedDecision.category,breakdown:{...tradingVal.breakdown,reasoning:[...(tradingVal.breakdown.reasoning||[]),...governedDecision.mathematicalJustification.split(' | '),'GOVERNED ROLLOUT: evidence traversed the production staged classifier; no decision bypass was used.']}};
     }
   } catch(error) { console.warn(`[AdaptiveClassifier] Shadow evaluation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error); }
 
