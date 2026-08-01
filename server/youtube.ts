@@ -96,6 +96,7 @@ export interface DiscoveredChannelRaw {
   externalLinkDetails?: Array<{label?:string;url:string;domain?:string;resolved_entity_type?:string}>;
   visualEvidence?: Array<{source_ref:string;description:string;model_provenance:string}>;
   enrichmentStage?: number;
+  investigationId?: string;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
