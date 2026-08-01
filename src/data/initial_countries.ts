@@ -24,6 +24,23 @@ export const INITIAL_COUNTRY_VOCABULARIES: CountryVocabulary[] = [
     common_content_format_names: ['Morning prep', 'Pre market breakdown', 'Live trading journal', 'Weekly outlook']
   },
   {
+    country: 'United Kingdom',
+    languages: ['English'],
+    native_trading_terminology: [
+      'FTSE trading',
+      'spread betting',
+      'London session',
+      'price action',
+      'indices trading',
+      'order flow UK',
+      'prop trading London',
+      'ICT killzones'
+    ],
+    popular_instruments: ['FTSE 100', 'GBPUSD', 'Brent Crude', 'Gold'],
+    local_market_phrases: ['London open', 'FTSE analysis', 'LSE market update'],
+    common_content_format_names: ['Morning briefing', 'Weekly trade breakdown', 'London session recap']
+  },
+  {
     country: 'Germany',
     languages: ['German'],
     native_trading_terminology: [
@@ -77,23 +94,6 @@ export const INITIAL_COUNTRY_VOCABULARIES: CountryVocabulary[] = [
     popular_instruments: ['IBEX 35', 'EURUSD', 'Nasdaq', 'Bitcoin'],
     local_market_phrases: ['Apertura de mercado', 'Sesión de Nueva York', 'Prueba de fondeo'],
     common_content_format_names: ['Resumen semanal', 'Bitácora de trading', 'Análisis en directo']
-  },
-  {
-    country: 'United Kingdom',
-    languages: ['English'],
-    native_trading_terminology: [
-      'FTSE trading',
-      'spread betting',
-      'London session',
-      'price action',
-      'indices trading',
-      'order flow UK',
-      'prop trading London',
-      'ICT killzones'
-    ],
-    popular_instruments: ['FTSE 100', 'GBPUSD', 'Brent Crude', 'Gold'],
-    local_market_phrases: ['London open', 'FTSE analysis', 'LSE market update'],
-    common_content_format_names: ['Morning briefing', 'Weekly trade breakdown', 'London session recap']
   },
   {
     country: 'Netherlands',
