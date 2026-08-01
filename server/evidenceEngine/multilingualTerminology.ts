@@ -7,6 +7,15 @@ export const SUPPORTED_CLASSIFICATION_COUNTRIES = SUPPORTED_PRODUCTION_COUNTRIES
 
 export interface MultilingualClassificationPack {
   languageCode: 'en' | 'de' | 'fr' | 'es' | 'it' | 'nl' | 'ja' | 'da' | 'sv' | 'ar' | 'zh' | 'ms';
+export const SUPPORTED_CLASSIFICATION_COUNTRIES = [
+  'United States', 'United Kingdom', 'Germany', 'France', 'Spain',
+  'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland',
+  'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand',
+  'Belgium', 'Luxembourg', 'Ireland'
+] as const;
+
+export interface MultilingualClassificationPack {
+  languageCode: 'en' | 'de' | 'fr' | 'es' | 'it' | 'nl' | 'ja' | 'da' | 'sv' | 'ar';
   executionTerms: string[];
   educationalTerms: string[];
   businessNewsTerms: string[];
