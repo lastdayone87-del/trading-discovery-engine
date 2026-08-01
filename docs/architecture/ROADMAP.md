@@ -389,6 +389,16 @@ corroboration. Entity observation is default-off and no automatic merge or
 online mutable-graph dependency is introduced. See
 [the Phase 19 decision record](../phase-19-entity-resolution-source-independence.md).
 
+## Active implementation — Phase 20 temporal research frontier
+
+Phase 20 adds append-only bitemporal entity relationships, sealed as-of graph
+snapshots, deterministic attributed neighborhood planning, and incremental-yield
+outcomes linked to evaluation cohorts. Traversal is bounded by depth, fan-out,
+hub, component, freshness, confidence, and source-family independence. It is
+shadow-only by default, cannot confirm candidates, and never places the mutable
+graph on the serving path. See
+[the Phase 20 decision record](../phase-20-temporal-research-frontier.md).
+
 ## What not to do
 
 - Do not fix global recall by continually appending static keywords.
