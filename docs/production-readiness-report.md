@@ -1,5 +1,7 @@
 # Production Readiness Report
 
+> **Historical snapshot:** This report predates phases 16–21 and the final 2026-08-01 audit. Findings superseded by later implementation are retained for history; use [Final production-readiness review](./architecture/FINAL_PRODUCTION_READINESS_REVIEW.md) for the current decision.
+
 Date: 2026-07-29
 
 ## Phase A-F end-to-end validation
@@ -218,7 +220,7 @@ existing incompatible legacy operation: it returns an error by design.
 | Variable | Requirement |
 | --- | --- |
 | `DATABASE_URL` | Required; Railway PostgreSQL connection string. |
-| `YOUTUBE_API_KEY` (or `_1` … `_5`) | Required for real discovery/enrichment. |
+| `YOUTUBE_API_KEY` (plus indexed keys through the configured `YOUTUBE_API_KEY_POOL_SIZE`) | Required for real discovery/enrichment. |
 | `GEMINI_API_KEY` | Required for Gemini semantic evidence; do not use it as a YouTube key. |
 | `NODE_ENV=production` | Required for production static serving/runtime behavior. |
 | `PORT` | Railway injects it; local default is 3000. |

@@ -49,7 +49,7 @@ Every autonomous selection comes from the country-scoped query library. New libr
 
 ### 1. Curated country search atoms
 
-A hard-coded map supplies compact instruments, methods, markets, and formats for the ten supported discovery countries. These are stable cold-start controls.
+A governed map supplies compact instruments, methods, markets, and formats for all supported production discovery countries. These are stable cold-start controls.
 
 ### 2. Seeded country vocabularies
 
@@ -228,3 +228,11 @@ Candidates should enter bounded randomized trials, be measured on quality-adjust
 ## Priority 10 knowledge-plane consumption
 
 The planner may consume only the deterministic discovery projection of an immutable pinned knowledge publication. Every atom carries concept and surface identity, concept version, language/script/locale, policy version, publication checksum, and pointer version. Query outcomes return as append-only contributions and never mutate the active artifact. Existing proven catalogs and curated atoms remain compatibility controls until shadow replay, bounded canaries, and rollback proof permit migration.
+
+## Production country coverage
+
+Discovery uses nineteen production country vocabularies and matching cold-start query atoms, inference signals, language/script policies, and classification knowledge packs. Switzerland, Denmark, Sweden, the United Arab Emirates, Singapore, New Zealand, Belgium, Luxembourg, and Ireland participate in the same persisted coverage lifecycle, terminology trials, query performance evaluation, governed adaptation, rollout controls, and benchmark segmentation as the original ten countries. Country is already a first-class dimension in those generic systems, so registering full vocabulary and knowledge packs automatically creates independent evaluation and learning slices without country-specific duplicate pipelines.
+
+## YouTube provider pool configuration
+
+`YOUTUBE_API_KEY_POOL_SIZE` controls the complete ordered provider pool. It defaults to 30 and names keys `YOUTUBE_API_KEY`, then `YOUTUBE_API_KEY_1` through the configured size minus one. Rotation, quota accounting, provider cooldown, backoff, scheduling, and rollout behavior consume the resolved pool and do not impose a separate application limit. Changing pool capacity therefore requires configuration only.

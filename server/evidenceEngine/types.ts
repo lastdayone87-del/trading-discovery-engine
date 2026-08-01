@@ -114,6 +114,8 @@ export interface LanguageKnowledge {
 export interface CountryKnowledgePack {
   countryName: string;
   primaryLanguage: string;
+  /** All deterministic language packs supported for multilingual countries. */
+  languageCodes?: string[];
   regionalExchanges: string[];
   localBrokers: string[];
   popularInstruments: string[];
@@ -128,6 +130,7 @@ export interface LayeredKnowledgeContext {
   globalAdvancedConcepts: string[];
   globalNegativeTerms: string[];
   languageKnowledge?: LanguageKnowledge;
+  languageKnowledgePacks?: LanguageKnowledge[];
   countryKnowledge?: CountryKnowledgePack;
 }
 

@@ -25,7 +25,7 @@ test('daily quota exhaustion cools only that provider until the next UTC day', (
   assert.deepEqual(providers.status('project-a'), { status: 'Active', retryAt: null });
 });
 
-test('availability and recovery status scale across all ten providers independently', () => {
+test('availability and recovery status scale across the configured provider pool independently', () => {
   let now = Date.parse('2026-07-30T12:00:00Z');
   const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,now:()=>now});
   const keys = Array.from({ length: 10 }, (_, index) => `project-${index + 1}`);

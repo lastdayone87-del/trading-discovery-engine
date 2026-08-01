@@ -117,7 +117,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
 
 /**
  * Retrieves all valid YouTube API keys available in environment variables.
- * Checks YOUTUBE_API_KEY and YOUTUBE_API_KEY_1..9.
+ * Checks the configuration-driven YouTube key environment-variable pool.
  */
 let activeKeyIndex = 0;
 let outboundTraceSequence = 0;

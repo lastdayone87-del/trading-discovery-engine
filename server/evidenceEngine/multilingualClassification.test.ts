@@ -9,6 +9,7 @@ import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { getLayeredKnowledgeContext } from './knowledgePacks';
 import { SUPPORTED_CLASSIFICATION_COUNTRIES } from './multilingualTerminology';
+import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries';
 
 const engine = new EvidenceBasedTradingEngine([
   new ChannelMetadataProvider(),
@@ -74,8 +75,8 @@ for (const example of adjacentCases) {
   });
 }
 
-test('classification knowledge is restricted to the ten supported countries', () => {
-  assert.deepEqual([...SUPPORTED_CLASSIFICATION_COUNTRIES], ['United States', 'United Kingdom', 'Germany', 'France', 'Spain', 'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan']);
+test('classification knowledge covers every production country', () => {
+  assert.deepEqual(SUPPORTED_CLASSIFICATION_COUNTRIES, SUPPORTED_PRODUCTION_COUNTRIES);
   assert.equal(getLayeredKnowledgeContext('Brazil').countryKnowledge, undefined);
   assert.equal(getLayeredKnowledgeContext('India').countryKnowledge, undefined);
 });
