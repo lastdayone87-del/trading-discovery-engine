@@ -353,6 +353,65 @@ The `governed-knowledge-v1` contract is the common publication boundary for clas
 - explicit review workload budgets;
 - documentation updates in `docs/architecture/`.
 
+## Completed implementation — Phase 16 decision evaluation control plane
+
+The post-roadmap implementation begins with the measurement dependency shared by
+all later adaptive work. Phase 16 adds immutable cohort assignments with known
+inclusion propensity, ground-truth lineage, sealed evaluation datasets,
+propensity-weighted benchmarking and calibration diagnostics, and evidence-based
+promotion gates. These records are observational and cannot activate production.
+See [the Phase 16 decision record](../phase-16-decision-evaluation-control-plane.md).
+
+## Completed implementation — Phase 17 intelligent evidence acquisition
+
+Phase 17 introduces the shared utility/hard-constraint contract and a
+value-of-information controller over the existing bounded enrichment actions.
+It derives typed evidence gaps, compares expected resolution against provider,
+review, latency, quota, and risk cost, and records immutable selections and
+outcomes. `OFF` and `SHADOW` preserve the legacy action; a bounded `CANARY` may
+choose only a registered action and cannot bypass staged classification. See
+[the Phase 17 decision record](../phase-17-value-of-information-evidence.md).
+
+## Completed implementation — Phase 18 resumable investigations
+
+Phase 18 wraps long-running evidence acquisition in an idempotent workflow with
+transactional step/job scheduling, immutable attempt events, leases, deadlines,
+stale recovery, orphan reconciliation, output checksums, and projection repair.
+It is default-off and preserves legacy `ENRICH_CHANNEL` execution and rollback.
+See [the Phase 18 decision record](../phase-18-resumable-investigation-workflows.md).
+
+## Completed implementation — Phase 19 conservative entity resolution
+
+Phase 19 adds country-neutral canonical entity identifiers, governed binding
+proposals, source-family correlation units, and immutable resolution lineage.
+Classification now collapses correlated source families before granting
+corroboration. Entity observation is default-off and no automatic merge or
+online mutable-graph dependency is introduced. See
+[the Phase 19 decision record](../phase-19-entity-resolution-source-independence.md).
+
+## Completed implementation — Phase 20 temporal research frontier
+
+Phase 20 adds append-only bitemporal entity relationships, sealed as-of graph
+snapshots, deterministic attributed neighborhood planning, and incremental-yield
+outcomes linked to evaluation cohorts. Traversal is bounded by depth, fan-out,
+hub, component, freshness, confidence, and source-family independence. It is
+shadow-only by default, cannot confirm candidates, and never places the mutable
+graph on the serving path. See
+[the Phase 20 decision record](../phase-20-temporal-research-frontier.md).
+
+## Completed implementation — Phase 21 governed adaptation
+
+The final dependency stage closes the corrective-learning and safe-adaptation
+loop without adding autonomous publication. Human-confirmed misses create
+source-bound causal incidents and remediation proposals; protected audits remain
+separate from operational and active-learning review capacity. Coverage
+opportunity and saturation share one uncertainty-aware signal with scheduled
+probes. Generalized experiment, drift, operational-attribution, and segmented
+provider-calibration records are immutable, default-off, evaluation-bound, and
+have no serving authority. See
+[the Phase 21 decision record](../phase-21-governed-adaptation.md) and the
+[final implementation audit](./FINAL_IMPLEMENTATION_AUDIT.md).
+
 ## What not to do
 
 - Do not fix global recall by continually appending static keywords.

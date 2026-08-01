@@ -1,7 +1,6 @@
 import { completeJob, finishQuotaReservation, getAppSetting, getDailyYouTubeQuotaBudget, getDb, tryReserveQuota, type DurableJob } from './db';
 import { normalizePlaylistObservations, PLAYLIST_PROVIDER_COST } from './evidenceGraphAdapters';
-import { fetchYouTubePlaylistChannels } from './youtube';
-import type { DiscoveredChannelRaw } from './youtube';
+import { fetchYouTubePlaylistChannels, type DiscoveredChannelRaw } from './youtube';
 
 export async function processPlaylistInspectionJob(job:DurableJob,ingest:(raw:DiscoveredChannelRaw,country:string,source:'automated_query')=>Promise<unknown>):Promise<void>{
   const db=await getDb();const actionId=String(job.payload.actionId||'');

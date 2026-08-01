@@ -29,6 +29,8 @@ import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
+import { recordEvidenceActionOutcome } from './voiEvidenceController';
+import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
@@ -133,6 +135,8 @@ export async function processNextSearchJob(
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
+  await recoverStaleInvestigationSteps();
+  await reconcileOrphanInvestigations();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
@@ -156,14 +160,17 @@ export async function processNextSearchJob(
 
   const job = await claimNextJob(workerId, claimableTypes);
   if (!job) return false;
+  const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
   return withExecutionTrace(traceId,async()=>{
   const heartbeat = setInterval(() => {
     heartbeatJob(job.id, workerId).catch(error => console.error(`[Queue Worker:${workerId}] Heartbeat failed:`, error));
+    if(investigationId&&investigationStepId)heartbeatInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,workerId}).catch(error=>console.error(`[Investigation:${investigationId}] Heartbeat failed:`,error));
   }, 60_000);
   heartbeat.unref?.();
 
   try {
+    if(investigationId&&investigationStepId&&!await startInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,attempt:job.attempts,workerId})){await completeJob(job.id);return true;}
     await recordExecutionStage('DISPATCHER','REACHED',{jobId:job.id,type:job.type});
     if(job.type==='TERM_HARVEST'){await processTermHarvestJob(job);return true;}
     if(job.type==='SCORE_CANDIDATES'){await processCandidateScoringJob(job);return true;}
@@ -210,6 +217,7 @@ export async function processNextSearchJob(
       return true;
     }
     if (job.type === 'ENRICH_CHANNEL') {
+      const evidenceStartedAt=Date.now(),evidenceDecisionId=String(job.payload.evidenceAcquisitionDecisionId||'');
       const { channelId, targetCountry, source, candidate } = job.payload as {
         channelId: string;
         targetCountry: string;
@@ -218,10 +226,12 @@ export async function processNextSearchJob(
         enrichmentStage?:number;
       };
       const enrichmentStage=Math.min(3,Math.max(1,Number(job.payload.enrichmentStage||1))) as 1|2|3;
+      if(investigationId)candidate.investigationId=investigationId;
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
       const channel = await getChannelById(channelId);
       if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
-        await completeJob(job.id);
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel?.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'CASE_NO_LONGER_ELIGIBLE'}).catch(()=>undefined);
+        if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel?.trading_status||'NEEDS_REVIEW',output:{reason:'CASE_NO_LONGER_ELIGIBLE'}});else await completeJob(job.id);
         return true;
       }
 
@@ -237,10 +247,12 @@ export async function processNextSearchJob(
       if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
         const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage);
-        await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
+        const pipelineOutcome=await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentStage>=2?202:101,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
-        await completeJob(job.id);
+        if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
       } catch (error) {
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, false);
         throw error;
       }
@@ -316,11 +328,12 @@ export async function processNextSearchJob(
       // without retrying so it can never spend external API quota.
       const runId = String(job.payload?.queryRunId || '');
       if (runId) await failQueryRun(runId, err, true);
-      await completeJob(job.id);
+      if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
       return true;
     }
     const disposition=await failJob(job.id, err);
     const terminal=disposition==='FAILED';
+    if(investigationId&&investigationStepId)await failInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,attempt:job.attempts,terminal,failureClass:String(err?.code||err?.name||'WORKER_FAILURE')}).catch(error=>console.error(`[Investigation:${investigationId}] Failure transition failed:`,error));
     if (job.type === 'MANUAL_SEARCH_PAGE' && terminal) await failManualSearch(String(job.payload.sessionId||''), err);
     if (job.type === 'ENRICH_CHANNEL' && terminal) {
       const channelId = String(job.payload?.channelId || '');

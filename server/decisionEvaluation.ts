@@ -1,0 +1,126 @@
+import { createHash } from 'node:crypto';
+import { getDb } from './db';
+
+export const DECISION_EVALUATION_SCHEMA_VERSION = 'decision-evaluation-v1';
+export const DEFAULT_LABEL_POLICY_VERSION = 'evaluation-ground-truth-v1';
+
+const stable = (value:unknown):string => JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)
+  ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))) : item);
+export const evaluationChecksum = (value:unknown):string => createHash('sha256').update(stable(value)).digest('hex');
+
+export interface SamplingPolicy {
+  policyKey:string;
+  version:number;
+  salt:string;
+  protectedAuditBasisPoints:number;
+  targetedAuditBasisPoints:number;
+  targetedStrata?:Record<string,number>;
+}
+export interface EvaluationStratum {country:string;language:string;script:string;evidenceBand:string;providerState:string;discoveryOrigin:string}
+export interface CohortAssignment {assignmentKey:string;cohort:'PROTECTED_AUDIT'|'TARGETED_AUDIT'|'NOT_SELECTED';inclusionBasisPoints:number;randomizationValue:number;stratum:EvaluationStratum}
+
+function basisPoints(value:number,name:string){if(!Number.isInteger(value)||value<0||value>10000)throw new Error(`${name} must be an integer between 0 and 10000.`);}
+export function validateSamplingPolicy(policy:SamplingPolicy):void{
+  if(!policy.policyKey?.trim()||!policy.salt?.trim()||!Number.isInteger(policy.version)||policy.version<1)throw new Error('Sampling policy identity, salt, and positive version are required.');
+  basisPoints(policy.protectedAuditBasisPoints,'protectedAuditBasisPoints');basisPoints(policy.targetedAuditBasisPoints,'targetedAuditBasisPoints');
+  if(policy.protectedAuditBasisPoints+policy.targetedAuditBasisPoints>10000)throw new Error('Sampling allocations cannot exceed 10000 basis points.');
+  for(const [key,value] of Object.entries(policy.targetedStrata||{})){if(!key.trim())throw new Error('Targeted stratum keys cannot be empty.');basisPoints(value,`targetedStrata.${key}`);}
+}
+const stratumKey=(s:EvaluationStratum)=>[s.country,s.language,s.script,s.evidenceBand,s.providerState,s.discoveryOrigin].join('|');
+const deterministicBasisPoints=(key:string)=>parseInt(createHash('sha256').update(key).digest('hex').slice(0,8),16)%10000;
+export function assignEvaluationCohort(subjectKey:string,stratum:EvaluationStratum,policy:SamplingPolicy):CohortAssignment{
+  validateSamplingPolicy(policy);if(!subjectKey.trim())throw new Error('subjectKey is required.');
+  const key=stratumKey(stratum),value=deterministicBasisPoints(`${policy.salt}|${policy.policyKey}|${policy.version}|${subjectKey}`);
+  const targeted=Math.max(policy.targetedAuditBasisPoints,policy.targetedStrata?.[key]||0);
+  const protectedCutoff=policy.protectedAuditBasisPoints,targetedCutoff=Math.min(10000,protectedCutoff+targeted);
+  const cohort=value<protectedCutoff?'PROTECTED_AUDIT':value<targetedCutoff?'TARGETED_AUDIT':'NOT_SELECTED';
+  // Both selected cohorts are members of the same audit population. Their
+  // inclusion probability is the full selected interval, not the width of the
+  // named sub-lane; otherwise propensity weighting would over-count protected
+  // audit examples whenever a targeted lane is also enabled.
+  const probability=cohort==='NOT_SELECTED'?Math.max(0,10000-targetedCutoff):targetedCutoff;
+  return {assignmentKey:evaluationChecksum({schema:DECISION_EVALUATION_SCHEMA_VERSION,subjectKey,policy:policy.policyKey,version:policy.version}),cohort,inclusionBasisPoints:probability,randomizationValue:value,stratum};
+}
+
+export interface LabeledDecision {key:string;truth:'TRADING_CONFIRMED'|'NON_TRADING';predicted:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';score:number;inclusionProbability:number;reviewRequired?:boolean;segment?:Record<string,string>}
+export interface EvaluationMetrics {sampleSize:number;effectiveSampleSize:number;weightedTotal:number;precision:number|null;recall:number|null;falsePositiveRate:number|null;falseNegativeRate:number|null;abstentionRate:number;reviewRate:number;brierScore:number;expectedCalibrationError:number}
+export interface MetricInterval {lower:number;upper:number}
+export interface BenchmarkResult {metrics:EvaluationMetrics;intervals:{precision:MetricInterval|null;recall:MetricInterval|null};segments:Record<string,EvaluationMetrics>;calibration:{bins:Array<{lower:number;upper:number;weight:number;predicted:number;observed:number}>};reasonCodes:string[]}
+export interface IsotonicPoint {upper:number;probability:number;weight:number}
+
+const ratio=(a:number,b:number)=>b>0?a/b:null;
+function wilsonProportion(p:number|null,effectiveTotal:number,z=1.96):MetricInterval|null{if(p===null||effectiveTotal<=0)return null;const z2=z*z,d=1+z2/effectiveTotal,c=(p+z2/(2*effectiveTotal))/d,r=z*Math.sqrt((p*(1-p)+z2/(4*effectiveTotal))/effectiveTotal)/d;return {lower:Math.max(0,c-r),upper:Math.min(1,c+r)};}
+function weightedEffectiveSize(rows:LabeledDecision[]){const weights=rows.map(row=>1/row.inclusionProbability),sum=weights.reduce((a,b)=>a+b,0),sum2=weights.reduce((a,b)=>a+b*b,0);return sum2?sum*sum/sum2:0;}
+function evaluateMetrics(rows:LabeledDecision[]):EvaluationMetrics{
+  let weight=0,weight2=0,tp=0,fp=0,tn=0,fn=0,abstain=0,review=0,brier=0,ece=0;
+  const bins=Array.from({length:10},()=>({w:0,p:0,o:0}));
+  for(const row of rows){if(!(row.inclusionProbability>0&&row.inclusionProbability<=1))throw new Error('Inclusion probability must be within (0,1].');if(!Number.isFinite(row.score)||row.score<0||row.score>1)throw new Error('Scores must be probabilities between zero and one.');const w=1/row.inclusionProbability,y=row.truth==='TRADING_CONFIRMED'?1:0;weight+=w;weight2+=w*w;brier+=w*(row.score-y)**2;const bin=Math.min(9,Math.floor(row.score*10));bins[bin].w+=w;bins[bin].p+=w*row.score;bins[bin].o+=w*y;if(row.reviewRequired??row.predicted==='UNCERTAIN')review+=w;if(row.predicted==='UNCERTAIN')abstain+=w;else if(row.predicted==='TRADING_CONFIRMED'&&y)tp+=w;else if(row.predicted==='TRADING_CONFIRMED')fp+=w;else if(y)fn+=w;else tn+=w;}
+  for(const bin of bins)if(bin.w)ece+=(bin.w/Math.max(weight,1))*Math.abs(bin.p/bin.w-bin.o/bin.w);
+  return {sampleSize:rows.length,effectiveSampleSize:weight2?weight*weight/weight2:0,weightedTotal:weight,precision:ratio(tp,tp+fp),recall:ratio(tp,tp+fn),falsePositiveRate:ratio(fp,fp+tn),falseNegativeRate:ratio(fn,fn+tp),abstentionRate:weight?abstain/weight:0,reviewRate:weight?review/weight:0,brierScore:weight?brier/weight:0,expectedCalibrationError:ece};
+}
+export function benchmarkDecisions(rows:LabeledDecision[],minimumEffectiveSampleSize=30):BenchmarkResult{
+  const metrics=evaluateMetrics(rows),segments:Record<string,EvaluationMetrics>={};
+  for(const row of rows){const key=stable(row.segment||{});(segments[key] ||= evaluateMetrics([]));}
+  for(const key of Object.keys(segments))segments[key]=evaluateMetrics(rows.filter(row=>stable(row.segment||{})===key));
+  const bins=Array.from({length:10},(_,index)=>{const selected=rows.filter(row=>Math.min(9,Math.floor(row.score*10))===index),weight=selected.reduce((sum,row)=>sum+1/row.inclusionProbability,0);return {lower:index/10,upper:(index+1)/10,weight,predicted:weight?selected.reduce((sum,row)=>sum+row.score/row.inclusionProbability,0)/weight:0,observed:weight?selected.reduce((sum,row)=>sum+(row.truth==='TRADING_CONFIRMED'?1:0)/row.inclusionProbability,0)/weight:0};});
+  const positivePredictions=rows.filter(r=>r.predicted==='TRADING_CONFIRMED'),truthPositives=rows.filter(r=>r.truth==='TRADING_CONFIRMED'&&r.predicted!=='UNCERTAIN');
+  const reasons=metrics.effectiveSampleSize<minimumEffectiveSampleSize?['INSUFFICIENT_EFFECTIVE_SAMPLE_SIZE']:[];
+  return {metrics,intervals:{precision:wilsonProportion(metrics.precision,weightedEffectiveSize(positivePredictions)),recall:wilsonProportion(metrics.recall,weightedEffectiveSize(truthPositives))},segments,calibration:{bins},reasonCodes:reasons};
+}
+export function fitBinnedIsotonic(rows:LabeledDecision[]):IsotonicPoint[]{
+  const ordered=[...rows].sort((a,b)=>a.score-b.score||a.key.localeCompare(b.key)),blocks:Array<{upper:number;weight:number;positive:number}>=[];
+  for(const row of ordered){const weight=1/row.inclusionProbability,positive=row.truth==='TRADING_CONFIRMED'?weight:0;blocks.push({upper:row.score,weight,positive});while(blocks.length>1){const right=blocks[blocks.length-1],left=blocks[blocks.length-2];if(left.positive/left.weight<=right.positive/right.weight)break;blocks.splice(-2,2,{upper:right.upper,weight:left.weight+right.weight,positive:left.positive+right.positive});}}
+  return blocks.map(block=>({upper:block.upper,probability:block.weight?block.positive/block.weight:0,weight:block.weight}));
+}
+export function applyIsotonic(score:number,points:IsotonicPoint[]):number{if(!points.length)return score;return (points.find(point=>score<=point.upper)||points[points.length-1]).probability;}
+
+export interface PromotionPolicy {minimumEffectiveSampleSize:number;minimumPrecisionLowerBound:number;maximumRecallRegression:number;maximumAbstentionIncrease:number;maximumBrierRegression:number;requiredSegments:string[]}
+export function decidePromotion(baseline:BenchmarkResult,candidate:BenchmarkResult,policy:PromotionPolicy){
+  const reasons:string[]=[];if(candidate.metrics.effectiveSampleSize<policy.minimumEffectiveSampleSize)reasons.push('INSUFFICIENT_EFFECTIVE_SAMPLE_SIZE');
+  if(candidate.intervals.precision===null||candidate.intervals.precision.lower<policy.minimumPrecisionLowerBound)reasons.push('PRECISION_LOWER_BOUND');
+  if((baseline.metrics.recall??0)-(candidate.metrics.recall??0)>policy.maximumRecallRegression)reasons.push('RECALL_REGRESSION');
+  if(candidate.metrics.abstentionRate-baseline.metrics.abstentionRate>policy.maximumAbstentionIncrease)reasons.push('ABSTENTION_REGRESSION');
+  if(candidate.metrics.brierScore-baseline.metrics.brierScore>policy.maximumBrierRegression)reasons.push('CALIBRATION_REGRESSION');
+  for(const segment of policy.requiredSegments)if(!candidate.segments[segment]||candidate.segments[segment].effectiveSampleSize<policy.minimumEffectiveSampleSize)reasons.push(`SEGMENT_INSUFFICIENT:${segment}`);
+  return {decision:reasons.some(r=>r.startsWith('INSUFFICIENT')||r.startsWith('SEGMENT_INSUFFICIENT'))?'INSUFFICIENT_EVIDENCE' as const:reasons.length?'REJECT' as const:'PROMOTE' as const,reasonCodes:reasons,comparison:{baseline:baseline.metrics,candidate:candidate.metrics}};
+}
+
+export async function recordEvaluationGroundTruth(input:{channelId:string;reviewDecisionId?:string;label:'TRADING_CONFIRMED'|'NON_TRADING'|'DISPUTED';provenance:'HUMAN_REVIEW'|'DELAYED_PRODUCTION'|'ADJUDICATION';reviewerCount?:number;disagreement?:boolean;evidenceSnapshot?:unknown;labelPolicyVersion?:string}){
+  if(!input.channelId?.trim())throw new Error('Ground-truth channel identity is required.');if(input.provenance==='HUMAN_REVIEW'&&!input.reviewDecisionId)throw new Error('Human-review ground truth requires a review decision.');if(input.provenance==='DELAYED_PRODUCTION'&&(!input.evidenceSnapshot||typeof input.evidenceSnapshot!=='object'))throw new Error('Delayed-production ground truth requires an evidence snapshot.');
+  const db=await getDb(),labelPolicyVersion=input.labelPolicyVersion||DEFAULT_LABEL_POLICY_VERSION,labelKey=evaluationChecksum({channelId:input.channelId,reviewDecisionId:input.reviewDecisionId||null,label:input.label,provenance:input.provenance,labelPolicyVersion});
+  const result=await db.query(`INSERT INTO evaluation_ground_truth_labels(label_key,channel_id,review_decision_id,label,provenance,reviewer_count,disagreement,label_policy_version,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(label_key) DO NOTHING RETURNING *`,[labelKey,input.channelId,input.reviewDecisionId||null,input.label,input.provenance,input.reviewerCount||1,!!input.disagreement,labelPolicyVersion,JSON.stringify(input.evidenceSnapshot||{})]);return result.rows[0]||null;
+}
+
+export async function recordRetrievalEvaluationAssignment(input:{channelId:string;targetCountry:string;discoveryOrigin:string;language?:string;script?:string;observedAt?:string;context?:unknown},policy:SamplingPolicy):Promise<CohortAssignment>{
+  const observedAt=input.observedAt||new Date().toISOString(),day=observedAt.slice(0,10),stratum:EvaluationStratum={country:input.targetCountry||'GLOBAL',language:input.language||'und',script:input.script||'UNKNOWN',evidenceBand:'PRE_CLASSIFICATION',providerState:'NOT_OBSERVED',discoveryOrigin:input.discoveryOrigin};
+  const assignment=assignEvaluationCohort(`${input.channelId}|${input.discoveryOrigin}|${day}`,stratum,policy),db=await getDb();
+  await db.query(`INSERT INTO evaluation_cohort_assignments(assignment_key,channel_id,policy_key,policy_version,cohort,inclusion_basis_points,randomization_value,stratum,discovery_context,assigned_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(assignment_key) DO NOTHING`,[assignment.assignmentKey,input.channelId,policy.policyKey,policy.version,assignment.cohort,assignment.inclusionBasisPoints,assignment.randomizationValue,JSON.stringify(stratum),JSON.stringify(input.context||{}),observedAt]);return assignment;
+}
+
+export interface DatasetDefinition {datasetKey:string;cutoffAt:string;calibrationFrom:string;testFrom:string;minimumInclusionBasisPoints?:number;countries?:string[];languages?:string[]}
+export async function sealEvaluationDataset(input:{definition:DatasetDefinition;actor:string}){
+  const d=input.definition;for(const key of ['datasetKey','cutoffAt','calibrationFrom','testFrom'] as const)if(!String(d[key]||'').trim())throw new Error(`${key} is required.`);
+  const cutoff=new Date(d.cutoffAt),calibration=new Date(d.calibrationFrom),test=new Date(d.testFrom);if([cutoff,calibration,test].some(x=>!Number.isFinite(x.getTime()))||!(calibration<test&&test<=cutoff))throw new Error('Dataset time split must satisfy calibrationFrom < testFrom <= cutoffAt.');
+  const db=await getDb();const rows=await db.query(`WITH latest_labels AS (
+      SELECT DISTINCT ON(channel_id) * FROM evaluation_ground_truth_labels WHERE labeled_at<=$1 AND label<>'DISPUTED' ORDER BY channel_id,labeled_at DESC,id DESC
+    ), latest_diagnostics AS (
+      SELECT DISTINCT ON(d.channel_id) d.* FROM production_classification_diagnostics d JOIN latest_labels l USING(channel_id) WHERE d.created_at<=l.labeled_at ORDER BY d.channel_id,d.created_at DESC,d.id DESC
+    ), latest_assignments AS (
+      SELECT DISTINCT ON(channel_id) * FROM evaluation_cohort_assignments WHERE assigned_at<=$1 AND cohort<>'NOT_SELECTED' ORDER BY channel_id,assigned_at DESC,id DESC
+    ) SELECT d.id diagnostic_id,d.channel_id,d.created_at,d.normalized_input,d.provider_execution,d.decision,l.id label_id,l.label,l.labeled_at,a.id assignment_id,a.inclusion_basis_points,a.stratum
+      FROM latest_diagnostics d JOIN latest_labels l USING(channel_id) JOIN latest_assignments a USING(channel_id)
+      WHERE a.inclusion_basis_points>=COALESCE($2,1) AND ($3::text[] IS NULL OR a.stratum->>'country'=ANY($3)) AND ($4::text[] IS NULL OR a.stratum->>'language'=ANY($4)) ORDER BY d.created_at,d.channel_id`,[d.cutoffAt,d.minimumInclusionBasisPoints||1,d.countries?.length?d.countries:null,d.languages?.length?d.languages:null]);
+  const definition={schemaVersion:DECISION_EVALUATION_SCHEMA_VERSION,...d},examples=rows.rows.map((row:any)=>{const split=new Date(row.created_at)<calibration?'TRAIN':new Date(row.created_at)<test?'CALIBRATION':'TEST',segment={country:row.stratum?.country||row.normalized_input?.country||'GLOBAL',language:row.stratum?.language||'und',script:row.stratum?.script||'UNKNOWN',evidenceBand:row.stratum?.evidenceBand||'UNKNOWN',providerState:Array.isArray(row.provider_execution)&&row.provider_execution.some((p:any)=>p.availability==='FAILED'||p.availability==='UNAVAILABLE')?'DEGRADED':'AVAILABLE'};return {...row,split,segment,exampleKey:evaluationChecksum({diagnosticId:row.diagnostic_id,labelId:row.label_id,assignmentId:row.assignment_id})};});
+  const checksum=evaluationChecksum({definition,examples:examples.map((e:any)=>[e.exampleKey,e.split,e.label,e.inclusion_basis_points])}),client=await db.connect();try{await client.query('BEGIN');const version=await client.query('SELECT COALESCE(MAX(version),0)+1 version FROM decision_evaluation_datasets WHERE dataset_key=$1',[d.datasetKey]);const dataset=await client.query(`INSERT INTO decision_evaluation_datasets(dataset_key,version,cutoff_at,definition,checksum,example_count,created_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[d.datasetKey,version.rows[0].version,d.cutoffAt,JSON.stringify(definition),checksum,examples.length,input.actor]);for(const e of examples)await client.query(`INSERT INTO decision_evaluation_examples(dataset_id,example_key,channel_id,decision_diagnostic_id,assignment_id,label_id,split,segment,production_status,production_score,ground_truth_label,inclusion_probability,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,[dataset.rows[0].id,e.exampleKey,e.channel_id,e.diagnostic_id,e.assignment_id,e.label_id,e.split,JSON.stringify(e.segment),e.decision?.status||'UNCERTAIN',Number(e.decision?.confidenceScore||0),e.label,e.inclusion_basis_points/10000,e.created_at]);await client.query('COMMIT');return dataset.rows[0];}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
+
+export async function persistDecisionBenchmark(input:{datasetId:string;candidateKey:string;candidateVersion:string;policyVersion:string;predictions:Array<{exampleKey:string;predicted:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';probability:number;reviewRequired?:boolean}>;minimumEffectiveSampleSize?:number;actor:string}){
+  if(!input.candidateKey?.trim()||!input.candidateVersion?.trim()||!input.policyVersion?.trim())throw new Error('Candidate identity and policy version are required.');const db=await getDb(),examples=await db.query(`SELECT example_key,ground_truth_label,inclusion_probability,segment,split FROM decision_evaluation_examples WHERE dataset_id=$1 AND split IN('CALIBRATION','TEST') ORDER BY split,example_key`,[input.datasetId]),predictions=new Map(input.predictions.map(p=>[p.exampleKey,p]));
+  const missing=examples.rows.filter((e:any)=>!predictions.has(e.example_key));if(missing.length)throw new Error(`Predictions are missing ${missing.length} calibration/test examples.`);const mapped:LabeledDecision[]=examples.rows.map((e:any)=>{const p=predictions.get(e.example_key)!;return {key:e.example_key,truth:e.ground_truth_label,predicted:p.predicted,score:p.probability,reviewRequired:p.reviewRequired,inclusionProbability:Number(e.inclusion_probability),segment:e.segment};}),calibrationRows=mapped.filter((_row,index)=>examples.rows[index].split==='CALIBRATION'),points=fitBinnedIsotonic(calibrationRows),testRows=mapped.filter((_row,index)=>examples.rows[index].split==='TEST').map(row=>({...row,score:applyIsotonic(row.score,points)})),result=benchmarkDecisions(testRows,input.minimumEffectiveSampleSize||30);if(weightedEffectiveSize(calibrationRows)<(input.minimumEffectiveSampleSize||30))result.reasonCodes.push('INSUFFICIENT_CALIBRATION_SPLIT');const runKey=evaluationChecksum({datasetId:input.datasetId,candidateKey:input.candidateKey,candidateVersion:input.candidateVersion,policyVersion:input.policyVersion,predictions:input.predictions}),checksum=evaluationChecksum({runKey,result,points}),decision=result.reasonCodes.length?'INSUFFICIENT_EVIDENCE':'PASS';
+  const client=await db.connect();try{await client.query('BEGIN');const persistedMetrics={...result.metrics,_intervals:result.intervals};const inserted=await client.query(`INSERT INTO decision_benchmark_runs(run_key,dataset_id,candidate_key,candidate_version,policy_version,metrics,segments,calibration,guardrail_reasons,decision,checksum,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(run_key) DO NOTHING RETURNING *`,[runKey,input.datasetId,input.candidateKey,input.candidateVersion,input.policyVersion,JSON.stringify(persistedMetrics),JSON.stringify(result.segments),JSON.stringify({...result.calibration,isotonicPoints:points,fitSplit:'CALIBRATION',evaluationSplit:'TEST'}),JSON.stringify(result.reasonCodes),decision,checksum,input.actor]);const run=inserted.rowCount?inserted:await client.query('SELECT * FROM decision_benchmark_runs WHERE run_key=$1',[runKey]);const artifactUnsigned={schemaVersion:DECISION_EVALUATION_SCHEMA_VERSION,benchmarkRunId:run.rows[0].id,method:'BINNED_ISOTONIC',parameters:{points},segmentScope:{fitSplit:'CALIBRATION',evaluationSplit:'TEST'}},artifactChecksum=evaluationChecksum(artifactUnsigned);await client.query(`INSERT INTO calibration_artifacts(artifact_key,benchmark_run_id,method,parameters,segment_scope,checksum) VALUES($1,$2,'BINNED_ISOTONIC',$3,$4,$5) ON CONFLICT(artifact_key) DO NOTHING`,[evaluationChecksum({runKey,kind:'calibration'}),run.rows[0].id,JSON.stringify({points}),JSON.stringify({fitSplit:'CALIBRATION',evaluationSplit:'TEST'}),artifactChecksum]);await client.query('COMMIT');return {...run.rows[0],result,calibration:{points}};}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
+
+const resultFromRow=(row:any):BenchmarkResult=>({metrics:row.metrics,segments:row.segments,calibration:row.calibration,reasonCodes:row.guardrail_reasons,intervals:row.metrics?._intervals||{precision:null,recall:null}});
+export async function persistPromotionGate(input:{baselineRunId:string;candidateRunId:string;policy:PromotionPolicy;actor:string}){const db=await getDb(),runs=await db.query('SELECT * FROM decision_benchmark_runs WHERE id=ANY($1::uuid[])',[input.baselineRunId,input.candidateRunId]);const baseline=runs.rows.find((r:any)=>r.id===input.baselineRunId),candidate=runs.rows.find((r:any)=>r.id===input.candidateRunId);if(!baseline||!candidate)throw new Error('Baseline and candidate benchmark runs are required.');if(baseline.dataset_id!==candidate.dataset_id)throw new Error('Promotion comparisons require the same sealed dataset.');const outcome=decidePromotion(resultFromRow(baseline),resultFromRow(candidate),input.policy),gateKey=evaluationChecksum({baselineRunId:input.baselineRunId,candidateRunId:input.candidateRunId,policy:input.policy});const inserted=await db.query(`INSERT INTO decision_promotion_gates(gate_key,baseline_run_id,candidate_run_id,policy,comparison,decision,reason_codes,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(gate_key) DO NOTHING RETURNING *`,[gateKey,input.baselineRunId,input.candidateRunId,JSON.stringify(input.policy),JSON.stringify(outcome.comparison),outcome.decision,JSON.stringify(outcome.reasonCodes),input.actor]);if(inserted.rowCount)return inserted.rows[0];return (await db.query('SELECT * FROM decision_promotion_gates WHERE gate_key=$1',[gateKey])).rows[0];}
+
+export async function inspectDecisionEvaluation(limit=100){const db=await getDb(),n=Math.min(500,Math.max(1,Math.trunc(limit)));const [assignments,labels,datasets,runs,gates]=await Promise.all([db.query('SELECT * FROM evaluation_cohort_assignments ORDER BY assigned_at DESC LIMIT $1',[n]),db.query('SELECT * FROM evaluation_ground_truth_labels ORDER BY labeled_at DESC LIMIT $1',[n]),db.query('SELECT * FROM decision_evaluation_datasets ORDER BY created_at DESC LIMIT $1',[n]),db.query('SELECT * FROM decision_benchmark_runs ORDER BY created_at DESC LIMIT $1',[n]),db.query('SELECT * FROM decision_promotion_gates ORDER BY decided_at DESC LIMIT $1',[n])]);return {schemaVersion:DECISION_EVALUATION_SCHEMA_VERSION,servingAuthority:false,automaticPromotion:false,assignments:assignments.rows,labels:labels.rows,datasets:datasets.rows,benchmarkRuns:runs.rows,promotionGates:gates.rows};}

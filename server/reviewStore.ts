@@ -1,6 +1,8 @@
 import { getDb } from './db';
 import { REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION } from './replayMeasurement';
 import { recordAdaptiveShadowLabel } from './adaptiveTradingClassifier';
+import { recordEvaluationGroundTruth } from './decisionEvaluation';
+import { recordFalseNegativeIncident } from './governedAdaptation';
 
 export type ReviewState = 'NOT_REQUIRED'|'PENDING'|'APPROVED'|'REJECTED'|'SUPERSEDED';
 export type ReviewAction = 'APPROVE'|'REJECT'|'FORCE_RESCAN';
@@ -73,6 +75,10 @@ export async function decideReview(input:DecideInput) {
     // commits, never await them, and contain all failures at this boundary.
     if(input.action==='APPROVE'||input.action==='REJECT')void recordAdaptiveShadowLabel(input.channelId,inserted.rows[0].id,input.action==='APPROVE'?'TRADING_CONFIRMED':'NON_TRADING')
       .catch(error=>console.warn(`[AdaptiveClassifier] Shadow label failed for ${input.channelId}:`,error instanceof Error?error.message:error));
+    if(input.action==='APPROVE'||input.action==='REJECT')void recordEvaluationGroundTruth({channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,label:input.action==='APPROVE'?'TRADING_CONFIRMED':'NON_TRADING',provenance:'HUMAN_REVIEW',evidenceSnapshot:evidence})
+      .catch(error=>console.warn(`[DecisionEvaluation] Ground-truth label failed for ${input.channelId}:`,error instanceof Error?error.message:error));
+    if(input.action==='APPROVE'&&row.channel_snapshot?.trading_status!=='TRADING_CONFIRMED')void recordFalseNegativeIncident({channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,priorStatus:row.channel_snapshot?.trading_status||'UNKNOWN',evidenceSnapshot:evidence})
+      .catch(error=>console.warn(`[CorrectiveLearning] False-negative diagnosis failed for ${input.channelId}:`,error instanceof Error?error.message:error));
     return {decision:inserted.rows[0],idempotent:false};
   } catch(e){await client.query('ROLLBACK'); throw e;} finally {client.release();}
 }
