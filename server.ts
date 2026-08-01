@@ -36,6 +36,7 @@ import { allocateBestFirst, createPolicy, inspectPortfolio, transitionPolicy } f
 import { inspectAdaptiveClassifier } from './server/adaptiveTradingClassifier';
 import { inspectDecisionEvaluation, persistDecisionBenchmark, persistPromotionGate, sealEvaluationDataset } from './server/decisionEvaluation';
 import { inspectVoiEvidenceController } from './server/voiEvidenceController';
+import { inspectInvestigations, repairInvestigationProjection } from './server/investigationWorkflow';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -120,6 +121,8 @@ async function startServer() {
   app.post('/api/decision-evaluation/benchmarks',async(req,res)=>{try{res.status(201).json(await persistDecisionBenchmark({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_DECISION_BENCHMARK',requestId:req.requestId});}});
   app.post('/api/decision-evaluation/promotion-gates',async(req,res)=>{try{res.status(201).json(await persistPromotionGate({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PROMOTION_GATE',requestId:req.requestId});}});
   app.get('/api/evidence-acquisition',async(req,res)=>{try{res.json(await inspectVoiEvidenceController(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/investigations',async(req,res)=>{try{res.json(await inspectInvestigations(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/investigations/:id/repair',async(req,res)=>{try{res.json(await repairInvestigationProjection(req.params.id,req.operator!.actorId));}catch(err:any){res.status(err.message==='INVESTIGATION_NOT_FOUND'?404:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/proposals',async(req,res)=>{try{res.status(201).json(await proposePlaylistInspection({...req.body,programKey:req.body.programKey||'price-action-trading'}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/control',async(req,res)=>{try{res.json(await configurePlaylistCanary({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='ADAPTER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/actions/:id/enqueue',async(req,res)=>{try{const result=await enqueuePlaylistCanary(req.params.id,String(req.body.targetCountry||''));res.status(result.queued?202:409).json(result);}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});

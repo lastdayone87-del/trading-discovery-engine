@@ -372,6 +372,14 @@ outcomes. `OFF` and `SHADOW` preserve the legacy action; a bounded `CANARY` may
 choose only a registered action and cannot bypass staged classification. See
 [the Phase 17 decision record](../phase-17-value-of-information-evidence.md).
 
+## Active implementation — Phase 18 resumable investigations
+
+Phase 18 wraps long-running evidence acquisition in an idempotent workflow with
+transactional step/job scheduling, immutable attempt events, leases, deadlines,
+stale recovery, orphan reconciliation, output checksums, and projection repair.
+It is default-off and preserves legacy `ENRICH_CHANNEL` execution and rollback.
+See [the Phase 18 decision record](../phase-18-resumable-investigation-workflows.md).
+
 ## What not to do
 
 - Do not fix global recall by continually appending static keywords.
