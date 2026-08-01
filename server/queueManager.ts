@@ -29,6 +29,7 @@ import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
+import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
@@ -210,6 +211,7 @@ export async function processNextSearchJob(
       return true;
     }
     if (job.type === 'ENRICH_CHANNEL') {
+      const evidenceStartedAt=Date.now(),evidenceDecisionId=String(job.payload.evidenceAcquisitionDecisionId||'');
       const { channelId, targetCountry, source, candidate } = job.payload as {
         channelId: string;
         targetCountry: string;
@@ -221,6 +223,7 @@ export async function processNextSearchJob(
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
       const channel = await getChannelById(channelId);
       if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel?.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'CASE_NO_LONGER_ELIGIBLE'}).catch(()=>undefined);
         await completeJob(job.id);
         return true;
       }
@@ -237,10 +240,12 @@ export async function processNextSearchJob(
       if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
         const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage);
-        await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
+        const pipelineOutcome=await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentStage>=2?202:101,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
         await completeJob(job.id);
       } catch (error) {
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, false);
         throw error;
       }
