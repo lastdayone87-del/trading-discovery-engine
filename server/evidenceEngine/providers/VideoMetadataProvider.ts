@@ -16,6 +16,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
     const titles = input.video_titles || [];
     const descriptions = input.video_descriptions || [];
     const now = new Date().toISOString();
+    const videoRef=(index:number)=>({field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at,sourceFamilyId:input.videos?.[index]?.source_family_id,sourceEntityId:input.videos?.[index]?.source_entity_id||input.channel_entity_id});
 
     if (titles.length === 0) {
       return items;
@@ -90,7 +91,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'MULTI_VIDEO_CONSISTENCY',
           matchedTerm: `${tradingFocusedCount}/${titles.length} videos matching trading terms`,
           sourceRef: 'Sample Video Titles',
-          fields:titles.map((_title,index)=>({field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}))
+          fields:titles.map((_title,index)=>videoRef(index))
         },
         timestamp: now
       });
@@ -115,7 +116,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'INSTRUMENT',
           matchedTerm: matchedInstrumentsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>matchedInstrumentsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[{field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}]:[])
+          fields:titles.flatMap((title,index)=>matchedInstrumentsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
         },
         timestamp: now
       });
@@ -140,7 +141,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'PLATFORM_BROKER_PROPFIRM',
           matchedTerm: matchedPlatformsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>matchedPlatformsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[{field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}]:[])
+          fields:titles.flatMap((title,index)=>matchedPlatformsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
         },
         timestamp: now
       });
@@ -165,7 +166,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           type: 'METHODOLOGY_CONCEPT',
           matchedTerm: matchedConceptsInVideos.join(', '),
           sourceRef: 'Sample Video Titles & Descriptions',
-          fields:titles.flatMap((title,index)=>matchedConceptsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[{field:'video_title' as const,index,sourceId:input.videos?.[index]?.id,publishedAt:input.videos?.[index]?.published_at}]:[])
+          fields:titles.flatMap((title,index)=>matchedConceptsInVideos.some(term=>textMatchesTerm(`${title} ${descriptions[index]||''}`,term))?[videoRef(index)]:[])
         },
         timestamp: now
       });

@@ -9,8 +9,8 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     const textBlob = `${input.channel_name} ${input.description || ''}`;
     const now = new Date().toISOString();
     const fieldsFor=(terms:string[])=>[
-      ...(terms.some(term=>textMatchesTerm(input.channel_name,term))?[{field:'channel_title' as const}]:[]),
-      ...(terms.some(term=>textMatchesTerm(input.description||'',term))?[{field:'channel_bio' as const}]:[])
+      ...(terms.some(term=>textMatchesTerm(input.channel_name,term))?[{field:'channel_title' as const,sourceFamilyId:input.channel_source_family_id,sourceEntityId:input.channel_entity_id}]:[]),
+      ...(terms.some(term=>textMatchesTerm(input.description||'',term))?[{field:'channel_bio' as const,sourceFamilyId:input.channel_source_family_id,sourceEntityId:input.channel_entity_id}]:[])
     ];
 
     // 1. Match Global & Country Instruments in Channel Name/Description

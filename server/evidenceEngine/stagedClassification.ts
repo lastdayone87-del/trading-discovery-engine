@@ -2,6 +2,7 @@ import type {
   ClassificationStageResult, EvidenceCollectionReport, EvidenceFieldRef, EvidenceItem,
   LifecycleAction, RawChannelInput, StagedClassificationReport
 } from './types';
+import { collapseSourceIndependentObservations } from '../entityResolution';
 
 export const STAGED_CLASSIFICATION_VERSION = '2.2.0';
 
@@ -48,7 +49,9 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const attributableFields=corroborating.flatMap(item=>item.provenance?.fields||[]);
   const observations=new Set(attributableFields.map(ref=>`${ref.field}:${ref.sourceId || ref.index || ''}`));
   const observationFamilies=new Set(attributableFields.map(ref=>ref.field==='video_title'||ref.field==='video_description'?'video':ref.field==='playlist_name'||ref.field==='playlist_description'?'playlist':ref.field));
-  const repeated = evidence.some(item => item.category === 'MULTI_VIDEO_CONSISTENCY' && item.polarity === 'POSITIVE');
+  const independence=collapseSourceIndependentObservations(attributableFields.map((ref,index)=>({observationId:`${ref.field}:${ref.sourceId||ref.index||index}`,sourceFamilyId:ref.sourceFamilyId,sourceEntityId:ref.sourceEntityId})));
+  const repeatedItems=evidence.filter(item => item.category === 'MULTI_VIDEO_CONSISTENCY' && item.polarity === 'POSITIVE'),repeatedFields=repeatedItems.flatMap(item=>item.provenance?.fields||[]),repeatedIndependence=collapseSourceIndependentObservations(repeatedFields.map((ref,index)=>({observationId:`${ref.field}:${ref.sourceId||ref.index||index}`,sourceFamilyId:ref.sourceFamilyId,sourceEntityId:ref.sourceEntityId})));
+  const repeated = repeatedItems.length>0&&(repeatedFields.length===0||repeatedIndependence.independentFamilyCount>=2);
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
@@ -67,11 +70,11 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   // Independence is established by separately attributable observations, not by
   // duplicate provider emissions of the same lexical match. Multiple videos,
   // an About page plus a video, or another distinct document family qualify.
-  const independentObservations=observations.size>=2 && (observationFamilies.size>=2 || attributableFields.filter(f=>f.field==='video_title'||f.field==='video_description').length>=2);
-  const corroborated = corroborating.length > 0 && (repeated || independentObservations || sources.size >= 2 || independentDimensions.size >= 2);
+  const independentObservations=independence.independentFamilyCount>=2 && observations.size>=2 && (observationFamilies.size>=2 || attributableFields.filter(f=>f.field==='video_title'||f.field==='video_description').length>=2);
+  const corroborated = corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2));
   const corroboration = corroborated
-    ? result('CORROBORATION', 'PASS', ['INDEPENDENT_OBSERVATION_CORROBORATION'], corroborating, { sources: sources.size, fields: observations.size, dimensions: independentDimensions.size, repeatedVideos: repeated })
-    : result('CORROBORATION', 'ABSTAIN', ['CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, dimensions: independentDimensions.size, repeatedVideos: repeated });
+    ? result('CORROBORATION', 'PASS', ['SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated })
+    : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated });
   const contradiction = dominantContradiction
     ? result('CONTRADICTION', 'FAIL', ['DOMINANT_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight })
     : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight });
