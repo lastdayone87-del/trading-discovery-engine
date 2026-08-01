@@ -3,7 +3,7 @@ import type {
   LifecycleAction, RawChannelInput, StagedClassificationReport
 } from './types';
 
-export const STAGED_CLASSIFICATION_VERSION = '2.1.0';
+export const STAGED_CLASSIFICATION_VERSION = '2.2.0';
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
   if (item.provenance?.fields?.length) return item.provenance.fields;
@@ -54,8 +54,12 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const dominantContradiction = negative.length > 0 && (negativeWeight >= 25 || negativeWeight > positiveWeight * 1.5);
 
-  const availability = collection.sufficiency === 'SUFFICIENT' && !collection.degraded
-    ? result('AVAILABILITY', 'PASS', ['STAGE_EVIDENCE_SUFFICIENT'], evidence, { sufficiency: collection.sufficiency, degraded: false })
+  // Availability describes whether the evidence in hand is sufficient to make a
+  // governed decision. An optional provider failing must remain observable, but
+  // must not veto an otherwise complete, independently corroborated evidence
+  // bundle. Candidate/corroboration/contradiction remain the safety gates.
+  const availability = collection.sufficiency === 'SUFFICIENT'
+    ? result('AVAILABILITY', 'PASS', [collection.degraded ? 'STAGE_EVIDENCE_SUFFICIENT_WITH_PROVIDER_DEGRADATION' : 'STAGE_EVIDENCE_SUFFICIENT'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded })
     : result('AVAILABILITY', 'ABSTAIN', collection.reasonCodes.length ? collection.reasonCodes : ['STAGE_EVIDENCE_NOT_READY'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded });
   const candidate = semantic.length > 0
     ? result('CANDIDATE_DETECTION', 'PASS', ['SEMANTIC_CANDIDATE_FOUND'], semantic, { candidateSignals: semantic.length })

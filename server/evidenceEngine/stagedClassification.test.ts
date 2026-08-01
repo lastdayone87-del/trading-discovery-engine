@@ -35,8 +35,10 @@ test('missing evidence enriches and affirmative dominant contradiction rejects',
   assert.equal(evaluateClassificationStages({ channel_name: 'Games', description: 'gaming' }, [negative], collection()).lifecycleAction, 'REJECT');
 });
 
-test('provider degradation causes an explicit stage abstention', () => {
-  const report = evaluateClassificationStages({ channel_name: 'A', description: 'context' }, [evidence('method', {})], collection({ degraded: true, reasonCodes: ['PROVIDER_COVERAGE_DEGRADED'] }));
-  assert.equal(stage(report, 'AVAILABILITY').disposition, 'ABSTAIN');
-  assert.equal(report.lifecycleAction, 'REVIEW');
+test('provider degradation remains observable without vetoing sufficient independent evidence', () => {
+  const items=[evidence('method-a',{provenance:{provider:'video_metadata',type:'method',matchedTerm:'price action',sourceRef:'v1',fields:[{field:'video_title',sourceId:'v1'}]}}),evidence('method-b',{provenance:{provider:'video_metadata',type:'method',matchedTerm:'price action',sourceRef:'v2',fields:[{field:'video_title',sourceId:'v2'}]}})];
+  const report = evaluateClassificationStages({ channel_name: 'A', description: 'context' }, items, collection({ degraded: true, reasonCodes: ['PROVIDER_COVERAGE_DEGRADED'] }));
+  assert.equal(stage(report, 'AVAILABILITY').disposition, 'PASS');
+  assert.equal(stage(report, 'AVAILABILITY').metrics.degraded,true);
+  assert.equal(report.lifecycleAction, 'CONFIRM');
 });

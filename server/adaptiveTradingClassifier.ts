@@ -3,7 +3,7 @@ import { getDb } from './db';
 import { ConfigurableWeightedStrategy, type EvidenceItem, type RawChannelInput, type VerificationDecision } from './evidenceEngine';
 import { textMatchesTerm } from './evidenceEngine/utils/textMatching';
 
-export const ADAPTIVE_CLASSIFIER_VERSION='adaptive-shadow-v1';
+export const ADAPTIVE_CLASSIFIER_VERSION='adaptive-shadow-v2';
 export const ADAPTIVE_POLICY_VERSION='adaptive-conservative-v1';
 export type ShadowStatus='TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';
 export interface AdaptiveTerm {surfaceId:string;conceptId:string;literal:string;normalized:string;conceptClass:string;origin:'HUMAN_APPROVED_TERMINOLOGY'|'APPROVED_CONCEPT';catalogVersion:string}
@@ -35,7 +35,12 @@ export function classifyAdaptiveShadow(input:RawChannelInput,production:Verifica
   const videoConcepts=new Set(distinct.filter(t=>videos.some(v=>textMatchesTerm(v,t.literal))).map(t=>t.conceptId));
   const corroborated=distinct.filter(t=>videoConcepts.has(t.conceptId)||graphConceptIds.has(t.conceptId));
   const now=new Date().toISOString();const evidence:EvidenceItem[]=[];
-  if(corroborated.length)evidence.push({id:`adaptive:${sum(corroborated.map(t=>t.surfaceId)).slice(0,16)}`,source:'adaptive_catalog',polarity:'POSITIVE',category:'METHODOLOGY_CONCEPT',fact:`Governed adaptive catalog matched ${corroborated.length} corroborated concepts.`,rawMatches:corroborated.map(t=>t.literal),confidence:80,reliability:'MEDIUM',reliabilityMultiplier:.65,rawWeight:Math.min(12,corroborated.length*4),finalWeight:Math.min(12,corroborated.length*4)*.65*.8,provenance:{provider:'adaptive_catalog',type:'GOVERNED_CONCEPT',matchedTerm:corroborated.map(t=>t.literal).join(', '),sourceRef:'Approved terminology/concept snapshot'},timestamp:now});
+  const governedFields=corroborated.flatMap(term=>[
+    ...(textMatchesTerm(input.channel_name,term.literal)?[{field:'channel_title' as const}]:[]),
+    ...(textMatchesTerm(input.description||'',term.literal)?[{field:'channel_bio' as const}]:[]),
+    ...(input.videos||[]).flatMap((video,index)=>textMatchesTerm(`${video.title} ${video.description||''}`,term.literal)?[{field:'video_title' as const,index,sourceId:video.id,publishedAt:video.published_at}]:[])
+  ]);
+  if(corroborated.length)evidence.push({id:`adaptive:${sum(corroborated.map(t=>t.surfaceId)).slice(0,16)}`,source:'adaptive_catalog',polarity:'POSITIVE',category:'METHODOLOGY_CONCEPT',fact:`Governed adaptive catalog matched ${corroborated.length} corroborated concepts.`,rawMatches:corroborated.map(t=>t.literal),confidence:80,reliability:'MEDIUM',reliabilityMultiplier:.65,rawWeight:Math.min(12,corroborated.length*4),finalWeight:Math.min(12,corroborated.length*4)*.65*.8,provenance:{provider:'adaptive_catalog',type:'GOVERNED_CONCEPT',matchedTerm:corroborated.map(t=>t.literal).join(', '),sourceRef:'Approved terminology/concept snapshot',fields:governedFields},timestamp:now});
   const graphMatches=corroborated.filter(t=>graphConceptIds.has(t.conceptId));
   if(graphMatches.length)evidence.push({id:`graph:${sum(graphMatches.map(t=>t.conceptId)).slice(0,16)}`,source:'evidence_graph',polarity:'POSITIVE',category:'TERMINOLOGY',fact:`Evidence Graph corroborates ${graphMatches.length} governed concepts.`,rawMatches:graphMatches.map(t=>t.literal),confidence:75,reliability:'MEDIUM',reliabilityMultiplier:.5,rawWeight:Math.min(6,graphMatches.length*2),finalWeight:Math.min(6,graphMatches.length*2)*.5*.75,provenance:{provider:'evidence_graph',type:'CORROBORATION_ONLY',matchedTerm:graphMatches.map(t=>t.literal).join(', '),sourceRef:'Immutable active channel-to-concept edges'},timestamp:now});
   const strategy=new ConfigurableWeightedStrategy();const candidate=strategy.evaluateDecision([...production.positiveEvidence,...production.negativeEvidence,...evidence],{globalInstruments:[],globalPlatformsPropFirms:[],globalAdvancedConcepts:[],globalNegativeTerms:[]},input.country||'UNKNOWN');
