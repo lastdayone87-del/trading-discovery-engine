@@ -34,11 +34,12 @@ import { approveCatalog, inspectCatalogs, publishCatalog, stageCatalog, transiti
 import { configurePlaylistCanary, enqueuePlaylistCanary, inspectEvidenceGraph, proposePlaylistInspection } from './server/evidenceGraphAdapters';
 import { allocateBestFirst, createPolicy, inspectPortfolio, transitionPolicy } from './server/portfolioAllocator';
 import { inspectAdaptiveClassifier } from './server/adaptiveTradingClassifier';
-import { inspectDecisionEvaluation, persistDecisionBenchmark, persistPromotionGate, sealEvaluationDataset } from './server/decisionEvaluation';
+import { inspectDecisionEvaluation, persistDecisionBenchmark, persistPromotionGate, recordEvaluationGroundTruth, sealEvaluationDataset } from './server/decisionEvaluation';
 import { inspectVoiEvidenceController } from './server/voiEvidenceController';
 import { inspectInvestigations, repairInvestigationProjection } from './server/investigationWorkflow';
 import { inspectEntityResolution, moderateEntityBinding, proposeEntityBinding } from './server/entityResolution';
 import { configureTemporalFrontier, createFrontierRun, inspectTemporalFrontier, recordFrontierOutcome, recordTemporalRelationship, sealFrontierSnapshot } from './server/temporalResearchFrontier';
+import { inspectGovernedAdaptation, recordFalseNegativeIncident } from './server/governedAdaptation';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -122,6 +123,7 @@ async function startServer() {
   app.post('/api/decision-evaluation/datasets',async(req,res)=>{try{res.status(201).json(await sealEvaluationDataset({definition:req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_EVALUATION_DATASET',requestId:req.requestId});}});
   app.post('/api/decision-evaluation/benchmarks',async(req,res)=>{try{res.status(201).json(await persistDecisionBenchmark({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_DECISION_BENCHMARK',requestId:req.requestId});}});
   app.post('/api/decision-evaluation/promotion-gates',async(req,res)=>{try{res.status(201).json(await persistPromotionGate({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_PROMOTION_GATE',requestId:req.requestId});}});
+  app.post('/api/decision-evaluation/ground-truth',async(req,res)=>{try{const provenance=req.body.provenance||'DELAYED_PRODUCTION',label=await recordEvaluationGroundTruth({...req.body,provenance});if(req.body.label==='TRADING_CONFIRMED'&&provenance!=='HUMAN_REVIEW')void recordFalseNegativeIncident({channelId:req.body.channelId,priorStatus:req.body.priorStatus||'UNKNOWN',evidenceSnapshot:req.body.evidenceSnapshot||{}}).catch(error=>console.warn('[CorrectiveLearning] Delayed confirmation diagnosis failed:',error));res.status(201).json(label);}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_GROUND_TRUTH',requestId:req.requestId});}});
   app.get('/api/evidence-acquisition',async(req,res)=>{try{res.json(await inspectVoiEvidenceController(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/investigations',async(req,res)=>{try{res.json(await inspectInvestigations(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/investigations/:id/repair',async(req,res)=>{try{res.json(await repairInvestigationProjection(req.params.id,req.operator!.actorId));}catch(err:any){res.status(err.message==='INVESTIGATION_NOT_FOUND'?404:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
@@ -134,6 +136,7 @@ async function startServer() {
   app.post('/api/temporal-research-frontier/runs',async(req,res)=>{try{res.status(201).json(await createFrontierRun({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/temporal-research-frontier/outcomes',async(req,res)=>{try{res.status(201).json(await recordFrontierOutcome(req.body));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/temporal-research-frontier/control',async(req,res)=>{try{res.json(await configureTemporalFrontier({...req.body,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='FRONTIER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  app.get('/api/governed-adaptation',async(req,res)=>{try{res.json(await inspectGovernedAdaptation(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/acquisition-adapters/playlist/proposals',async(req,res)=>{try{res.status(201).json(await proposePlaylistInspection({...req.body,programKey:req.body.programKey||'price-action-trading'}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/control',async(req,res)=>{try{res.json(await configurePlaylistCanary({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='ADAPTER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/actions/:id/enqueue',async(req,res)=>{try{const result=await enqueuePlaylistCanary(req.params.id,String(req.body.targetCountry||''));res.status(result.queued?202:409).json(result);}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});

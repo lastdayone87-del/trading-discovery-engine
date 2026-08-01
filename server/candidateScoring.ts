@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
 import { GoogleGenAI } from '@google/genai';
-import { completeJob, enqueueJob, getDb } from './db';
+import { appendProviderCallEvent, completeJob, enqueueJob, getDb } from './db';
 import { executeProviderCall } from './providerResilience';
-import { appendProviderCallEvent } from './db';
 
 export const FEATURE_SET_VERSION='candidate-features-v1';
 export const CLASSIFIER_VERSION='bounded-semantic-v1';

@@ -8,19 +8,18 @@ import {
   getChannelById,
   upsertChannel,
   enqueueJob,
-  getQuota
+  getQuota,
+  getAppSetting
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
-import type { RawChannelInput } from './evidenceEngine';
-import { getAppSetting } from './db';
+import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
 import {recordProductionClassification} from './classificationDiagnostics';
 import { recordRetrievalEvaluationAssignment } from './decisionEvaluation';
 import { ACTIONS, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
-import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport} from './evidenceEngine';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided

@@ -1,7 +1,7 @@
 # Principal architecture review — post-roadmap evolution
 
-**Status:** Architectural assessment, not an implementation commitment  
-**Review date:** 2026-08-01  
+**Status:** Architectural assessment, not an implementation commitment
+**Review date:** 2026-08-01
 **Scope:** The assembled production and governed-shadow architecture after Priorities 0, 1, 2, 7, 8, and 10 and the recent production integration work
 
 ## Executive judgment

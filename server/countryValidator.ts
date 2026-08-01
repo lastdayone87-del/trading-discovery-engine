@@ -1,5 +1,4 @@
-import type { CountryStatus } from '../src/types';
-import type { CountryMetadataStatus } from '../src/types';
+import type { CountryMetadataStatus, CountryStatus } from '../src/types';
 import { getExcludedCountries, getCountryVocabularies } from './db';
 import { CountryInferenceEvidence, inferChannelCountry } from './countryInference';
 

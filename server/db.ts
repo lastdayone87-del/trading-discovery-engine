@@ -10,8 +10,7 @@ import { getConfiguredYouTubeKeys } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
-import type { ValidationKind, ValidationStatus } from './phase3Validation';
-import { validateLedgerInput } from './phase3Validation';
+import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 
 const { Pool } = pg;
