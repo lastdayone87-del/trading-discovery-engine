@@ -15,6 +15,7 @@ import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import type { RawChannelInput } from './evidenceEngine';
 import { getAppSetting } from './db';
 import {recordProductionClassification} from './classificationDiagnostics';
+import { recordRetrievalEvaluationAssignment } from './decisionEvaluation';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport} from './evidenceEngine';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
@@ -67,6 +68,8 @@ export async function processChannelThroughPipeline(
   isEnrichmentPass: boolean = false
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
+  if(await getAppSetting('decision_evaluation_sampling_enabled','false')==='true')await recordRetrievalEvaluationAssignment({channelId:candidate.channelId,targetCountry,discoveryOrigin:source,language:candidate.detectedLanguages?.[0]?.language,observedAt:now,context:{isManualScan,isEnrichmentPass}} ,{policyKey:'protected-audit',version:1,salt:process.env.DECISION_EVALUATION_SAMPLING_SALT||'',protectedAuditBasisPoints:100,targetedAuditBasisPoints:0})
+    .catch(error=>console.warn(`[DecisionEvaluation] Cohort assignment failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
 
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);
