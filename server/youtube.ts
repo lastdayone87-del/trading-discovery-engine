@@ -89,13 +89,14 @@ export interface DiscoveredChannelRaw {
   activityBand?: ChannelActivityBand;
   activityScore?: number;
   activityObservedAt?: string;
-  videos?: Array<{id?:string;title:string;description?:string;published_at?:string;content_type?:string;language?:string;script?:string}>;
+  videos?: Array<{id?:string;title:string;description?:string;published_at?:string;content_type?:string;language?:string;script?:string;source_family_id?:string;source_entity_id?:string}>;
   playlists?: Array<{id?:string;name:string;description?:string}>;
   transcriptExcerpts?: Array<{video_id?:string;text:string;language?:string}>;
   detectedLanguages?: Array<{language:string;confidence?:number;field?:import('./evidenceEngine').EvidenceFieldType}>;
-  externalLinkDetails?: Array<{label?:string;url:string;domain?:string;resolved_entity_type?:string}>;
+  externalLinkDetails?: Array<{label?:string;url:string;domain?:string;resolved_entity_type?:string;source_family_id?:string;source_entity_id?:string}>;
   visualEvidence?: Array<{source_ref:string;description:string;model_provenance:string}>;
   enrichmentStage?: number;
+  investigationId?: string;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 

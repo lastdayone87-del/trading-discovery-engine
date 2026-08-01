@@ -58,6 +58,8 @@ export interface EvidenceFieldRef {
   field: EvidenceFieldType;
   index?: number;
   sourceId?: string;
+  sourceFamilyId?: string;
+  sourceEntityId?: string;
   publishedAt?: string;
   contentType?: string;
 }
@@ -88,9 +90,11 @@ export interface RawChannelInput {
   external_links?: string[];
   location_tag?: string;
   discord_invite?: string | null;
-  videos?: Array<{ id?: string; title: string; description?: string; published_at?: string; content_type?: string; language?: string; script?: string }>;
+  channel_entity_id?: string;
+  channel_source_family_id?: string;
+  videos?: Array<{ id?: string; title: string; description?: string; published_at?: string; content_type?: string; language?: string; script?: string; source_family_id?:string; source_entity_id?:string }>;
   playlists?: Array<{ id?: string; name: string; description?: string }>;
-  external_link_details?: Array<{ label?: string; url: string; domain?: string; resolved_entity_type?: string }>;
+  external_link_details?: Array<{ label?: string; url: string; domain?: string; resolved_entity_type?: string; source_family_id?:string; source_entity_id?:string }>;
   detected_languages?: Array<{ language: string; confidence?: number; field?: EvidenceFieldType }>;
   transcript_excerpts?: Array<{ video_id?: string; text: string; language?: string }>;
   visual_evidence?: Array<{ source_ref: string; description: string; model_provenance: string }>;
