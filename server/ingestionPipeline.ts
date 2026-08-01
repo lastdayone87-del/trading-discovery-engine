@@ -7,7 +7,8 @@ import { inspectAndValidateChannel } from './queueManager';
 import {
   getChannelById,
   upsertChannel,
-  enqueueJob
+  enqueueJob,
+  getQuota
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
 import { enqueueTermHarvest } from './candidateCorpus';
@@ -15,6 +16,8 @@ import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import type { RawChannelInput } from './evidenceEngine';
 import { getAppSetting } from './db';
 import {recordProductionClassification} from './classificationDiagnostics';
+import { recordRetrievalEvaluationAssignment } from './decisionEvaluation';
+import { ACTIONS, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport} from './evidenceEngine';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
@@ -67,6 +70,8 @@ export async function processChannelThroughPipeline(
   isEnrichmentPass: boolean = false
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
+  if(await getAppSetting('decision_evaluation_sampling_enabled','false')==='true')await recordRetrievalEvaluationAssignment({channelId:candidate.channelId,targetCountry,discoveryOrigin:source,language:candidate.detectedLanguages?.[0]?.language,observedAt:now,context:{isManualScan,isEnrichmentPass}} ,{policyKey:'protected-audit',version:1,salt:process.env.DECISION_EVALUATION_SAMPLING_SALT||'',protectedAuditBasisPoints:100,targetedAuditBasisPoints:0})
+    .catch(error=>console.warn(`[DecisionEvaluation] Cohort assignment failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
 
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);
@@ -178,8 +183,8 @@ export async function processChannelThroughPipeline(
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
-  await recordProductionClassification({channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision})
-    .catch(error=>console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+  const classificationDiagnosticId=await recordProductionClassification({channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision})
+    .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
   let tradingVal = productionClassification.result;
   // Governed evidence remains independently observable and is rollout-gated. It
   // may corroborate existing production-positive evidence, never confirm alone.
@@ -258,11 +263,14 @@ export async function processChannelThroughPipeline(
 
   if (tradingVal.status === 'UNCERTAIN') {
     console.log(
-      `[Unified Ingestion Pipeline - Gate 2] Channel '${candidate.channelName}' classified as UNCERTAIN (${tradingVal.confidenceScore}/100). ${isEnrichmentPass ? 'Routing to human review.' : 'Scheduling durable enrichment.'}`
+      `[Unified Ingestion Pipeline - Gate 2] Channel '${candidate.channelName}' classified as UNCERTAIN (${tradingVal.confidenceScore}/100). Evaluating the governed enrichment/review route.`
     );
 
-    const hasAnotherEnrichmentStage=isEnrichmentPass&&(candidate.enrichmentStage||0)<2;
-    const lifecycle = resolveUncertainLifecycle(isEnrichmentPass&&!hasAnotherEnrichmentStage);
+    const currentStage=candidate.enrichmentStage||0,legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
+    let evidencePlan:EvidenceActionPlan|undefined;
+    try {const quota=await getQuota();evidencePlan=await planAndRecordEvidenceAction({channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,decision:productionClassification.decision,rawInput:productionClassification.input,legacyAction,providerQuotaRemaining:Math.max(0,quota.dailyLimit-quota.unitsUsed)});} catch(error){console.warn(`[VOI Evidence] Planning failed for ${candidate.channelId}; preserving legacy enrichment.`,error instanceof Error?error.message:error);}
+    const appliedAction=evidencePlan?.appliedAction||legacyAction,shouldReview=appliedAction==='HUMAN_REVIEW';
+    const lifecycle = resolveUncertainLifecycle(shouldReview);
     const finalUncertainStatus = lifecycle.tradingStatus;
     const finalScanStatus = lifecycle.scanStatus;
 
@@ -304,10 +312,11 @@ export async function processChannelThroughPipeline(
     await upsertChannel(uncertainChannel);
 
     if (lifecycle.shouldEnqueue) {
+      const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
       await enqueueJob(
         'ENRICH_CHANNEL',
-        { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate, enrichmentStage:Math.min(2,(candidate.enrichmentStage||0)+1) },
-        { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}:stage:${Math.min(2,(candidate.enrichmentStage||0)+1)}` }
+        { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate, enrichmentStage:nextStage, evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction },
+        { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}:stage:${nextStage}` }
       );
     }
 
