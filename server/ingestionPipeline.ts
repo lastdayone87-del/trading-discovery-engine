@@ -19,6 +19,7 @@ import {recordProductionClassification} from './classificationDiagnostics';
 import { recordRetrievalEvaluationAssignment } from './decisionEvaluation';
 import { ACTIONS, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
+import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport} from './evidenceEngine';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
@@ -174,10 +175,15 @@ export async function processChannelThroughPipeline(
   }
 
   // Step 2: GATE 2 - Evidence-Based Trading Verification Engine
+  const channelEntityId=deterministicUuid('youtube-channel',candidate.channelId),channelSourceFamilyId=sourceFamilyIdentity({provider:'youtube',nativeId:candidate.channelId}).familyId;
+  const structuredVideos=(candidate.videos || candidate.videoTitles.map((title,index)=>({title,description:candidate.videoDescriptions?.[index],published_at:candidate.uploadTimestamps?.[index]}))).map((video,index)=>({...video,source_entity_id:video.source_entity_id||channelEntityId,source_family_id:video.source_family_id||sourceFamilyIdentity({provider:'youtube',nativeId:video.id||`${candidate.channelId}:slot:${index}`}).familyId}));
+  const structuredExternalLinks=(candidate.externalLinkDetails||(candidate.channelLinks||[]).map(url=>({url}))).map(detail=>{let familyId='source_family_id' in detail&&typeof detail.source_family_id==='string'?detail.source_family_id:undefined;if(!familyId)try{familyId=sourceFamilyIdentity({provider:'external-link',canonicalUrl:detail.url}).familyId;}catch{familyId=sourceFamilyIdentity({provider:'external-link',artifactId:entityChecksum(detail.url)}).familyId;}return {...detail,source_family_id:familyId};});
+  void observeYouTubeChannelEntity({channelId:candidate.channelId,channelName:candidate.channelName,youtubeUrl:candidate.youtubeUrl,observedAt:now,videos:structuredVideos,externalUrls:structuredExternalLinks.map(detail=>detail.url)}).catch(error=>console.warn(`[EntityResolution] Channel observation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
   const classifierInput:RawChannelInput={
     channel_id:candidate.channelId,channel_name:candidate.channelName,description:candidate.description||'',country:resolvedCountry,
-    location_tag:candidate.locationTag,external_links:candidate.channelLinks||[],external_link_details:candidate.externalLinkDetails,
-    videos:candidate.videos || candidate.videoTitles.map((title,index)=>({title,description:candidate.videoDescriptions?.[index],published_at:candidate.uploadTimestamps?.[index]})),
+    channel_entity_id:channelEntityId,channel_source_family_id:channelSourceFamilyId,
+    location_tag:candidate.locationTag,external_links:candidate.channelLinks||[],external_link_details:structuredExternalLinks,
+    videos:structuredVideos,
     video_titles:candidate.videoTitles,video_descriptions:candidate.videoDescriptions||[],playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:candidate.detectedLanguages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
@@ -319,11 +325,6 @@ export async function processChannelThroughPipeline(
         try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority:10,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
         catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);await enqueueJob('ENRICH_CHANNEL',payload,{priority:10,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});}
       }else await enqueueJob('ENRICH_CHANNEL',payload,{priority:10,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});
-      await enqueueJob(
-        'ENRICH_CHANNEL',
-        { channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate, enrichmentStage:nextStage, evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction },
-        { priority: 10, maxAttempts: 4, idempotencyKey: `enrich:${candidate.channelId}:stage:${nextStage}` }
-      );
     }
 
     return {

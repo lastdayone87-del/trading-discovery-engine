@@ -13,6 +13,7 @@ export class ExternalLinkProvider implements EvidenceProvider {
     const items: EvidenceItem[] = [];
     const links = input.external_links || [];
     const now = new Date().toISOString();
+    const fieldsFor=(values:string[])=>(input.external_link_details||[]).flatMap((detail,index)=>values.some(value=>detail.url.toLocaleLowerCase('und').includes(value.toLocaleLowerCase('und'))||detail.domain?.toLocaleLowerCase('und')===value.toLocaleLowerCase('und'))?[{field:'external_link_domain' as const,index,sourceId:detail.url,sourceFamilyId:detail.source_family_id,sourceEntityId:detail.source_entity_id}]:[]);
 
     if (links.length === 0) {
       return items;
@@ -59,7 +60,7 @@ export class ExternalLinkProvider implements EvidenceProvider {
           provider: 'external_links',
           type: 'EXTERNAL_RESOURCE',
           matchedTerm: matchedTradingSites.join(', '),
-          sourceRef: 'Channel External Links'
+          sourceRef: 'Channel External Links',fields:fieldsFor(matchedTradingSites)
         },
         timestamp: now
       });
@@ -82,7 +83,7 @@ export class ExternalLinkProvider implements EvidenceProvider {
           provider: 'external_links',
           type: 'PLATFORM_BROKER_PROPFIRM',
           matchedTerm: matchedPropFirms.slice(0, 2).join(', '),
-          sourceRef: 'Channel External Links'
+          sourceRef: 'Channel External Links',fields:fieldsFor(matchedPropFirms)
         },
         timestamp: now
       });

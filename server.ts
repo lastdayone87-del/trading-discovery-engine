@@ -37,6 +37,7 @@ import { inspectAdaptiveClassifier } from './server/adaptiveTradingClassifier';
 import { inspectDecisionEvaluation, persistDecisionBenchmark, persistPromotionGate, sealEvaluationDataset } from './server/decisionEvaluation';
 import { inspectVoiEvidenceController } from './server/voiEvidenceController';
 import { inspectInvestigations, repairInvestigationProjection } from './server/investigationWorkflow';
+import { inspectEntityResolution, moderateEntityBinding, proposeEntityBinding } from './server/entityResolution';
 import {
   addSearchJob,
   addManualCountrySearch,
@@ -123,6 +124,9 @@ async function startServer() {
   app.get('/api/evidence-acquisition',async(req,res)=>{try{res.json(await inspectVoiEvidenceController(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/investigations',async(req,res)=>{try{res.json(await inspectInvestigations(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/investigations/:id/repair',async(req,res)=>{try{res.json(await repairInvestigationProjection(req.params.id,req.operator!.actorId));}catch(err:any){res.status(err.message==='INVESTIGATION_NOT_FOUND'?404:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  app.get('/api/entity-resolution',async(req,res)=>{try{res.json(await inspectEntityResolution(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/entity-resolution/proposals',async(req,res)=>{try{res.status(201).json(await proposeEntityBinding(req.body));}catch(err:any){res.status(400).json({error:err.message,code:'INVALID_ENTITY_PROPOSAL',requestId:req.requestId});}});
+  app.post('/api/entity-bindings/:id/moderate',async(req,res)=>{try{res.json(await moderateEntityBinding({bindingId:req.params.id,expectedVersion:Number(req.body.expectedVersion),action:req.body.action,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId,reason:req.body.reason}));}catch(err:any){res.status(err.message==='ENTITY_BINDING_VERSION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/proposals',async(req,res)=>{try{res.status(201).json(await proposePlaylistInspection({...req.body,programKey:req.body.programKey||'price-action-trading'}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/control',async(req,res)=>{try{res.json(await configurePlaylistCanary({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='ADAPTER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/actions/:id/enqueue',async(req,res)=>{try{const result=await enqueuePlaylistCanary(req.params.id,String(req.body.targetCountry||''));res.status(result.queued?202:409).json(result);}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});

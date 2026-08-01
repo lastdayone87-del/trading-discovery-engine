@@ -380,6 +380,15 @@ stale recovery, orphan reconciliation, output checksums, and projection repair.
 It is default-off and preserves legacy `ENRICH_CHANNEL` execution and rollback.
 See [the Phase 18 decision record](../phase-18-resumable-investigation-workflows.md).
 
+## Active implementation — Phase 19 conservative entity resolution
+
+Phase 19 adds country-neutral canonical entity identifiers, governed binding
+proposals, source-family correlation units, and immutable resolution lineage.
+Classification now collapses correlated source families before granting
+corroboration. Entity observation is default-off and no automatic merge or
+online mutable-graph dependency is introduced. See
+[the Phase 19 decision record](../phase-19-entity-resolution-source-independence.md).
+
 ## What not to do
 
 - Do not fix global recall by continually appending static keywords.
