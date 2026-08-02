@@ -97,6 +97,11 @@ export interface DiscoveredChannelRaw {
   visualEvidence?: Array<{source_ref:string;description:string;model_provenance:string}>;
   enrichmentStage?: number;
   investigationId?: string;
+  /** The retrieval document nominated this channel; it is not channel About metadata. */
+  matchedDocument?: {type:'VIDEO'|'CHANNEL'|'PLAYLIST'|'EXTERNAL'|'MANUAL'|'UNKNOWN';providerNativeId?:string;title?:string;description?:string;publishedAt?:string;locator?:string};
+  nominationId?: string;
+  queryRunId?: string;
+  discoveryJobId?: string;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
@@ -230,12 +235,18 @@ export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, san
       channelId,
       channelName,
       youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
-      description: item.snippet?.description || '',
+      // A VIDEO search snippet describes the matched video, not the channel.
+      // Preserve it as retrieval provenance and leave About unknown until the
+      // authoritative channels resource is hydrated.
+      description: lane === 'VIDEO' ? '' : (item.snippet?.description || ''),
       videoTitles: videoTitle ? [videoTitle] : [sanitizedQuery],
       videoDescriptions: videoDescription ? [videoDescription] : [],
       locationTag: item.snippet?.country || undefined,
       channelLinks: [],
-      channelThumbnailUrl: thumb
+      channelThumbnailUrl: thumb,
+      matchedDocument: lane==='VIDEO'
+        ? {type:'VIDEO',providerNativeId:item.id?.videoId,title:videoTitle,description:videoDescription,publishedAt:item.snippet?.publishedAt,locator:item.id?.videoId?`youtube:video:${item.id.videoId}`:undefined}
+        : {type:'CHANNEL',providerNativeId:channelId,title:item.snippet?.title,description:item.snippet?.description,locator:`youtube:channel:${channelId}`}
     });
   }
   return [...results.values()];

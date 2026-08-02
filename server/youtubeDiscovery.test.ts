@@ -12,6 +12,8 @@ test('video lane extracts unique channels and retains matching video evidence', 
   assert.equal(results.length, 2);
   assert.deepEqual(results[0].videoTitles, ['DAX setup', 'DAX analysis']);
   assert.deepEqual(results[0].videoDescriptions, ['first', 'second']);
+  assert.equal(results[0].description, '');
+  assert.deepEqual(results[0].matchedDocument, {type:'VIDEO',providerNativeId:'v1',title:'DAX setup',description:'first',publishedAt:undefined,locator:'youtube:video:v1'});
 });
 
 test('channel lane preserves direct channel discovery behavior', () => {
@@ -20,4 +22,5 @@ test('channel lane preserves direct channel discovery behavior', () => {
   ], 'CHANNEL', 'trading education');
   assert.equal(results[0].channelId, 'creator-1');
   assert.deepEqual(results[0].videoTitles, ['trading education']);
+  assert.equal(results[0].description, 'education');
 });
