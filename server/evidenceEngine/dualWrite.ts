@@ -33,5 +33,9 @@ export async function persistClassificationEvidenceBundle(input: RawChannelInput
     enabled: true, documents: documentResult, assertions: assertionResult, coverage: coverageResult,
     comparison: { equivalent: true, projectableCount: comparison.projectableCount, excludedEvidenceIds: comparison.excludedEvidenceIds },
     creatorFocus, gapPlan, servingAuthority: false, version: EVIDENCE_DUAL_WRITE_VERSION
+  return {
+    enabled: true, documents: documentResult, assertions: assertionResult, coverage: coverageResult,
+    comparison: { equivalent: true, projectableCount: comparison.projectableCount, excludedEvidenceIds: comparison.excludedEvidenceIds },
+    servingAuthority: false, version: EVIDENCE_DUAL_WRITE_VERSION
   };
 }

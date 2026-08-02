@@ -21,6 +21,7 @@ test('Phase 3 exposes V2 contracts and compatibility adapters without replacing 
 });
 
 test('Phase 3 separates search context and remains the ordered foundation for Release 3', async () => {
+test('Phase 3 separates search context and does not begin Release 3', async () => {
   const [canonical, semantic, ingestion] = await Promise.all([
     read('./canonicalEvidencePlane.ts'), read('./providers/GeminiSemanticProvider.ts'), read('../ingestionPipeline.ts')
   ]);
@@ -32,6 +33,7 @@ test('Phase 3 separates search context and remains the ordered foundation for Re
   assert.ok(migrations.includes('055_evidence_documents_and_assertions.sql'));
   assert.ok(migrations.includes('056_evidence_coverage_snapshots.sql'));
   const focus=migrations.indexOf('057_creator_focus_classification.sql');if(focus>=0)assert.ok(focus>migrations.indexOf('056_evidence_coverage_snapshots.sql'));
+  assert.equal(migrations.includes('057_creator_focus_classification.sql'), false);
 });
 
 test('Phase 3 keeps the research graph assertion schema intact and exposes read-only evidence inspection', async () => {
