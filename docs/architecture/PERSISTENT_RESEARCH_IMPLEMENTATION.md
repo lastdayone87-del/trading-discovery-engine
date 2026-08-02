@@ -9,10 +9,10 @@ are fully implemented or that only operational rollout remains.
 Migrations 043–044 and the persistent-research controller provide substantial,
 fail-closed foundations. They preserve the existing scheduler, classifier,
 terminology governance, entity resolution, graph limits, and adapter controls.
-However, several capabilities described as complete in the prior report are
-only represented by schemas, pure helpers, aggregate projections, or manually
-submitted inputs. Those are repository-code gaps, not production-credential or
-rollout dependencies.
+All six phases are implemented in repository code. Phase 5's real-provider
+onboarding correctly remains external/operational, while Phase 6 now uses immutable
+logged behavior assignments and propensities for support-aware, time-split offline
+policy evaluation.
 
 ## Correctly implemented and retained
 
@@ -200,45 +200,37 @@ providers, adding credentials through production secret infrastructure,
 contract/legal approval, provider-specific adapter packages, setting real quotas,
 applying migrations, and canary outcome collection are genuine operational or
 external-infrastructure dependencies. Until those occur, controls remain paused
-and killed with zero request capacity. Phase 6 has not begun.
+and killed with zero request capacity. This operational block does not prevent the
+repository-only Phase 6 audit below.
 
 ### Phase 6 — Governed contextual allocation: **complete**
 
 Implemented and independently verified:
 
-- candidate-versus-baseline evaluation is mandatory; a policy cannot obtain a
-  passing evaluation without an explicit baseline policy;
-- sealed, checksummed historical replay datasets snapshot actions and outcomes at
-  a pinned cutoff without mutating production assignments or outcomes;
-- both policy configurations are replayed over the identical dataset and every
-  candidate/baseline action decision, utility, reward, propensity, overlap
-  correction, coordinate, and reason code is stored immutably;
-- evaluation uses overlap-corrected inverse-propensity weighting, effective sample
-  size, confidence intervals, and country/language segment guardrails;
-- promotion passes only when the candidate confidence lower bound exceeds the
-  baseline upper bound and every sufficiently sampled segment guardrail passes;
-- insufficient effective or segment samples abstain rather than bootstrap a
-  serving policy from its own live outcomes;
-- protected exploration now uses a deterministic randomized inclusion bucket over
-  cross-action candidates and persists the actual nonzero inclusion propensity
-  for selected and unselected shadow decisions;
-- deterministic exploitation remains truthful at propensity 10,000 and all hard
-  provider, review, action, cluster, program-floor, and curated-search constraints
-  remain authoritative; and
-- `enabled`, mode, pause, kill switch, budgets, policy pin, and configuration
-  version are changed in one transaction with an immutable before/after audit
-  event. The legacy app setting is synchronized in that same transaction but is
-  no longer serving authority.
-
-The existing contextual utility model, allocator constraints, provider budgets,
-policy approval status, passing-evaluation requirement, leased materializers, and
-immutable assignment ledger were extended rather than replaced. No remaining
-Phase 6 recommendation requires repository code.
+- replay uses an explicit evaluation-window start and cutoff and rejects invalid
+  windows, rather than evaluating an undifferentiated history;
+- every observed reward is joined through its immutable selected behavior-policy
+  assignment, retaining the assignment identity and actual logged propensity;
+- inverse-propensity weights use the target-policy probability as numerator and the
+  logged behavior-policy probability as denominator;
+- candidate or baseline selections without logged support are recorded explicitly and
+  force `ABSTAIN` instead of being converted into zero-reward observations;
+- effective sample size, confidence intervals, and country/language segment guardrails
+  are calculated only from supported observations;
+- the caller's positive integer `minimumAssignments` gate is validated, persisted in
+  the evaluation artifact, and applied to both policy arms;
+- sealed replay datasets and immutable action decisions retain evaluation windows,
+  behavior assignments, behavior and target propensities, and support status;
+- regression tests cover unequal logged propensities, support mismatch, sample-floor
+  enforcement, time-window wiring, and assignment/outcome joins; and
+- the previously verified allocation constraints, protected exploration, mandatory
+  baseline, atomic activation audit, pause, kill switch, budgets, and policy pin remain
+  intact.
 
 **Conclusion:** Phase 6 is fully complete in repository code. Applying migrations,
-approving a baseline and candidate policy, accumulating a representative sealed
-historical dataset, selecting operational exploration/budget limits, and running
-a monitored canary are rollout activities rather than repository-code gaps.
+collecting a representative time-split dataset, obtaining policy approval, and running
+a monitored canary are operational rollout activities rather than repository-code
+gaps.
 
 ## Recommendation accounting
 
@@ -252,19 +244,21 @@ a monitored canary are rollout activities rather than repository-code gaps.
 | Multilingual discovery | Complete: global capability admission, scripts/locales, independent evidence, controlled trials, and existing catalog governance are retained. |
 | Hierarchical coverage and gap generation | Complete: six-level sparse cells, capture–recapture estimates, probes, replay snapshots, triggers, and program lifecycle are implemented. |
 | Provider-neutral and structured providers | Complete in generic repository code: registry, typed adapter contract, durable jobs, bounds, immutable ledgers, and identity workflow exist; real provider onboarding is operational/external. |
-| Contextual portfolio and exploration/exploitation | Complete: server-owned allocation, hard constraints, protected randomized exploration, truthful propensities, sealed replay, counterfactual gates, and atomic activation are implemented. |
+| Contextual portfolio and exploration/exploitation | Complete: allocation constraints, protected exploration, sealed artifacts, atomic activation, logged-behavior IPS, explicit support, time-split evaluation, and sample gates are implemented. |
 | Incremental/delayed attribution | Complete: entity captures, delayed review projection, multi-path credits, incrementality snapshots, and provider/review costs are implemented. |
 | Semantic/ecosystem diversity | Complete: result, semantic, creator-component, and source-family overlap affect allocation with replayable explanations. |
 | Diminishing returns | Complete: cutoff-pinned cell/program sleeping, scheduled probes, immutable transitions, and all specified reactivation triggers are implemented. |
-| Representative evaluation/active learning | Existing production evaluation is retained; research policies additionally use propensity-weighted, segmented counterfactual replay and abstention. |
+| Representative evaluation/active learning | Complete: existing production evaluation is retained; research-policy replay uses logged behavior assignments/propensities, abstains without support, enforces explicit evaluation windows and sample gates, and reports segmented uncertainty. |
 | Production classification and rollout safety | Complete and retained: classifier authority is unchanged; flags, provider modes, evaluated policies, budgets, pause, kill switches, leases, idempotency, and audit events remain fail-closed. |
 
 ## Final confirmation
 
-All repository-code recommendations from the six-phase architectural roadmap are
-now accounted for and implemented. **Phases 1 through 6 are fully complete in
-repository code.** Remaining work is limited to applying migrations, production
-provider/credential/legal onboarding, operator approvals, representative data
-collection, canary monitoring, and staged rollout. Those activities require
-production infrastructure, external agreements, elapsed observation windows, or
-human governance and cannot be completed solely by changing this repository.
+All repository-code recommendations from the six-phase architectural roadmap are now
+accounted for and implemented. **Phases 1 through 6 are fully complete in repository
+code.** No repository-code gap from the authoritative audit remains.
+
+Remaining work is limited to migration application, real provider/credential/legal
+onboarding, human approvals, representative time-split data collection, canary
+monitoring, and staged rollout. Those activities require production infrastructure,
+external agreements, elapsed observation windows, or human governance and cannot be
+completed solely by changing this repository.
