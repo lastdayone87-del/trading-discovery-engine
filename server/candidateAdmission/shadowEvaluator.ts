@@ -1,0 +1,119 @@
+import { recordDashboardCorpusShadow } from '../dashboardCorpus/store';
+import { getAppSetting, getDb } from '../db';
+import { assertAdmissionTransition, evaluateAdmission } from './policy';
+import type { AdmissionMode, AdmissionPolicyInput } from './types';
+import { ADMISSION_POLICY_VERSION } from './types';
+import { admissionChecksum } from './versioning';
+
+/** Records one observational admission decision and its repairable projection. */
+export async function recordAdmissionShadow(input: AdmissionPolicyInput) {
+  const configured = (await getAppSetting('candidate_admission_mode', 'OFF')).toUpperCase();
+  const mode: AdmissionMode = ['SHADOW', 'CANARY', 'ACTIVE'].includes(configured)
+    ? configured as AdmissionMode
+    : 'OFF';
+  const evaluation = evaluateAdmission(input);
+  if (mode === 'OFF') return { ...evaluation, mode, recorded: false };
+
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const locked = await client.query(
+      'SELECT * FROM channel_admission_projection WHERE channel_id=$1 FOR UPDATE',
+      [input.channelId]
+    );
+    const priorState = locked.rows[0]?.state || input.priorState || 'NOT_EVALUATED';
+    const priorVersion = Number(locked.rows[0]?.version || 0);
+    assertAdmissionTransition(priorState, evaluation.resultingState);
+
+    const snapshot = { ...input, priorState, mode };
+    const inputChecksum = admissionChecksum(snapshot);
+    const outputChecksum = admissionChecksum(evaluation);
+    const decisionKey = admissionChecksum({
+      channelId: input.channelId,
+      inputChecksum,
+      outputChecksum,
+      policyVersion: ADMISSION_POLICY_VERSION
+    });
+    const decision = await client.query(
+      `INSERT INTO channel_admission_decisions(
+        decision_key,channel_id,prior_state,resulting_state,classification_status,
+        investigation_state,candidate_hypothesis,evidence_coverage,reason_codes,
+        input_snapshot,input_checksum,output_checksum,classification_diagnostic_id,
+        investigation_id,review_id,policy_version,mode
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+      ON CONFLICT(decision_key) DO NOTHING RETURNING id,decided_at`,
+      [
+        decisionKey, input.channelId, priorState, evaluation.resultingState,
+        input.classificationStatus, input.investigationState || 'UNKNOWN',
+        JSON.stringify(input.candidateHypothesis || {}),
+        JSON.stringify(input.evidenceCoverage || {}), JSON.stringify(evaluation.reasonCodes),
+        JSON.stringify(snapshot), inputChecksum, outputChecksum,
+        input.classificationDiagnosticId || null, input.investigationId || null,
+        input.reviewId || null, ADMISSION_POLICY_VERSION, mode
+      ]
+    );
+    if (!decision.rowCount) {
+      await client.query('COMMIT');
+      return { ...evaluation, mode, recorded: false, idempotent: true };
+    }
+
+    const decidedAt = decision.rows[0].decided_at;
+    const eventKey = admissionChecksum({ decisionKey, event: 'ADMISSION_DECIDED' });
+    await client.query(
+      `INSERT INTO channel_admission_events(
+        event_key,channel_id,decision_id,event_type,expected_projection_version,payload,policy_version
+      ) VALUES($1,$2,$3,'ADMISSION_DECIDED',$4,$5,$6)`,
+      [
+        eventKey, input.channelId, decision.rows[0].id, priorVersion,
+        JSON.stringify({
+          priorState,
+          resultingState: evaluation.resultingState,
+          evidenceChecksum: inputChecksum,
+          reasonCodes: evaluation.reasonCodes
+        }),
+        ADMISSION_POLICY_VERSION
+      ]
+    );
+    await client.query(
+      `INSERT INTO channel_admission_projection(
+        channel_id,state,version,decision_id,investigation_id,classification_diagnostic_id,
+        review_id,policy_version,evidence_checksum,reason_codes,decided_at
+      ) VALUES($1,$2,1,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        state=excluded.state,version=channel_admission_projection.version+1,
+        decision_id=excluded.decision_id,investigation_id=excluded.investigation_id,
+        classification_diagnostic_id=excluded.classification_diagnostic_id,
+        review_id=excluded.review_id,policy_version=excluded.policy_version,
+        evidence_checksum=excluded.evidence_checksum,reason_codes=excluded.reason_codes,
+        decided_at=excluded.decided_at,updated_at=now()`,
+      [
+        input.channelId, evaluation.resultingState, decision.rows[0].id,
+        input.investigationId || null, input.classificationDiagnosticId || null,
+        input.reviewId || null, ADMISSION_POLICY_VERSION, inputChecksum,
+        JSON.stringify(evaluation.reasonCodes), decidedAt
+      ]
+    );
+    await client.query(
+      `UPDATE candidate_subjects SET current_admission_state=$2,
+        projection_version=projection_version+1,updated_at=now() WHERE channel_id=$1`,
+      [input.channelId, evaluation.resultingState]
+    );
+    await client.query('COMMIT');
+
+    await recordDashboardCorpusShadow({
+      channelId: input.channelId,
+      admissionState: evaluation.resultingState,
+      admissionDecisionId: decision.rows[0].id
+    }).catch(error => console.warn(
+      `[DashboardCorpus] shadow write failed for ${input.channelId}:`,
+      error instanceof Error ? error.message : error
+    ));
+    return { ...evaluation, mode, recorded: true, decisionId: decision.rows[0].id };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}

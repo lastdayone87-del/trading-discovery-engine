@@ -12,8 +12,9 @@ test('operator-visible channel policy excludes rejected and disallowed countries
 
 test('dashboard summary and channel listing share one eligibility policy', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./db.ts', import.meta.url), 'utf8'));
-  assert.match(source, /clauses=\[args\.includeRejected\?'TRUE':OPERATOR_VISIBLE_CHANNEL_SQL\]/);
-  assert.match(source, /FROM channels WHERE \$\{OPERATOR_VISIBLE_CHANNEL_SQL\}/);
+  assert.match(source, /dashboardServingPredicate/);
+  assert.match(source, /release5_dashboard_serving_mode/);
+  assert.match(source, /FROM channels WHERE \$\{serving\.predicate\}/);
 });
 
 test('dashboard pending review count uses the durable review queue', async () => {
