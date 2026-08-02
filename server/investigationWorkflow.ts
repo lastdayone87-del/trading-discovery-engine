@@ -3,7 +3,7 @@ import { getAppSetting, getDb, type DurableJob } from './db';
 
 export const INVESTIGATION_POLICY_VERSION='investigation-workflow-v1';
 export class InvestigationDeadlineExceededError extends Error {readonly code='INVESTIGATION_DEADLINE_EXCEEDED';constructor(){super('Investigation deadline exceeded.');this.name='InvestigationDeadlineExceededError';}}
-export type InvestigationState='ACTIVE'|'COMPLETED'|'NEEDS_REVIEW'|'FAILED'|'SUPERSEDED';
+export type InvestigationState='ACTIVE'|'COMPLETED'|'NEEDS_REVIEW'|'UNRESOLVED'|'OPERATIONALLY_BLOCKED'|'POLICY_REJECTED'|'FAILED'|'SUPERSEDED';
 export type StepState='PENDING'|'RUNNING'|'RETRYING'|'COMPLETED'|'FAILED'|'SKIPPED';
 export interface InvestigationProjection {state:InvestigationState;version:number;currentSequence:number;hasPendingSuccessor:boolean}
 const stable=(value:unknown):string=>JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))):item);

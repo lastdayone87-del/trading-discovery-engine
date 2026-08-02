@@ -42,7 +42,7 @@ function defaultClient(): SemanticModelClient | undefined {
 }
 
 function fieldDocuments(input: RawChannelInput) {
-  if(input.evidence_corpus?.length)return input.evidence_corpus.filter(document=>document.field!=='activity_metadata').slice(0,40).map(document=>({ref:documentRef(document),text:document.text}));
+  if(input.evidence_corpus?.length)return input.evidence_corpus.filter(document=>!['activity_metadata','search_match_context','country','language'].includes(document.field)).slice(0,40).map(document=>({ref:documentRef(document),text:document.text}));
   return [
     { ref: { field: 'channel_title' as const }, text: input.channel_name },
     { ref: { field: 'channel_bio' as const }, text: input.description },

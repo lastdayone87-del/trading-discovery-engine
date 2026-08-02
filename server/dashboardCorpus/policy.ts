@@ -1,0 +1,5 @@
+import type {AdmissionState} from '../candidateAdmission/types';
+export const DASHBOARD_CORPUS_POLICY_VERSION='dashboard-corpus-separation-v1';
+export type DashboardCorpus='DISCOVERY_CANDIDATES'|'INVESTIGATING'|'REVIEW'|'CONFIRMED'|'WITHHELD';
+export interface DashboardCorpusDecision{corpus:DashboardCorpus;reasonCodes:string[];servingAuthority:false;policyVersion:string}
+export function classifyDashboardCorpus(admissionState:AdmissionState):DashboardCorpusDecision{let corpus:DashboardCorpus,reason:string;switch(admissionState){case 'ADMITTED_CONFIRMED':corpus='CONFIRMED';reason='CONFIRMED_CORPUS';break;case 'ADMITTED_REVIEW':corpus='REVIEW';reason='REVIEW_CORPUS';break;case 'WITHHELD_INVESTIGATING':corpus='INVESTIGATING';reason='INVESTIGATION_IN_PROGRESS';break;case 'NOT_EVALUATED':case 'LEGACY_VISIBLE':corpus='DISCOVERY_CANDIDATES';reason='CANDIDATE_NOT_ADMITTED';break;default:corpus='WITHHELD';reason='WITHHELD_BY_ADMISSION_POLICY';}return {corpus,reasonCodes:[reason],servingAuthority:false,policyVersion:DASHBOARD_CORPUS_POLICY_VERSION};}
