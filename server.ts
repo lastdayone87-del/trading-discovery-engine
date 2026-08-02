@@ -83,6 +83,11 @@ import { inspectExecutionTrace, recordExecutionStage, withExecutionTrace } from 
 import { getNomination, inspectNominationAttribution, listNominations } from './server/candidateAdmission/store';
 import { getCandidateAdmissionBaseline } from './server/candidateAdmission/metrics';
 import { getAdmissionForChannel, inspectAdmission, loadAdmissionReplay, repairAdmissionProjection, verifyAdmissionProjection } from './server/candidateAdmission/replay';
+import {listEvidenceDocuments} from './server/evidenceEngine/documentStore';
+import {listEvidenceAssertions} from './server/evidenceEngine/assertionStore';
+import {listEvidenceCoverage} from './server/evidenceEngine/coverageStore';
+import {inspectCreatorFocusShadow} from './server/evidenceEngine/creatorFocusClassifier';
+import {inspectGapSpecificPlans} from './server/gapSpecificInvestigation';
 
 
 async function startServer() {
@@ -107,6 +112,11 @@ async function startServer() {
   app.post('/api/admission/replay',async(req,res)=>{try{const result=await loadAdmissionReplay(String(req.body?.cutoff||new Date().toISOString()));res.json({cutoff:result.cutoff,eventCount:result.events.length,states:[...result.states.entries()].map(([channelId,state])=>({channelId,...state})),networkAccess:false,materialized:false});}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/admission/projection/verify',async(req,res)=>{try{res.json(await verifyAdmissionProjection(String(req.body?.cutoff||new Date().toISOString())));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/admission/projection/repair',async(req,res)=>{try{res.json(await repairAdmissionProjection(req.operator!.actorId,String(req.body?.cutoff||new Date().toISOString())));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/evidence-documents',async(req,res)=>{try{res.json(await listEvidenceDocuments({channelId:req.query.channel_id as string|undefined,subjectEntityId:req.query.subject_entity_id as string|undefined,limit:Number(req.query.limit||100),offset:Number(req.query.offset||0),cutoff:req.query.cutoff as string|undefined}));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/evidence-assertions',async(req,res)=>{try{res.json(await listEvidenceAssertions({channelId:req.query.channel_id as string|undefined,subjectEntityId:req.query.subject_entity_id as string|undefined,limit:Number(req.query.limit||100),offset:Number(req.query.offset||0),cutoff:req.query.cutoff as string|undefined}));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/evidence-coverage',async(req,res)=>{try{res.json(await listEvidenceCoverage({channelId:req.query.channel_id as string|undefined,limit:Number(req.query.limit||100),offset:Number(req.query.offset||0),cutoff:req.query.cutoff as string|undefined}));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/creator-focus/shadow',async(req,res)=>{try{res.json(await inspectCreatorFocusShadow(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/investigations/gap-plans',async(req,res)=>{try{res.json(await inspectGapSpecificPlans(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
 
   const requireReviewer: express.RequestHandler = (req,res,next) => {
     // The central operator boundary has authenticated this request. Keeping this

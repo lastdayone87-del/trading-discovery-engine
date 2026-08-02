@@ -7,6 +7,8 @@ import { persistEvidenceAssertions } from './assertionStore';
 import { buildEvidenceCoverageSnapshot } from './coverage';
 import { persistEvidenceCoverage } from './coverageStore';
 import { compareLegacyEvidenceProjection } from './providerV2';
+import { runCreatorFocusShadow } from './creatorFocusClassifier';
+import {recordGapSpecificPlan} from '../gapSpecificInvestigation';
 
 export const EVIDENCE_DUAL_WRITE_VERSION = 'evidence-dual-write-v1';
 
@@ -25,6 +27,12 @@ export async function persistClassificationEvidenceBundle(input: RawChannelInput
   if (assertionsEnabled) assertionResult = await persistEvidenceAssertions(assertions);
   const coverage = buildEvidenceCoverageSnapshot(input, documents, decision.evidenceCollection, observedAt, classificationDiagnosticId);
   const coverageResult = await persistEvidenceCoverage(coverage);
+  const creatorFocus = classificationDiagnosticId ? await runCreatorFocusShadow({channelId:input.channel_id,subjectEntityId:coverage.subjectEntityId,diagnosticId:classificationDiagnosticId,documents,assertions,coverage}).catch(error=>({enabled:false,servingAuthority:false,error:error instanceof Error?error.message:String(error)})) : {enabled:false,servingAuthority:false};
+  const gapPlan = creatorFocus.enabled&&'decision' in creatorFocus ? await recordGapSpecificPlan({channelId:input.channel_id,diagnosticId:classificationDiagnosticId,creatorFocusSnapshotId:undefined,decision:creatorFocus.decision,providerQuotaRemaining:Number(await getAppSetting('gap_specific_case_quota_cap','303')),caseQuotaRemaining:Number(await getAppSetting('gap_specific_case_quota_cap','303')),deadlineRemainingMs:Number(await getAppSetting('gap_specific_deadline_minutes','30'))*60_000,reviewCapacity:0}).catch(error=>({enabled:false,servingAuthority:false,error:error instanceof Error?error.message:String(error)})) : {enabled:false,servingAuthority:false};
+  return {
+    enabled: true, documents: documentResult, assertions: assertionResult, coverage: coverageResult,
+    comparison: { equivalent: true, projectableCount: comparison.projectableCount, excludedEvidenceIds: comparison.excludedEvidenceIds },
+    creatorFocus, gapPlan, servingAuthority: false, version: EVIDENCE_DUAL_WRITE_VERSION
   return {
     enabled: true, documents: documentResult, assertions: assertionResult, coverage: coverageResult,
     comparison: { equivalent: true, projectableCount: comparison.projectableCount, excludedEvidenceIds: comparison.excludedEvidenceIds },

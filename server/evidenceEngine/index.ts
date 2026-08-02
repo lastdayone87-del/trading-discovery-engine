@@ -124,3 +124,7 @@ export * from './documentReplay';
 export * from './providerV2';
 export * from './coverage';
 export * from './documentIndependence';
+export * from './hypothesisTaxonomy';
+export * from './documentSemanticProvider';
+export * from './creatorFocusAggregation';
+export * from './classifierV4';
