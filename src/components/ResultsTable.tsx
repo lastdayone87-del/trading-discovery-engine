@@ -2,6 +2,7 @@ import { apiFetch } from '../apiClient';
 import React, { useEffect, useMemo, useState } from 'react';
 import { ChannelRecord, ReviewQueueItem } from '../types';
 import { ExternalLink, RefreshCw, Eye, Copy, Check, Search, CheckCircle2, XCircle, ShieldAlert, X } from 'lucide-react';
+import { responseError, submitReviewDecision } from '../reviewDecision';
 
 interface Props {
   channels: ChannelRecord[];
@@ -32,6 +33,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   const [pendingReviewOnly, setPendingReviewOnly] = useState(false);
   const [reviewBusy, setReviewBusy] = useState<string | null>(null);
   const [reviewError, setReviewError] = useState('');
+  const [reviewSuccess, setReviewSuccess] = useState('');
   const [reviewDetails, setReviewDetails] = useState<ReviewQueueItem | null>(null);
   const [decidedChannelIds, setDecidedChannelIds] = useState<Set<string>>(() => new Set());
 
@@ -73,15 +75,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     ? {}
     : { Authorization: `Bearer ${reviewToken}`, 'X-Reviewer-Id': reviewer };
 
-  const parseError = async (response: Response) => {
-    const body = await response.json().catch(() => ({}));
-    return body.error || `Review request failed (${response.status}).`;
-  };
-
   const loadReviewDetails = async (channelId: string) => {
     setReviewError('');
     const response = await apiFetch(`/api/reviews/${encodeURIComponent(channelId)}`, { headers: reviewHeaders() });
-    if (!response.ok) throw new Error(await parseError(response));
+    if (!response.ok) throw new Error(await responseError(response));
     return response.json() as Promise<ReviewQueueItem>;
   };
 
@@ -110,24 +107,22 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     if (!reason) return;
     const notes = window.prompt('Optional notes')?.trim() || '';
     setReviewError('');
+    setReviewSuccess('');
     setReviewBusy(`${channelId}:${action}`);
 
     try {
       const details = currentDetails || await loadReviewDetails(channelId);
-      const response = await apiFetch(`/api/reviews/${encodeURIComponent(channelId)}/${action}`, {
-        method: 'POST',
-        headers: {
-          ...reviewHeaders(),
-          'Content-Type': 'application/json',
-          'Idempotency-Key': crypto.randomUUID()
-        },
-        body: JSON.stringify({ reviewVersion: details.reviewVersion, reason, notes })
-      });
-      if (!response.ok) throw new Error(await parseError(response));
-
+      const result = await submitReviewDecision(
+        { channelId, action, reviewVersion: details.reviewVersion, reason, notes },
+        apiFetch,
+        reviewHeaders()
+      );
       setReviewDetails(null);
       setDecidedChannelIds(previous => new Set(previous).add(channelId));
-      await onReviewCompleted?.();
+      const label = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'queued for rescan';
+      setReviewSuccess(`${details.channelName} was ${label}. Channel status is ${result.channel.tradingStatus}; it has been removed from the pending review queue.`);
+      // Optimistic state above is immediate; server-backed counts and rows follow.
+      void onReviewCompleted?.().catch(error => setReviewError(error instanceof Error ? `Decision saved, but refresh failed: ${error.message}` : 'Decision saved, but refresh failed.'));
     } catch (error) {
       setReviewError(error instanceof Error ? error.message : 'Unable to complete the review action.');
       try {
@@ -200,6 +195,12 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
           <div role="alert" className="flex items-center justify-between gap-3 rounded-lg bg-rose-50 dark:bg-rose-950/40 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
             <span>{reviewError}</span>
             <button type="button" onClick={() => setReviewError('')} aria-label="Dismiss review error"><X className="w-3.5 h-3.5" /></button>
+          </div>
+        )}
+        {reviewEnabled && reviewSuccess && (
+          <div role="status" className="flex items-center justify-between gap-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+            <span>{reviewSuccess}</span>
+            <button type="button" onClick={() => setReviewSuccess('')} aria-label="Dismiss review success"><X className="w-3.5 h-3.5" /></button>
           </div>
         )}
         <div className="flex flex-col md:flex-row gap-3 items-center justify-between">

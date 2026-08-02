@@ -40,12 +40,15 @@ export async function getReviewDetails(channelId:string) {
 
 export interface DecideInput { channelId:string; action:ReviewAction; expectedVersion:number; reviewer:string; reason:string; notes?:string; idempotencyKey:string; }
 export async function decideReview(input:DecideInput) {
+  if(!Number.isInteger(input.expectedVersion)||input.expectedVersion<1) throw new Error('reviewVersion must be a positive integer.');
   if(!input.reviewer.trim()||!input.reason.trim()||!input.idempotencyKey.trim()) throw new Error('reviewer, reason, and idempotencyKey are required.');
   const db=await getDb(); const client=await db.connect();
   try {
     await client.query('BEGIN');
-    const prior=await client.query('SELECT * FROM channel_review_decisions WHERE idempotency_key=$1',[input.idempotencyKey]);
-    if(prior.rowCount){ await client.query('COMMIT'); return {decision:prior.rows[0],idempotent:true}; }
+    const prior=await client.query(`SELECT d.*,r.state,r.review_version current_review_version,c.trading_status,c.scan_status,c.discord_status
+      FROM channel_review_decisions d JOIN channel_reviews r USING(channel_id) JOIN channels c USING(channel_id)
+      WHERE d.idempotency_key=$1`,[input.idempotencyKey]);
+    if(prior.rowCount){const saved=prior.rows[0];await client.query('COMMIT');return {decision:saved,review:{state:saved.state,reviewVersion:saved.current_review_version},channel:{channelId:saved.channel_id,tradingStatus:saved.trading_status,scanStatus:saved.scan_status,discordStatus:saved.discord_status},queuePending:saved.state==='PENDING',idempotent:true};}
     const locked=await client.query(`SELECT r.*,to_jsonb(c) channel_snapshot FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.channel_id=$1 FOR UPDATE OF r,c`,[input.channelId]);
     if(!locked.rowCount) throw new ReviewNotFoundError('Review item not found.');
     const row=locked.rows[0];
@@ -69,7 +72,9 @@ export async function decideReview(input:DecideInput) {
     const lineage=await client.query(`SELECT s.query_run_id,s.query_id,r.job_id,r.country,r.retrieval_lane FROM channel_sightings s JOIN query_runs r ON r.id=s.query_run_id WHERE s.channel_id=$1 ORDER BY s.observed_at DESC LIMIT 1`,[input.channelId]);
     const origin=lineage.rows[0];
     await client.query(`INSERT INTO outcome_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,verification_status,policy_version,feature_version,event_time,payload) VALUES($1,'CHANNEL',$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13) ON CONFLICT(event_key) DO NOTHING`,[`review:${input.channelId}:version:${nextVersion}:v1`,input.channelId,input.action==='FORCE_RESCAN'?'REVIEW_CORRECTED':'REVIEW_VERIFIED',origin?`query-run:${origin.query_run_id}:selected:v1`:null,origin?.query_id||null,origin?.query_run_id||null,origin?.job_id||null,origin?.country||row.channel_snapshot?.country||null,origin?.retrieval_lane||null,input.action==='FORCE_RESCAN'?'CORRECTIVE':'VERIFIED',REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,JSON.stringify({action:input.action,previousStatus:row.state,resultingStatus:resulting,reviewVersion:nextVersion,reasonCode:input.reason.trim()})]);
-    await client.query(`UPDATE channel_reviews SET state=$2,review_version=$3,evidence_snapshot=$4,decided_at=CASE WHEN $2='PENDING' THEN NULL ELSE now() END,pending_since=CASE WHEN $2='PENDING' THEN now() ELSE pending_since END,updated_at=now() WHERE channel_id=$1`,[input.channelId,resulting,nextVersion,JSON.stringify(evidence)]);
+    const updatedReview=await client.query(`UPDATE channel_reviews SET state=$2,review_version=$3,evidence_snapshot=$4,decided_at=CASE WHEN $2='PENDING' THEN NULL ELSE now() END,pending_since=CASE WHEN $2='PENDING' THEN now() ELSE pending_since END,updated_at=now() WHERE channel_id=$1 RETURNING state,review_version`,[input.channelId,resulting,nextVersion,JSON.stringify(evidence)]);
+    const updatedChannel=await client.query(`SELECT channel_id,trading_status,scan_status,discord_status FROM channels WHERE channel_id=$1`,[input.channelId]);
+    if(updatedReview.rowCount!==1||updatedChannel.rowCount!==1)throw new Error('Review decision persistence verification failed.');
     await client.query('COMMIT');
     // Labels are observational: schedule only after the authoritative review
     // commits, never await them, and contain all failures at this boundary.
@@ -79,6 +84,7 @@ export async function decideReview(input:DecideInput) {
       .catch(error=>console.warn(`[DecisionEvaluation] Ground-truth label failed for ${input.channelId}:`,error instanceof Error?error.message:error));
     if(input.action==='APPROVE'&&row.channel_snapshot?.trading_status!=='TRADING_CONFIRMED')void recordFalseNegativeIncident({channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,priorStatus:row.channel_snapshot?.trading_status||'UNKNOWN',evidenceSnapshot:evidence})
       .catch(error=>console.warn(`[CorrectiveLearning] False-negative diagnosis failed for ${input.channelId}:`,error instanceof Error?error.message:error));
-    return {decision:inserted.rows[0],idempotent:false};
+    const channel=updatedChannel.rows[0];
+    return {decision:inserted.rows[0],review:{state:updatedReview.rows[0].state,reviewVersion:updatedReview.rows[0].review_version},channel:{channelId:channel.channel_id,tradingStatus:channel.trading_status,scanStatus:channel.scan_status,discordStatus:channel.discord_status},queuePending:updatedReview.rows[0].state==='PENDING',idempotent:false};
   } catch(e){await client.query('ROLLBACK'); throw e;} finally {client.release();}
 }
