@@ -15,6 +15,8 @@ import {
 import { assertCountryAllowed } from './countryExclusion';
 import { selectNextQueryForCountry } from './queryIntelligence';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
+import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
+import { runPersistentResearchCycle } from './persistentResearchController';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -138,6 +140,10 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       };
     }
 
+    // The research controller is an isolated observer/planner. Failure never
+    // delays the proven query scheduler, and serving remains separately gated.
+    await runPersistentResearchCycle(`autonomous-research:${process.pid}`)
+      .catch(error => console.warn('[PersistentResearch] Planning cycle failed; legacy query scheduling continues:', error));
     const config = await getDiscoveryConfig();
     const snapshot = await getAutonomousSchedulingSnapshot();
     const now = new Date();
@@ -186,7 +192,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     while (scheduled.length < capacity && attempts < capacity * Math.max(3, countries.length)) {
       const country = countries[(currentCountryIndex + attempts) % countries.length];
       attempts++;
-      const selected = await selectNextQueryForCountry(country);
+      const research = await getAllocatedResearchQuery(country);
+      const selected = research ? {
+        queryRecord: research.queryRecord,
+        selectionStrategy: 'UCB1_EXPLORATION' as const,
+        reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
+      } : await selectNextQueryForCountry(country);
       const intent = selected.queryRecord.intent;
       const primaryTerm = selected.queryRecord.primary_term || selected.queryRecord.query;
       if ((usedIntents.has(intent) || usedPrimaryTerms.has(primaryTerm)) && attempts < countries.length * 2) continue;
@@ -197,6 +208,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       }], workerId, cooldownMinutes);
       if (created.length) {
         scheduled.push(...created);
+        if (research) await markResearchActionQueued(research.actionId,created[0].runId);
         usedIntents.add(intent);
         usedPrimaryTerms.add(primaryTerm);
       }
