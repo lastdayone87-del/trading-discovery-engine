@@ -6,9 +6,10 @@ import {
   LayeredKnowledgeContext
 } from './types';
 import type { StagedClassificationReport } from './types';
-import { evaluateClassificationStages, stage } from './stagedClassification';
+import { evaluateClassificationStages } from './stagedClassification';
 import { ENGINE_VERSIONS, getScoringConfig } from './config';
 import { TradingCategory } from '../../src/types';
+import { evaluateUnifiedDecisionPolicy, UNIFIED_DECISION_POLICY_VERSION } from './decisionPolicy';
 
 export class ConfigurableWeightedStrategy {
   private config: ScoringEngineConfig;
@@ -32,10 +33,6 @@ export class ConfigurableWeightedStrategy {
 
     const totalPositiveWeight = positiveItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
     const totalNegativeWeight = negativeItems.reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
-    const explicitNegativeWeight = negativeItems
-      .filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY')
-      .reduce((acc, curr) => acc + Math.abs(curr.finalWeight), 0);
-
     // Multi-video consistency ratio check
     const consistencyItem = evidenceItems.find(i => i.category === 'MULTI_VIDEO_CONSISTENCY');
     let consistencyRatio = 0.5; // default if no video titles present
@@ -47,11 +44,6 @@ export class ConfigurableWeightedStrategy {
       }
     }
 
-    // Check if negative evidence contains explicit irrelevant domain signals (e.g. gaming, cooking, vlogs)
-    const hasIrrelevantDomainNegative = negativeItems.some(i => i.category === 'IRRELEVANT_DOMAIN');
-    const hasAdjacentFinanceNegative = negativeItems.some(i => i.category === 'NON_TRADING_ADJACENT');
-    const hasSevereHypeNegative = negativeItems.some(i => i.category === 'HYPE_SPECULATION');
-
     // Calculate Net Evidence Score (baseline 50)
     const netWeight = totalPositiveWeight - totalNegativeWeight;
     let confidenceScore = Math.max(0, Math.min(100, Math.round(50 + netWeight)));
@@ -59,7 +51,7 @@ export class ConfigurableWeightedStrategy {
     // Categorize
     const category = this.detectPrimaryCategory(evidenceItems);
 
-    // Determine lifecycle state
+    // Determine lifecycle state through one selective policy after feature/stage construction.
     let status: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' = 'UNCERTAIN';
     const justifications: string[] = [];
 
@@ -72,34 +64,12 @@ export class ConfigurableWeightedStrategy {
     const hasPlatformOrPropFirm = positiveItems.some(i => i.category === 'PLATFORM_BROKER_PROPFIRM' || i.category === 'EXTERNAL_RESOURCE');
     const hasMethodologyConcept = positiveItems.some(i => i.category === 'METHODOLOGY_CONCEPT' || i.category === 'TERMINOLOGY');
 
-    if (
-      // Standard condition: positive weight >= threshold and score >= 65 and consistency ratio
-      (totalPositiveWeight >= this.config.minPositiveWeightTrading && confidenceScore >= this.config.minVerifiedTradingScore && consistencyRatio >= this.config.minMultiVideoConsistency && !hasSevereHypeNegative && !hasAdjacentFinanceNegative) ||
-      // Concept / Methodology condition: strong positive evidence without negative domain matches
-      (totalPositiveWeight >= 15 && !hasIrrelevantDomainNegative && !hasSevereHypeNegative && !hasAdjacentFinanceNegative && (hasMethodologyConcept || hasHighReliabilityMatch)) ||
-      // Platform / Prop firm match: explicit tool references
-      (hasPlatformOrPropFirm && totalPositiveWeight >= 15 && !hasIrrelevantDomainNegative && !hasSevereHypeNegative && !hasAdjacentFinanceNegative) ||
-      // Strong net positive weight
-      (totalPositiveWeight >= 25 && !hasIrrelevantDomainNegative && !hasSevereHypeNegative && !hasAdjacentFinanceNegative)
-    ) {
-      status = 'TRADING_CONFIRMED';
-      confidenceScore = Math.max(82, confidenceScore);
-      justifications.push(`DECISION: VERIFIED_TRADING. Consistent financial trading signals across multiple independent sources.`);
-    } else if (
-      // Non-trading condition: Explicit negative domain match with low positive trading signals
-      (hasIrrelevantDomainNegative && totalPositiveWeight < 10) ||
-      // Heavy negative evidence with negligible positive weight
-      (explicitNegativeWeight >= 25 && totalPositiveWeight <= 5) ||
-      // Low confidence score with negative domain presence
-      (confidenceScore <= 30 && hasIrrelevantDomainNegative) ||
-      // Adjacent finance/news and hype are not trading channels without methodology evidence
-      ((hasAdjacentFinanceNegative || hasSevereHypeNegative) && totalPositiveWeight < 15)
-    ) {
-      status = 'NON_TRADING';
-      confidenceScore = Math.min(22, confidenceScore);
-      justifications.push(`DECISION: VERIFIED_NON_TRADING. Explicit negative-domain evidence confirms a non-trading focus.`);
-    } else {
-      status = 'UNCERTAIN';
+    const policyMinimum=(hasMethodologyConcept||hasHighReliabilityMatch||hasPlatformOrPropFirm)?15:this.config.minPositiveWeightTrading;
+    const policy=evaluateUnifiedDecisionPolicy({evidence:evidenceItems,collection:evidenceCollection,lifecycleAction:stages.lifecycleAction,minimumPositiveWeight:policyMinimum,minimumTradingScore:this.config.minVerifiedTradingScore});
+    status=policy.status;confidenceScore=policy.confidenceScore;
+    if(status==='TRADING_CONFIRMED')justifications.push('DECISION: VERIFIED_TRADING. Calibrated support and independent corroboration satisfied.');
+    else if(status==='NON_TRADING')justifications.push('DECISION: VERIFIED_NON_TRADING. Explicit negative-domain evidence forms a dominant attributed contradiction.');
+    else {
       const suffix = evidenceCollection.sufficiency === 'MISSING'
         ? 'Required classification metadata is missing.'
         : evidenceCollection.sufficiency === 'INSUFFICIENT'
@@ -108,18 +78,7 @@ export class ConfigurableWeightedStrategy {
       justifications.push(`DECISION: UNCERTAIN. ${suffix} Preserving for enrichment or review.`);
     }
 
-    // Scores are evidence summaries, not lifecycle states. A positive score may
-    // only confirm after availability, candidate, corroboration and contradiction
-    // gates agree. Priority 0 negative behavior remains affirmative-evidence-only.
-    if (status === 'TRADING_CONFIRMED' && stages.lifecycleAction !== 'CONFIRM') {
-      status = 'UNCERTAIN';
-      confidenceScore = Math.min(confidenceScore, 79);
-      justifications.push(`STAGED POLICY: confirmation abstained (${stage(stages, 'CORROBORATION').reasonCodes.join(', ')}).`);
-    } else if (status === 'NON_TRADING' && stages.lifecycleAction !== 'REJECT') {
-      status = 'UNCERTAIN';
-      confidenceScore = Math.max(confidenceScore, 23);
-      justifications.push('STAGED POLICY: rejection abstained because contradiction was not dominant.');
-    }
+    justifications.push(`UNIFIED POLICY ${UNIFIED_DECISION_POLICY_VERSION}: ${policy.reasonCodes.join(', ')}; calibrated trading probability ${policy.tradingProbability}%; coverage ${policy.coverageConfidence}%.`);
 
     // Extract Gemini semantic summary if available
     const geminiItem = evidenceItems.find(i => i.source === 'gemini_semantic');
@@ -154,7 +113,8 @@ export class ConfigurableWeightedStrategy {
       mathematicalJustification: justifications.join(' | '),
       evidenceCollection,
       stagedClassification: stages,
-      timestamp: now
+      timestamp: now,
+      decisionPolicy:{version:UNIFIED_DECISION_POLICY_VERSION,tradingProbability:policy.tradingProbability,nonTradingProbability:policy.nonTradingProbability,coverageConfidence:policy.coverageConfidence,reasonCodes:policy.reasonCodes}
     };
   }
 

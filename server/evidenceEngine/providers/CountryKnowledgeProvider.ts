@@ -1,5 +1,6 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
 import { textMatchesTerm } from '../utils/textMatching';
+import { documentRef } from '../canonicalEvidencePlane';
 
 export class CountryKnowledgeProvider implements EvidenceProvider {
   name = 'country_knowledge' as const;
@@ -10,6 +11,8 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     const now = new Date().toISOString();
     const countryPack = knowledgeContext.countryKnowledge;
     const langPack = knowledgeContext.languageKnowledge;
+    const langPacks=knowledgeContext.languageKnowledgePacks||[langPack].filter((pack):pack is NonNullable<typeof pack>=>Boolean(pack));
+    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>terms.some(term=>textMatchesTerm(document.text,term))).map(documentRef);
 
     if (!countryPack && !langPack) {
       return items;
@@ -42,7 +45,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
           provider: 'country_knowledge',
           type: 'INSTRUMENT',
           matchedTerm: matchedRegionalExchanges.join(', '),
-          sourceRef: `Country Knowledge Pack (${countryPack?.countryName || 'Global'})`
+          sourceRef: `Country Knowledge Pack (${countryPack?.countryName || 'Global'})`, fields:fieldsFor(matchedRegionalExchanges)
         },
         timestamp: now
       });
@@ -52,8 +55,8 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     const matchedNativeTerms: string[] = [];
     const nativeTermsList = [
       ...(countryPack?.nativeTradingTerminology || []),
-      ...(langPack?.positiveTerms || []),
-      ...(langPack?.commonPhrases || [])
+      ...langPacks.flatMap(pack=>pack.positiveTerms),
+      ...langPacks.flatMap(pack=>pack.commonPhrases)
     ];
 
     for (const term of nativeTermsList) {
@@ -79,7 +82,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
           provider: 'country_knowledge',
           type: 'TERMINOLOGY',
           matchedTerm: matchedNativeTerms.slice(0, 5).join(', '),
-          sourceRef: `Language Pack (${langPack?.languageName || 'English'})`
+          sourceRef: `Language Pack (${langPack?.languageName || 'English'})`, fields:fieldsFor(matchedNativeTerms)
         },
         timestamp: now
       });
@@ -89,7 +92,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     const matchedRegionalNegative: string[] = [];
     const regionalNegativesList = [
       ...(countryPack?.regionalNegativeTerms || []),
-      ...(langPack?.negativeTerms || [])
+      ...langPacks.flatMap(pack=>pack.negativeTerms)
     ];
 
     for (const neg of regionalNegativesList) {
@@ -115,7 +118,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
           provider: 'country_knowledge',
           type: 'IRRELEVANT_DOMAIN',
           matchedTerm: matchedRegionalNegative.join(', '),
-          sourceRef: `Country Exclusions (${countryPack?.countryName || langPack?.languageName})`
+          sourceRef: `Country Exclusions (${countryPack?.countryName || langPack?.languageName})`, fields:fieldsFor(matchedRegionalNegative)
         },
         timestamp: now
       });

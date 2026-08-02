@@ -57,7 +57,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
           matchedConceptsInVideos.push(concept);
         }
       }
-      for (const langTerm of knowledgeContext.languageKnowledge?.positiveTerms || []) {
+      for (const langTerm of (knowledgeContext.languageKnowledgePacks||[knowledgeContext.languageKnowledge]).flatMap(pack=>pack?.positiveTerms||[])) {
         if (textMatchesTerm(combo, langTerm) && !matchedConceptsInVideos.includes(langTerm)) {
           matchedConceptsInVideos.push(langTerm);
         }

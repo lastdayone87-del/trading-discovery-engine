@@ -1,12 +1,12 @@
 import type { EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
-import { completeChannelText, matchedTerms, MULTILINGUAL_CLASSIFICATION_PACKS } from '../multilingualTerminology';
+import { completeChannelText, contentLanguagePacks, matchedTerms } from '../multilingualTerminology';
+import { documentRef } from '../canonicalEvidencePlane';
 
 export class MultilingualContextProvider implements EvidenceProvider {
   name = 'multilingual_context' as const;
 
   async collectEvidence(input: RawChannelInput, context: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
-    const packs = (context.languageKnowledgePacks || [context.languageKnowledge]).filter(Boolean)
-      .map(language => MULTILINGUAL_CLASSIFICATION_PACKS[language!.languageCode as keyof typeof MULTILINGUAL_CLASSIFICATION_PACKS] || MULTILINGUAL_CLASSIFICATION_PACKS.en);
+    const packs = contentLanguagePacks(input,context);
     const text = completeChannelText(input);
     const matches = (key: 'executionTerms' | 'educationalTerms' | 'businessNewsTerms' | 'genericFinanceTerms' | 'hypeTerms' | 'motivationTerms') => [...new Set(packs.flatMap(pack => matchedTerms(text, pack[key])))];
     const execution = matches('executionTerms');
@@ -18,6 +18,7 @@ export class MultilingualContextProvider implements EvidenceProvider {
     const hasCreatorTradingPractice = execution.length > 0 || education.length > 0;
     const items: EvidenceItem[] = [];
     const now = new Date().toISOString();
+    const fieldsFor=(terms:string[])=>(input.evidence_corpus||[]).filter(document=>terms.some(term=>matchedTerms(document.text,[term]).length>0)).map(documentRef);
 
     if (hasCreatorTradingPractice) {
       const matches = [...execution, ...education];
@@ -34,7 +35,7 @@ export class MultilingualContextProvider implements EvidenceProvider {
         reliabilityMultiplier: 1,
         rawWeight,
         finalWeight: rawWeight * (execution.length >= 2 ? 0.94 : 0.86),
-        provenance: { provider: this.name, type: 'AUTHENTIC_TRADING_PRACTICE', matchedTerm: matches.join(', '), sourceRef: 'Channel title, description, recent uploads, metadata, and official links' },
+        provenance: { provider: this.name, type: 'AUTHENTIC_TRADING_PRACTICE', matchedTerm: matches.join(', '), sourceRef: 'Canonical evidence corpus', fields:fieldsFor(matches) },
         timestamp: now
       });
     }
@@ -53,7 +54,7 @@ export class MultilingualContextProvider implements EvidenceProvider {
         reliabilityMultiplier: 0.85,
         rawWeight,
         finalWeight: -rawWeight * 0.85 * (confidence / 100),
-        provenance: { provider: this.name, type: category, matchedTerm: matches.join(', '), sourceRef: 'Complete channel context contrast analysis' },
+        provenance: { provider: this.name, type: category, matchedTerm: matches.join(', '), sourceRef: 'Canonical evidence corpus contrast analysis', fields:fieldsFor(matches) },
         timestamp: now
       });
     };

@@ -1,5 +1,5 @@
 import { EvidenceCollectionReport, EvidenceItem, EvidenceProvider, RawChannelInput, VerificationDecision, ScoringEngineConfig } from './types';
-import { getLayeredKnowledgeContext } from './knowledgePacks';
+import { getLayeredKnowledgeContext, LANGUAGE_KNOWLEDGE_PACKS } from './knowledgePacks';
 import { ChannelMetadataProvider } from './providers/ChannelMetadataProvider';
 import { VideoMetadataProvider } from './providers/VideoMetadataProvider';
 import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
@@ -9,6 +9,8 @@ import { DiscordProvider } from './providers/DiscordProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { ConfigurableWeightedStrategy } from './scoringEngine';
 import { evaluateClassificationStages } from './stagedClassification';
+import { buildCanonicalEvidenceCorpus, validateEvidenceProvenance } from './canonicalEvidencePlane';
+import { contentLanguagePacks } from './multilingualTerminology';
 
 export class EvidenceBasedTradingEngine {
   private providers: EvidenceProvider[];
@@ -36,8 +38,11 @@ export class EvidenceBasedTradingEngine {
       video_descriptions: input.video_descriptions?.length ? input.video_descriptions : input.videos?.map(video => video.description || ''),
       external_links: input.external_links?.length ? input.external_links : input.external_link_details?.map(link => link.url)
     };
+    input.evidence_corpus=buildCanonicalEvidenceCorpus(input);
     const country = input.country || 'UNKNOWN';
     const knowledgeContext = getLayeredKnowledgeContext(country);
+    const routedCodes=contentLanguagePacks(input,knowledgeContext).map(pack=>pack.languageCode);
+    knowledgeContext.languageKnowledgePacks=[...new Map([...(knowledgeContext.languageKnowledgePacks||[]),...routedCodes.map(code=>LANGUAGE_KNOWLEDGE_PACKS[code]).filter(Boolean)].map(pack=>[pack.languageCode,pack])).values()];
 
     // Collect evidence from all independent providers in parallel
     const providerPromises = this.providers.map(async provider => {
@@ -66,6 +71,7 @@ export class EvidenceBasedTradingEngine {
 
     const providerResults = await Promise.all(providerPromises);
     const allEvidence = providerResults.flatMap(result => result.items);
+    const provenanceErrors=validateEvidenceProvenance(allEvidence);
     const fieldsPresent = [
       input.channel_name?.trim() && 'channel_name', input.description?.trim() && 'description',
       input.video_titles?.length && 'video_titles', input.video_descriptions?.length && 'video_descriptions',
@@ -81,10 +87,12 @@ export class EvidenceBasedTradingEngine {
     const degraded = providerResults.some(result => result.report.availability === 'FAILED');
     const explicitNegative = allEvidence.some(item => item.polarity === 'NEGATIVE' && item.category !== 'MULTI_VIDEO_CONSISTENCY');
     const hasSubstantiveContext = (input.description?.trim().length || 0) >= 40 || (input.video_titles?.length || 0) >= 2 || (input.external_links?.length || 0) > 0 || (input.playlists?.length || 0) > 0 || (input.transcript_excerpts?.length || 0) > 0;
-    const sufficiency = fieldsPresent.length === 0 ? 'MISSING' : (allEvidence.length > 0 || explicitNegative || hasSubstantiveContext) ? 'SUFFICIENT' : 'INSUFFICIENT';
+    const substantiveEvidence=allEvidence.some(item=>item.rawMatches.length>0&&item.category!=='SEMANTIC_ABSTENTION');
+    const sufficiency = fieldsPresent.length === 0 ? 'MISSING' : (substantiveEvidence || explicitNegative || hasSubstantiveContext) ? 'SUFFICIENT' : 'INSUFFICIENT';
     const reasonCodes = [
       sparseMetadata && 'SPARSE_METADATA', degraded && 'PROVIDER_COVERAGE_DEGRADED',
       sufficiency === 'MISSING' && 'NO_CLASSIFIABLE_METADATA', sufficiency === 'INSUFFICIENT' && 'INSUFFICIENT_CLASSIFICATION_EVIDENCE'
+      , ...provenanceErrors
     ].filter(Boolean) as string[];
     const collection: EvidenceCollectionReport = { sufficiency, sparseMetadata, degraded, fieldsPresent, reasonCodes, providers: providerResults.map(result => result.report) };
 
@@ -107,3 +115,5 @@ export * from './knowledgePacks';
 export * from './scoringEngine';
 export * from './reportGenerator';
 export * from './stagedClassification';
+export * from './canonicalEvidencePlane';
+export * from './decisionPolicy';

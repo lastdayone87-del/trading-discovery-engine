@@ -1,4 +1,5 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
+import { documentRef } from '../canonicalEvidencePlane';
 
 export class DiscordProvider implements EvidenceProvider {
   name = 'discord_metadata' as const;
@@ -31,7 +32,7 @@ export class DiscordProvider implements EvidenceProvider {
           provider: 'discord_metadata',
           type: 'EXTERNAL_RESOURCE',
           matchedTerm: invite,
-          sourceRef: 'Discord Invite'
+          sourceRef: 'Discord Invite', fields:(input.evidence_corpus||[]).filter(document=>document.field==='discord_invite').map(documentRef)
         },
         timestamp: now
       });

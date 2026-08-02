@@ -3,6 +3,7 @@ import { appendProviderCallEvent } from '../../db';
 import { executeProviderCall } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
+import { documentRef } from '../canonicalEvidencePlane';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
@@ -41,6 +42,7 @@ function defaultClient(): SemanticModelClient | undefined {
 }
 
 function fieldDocuments(input: RawChannelInput) {
+  if(input.evidence_corpus?.length)return input.evidence_corpus.filter(document=>document.field!=='activity_metadata').slice(0,40).map(document=>({ref:documentRef(document),text:document.text}));
   return [
     { ref: { field: 'channel_title' as const }, text: input.channel_name },
     { ref: { field: 'channel_bio' as const }, text: input.description },

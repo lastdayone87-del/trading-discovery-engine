@@ -101,6 +101,8 @@ export interface RawChannelInput {
   pinned_comment?: string;
   activity_metadata?: { latest_upload_at?: string; uploads_last_30_days?: number; uploads_last_90_days?: number; uploads_last_365_days?: number; activity_band?: string; activity_score?: number; observed_at?: string };
   enrichment_stage?: number;
+  /** Immutable provider input projection, populated by the engine. */
+  evidence_corpus?: import('./canonicalEvidencePlane').CanonicalEvidenceDocument[];
 }
 
 export interface LanguageKnowledge {
@@ -179,6 +181,13 @@ export interface VerificationDecision {
   /** Present on production v2 decisions; optional for replaying pre-v2 fixtures. */
   stagedClassification?: StagedClassificationReport;
   timestamp: string;
+  decisionPolicy?: {
+    version: string;
+    tradingProbability: number;
+    nonTradingProbability: number;
+    coverageConfidence: number;
+    reasonCodes: string[];
+  };
 }
 
 export type ProviderAvailability = 'AVAILABLE' | 'NOT_APPLICABLE' | 'UNAVAILABLE' | 'FAILED';
