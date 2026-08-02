@@ -3,6 +3,7 @@ import { REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION } from './replayMeasureme
 import { recordAdaptiveShadowLabel } from './adaptiveTradingClassifier';
 import { recordEvaluationGroundTruth } from './decisionEvaluation';
 import { recordFalseNegativeIncident } from './governedAdaptation';
+import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 
 export type ReviewState = 'NOT_REQUIRED'|'PENDING'|'APPROVED'|'REJECTED'|'SUPERSEDED';
 export type ReviewAction = 'APPROVE'|'REJECT'|'FORCE_RESCAN';
@@ -84,6 +85,8 @@ export async function decideReview(input:DecideInput) {
       .catch(error=>console.warn(`[DecisionEvaluation] Ground-truth label failed for ${input.channelId}:`,error instanceof Error?error.message:error));
     if(input.action==='APPROVE'&&row.channel_snapshot?.trading_status!=='TRADING_CONFIRMED')void recordFalseNegativeIncident({channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,priorStatus:row.channel_snapshot?.trading_status||'UNKNOWN',evidenceSnapshot:evidence})
       .catch(error=>console.warn(`[CorrectiveLearning] False-negative diagnosis failed for ${input.channelId}:`,error instanceof Error?error.message:error));
+    if(input.action!=='FORCE_RESCAN')void recordAdmissionShadow({channelId:input.channelId,priorState:'NOT_EVALUATED',classificationStatus:input.action==='APPROVE'?'TRADING_CONFIRMED':'HUMAN_REJECTED',investigationState:'COMPLETED',reviewId:inserted.rows[0].id,candidateHypothesis:{humanDecision:input.action},evidenceCoverage:{reviewVersion:nextVersion}})
+      .catch(error=>console.warn(`[CandidateAdmission] review shadow write failed for ${input.channelId}:`,error instanceof Error?error.message:error));
     const channel=updatedChannel.rows[0];
     return {decision:inserted.rows[0],review:{state:updatedReview.rows[0].state,reviewVersion:updatedReview.rows[0].review_version},channel:{channelId:channel.channel_id,tradingStatus:channel.trading_status,scanStatus:channel.scan_status,discordStatus:channel.discord_status},queuePending:updatedReview.rows[0].state==='PENDING',idempotent:false};
   } catch(e){await client.query('ROLLBACK'); throw e;} finally {client.release();}

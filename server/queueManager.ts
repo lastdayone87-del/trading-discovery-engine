@@ -48,6 +48,8 @@ import { recordExternalNominations } from './persistentResearchController';
 import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
+import { recordNomination } from './candidateAdmission/store';
+import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -279,9 +281,18 @@ export async function processNextSearchJob(
     if(queryRunId) await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
     const extracted = searchPage?.channels || await searchYouTubeChannels(query, country, vocab, retrievalLane);
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
+    const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
     const sightings = [];
     for (const [index, raw] of distinctExtracted.entries()) {
+      // A durable nomination is written before channel processing. When the
+      // ledger is OFF, legacy channel_sightings remain the compatibility path.
+      const nomination=await recordNomination({channelId:raw.channelId,sourceType:source,queryId,queryRunId,jobId:job.id,
+        queryCatalogVersion:typeof job.payload.catalogPin?.checksum==='string'?job.payload.catalogPin.checksum:undefined,
+        query,querySemanticClasses:queryRecord?.intent?[queryRecord.intent]:[],queryGenerationMode:queryRecord?.generation_mode,
+        country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
+        matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
+      raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
       const outcome = await processDiscoveredChannel(raw, country, source);
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
@@ -349,6 +360,8 @@ export async function processNextSearchJob(
         channel.scan_attempts = job.attempts;
         channel.last_checked = new Date().toISOString();
         await upsertChannel(channel);
+        void recordAdmissionShadow({channelId,priorState:'NOT_EVALUATED',classificationStatus:'UNCERTAIN',investigationState:'OPERATIONALLY_BLOCKED',operationalFailure:true,candidateHypothesis:{},evidenceCoverage:{failureClass:String(err?.code||err?.name||'WORKER_FAILURE')}})
+          .catch(error=>console.warn(`[CandidateAdmission] operational-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
       }
     }
     const runId = String(job.payload?.queryRunId || '');
@@ -688,7 +701,11 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
     const qualityScores: number[] = [];
     const communityIds: string[] = [];
     let countryAccepted = 0;
-    for (const raw of unique) {
+    for (const [index,raw] of unique.entries()) {
+      const nomination=await recordNomination({channelId:raw.channelId,sourceType:'manual_search',sourceActionId:sessionId,query:queryVariant,
+        queryGenerationMode:'OPERATOR_DIRECTED',country:session.country,retrievalLane:session.retrievalLane,pageNumber,resultRank:index+1,
+        matchedDocument:raw.matchedDocument||{type:'MANUAL'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,sessionId,variantIndex}},'INVESTIGATION_QUEUED');
+      raw.nominationId=nomination.id||undefined;
       const outcome = await processDiscoveredChannel(raw, session.country, 'manual_search');
       if (outcome.wasKnown) knownIds.push(outcome.channelId);
       if (outcome.persisted && outcome.countryStatus !== 'REJECTED') acceptedIds.push(outcome.channelId);
