@@ -20,6 +20,7 @@ import { recordRetrievalEvaluationAssignment } from './decisionEvaluation';
 import { ACTIONS, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
+import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -157,6 +158,9 @@ export async function processChannelThroughPipeline(
       timestamp: now
     }));
 
+    void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:'COUNTRY_REJECTED',
+      investigationState:'POLICY_REJECTED',terminalCountryPolicy:true,candidateHypothesis:{},evidenceCoverage:{countryDecision:countryVal.status}})
+      .catch(error=>console.warn(`[CandidateAdmission] country-policy shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,
@@ -186,12 +190,18 @@ export async function processChannelThroughPipeline(
     video_titles:candidate.videoTitles,video_descriptions:candidate.videoDescriptions||[],playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:candidate.detectedLanguages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
+    search_match_context:candidate.matchedDocument?{provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
-  const classificationDiagnosticId=await recordProductionClassification({channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision})
+  const classificationDiagnosticId=await recordProductionClassification({channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:candidate.discoveryJobId,queryRunId:candidate.queryRunId,nominationId:candidate.nominationId})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
   let tradingVal = productionClassification.result;
+  void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:productionClassification.decision.status,
+    investigationState:productionClassification.decision.status==='UNCERTAIN'?'ACTIVE':'COMPLETED',classificationDiagnosticId,
+    candidateHypothesis:{category:productionClassification.decision.category,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length},
+    evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent}})
+    .catch(error=>console.warn(`[CandidateAdmission] shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
   // Governed evidence remains independently observable and is rollout-gated. It
   // may corroborate existing production-positive evidence, never confirm alone.
   try {

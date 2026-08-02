@@ -52,7 +52,7 @@ export type EvidenceFieldType =
   | 'channel_title' | 'channel_bio' | 'video_title' | 'video_description'
   | 'playlist_name' | 'playlist_description' | 'external_link_label'
   | 'external_link_domain' | 'country' | 'language' | 'transcript_excerpt'
-  | 'visual_evidence' | 'discord_invite' | 'pinned_comment' | 'activity_metadata' | 'location';
+  | 'visual_evidence' | 'discord_invite' | 'pinned_comment' | 'activity_metadata' | 'location' | 'search_match_context';
 
 export interface EvidenceFieldRef {
   field: EvidenceFieldType;
@@ -103,6 +103,8 @@ export interface RawChannelInput {
   enrichment_stage?: number;
   /** Immutable provider input projection, populated by the engine. */
   evidence_corpus?: import('./canonicalEvidencePlane').CanonicalEvidenceDocument[];
+  /** Retrieval provenance is persisted separately and never masquerades as channel About evidence. */
+  search_match_context?: {provider_native_id?:string;title?:string;description?:string;published_at?:string;locator?:string};
 }
 
 export interface LanguageKnowledge {
@@ -241,3 +243,4 @@ export interface EvidenceProvider {
   collectEvidence(input: RawChannelInput, knowledgeContext: LayeredKnowledgeContext): Promise<EvidenceItem[]>;
   availability?(input: RawChannelInput): { availability: Exclude<ProviderAvailability, 'FAILED'>; reason?: string };
 }
+export type {EvidenceProviderV2,EvidenceDocumentObservation,EvidenceAssertionObservation,EvidenceCoverageSnapshot} from './documentTypes';
