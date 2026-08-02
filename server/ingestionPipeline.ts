@@ -190,6 +190,7 @@ export async function processChannelThroughPipeline(
     video_titles:candidate.videoTitles,video_descriptions:candidate.videoDescriptions||[],playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:candidate.detectedLanguages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
+    search_match_context:candidate.matchedDocument?{provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);

@@ -1,6 +1,7 @@
 import {createHash} from 'node:crypto';
 import {getDb} from './db';
 import type {RawChannelInput,VerificationDecision} from './evidenceEngine';
+import {persistClassificationEvidenceBundle} from './evidenceEngine/dualWrite';
 
 function normalize(input:RawChannelInput){
   const stable={...input,channel_name:input.channel_name.normalize('NFKC').trim(),description:input.description||'',external_links:[...(input.external_links||[])].sort()};
