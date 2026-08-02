@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 
-export const STAGED_CLASSIFICATION_VERSION = '2.2.0';
+export const STAGED_CLASSIFICATION_VERSION = '3.0.0';
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
   if (item.provenance?.fields?.length) return item.provenance.fields;

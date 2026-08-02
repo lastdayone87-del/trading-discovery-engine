@@ -90,7 +90,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     const matchedConcepts: string[] = [];
     const allConcepts = [
       ...knowledgeContext.globalAdvancedConcepts,
-      ...(knowledgeContext.languageKnowledge?.positiveTerms || []),
+      ...(knowledgeContext.languageKnowledgePacks||[knowledgeContext.languageKnowledge]).flatMap(pack=>pack?.positiveTerms||[]),
       ...(knowledgeContext.countryKnowledge?.nativeTradingTerminology || [])
     ];
 
@@ -129,7 +129,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
     const allNegative = [
       ...knowledgeContext.globalNegativeTerms,
       ...(knowledgeContext.countryKnowledge?.regionalNegativeTerms || []),
-      ...(knowledgeContext.languageKnowledge?.negativeTerms || [])
+      ...(knowledgeContext.languageKnowledgePacks||[knowledgeContext.languageKnowledge]).flatMap(pack=>pack?.negativeTerms||[])
     ];
 
     for (const neg of allNegative) {

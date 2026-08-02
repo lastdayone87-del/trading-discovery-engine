@@ -97,7 +97,16 @@ export const MULTILINGUAL_CLASSIFICATION_PACKS: Record<MultilingualClassificatio
 };
 
 export function completeChannelText(input: RawChannelInput): string {
-  return [input.channel_name, input.description, ...(input.video_titles || []), ...(input.video_descriptions || []), input.location_tag, ...(input.external_links || [])].filter(Boolean).join(' ');
+  return (input.evidence_corpus?.map(document=>document.text) || [input.channel_name, input.description, ...(input.video_titles || []), ...(input.video_descriptions || []), input.location_tag, ...(input.external_links || [])]).filter(Boolean).join(' ');
+}
+
+/** Select languages from actual field content and declared field hints, not country alone. */
+export function contentLanguagePacks(input:RawChannelInput,context:LayeredKnowledgeContext):MultilingualClassificationPack[]{
+  const text=completeChannelText(input),hinted=new Set([...(input.detected_languages||[]).filter(item=>(item.confidence??100)>=50).map(item=>item.language.toLocaleLowerCase('und').split('-')[0]),...(input.evidence_corpus||[]).map(item=>item.language?.toLocaleLowerCase('und').split('-')[0]).filter((x):x is string=>Boolean(x))]);
+  const configured=(context.languageKnowledgePacks||[context.languageKnowledge]).map(item=>item?.languageCode).filter((x):x is string=>Boolean(x));
+  const contentMatched=Object.values(MULTILINGUAL_CLASSIFICATION_PACKS).filter(pack=>[...pack.executionTerms,...pack.educationalTerms,...pack.businessNewsTerms,...pack.genericFinanceTerms,...pack.hypeTerms,...pack.motivationTerms].some(term=>textMatchesTerm(text,term))).map(pack=>pack.languageCode);
+  const codes=[...new Set([...configured,...hinted,...contentMatched])];
+  return codes.map(code=>MULTILINGUAL_CLASSIFICATION_PACKS[code as keyof typeof MULTILINGUAL_CLASSIFICATION_PACKS]).filter((pack):pack is MultilingualClassificationPack=>Boolean(pack));
 }
 
 export function matchedTerms(text: string, terms: string[]): string[] {
@@ -105,8 +114,7 @@ export function matchedTerms(text: string, terms: string[]): string[] {
 }
 
 export function isTradingFocusedText(text: string, context: LayeredKnowledgeContext): boolean {
-  const languagePacks = (context.languageKnowledgePacks || [context.languageKnowledge]).filter(Boolean)
-    .map(item => MULTILINGUAL_CLASSIFICATION_PACKS[item!.languageCode as keyof typeof MULTILINGUAL_CLASSIFICATION_PACKS] || MULTILINGUAL_CLASSIFICATION_PACKS.en);
+  const languagePacks = contentLanguagePacks({channel_name:'',description:text},context);
   const hasExecution = languagePacks.some(pack => matchedTerms(text, pack.executionTerms).length > 0);
   const hasEducation = languagePacks.some(pack => matchedTerms(text, pack.educationalTerms).length > 0);
   const hasMethodology = context.globalAdvancedConcepts.some(term => textMatchesTerm(text, term));

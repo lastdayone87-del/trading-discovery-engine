@@ -1,4 +1,5 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
+import { documentRef } from '../canonicalEvidencePlane';
 
 export class ExternalLinkProvider implements EvidenceProvider {
   name = 'external_links' as const;
@@ -13,7 +14,7 @@ export class ExternalLinkProvider implements EvidenceProvider {
     const items: EvidenceItem[] = [];
     const links = input.external_links || [];
     const now = new Date().toISOString();
-    const fieldsFor=(values:string[])=>(input.external_link_details||[]).flatMap((detail,index)=>values.some(value=>detail.url.toLocaleLowerCase('und').includes(value.toLocaleLowerCase('und'))||detail.domain?.toLocaleLowerCase('und')===value.toLocaleLowerCase('und'))?[{field:'external_link_domain' as const,index,sourceId:detail.url,sourceFamilyId:detail.source_family_id,sourceEntityId:detail.source_entity_id}]:[]);
+    const fieldsFor=(values:string[])=>(input.evidence_corpus||[]).filter(document=>document.field==='external_link_domain'&&values.some(value=>document.text.toLocaleLowerCase('und').includes(value.toLocaleLowerCase('und')))).map(documentRef);
 
     if (links.length === 0) {
       return items;
