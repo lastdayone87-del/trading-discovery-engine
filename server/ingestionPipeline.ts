@@ -21,6 +21,7 @@ import { ACTIONS, planAndRecordEvidenceAction, type EvidenceActionType, type Evi
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
+import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -289,6 +290,8 @@ export async function processChannelThroughPipeline(
     const lifecycle = resolveUncertainLifecycle(shouldReview);
     const finalUncertainStatus = lifecycle.tradingStatus;
     const finalScanStatus = lifecycle.scanStatus;
+    const corroboration=productionClassification.decision.stagedClassification?.stages.find(stage=>stage.stage==='CORROBORATION');
+    void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:productionClassification.decision.positiveEvidence.length>0,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false}).catch(error=>console.warn(`[ReviewEligibility] shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
 
     const uncertainChannel: ChannelRecord = existing || {
       channel_id: candidate.channelId,

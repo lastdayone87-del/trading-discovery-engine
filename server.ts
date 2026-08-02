@@ -88,6 +88,10 @@ import {listEvidenceAssertions} from './server/evidenceEngine/assertionStore';
 import {listEvidenceCoverage} from './server/evidenceEngine/coverageStore';
 import {inspectCreatorFocusShadow} from './server/evidenceEngine/creatorFocusClassifier';
 import {inspectGapSpecificPlans} from './server/gapSpecificInvestigation';
+import {inspectDashboardCorpora} from './server/dashboardCorpus/store';
+import {repairDashboardCorpusProjection,verifyDashboardCorpusProjection} from './server/dashboardCorpus/replay';
+import {inspectReviewEligibility} from './server/reviewEligibility/store';
+import {repairReviewEligibilityProjection,verifyReviewEligibilityProjection} from './server/reviewEligibility/replay';
 
 
 async function startServer() {
@@ -117,6 +121,12 @@ async function startServer() {
   app.get('/api/evidence-coverage',async(req,res)=>{try{res.json(await listEvidenceCoverage({channelId:req.query.channel_id as string|undefined,limit:Number(req.query.limit||100),offset:Number(req.query.offset||0),cutoff:req.query.cutoff as string|undefined}));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/creator-focus/shadow',async(req,res)=>{try{res.json(await inspectCreatorFocusShadow(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/investigations/gap-plans',async(req,res)=>{try{res.json(await inspectGapSpecificPlans(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/dashboard/corpora',async(req,res)=>{try{res.json(await inspectDashboardCorpora({corpus:req.query.corpus as string|undefined,limit:Number(req.query.limit||100)}));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/dashboard/corpora/verify',async(_req,res)=>{try{res.json(await verifyDashboardCorpusProjection());}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/dashboard/corpora/repair',async(req,res)=>{try{res.json(await repairDashboardCorpusProjection(req.operator!.actorId));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/review-eligibility/v2',async(req,res)=>{try{res.json(await inspectReviewEligibility(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/review-eligibility/v2/verify',async(_req,res)=>{try{res.json(await verifyReviewEligibilityProjection());}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/review-eligibility/v2/repair',async(req,res)=>{try{res.json(await repairReviewEligibilityProjection(req.operator!.actorId));}catch(err:any){sendOperationError(res,err);}});
 
   const requireReviewer: express.RequestHandler = (req,res,next) => {
     // The central operator boundary has authenticated this request. Keeping this
