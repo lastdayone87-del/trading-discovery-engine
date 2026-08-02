@@ -92,6 +92,7 @@ import {inspectDashboardCorpora} from './server/dashboardCorpus/store';
 import {repairDashboardCorpusProjection,verifyDashboardCorpusProjection} from './server/dashboardCorpus/replay';
 import {inspectReviewEligibility} from './server/reviewEligibility/store';
 import {repairReviewEligibilityProjection,verifyReviewEligibilityProjection} from './server/reviewEligibility/replay';
+import {activateRelease5Capability,inspectRelease5Rollout,repairRelease5Projection,revokeRelease5Capability,setRelease5KillSwitch,verifyRelease5Projection} from './server/release5/rollout';
 
 
 async function startServer() {
@@ -127,6 +128,12 @@ async function startServer() {
   app.get('/api/review-eligibility/v2',async(req,res)=>{try{res.json(await inspectReviewEligibility(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/review-eligibility/v2/verify',async(_req,res)=>{try{res.json(await verifyReviewEligibilityProjection());}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/review-eligibility/v2/repair',async(req,res)=>{try{res.json(await repairReviewEligibilityProjection(req.operator!.actorId));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/release5/rollout',async(req,res)=>{try{res.json(await inspectRelease5Rollout(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/release5/rollout/activate',async(req,res)=>{try{res.json(await activateRelease5Capability({capability:req.body.capability,mode:req.body.mode,canaryBasisPoints:Number(req.body.canaryBasisPoints),promotionGateId:String(req.body.promotionGateId||''),actor:req.operator!.actorId,reason:String(req.body.reason||'')}));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/release5/rollout/revoke',async(req,res)=>{try{res.json(await revokeRelease5Capability({capability:req.body.capability,actor:req.operator!.actorId,reason:String(req.body.reason||'')}));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/release5/rollout/verify',async(_req,res)=>{try{res.json(await verifyRelease5Projection());}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/release5/rollout/repair',async(req,res)=>{try{res.json(await repairRelease5Projection(req.operator!.actorId));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/release5/rollout/control',async(req,res)=>{try{res.json(await setRelease5KillSwitch({capability:req.body.capability,mode:req.body.mode,actor:req.operator!.actorId,reason:String(req.body.reason||'')}));}catch(err:any){sendOperationError(res,err);}});
 
   const requireReviewer: express.RequestHandler = (req,res,next) => {
     // The central operator boundary has authenticated this request. Keeping this

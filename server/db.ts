@@ -210,18 +210,31 @@ export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
     WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) =
       lower(regexp_replace(trim(channels.country), '\\s+', ' ', 'g'))
   )`;
-function channelListingWhere(args:ChannelListingFilter):{where:string;values:string[]} {
-  const clauses=[args.includeRejected?'TRUE':OPERATOR_VISIBLE_CHANNEL_SQL]; const values:string[]=[];
+async function dashboardServingPredicate(db:InstanceType<typeof Pool>):Promise<{predicate:string;scope:string}>{
+  const result=await db.query(`SELECT s.setting_value,p.mode,p.activation_id,g.decision
+    FROM app_settings s LEFT JOIN release5_rollout_projection p ON p.capability='DASHBOARD_CORPUS'
+    LEFT JOIN decision_promotion_gates g ON g.id=p.promotion_gate_id
+    WHERE s.setting_key='release5_dashboard_serving_mode'`);
+  const control=result.rows[0];
+  if(!control||control.setting_value==='OFF'||control.setting_value!==control.mode||control.decision!=='PROMOTE')return {predicate:OPERATOR_VISIBLE_CHANNEL_SQL,scope:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'};
+  const projected=`EXISTS(SELECT 1 FROM dashboard_corpus_projection dcp WHERE dcp.channel_id=channels.channel_id AND dcp.corpus IN('CONFIRMED','REVIEW'))`;
+  if(control.mode==='ACTIVE')return {predicate:projected,scope:'RELEASE5_ACTIVE_DASHBOARD_CORPUS'};
+  const assigned=`EXISTS(SELECT 1 FROM release5_serving_assignments rsa WHERE rsa.capability='DASHBOARD_CORPUS' AND rsa.channel_id=channels.channel_id AND rsa.activation_id=(SELECT activation_id FROM release5_rollout_projection WHERE capability='DASHBOARD_CORPUS') AND rsa.assigned=true)`;
+  return {predicate:`((${assigned}) AND (${projected}) OR (NOT (${assigned}) AND (${OPERATOR_VISIBLE_CHANNEL_SQL})))`,scope:'RELEASE5_CANARY_DASHBOARD_CORPUS'};
+}
+async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelListingFilter):Promise<{where:string;values:string[];scope:string}> {
+  const serving=args.includeRejected?{predicate:'TRUE',scope:'ALL_CHANNELS'}:await dashboardServingPredicate(db);
+  const clauses=[serving.predicate]; const values:string[]=[];
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
   add('discord_status',args.discordStatus); add('scan_status',args.scanStatus);
-  return {where:clauses.join(' AND '),values};
+  return {where:clauses.join(' AND '),values,scope:serving.scope};
 }
 
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
-  const {where,values}=channelListingWhere(args);
+  const {where,values}=await channelListingWhere(db,args);
   const columns=`channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at`;
   const [page,summary]=await Promise.all([
     db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY first_seen DESC,channel_id LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
@@ -231,7 +244,7 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
 }
 
 export async function getChannelListingRevision(args:ChannelListingFilter):Promise<{total:number;revision:string|null}> {
-  const db=await getDb(); const {where,values}=channelListingWhere(args);
+  const db=await getDb(); const {where,values}=await channelListingWhere(db,args);
   const result=await db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values);
   return {total:Number(result.rows[0].total||0),revision:iso(result.rows[0].revision)};
 }
@@ -241,14 +254,14 @@ export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=proce
   const db=await getDb();
   // One aggregate query preserves the summary-endpoint optimization while the
   // shared eligibility predicate prevents KPI/listing population drift.
-  const result=await db.query(`SELECT COUNT(*)::int stored_channels,
+  const serving=await dashboardServingPredicate(db);const result=await db.query(`SELECT COUNT(*)::int stored_channels,
     COUNT(*) FILTER(WHERE discord_status IN('ACTIVE','ACTIVE_LOW_VOLUME'))::int active_discords,
     COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW'))::int pending_scans,
     (SELECT COUNT(*)::int FROM channel_reviews WHERE state='PENDING') pending_reviews
-    FROM channels WHERE ${OPERATOR_VISIBLE_CHANNEL_SQL}`);
+    FROM channels WHERE ${serving.predicate}`);
   const row=result.rows[0];
   return {storedChannels:Number(row.stored_channels||0),activeDiscords:Number(row.active_discords||0),pendingScans:Number(row.pending_scans||0),pendingReviews:Number(row.pending_reviews||0),
-    scope:{storedChannels:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS',operationalMetrics:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS',pendingReviews:'DURABLE_REVIEW_QUEUE'},
+    scope:{storedChannels:serving.scope,operationalMetrics:serving.scope,pendingReviews:'DURABLE_REVIEW_QUEUE'},
     deployment:{environment:env.RAILWAY_ENVIRONMENT_NAME||env.DEPLOYMENT_ENVIRONMENT||env.NODE_ENV||'unknown',service:env.RAILWAY_SERVICE_NAME||env.SERVICE_NAME||'trading-discovery-engine',instance:env.RAILWAY_DEPLOYMENT_ID?.slice(0,12)||env.DEPLOYMENT_ID?.slice(0,12)||'local'}};
 }
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {

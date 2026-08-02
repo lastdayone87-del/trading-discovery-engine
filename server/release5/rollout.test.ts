@@ -1,0 +1,4 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {replayRelease5Activations} from './rollout';
+const row=(id:string,prior:string|null,status='APPROVED',mode='CANARY')=>({id,capability:'DASHBOARD_CORPUS',prior_activation_id:prior,status,mode,canary_basis_points:status==='REVOKED'?0:100,promotion_gate_id:'g',definition_checksum:`x${id}`,activated_at:`2026-01-0${id}`});
+test('Release 5 activation replay is deterministic and rollback is explicit',()=>{const states=replayRelease5Activations([row('2','1','REVOKED'),row('1',null)]);assert.equal(states.get('DASHBOARD_CORPUS')?.mode,'OFF');assert.equal(states.get('DASHBOARD_CORPUS')?.version,2);});
+test('Release 5 activation replay fails closed on lineage gaps',()=>{assert.throws(()=>replayRelease5Activations([row('2','missing')]),/REPLAY_GAP/);});
