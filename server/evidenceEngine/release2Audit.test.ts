@@ -21,6 +21,7 @@ test('Phase 3 exposes V2 contracts and compatibility adapters without replacing 
 });
 
 test('Phase 3 separates search context and remains the ordered foundation for Release 3', async () => {
+test('Phase 3 separates search context and does not begin Release 3', async () => {
   const [canonical, semantic, ingestion] = await Promise.all([
     read('./canonicalEvidencePlane.ts'), read('./providers/GeminiSemanticProvider.ts'), read('../ingestionPipeline.ts')
   ]);
