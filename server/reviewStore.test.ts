@@ -14,3 +14,10 @@ test('terminal decisions cannot be overwritten',()=>{
   assert.throws(()=>resolveReviewTransition('APPROVED','REJECT'),ReviewConflictError);
   assert.throws(()=>resolveReviewTransition('REJECTED','APPROVE'),ReviewConflictError);
 });
+
+test('approval and rejection produce their durable terminal queue states',()=>{
+  assert.equal(resolveReviewTransition('PENDING','APPROVE'),'APPROVED');
+  assert.equal(resolveReviewTransition('PENDING','REJECT'),'REJECTED');
+  assert.notEqual(resolveReviewTransition('PENDING','APPROVE'),'PENDING');
+  assert.notEqual(resolveReviewTransition('PENDING','REJECT'),'PENDING');
+});
