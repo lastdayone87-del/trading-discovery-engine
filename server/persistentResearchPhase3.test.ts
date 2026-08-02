@@ -1,0 +1,14 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { admitResearchMultilingualSurface, detectTerminologyBurst, publicationRequestContract, terminologyTrialAssignment } from './persistentResearchPhase3';
+
+test('multilingual research uses the global organic language admission and independent usage sources',()=>{const admitted=admitResearchMultilingualSurface({candidateId:'c',conceptId:'concept',surface:'تداول يومي',sourceRefs:['doc:1','doc:2'],independentSourceIds:['artifact:1','artifact:2'],language:'ar',script:'Arab',locale:'ar-EG',experimentId:'e',assignmentCap:10,quotaCap:100});assert.ok(admitted);assert.equal(admitted?.languageCapability.disposition,'CONTROLLED_TRIAL');assert.equal(admitResearchMultilingualSurface({candidateId:'x',conceptId:'concept',surface:'трейдинг',sourceRefs:['a','b'],independentSourceIds:['same','same'],language:'ru',script:'Latn',locale:'ru-RU',experimentId:'e',assignmentCap:10,quotaCap:100}),null);});
+
+test('terminology trials and burst decisions are deterministic and bounded',()=>{assert.deepEqual(terminologyTrialAssignment('term'),terminologyTrialAssignment('term'));assert.throws(()=>terminologyTrialAssignment('term',10000),/INVALID_TERMINOLOGY_TRIAL_ALLOCATION/);assert.equal(detectTerminologyBurst({currentIndependentSources:4,baselineIndependentSources:1}).detected,true);assert.equal(detectTerminologyBurst({currentIndependentSources:2,baselineIndependentSources:0}).reasonCode,'INSUFFICIENT_CURRENT_SOURCES');});
+
+test('publication handoff explicitly preserves catalog governance',()=>{const contract=publicationRequestContract({conceptId:'c',surfaceId:'s',country:'Japan',locale:'ja-JP',evaluationId:'e'});assert.equal(contract.automaticPublication,false);assert.equal(contract.status,'AWAITING_GOVERNANCE');assert.ok(contract.requiredChecks.includes('ATOMIC_POINTER_CAS'));});
+
+test('phase three migration is additive and trial evidence is immutable',()=>{const sql=fs.readFileSync(new URL('./db/migrations/048_persistent_research_phase3_semantics.sql',import.meta.url),'utf8');for(const table of ['emerging_terminology_bursts','terminology_trial_assignments','terminology_trial_evaluations','terminology_catalog_publication_requests'])assert.match(sql,new RegExp(table));assert.match(sql,/reject_immutable_event_mutation/);assert.doesNotMatch(sql,/DROP TABLE|DROP COLUMN|TRUNCATE/i);});
+
+test('controller completes corpus, admission, burst, resolution, trial and publication stages',()=>{const source=fs.readFileSync(new URL('./persistentResearchController.ts',import.meta.url),'utf8');for(const token of ['generateCorpusMiningActions','materializeCorpusMiningActions','MINE_TRANSCRIPT_KEYPHRASES','MINE_CHANNEL_CORPUS','admitResearchMultilingualSurface','detectAndReactivateTerminology','enqueueConceptResolution','terminologyTrialAssignment','evaluateTerminologyTrials','publicationRequestContract'])assert.match(source,new RegExp(token));});
