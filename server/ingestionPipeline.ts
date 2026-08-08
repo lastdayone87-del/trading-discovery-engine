@@ -17,8 +17,9 @@ import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
 import {recordProductionClassification} from './classificationDiagnostics';
 import { recordRetrievalEvaluationAssignment } from './decisionEvaluation';
-import { ACTIONS, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
+import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
+import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
@@ -332,11 +333,12 @@ export async function processChannelThroughPipeline(
 
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
-      const payload={ channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate, enrichmentStage:nextStage, evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction };
-      if(await getAppSetting('investigation_workflow_enabled','false')==='true'){
-        try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority:10,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
-        catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);await enqueueJob('ENRICH_CHANNEL',payload,{priority:10,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});}
-      }else await enqueueJob('ENRICH_CHANNEL',payload,{priority:10,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});
+      const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate, enrichmentStage:nextStage, evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
+      const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
+      if(workflowAssignment.assigned||legacyWorkflowEnabled){
+        try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
+        catch(error){if(candidate.investigationId)throw error;console.error(`[Investigation] Initial transactional scheduling failed for ${candidate.channelId}; using compatible queue fallback.`,error);await enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});}
+      }else await enqueueJob('ENRICH_CHANNEL',payload,{priority,maxAttempts:4,idempotencyKey:`enrich:${candidate.channelId}:stage:${nextStage}`});
     }
 
     return {
