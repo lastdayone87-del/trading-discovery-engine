@@ -17,6 +17,11 @@
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts"
+    ,"phaseb:validate-documents": "tsx scripts/phaseBValidateDocuments.ts"
+    ,"phaseb:activate-assertions": "tsx scripts/phaseBActivateAssertions.ts"
+    ,"phaseb:seal-benchmark": "tsx scripts/phaseBSealBenchmark.ts"
+    ,"phaseb:disable-control": "tsx scripts/phaseBDisableControl.ts"
+    ,"phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts"
     ,"phase4:replay": "tsx scripts/phase4Replay.ts",
     "phase5:verify": "npm test && npm run lint && npm run build",
     "phase6:verify": "npm test && npm run lint && npm run build",

@@ -1,0 +1,2 @@
+import 'dotenv/config';import {disablePhaseBShadowControl} from '../server/phaseBShadow';
+const control=process.env.PHASE_B_CONTROL as 'EVALUATION_SAMPLING'|'EVIDENCE_DOCUMENTS'|'EVIDENCE_ASSERTIONS'|'CREATOR_FOCUS_SHADOW'|undefined;if(!control)throw new Error('PHASE_B_CONTROL is required');disablePhaseBShadowControl({control,actor:process.env.PHASE_B_ACTOR||'phase-b-operator',reason:process.env.PHASE_B_DISABLE_REASON||'Phase B rollback'}).then(result=>console.log(JSON.stringify(result,null,2))).catch(error=>{console.error(error);process.exitCode=1;});
