@@ -320,12 +320,9 @@ async function crawlSocialBios(
  */
 export async function scrapeRecentVideoDescriptions(youtubeUrl: string): Promise<string[]> {
   if (!youtubeUrl || !youtubeUrl.startsWith('http')) return [];
-
-  try {
-    const videosPageUrl = youtubeUrl.endsWith('/videos') ? youtubeUrl : `${youtubeUrl.replace(/\/+$/, '')}/videos`;
-    const page = await fetchWithTimeout(videosPageUrl, 0);
-    
-    if (!page) return [];
+  const videosPageUrl = youtubeUrl.endsWith('/videos') ? youtubeUrl : `${youtubeUrl.replace(/\/+$/, '')}/videos`;
+  const page = await fetchWithTimeout(videosPageUrl, 0);
+  if (!page) throw new Error('Recent-video page acquisition failed');
 
     const html = page.html;
 
@@ -370,11 +367,7 @@ export async function scrapeRecentVideoDescriptions(youtubeUrl: string): Promise
       }
     }
 
-    return descriptions;
-  } catch (err) {
-    console.warn('Failed to scrape recent video descriptions:', err);
-    return [];
-  }
+  return descriptions;
 }
 
 /**
@@ -483,11 +476,14 @@ export async function runChannelInspection(channelData: {
   socialLinks?: string[];
   youtubeUrl?: string;
   forceLiveFetch?: boolean;
+  liveChannelDataLoader?: typeof fetchLiveYouTubeChannelData;
 }): Promise<InspectionResult> {
   const steps: InspectionStep[] = [];
   const now = new Date().toISOString();
   let extractedThumbnailUrl: string | undefined;
   const acquisitionOutcomes:ExternalAcquisitionObservation[]=[];
+  let acquiredAboutUrl:string|undefined;
+  const acquiredRecentDescriptionSurfaces:string[]=[];
 
   let debugLog: any = channelData.enableDebug ? {
     rawAboutPageHtml: null,
@@ -506,9 +502,10 @@ export async function runChannelInspection(channelData: {
   if (channelData.youtubeUrl || channelData.channelId) {
     if (channelData.youtubeUrl && (channelData.forceLiveFetch || links.length === 0 || bio.length < 20)) {
       try {
-        await incrementQuota(25); // Track YouTube live channel page scrape units
-        const liveData = await fetchLiveYouTubeChannelData(channelData.youtubeUrl, channelData.enableDebug);
+        if(!channelData.liveChannelDataLoader)await incrementQuota(25); // injected loaders are test/replay inputs, not provider calls
+        const liveData = await (channelData.liveChannelDataLoader || fetchLiveYouTubeChannelData)(channelData.youtubeUrl, channelData.enableDebug);
         if (liveData) {
+          acquiredAboutUrl=channelData.youtubeUrl;
           if (liveData.bio) bio = `${bio} ${liveData.bio}`.trim();
           if (liveData.channelLinks && liveData.channelLinks.length > 0) {
             links = Array.from(new Set([...links, ...liveData.channelLinks]));
@@ -520,8 +517,9 @@ export async function runChannelInspection(channelData: {
             debugLog.rawAboutPageHtml = liveData.rawHtml;
             debugLog.fetchLog = liveData.fetchLog;
           }
-        }
+        } else acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'YOUTUBE_ABOUT_ACQUISITION_FAILED',detail:'YouTube About page could not be acquired',observedAt:now});
       } catch (e) {
+        acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'YOUTUBE_ABOUT_ACQUISITION_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});
         console.warn('Live YouTube channel scrape failed:', e);
       }
     }
@@ -531,10 +529,12 @@ export async function runChannelInspection(channelData: {
       if (channelData.channelId) {
         try {
           const apiDescs = await fetchRecentVideoDescriptionsFromAPI(channelData.channelId);
+          acquiredRecentDescriptionSurfaces.push(`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`);
           if (apiDescs.length > 0) {
             videoDescs = Array.from(new Set([...videoDescs, ...apiDescs]));
           }
         } catch (e) {
+          acquisitionOutcomes.push({requestedUrl:`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_API_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});
           console.warn('API video descriptions fetch failed:', e);
         }
       }
@@ -542,10 +542,12 @@ export async function runChannelInspection(channelData: {
       if (videoDescs.length < 5 && channelData.youtubeUrl) {
         try {
           const scrapedDescs = await scrapeRecentVideoDescriptions(channelData.youtubeUrl);
+          acquiredRecentDescriptionSurfaces.push(`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`);
           if (scrapedDescs.length > 0) {
             videoDescs = Array.from(new Set([...videoDescs, ...scrapedDescs]));
           }
         } catch (e) {
+          acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_SCRAPE_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});
           console.warn('Scraped video descriptions failed:', e);
         }
       }
@@ -624,8 +626,10 @@ export async function runChannelInspection(channelData: {
   if (directBioInvite) {
     step1Logs.push(`Direct Discord invite detected in Channel Bio: Invite Code "${directBioInvite}"`);
     addStep('BIO', 'Step 1 — Channel Bio & About Panel', 'FOUND', step1Logs, directBioInvite, 'CHANNEL_ABOUT');
-    return { foundInvite: directBioInvite, foundLocation: 'CHANNEL_ABOUT', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
+    acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl||`youtube:channel:${channelData.channelId}`,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in YouTube About content',observedAt:now});
+    return { foundInvite: directBioInvite, foundLocation: 'CHANNEL_ABOUT', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
   } else {
+    if(acquiredAboutUrl)acquisitionOutcomes.push({requestedUrl:acquiredAboutUrl,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:'YouTube About page acquired and inspected without a Discord invite',observedAt:now});
     step1Logs.push('No direct Discord invite found in channel bio.');
     addStep('BIO', 'Step 1 — Channel Bio & About Panel', 'NOT_FOUND', step1Logs);
   }
@@ -643,7 +647,8 @@ export async function runChannelInspection(channelData: {
       if (inv) {
         step2Logs.push(`Direct Discord invite detected in channel links: ${link}`);
         addStep('EXTERNAL_LINKS', 'Step 2 — Channel External Links', 'FOUND', step2Logs, inv, 'CHANNEL_LINKS');
-        return { foundInvite: inv, foundLocation: 'CHANNEL_LINKS', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
+        acquisitionOutcomes.push({requestedUrl:link,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});
+        return { foundInvite: inv, foundLocation: 'CHANNEL_LINKS', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
       }
     }
     step2Logs.push('No direct Discord invite found in channel links.');
@@ -666,7 +671,8 @@ export async function runChannelInspection(channelData: {
       if (inv) {
         step3Logs.push(`Discord invite detected in ${sourceName}`);
         addStep('VIDEO_DESCRIPTIONS', 'Step 3 — Latest Video Descriptions', 'FOUND', step3Logs, inv, sourceName);
-        return { foundInvite: inv, foundLocation: sourceName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
+        acquisitionOutcomes.push({requestedUrl:`youtube:channel:${channelData.channelId}:${sourceName}`,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in recent video description',observedAt:now});
+        return { foundInvite: inv, foundLocation: sourceName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
       }
     }
     step3Logs.push('No direct Discord invite found in video descriptions.');
@@ -674,6 +680,7 @@ export async function runChannelInspection(channelData: {
   } else {
     addStep('VIDEO_DESCRIPTIONS', 'Step 3 — Latest Video Descriptions', 'SKIPPED', ['No video descriptions available.']);
   }
+  for(const surface of acquiredRecentDescriptionSurfaces)acquisitionOutcomes.push({requestedUrl:surface,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:'Recent video descriptions acquired and inspected without a Discord invite',observedAt:now});
 
   // Deduplicate and filter external URLs
   const uniqueUrls = new Map<string, { url: string; contextMatches: boolean; source: string }>();

@@ -4,7 +4,7 @@ import { evaluateClassificationStages, stage } from './stagedClassification';
 import type { EvidenceCollectionReport, EvidenceItem } from './types';
 
 const collection = (overrides: Partial<EvidenceCollectionReport> = {}): EvidenceCollectionReport => ({
-  sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false, fieldsPresent: ['channel_name', 'video_titles'], reasonCodes: [], providers: [], ...overrides
+  sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false, fieldsPresent: ['channel_name', 'video_titles'], reasonCodes: [], providers: [], terminalNegativeSufficiency:{status:'SUFFICIENT',creatorLevelCoverage:true,independentSourceFamilies:1,independentObservations:1,reasonCodes:['CREATOR_LEVEL_NEGATIVE_COVERAGE']}, ...overrides
 });
 const evidence = (id: string, partial: Partial<EvidenceItem>): EvidenceItem => ({
   id, source: 'video_metadata', polarity: 'POSITIVE', category: 'METHODOLOGY_CONCEPT', fact: id,

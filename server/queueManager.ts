@@ -137,7 +137,7 @@ export async function addAutomatedCountrySearch(countryName: string, provenance?
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -150,6 +150,7 @@ export async function processNextSearchJob(
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('POST_APPROVAL_ENRICH'))) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('FORCE_REVIEW_RESCAN'))) claimableTypes.push('FORCE_REVIEW_RESCAN');
+  if (!qStatus.discordValidation.isPaused && (!claimableOverride || claimableOverride.includes('RETRY_COMMUNITY_ACQUISITION'))) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
   if(!claimableOverride||claimableOverride.includes('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER')){const db=await getDb();const c=await db.query(`SELECT 1 FROM external_provider_adapter_controls WHERE mode IN('CANARY','ACTIVE') AND NOT paused AND NOT kill_switch LIMIT 1`);if(c.rowCount)claimableTypes.push('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_PLAYLIST')){const db=await getDb();const c=await db.query(`SELECT mode,paused,kill_switch FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_PLAYLIST'`);if(c.rows[0]?.mode==='CANARY'&&!c.rows[0].paused&&!c.rows[0].kill_switch)claimableTypes.push('INSPECT_PLAYLIST');}
   if (!claimableOverride || claimableOverride.includes('TERM_HARVEST')) {
@@ -179,6 +180,14 @@ export async function processNextSearchJob(
   try {
     if(investigationId&&investigationStepId&&!await startInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,attempt:job.attempts,workerId})){await completeJob(job.id);return true;}
     await recordExecutionStage('DISPATCHER','REACHED',{jobId:job.id,type:job.type});
+    if(job.type==='RETRY_COMMUNITY_ACQUISITION'){
+      const channel=await getChannelById(String(job.payload.channelId||''));
+      if(!channel){await completeJob(job.id);return true;}
+      await inspectAndValidateChannel(channel,undefined,false,false,false);
+      const refreshed=await getChannelById(channel.channel_id);
+      if(refreshed?.scan_status==='FAILED')throw new Error('Retryable community acquisition remains unresolved');
+      await completeJob(job.id);return true;
+    }
     if(job.type==='TERM_HARVEST'){await processTermHarvestJob(job);return true;}
     if(job.type==='SCORE_CANDIDATES'){await processCandidateScoringJob(job);return true;}
     if(job.type==='AI_ADJUDICATE_CANDIDATE'){await processAiAdjudicationJob(job);return true;}
@@ -406,7 +415,8 @@ export async function inspectAndValidateChannel(
   channel: ChannelRecord,
   rawDetails?: DiscoveredChannelRaw,
   isManualScan: boolean = false,
-  enableDebug: boolean = false
+  enableDebug: boolean = false,
+  scheduleRetry: boolean = true
 ): Promise<{ debugLog?: any } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
@@ -512,22 +522,30 @@ export async function inspectAndValidateChannel(
         .catch(error=>console.warn(`[DiscordCheck] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
       channel.discord_status = discordVal.status;
+      channel.discord_candidate_locator = discordVal.candidateInviteUrl;
       // ONLY persist invite URL if status is ACTIVE or ACTIVE_LOW_VOLUME (otherwise null)
       channel.discord_invite = discordVal.inviteUrl;
       channel.scan_status = discordVal.operationalOutcome==='SUCCEEDED'||discordVal.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
+      channel.discord_discovery_status = channel.scan_status==='COMPLETED'?'VALIDATED':'DISCOVERED_VALIDATION_FAILED';
       channel.scan_attempts = discordVal.operationalOutcome==='SUCCEEDED'||discordVal.operationalOutcome==='CONFIRMED_INVALID'?0:channel.scan_attempts+discordVal.attempts.length;
       channel.last_checked = now;
+      if(discordVal.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       channel.discord_status='UNCERTAIN';
       channel.scan_status='FAILED';
       channel.scan_attempts++;
+      channel.discord_discovery_status='NOT_DISCOVERED';
+      channel.discord_candidate_locator=null;
       channel.last_checked=now;
+      if(inspection.acquisitionOutcomes?.some(item=>item.retryable)&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
     } else {
       // Nothing Found After All Steps
       channel.discord_status = 'NOT_FOUND';
       channel.scan_status = 'COMPLETED';
       channel.scan_attempts = 0;
+      channel.discord_discovery_status='NOT_DISCOVERED';
+      channel.discord_candidate_locator=null;
       channel.last_checked = now;
     }
 
@@ -538,10 +556,16 @@ export async function inspectAndValidateChannel(
     } else {
       channel.scan_status = 'FAILED';
     }
+    if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
   } finally {
     await upsertChannel(channel);
   }
   if (enableDebug) return { debugLog: finalDebugLog };
+}
+
+export function communityAcquisitionRetryKey(channelId:string):string{return `community-acquisition-retry:${channelId}`;}
+async function enqueueCommunityAcquisitionRetry(channelId:string):Promise<void>{
+  await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5});
 }
 
 /**

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {validateDiscordInvite} from './discordValidator';
+import {crawlExternalLinks,runChannelInspection} from './inspector';
+import {communityAcquisitionRetryKey} from './queueManager';
 import {crawlExternalLinks} from './inspector';
 import {ProviderCallError} from './providerResilience';
 import {readFileSync} from 'node:fs';
@@ -32,6 +34,11 @@ test('malformed Discord success payload remains retryable uncertainty',async()=>
   assert.equal(result.status,'UNCERTAIN');assert.equal(result.operationalOutcome,'MALFORMED_RESPONSE');assert.equal(result.attempts.length,2);
 });
 
+test('ambiguous successful Discord lookup remains semantic uncertainty after a completed provider call',async()=>{const result=await validateDiscordInvite('community',{maxAttempts:1,emitProviderEvent:noEvent,fetchImpl:async()=>response(200,JSON.stringify({code:'community',guild:{name:'Community'}}))});assert.equal(result.status,'UNCERTAIN');assert.equal(result.operationalOutcome,'SUCCEEDED');assert.equal(result.retryable,false);});
+test('successful trading Discord validation retains active semantics',async()=>{const result=await validateDiscordInvite('futures-room',{maxAttempts:1,emitProviderEvent:noEvent,fetchImpl:async()=>response(200,JSON.stringify({code:'futures-room',approximate_member_count:100,guild:{name:'Futures Trading Room'}}))});assert.equal(result.status,'ACTIVE');assert.equal(result.operationalOutcome,'SUCCEEDED');assert.equal(result.inviteUrl,'https://discord.gg/futures-room');});
+test('failed YouTube About acquisition is retryable rather than NOT_FOUND',async()=>{const result=await runChannelInspection({channelId:'c1',channelBio:'',youtubeUrl:'https://youtube.test/c1',forceLiveFetch:true,videoDescriptions:['one','two','three','four','five'],liveChannelDataLoader:async()=>null});assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');assert.equal(result.acquisitionOutcomes?.[0].failureClass,'YOUTUBE_ABOUT_ACQUISITION_FAILED');});
+test('community retry identity is stable and channel-scoped',()=>{assert.equal(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-1'));assert.notEqual(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-2'));});
+
 test('failed website acquisition is not confirmed NOT_FOUND',async()=>{
   const result=await crawlExternalLinks(['https://example.test'],[],undefined,async()=>response(503,'','text/html'));
   assert.equal(result.foundInvite,null);assert.equal(result.outcome,'ACQUISITION_FAILED');assert.equal(result.observations[0].retryable,true);
@@ -49,5 +56,6 @@ test('queue compatibility projection keeps failed acquisition uncertain and obse
   assert.match(queue,/acquisitionStatus==='ACQUISITION_FAILED'\|\|inspection\.acquisitionStatus==='PARTIALLY_INSPECTED'/);
   assert.match(queue,/channel\.discord_status='UNCERTAIN'/);assert.match(queue,/channel\.scan_status='FAILED'/);
   assert.match(queue,/appendDiscordCheckAttempts[\s\S]+\.catch/);assert.match(queue,/appendExternalAcquisitionObservations[\s\S]+\.catch/);
+  assert.match(queue,/discord_candidate_locator = discordVal\.candidateInviteUrl/);assert.match(queue,/DISCOVERED_VALIDATION_FAILED/);
   assert.match(diagnostics,/persistClassificationEvidenceBundle\([\s\S]+\.catch/);
 });

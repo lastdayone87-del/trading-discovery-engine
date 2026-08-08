@@ -191,15 +191,15 @@ export async function validateDiscordInvite(
         });
       }
 
-      console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) REJECTED as NON_TRADING (Confidence: ${confidence}%).`);
+      console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) CLASSIFIED as UNCERTAIN (Confidence: ${confidence}%).`);
       return result({
-        status: 'NON_TRADING',
+        status: 'UNCERTAIN',
         confidence,
         inviteUrl: null, // DO NOT store invite URL!
         guildName: guildName || 'Discord Server',
         approximateMemberCount: memberCount,
         approximatePresenceCount: presenceCount,
-        relevanceReason: `Low confidence trading relevance (${confidence}%)`,operationalOutcome:'SUCCEEDED',retryable:false
+        relevanceReason: `Ambiguous community (${confidence}% - no explicit negative evidence)`,operationalOutcome:'SUCCEEDED',retryable:false
       });
 
     } else {

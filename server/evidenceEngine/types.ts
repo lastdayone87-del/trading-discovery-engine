@@ -217,6 +217,13 @@ export interface EvidenceCollectionReport {
   fieldsPresent: string[];
   reasonCodes: string[];
   providers: ProviderExecutionReport[];
+  terminalNegativeSufficiency?: {
+    status: 'SUFFICIENT' | 'INSUFFICIENT';
+    creatorLevelCoverage: boolean;
+    independentSourceFamilies: number;
+    independentObservations: number;
+    reasonCodes: string[];
+  };
 }
 
 export type ClassificationStageName = 'AVAILABILITY' | 'CANDIDATE_DETECTION' | 'CORROBORATION' | 'CONTRADICTION' | 'LIFECYCLE';

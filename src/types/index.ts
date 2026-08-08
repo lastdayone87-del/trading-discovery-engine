@@ -11,6 +11,7 @@ export interface DashboardOperationalSummary {
 }
 
 export type DiscordStatus = 'PENDING' | 'NOT_FOUND' | 'ACTIVE' | 'ACTIVE_LOW_VOLUME' | 'NON_TRADING' | 'DEAD' | 'UNCERTAIN';
+export type DiscordDiscoveryStatus = 'NOT_DISCOVERED' | 'DISCOVERED_VALIDATION_FAILED' | 'VALIDATED';
 
 export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED';
 
@@ -126,6 +127,8 @@ export interface ChannelRecord {
   confidence_score: number; // 0 to 100
   discord_status: DiscordStatus;
   discord_invite?: string | null;
+  discord_discovery_status?: DiscordDiscoveryStatus;
+  discord_candidate_locator?: string | null;
   scan_status: ScanStatus;
   scan_attempts: number;
   discovery_source: DiscoverySource;

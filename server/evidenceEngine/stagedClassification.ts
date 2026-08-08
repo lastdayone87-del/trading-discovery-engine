@@ -55,7 +55,9 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
-  const dominantContradiction = negative.length > 0 && (negativeWeight >= 25 || negativeWeight > positiveWeight * 1.5);
+  const negativeWouldDominate = negative.length > 0 && (negativeWeight >= 25 || negativeWeight > positiveWeight * 1.5);
+  const terminalNegativeSufficient=collection.terminalNegativeSufficiency?.status==='SUFFICIENT';
+  const dominantContradiction = negativeWouldDominate && terminalNegativeSufficient;
 
   // Availability describes whether the evidence in hand is sufficient to make a
   // governed decision. An optional provider failing must remain observable, but
@@ -77,11 +79,14 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated });
   const contradiction = dominantContradiction
     ? result('CONTRADICTION', 'FAIL', ['DOMINANT_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight })
-    : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight });
+    : negativeWouldDominate
+      ? result('CONTRADICTION','ABSTAIN',['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT'],negative,{negativeWeight,positiveWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
+      : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight });
 
   let lifecycleAction: LifecycleAction = 'REVIEW';
   if (availability.disposition !== 'PASS') lifecycleAction = collection.sufficiency === 'MISSING' || collection.sufficiency === 'INSUFFICIENT' ? 'ENRICH' : 'REVIEW';
   else if (contradiction.disposition === 'FAIL') lifecycleAction = 'REJECT';
+  else if (contradiction.disposition === 'ABSTAIN') lifecycleAction = 'ENRICH';
   else if (candidate.disposition === 'PASS' && corroboration.disposition === 'PASS') lifecycleAction = 'CONFIRM';
   const lifecycle = result('LIFECYCLE', 'PASS', [`ROUTE_${lifecycleAction}`], [], { action: lifecycleAction });
   return { pipelineVersion: STAGED_CLASSIFICATION_VERSION, stages: [availability, candidate, corroboration, contradiction, lifecycle], lifecycleAction };
