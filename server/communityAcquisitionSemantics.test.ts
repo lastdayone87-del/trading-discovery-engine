@@ -3,7 +3,6 @@ import test from 'node:test';
 import {validateDiscordInvite} from './discordValidator';
 import {crawlExternalLinks,runChannelInspection} from './inspector';
 import {communityAcquisitionRetryKey} from './queueManager';
-import {crawlExternalLinks} from './inspector';
 import {ProviderCallError} from './providerResilience';
 import {readFileSync} from 'node:fs';
 
@@ -58,4 +57,31 @@ test('queue compatibility projection keeps failed acquisition uncertain and obse
   assert.match(queue,/appendDiscordCheckAttempts[\s\S]+\.catch/);assert.match(queue,/appendExternalAcquisitionObservations[\s\S]+\.catch/);
   assert.match(queue,/discord_candidate_locator = discordVal\.candidateInviteUrl/);assert.match(queue,/DISCOVERED_VALIDATION_FAILED/);
   assert.match(diagnostics,/persistClassificationEvidenceBundle\([\s\S]+\.catch/);
+});
+
+test('YouTube redirect destinations are decoded, normalized, classified by hostname, and deduplicable',async()=>{
+  const {normalizeExternalUrl}=await import('./inspector');
+  const wrapper='https://www.youtube.com/redirect?event=channel_description&q='+encodeURIComponent('https://Instagram.com/trader/?utm_source=youtube#bio');
+  const normalized=normalizeExternalUrl(wrapper);assert.equal(normalized?.url,'https://instagram.com/trader');assert.equal(normalized?.kind,'SOCIAL');assert.equal(normalized?.wrapperUrl,wrapper);
+  assert.equal(normalizeExternalUrl('https://youtube.com/watch?v=abcdefghijk'),null);
+});
+
+test('recent-video Discord is preserved before optional acquisition',async()=>{
+  const result=await runChannelInspection({channelId:'recent',channelBio:'No invite',channelLinks:[],videoDescriptions:['one','two https://discord.gg/recent-room','three','four','five']});
+  assert.equal(result.foundInvite,'recent-room');assert.equal(result.foundLocation,'VIDEO_2_DESCRIPTION');assert.equal(result.acquisitionStatus,'FOUND');
+  assert.equal(result.acquisitionOutcomes?.at(-1)?.surface,'RECENT_VIDEO_DESCRIPTIONS');
+});
+
+test('Discord extraction is preserved across supported acquired surfaces',async()=>{
+  const about=await runChannelInspection({channelId:'about',channelBio:'Join https://discord.com/invite/about-room',videoDescriptions:['1','2','3','4','5']});
+  const links=await runChannelInspection({channelId:'links',channelBio:'none',channelLinks:['https://discord.gg/link-room'],videoDescriptions:['1','2','3','4','5']});
+  assert.equal(about.foundInvite,'about-room');assert.equal(links.foundInvite,'link-room');
+});
+
+test('optional website failure does not contaminate social or required acquisition coverage',async()=>{
+  const result=await runChannelInspection({channelId:'optional',channelBio:'https://unreachable.invalid',videoDescriptions:['1','2','3','4','5'],externalFetchImpl:async()=>response(503,'','text/html')});
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  const website=result.steps.find(step=>step.step==='CUSTOM_DOMAINS'),social=result.steps.find(step=>step.step==='SOCIAL_BIO');
+  assert.equal(website?.status,'ERROR');assert.equal(social?.status,'SKIPPED');
+  assert.equal(result.acquisitionOutcomes?.find(item=>item.surface==='CREATOR_WEBSITES')?.required,false);
 });

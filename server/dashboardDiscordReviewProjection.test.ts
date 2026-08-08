@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';
+test('dashboard distinguishes Discord discovery from validation status',()=>{const ui=readFileSync('src/components/ResultsTable.tsx','utf8');assert.match(ui,/Discovered · validation failed/);assert.match(ui,/Discovered · validation ambiguous/);assert.match(ui,/Candidate retained/);});
+test('dashboard renders human rejection and post-approval job lifecycle explicitly',()=>{const ui=readFileSync('src/components/ResultsTable.tsx','utf8'),db=readFileSync('server/db.ts','utf8');assert.match(ui,/HUMAN REJECTED/);assert.match(ui,/Approved → enrichment/);assert.match(ui,/Post-approval enrichment processing/);assert.match(db,/post_approval_job_status/);});
