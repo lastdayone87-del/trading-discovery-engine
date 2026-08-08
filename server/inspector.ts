@@ -682,7 +682,7 @@ export async function runChannelInspection(channelData: {
 
   const allCollectedUrls = Array.from(uniqueUrls.values());
 
-  let websiteUrls = allCollectedUrls.filter(u => u.kind==='WEBSITE'&&!extractDiscordInvite(u.url));
+  let websiteUrls = allCollectedUrls.filter(u => u.kind==='WEBSITE');
   let socialBioUrls = allCollectedUrls.filter(u => u.kind==='SOCIAL');
 
   // Sort website URLs so contextMatches=true comes first
