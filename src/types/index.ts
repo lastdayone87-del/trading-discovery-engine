@@ -12,12 +12,16 @@ export interface DashboardOperationalSummary {
 
 export type DiscordStatus = 'PENDING' | 'NOT_FOUND' | 'ACTIVE' | 'ACTIVE_LOW_VOLUME' | 'NON_TRADING' | 'DEAD' | 'UNCERTAIN';
 export type DiscordDiscoveryStatus = 'NOT_DISCOVERED' | 'DISCOVERED_VALIDATION_FAILED' | 'VALIDATED';
+export type DiscordResolutionStatus='NOT_ATTEMPTED'|'RESOLVED'|'UNRESOLVED';
+export type DiscordLivenessStatus='NOT_CHECKED'|'ACTIVE'|'INVALID_OBSERVED'|'DEAD'|'UNCERTAIN';
+export type DiscordRelevanceStatus='NOT_CHECKED'|'TRADING_RELEVANT'|'NON_TRADING'|'UNCERTAIN';
+export type DiscordValidationStatus='NOT_STARTED'|'RETRY_PENDING'|'SUCCEEDED'|'FAILED_OPERATIONAL'|'COMPLETED';
 
 export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED';
 
 export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 
-export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED' | 'HUMAN_REJECTED';
+export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
 
 export type ReviewState = 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'SUPERSEDED';
 export interface ReviewQueueItem {
@@ -129,6 +133,15 @@ export interface ChannelRecord {
   discord_invite?: string | null;
   discord_discovery_status?: DiscordDiscoveryStatus;
   discord_candidate_locator?: string | null;
+  discord_candidate_id?: string | null;
+  discord_candidate_raw_locator?: string | null;
+  discord_candidate_type?: string | null;
+  discord_resolution_status?: DiscordResolutionStatus;
+  discord_liveness_status?: DiscordLivenessStatus;
+  discord_relevance_status?: DiscordRelevanceStatus;
+  discord_validation_status?: DiscordValidationStatus;
+  post_approval_job_status?: 'PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
+  post_approval_job_error?: string;
   scan_status: ScanStatus;
   scan_attempts: number;
   discovery_source: DiscoverySource;

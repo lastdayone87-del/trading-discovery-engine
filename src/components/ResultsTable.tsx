@@ -36,6 +36,9 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
   const [reviewSuccess, setReviewSuccess] = useState('');
   const [reviewDetails, setReviewDetails] = useState<ReviewQueueItem | null>(null);
   const [decidedChannelIds, setDecidedChannelIds] = useState<Set<string>>(() => new Set());
+  const [reasonCatalog,setReasonCatalog]=useState<{version:string;actions:Record<'APPROVE'|'REJECT',Array<{code:string;label:string;allowsOther?:boolean}>>}|null>(null);
+  const [pendingDecision,setPendingDecision]=useState<{channelId:string;action:'approve'|'reject';details?:ReviewQueueItem}|null>(null);
+  const [reasonCode,setReasonCode]=useState('');const [reasonOther,setReasonOther]=useState('');const [decisionNotes,setDecisionNotes]=useState('');
 
   const countries = useMemo(()=>Array.from(new Set(channels.map(c => c.country))),[channels]);
 
@@ -48,6 +51,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
       .catch(() => { if (active) setReviewerDefaultsAvailable(false); });
     return () => { active = false; };
   }, [reviewEnabled]);
+
+  useEffect(()=>{if(!reviewEnabled||(!reviewerDefaultsAvailable&&(!reviewToken||!reviewer)))return;apiFetch('/api/review-reasons',{headers:reviewHeaders()}).then(r=>r.ok?r.json():Promise.reject()).then(setReasonCatalog).catch(()=>setReasonCatalog(null));},[reviewEnabled,reviewerDefaultsAvailable,reviewToken,reviewer]);
 
   useEffect(()=>{if(!onFiltersChange)return;const timer=setTimeout(()=>onFiltersChange({search:searchTerm,country:selectedCountry,countryStatus:selectedCountryStatus,tradingStatus:selectedTradingStatus,discordStatus:selectedDiscordStatus,scanStatus:selectedScanStatus}),200);return()=>clearTimeout(timer);},[searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,onFiltersChange]);
 
@@ -97,15 +102,14 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     }
   };
 
-  const handleReviewAction = async (channelId: string, action: ReviewAction, currentDetails?: ReviewQueueItem) => {
+  const handleReviewAction = async (channelId: string, action: ReviewAction, currentDetails?: ReviewQueueItem,structured?:{code:string;other?:string;notes?:string}) => {
     if (!reviewerDefaultsAvailable && (!reviewToken || !reviewer)) {
       setReviewError('Enter a reviewer API token and reviewer identity before making a decision.');
       return;
     }
 
-    const reason = window.prompt(`Reason for ${action}`)?.trim();
-    if (!reason) return;
-    const notes = window.prompt('Optional notes')?.trim() || '';
+    const reason = action==='force-rescan'?window.prompt('Reason for force rescan')?.trim():undefined;
+    if(action==='force-rescan'&&!reason)return;
     setReviewError('');
     setReviewSuccess('');
     setReviewBusy(`${channelId}:${action}`);
@@ -113,11 +117,12 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     try {
       const details = currentDetails || await loadReviewDetails(channelId);
       const result = await submitReviewDecision(
-        { channelId, action, reviewVersion: details.reviewVersion, reason, notes },
+        { channelId, action, reviewVersion: details.reviewVersion, reason,reviewReasonCode:structured?.code,reviewReasonVersion:structured?reasonCatalog?.version:undefined,reviewReasonOther:structured?.other,notes:structured?.notes },
         apiFetch,
         reviewHeaders()
       );
       setReviewDetails(null);
+      setPendingDecision(null);
       setDecidedChannelIds(previous => new Set(previous).add(channelId));
       const label = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'queued for rescan';
       setReviewSuccess(`${details.channelName} was ${label}. Channel status is ${result.channel.tradingStatus}; it has been removed from the pending review queue.`);
@@ -134,6 +139,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
       setReviewBusy(null);
     }
   };
+  const beginDecision=(channelId:string,action:'approve'|'reject',details?:ReviewQueueItem)=>{if(!reasonCatalog){setReviewError('The governed review-reason catalog is unavailable. Refresh before deciding.');return;}const first=reasonCatalog.actions[action.toUpperCase() as 'APPROVE'|'REJECT'][0]?.code||'';setReasonCode(first);setReasonOther('');setDecisionNotes('');setPendingDecision({channelId,action,details});};
 
   const handleRecheckClick = async (channel: ChannelRecord) => {
     if (channel.scan_status === 'LOCKED') return;
@@ -375,11 +381,11 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
                             c.trading_status === 'TRADING_CONFIRMED'
                               ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-300/50 dark:border-emerald-800'
-                              : c.trading_status === 'NON_TRADING'
+                              : c.trading_status === 'NON_TRADING' || c.trading_status === 'HUMAN_REJECTED'
                               ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 border border-rose-300/50 dark:border-rose-800'
                               : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
                           }`}>
-                            {c.trading_status === 'TRADING_CONFIRMED' ? 'TRADING CONFIRMED' : c.trading_status === 'NON_TRADING' ? 'NON-TRADING' : c.trading_status === 'NEEDS_REVIEW' ? 'NEEDS REVIEW' : 'UNCERTAIN'}
+                            {c.trading_status === 'TRADING_CONFIRMED' ? 'TRADING CONFIRMED' : c.trading_status === 'HUMAN_REJECTED' ? 'HUMAN REJECTED' : c.trading_status === 'NON_TRADING' ? 'NON-TRADING' : c.trading_status === 'NEEDS_REVIEW' ? 'NEEDS REVIEW' : 'UNCERTAIN'}
                           </span>
                           <span className="text-[10px] font-mono font-semibold text-slate-500 dark:text-slate-400">
                             {c.trading_confidence_score || 0}%
@@ -484,6 +490,21 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           </button>
                         </div>
                       )}
+                      <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
+                        {c.discord_discovery_status === 'DISCOVERED_VALIDATION_FAILED'
+                          ? 'Discovered · validation failed'
+                          : c.discord_discovery_status === 'VALIDATED' && c.discord_status === 'UNCERTAIN'
+                          ? 'Discovered · validation ambiguous'
+                          : c.discord_discovery_status === 'VALIDATED'
+                          ? 'Discovered · validation completed'
+                          : 'Not discovered'}
+                      </div>
+                      {c.discord_liveness_status&&c.discord_liveness_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Liveness: <b>{c.discord_liveness_status.replaceAll('_',' ')}</b></div>}
+                      {c.discord_relevance_status&&c.discord_relevance_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Relevance: <b>{c.discord_relevance_status.replaceAll('_',' ')}</b></div>}
+                      {c.discord_validation_status==='RETRY_PENDING'&&<div className="text-[10px] font-semibold text-amber-600">Validation retry pending</div>}
+                      {c.discord_liveness_status==='INVALID_OBSERVED'&&<div className="text-[10px] text-amber-600">Invalid observation awaiting confirmation</div>}
+                      {c.discord_candidate_type&&<div className="text-[10px] text-slate-400">Locator: {c.discord_candidate_type.replaceAll('_',' ')}</div>}
+                      {c.discord_candidate_locator && !c.discord_invite && <div className="mt-0.5 max-w-48 truncate font-mono text-[10px] text-slate-500" title={c.discord_candidate_locator}>Candidate retained: {c.discord_candidate_locator.replace('https://','')}</div>}
                     </td>
 
                     {/* Scan Status */}
@@ -506,6 +527,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           Attempts: {c.scan_attempts}
                         </span>
                       )}
+                      {c.trading_status==='TRADING_CONFIRMED'&&c.scan_status==='ENRICHMENT_PENDING'&&<span className="block text-[10px] text-indigo-600 mt-1">Approved → enrichment {c.post_approval_job_status?.toLowerCase()||'queued'}</span>}
+                      {c.post_approval_job_status==='PROCESSING'&&<span className="block text-[10px] text-indigo-600 mt-1">Post-approval enrichment processing</span>}
+                      {c.post_approval_job_status==='COMPLETED'&&<span className="block text-[10px] text-emerald-600 mt-1">Post-approval enrichment completed</span>}
+                      {c.post_approval_job_status==='FAILED'&&<span className="block text-[10px] text-amber-600 mt-1" title={c.post_approval_job_error}>Post-approval enrichment failed</span>}
                     </td>
 
                     {/* Last Scanned */}
@@ -518,7 +543,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       {reviewEnabled && c.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(c.channel_id) && (
                         <>
                           <button
-                            onClick={() => handleReviewAction(c.channel_id, 'approve')}
+                            onClick={() => beginDecision(c.channel_id, 'approve')}
                             disabled={Boolean(reviewBusy)}
                             className="px-2.5 py-1 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg transition-colors inline-flex items-center gap-1"
                           >
@@ -526,7 +551,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                             <span>Approve</span>
                           </button>
                           <button
-                            onClick={() => handleReviewAction(c.channel_id, 'reject')}
+                            onClick={() => beginDecision(c.channel_id, 'reject')}
                             disabled={Boolean(reviewBusy)}
                             className="px-2.5 py-1 text-xs font-semibold bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-lg transition-colors inline-flex items-center gap-1"
                           >
@@ -580,6 +605,18 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
         </div>
       </div>
 
+      {pendingDecision && reasonCatalog && (()=>{const action=pendingDecision.action.toUpperCase() as 'APPROVE'|'REJECT';const options=reasonCatalog.actions[action];const selected=options.find(option=>option.code===reasonCode);return (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/60 p-4" role="dialog" aria-modal="true" aria-labelledby="decision-reason-title">
+          <form className="w-full max-w-lg rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 p-5 space-y-4" onSubmit={event=>{event.preventDefault();void handleReviewAction(pendingDecision.channelId,pendingDecision.action,pendingDecision.details,{code:reasonCode,other:reasonOther,notes:decisionNotes});}}>
+            <h3 id="decision-reason-title" className="font-bold text-lg">{action==='APPROVE'?'Approve creator':'Reject creator'}</h3>
+            <label className="block text-sm font-semibold">Reason<select required value={reasonCode} onChange={event=>{setReasonCode(event.target.value);setReasonOther('');}} className="mt-1 w-full rounded-lg border p-2 bg-white dark:bg-slate-800">{options.map(option=><option key={option.code} value={option.code}>{option.label}</option>)}</select></label>
+            {selected?.allowsOther&&<label className="block text-sm font-semibold">Other reason<input required value={reasonOther} onChange={event=>setReasonOther(event.target.value)} className="mt-1 w-full rounded-lg border p-2 bg-white dark:bg-slate-800" /></label>}
+            <label className="block text-sm font-semibold">Optional notes<textarea value={decisionNotes} onChange={event=>setDecisionNotes(event.target.value)} className="mt-1 w-full rounded-lg border p-2 bg-white dark:bg-slate-800" /></label>
+            <p className="text-[10px] text-slate-500">Governed catalog {reasonCatalog.version}</p>
+            <div className="flex justify-end gap-2"><button type="button" onClick={()=>setPendingDecision(null)} className="rounded-lg border px-3 py-2">Cancel</button><button disabled={Boolean(reviewBusy)} className={`rounded-lg px-3 py-2 font-semibold text-white ${action==='APPROVE'?'bg-emerald-600':'bg-rose-600'}`}>Confirm {pendingDecision.action}</button></div>
+          </form>
+        </div>);})()}
+
       {reviewEnabled && reviewDetails && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4" role="dialog" aria-modal="true" aria-labelledby="review-details-title">
           <div className="w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-xl p-5 space-y-4">
@@ -607,8 +644,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
             <div className="flex flex-wrap gap-2">
               {reviewDetails.state === 'PENDING' && (
                 <>
-                  <button disabled={Boolean(reviewBusy)} onClick={() => handleReviewAction(reviewDetails.channelId, 'approve', reviewDetails)} className="flex items-center gap-1 bg-emerald-600 disabled:opacity-50 text-white rounded-lg px-3 py-2 text-sm font-semibold"><CheckCircle2 size={16} />Approve</button>
-                  <button disabled={Boolean(reviewBusy)} onClick={() => handleReviewAction(reviewDetails.channelId, 'reject', reviewDetails)} className="flex items-center gap-1 bg-rose-600 disabled:opacity-50 text-white rounded-lg px-3 py-2 text-sm font-semibold"><XCircle size={16} />Reject</button>
+                  <button disabled={Boolean(reviewBusy)} onClick={() => beginDecision(reviewDetails.channelId, 'approve', reviewDetails)} className="flex items-center gap-1 bg-emerald-600 disabled:opacity-50 text-white rounded-lg px-3 py-2 text-sm font-semibold"><CheckCircle2 size={16} />Approve</button>
+                  <button disabled={Boolean(reviewBusy)} onClick={() => beginDecision(reviewDetails.channelId, 'reject', reviewDetails)} className="flex items-center gap-1 bg-rose-600 disabled:opacity-50 text-white rounded-lg px-3 py-2 text-sm font-semibold"><XCircle size={16} />Reject</button>
                 </>
               )}
               {reviewDetails.state === 'REJECTED' && (

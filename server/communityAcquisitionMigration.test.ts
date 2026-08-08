@@ -10,3 +10,7 @@ test('community acquisition attempt history is additive, immutable, and separate
   assert.match(sql,/reject_immutable_event_mutation/);assert.doesNotMatch(sql,/\b(?:DROP|ALTER)\s+TABLE\b/i);
 });
 test('community reliability migration adds backward-compatible discovery projections',()=>{const sql=readFileSync('server/db/migrations/067_terminal_negative_and_community_retry.sql','utf8');assert.match(sql,/ADD COLUMN IF NOT EXISTS discord_discovery_status/);assert.match(sql,/DISCOVERED_VALIDATION_FAILED/);assert.match(sql,/ADD COLUMN IF NOT EXISTS discord_candidate_locator/);});
+
+test('structured review reason migration preserves legacy values and adds governed metadata',()=>{const sql=readFileSync('server/db/migrations/068_discord_surfaces_and_review_reasons.sql','utf8');assert.match(sql,/reason_code TEXT NOT NULL DEFAULT 'LEGACY_FREE_TEXT'/);assert.match(sql,/reason_catalog_version TEXT NOT NULL DEFAULT 'legacy'/);assert.match(sql,/reason_other_text TEXT/);});
+
+test('Discord reliability migration separates conservative state and preserves existing records without upgrades',()=>{const sql=readFileSync('server/db/migrations/069_discord_candidate_reliability.sql','utf8');assert.match(sql,/discord_liveness_status TEXT NOT NULL DEFAULT 'NOT_CHECKED'/);assert.match(sql,/discord_relevance_status TEXT NOT NULL DEFAULT 'NOT_CHECKED'/);assert.match(sql,/discord_validation_status TEXT NOT NULL DEFAULT 'NOT_STARTED'/);assert.doesNotMatch(sql,/UPDATE channels/);assert.match(sql,/candidate_id/);assert.match(sql,/INVALID_OBSERVED/);});

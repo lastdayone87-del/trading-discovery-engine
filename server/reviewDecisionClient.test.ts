@@ -13,10 +13,10 @@ for (const action of ['approve','reject'] as const) test(`frontend sends ${actio
   let url=''; let init:RequestInit|undefined;
   const expected=successfulResult(action==='approve'?'APPROVE':'REJECT');
   const fetcher:typeof fetch=async(input,requestInit)=>{url=String(input);init=requestInit;return new Response(JSON.stringify(expected),{status:200,headers:{'content-type':'application/json'}});};
-  const result=await submitReviewDecision({channelId:'channel/1',action,reviewVersion:1,reason:'manual evidence'},fetcher,{'X-Reviewer-Id':'reviewer'},'decision-key');
+  const result=await submitReviewDecision({channelId:'channel/1',action,reviewVersion:1,reviewReasonCode:action==='approve'?'CONFIRMED_TRADING_CREATOR':'NOT_TRADING_CREATOR',reviewReasonVersion:'human-review-reasons-v1'},fetcher,{'X-Reviewer-Id':'reviewer'},'decision-key');
   assert.equal(url,`/api/reviews/channel%2F1/${action}`);
   assert.equal(init?.method,'POST');
-  assert.deepEqual(JSON.parse(String(init?.body)),{reviewVersion:1,reason:'manual evidence',notes:''});
+  assert.deepEqual(JSON.parse(String(init?.body)),{reviewVersion:1,reviewReasonCode:action==='approve'?'CONFIRMED_TRADING_CREATOR':'NOT_TRADING_CREATOR',reviewReasonVersion:'human-review-reasons-v1',notes:''});
   assert.equal(new Headers(init?.headers).get('Idempotency-Key'),'decision-key');
   assert.equal(result.queuePending,false);
   assert.equal(result.review.state,action==='approve'?'APPROVED':'REJECTED');

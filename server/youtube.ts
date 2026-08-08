@@ -350,10 +350,12 @@ export async function searchYouTubeChannelPage(
  */
 export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Promise<string[]> {
   const keyPool = getYouTubeKeyPool();
-  if (keyPool.length === 0 || !channelId) return [];
+  if (!channelId) return [];
+  if (keyPool.length === 0) throw new Error('Recent-video description API is unavailable because no provider is configured.');
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
 
+  let acquiredResponse = false;
   try { const providerIndexes=availableKeyIndexes(keyPool); for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
     const currentIndex = providerIndexes[attempt];
     const apiKey = keyPool[currentIndex];
@@ -363,6 +365,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
       const res = await youtubeFetch(searchUrl,'recent-videos-search',100,attempt+1,acquisition);
 
       if (res.ok) {
+        acquiredResponse = true;
         activeKeyIndex = currentIndex;
         await incrementQuota(100);
         const data = await res.json();
@@ -404,6 +407,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
 
   acquisition.providerFailed(quotaExceededCount === keyPool.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
 
+  if(!acquiredResponse)throw new Error('Recent-video description API acquisition failed for every configured provider.');
   return [];
   } finally { acquisition.release(); }
 }

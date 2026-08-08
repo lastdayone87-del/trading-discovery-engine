@@ -74,11 +74,20 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
             )}
           </div>
 
+          <div className="grid grid-cols-2 gap-2 rounded-lg border border-slate-200 dark:border-slate-800 p-3 text-[11px]">
+            <div><span className="text-slate-500 block">Resolution</span><b>{channel.discord_resolution_status?.replaceAll('_',' ')||'NOT ATTEMPTED'}</b></div>
+            <div><span className="text-slate-500 block">Liveness</span><b>{channel.discord_liveness_status?.replaceAll('_',' ')||'NOT CHECKED'}</b></div>
+            <div><span className="text-slate-500 block">Relevance</span><b>{channel.discord_relevance_status?.replaceAll('_',' ')||'NOT CHECKED'}</b></div>
+            <div><span className="text-slate-500 block">Validation</span><b>{channel.discord_validation_status?.replaceAll('_',' ')||'NOT STARTED'}</b></div>
+            {channel.discord_candidate_raw_locator&&<div className="col-span-2"><span className="text-slate-500 block">Source locator ({channel.discord_candidate_type?.replaceAll('_',' ')})</span><code className="break-all">{channel.discord_candidate_raw_locator}</code></div>}
+            {channel.discord_candidate_locator&&<div className="col-span-2"><span className="text-slate-500 block">Resolved candidate</span><code className="break-all">{channel.discord_candidate_locator}</code></div>}
+          </div>
+
           {/* Early Stopping Rule Info */}
           <div className="text-xs text-slate-500 dark:text-slate-400 bg-indigo-50/50 dark:bg-indigo-950/20 p-3 rounded-lg border border-indigo-100 dark:border-indigo-900/30 flex items-start gap-2">
             <StopCircle className="w-4 h-4 text-indigo-600 dark:text-indigo-400 shrink-0 mt-0.5" />
             <span>
-              <strong>Early Stopping Protocol:</strong> Inspection checks are executed sequentially in order of efficiency. The process halts immediately the instant a Discord invite is detected.
+              <strong>Bounded Candidate Protocol:</strong> Supported surfaces are inspected in order, while distinct Discord candidates are retained so an invalid first locator cannot hide a later valid one.
             </span>
           </div>
 
@@ -236,7 +245,7 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                             <span className="text-[10px] text-emerald-800 dark:text-emerald-300">Found in: <strong className="uppercase bg-emerald-200/50 dark:bg-emerald-800/50 px-1 rounded">{step.inviteLocation}</strong></span>
                           )}
                         </div>
-                        <span className="text-[10px] uppercase font-sans font-bold text-emerald-700 dark:text-emerald-400 text-right">Early Stop Triggered</span>
+                        <span className="text-[10px] uppercase font-sans font-bold text-emerald-700 dark:text-emerald-400 text-right">Candidate Retained</span>
                       </div>
                     )}
                   </div>
