@@ -4,6 +4,7 @@ import { recordAdaptiveShadowLabel } from './adaptiveTradingClassifier';
 import { recordEvaluationGroundTruth, type CreatorType } from './decisionEvaluation';
 import { recordFalseNegativeIncident } from './governedAdaptation';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
+import {resolveReviewReason, type ReviewReasonAction} from './reviewReasons';
 
 export type ReviewState = 'NOT_REQUIRED'|'PENDING'|'APPROVED'|'REJECTED'|'SUPERSEDED';
 export type ReviewAction = 'APPROVE'|'REJECT'|'FORCE_RESCAN';
@@ -34,15 +35,17 @@ export async function listReviewQueue(filters:{country?:string;search?:string;li
 export async function getReviewDetails(channelId:string) {
   const db=await getDb(); const [item,history]=await Promise.all([
     db.query(`SELECT r.*,c.channel_name,c.youtube_url,c.country,c.trading_status,c.scan_status,c.quality_score,c.discord_status FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.channel_id=$1`,[channelId]),
-    db.query(`SELECT id,decision,previous_status,resulting_status,reviewer,decided_at,reason,notes,review_version,evidence_snapshot,idempotency_key FROM channel_review_decisions WHERE channel_id=$1 ORDER BY review_version DESC`,[channelId])
+    db.query(`SELECT id,decision,previous_status,resulting_status,reviewer,decided_at,reason,reason_code,reason_catalog_version,reason_other_text,notes,review_version,evidence_snapshot,idempotency_key FROM channel_review_decisions WHERE channel_id=$1 ORDER BY review_version DESC`,[channelId])
   ]); if(!item.rowCount) throw new ReviewNotFoundError('Review item not found.');
   return {...map(item.rows[0]),history:history.rows};
 }
 
-export interface DecideInput { channelId:string; action:ReviewAction; expectedVersion:number; reviewer:string; reason:string; notes?:string; idempotencyKey:string; creatorType?:CreatorType; reasonCodes?:string[]; }
+export interface DecideInput { channelId:string; action:ReviewAction; expectedVersion:number; reviewer:string; reason?:string; reviewReasonCode?:string; reviewReasonVersion?:string; reviewReasonOther?:string; notes?:string; idempotencyKey:string; creatorType?:CreatorType; reasonCodes?:string[]; }
 export async function decideReview(input:DecideInput) {
   if(!Number.isInteger(input.expectedVersion)||input.expectedVersion<1) throw new Error('reviewVersion must be a positive integer.');
-  if(!input.reviewer.trim()||!input.reason.trim()||!input.idempotencyKey.trim()) throw new Error('reviewer, reason, and idempotencyKey are required.');
+  if(!input.reviewer.trim()||!input.idempotencyKey.trim()) throw new Error('reviewer and idempotencyKey are required.');
+  const structured=input.action==='FORCE_RESCAN'?null:resolveReviewReason(input.action as ReviewReasonAction,String(input.reviewReasonCode||''),String(input.reviewReasonVersion||''),input.reviewReasonOther);
+  const reason=structured?.display||input.reason?.trim();if(!reason)throw new Error('reason is required.');
   const db=await getDb(); const client=await db.connect();
   try {
     await client.query('BEGIN');
@@ -56,7 +59,7 @@ export async function decideReview(input:DecideInput) {
     if(row.review_version!==input.expectedVersion) throw new ReviewConflictError(`Review version is ${row.review_version}; received ${input.expectedVersion}.`);
     const resulting=resolveReviewTransition(row.state,input.action);
     const nextVersion=row.review_version+1;
-    const evidence={...row.evidence_snapshot,decision_channel:row.channel_snapshot,decided_at:new Date().toISOString()};
+    const evidence={...row.evidence_snapshot,decision_channel:row.channel_snapshot,decided_at:new Date().toISOString(),review_reason:structured};
     if(input.action==='APPROVE') {
       await client.query(`UPDATE channels SET trading_status='TRADING_CONFIRMED',scan_status='ENRICHMENT_PENDING',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
       await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('POST_APPROVAL_ENRICH',$1,1000,4,$2) ON CONFLICT(idempotency_key) DO NOTHING`,[JSON.stringify({channelId:input.channelId,reviewVersion:nextVersion}),`post-approval:${input.channelId}:${nextVersion}`]);
@@ -69,10 +72,10 @@ export async function decideReview(input:DecideInput) {
       await client.query(`UPDATE channels SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',discord_status='UNCERTAIN',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
       await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('FORCE_REVIEW_RESCAN',$1,1000,4,$2) ON CONFLICT(idempotency_key) DO NOTHING`,[JSON.stringify({channelId:input.channelId,reviewVersion:nextVersion}),`force-review-rescan:${input.channelId}:${nextVersion}`]);
     }
-    const inserted=await client.query(`INSERT INTO channel_review_decisions(channel_id,decision,previous_status,resulting_status,reviewer,reason,notes,review_version,evidence_snapshot,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[input.channelId,input.action,row.state,resulting,input.reviewer.trim(),input.reason.trim(),input.notes?.trim()||null,nextVersion,JSON.stringify(evidence),input.idempotencyKey]);
+    const inserted=await client.query(`INSERT INTO channel_review_decisions(channel_id,decision,previous_status,resulting_status,reviewer,reason,notes,review_version,evidence_snapshot,idempotency_key,reason_code,reason_catalog_version,reason_other_text) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,[input.channelId,input.action,row.state,resulting,input.reviewer.trim(),reason,input.notes?.trim()||null,nextVersion,JSON.stringify(evidence),input.idempotencyKey,structured?.code||'LEGACY_FREE_TEXT',structured?.version||'legacy',structured?.otherText||null]);
     const lineage=await client.query(`SELECT s.query_run_id,s.query_id,r.job_id,r.country,r.retrieval_lane FROM channel_sightings s JOIN query_runs r ON r.id=s.query_run_id WHERE s.channel_id=$1 ORDER BY s.observed_at DESC LIMIT 1`,[input.channelId]);
     const origin=lineage.rows[0];
-    await client.query(`INSERT INTO outcome_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,verification_status,policy_version,feature_version,event_time,payload) VALUES($1,'CHANNEL',$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13) ON CONFLICT(event_key) DO NOTHING`,[`review:${input.channelId}:version:${nextVersion}:v1`,input.channelId,input.action==='FORCE_RESCAN'?'REVIEW_CORRECTED':'REVIEW_VERIFIED',origin?`query-run:${origin.query_run_id}:selected:v1`:null,origin?.query_id||null,origin?.query_run_id||null,origin?.job_id||null,origin?.country||row.channel_snapshot?.country||null,origin?.retrieval_lane||null,input.action==='FORCE_RESCAN'?'CORRECTIVE':'VERIFIED',REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,JSON.stringify({action:input.action,previousStatus:row.state,resultingStatus:resulting,reviewVersion:nextVersion,reasonCode:input.reason.trim()})]);
+    await client.query(`INSERT INTO outcome_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,verification_status,policy_version,feature_version,event_time,payload) VALUES($1,'CHANNEL',$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13) ON CONFLICT(event_key) DO NOTHING`,[`review:${input.channelId}:version:${nextVersion}:v1`,input.channelId,input.action==='FORCE_RESCAN'?'REVIEW_CORRECTED':'REVIEW_VERIFIED',origin?`query-run:${origin.query_run_id}:selected:v1`:null,origin?.query_id||null,origin?.query_run_id||null,origin?.job_id||null,origin?.country||row.channel_snapshot?.country||null,origin?.retrieval_lane||null,input.action==='FORCE_RESCAN'?'CORRECTIVE':'VERIFIED',REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,JSON.stringify({action:input.action,previousStatus:row.state,resultingStatus:resulting,reviewVersion:nextVersion,reasonCode:structured?.code||'LEGACY_FREE_TEXT'})]);
     const updatedReview=await client.query(`UPDATE channel_reviews SET state=$2,review_version=$3,evidence_snapshot=$4,decided_at=CASE WHEN $2='PENDING' THEN NULL ELSE now() END,pending_since=CASE WHEN $2='PENDING' THEN now() ELSE pending_since END,updated_at=now() WHERE channel_id=$1 RETURNING state,review_version`,[input.channelId,resulting,nextVersion,JSON.stringify(evidence)]);
     const updatedChannel=await client.query(`SELECT channel_id,trading_status,scan_status,discord_status FROM channels WHERE channel_id=$1`,[input.channelId]);
     if(updatedReview.rowCount!==1||updatedChannel.rowCount!==1)throw new Error('Review decision persistence verification failed.');

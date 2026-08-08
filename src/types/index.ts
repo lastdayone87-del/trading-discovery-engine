@@ -17,7 +17,7 @@ export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHIN
 
 export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 
-export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED' | 'HUMAN_REJECTED';
+export type TradingStatus = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
 
 export type ReviewState = 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'SUPERSEDED';
 export interface ReviewQueueItem {
@@ -129,6 +129,8 @@ export interface ChannelRecord {
   discord_invite?: string | null;
   discord_discovery_status?: DiscordDiscoveryStatus;
   discord_candidate_locator?: string | null;
+  post_approval_job_status?: 'PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
+  post_approval_job_error?: string;
   scan_status: ScanStatus;
   scan_attempts: number;
   discovery_source: DiscoverySource;

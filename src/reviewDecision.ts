@@ -4,7 +4,10 @@ export interface ReviewDecisionRequest {
   channelId: string;
   action: ReviewDecisionAction;
   reviewVersion: number;
-  reason: string;
+  reason?: string;
+  reviewReasonCode?: string;
+  reviewReasonVersion?: string;
+  reviewReasonOther?: string;
   notes?: string;
   creatorType?: string;
   reasonCodes?: string[];
@@ -36,7 +39,7 @@ export async function submitReviewDecision(
   const response = await fetcher(`/api/reviews/${encodeURIComponent(request.channelId)}/${request.action}`, {
     method: 'POST',
     headers: { ...headers, 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
-    body: JSON.stringify({ reviewVersion: request.reviewVersion, reason: request.reason, notes: request.notes || '',creatorType:request.creatorType,reasonCodes:request.reasonCodes })
+    body: JSON.stringify({ reviewVersion: request.reviewVersion, reason: request.reason,reviewReasonCode:request.reviewReasonCode,reviewReasonVersion:request.reviewReasonVersion,reviewReasonOther:request.reviewReasonOther,notes: request.notes || '',creatorType:request.creatorType,reasonCodes:request.reasonCodes })
   });
   if (!response.ok) throw new Error(await responseError(response));
   return response.json() as Promise<ReviewDecisionResult>;

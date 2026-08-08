@@ -535,17 +535,20 @@ export async function inspectAndValidateChannel(
       channel.discord_status='UNCERTAIN';
       channel.scan_status='FAILED';
       channel.scan_attempts++;
-      channel.discord_discovery_status='NOT_DISCOVERED';
-      channel.discord_candidate_locator=null;
+      // An incomplete rescan cannot erase an earlier discovered locator. The
+      // append-only checks remain authoritative until a new validation replaces
+      // this compatibility projection.
+      channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':'NOT_DISCOVERED';
       channel.last_checked=now;
       if(inspection.acquisitionOutcomes?.some(item=>item.retryable)&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
     } else {
       // Nothing Found After All Steps
-      channel.discord_status = 'NOT_FOUND';
+      channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
       channel.scan_status = 'COMPLETED';
       channel.scan_attempts = 0;
-      channel.discord_discovery_status='NOT_DISCOVERED';
-      channel.discord_candidate_locator=null;
+      // Only a complete inspection with no prior discovery may project absence.
+      if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
+      else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
       channel.last_checked = now;
     }
 
