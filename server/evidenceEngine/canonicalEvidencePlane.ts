@@ -48,7 +48,7 @@ export function buildCanonicalEvidenceCorpus(input:RawChannelInput):CanonicalEvi
   if(input.discord_invite)add('discord_invite',input.discord_invite,{sourceFamilyId:family('community',input.discord_invite)});
   add('pinned_comment',input.pinned_comment);
   if(input.activity_metadata)add('activity_metadata',JSON.stringify(input.activity_metadata));
-  if(input.search_match_context){const context=input.search_match_context,sourceFamilyId=family('search-match',context.provider_native_id||context.locator||`${channelLocator}:search-match`);add('search_match_context',[context.title,context.description].filter(Boolean).join('\n'),{sourceFamilyId,providerNativeId:context.provider_native_id,publishedAt:context.published_at,contentType:'search_match'});}
+  if(input.search_match_context){const context=input.search_match_context,sourceFamilyId=family('search-match',context.provider_native_id||context.locator||`${channelLocator}:search-match`);add('search_match_context',[context.title,context.description].filter(Boolean).join('\n'),{sourceFamilyId,providerNativeId:context.provider_native_id,publishedAt:context.published_at,contentType:`search_match:${context.type||'UNKNOWN'}`});}
   return out;
 }
 

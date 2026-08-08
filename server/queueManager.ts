@@ -20,7 +20,9 @@ import {
   getAppSetting,
   heartbeatJob,
   recordQueryRunSightings,
-  getDailyYouTubeQuotaBudget
+  getDailyYouTubeQuotaBudget,
+  appendDiscordCheckAttempts,
+  appendExternalAcquisitionObservations
 } from './db';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
@@ -472,6 +474,8 @@ export async function inspectAndValidateChannel(
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description
     });
+    if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
+      .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
     // Live About-page hydration can reveal stronger country evidence than the
     // search snippet. Re-evaluate before persisting any discovered community.
@@ -504,13 +508,21 @@ export async function inspectAndValidateChannel(
         parentChannelIsTrading: channel.trading_status === 'TRADING_CONFIRMED',
         channelName: channel.channel_name
       });
+      await appendDiscordCheckAttempts(channel.channel_id,discordVal.candidateInviteUrl,discordVal.status,discordVal.attempts)
+        .catch(error=>console.warn(`[DiscordCheck] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
       channel.discord_status = discordVal.status;
       // ONLY persist invite URL if status is ACTIVE or ACTIVE_LOW_VOLUME (otherwise null)
       channel.discord_invite = discordVal.inviteUrl;
-      channel.scan_status = 'COMPLETED';
-      channel.scan_attempts = 0;
+      channel.scan_status = discordVal.operationalOutcome==='SUCCEEDED'||discordVal.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
+      channel.scan_attempts = discordVal.operationalOutcome==='SUCCEEDED'||discordVal.operationalOutcome==='CONFIRMED_INVALID'?0:channel.scan_attempts+discordVal.attempts.length;
       channel.last_checked = now;
+    } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
+      // A failed or partial crawl is operational uncertainty, not confirmed absence.
+      channel.discord_status='UNCERTAIN';
+      channel.scan_status='FAILED';
+      channel.scan_attempts++;
+      channel.last_checked=now;
     } else {
       // Nothing Found After All Steps
       channel.discord_status = 'NOT_FOUND';
