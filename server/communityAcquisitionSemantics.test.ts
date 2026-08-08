@@ -3,6 +3,7 @@ import test from 'node:test';
 import {validateDiscordInvite} from './discordValidator';
 import {crawlExternalLinks,runChannelInspection} from './inspector';
 import {communityAcquisitionRetryKey} from './queueManager';
+import {crawlExternalLinks} from './inspector';
 import {ProviderCallError} from './providerResilience';
 import {readFileSync} from 'node:fs';
 

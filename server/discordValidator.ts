@@ -81,7 +81,7 @@ export async function validateDiscordInvite(
   const maxAttempts=Math.min(5,Math.max(1,options?.maxAttempts||3)),fetchImpl=options?.fetchImpl||fetch,emit=options?.emitProviderEvent||appendProviderCallEvent;
   for(let attemptNumber=1;attemptNumber<=maxAttempts;attemptNumber++) try {
     const apiUrl = `https://discord.com/api/v9/invites/${encodeURIComponent(cleanCode)}?with_counts=true`;
-    const res = await executeProviderCall({context:{provider:'discord',operation:'invite-lookup',attempt:attemptNumber},timeoutMs:Number(process.env.DISCORD_PROVIDER_TIMEOUT_MS||'15000'),enabled:true,emit,call:signal=>fetchImpl(apiUrl, {
+    const res = await executeProviderCall({context:{provider:'discord',operation:'invite-lookup',attempt:attemptNumber},timeoutMs:Number(process.env.DISCORD_PROVIDER_TIMEOUT_MS||'15000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit,call:signal=>fetchImpl(apiUrl, {
       signal, headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
