@@ -14,10 +14,14 @@ export interface DiscordValidationResult {
   operationalOutcome: DiscordOperationalOutcome;
   retryable: boolean;
   attempts: DiscordCheckAttempt[];
+  livenessStatus:'ACTIVE'|'INVALID_OBSERVED'|'DEAD'|'UNCERTAIN';
+  relevanceStatus:'TRADING_RELEVANT'|'NON_TRADING'|'UNCERTAIN'|'NOT_CHECKED';
+  resolutionStatus:'RESOLVED'|'UNRESOLVED';
+  validationStatus:'RETRY_PENDING'|'SUCCEEDED'|'FAILED_OPERATIONAL'|'COMPLETED';
 }
 
-export type DiscordOperationalOutcome = 'SUCCEEDED'|'CONFIRMED_INVALID'|'RATE_LIMITED'|'TIMEOUT'|'NETWORK_FAILURE'|'AUTHENTICATION_FAILURE'|'PROVIDER_FAILURE'|'MALFORMED_RESPONSE'|'INVALID_LOCATOR';
-export interface DiscordCheckAttempt {attemptNumber:number;operationalOutcome:DiscordOperationalOutcome;retryable:boolean;httpStatus?:number;providerErrorClass?:string;reason:string;checkedAt:string}
+export type DiscordOperationalOutcome = 'SUCCEEDED'|'INVALID_OBSERVED'|'CONFIRMED_INVALID'|'RATE_LIMITED'|'TIMEOUT'|'NETWORK_FAILURE'|'AUTHENTICATION_FAILURE'|'PROVIDER_FAILURE'|'MALFORMED_RESPONSE'|'INVALID_LOCATOR';
+export interface DiscordCheckAttempt {attemptNumber:number;operationalOutcome:DiscordOperationalOutcome;retryable:boolean;httpStatus?:number;providerErrorClass?:string;providerErrorCode?:number;responseContentType?:string;reason:string;checkedAt:string}
 
 export interface DiscordValidationOptions {
   parentChannelIsTrading?: boolean;
@@ -26,6 +30,7 @@ export interface DiscordValidationOptions {
   retryDelayMs?: number;
   fetchImpl?: typeof fetch;
   emitProviderEvent?: typeof appendProviderCallEvent;
+  priorInvalidObservations?: number;
 }
 
 // Keywords required to confirm a Discord community is relevant to trading / finance
@@ -75,7 +80,7 @@ export async function validateDiscordInvite(
   const result=(value:Omit<DiscordValidationResult,'candidateInviteUrl'|'attempts'>):DiscordValidationResult=>({...value,candidateInviteUrl,attempts});
   if (!cleanCode || cleanCode.length < 2 || RESERVED_WORDS.includes(cleanCode.toLowerCase())) {
     attempts.push({attemptNumber:1,operationalOutcome:'INVALID_LOCATOR',retryable:false,reason:'Invalid or reserved invite code',checkedAt:new Date().toISOString()});
-    return result({ status: 'UNCERTAIN', confidence: 0, inviteUrl: null, relevanceReason: 'Invalid or reserved invite code',operationalOutcome:'INVALID_LOCATOR',retryable:false });
+    return result({ status: 'UNCERTAIN', confidence: 0, inviteUrl: null, relevanceReason: 'Invalid or reserved invite code',operationalOutcome:'INVALID_LOCATOR',retryable:false,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'UNRESOLVED',validationStatus:'COMPLETED' });
   }
 
   const maxAttempts=Math.min(5,Math.max(1,options?.maxAttempts||3)),fetchImpl=options?.fetchImpl||fetch,emit=options?.emitProviderEvent||appendProviderCallEvent;
@@ -88,19 +93,24 @@ export async function validateDiscordInvite(
     })});
 
     if (!res.ok) {
-      const outcome:DiscordOperationalOutcome=res.status===404?'CONFIRMED_INVALID':res.status===429?'RATE_LIMITED':[401,403].includes(res.status)?'AUTHENTICATION_FAILURE':res.status>=500?'PROVIDER_FAILURE':'PROVIDER_FAILURE';
-      const retryable=outcome==='RATE_LIMITED'||(outcome==='PROVIDER_FAILURE'&&res.status>=500);
-      const reason=outcome==='CONFIRMED_INVALID'?'Discord confirmed the invite is expired or invalid':`Discord invite lookup returned HTTP ${res.status}`;
-      attempts.push({attemptNumber,operationalOutcome:outcome,retryable,httpStatus:res.status,reason,checkedAt:new Date().toISOString()});
-      if(outcome==='CONFIRMED_INVALID')return result({ status:'DEAD',confidence:100,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable:false });
+      let discordErrorCode:number|undefined;try{const body=await res.clone().json();discordErrorCode=Number(body?.code)||undefined;}catch{}
+      const expectedInvalid=res.status===404&&discordErrorCode===10006;
+      const prior=Math.max(0,options?.priorInvalidObservations||0);
+      const outcome:DiscordOperationalOutcome=expectedInvalid?(prior>=1?'CONFIRMED_INVALID':'INVALID_OBSERVED'):res.status===429?'RATE_LIMITED':[401,403].includes(res.status)?'AUTHENTICATION_FAILURE':res.status>=500?'PROVIDER_FAILURE':'PROVIDER_FAILURE';
+      const retryable=outcome==='RATE_LIMITED'||(outcome==='PROVIDER_FAILURE'&&(res.status>=500||res.status===404));
+      const reason=outcome==='CONFIRMED_INVALID'?'Discord invalid-invite response was confirmed by a separate durable observation':outcome==='INVALID_OBSERVED'?'Discord reported an invalid invite; terminal confirmation is pending':`Discord invite lookup returned HTTP ${res.status}`;
+      const effectiveRetryable=outcome==='INVALID_OBSERVED'||retryable;
+      attempts.push({attemptNumber,operationalOutcome:outcome,retryable:effectiveRetryable,httpStatus:res.status,providerErrorCode:discordErrorCode,responseContentType:res.headers.get('content-type')||undefined,reason,checkedAt:new Date().toISOString()});
+      if(outcome==='CONFIRMED_INVALID')return result({ status:'DEAD',confidence:100,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable:false,livenessStatus:'DEAD',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'COMPLETED' });
+      if(outcome==='INVALID_OBSERVED')return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable:true,livenessStatus:'INVALID_OBSERVED',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'RETRY_PENDING'});
       if(retryable&&attemptNumber<maxAttempts){await new Promise(resolve=>setTimeout(resolve,(options?.retryDelayMs??250)*2**(attemptNumber-1)));continue;}
-      return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable});
+      return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:retryable?'RETRY_PENDING':'FAILED_OPERATIONAL'});
     }
 
     const data = await res.json();
 
     if (data && (data.guild || data.code)) {
-      attempts.push({attemptNumber,operationalOutcome:'SUCCEEDED',retryable:false,httpStatus:res.status,reason:'Discord invite metadata retrieved',checkedAt:new Date().toISOString()});
+      attempts.push({attemptNumber,operationalOutcome:'SUCCEEDED',retryable:false,httpStatus:res.status,responseContentType:res.headers.get('content-type')||undefined,reason:'Discord invite metadata retrieved',checkedAt:new Date().toISOString()});
       const memberCount = data.approximate_member_count || 0;
       const presenceCount = data.approximate_presence_count || 0;
       const guildName = data.guild?.name || '';
@@ -111,7 +121,7 @@ export async function validateDiscordInvite(
       const canonicalInviteUrl = `https://discord.gg/${actualCode}`;
 
       // Combine all available server metadata into lowercased text string
-      const fullText = [guildName, guildDescription, channelName, welcomeDesc, cleanCode, options?.channelName]
+      const fullText = [guildName, guildDescription, channelName, welcomeDesc, cleanCode]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
@@ -160,7 +170,7 @@ export async function validateDiscordInvite(
           guildName: guildName || 'Discord Server',
           approximateMemberCount: memberCount,
           approximatePresenceCount: presenceCount,
-          relevanceReason: `Non-trading server detected (matched non-finance signals: ${matchedNegative.join(', ')})`,operationalOutcome:'SUCCEEDED',retryable:false
+          relevanceReason: `Non-trading server detected (matched non-finance signals: ${matchedNegative.join(', ')})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'NON_TRADING',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
         });
       }
 
@@ -174,7 +184,7 @@ export async function validateDiscordInvite(
           guildName: guildName || 'Trading Discord',
           approximateMemberCount: memberCount,
           approximatePresenceCount: presenceCount,
-          relevanceReason: `Confirmed trading community (Confidence: ${confidence}%, Matched: ${matchedTrading.slice(0, 3).join(', ') || 'Creator Link'})`,operationalOutcome:'SUCCEEDED',retryable:false
+          relevanceReason: `Confirmed trading community (Confidence: ${confidence}%, Matched: ${matchedTrading.slice(0, 3).join(', ') || 'Parent Creator Link'})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'TRADING_RELEVANT',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
         });
       }
 
@@ -187,7 +197,7 @@ export async function validateDiscordInvite(
           guildName: guildName || 'Discord Server',
           approximateMemberCount: memberCount,
           approximatePresenceCount: presenceCount,
-          relevanceReason: `Ambiguous community (Confidence: ${confidence}% - Insufficient explicit trading evidence)`,operationalOutcome:'SUCCEEDED',retryable:false
+          relevanceReason: `Ambiguous community (Confidence: ${confidence}% - Insufficient explicit trading evidence)`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'UNCERTAIN',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
         });
       }
 
@@ -199,19 +209,19 @@ export async function validateDiscordInvite(
         guildName: guildName || 'Discord Server',
         approximateMemberCount: memberCount,
         approximatePresenceCount: presenceCount,
-        relevanceReason: `Ambiguous community (${confidence}% - no explicit negative evidence)`,operationalOutcome:'SUCCEEDED',retryable:false
+        relevanceReason: `Ambiguous community (${confidence}% - no explicit negative evidence)`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'UNCERTAIN',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
       });
 
     } else {
       const reason='Discord returned malformed guild data';attempts.push({attemptNumber,operationalOutcome:'MALFORMED_RESPONSE',retryable:true,reason,checkedAt:new Date().toISOString()});
       if(attemptNumber<maxAttempts){await new Promise(resolve=>setTimeout(resolve,(options?.retryDelayMs??250)*2**(attemptNumber-1)));continue;}
-      return result({ status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:'MALFORMED_RESPONSE',retryable:true });
+      return result({ status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:'MALFORMED_RESPONSE',retryable:true,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'RETRY_PENDING' });
     }
   } catch (err: any) {
     const typed=err as ProviderCallError,outcome:DiscordOperationalOutcome=typed.errorClass==='TIMEOUT'?'TIMEOUT':typed.errorClass==='RATE_LIMIT'?'RATE_LIMITED':typed.errorClass==='PERMANENT_INPUT'?'PROVIDER_FAILURE':'NETWORK_FAILURE',retryable=typed.retryable!==false;
     const reason=`Discord check failed: ${typed.message||String(err)}`;attempts.push({attemptNumber,operationalOutcome:outcome,retryable,httpStatus:typed.status,providerErrorClass:typed.errorClass,reason,checkedAt:new Date().toISOString()});
     if(retryable&&attemptNumber<maxAttempts){await new Promise(resolve=>setTimeout(resolve,(options?.retryDelayMs??250)*2**(attemptNumber-1)));continue;}
-    return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable});
+    return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:outcome,retryable,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:retryable?'RETRY_PENDING':'FAILED_OPERATIONAL'});
   }
-  return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:'Discord check attempts exhausted',operationalOutcome:'PROVIDER_FAILURE',retryable:true});
+  return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:'Discord check attempts exhausted',operationalOutcome:'PROVIDER_FAILURE',retryable:true,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'RETRY_PENDING'});
 }

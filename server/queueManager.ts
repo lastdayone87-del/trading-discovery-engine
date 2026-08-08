@@ -22,11 +22,13 @@ import {
   recordQueryRunSightings,
   getDailyYouTubeQuotaBudget,
   appendDiscordCheckAttempts,
+  countDiscordInvalidObservations,
   appendExternalAcquisitionObservations
 } from './db';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
+import {projectDiscordValidation} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
@@ -513,26 +515,32 @@ export async function inspectAndValidateChannel(
     }
 
     if (inspection.foundInvite) {
-      // Discord Found! Validate invite via Discord API with parent channel context
-      const discordVal = await validateDiscordInvite(inspection.foundInvite, {
-        parentChannelIsTrading: channel.trading_status === 'TRADING_CONFIRMED',
-        channelName: channel.channel_name
-      });
-      await appendDiscordCheckAttempts(channel.channel_id,discordVal.candidateInviteUrl,discordVal.status,discordVal.attempts)
-        .catch(error=>console.warn(`[DiscordCheck] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
-
-      channel.discord_status = discordVal.status;
-      channel.discord_candidate_locator = discordVal.candidateInviteUrl;
-      // ONLY persist invite URL if status is ACTIVE or ACTIVE_LOW_VOLUME (otherwise null)
-      channel.discord_invite = discordVal.inviteUrl;
-      channel.scan_status = discordVal.operationalOutcome==='SUCCEEDED'||discordVal.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
-      channel.discord_discovery_status = channel.scan_status==='COMPLETED'?'VALIDATED':'DISCOVERED_VALIDATION_FAILED';
-      channel.scan_attempts = discordVal.operationalOutcome==='SUCCEEDED'||discordVal.operationalOutcome==='CONFIRMED_INVALID'?0:channel.scan_attempts+discordVal.attempts.length;
-      channel.last_checked = now;
-      if(discordVal.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
+      // Validate every bounded native candidate until one is live. A stale or
+      // invalid first match must not suppress a later valid locator.
+      const candidates=inspection.discordCandidates?.length?inspection.discordCandidates:[{candidateId:`legacy:${inspection.foundInvite}`,locatorType:'NATIVE_INVITE' as const,sourceSurface:'CHANNEL_EXTERNAL_LINKS' as const,rawLocator:inspection.foundInvite,nativeInviteCode:inspection.foundInvite,normalizedLocator:`https://discord.gg/${inspection.foundInvite}`,extractionConfidence:'EXPLICIT' as const}];
+      let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0];
+      const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
+      for(const candidate of candidates){
+        if(!candidate.nativeInviteCode)continue;
+        const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
+        const priorInvalidObservations=await countDiscordInvalidObservations(channel.channel_id,candidate.candidateId,locator);
+        const validation=await validateDiscordInvite(candidate.nativeInviteCode,{parentChannelIsTrading:channel.trading_status==='TRADING_CONFIRMED',channelName:channel.channel_name,priorInvalidObservations});
+        await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
+        if(validation.operationalOutcome==='SUCCEEDED'){selected=validation;selectedCandidate=candidate;break;}
+        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}
+        if(!selected||validation.operationalOutcome==='INVALID_OBSERVED'){selected=validation;selectedCandidate=candidate;}
+      }
+      if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0];selectedCandidate=candidates[0];}
+      if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');
+      Object.assign(channel,projectDiscordValidation(channel,selected,selectedCandidate));
+      channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
+      channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:channel.scan_attempts+selected.attempts.length;
+      channel.last_checked=now;
+      if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       channel.discord_status='UNCERTAIN';
+      channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';channel.discord_validation_status='RETRY_PENDING';
       channel.scan_status='FAILED';
       channel.scan_attempts++;
       // An incomplete rescan cannot erase an earlier discovered locator. The
@@ -544,6 +552,7 @@ export async function inspectAndValidateChannel(
     } else {
       // Nothing Found After All Steps
       channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
+      if(!channel.discord_candidate_locator){channel.discord_resolution_status='NOT_ATTEMPTED';channel.discord_liveness_status='NOT_CHECKED';channel.discord_relevance_status='NOT_CHECKED';channel.discord_validation_status='COMPLETED';}
       channel.scan_status = 'COMPLETED';
       channel.scan_attempts = 0;
       // Only a complete inspection with no prior discovery may project absence.

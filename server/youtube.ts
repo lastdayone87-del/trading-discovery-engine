@@ -350,7 +350,8 @@ export async function searchYouTubeChannelPage(
  */
 export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Promise<string[]> {
   const keyPool = getYouTubeKeyPool();
-  if (keyPool.length === 0 || !channelId) return [];
+  if (!channelId) return [];
+  if (keyPool.length === 0) throw new Error('Recent-video description API is unavailable because no provider is configured.');
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
 

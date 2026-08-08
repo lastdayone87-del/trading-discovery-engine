@@ -2,6 +2,7 @@ import * as cheerio from 'cheerio';
 import { InspectionStep } from '../src/types';
 import { incrementQuota } from './db';
 import { fetchRecentVideoDescriptionsFromAPI } from './youtube';
+import {extractDiscordCandidates,makeDiscordCandidate,type DiscordCandidate} from './discordCandidates';
 
 export interface InspectionResult {
   debugLog?: any;
@@ -13,6 +14,7 @@ export interface InspectionResult {
   observedChannelLinks: string[];
   acquisitionStatus?: ExternalAcquisitionStatus;
   acquisitionOutcomes?: ExternalAcquisitionObservation[];
+  discordCandidates?: DiscordCandidate[];
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
 export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
@@ -54,64 +56,7 @@ export function normalizeExternalUrl(raw:string):NormalizedExternalUrl|null {
  * - Obfuscated: discord [dot] gg / XXXXX, discord.gg: XXXXX
  */
 export function extractDiscordInvite(text: string): string | null {
-  if (!text) return null;
-
-  // 1. De-escape JSON slashes & URL encoding
-  let cleanText = text
-    .replace(/\\\/|\\u002f/gi, '/')
-    .replace(/\\u003a/gi, ':')
-    .replace(/\\u0026/gi, '&')
-    .replace(/%2f/gi, '/')
-    .replace(/%3a/gi, ':');
-
-  // 2. De-obfuscate common patterns
-  cleanText = cleanText
-    .replace(/discord\s*(\[|\()?dot(\]|\))?\s*gg\s*[\/\\]\s*/gi, 'discord.gg/')
-    .replace(/discord\s*\[?\.\]?\s*gg\s*[\/\\]\s*/gi, 'discord.gg/')
-    .replace(/discord\s*\.\s*gg\s*[\/\\]\s*/gi, 'discord.gg/')
-    .replace(/discord\s*(\[|\()?dot(\]|\))?\s*com\s*[\/\\]\s*invite\s*[\/\\]\s*/gi, 'discord.com/invite/')
-    .replace(/discord\s*\[?\.\]?\s*com\s*[\/\\]\s*invite\s*[\/\\]\s*/gi, 'discord.com/invite/')
-    .replace(/discord\s*\.\s*com\s*[\/\\]\s*invite\s*[\/\\]\s*/gi, 'discord.com/invite/')
-    .replace(/discordapp\s*(\[|\()?dot(\]|\))?\s*com\s*[\/\\]\s*invite\s*[\/\\]\s*/gi, 'discordapp.com/invite/')
-    .replace(/discordapp\s*\[?\.\]?\s*com\s*[\/\\]\s*invite\s*[\/\\]\s*/gi, 'discordapp.com/invite/')
-    .replace(/discordapp\s*\.\s*com\s*[\/\\]\s*invite\s*[\/\\]\s*/gi, 'discordapp.com/invite/');
-
-  const reservedWords = [
-    'channels', 'guilds', 'store', 'download', 'nitro', 'login', 'register',
-    'api', 'widget', 'terms', 'privacy', 'branding', 'jobs', 'before', 'after',
-    'next', 'prev', 'index', 'home', 'about', 'contact', 'faq', 'support',
-    'invite', 'oauth2', 'template'
-  ];
-
-  // 3. Primary regex: discord.gg/code, discord.com/invite/code, discordapp.com/invite/code, discord.app/invite/code
-  const primaryRegex = /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite)\/([a-zA-Z0-9\-_]{2,32})/gi;
-  let match: RegExpExecArray | null;
-  while ((match = primaryRegex.exec(cleanText)) !== null) {
-    const code = match[1];
-    const lower = code.toLowerCase();
-    if (!reservedWords.includes(lower)) {
-      return code;
-    }
-  }
-
-  // 4. Secondary regex: dsc.gg/code, discord.me/code, discord.io/code, disboard.org/server/code
-  const altRegex = /(?:https?:\/\/)?(?:www\.)?(?:dsc\.gg|discord\.me|discord\.io|disboard\.org\/server)\/([a-zA-Z0-9\-_]{2,32})/gi;
-  while ((match = altRegex.exec(cleanText)) !== null) {
-    const code = match[1];
-    if (code && !reservedWords.includes(code.toLowerCase())) return code;
-  }
-
-  // 5. Colon regex: "Discord: CODE" or "discord.gg: CODE"
-  const colonRegex = /discord(?:\.gg)?\s*[:=\-]\s*([a-zA-Z0-9\-_]{4,25})/gi;
-  while ((match = colonRegex.exec(cleanText)) !== null) {
-    const code = match[1];
-    const lower = code.toLowerCase();
-    if (!['http', 'https', 'com', 'org', 'net', 'join', 'server', 'link', ...reservedWords].includes(lower)) {
-      return code;
-    }
-  }
-
-  return null;
+  return extractDiscordCandidates(text).find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||null;
 }
 
 /**
@@ -367,7 +312,7 @@ async function scrapeRecentVideoDescriptionsWithCoverage(youtubeUrl:string):Prom
       }
     }
 
-    if (videoIds.length === 0) return {descriptions:[],attempted:0,acquired:0};
+    if (videoIds.length === 0) throw new Error('Recent-video page schema was not recognized; absence is not confirmed');
 
     const descriptions: string[] = [];
     let acquired=0;
@@ -650,10 +595,13 @@ export async function runChannelInspection(channelData: {
     }
   }
 
+  const discoveredCandidates:DiscordCandidate[]=[];
+  const retainCandidates=(items:DiscordCandidate[])=>{for(const item of items)if(item.nativeInviteCode&&!discoveredCandidates.some(existing=>existing.candidateId===item.candidateId))discoveredCandidates.push(item);};
+
   // STEP 1 — Channel Bio & About Section
   const step1Logs: string[] = [];
   step1Logs.push(`Inspecting channel bio text (${bio.length} characters) and embedded links.`);
-  const directBioInvite = extractDiscordInvite(bio);
+  const bioCandidates=extractDiscordCandidates(bio,'YOUTUBE_ABOUT',channelData.youtubeUrl),directBioInvite=bioCandidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||null;
   
   if (debugLog) debugLog.discordRegexAttempts.push({ source: 'CHANNEL_ABOUT', textLength: bio.length, result: directBioInvite });
 
@@ -663,7 +611,7 @@ export async function runChannelInspection(channelData: {
     step1Logs.push(`Direct Discord invite detected in Channel Bio: Invite Code "${directBioInvite}"`);
     addStep('BIO', 'Step 1 — Channel Bio & About Panel', 'FOUND', step1Logs, directBioInvite, 'CHANNEL_ABOUT');
     acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl||`youtube:channel:${channelData.channelId}`,surface:'YOUTUBE_ABOUT',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in YouTube About content',observedAt:now});
-    return { foundInvite: directBioInvite, foundLocation: 'CHANNEL_ABOUT', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
+    retainCandidates(bioCandidates);
   } else {
     if(acquiredAboutUrl)acquisitionOutcomes.push({requestedUrl:acquiredAboutUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:'YouTube About page acquired and inspected without a Discord invite',observedAt:now});
     step1Logs.push('No direct Discord invite found in channel bio.');
@@ -678,13 +626,14 @@ export async function runChannelInspection(channelData: {
   if (links.length > 0) {
     step2Logs.push(`Scanning ${links.length} channel links.`);
     for (const link of links) {
-      const inv = extractDiscordInvite(link);
+      const linkCandidates=extractDiscordCandidates(link,'CHANNEL_EXTERNAL_LINKS',link),inv=linkCandidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||null;
       if (debugLog) debugLog.discordRegexAttempts.push({ source: 'CHANNEL_LINKS', url: link, result: inv });
       if (inv) {
         step2Logs.push(`Direct Discord invite detected in channel links: ${link}`);
         addStep('EXTERNAL_LINKS', 'Step 2 — Channel External Links', 'FOUND', step2Logs, inv, 'CHANNEL_LINKS');
         acquisitionOutcomes.push({requestedUrl:link,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});
-        return { foundInvite: inv, foundLocation: 'CHANNEL_LINKS', steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
+        const all=links.flatMap(item=>extractDiscordCandidates(item,'CHANNEL_EXTERNAL_LINKS',item)).filter(candidate=>candidate.nativeInviteCode);
+        retainCandidates(all);break;
       }
     }
     step2Logs.push('No direct Discord invite found in channel links.');
@@ -702,13 +651,14 @@ export async function runChannelInspection(channelData: {
       const sourceName = `VIDEO_${i + 1}_DESCRIPTION`;
       addExternalUrls(d, sourceName);
       
-      const inv = extractDiscordInvite(d);
+      const descriptionCandidates=extractDiscordCandidates(d,'RECENT_VIDEO_DESCRIPTIONS',`youtube:channel:${channelData.channelId}:${sourceName}`),inv=descriptionCandidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||null;
       if (debugLog) debugLog.discordRegexAttempts.push({ source: sourceName, textLength: d.length, result: inv });
       if (inv) {
         step3Logs.push(`Discord invite detected in ${sourceName}`);
         addStep('VIDEO_DESCRIPTIONS', 'Step 3 — Latest Video Descriptions', 'FOUND', step3Logs, inv, sourceName);
         acquisitionOutcomes.push({requestedUrl:`youtube:channel:${channelData.channelId}:${sourceName}`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in recent video description',observedAt:now});
-        return { foundInvite: inv, foundLocation: sourceName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
+        const all=videoDescs.slice(0,5).flatMap((text,index)=>extractDiscordCandidates(text,'RECENT_VIDEO_DESCRIPTIONS',`youtube:channel:${channelData.channelId}:VIDEO_${index+1}_DESCRIPTION`)).filter(candidate=>candidate.nativeInviteCode);
+        retainCandidates(all);break;
       }
     }
     step3Logs.push('No direct Discord invite found in video descriptions.');
@@ -752,7 +702,10 @@ export async function runChannelInspection(channelData: {
       if (crawlRes.foundInvite) {
         step5Logs.push(`Discord invite found! ${crawlRes.details}`);
         addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', 'FOUND', step5Logs, crawlRes.foundInvite, locName);
-        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
+        let candidates=extractDiscordCandidates(`${item.url}\n${crawlRes.details}`,'CREATOR_WEBSITES',item.url).filter(candidate=>candidate.nativeInviteCode);
+        const alternative=extractDiscordCandidates(item.url,'CREATOR_WEBSITES',item.url).find(candidate=>candidate.locatorType==='ALTERNATIVE_REDIRECT'||candidate.locatorType==='DIRECTORY_PAGE');
+        if(alternative&&candidates[0]?.nativeInviteCode){const {candidateId:_,...base}=alternative;candidates=[makeDiscordCandidate({...base,nativeInviteCode:candidates[0].nativeInviteCode,normalizedLocator:candidates[0].normalizedLocator,extractionConfidence:'RESOLVED'})];}
+        retainCandidates(candidates);break;
       }
     }
     const websiteOutcomes=acquisitionOutcomes.filter(item=>item.surface==='CREATOR_WEBSITES');
@@ -780,7 +733,10 @@ export async function runChannelInspection(channelData: {
       if (crawlRes.foundInvite) {
         step6Logs.push(`Discord invite found! ${crawlRes.details}`);
         addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', 'FOUND', step6Logs, crawlRes.foundInvite, locName);
-        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
+        let candidates=extractDiscordCandidates(`${item.url}\n${crawlRes.details}`,'SOCIAL_PROFILES',item.url).filter(candidate=>candidate.nativeInviteCode);
+        const alternative=extractDiscordCandidates(item.url,'SOCIAL_PROFILES',item.url).find(candidate=>candidate.locatorType==='ALTERNATIVE_REDIRECT'||candidate.locatorType==='DIRECTORY_PAGE');
+        if(alternative&&candidates[0]?.nativeInviteCode){const {candidateId:_,...base}=alternative;candidates=[makeDiscordCandidate({...base,nativeInviteCode:candidates[0].nativeInviteCode,normalizedLocator:candidates[0].normalizedLocator,extractionConfidence:'RESOLVED'})];}
+        retainCandidates(candidates);break;
       }
     }
     const failed=acquisitionOutcomes.some(item=>item.surface==='SOCIAL_PROFILES'&&item.outcome==='ACQUISITION_FAILED');
@@ -805,5 +761,5 @@ export async function runChannelInspection(channelData: {
   });
   const inspected=required.some(item=>item.outcome==='INSPECTED_NO_MATCH');
   const acquisitionStatus:ExternalAcquisitionStatus=failed&&inspected?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';
-  return { foundInvite: null, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus,acquisitionOutcomes };
+  return { foundInvite: discoveredCandidates[0]?.nativeInviteCode||null,foundLocation:discoveredCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||discoveredCandidates[0]?.sourceSurface, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:discoveredCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,discordCandidates:discoveredCandidates };
 }

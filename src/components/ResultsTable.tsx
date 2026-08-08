@@ -499,6 +499,11 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           ? 'Discovered · validation completed'
                           : 'Not discovered'}
                       </div>
+                      {c.discord_liveness_status&&c.discord_liveness_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Liveness: <b>{c.discord_liveness_status.replaceAll('_',' ')}</b></div>}
+                      {c.discord_relevance_status&&c.discord_relevance_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Relevance: <b>{c.discord_relevance_status.replaceAll('_',' ')}</b></div>}
+                      {c.discord_validation_status==='RETRY_PENDING'&&<div className="text-[10px] font-semibold text-amber-600">Validation retry pending</div>}
+                      {c.discord_liveness_status==='INVALID_OBSERVED'&&<div className="text-[10px] text-amber-600">Invalid observation awaiting confirmation</div>}
+                      {c.discord_candidate_type&&<div className="text-[10px] text-slate-400">Locator: {c.discord_candidate_type.replaceAll('_',' ')}</div>}
                       {c.discord_candidate_locator && !c.discord_invite && <div className="mt-0.5 max-w-48 truncate font-mono text-[10px] text-slate-500" title={c.discord_candidate_locator}>Candidate retained: {c.discord_candidate_locator.replace('https://','')}</div>}
                     </td>
 
