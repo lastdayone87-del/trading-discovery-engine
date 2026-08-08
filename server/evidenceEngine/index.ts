@@ -89,12 +89,21 @@ export class EvidenceBasedTradingEngine {
     const hasSubstantiveContext = (input.description?.trim().length || 0) >= 40 || (input.video_titles?.length || 0) >= 2 || (input.external_links?.length || 0) > 0 || (input.playlists?.length || 0) > 0 || (input.transcript_excerpts?.length || 0) > 0;
     const substantiveEvidence=allEvidence.some(item=>item.rawMatches.length>0&&item.category!=='SEMANTIC_ABSTENTION');
     const sufficiency = fieldsPresent.length === 0 ? 'MISSING' : (substantiveEvidence || explicitNegative || hasSubstantiveContext) ? 'SUFFICIENT' : 'INSUFFICIENT';
+    // Terminal negative decisions require creator-level coverage or independent
+    // underlying observations. Multiple providers interpreting the same document
+    // remain one observation and cannot manufacture rejection sufficiency.
+    const negativeFields=allEvidence.filter(item=>item.polarity==='NEGATIVE').flatMap(item=>item.provenance?.fields||[]);
+    const negativeObservationKeys=new Set(negativeFields.map(field=>field.sourceFamilyId||`${field.field}:${field.sourceId||field.index||''}`));
+    const negativeSourceFamilies=new Set(negativeFields.map(field=>field.sourceFamilyId).filter((value):value is string=>!!value));
+    const creatorLevelCoverage=(input.description?.trim().length||0)>=40&&negativeFields.some(field=>field.field==='channel_bio');
+    const independentNegativeSupport=negativeObservationKeys.size>=2&&(negativeSourceFamilies.size>=2||new Set(negativeFields.map(field=>field.field==='video_title'||field.field==='video_description'?`video:${field.sourceId||field.index}`:field.field)).size>=2);
+    const terminalNegativeSufficiency={status:creatorLevelCoverage||independentNegativeSupport?'SUFFICIENT' as const:'INSUFFICIENT' as const,creatorLevelCoverage,independentSourceFamilies:negativeSourceFamilies.size,independentObservations:negativeObservationKeys.size,reasonCodes:creatorLevelCoverage?['CREATOR_LEVEL_NEGATIVE_COVERAGE']:independentNegativeSupport?['INDEPENDENT_NEGATIVE_SUPPORT']:['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT']};
     const reasonCodes = [
       sparseMetadata && 'SPARSE_METADATA', degraded && 'PROVIDER_COVERAGE_DEGRADED',
       sufficiency === 'MISSING' && 'NO_CLASSIFIABLE_METADATA', sufficiency === 'INSUFFICIENT' && 'INSUFFICIENT_CLASSIFICATION_EVIDENCE'
       , ...provenanceErrors
     ].filter(Boolean) as string[];
-    const collection: EvidenceCollectionReport = { sufficiency, sparseMetadata, degraded, fieldsPresent, reasonCodes, providers: providerResults.map(result => result.report) };
+    const collection: EvidenceCollectionReport = { sufficiency, sparseMetadata, degraded, fieldsPresent, reasonCodes, providers: providerResults.map(result => result.report),terminalNegativeSufficiency };
 
     // Evaluate decision deterministically via Scoring Strategy
     const stages = evaluateClassificationStages(input, allEvidence, collection);

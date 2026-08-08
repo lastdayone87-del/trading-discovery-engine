@@ -104,7 +104,7 @@ export interface RawChannelInput {
   /** Immutable provider input projection, populated by the engine. */
   evidence_corpus?: import('./canonicalEvidencePlane').CanonicalEvidenceDocument[];
   /** Retrieval provenance is persisted separately and never masquerades as channel About evidence. */
-  search_match_context?: {provider_native_id?:string;title?:string;description?:string;published_at?:string;locator?:string};
+  search_match_context?: {type?:'VIDEO'|'CHANNEL'|'PLAYLIST'|'EXTERNAL'|'MANUAL'|'UNKNOWN';provider_native_id?:string;title?:string;description?:string;published_at?:string;locator?:string};
 }
 
 export interface LanguageKnowledge {
@@ -217,6 +217,13 @@ export interface EvidenceCollectionReport {
   fieldsPresent: string[];
   reasonCodes: string[];
   providers: ProviderExecutionReport[];
+  terminalNegativeSufficiency?: {
+    status: 'SUFFICIENT' | 'INSUFFICIENT';
+    creatorLevelCoverage: boolean;
+    independentSourceFamilies: number;
+    independentObservations: number;
+    reasonCodes: string[];
+  };
 }
 
 export type ClassificationStageName = 'AVAILABILITY' | 'CANDIDATE_DETECTION' | 'CORROBORATION' | 'CONTRADICTION' | 'LIFECYCLE';
