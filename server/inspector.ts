@@ -11,7 +11,11 @@ export interface InspectionResult {
   extractedThumbnailUrl?: string;
   observedAboutBio: string;
   observedChannelLinks: string[];
+  acquisitionStatus?: ExternalAcquisitionStatus;
+  acquisitionOutcomes?: ExternalAcquisitionObservation[];
 }
+export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
+export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;detail:string;observedAt:string}
 
 /**
  * Extracts clean Discord invite code or link from raw text.
@@ -171,9 +175,11 @@ async function fetchWithTimeout(url: string, depth = 0): Promise<{ html: string;
 export async function crawlExternalLinks(
   links: string[],
   logDetails: string[] = [],
-  debugLog?: any
-): Promise<{ foundInvite: string | null;  foundLocation?: string; details: string }> {
+  debugLog?: any,
+  fetchImpl:typeof fetch=fetch
+): Promise<{ foundInvite: string | null; foundLocation?: string; details: string; outcome:ExternalAcquisitionStatus; observations:ExternalAcquisitionObservation[] }> {
   let scannedCount = 0;
+  const observations:ExternalAcquisitionObservation[]=[];
 
   for (const rawUrl of links) {
     if (!rawUrl || typeof rawUrl !== 'string') continue;
@@ -190,11 +196,13 @@ export async function crawlExternalLinks(
     if (debugLog) debugLog.discordRegexAttempts.push({ source: 'crawlExternalLinks_direct', url, result: directInvite });
     if (directInvite) {
       logDetails.push(`Direct Discord link detected in URL parameter: ${url} (Invite: ${directInvite})`);
-      return { foundInvite: directInvite, details: logDetails.join('\n') };
+      observations.push({requestedUrl:url,finalUrl:url,outcome:'FOUND',retryable:false,detail:'Direct Discord invite in URL',observedAt:new Date().toISOString()});
+      return { foundInvite: directInvite, details: logDetails.join('\n'),outcome:'FOUND',observations };
     }
 
     // Crawl target page (fetchWithTimeout follows HTTP redirects)
-    const page = await fetchWithTimeout(url, 0);
+    let page:{html:string;finalUrl:string}|null=null;
+    try{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);const response=await fetchImpl(url,{signal:controller.signal,headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'},redirect:'follow'});clearTimeout(timer);const contentType=response.headers.get('content-type')||'';if(!response.ok){const retryable=response.status===429||response.status>=500;observations.push({requestedUrl:url,finalUrl:response.url||url,outcome:'ACQUISITION_FAILED',retryable,httpStatus:response.status,failureClass:response.status===429?'RATE_LIMIT':response.status>=500?'TRANSIENT_HTTP':'HTTP_ERROR',detail:`HTTP ${response.status}`,observedAt:new Date().toISOString()});}else if(!contentType.includes('text/html')&&!contentType.includes('json')&&!contentType.includes('plain'))observations.push({requestedUrl:url,finalUrl:response.url||url,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:response.status,failureClass:'UNSUPPORTED_CONTENT_TYPE',detail:`Unsupported content type ${contentType||'unknown'}`,observedAt:new Date().toISOString()});else page={html:await response.text(),finalUrl:response.url||url};}catch(error:any){const timeout=error?.name==='AbortError';observations.push({requestedUrl:url,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:timeout?'TIMEOUT':'NETWORK_FAILURE',detail:String(error?.message||error),observedAt:new Date().toISOString()});}
     if (debugLog && page) {
       debugLog.redirectsFollowed.push({ from: url, to: page.finalUrl });
     }
@@ -210,7 +218,8 @@ export async function crawlExternalLinks(
     if (debugLog) debugLog.discordRegexAttempts.push({ source: 'crawlExternalLinks_finalUrl', url: page.finalUrl, result: finalUrlInvite });
     if (finalUrlInvite) {
       logDetails.push(`Redirect target URL resolved to Discord invite on ${page.finalUrl} (Invite: ${finalUrlInvite})`);
-      return { foundInvite: finalUrlInvite, details: logDetails.join('\n') };
+      observations.push({requestedUrl:url,finalUrl:page.finalUrl,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found after redirect',observedAt:new Date().toISOString()});
+      return { foundInvite: finalUrlInvite, details: logDetails.join('\n'),outcome:'FOUND',observations };
     }
 
     // Extract directly from page HTML (covers embedded JSON state objects in Next.js/React/Nuxt)
@@ -218,7 +227,8 @@ export async function crawlExternalLinks(
     if (debugLog) debugLog.discordRegexAttempts.push({ source: 'crawlExternalLinks_html', url: page.finalUrl, textLength: page.html.length, result: inviteFromHtml });
     if (inviteFromHtml) {
       logDetails.push(`Discord invite extracted from page HTML payload on ${page.finalUrl} (Invite: ${inviteFromHtml})`);
-      return { foundInvite: inviteFromHtml, details: logDetails.join('\n') };
+      observations.push({requestedUrl:url,finalUrl:page.finalUrl,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found in page content',observedAt:new Date().toISOString()});
+      return { foundInvite: inviteFromHtml, details: logDetails.join('\n'),outcome:'FOUND',observations };
     }
 
     // Parse anchor tags
@@ -257,7 +267,8 @@ export async function crawlExternalLinks(
     });
 
     if (pageFound) {
-      return { foundInvite: pageFound, details: logDetails.join('\n') };
+      observations.push({requestedUrl:url,finalUrl:page.finalUrl,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found in page link',observedAt:new Date().toISOString()});
+      return { foundInvite: pageFound, details: logDetails.join('\n'),outcome:'FOUND',observations };
     }
 
     // Level 2 depth crawl for community subpages
@@ -270,19 +281,24 @@ export async function crawlExternalLinks(
         if (debugLog) debugLog.discordRegexAttempts.push({ source: 'crawlExternalLinks_subPage_finalUrl', url: subPage.finalUrl, result: subFinalInv });
         if (subFinalInv) {
           logDetails.push(`Subpage redirect reached Discord invite: ${subPage.finalUrl} (Invite: ${subFinalInv})`);
-          return { foundInvite: subFinalInv, details: logDetails.join('\n') };
+          observations.push({requestedUrl:url,finalUrl:subPage.finalUrl,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found on community subpage redirect',observedAt:new Date().toISOString()});
+          return { foundInvite: subFinalInv, details: logDetails.join('\n'),outcome:'FOUND',observations };
         }
         const subInv = extractDiscordInvite(subPage.html);
         if (subInv) {
           logDetails.push(`Discord invite extracted from subpage ${subUrl} (Invite: ${subInv})`);
-          return { foundInvite: subInv, details: logDetails.join('\n') };
+          observations.push({requestedUrl:url,finalUrl:subUrl,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found on community subpage',observedAt:new Date().toISOString()});
+          return { foundInvite: subInv, details: logDetails.join('\n'),outcome:'FOUND',observations };
         }
       }
     }
+    observations.push({requestedUrl:url,finalUrl:page.finalUrl,outcome:'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:'Page and bounded community links inspected without a Discord invite',observedAt:new Date().toISOString()});
   }
 
   logDetails.push(`Crawled ${scannedCount} external link(s). No Discord invite detected.`);
-  return { foundInvite: null, details: logDetails.join('\n') };
+  const failed=observations.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspected=observations.filter(item=>item.outcome==='INSPECTED_NO_MATCH').length;
+  const outcome:ExternalAcquisitionStatus=failed&&inspected?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';
+  return { foundInvite: null, details: logDetails.join('\n'),outcome,observations };
 }
 
 /**
@@ -292,42 +308,10 @@ async function crawlSocialBios(
   socialUrls: string[],
   logDetails: string[] = [],
   debugLog?: any
-): Promise<{ foundInvite: string | null;
-  foundLocation?: string; details: string }> {
-  for (const url of socialUrls) {
-    if (!url.startsWith('http')) continue;
-
-    const inv = extractDiscordInvite(url);
-    if (inv) {
-      logDetails.push(`Direct social link is Discord: ${url} (Invite: ${inv})`);
-      return { foundInvite: inv, details: logDetails.join('\n') };
-    }
-
-    logDetails.push(`Fetching social profile page: ${url}`);
-    const page = await fetchWithTimeout(url, 0);
-    if (page) {
-      if (debugLog) debugLog.redirectsFollowed.push({ from: url, to: page.finalUrl });
-      const invFromHtml = extractDiscordInvite(page.html);
-      if (debugLog) debugLog.discordRegexAttempts.push({ source: 'crawlSocialBios_html', url: page.finalUrl, textLength: page.html.length, result: invFromHtml });
-      if (invFromHtml) {
-        logDetails.push(`Discord link found in social bio page (${url}) -> Invite: ${invFromHtml}`);
-        return { foundInvite: invFromHtml, details: logDetails.join('\n') };
-      }
-
-      // Also extract external URLs in social bio HTML and crawl them
-      const extInBio = extractExternalUrlsFromText(page.html);
-      if (extInBio.length > 0) {
-        logDetails.push(`Found ${extInBio.length} external link(s) in social bio HTML. Crawling...`);
-        const crawlRes = await crawlExternalLinks(extInBio, logDetails, debugLog);
-        if (crawlRes.foundInvite) {
-          return crawlRes;
-        }
-      }
-    }
-  }
-
-  logDetails.push(`Crawled ${socialUrls.length} social profile URL(s). No Discord detected.`);
-  return { foundInvite: null, details: logDetails.join('\n') };
+): Promise<{foundInvite:string|null;foundLocation?:string;details:string;outcome:ExternalAcquisitionStatus;observations:ExternalAcquisitionObservation[]}> {
+  // Social profiles use the same bounded acquisition contract as creator-owned
+  // websites so an anti-bot response or timeout cannot become confirmed absence.
+  return crawlExternalLinks(socialUrls,logDetails,debugLog);
 }
 
 /**
@@ -503,6 +487,7 @@ export async function runChannelInspection(channelData: {
   const steps: InspectionStep[] = [];
   const now = new Date().toISOString();
   let extractedThumbnailUrl: string | undefined;
+  const acquisitionOutcomes:ExternalAcquisitionObservation[]=[];
 
   let debugLog: any = channelData.enableDebug ? {
     rawAboutPageHtml: null,
@@ -723,14 +708,16 @@ export async function runChannelInspection(channelData: {
       const locName = item.url.includes('linktr.ee') ? 'LINKTREE' : 'CUSTOM_DOMAIN';
 
       const crawlRes = await crawlExternalLinks([item.url], [], debugLog);
+      acquisitionOutcomes.push(...crawlRes.observations);
       if (crawlRes.foundInvite) {
         step5Logs.push(`Discord invite found! ${crawlRes.details}`);
         addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', 'FOUND', step5Logs, crawlRes.foundInvite, locName);
-        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
+        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
       }
     }
-    step5Logs.push('No Discord invite found in linked websites.');
-    addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', 'NOT_FOUND', step5Logs);
+    const failed=acquisitionOutcomes.some(item=>item.outcome==='ACQUISITION_FAILED'),inspected=acquisitionOutcomes.some(item=>item.outcome==='INSPECTED_NO_MATCH');
+    step5Logs.push(failed?'Linked website acquisition was incomplete; absence of an invite is not confirmed.':'No Discord invite found in successfully inspected linked websites.');
+    addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', failed?(inspected?'ERROR':'ERROR'):'NOT_FOUND', step5Logs);
   } else {
     addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', 'SKIPPED', ['No website URLs to crawl.']);
   }
@@ -748,14 +735,16 @@ export async function runChannelInspection(channelData: {
       if (item.url.includes('tiktok.com')) locName = 'TIKTOK_BIO';
 
       const crawlRes = await crawlSocialBios([item.url], [], debugLog);
+      acquisitionOutcomes.push(...crawlRes.observations);
       if (crawlRes.foundInvite) {
         step6Logs.push(`Discord invite found! ${crawlRes.details}`);
         addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', 'FOUND', step6Logs, crawlRes.foundInvite, locName);
-        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
+        return { foundInvite: crawlRes.foundInvite, foundLocation: locName, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus:'FOUND',acquisitionOutcomes };
       }
     }
-    step6Logs.push('No Discord invite found in social profile bios.');
-    addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', 'NOT_FOUND', step6Logs);
+    const failed=acquisitionOutcomes.some(item=>item.outcome==='ACQUISITION_FAILED');
+    step6Logs.push(failed?'Social profile acquisition was incomplete; absence of an invite is not confirmed.':'No Discord invite found in inspected social profile bios.');
+    addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', failed?'ERROR':'NOT_FOUND', step6Logs);
   } else {
     addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', 'SKIPPED', ['No social profile URLs to crawl.']);
   }
@@ -764,5 +753,7 @@ export async function runChannelInspection(channelData: {
     debugLog.failureStep = 'ALL_EXHAUSTED';
   }
 
-  return { foundInvite: null, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links };
+  const failed=acquisitionOutcomes.some(item=>item.outcome==='ACQUISITION_FAILED'),inspected=acquisitionOutcomes.some(item=>item.outcome==='INSPECTED_NO_MATCH');
+  const acquisitionStatus:ExternalAcquisitionStatus=failed&&inspected?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';
+  return { foundInvite: null, steps, extractedThumbnailUrl, debugLog, observedAboutBio:bio, observedChannelLinks:links,acquisitionStatus,acquisitionOutcomes };
 }
