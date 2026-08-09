@@ -12,6 +12,7 @@ import {
 } from './contracts';
 import { projectShadowCreatorOutcomes } from './shadowProjection';
 import { projectShadowCreatorProgramState } from './shadowState';
+import { reconcilePlaylistLineage } from './playlistLineage';
 
 export const CREATOR_READINESS_POLICY_VERSION = 'creator-readiness-shadow-v1';
 export const CREATOR_ALLOCATION_PROJECTION_VERSION = 'creator-program-allocation-shadow-v1';
@@ -278,8 +279,7 @@ export async function projectShadowProgramAllocations(cutoffAt: string): Promise
     await client.query('ROLLBACK');
     throw error;
   } finally { client.release(); }
-}
-
+        }
 export async function projectShadowAssignmentLineage(allocationRunId: string, cutoffAt: string): Promise<{ records: number; completeness: number }> {
   const db = await getDb();
   const allocations = await db.query(`SELECT * FROM creator_program_allocation_shadow_decisions WHERE allocation_run_id=$1 ORDER BY scheduling_opportunity_key`, [allocationRunId]);
@@ -345,6 +345,7 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
     const allocations = await projectShadowProgramAllocations(cutoffAt);
     const lineage = await projectShadowAssignmentLineage(allocations.runId, cutoffAt);
     const guardrails = await projectShadowGuardrails(allocations.runId, from, cutoffAt);
+    const playlistLineage = await reconcilePlaylistLineage(allocations.runId, cutoffAt);
     const allocationRows = await db.query(`SELECT opportunity_count,decision_count,input_checksum,output_checksum FROM creator_program_allocation_shadow_runs WHERE id=$1`, [allocations.runId]);
     const outcomeRows = await db.query(`SELECT input_count,output_count,input_checksum,output_checksum FROM creator_outcome_projection_runs WHERE id=$1`, [outcomes.projectionRunId]);
     const replayVariants = await db.query(`SELECT COUNT(DISTINCT output_checksum)::int count FROM creator_program_allocation_shadow_runs WHERE cutoff_at=$1 AND projection_version=$2`, [cutoffAt, CREATOR_ALLOCATION_PROJECTION_VERSION]);
@@ -360,9 +361,6 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
     const record = evaluateCreatorReadiness({ cutoffAt, checks, guardrails, sourceChecksums: [allocations.runKey, ...coverageRuns, outcomeRows.rows[0]?.output_checksum, ...playlistLineage.sourceChecksums].filter(Boolean) });
     await persistReadiness(record, outcomes.projectionRunId, allocations.runId);
     await db.query(`INSERT INTO creator_readiness_shadow_events(event_key,cutoff_at,event_type,result,reason_codes,detail,policy_version,serving_authority) VALUES($1,$2,'RUN_COMPLETED',$3,$4,$5,$6,false) ON CONFLICT(event_key) DO NOTHING`, [creatorIntelligenceChecksum({ readinessKey: record.readinessKey, event: 'RUN_COMPLETED' }), cutoffAt, record.result, JSON.stringify(record.reasonCodes), JSON.stringify({ readinessKey: record.readinessKey, outcomeProjectionRunId: outcomes.projectionRunId, allocationRunId: allocations.runId, playlistLineage }), CREATOR_READINESS_POLICY_VERSION]);
-    const record = evaluateCreatorReadiness({ cutoffAt, checks, guardrails, sourceChecksums: [allocations.runKey, ...coverageRuns, outcomeRows.rows[0]?.output_checksum].filter(Boolean) });
-    await persistReadiness(record, outcomes.projectionRunId, allocations.runId);
-    await db.query(`INSERT INTO creator_readiness_shadow_events(event_key,cutoff_at,event_type,result,reason_codes,detail,policy_version,serving_authority) VALUES($1,$2,'RUN_COMPLETED',$3,$4,$5,$6,false) ON CONFLICT(event_key) DO NOTHING`, [creatorIntelligenceChecksum({ readinessKey: record.readinessKey, event: 'RUN_COMPLETED' }), cutoffAt, record.result, JSON.stringify(record.reasonCodes), JSON.stringify({ readinessKey: record.readinessKey, outcomeProjectionRunId: outcomes.projectionRunId, allocationRunId: allocations.runId }), CREATOR_READINESS_POLICY_VERSION]);
     return record;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -371,4 +369,4 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
     await db.query(`INSERT INTO creator_readiness_shadow_events(event_key,cutoff_at,event_type,result,reason_codes,detail,policy_version,serving_authority) VALUES($1,$2,'RUN_ABSTAINED','ABSTAIN',$3,$4,$5,false) ON CONFLICT(event_key) DO NOTHING`, [creatorIntelligenceChecksum({ readinessKey: record.readinessKey, event: 'RUN_ABSTAINED' }), cutoffAt, JSON.stringify([...record.reasonCodes, 'OPERATIONAL_SHADOW_FAILURE']), JSON.stringify({ error: message }), CREATOR_READINESS_POLICY_VERSION]);
     return record;
   }
-}
+                   }
