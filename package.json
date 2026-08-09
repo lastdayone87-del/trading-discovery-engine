@@ -17,10 +17,13 @@
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts"
+    ,"admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts"
     ,"phaseb:validate-documents": "tsx scripts/phaseBValidateDocuments.ts"
     ,"phaseb:activate-assertions": "tsx scripts/phaseBActivateAssertions.ts"
     ,"phaseb:seal-benchmark": "tsx scripts/phaseBSealBenchmark.ts"
     ,"phaseb:disable-control": "tsx scripts/phaseBDisableControl.ts"
+    ,"phaseb:history-readiness": "tsx scripts/phaseBHistoryReadiness.ts"
+    ,"phaseb:observation-completeness": "tsx scripts/phaseBObservationCompleteness.ts"
     ,"phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts"
     ,"phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts"
     ,"creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts"
