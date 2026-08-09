@@ -22,6 +22,7 @@
     ,"phaseb:activate-assertions": "tsx scripts/phaseBActivateAssertions.ts"
     ,"phaseb:seal-benchmark": "tsx scripts/phaseBSealBenchmark.ts"
     ,"phaseb:disable-control": "tsx scripts/phaseBDisableControl.ts"
+    ,"phaseb:history-readiness": "tsx scripts/phaseBHistoryReadiness.ts"
     ,"phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts"
     ,"phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts"
     ,"creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts"
