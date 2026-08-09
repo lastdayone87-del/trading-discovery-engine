@@ -23,6 +23,7 @@
     ,"phaseb:disable-control": "tsx scripts/phaseBDisableControl.ts"
     ,"phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts"
     ,"phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts"
+    ,"creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts"
     ,"phase4:replay": "tsx scripts/phase4Replay.ts",
     "phase5:verify": "npm test && npm run lint && npm run build",
     "phase6:verify": "npm test && npm run lint && npm run build",

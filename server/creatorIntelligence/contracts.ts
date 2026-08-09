@@ -227,6 +227,70 @@ export interface CreatorLevelMetrics {
   asOf: string;
 }
 
+export const CREATOR_READINESS_RESULTS = ['PASS', 'FAIL', 'ABSTAIN'] as const;
+export type CreatorReadinessResult = typeof CREATOR_READINESS_RESULTS[number];
+
+export const CREATOR_GUARDRAIL_METRICS = [
+  'COUNTRY_PRECISION', 'TRADING_PRECISION', 'VERIFIED_CREATOR_YIELD',
+  'ACTIVE_VERIFIED_CREATOR_YIELD', 'REVIEW_BURDEN', 'INACTIVE_CREATOR_RATE',
+  'PROVIDER_COST', 'QUOTA_CONSUMPTION'
+] as const;
+export type CreatorGuardrailMetric = typeof CREATOR_GUARDRAIL_METRICS[number];
+
+/** Phase 3.5 stops at allocation context; it cannot contain a query specification. */
+export interface CreatorProgramAllocation {
+  allocationKey: string;
+  schedulingOpportunityKey: string;
+  actualQueryRunId: string;
+  country: string;
+  programId?: string;
+  objectiveKey?: string;
+  objectiveVersion?: number;
+  hypothesisId?: string;
+  disposition: 'ALLOCATED' | 'ABSTAIN';
+  reasonCodes: string[];
+  supportingEvidence: string[];
+  eligibleProgramKeys: string[];
+  behaviorPropensityBasisPoints: number;
+  targetPropensityBasisPoints: number;
+  randomizationValue: number;
+  policyVersion: string;
+  decidedAt: string;
+  servingAuthority: false;
+}
+
+export interface CreatorGuardrailSnapshot {
+  snapshotKey: string;
+  allocationRunKey: string;
+  metric: CreatorGuardrailMetric;
+  numerator: number;
+  denominator: number;
+  value: number | null;
+  attributionCompleteness: number;
+  maturityPolicy: string;
+  observationWindow: { from: string; to: string };
+  latestEvidenceAt: string | null;
+  sampleSize: number;
+  effectiveSampleSize: number;
+  confidence: { lower: number; upper: number } | null;
+  result: CreatorReadinessResult;
+  reasonCodes: string[];
+  policyVersion: string;
+  servingAuthority: false;
+}
+
+export interface CreatorReadinessRecord {
+  readinessKey: string;
+  cutoffAt: string;
+  result: CreatorReadinessResult;
+  reasonCodes: string[];
+  checks: Record<string, CreatorReadinessResult>;
+  inputChecksum: string;
+  outputChecksum: string;
+  policyVersion: string;
+  servingAuthority: false;
+}
+
 /** Compatibility reference for mapping current query runs in a later shadow phase. */
 export interface LegacyQueryRunReference {
   queryRunId: string;
