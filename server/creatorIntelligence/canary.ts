@@ -96,6 +96,7 @@ export function decideCreatorCanaryArm(input: {
 
 function rowControl(row: any): CreatorCanaryControl {
   return { enabled: row.enabled, killSwitch: row.kill_switch, servingAuthorityEnabled: row.serving_authority_enabled, topLevelAuthorityEnabled: row.top_level_authority_enabled || false,
+  return { enabled: row.enabled, killSwitch: row.kill_switch, servingAuthorityEnabled: row.serving_authority_enabled,
     rolloutBasisPoints: Number(row.rollout_basis_points), globalDailyAllocationCap: Number(row.global_daily_allocation_cap),
     globalDailyQuotaCap: Number(row.global_daily_quota_cap), maximumReadinessAgeHours: Number(row.maximum_readiness_age_hours),
     minimumAttributionCompleteness: Number(row.minimum_attribution_completeness), readinessPolicyVersion: row.readiness_policy_version,
@@ -103,6 +104,7 @@ function rowControl(row: any): CreatorCanaryControl {
 }
 
 export async function allocateCreatorSearchCanary(input: { opportunityKey: string; country: string; assignedAt: string; estimatedQuotaUnits?: number; requiredProgramId?: string; additionalSafetyReasons?: string[] }): Promise<CreatorCanaryAssignment> {
+export async function allocateCreatorSearchCanary(input: { opportunityKey: string; country: string; assignedAt: string; estimatedQuotaUnits?: number }): Promise<CreatorCanaryAssignment> {
   const db = await getDb(), client = await db.connect(), estimatedQuotaUnits = input.estimatedQuotaUnits ?? 100;
   if (!input.opportunityKey.trim() || !input.country.trim() || !Number.isFinite(new Date(input.assignedAt).getTime()) || !Number.isSafeInteger(estimatedQuotaUnits) || estimatedQuotaUnits < 0) throw new Error('INVALID_CREATOR_CANARY_OPPORTUNITY');
   try {
@@ -112,6 +114,7 @@ export async function allocateCreatorSearchCanary(input: { opportunityKey: strin
     const controlResult = await client.query(`SELECT * FROM creator_search_canary_control WHERE singleton=true FOR UPDATE`);
     if (!controlResult.rowCount) throw new Error('CREATOR_CANARY_CONTROL_MISSING');
     const control = rowControl(controlResult.rows[0]), reasons: string[] = [...(input.additionalSafetyReasons || [])];
+    const control = rowControl(controlResult.rows[0]), reasons: string[] = [];
     if (!control.enabled) reasons.push('CANARY_DISABLED');
     if (control.killSwitch) reasons.push('KILL_SWITCH_ACTIVE');
     if (!control.servingAuthorityEnabled) reasons.push('SERVING_AUTHORITY_DISABLED');
@@ -126,6 +129,7 @@ export async function allocateCreatorSearchCanary(input: { opportunityKey: strin
     if (readinessRow && new Date(input.assignedAt).getTime() - new Date(readinessRow.cutoff_at).getTime() > control.maximumReadinessAgeHours * 3600000) reasons.push('READINESS_STALE');
     if (readinessRow && Object.values(readinessRow.checks || {}).some(value => value !== 'PASS')) reasons.push('READINESS_CHECK_NOT_PASS');
     const guards = readinessRow?.allocation_run_id ? await client.query(`SELECT metric,result,attribution_completeness,policy_version FROM creator_guardrail_shadow_snapshots WHERE allocation_run_id=$1 ORDER BY metric`, [readinessRow.allocation_run_id]) : { rows: [], rowCount: 0 };
+    const guards = readinessRow?.allocation_run_id ? await client.query(`SELECT result,attribution_completeness,policy_version FROM creator_guardrail_shadow_snapshots WHERE allocation_run_id=$1`, [readinessRow.allocation_run_id]) : { rows: [], rowCount: 0 };
     if (guards.rowCount !== 8 || guards.rows.some((guard: any) => guard.result !== 'PASS')) reasons.push('GUARDRAILS_NOT_PASS');
     if (guards.rows.some((guard: any) => Number(guard.attribution_completeness) < control.minimumAttributionCompleteness)) reasons.push('ATTRIBUTION_INCOMPLETE');
     if (guards.rows.some((guard: any) => guard.policy_version !== control.readinessPolicyVersion)) reasons.push('GUARDRAIL_POLICY_MISMATCH');
@@ -142,6 +146,7 @@ export async function allocateCreatorSearchCanary(input: { opportunityKey: strin
     }
 
     const candidateRows = await client.query(`SELECT p.id program_id,p.program_key,cv.objective,h.id hypothesis_id,h.hypothesis_key,h.confidence_basis_points,f.uncertainty frontier_uncertainty,f.frontier_key,l.daily_allocation_cap,l.daily_quota_cap FROM research_programs p JOIN creator_search_canary_program_limits l ON l.program_id=p.id AND l.enabled=true AND l.policy_version=$3 JOIN LATERAL(SELECT objective FROM creator_program_contract_versions WHERE program_id=p.id AND effective_at<=$1 ORDER BY objective_version DESC,effective_at DESC LIMIT 1)cv ON true JOIN LATERAL(SELECT id,hypothesis_key,confidence_basis_points FROM discovery_hypotheses WHERE program_id=p.id AND lifecycle IN('PROPOSED','VALIDATED','TRIAL','PROVEN') AND policy_version IS NOT NULL AND created_at<=$1 ORDER BY confidence_basis_points DESC,hypothesis_key LIMIT 1)h ON true JOIN LATERAL(SELECT uncertainty,frontier_key,as_of FROM creator_frontier_shadow_snapshots WHERE program_id=p.id AND as_of<=$1 AND as_of>=$1::timestamptz-($4||' hours')::interval ORDER BY as_of DESC,uncertainty DESC,target_key LIMIT 1)f ON true WHERE p.creator_shadow_only=true AND p.mode='SHADOW' AND p.activation_enabled=false AND lower(cv.objective->'coordinates'->>'country')=lower($2) AND ($5::uuid IS NULL OR p.id=$5) ORDER BY p.program_key`, [input.assignedAt, input.country, control.policyVersion, String(control.maximumReadinessAgeHours), input.requiredProgramId || null]);
+    const candidateRows = await client.query(`SELECT p.id program_id,p.program_key,cv.objective,h.id hypothesis_id,h.hypothesis_key,h.confidence_basis_points,f.uncertainty frontier_uncertainty,f.frontier_key,l.daily_allocation_cap,l.daily_quota_cap FROM research_programs p JOIN creator_search_canary_program_limits l ON l.program_id=p.id AND l.enabled=true AND l.policy_version=$3 JOIN LATERAL(SELECT objective FROM creator_program_contract_versions WHERE program_id=p.id AND effective_at<=$1 ORDER BY objective_version DESC,effective_at DESC LIMIT 1)cv ON true JOIN LATERAL(SELECT id,hypothesis_key,confidence_basis_points FROM discovery_hypotheses WHERE program_id=p.id AND lifecycle IN('PROPOSED','VALIDATED','TRIAL','PROVEN') AND policy_version IS NOT NULL AND created_at<=$1 ORDER BY confidence_basis_points DESC,hypothesis_key LIMIT 1)h ON true JOIN LATERAL(SELECT uncertainty,frontier_key,as_of FROM creator_frontier_shadow_snapshots WHERE program_id=p.id AND as_of<=$1 AND as_of>=$1::timestamptz-($4||' hours')::interval ORDER BY as_of DESC,uncertainty DESC,target_key LIMIT 1)f ON true WHERE p.creator_shadow_only=true AND p.mode='SHADOW' AND p.activation_enabled=false AND lower(cv.objective->'coordinates'->>'country')=lower($2) ORDER BY p.program_key`, [input.assignedAt, input.country, control.policyVersion, String(control.maximumReadinessAgeHours)]);
     const eligible: ShadowAllocationCandidate[] = [];
     for (const row of candidateRows.rows) {
       const usage = await client.query(`SELECT COUNT(*)::int allocations,COALESCE(SUM(estimated_quota_units),0)::int quota FROM creator_search_canary_assignments WHERE assignment_status='CANARY_ALLOCATED' AND program_id=$1 AND assigned_at>=date_trunc('day',$2::timestamptz AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`, [row.program_id, input.assignedAt]);
@@ -171,6 +176,7 @@ export async function bindCreatorCanaryQueryRun(input: { assignmentId: string; a
 }
 
 export async function updateCreatorCanaryControl(input: { rolloutBasisPoints?: number; killSwitch?: boolean; enabled?: boolean; servingAuthorityEnabled?: boolean; topLevelAuthorityEnabled?: boolean; actor: string; reason: string }): Promise<void> {
+export async function updateCreatorCanaryControl(input: { rolloutBasisPoints?: number; killSwitch?: boolean; enabled?: boolean; servingAuthorityEnabled?: boolean; actor: string; reason: string }): Promise<void> {
   if (!input.actor.trim() || !input.reason.trim()) throw new Error('CANARY_CONTROL_AUDIT_REQUIRED');
   if (input.rolloutBasisPoints !== undefined && (!Number.isInteger(input.rolloutBasisPoints) || input.rolloutBasisPoints < 0 || input.rolloutBasisPoints > 10000)) throw new Error('INVALID_CANARY_ROLLOUT');
   const db = await getDb(), client = await db.connect();
@@ -185,6 +191,9 @@ export async function updateCreatorCanaryControl(input: { rolloutBasisPoints?: n
     const resulting = { ...current, rollout_basis_points: rollout, kill_switch: killSwitch, enabled, serving_authority_enabled: !enabled || killSwitch || rollout === 0 ? false : requestedAuthority, top_level_authority_enabled: authority, configuration_version: Number(current.configuration_version) + 1 };
     if (resulting.serving_authority_enabled && !resulting.enabled) throw new Error('CANARY_AUTHORITY_REQUIRES_ENABLED_CONTROL');
     await client.query(`UPDATE creator_search_canary_control SET rollout_basis_points=$1,kill_switch=$2,enabled=$3,serving_authority_enabled=$4,top_level_authority_enabled=$5,configuration_version=$6,updated_at=now(),updated_by=$7 WHERE singleton=true`, [resulting.rollout_basis_points, resulting.kill_switch, resulting.enabled, resulting.serving_authority_enabled, resulting.top_level_authority_enabled, resulting.configuration_version, input.actor]);
+    const resulting = { ...current, rollout_basis_points: rollout, kill_switch: killSwitch, enabled, serving_authority_enabled: !enabled || killSwitch || rollout === 0 ? false : requestedAuthority, configuration_version: Number(current.configuration_version) + 1 };
+    if (resulting.serving_authority_enabled && !resulting.enabled) throw new Error('CANARY_AUTHORITY_REQUIRES_ENABLED_CONTROL');
+    await client.query(`UPDATE creator_search_canary_control SET rollout_basis_points=$1,kill_switch=$2,enabled=$3,serving_authority_enabled=$4,configuration_version=$5,updated_at=now(),updated_by=$6 WHERE singleton=true`, [resulting.rollout_basis_points, resulting.kill_switch, resulting.enabled, resulting.serving_authority_enabled, resulting.configuration_version, input.actor]);
     const eventKey = creatorIntelligenceChecksum({ prior: current, resulting, actor: input.actor, reason: input.reason, policyVersion: CREATOR_SEARCH_CANARY_POLICY_VERSION });
     await client.query(`INSERT INTO creator_search_canary_control_events(event_key,prior_configuration,resulting_configuration,reason,changed_by,policy_version) VALUES($1,$2,$3,$4,$5,$6)`, [eventKey, JSON.stringify(current), JSON.stringify(resulting), input.reason, input.actor, CREATOR_SEARCH_CANARY_POLICY_VERSION]);
     await client.query('COMMIT');

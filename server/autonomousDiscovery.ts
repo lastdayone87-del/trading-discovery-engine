@@ -20,6 +20,7 @@ import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
+import { allocateCreatorSearchCanary, bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -204,6 +205,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         country = authority.country;
       } catch (error) {
         console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
+      const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country, attempt: attempts });
+      let creatorAllocation: CreatorCanaryAssignment | undefined;
+      try {
+        creatorAllocation = await allocateCreatorSearchCanary({ opportunityKey, country, assignedAt: now.toISOString(), estimatedQuotaUnits: 100 });
+      } catch (error) {
+        console.warn('[CreatorIntelligence] Canary allocation unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       }
       const research = await getAllocatedResearchQuery(country);
       const selected = research ? {
