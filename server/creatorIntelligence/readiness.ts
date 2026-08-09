@@ -12,7 +12,7 @@ import {
 } from './contracts';
 import { projectShadowCreatorOutcomes } from './shadowProjection';
 import { projectShadowCreatorProgramState } from './shadowState';
-import { reconcilePlaylistLineage } from './playlistLineage';
+import { reconcilePlaylistLineage } from './playlistLineageReconciler';
 
 export const CREATOR_READINESS_POLICY_VERSION = 'creator-readiness-shadow-v1';
 export const CREATOR_ALLOCATION_PROJECTION_VERSION = 'creator-program-allocation-shadow-v1';
