@@ -1,7 +1,8 @@
 import { getDb } from './db';
 import { REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION } from './replayMeasurement';
 import { recordAdaptiveShadowLabel } from './adaptiveTradingClassifier';
-import { recordEvaluationGroundTruth, type CreatorType } from './decisionEvaluation';
+import { type CreatorType } from './decisionEvaluation';
+import { observeGroundTruthLabelReliably } from './phaseBObservationOutbox';
 import { recordFalseNegativeIncident } from './governedAdaptation';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import {resolveReviewReason, type ReviewReasonAction} from './reviewReasons';
@@ -84,7 +85,7 @@ export async function decideReview(input:DecideInput) {
     // commits, never await them, and contain all failures at this boundary.
     if(input.action==='APPROVE'||input.action==='REJECT')void recordAdaptiveShadowLabel(input.channelId,inserted.rows[0].id,input.action==='APPROVE'?'TRADING_CONFIRMED':'NON_TRADING')
       .catch(error=>console.warn(`[AdaptiveClassifier] Shadow label failed for ${input.channelId}:`,error instanceof Error?error.message:error));
-    if(input.action==='APPROVE'||input.action==='REJECT')void recordEvaluationGroundTruth({channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,label:input.action==='APPROVE'?'TRADING_CONFIRMED':'NON_TRADING',provenance:'HUMAN_REVIEW',evidenceSnapshot:evidence,creatorType:input.creatorType,reasonCodes:input.reasonCodes})
+    if(input.action==='APPROVE'||input.action==='REJECT')void observeGroundTruthLabelReliably({type:'GROUND_TRUTH_LABEL',input:{channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,label:input.action==='APPROVE'?'TRADING_CONFIRMED':'NON_TRADING',provenance:'HUMAN_REVIEW',evidenceSnapshot:evidence,creatorType:input.creatorType,reasonCodes:input.reasonCodes}})
       .catch(error=>console.warn(`[DecisionEvaluation] Ground-truth label failed for ${input.channelId}:`,error instanceof Error?error.message:error));
     if(input.action==='APPROVE'&&row.channel_snapshot?.trading_status!=='TRADING_CONFIRMED')void recordFalseNegativeIncident({channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,priorStatus:row.channel_snapshot?.trading_status||'UNKNOWN',evidenceSnapshot:evidence})
       .catch(error=>console.warn(`[CorrectiveLearning] False-negative diagnosis failed for ${input.channelId}:`,error instanceof Error?error.message:error));
