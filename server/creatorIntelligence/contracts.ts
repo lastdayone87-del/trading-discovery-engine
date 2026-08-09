@@ -237,6 +237,21 @@ export const CREATOR_GUARDRAIL_METRICS = [
 ] as const;
 export type CreatorGuardrailMetric = typeof CREATOR_GUARDRAIL_METRICS[number];
 
+export const CREATOR_NON_QUERY_SHADOW_ACTIONS = [
+  'INSPECT_PLAYLIST', 'INSPECT_FEATURED_CHANNELS', 'INSPECT_COLLABORATOR',
+  'INSPECT_WEBSITE_AUTHOR', 'RESOLVE_EXTERNAL_ENTITY'
+] as const;
+export type CreatorNonQueryShadowActionType = typeof CREATOR_NON_QUERY_SHADOW_ACTIONS[number];
+
+/** Phase 6 proposal only; execution propensity is permanently zero. */
+export interface CreatorNonQueryShadowProposal extends Omit<CreatorAction, 'actionType'> {
+  actionType: CreatorNonQueryShadowActionType;
+  expectedUncertaintyReduction: number;
+  confidence: number;
+  supportingEvidence: string[];
+  executionPropensityBasisPoints: 0;
+}
+
 /** Phase 3.5 stops at allocation context; it cannot contain a query specification. */
 export interface CreatorProgramAllocation {
   allocationKey: string;
