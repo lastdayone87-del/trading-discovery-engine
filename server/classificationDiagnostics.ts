@@ -77,14 +77,15 @@ export async function recordProductionClassification(
     ? (await db.query('SELECT id FROM production_classification_diagnostics WHERE observation_key=$1', [diagnostic.observationKey])).rows[0]?.id
     : undefined);
 
-  await persistClassificationEvidenceBundle(
-    diagnostic.input,
-    diagnostic.decision,
-    diagnosticId
-  ).catch(error => console.warn(
-    `[EvidenceDualWrite] observational write failed for ${diagnostic.channelId}:`,
-    error instanceof Error ? error.message : error
-  ));
+  try {
+    await persistClassificationEvidenceBundle(diagnostic.input, diagnostic.decision, diagnosticId);
+  } catch (error) {
+    console.warn(`[EvidenceDualWrite] observational write failed for ${diagnostic.channelId}:`, error instanceof Error ? error.message : error);
+    // Durable Phase B diagnostic tasks are complete only after their document
+    // projection and validation observation complete. Production callers without
+    // an observation key preserve the legacy failure-contained behavior.
+    if (diagnostic.observationKey) throw error;
+  }
 
   return diagnosticId;
 }
