@@ -55,6 +55,7 @@ import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
+import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -146,6 +147,7 @@ export async function processNextSearchJob(
   await recoverStaleJobs();
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
+  triggerPhaseBObservationReconciliation();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');

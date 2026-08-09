@@ -3,7 +3,7 @@ import { getDb } from './db';
 import type { RawChannelInput, VerificationDecision } from './evidenceEngine';
 import { persistClassificationEvidenceBundle } from './evidenceEngine/dualWrite';
 
-interface ProductionClassificationDiagnosticInput {
+export interface ProductionClassificationDiagnosticInput {
   channelId: string;
   input: RawChannelInput;
   decision: VerificationDecision;
@@ -11,6 +11,7 @@ interface ProductionClassificationDiagnosticInput {
   queryRunId?: string;
   nominationId?: string;
   catalogVersions?: string[];
+  observationKey?: string;
 }
 
 function normalize(input: RawChannelInput) {
@@ -38,8 +39,9 @@ export async function recordProductionClassification(
     `INSERT INTO production_classification_diagnostics(
       channel_id, job_id, query_run_id, nomination_id, enrichment_stage,
       normalized_input, provider_execution, evidence_items, staged_report,
-      decision, policy_versions, catalog_versions
-    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      decision, policy_versions, catalog_versions, observation_key
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    ON CONFLICT(observation_key) WHERE observation_key IS NOT NULL DO NOTHING
     RETURNING id`,
     [
       diagnostic.channelId,
@@ -67,10 +69,13 @@ export async function recordProductionClassification(
         decisionPolicy: diagnostic.decision.decisionPolicy
       }),
       JSON.stringify(diagnostic.decision.versions),
-      JSON.stringify(diagnostic.catalogVersions || [])
+      JSON.stringify(diagnostic.catalogVersions || []),
+      diagnostic.observationKey || null
     ]
   );
-  const diagnosticId = inserted.rows[0]?.id;
+  const diagnosticId = inserted.rows[0]?.id || (diagnostic.observationKey
+    ? (await db.query('SELECT id FROM production_classification_diagnostics WHERE observation_key=$1', [diagnostic.observationKey])).rows[0]?.id
+    : undefined);
 
   await persistClassificationEvidenceBundle(
     diagnostic.input,
