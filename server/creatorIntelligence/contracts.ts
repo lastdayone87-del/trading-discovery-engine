@@ -37,6 +37,9 @@ export type CreatorProgramLifecycle = typeof CREATOR_PROGRAM_LIFECYCLES[number];
 export const CREATOR_COVERAGE_LIFECYCLES = ['ACTIVE', 'SLEEPING', 'SATURATED', 'PAUSED', 'UNREACHABLE'] as const;
 export type CreatorCoverageLifecycle = typeof CREATOR_COVERAGE_LIFECYCLES[number];
 
+export const CREATOR_FRONTIER_STATES = ['UNEXPLORED', 'PARTIALLY_OBSERVED', 'OBSERVED', 'UNKNOWN', 'SLEEPING'] as const;
+export type CreatorFrontierState = typeof CREATOR_FRONTIER_STATES[number];
+
 export interface CreatorDiscoveryCriteria {
   roles?: Array<'TRADER' | 'EDUCATOR' | 'ANALYST' | 'COMMUNITY_OPERATOR'>;
   activityRequirement?: Exclude<CreatorActivityStatus, 'CONFLICTED'>;
@@ -177,6 +180,30 @@ export interface CreatorCoverageCell {
   lastProbedAt?: string;
   asOf: string;
   policyVersion: string;
+}
+
+/** A declared population segment; it describes opportunity but cannot schedule work. */
+export interface CreatorCoverageTarget {
+  targetKey: string;
+  programId: string;
+  coordinates: ResearchCoordinates;
+  required: boolean;
+  definition: Record<string, unknown>;
+  policyVersion: string;
+}
+
+export interface CreatorFrontierSnapshot {
+  frontierKey: string;
+  programId: string;
+  coverageTargetKey: string;
+  state: CreatorFrontierState;
+  observedCreatorClusters: number;
+  estimatedUnexploredCoverage: number | null;
+  uncertainty: number;
+  reasonCodes: string[];
+  asOf: string;
+  policyVersion: string;
+  servingAuthority: false;
 }
 
 export interface CreatorLevelMetrics {
