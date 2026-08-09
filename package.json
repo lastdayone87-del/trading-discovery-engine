@@ -17,6 +17,7 @@
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts"
+    ,"admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts"
     ,"phaseb:validate-documents": "tsx scripts/phaseBValidateDocuments.ts"
     ,"phaseb:activate-assertions": "tsx scripts/phaseBActivateAssertions.ts"
     ,"phaseb:seal-benchmark": "tsx scripts/phaseBSealBenchmark.ts"
