@@ -1,0 +1,15 @@
+{
+  "kind": "youtube#channelSectionListResponse",
+  "items": [
+    {
+      "id": "section-uploads",
+      "snippet": { "type": "uploads", "position": 0 },
+      "contentDetails": {}
+    },
+    {
+      "id": "section-playlists",
+      "snippet": { "type": "multiplePlaylists", "position": 1 },
+      "contentDetails": { "playlists": ["PL-example"] }
+    }
+  ]
+}

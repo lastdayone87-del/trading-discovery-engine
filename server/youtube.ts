@@ -7,6 +7,7 @@ import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler } from './youtubeRequestScheduler';
 import { youtubeProviderCooldown, YouTubeProvidersCoolingDownError } from './youtubeProviderCooldown';
+import { FEATURED_CHANNEL_PROVIDER_COST, parseFeaturedChannelSections, type FeaturedChannelProviderResult } from './featuredChannelAdapter';
 export type { SearchOrdering } from './searchOrdering';
 export type { RetrievalLane } from './retrievalLanes';
 
@@ -105,6 +106,23 @@ export interface DiscoveredChannelRaw {
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
+/** One bounded channelSections.list request; only explicit multipleChannels IDs survive parsing. */
+export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maximumFanout: number): Promise<FeaturedChannelProviderResult> {
+  if (!/^UC[A-Za-z0-9_-]{22}$/.test(sourceChannelId) || !Number.isInteger(maximumFanout) || maximumFanout < 1 || maximumFanout > 10) throw new Error('INVALID_FEATURED_CHANNEL_PROVIDER_INPUT');
+  const keys = getYouTubeKeyPool(); if (!keys.length) throw new Error('YouTube featured-channel inspection requires an API key.');
+  const acquisition = youtubePoolBackoff.beginAcquisition();
+  try {
+    const index = availableKeyIndexes(keys)[0];
+    const url = buildYouTubeApiUrl('channelSections', keys[index], { part: 'snippet,contentDetails', channelId: sourceChannelId, maxResults: Math.min(50, maximumFanout) });
+    let response: Response;
+    try {
+      response = await youtubeFetch(url, 'featured-channel-sections', FEATURED_CHANNEL_PROVIDER_COST, 1, acquisition);
+    } catch (error) { recordProviderFailure(keys[index], error); acquisition.providerFailed(isQuotaExceeded(error) ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE'); throw error; }
+    await incrementQuota(FEATURED_CHANNEL_PROVIDER_COST); activeKeyIndex = index;
+    return parseFeaturedChannelSections({ sourceChannelId, maximumFanout, response: await response.json(), observedAt: new Date().toISOString() });
+  } finally { acquisition.release(); }
+}
+
 /** One bounded playlistItems call (cost: one unit); no pagination is followed by the canary. */
 export async function fetchYouTubePlaylistChannels(playlistId:string,limit:number):Promise<PlaylistChannelObservation[]> {
   const keys=getYouTubeKeyPool();if(!keys.length)throw new Error('YouTube playlist inspection requires an API key.');
@@ -152,7 +170,7 @@ const YOUTUBE_API_ROOT = 'https://youtube.googleapis.com/youtube/v3';
  * parameters.
  */
 export function buildYouTubeApiUrl(
-  resource: 'search' | 'videos' | 'channels' | 'playlistItems',
+  resource: 'search' | 'videos' | 'channels' | 'playlistItems' | 'channelSections',
   apiKey: string,
   parameters: Record<string, string | number | undefined>
 ): string {

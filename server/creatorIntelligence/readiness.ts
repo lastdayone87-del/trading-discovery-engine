@@ -197,6 +197,7 @@ export function projectCreatorGuardrails(input: {
   const stale = !latestEvidenceAt || new Date(input.observationWindow.to).getTime() - new Date(latestEvidenceAt).getTime() > (input.maximumEvidenceAgeHours ?? 48) * 3600000;
   const ess = effectiveSampleSize(windowedOutcomes);
   return CREATOR_GUARDRAIL_METRICS.map(metric => {
+    const parts = metricParts(metric, windowedOutcomes);
     const value = parts.denominator ? parts.numerator / parts.denominator : null;
     const confidence = parts.confidence ? wilson(parts.numerator, parts.denominator) : null;
     const reasons: string[] = [];
@@ -278,7 +279,8 @@ export async function projectShadowProgramAllocations(cutoffAt: string): Promise
     await client.query('ROLLBACK');
     throw error;
   } finally { client.release(); }
-        }
+}
+
 export async function projectShadowAssignmentLineage(allocationRunId: string, cutoffAt: string): Promise<{ records: number; completeness: number }> {
   const db = await getDb();
   const allocations = await db.query(`SELECT * FROM creator_program_allocation_shadow_decisions WHERE allocation_run_id=$1 ORDER BY scheduling_opportunity_key`, [allocationRunId]);
@@ -297,7 +299,7 @@ export async function projectShadowAssignmentLineage(allocationRunId: string, cu
     const sourceChecksum = creatorIntelligenceChecksum({ allocationKey: allocation.allocation_key, outcomeIds, coverageRunIds, coverageSnapshotIds, coverageChanges, expectedCount, cutoffAt });
     const lineageKey = creatorIntelligenceChecksum({ allocationKey: allocation.allocation_key, sourceChecksum, policyVersion: CREATOR_READINESS_POLICY_VERSION });
     await db.query(`INSERT INTO creator_assignment_shadow_lineage(lineage_key,allocation_id,actual_query_run_id,outcome_projection_run_id,outcome_ids,coverage_projection_run_ids,coverage_snapshot_ids,coverage_changes,expected_outcome_count,attributed_outcome_count,attribution_completeness,source_checksum,policy_version,as_of,serving_authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,false) ON CONFLICT(lineage_key) DO NOTHING`, [lineageKey, allocation.id, allocation.actual_query_run_id, outcomeRun.rows[0]?.id || null, JSON.stringify(outcomeIds), JSON.stringify(coverageRunIds), JSON.stringify(coverageSnapshotIds), JSON.stringify(coverageChanges), expectedCount, attributedCount, completeness, sourceChecksum, CREATOR_READINESS_POLICY_VERSION, cutoffAt]);
-    }
+  }
   return { records: allocations.rows.length, completeness: allocations.rowCount ? complete / allocations.rowCount : 0 };
 }
 
@@ -337,6 +339,7 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
   if (!control.rows[0]?.enabled) throw new Error('CREATOR_READINESS_SHADOW_DISABLED');
   const from = new Date(new Date(cutoffAt).getTime() - windowDays * 86400000).toISOString();
   try {
+    const playlistLineage = await reconcileCreatorPlaylistLineage(cutoffAt);
     const outcomes = await projectShadowCreatorOutcomes(cutoffAt);
     const programs = await db.query(`SELECT id FROM research_programs WHERE creator_shadow_only=true AND mode='SHADOW' AND activation_enabled=false ORDER BY program_key`);
     const coverageRuns: string[] = [];
@@ -344,12 +347,12 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
     const allocations = await projectShadowProgramAllocations(cutoffAt);
     const lineage = await projectShadowAssignmentLineage(allocations.runId, cutoffAt);
     const guardrails = await projectShadowGuardrails(allocations.runId, from, cutoffAt);
-    const playlistLineage = await reconcileCreatorPlaylistLineage(allocations.runId, cutoffAt);
     const allocationRows = await db.query(`SELECT opportunity_count,decision_count,input_checksum,output_checksum FROM creator_program_allocation_shadow_runs WHERE id=$1`, [allocations.runId]);
     const outcomeRows = await db.query(`SELECT input_count,output_count,input_checksum,output_checksum FROM creator_outcome_projection_runs WHERE id=$1`, [outcomes.projectionRunId]);
     const replayVariants = await db.query(`SELECT COUNT(DISTINCT output_checksum)::int count FROM creator_program_allocation_shadow_runs WHERE cutoff_at=$1 AND projection_version=$2`, [cutoffAt, CREATOR_ALLOCATION_PROJECTION_VERSION]);
     const missingCoverage = await db.query(`SELECT COUNT(*)::int count FROM creator_assignment_shadow_lineage l JOIN creator_program_allocation_shadow_decisions d ON d.id=l.allocation_id WHERE d.allocation_run_id=$1 AND d.disposition='ALLOCATED' AND jsonb_array_length(l.coverage_projection_run_ids)=0`, [allocations.runId]);
     const checks: Record<string, CreatorReadinessResult> = {
+      playlistLineageReconciliation: playlistLineage.result,
       phase1OutcomesComplete: Number(outcomeRows.rows[0]?.input_count) === Number(outcomeRows.rows[0]?.output_count) ? 'PASS' : 'ABSTAIN',
       phase2CoverageConsistent: programs.rowCount === coverageRuns.length && Number(missingCoverage.rows[0]?.count) === 0 ? 'PASS' : 'ABSTAIN',
       phase3AllocationsComplete: Number(allocationRows.rows[0]?.opportunity_count) === Number(allocationRows.rows[0]?.decision_count) ? 'PASS' : 'ABSTAIN',
