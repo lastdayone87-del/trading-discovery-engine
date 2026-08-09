@@ -4,6 +4,7 @@ import { CREATOR_FOCUS_POLICY_VERSION } from './evidenceEngine/classifierV4';
 
 export const PHASE_B_HISTORY_READINESS_VERSION = 'phase-b-history-readiness-v1';
 export const PHASE_B_REQUIRED_MIGRATIONS = [36, 37, 55, 56, 57, 63, 81] as const;
+export const PHASE_B_REQUIRED_MIGRATIONS = [36, 37, 55, 56, 57, 63] as const;
 export const PHASE_B_REQUIRED_TABLES = [
   'production_classification_diagnostics',
   'evaluation_sampling_policies',
@@ -21,6 +22,7 @@ export const PHASE_B_REQUIRED_TABLES = [
   'evidence_projection_validation_runs',
   'phase_b_shadow_control_events',
   'phase_b_observation_outbox'
+  'phase_b_shadow_control_events'
 ] as const;
 
 export const PHASE_B_REQUIRED_IMMUTABLE_TABLES = [
