@@ -13,6 +13,7 @@ import {
 import { projectShadowCreatorOutcomes } from './shadowProjection';
 import { projectShadowCreatorProgramState } from './shadowState';
 import { reconcileCreatorPlaylistLineage } from './playlistLineageReconciler';
+import { reconcileCreatorFeaturedChannelLineage } from './featuredChannelLineageReconciler';
 
 export const CREATOR_READINESS_POLICY_VERSION = 'creator-readiness-shadow-v1';
 export const CREATOR_ALLOCATION_PROJECTION_VERSION = 'creator-program-allocation-shadow-v1';
@@ -340,6 +341,7 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
   const from = new Date(new Date(cutoffAt).getTime() - windowDays * 86400000).toISOString();
   try {
     const playlistLineage = await reconcileCreatorPlaylistLineage(cutoffAt);
+    const featuredChannelLineage = await reconcileCreatorFeaturedChannelLineage(cutoffAt);
     const outcomes = await projectShadowCreatorOutcomes(cutoffAt);
     const programs = await db.query(`SELECT id FROM research_programs WHERE creator_shadow_only=true AND mode='SHADOW' AND activation_enabled=false ORDER BY program_key`);
     const coverageRuns: string[] = [];
@@ -353,6 +355,7 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
     const missingCoverage = await db.query(`SELECT COUNT(*)::int count FROM creator_assignment_shadow_lineage l JOIN creator_program_allocation_shadow_decisions d ON d.id=l.allocation_id WHERE d.allocation_run_id=$1 AND d.disposition='ALLOCATED' AND jsonb_array_length(l.coverage_projection_run_ids)=0`, [allocations.runId]);
     const checks: Record<string, CreatorReadinessResult> = {
       playlistLineageReconciliation: playlistLineage.result,
+      featuredChannelLineageReconciliation: featuredChannelLineage.result,
       phase1OutcomesComplete: Number(outcomeRows.rows[0]?.input_count) === Number(outcomeRows.rows[0]?.output_count) ? 'PASS' : 'ABSTAIN',
       phase2CoverageConsistent: programs.rowCount === coverageRuns.length && Number(missingCoverage.rows[0]?.count) === 0 ? 'PASS' : 'ABSTAIN',
       phase3AllocationsComplete: Number(allocationRows.rows[0]?.opportunity_count) === Number(allocationRows.rows[0]?.decision_count) ? 'PASS' : 'ABSTAIN',

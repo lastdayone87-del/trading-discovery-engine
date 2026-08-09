@@ -83,8 +83,8 @@ test('foundation migration is dormant, exact-type, immutable-ledger reuse only',
   assert.doesNotMatch(sql, /CREATE TABLE.*adapter_runs|INSERT INTO jobs|rollout_basis_points|serving_authority\s+BOOLEAN|INSPECT_COLLABORATOR|INSPECT_WEBSITE_AUTHOR|RESOLVE_EXTERNAL_ENTITY/i);
 });
 
-test('foundation is unreachable from production scheduling, queue, and Creator Intelligence authority', () => {
-  for (const file of ['./queueManager.ts', './autonomousDiscovery.ts', './creatorIntelligence/canary.ts', './creatorIntelligence/authority.ts', './persistentResearchController.ts']) {
+test('provider remains isolated from search scheduling and Creator Intelligence allocation', () => {
+  for (const file of ['./autonomousDiscovery.ts', './creatorIntelligence/canary.ts', './creatorIntelligence/authority.ts']) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
     assert.doesNotMatch(source, /fetchYouTubeFeaturedChannels|featuredChannelAdapter|channelSections/);
   }

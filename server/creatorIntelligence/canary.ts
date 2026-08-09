@@ -4,7 +4,7 @@ import { allocateShadowCreatorProgram, CREATOR_READINESS_POLICY_VERSION, type Sh
 
 export const CREATOR_SEARCH_CANARY_POLICY_VERSION = 'creator-search-allocation-canary-v1';
 export const CREATOR_SEARCH_CANARY_ACTION_TYPE = 'SEARCH_YOUTUBE' as const;
-export type CreatorCanaryActionType = typeof CREATOR_SEARCH_CANARY_ACTION_TYPE | 'INSPECT_PLAYLIST';
+export type CreatorCanaryActionType = typeof CREATOR_SEARCH_CANARY_ACTION_TYPE | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS';
 
 export interface CreatorCanaryControl {
   enabled: boolean;
@@ -13,6 +13,8 @@ export interface CreatorCanaryControl {
   topLevelAuthorityEnabled: boolean;
   playlistAuthorityEnabled: boolean;
   playlistRolloutBasisPoints: number;
+  featuredChannelAuthorityEnabled: boolean;
+  featuredChannelRolloutBasisPoints: number;
   rolloutBasisPoints: number;
   globalDailyAllocationCap: number;
   globalDailyQuotaCap: number;
@@ -178,10 +180,11 @@ export async function bindCreatorCanaryQueryRun(input: { assignmentId: string; a
   return !!result.rowCount;
 }
 
-export async function updateCreatorCanaryControl(input: { rolloutBasisPoints?: number; playlistRolloutBasisPoints?: number; killSwitch?: boolean; enabled?: boolean; servingAuthorityEnabled?: boolean; topLevelAuthorityEnabled?: boolean; playlistAuthorityEnabled?: boolean; actor: string; reason: string }): Promise<void> {
+export async function updateCreatorCanaryControl(input: { rolloutBasisPoints?: number; playlistRolloutBasisPoints?: number; featuredChannelRolloutBasisPoints?: number; killSwitch?: boolean; enabled?: boolean; servingAuthorityEnabled?: boolean; topLevelAuthorityEnabled?: boolean; playlistAuthorityEnabled?: boolean; featuredChannelAuthorityEnabled?: boolean; actor: string; reason: string }): Promise<void> {
   if (!input.actor.trim() || !input.reason.trim()) throw new Error('CANARY_CONTROL_AUDIT_REQUIRED');
   if (input.rolloutBasisPoints !== undefined && (!Number.isInteger(input.rolloutBasisPoints) || input.rolloutBasisPoints < 0 || input.rolloutBasisPoints > 10000)) throw new Error('INVALID_CANARY_ROLLOUT');
   if (input.playlistRolloutBasisPoints !== undefined && (!Number.isInteger(input.playlistRolloutBasisPoints) || input.playlistRolloutBasisPoints < 0 || input.playlistRolloutBasisPoints > 10000)) throw new Error('INVALID_PLAYLIST_CANARY_ROLLOUT');
+  if (input.featuredChannelRolloutBasisPoints !== undefined && (!Number.isInteger(input.featuredChannelRolloutBasisPoints) || input.featuredChannelRolloutBasisPoints < 0 || input.featuredChannelRolloutBasisPoints > 10000)) throw new Error('INVALID_FEATURED_CHANNEL_CANARY_ROLLOUT');
   const db = await getDb(), client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -192,11 +195,14 @@ export async function updateCreatorCanaryControl(input: { rolloutBasisPoints?: n
     const resultingAuthority = input.topLevelAuthorityEnabled ?? current.top_level_authority_enabled;
     const playlistRollout = input.playlistRolloutBasisPoints ?? current.playlist_rollout_basis_points;
     const requestedPlaylistAuthority = input.playlistAuthorityEnabled ?? current.playlist_authority_enabled;
-    const authority = !enabled || killSwitch || rollout === 0 ? false : resultingAuthority;
-    const playlistAuthority = !enabled || killSwitch || playlistRollout === 0 ? false : requestedPlaylistAuthority;
-    const resulting = { ...current, rollout_basis_points: rollout, playlist_rollout_basis_points: playlistRollout, kill_switch: killSwitch, enabled, serving_authority_enabled: !enabled || killSwitch || rollout === 0 && playlistRollout === 0 ? false : requestedAuthority, top_level_authority_enabled: authority, playlist_authority_enabled: playlistAuthority, configuration_version: Number(current.configuration_version) + 1 };
+    const featuredChannelRollout = input.featuredChannelRolloutBasisPoints ?? current.featured_channel_rollout_basis_points;
+    const requestedFeaturedChannelAuthority = input.featuredChannelAuthorityEnabled ?? current.featured_channel_authority_enabled;
+    const authority = !enabled || killSwitch || !requestedAuthority || rollout === 0 ? false : resultingAuthority;
+    const playlistAuthority = !enabled || killSwitch || !requestedAuthority || playlistRollout === 0 ? false : requestedPlaylistAuthority;
+    const featuredChannelAuthority = !enabled || killSwitch || !requestedAuthority || featuredChannelRollout === 0 ? false : requestedFeaturedChannelAuthority;
+    const resulting = { ...current, rollout_basis_points: rollout, playlist_rollout_basis_points: playlistRollout, featured_channel_rollout_basis_points: featuredChannelRollout, kill_switch: killSwitch, enabled, serving_authority_enabled: !enabled || killSwitch || rollout === 0 && playlistRollout === 0 && featuredChannelRollout === 0 ? false : requestedAuthority, top_level_authority_enabled: authority, playlist_authority_enabled: playlistAuthority, featured_channel_authority_enabled: featuredChannelAuthority, configuration_version: Number(current.configuration_version) + 1 };
     if (resulting.serving_authority_enabled && !resulting.enabled) throw new Error('CANARY_AUTHORITY_REQUIRES_ENABLED_CONTROL');
-    await client.query(`UPDATE creator_search_canary_control SET rollout_basis_points=$1,playlist_rollout_basis_points=$2,kill_switch=$3,enabled=$4,serving_authority_enabled=$5,top_level_authority_enabled=$6,playlist_authority_enabled=$7,configuration_version=$8,updated_at=now(),updated_by=$9 WHERE singleton=true`, [resulting.rollout_basis_points, resulting.playlist_rollout_basis_points, resulting.kill_switch, resulting.enabled, resulting.serving_authority_enabled, resulting.top_level_authority_enabled, resulting.playlist_authority_enabled, resulting.configuration_version, input.actor]);
+    await client.query(`UPDATE creator_search_canary_control SET rollout_basis_points=$1,playlist_rollout_basis_points=$2,featured_channel_rollout_basis_points=$3,kill_switch=$4,enabled=$5,serving_authority_enabled=$6,top_level_authority_enabled=$7,playlist_authority_enabled=$8,featured_channel_authority_enabled=$9,configuration_version=$10,updated_at=now(),updated_by=$11 WHERE singleton=true`, [resulting.rollout_basis_points, resulting.playlist_rollout_basis_points, resulting.featured_channel_rollout_basis_points, resulting.kill_switch, resulting.enabled, resulting.serving_authority_enabled, resulting.top_level_authority_enabled, resulting.playlist_authority_enabled, resulting.featured_channel_authority_enabled, resulting.configuration_version, input.actor]);
     const eventKey = creatorIntelligenceChecksum({ prior: current, resulting, actor: input.actor, reason: input.reason, policyVersion: CREATOR_SEARCH_CANARY_POLICY_VERSION });
     await client.query(`INSERT INTO creator_search_canary_control_events(event_key,prior_configuration,resulting_configuration,reason,changed_by,policy_version) VALUES($1,$2,$3,$4,$5,$6)`, [eventKey, JSON.stringify(current), JSON.stringify(resulting), input.reason, input.actor, CREATOR_SEARCH_CANARY_POLICY_VERSION]);
     await client.query('COMMIT');
