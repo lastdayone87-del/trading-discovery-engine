@@ -382,6 +382,7 @@ export interface AutonomousQueryCandidate {
   query: QueryRecord;
   strategy: string;
   reason: string;
+  allocationProvenance?: Record<string, unknown>;
 }
 
 export interface AutonomousSchedulingSnapshot {
@@ -484,7 +485,7 @@ export async function scheduleAutonomousQueryRuns(
       const run = await client.query(
         `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata)
          VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7) RETURNING id`,
-        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify(candidate.query.generation_metadata || {})]
+        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) })]
       );
       const runId = run.rows[0].id;
       for (const component of queryComponents(candidate.query)) {
@@ -509,7 +510,7 @@ export async function scheduleAutonomousQueryRuns(
       );
       const jobId = job.rows[0].id;
       await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
-      await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,generationMode:candidate.query.generation_mode}});
+      await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     await client.query('COMMIT');
