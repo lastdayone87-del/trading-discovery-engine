@@ -8,7 +8,8 @@ import { CREATOR_SEARCH_CANARY_POLICY_VERSION, creatorCanaryBucket, decideCreato
 const at = '2026-08-09T00:00:00.000Z';
 const objective: CreatorDiscoveryObjective = { objectiveKey: 'german-futures', version: 1, title: 'German futures', statement: 'Find German futures creators.', coordinates: { country: 'Germany' }, criteria: {}, coverageDefinition: {}, evaluationHorizonDays: 30, createdAt: at, policyVersion: 'objective-v1' };
 const candidate: ShadowAllocationCandidate = { programId: 'program-1', programKey: 'german-futures', objective, hypothesisId: 'hypothesis-1', hypothesisKey: 'gap-1', hypothesisConfidence: .9, frontierUncertainty: .8, evidenceKeys: ['frontier-1'] };
-const control = (patch: Partial<CreatorCanaryControl> = {}): CreatorCanaryControl => ({ enabled: true, killSwitch: false, servingAuthorityEnabled: true, topLevelAuthorityEnabled: false, playlistAuthorityEnabled: false, playlistRolloutBasisPoints: 0, rolloutBasisPoints: 1000, globalDailyAllocationCap: 10, globalDailyQuotaCap: 1000, maximumReadinessAgeHours: 24, minimumAttributionCompleteness: 1, readinessPolicyVersion: CREATOR_READINESS_POLICY_VERSION, policyVersion: CREATOR_SEARCH_CANARY_POLICY_VERSION, configurationVersion: 1, ...patch });
+const control = (patch: Partial<CreatorCanaryControl> = {}): CreatorCanaryControl => ({ enabled: true, killSwitch: false, servingAuthorityEnabled: true, topLevelAuthorityEnabled: false, rolloutBasisPoints: 1000, globalDailyAllocationCap: 10, globalDailyQuotaCap: 1000, maximumReadinessAgeHours: 24, minimumAttributionCompleteness: 1, readinessPolicyVersion: CREATOR_READINESS_POLICY_VERSION, policyVersion: CREATOR_SEARCH_CANARY_POLICY_VERSION, configurationVersion: 1, ...patch });
+const control = (patch: Partial<CreatorCanaryControl> = {}): CreatorCanaryControl => ({ enabled: true, killSwitch: false, servingAuthorityEnabled: true, rolloutBasisPoints: 1000, globalDailyAllocationCap: 10, globalDailyQuotaCap: 1000, maximumReadinessAgeHours: 24, minimumAttributionCompleteness: 1, readinessPolicyVersion: CREATOR_READINESS_POLICY_VERSION, policyVersion: CREATOR_SEARCH_CANARY_POLICY_VERSION, configurationVersion: 1, ...patch });
 const opportunityFor = (predicate: (bucket: number) => boolean): string => {
   for (let index = 0; index < 100000; index++) { const key = `opportunity-${index}`; if (predicate(creatorCanaryBucket(key))) return key; }
   throw new Error('TEST_OPPORTUNITY_NOT_FOUND');
@@ -55,6 +56,7 @@ test('scheduler preserves Query Intelligence selection and existing quota accoun
   const scheduler = readFileSync(new URL('../autonomousDiscovery.ts', import.meta.url), 'utf8');
   const db = readFileSync(new URL('../db.ts', import.meta.url), 'utf8');
   assert.ok(scheduler.indexOf('allocateCreatorSearchAuthority') < scheduler.indexOf('selectNextQueryForCountry(country)'));
+  assert.ok(scheduler.indexOf('allocateCreatorSearchCanary') < scheduler.indexOf('selectNextQueryForCountry(country)'));
   assert.match(scheduler, /await selectNextQueryForCountry\(country\)/); assert.match(scheduler, /CANARY_ALLOCATION_UNAVAILABLE/);
   assert.match(db, /quota_reserved,metadata[^]*VALUES\(\$1,\$2,'automated_query',\$3,\$4,\$5,\$6,100,\$7\)/);
   assert.doesNotMatch(readFileSync(new URL('./canary.ts', import.meta.url), 'utf8'), /INSERT INTO jobs|INSERT INTO quota_reservations|searchYouTube|allocateRetrievalLane|allocateSearchOrdering/);
@@ -62,6 +64,6 @@ test('scheduler preserves Query Intelligence selection and existing quota accoun
 
 test('rollback control is auditable and supports kill switch or zero rollout', () => {
   const source = readFileSync(new URL('./canary.ts', import.meta.url), 'utf8');
-  assert.match(source, /updateCreatorCanaryControl/); assert.match(source, /rollout_basis_points=\$1,playlist_rollout_basis_points=\$2,kill_switch=\$3/); assert.match(source, /creator_search_canary_control_events/);
+  assert.match(source, /updateCreatorCanaryControl/); assert.match(source, /rollout_basis_points=\$1,kill_switch=\$2/); assert.match(source, /creator_search_canary_control_events/);
   assert.match(source, /!enabled \|\| killSwitch \|\| rollout === 0 \? false/);
 });
