@@ -18,6 +18,8 @@ import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
+import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
+import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
 import { allocateCreatorSearchCanary, bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
@@ -192,8 +194,17 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     let attempts = 0;
 
     while (scheduled.length < capacity && attempts < capacity * Math.max(3, countries.length)) {
-      const country = countries[(currentCountryIndex + attempts) % countries.length];
+      const legacyCountry = countries[(currentCountryIndex + attempts) % countries.length];
       attempts++;
+      const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
+      let creatorAllocation: CreatorCanaryAssignment | undefined;
+      let country = legacyCountry;
+      try {
+        const authority = await allocateCreatorSearchAuthority({ opportunityKey, legacyCountry, allowedCountries: countries, assignedAt: now.toISOString(), estimatedQuotaUnits: 100 });
+        creatorAllocation = authority.assignment;
+        country = authority.country;
+      } catch (error) {
+        console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country, attempt: attempts });
       let creatorAllocation: CreatorCanaryAssignment | undefined;
       try {
