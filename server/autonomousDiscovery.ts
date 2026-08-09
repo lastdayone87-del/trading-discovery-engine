@@ -232,7 +232,6 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
           policyVersion: creatorAllocation.policyVersion,
           queryAuthority: 'QUERY_INTELLIGENCE'
         } : { status: 'LEGACY_FALLBACK', reason: 'CANARY_ALLOCATION_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
-        } : { status: 'LEGACY_FALLBACK', reason: 'CREATOR_AUTHORITY_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
       }], workerId, cooldownMinutes);
       if (created.length) {
         scheduled.push(...created);
