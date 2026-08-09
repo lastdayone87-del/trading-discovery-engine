@@ -15,8 +15,7 @@ import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './qu
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
-import {recordProductionClassification} from './classificationDiagnostics';
-import { recordRetrievalEvaluationAssignment } from './decisionEvaluation';
+import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
@@ -74,7 +73,7 @@ export async function processChannelThroughPipeline(
   isEnrichmentPass: boolean = false
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
-  if(await getAppSetting('decision_evaluation_sampling_enabled','false')==='true')await recordRetrievalEvaluationAssignment({channelId:candidate.channelId,targetCountry,discoveryOrigin:source,language:candidate.detectedLanguages?.[0]?.language,observedAt:now,context:{isManualScan,isEnrichmentPass}} ,{policyKey:'protected-audit',version:1,salt:process.env.DECISION_EVALUATION_SAMPLING_SALT||'',protectedAuditBasisPoints:100,targetedAuditBasisPoints:0})
+  if(await getAppSetting('decision_evaluation_sampling_enabled','false')==='true')await observeRetrievalAssignmentReliably({type:'RETRIEVAL_ASSIGNMENT',input:{channelId:candidate.channelId,targetCountry,discoveryOrigin:source,language:candidate.detectedLanguages?.[0]?.language,observedAt:now,context:{isManualScan,isEnrichmentPass}},policy:{policyKey:'protected-audit',version:1,salt:process.env.DECISION_EVALUATION_SAMPLING_SALT||'',protectedAuditBasisPoints:100,targetedAuditBasisPoints:0}})
     .catch(error=>console.warn(`[DecisionEvaluation] Cohort assignment failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
 
   // Step 0: Terminal State & Existing Channel Check
@@ -196,7 +195,7 @@ export async function processChannelThroughPipeline(
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
-  const classificationDiagnosticId=await recordProductionClassification({channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:candidate.discoveryJobId,queryRunId:candidate.queryRunId,nominationId:candidate.nominationId})
+  const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:candidate.discoveryJobId,queryRunId:candidate.queryRunId,nominationId:candidate.nominationId}})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
   let tradingVal = productionClassification.result;
   void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:productionClassification.decision.status,
