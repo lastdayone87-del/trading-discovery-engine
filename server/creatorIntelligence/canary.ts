@@ -189,4 +189,5 @@ export async function updateCreatorCanaryControl(input: { rolloutBasisPoints?: n
     await client.query(`INSERT INTO creator_search_canary_control_events(event_key,prior_configuration,resulting_configuration,reason,changed_by,policy_version) VALUES($1,$2,$3,$4,$5,$6)`, [eventKey, JSON.stringify(current), JSON.stringify(resulting), input.reason, input.actor, CREATOR_SEARCH_CANARY_POLICY_VERSION]);
     await client.query('COMMIT');
   } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
-}
+  }
+                                             
