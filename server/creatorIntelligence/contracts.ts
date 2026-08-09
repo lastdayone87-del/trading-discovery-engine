@@ -285,6 +285,7 @@ export function validateCreatorOutcome(outcome: CreatorOutcome): void {
   for (const [value, name] of [[outcome.outcomeKey, 'outcomeKey'], [outcome.actionId, 'actionId'], [outcome.objectiveKey, 'objectiveKey'], [outcome.creator.sourceAccountId, 'sourceAccountId'], [outcome.policyVersion, 'policyVersion']] as const) assertNonEmpty(value, name);
   if (outcome.contractVersion !== CREATOR_INTELLIGENCE_CONTRACT_VERSION) throw new Error('Unsupported Creator Intelligence contract version.');
   if (outcome.creator.identityConfidence === 'CONFIRMED' && !outcome.creator.canonicalCreatorId) throw new Error('Confirmed creator identity requires a canonical creator ID.');
+  if (outcome.verifiedCreatorCredit && !outcome.creator.canonicalCreatorId) throw new Error('Verified creator credit requires a canonical creator identity.');
   if (outcome.verifiedCreatorCredit && !['NEW_VERIFIED_CREATOR', 'KNOWN_VERIFIED_CREATOR'].includes(outcome.outcomeType)) throw new Error('Verified creator credit requires a verified creator outcome.');
   if (outcome.activeCreatorCredit && (!outcome.verifiedCreatorCredit || outcome.evidence.activity?.status !== 'ACTIVE')) throw new Error('Active creator credit requires verified creator credit and ACTIVE evidence.');
   if (outcome.maturity !== 'TERMINAL' && outcome.outcomeType === 'HUMAN_REJECTED') throw new Error('Human-rejected outcomes must be terminal.');
