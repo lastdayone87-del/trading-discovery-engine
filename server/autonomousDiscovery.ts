@@ -147,6 +147,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     // delays the proven query scheduler, and serving remains separately gated.
     await runPersistentResearchCycle(`autonomous-research:${process.pid}`)
       .catch(error => console.warn('[PersistentResearch] Planning cycle failed; legacy query scheduling continues:', error));
+
     const config = await getDiscoveryConfig();
     const snapshot = await getAutonomousSchedulingSnapshot();
     const now = new Date();
@@ -231,12 +232,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
           policyVersion: creatorAllocation.policyVersion,
           queryAuthority: 'QUERY_INTELLIGENCE'
         } : { status: 'LEGACY_FALLBACK', reason: 'CANARY_ALLOCATION_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
+        } : { status: 'LEGACY_FALLBACK', reason: 'CREATOR_AUTHORITY_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
       }], workerId, cooldownMinutes);
       if (created.length) {
         scheduled.push(...created);
         if (creatorAllocation?.assignmentId) await bindCreatorCanaryQueryRun({ assignmentId: creatorAllocation.assignmentId, assignmentKey: creatorAllocation.assignmentKey, queryRunId: created[0].runId, queryId: created[0].query.id, selectionStrategy: selected.selectionStrategy, boundAt: now.toISOString() })
           .catch(error => console.warn('[CreatorIntelligence] Assignment binding failed without affecting scheduled query:', error instanceof Error ? error.message : error));
-        if (research) await markResearchActionQueued(research.actionId,created[0].runId);
+        if (research) await markResearchActionQueued(research.actionId, created[0].runId);
         usedIntents.add(intent);
         usedPrimaryTerms.add(primaryTerm);
       }
