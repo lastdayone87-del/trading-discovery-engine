@@ -35,6 +35,7 @@ test('failed observations can be retried with the original payload and identity'
   const dependencies = {
     recordAssignment: async () => { attempts++; if (attempts === 1) throw new Error('transient'); return { assignmentKey: 'assignment-1' } as any; },
     recordDiagnostic: async () => 'diagnostic-1', recordGroundTruth: async () => ({ id: 'label-1' } as any)
+    recordDiagnostic: async () => 'diagnostic-1'
   };
   await assert.rejects(executePhaseBObservation(payload, key, dependencies), /transient/);
   assert.equal(await executePhaseBObservation(payload, key, dependencies), 'assignment-1');
@@ -66,6 +67,14 @@ test('human ground truth is keyed only by immutable review decision and retries 
   assert.equal(attempts, 2);
 });
 
+    recordDiagnostic: async input => { received = input.observationKey; return 'diagnostic-1'; }
+  }), 'diagnostic-1');
+  assert.equal(received, key);
+  await assert.rejects(executePhaseBObservation(payload, key, {
+    recordAssignment: async () => ({ assignmentKey: 'unused' } as any), recordDiagnostic: async () => undefined
+  }), /PRODUCTION_DIAGNOSTIC_ID_REQUIRED/);
+});
+
 test('completeness report exposes pending loss instead of silently passing', () => {
   const incomplete = buildPhaseBObservationCompleteness([
     { observation_type: 'RETRIEVAL_ASSIGNMENT', captured: 10, completed: 9, pending: 1, oldest_pending_at: '2026-08-09T00:00:00Z' },
@@ -95,6 +104,8 @@ test('migration and integration are idempotent, retryable, and observational onl
   assert.match(migration, /never read by production decision paths/);
   const groundTruthMigration = readFileSync('server/db/migrations/082_phase_b_ground_truth_reconciliation.sql', 'utf8');
   assert.match(groundTruthMigration, /UNIQUE INDEX[^]*review_decision_id/i);
+  assert.match(migration, /observation_key TEXT NOT NULL UNIQUE/);
+  assert.match(migration, /never read by production decision paths/);
   assert.match(outbox, /ON CONFLICT\(observation_key\) DO NOTHING/);
   assert.match(outbox, /STALE_PROCESSING_RECOVERED/);
   assert.match(diagnostics, /ON CONFLICT\(observation_key\).*DO NOTHING/s);
