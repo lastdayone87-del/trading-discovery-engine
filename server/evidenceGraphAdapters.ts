@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getDb } from './db';
 import type { PlaylistChannelObservation } from './youtube';
+import { FEATURED_CHANNEL_ADAPTER_POLICY_VERSION, FEATURED_CHANNEL_MAX_FANOUT, FEATURED_CHANNEL_PROVIDER_COST, featuredChannelFrontierTarget, validateFeaturedChannelPayload } from './featuredChannelAdapter';
 
 export const PLAYLIST_ADAPTER_POLICY_VERSION='playlist-adapter-v1';
 export const ACQUISITION_PAYLOAD_VERSION=1;
@@ -47,6 +48,23 @@ export async function enqueuePlaylistCanary(actionId:string,targetCountry:string
     return {queued:true,jobId:job.rows[0].id};
   }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
 }
+
+/** Phase 8 materializer entry point; dormant unless both adapter and Creator Intelligence controls approve treatment. */
+export async function enqueueFeaturedChannelCanary(actionId:string,targetCountry:string,sourceCanonicalEntityId:string):Promise<{queued:boolean;reason?:string;jobId?:string}>{
+  if(!targetCountry.trim())throw new Error('TARGET_COUNTRY_REQUIRED');
+  const db=await getDb(),client=await db.connect();
+  try{await client.query('BEGIN');const c=await client.query(`SELECT * FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_FEATURED_CHANNELS' FOR UPDATE`),authorityResult=await client.query(`SELECT * FROM creator_search_canary_control WHERE singleton=true FOR UPDATE`),control=c.rows[0],authority=authorityResult.rows[0];
+    if(!control||control.mode!=='CANARY'||control.paused||control.kill_switch)return await rollbackResult(client,'ADAPTER_DISABLED');
+    if(!authority?.enabled||authority.kill_switch||!authority.serving_authority_enabled||!authority.featured_channel_authority_enabled||Number(authority.featured_channel_rollout_basis_points)<=0)return await rollbackResult(client,'CREATOR_FEATURED_CHANNEL_AUTHORITY_DISABLED');
+    const a=await client.query(`SELECT f.*,p.program_key FROM frontier_actions f JOIN research_programs p ON p.id=f.program_id WHERE f.id=$1 AND f.action_type='INSPECT_FEATURED_CHANNELS' AND f.lifecycle='PROPOSED' AND f.normalized_target~'^channel:UC[A-Za-z0-9_-]{22}$' FOR UPDATE`,[actionId]);
+    if(!a.rowCount)return await rollbackResult(client,'ACTION_NOT_FOUND');
+    const used=await client.query(`SELECT COUNT(*)::int daily FROM jobs WHERE type='INSPECT_FEATURED_CHANNELS' AND created_at>=date_trunc('day',now() AT TIME ZONE 'UTC')`);
+    if(Number(control.consumed_quota)+FEATURED_CHANNEL_PROVIDER_COST>Number(control.total_quota_cap)||Number(used.rows[0].daily)+FEATURED_CHANNEL_PROVIDER_COST>Number(control.daily_quota_cap))return await rollbackResult(client,'ADAPTER_QUOTA_EXHAUSTED');
+    const payload=validateFeaturedChannelPayload({payloadSchemaVersion:1,actionId,programKey:a.rows[0].program_key,sourceChannelId:String(a.rows[0].normalized_target).replace(/^channel:/,''),sourceCanonicalEntityId,targetCountry:targetCountry.trim(),maximumFanout:Math.min(FEATURED_CHANNEL_MAX_FANOUT,Number(control.max_fanout)),depth:1,policyVersion:FEATURED_CHANNEL_ADAPTER_POLICY_VERSION});
+    const job=await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('INSPECT_FEATURED_CHANNELS',$1,2,3,$2) ON CONFLICT(idempotency_key) DO UPDATE SET payload=jobs.payload RETURNING id`,[JSON.stringify(payload),`featured-channels:${a.rows[0].semantic_action_key}`]);
+    await client.query(`UPDATE frontier_actions SET lifecycle='MATERIALIZED' WHERE id=$1`,[actionId]);await client.query(`UPDATE acquisition_adapter_controls SET consumed_quota=consumed_quota+$1 WHERE adapter_type='INSPECT_FEATURED_CHANNELS'`,[FEATURED_CHANNEL_PROVIDER_COST]);await client.query('COMMIT');return {queued:true,jobId:job.rows[0].id};
+  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
 async function rollbackResult(client:any,reason:string){await client.query('ROLLBACK');return {queued:false,reason};}
 
 export async function proposePlaylistInspection(input:{programKey:string;playlistId:string;sourceNodeId:string;parentActionId:string;depth:number;observedAt:string}):Promise<unknown>{
@@ -77,4 +95,10 @@ export async function configurePlaylistCanary(input:{expectedVersion:number;mode
   if(!Number.isInteger(input.expectedVersion)||input.expectedVersion<1)throw new Error('INVALID_CONFIGURATION_VERSION');
   if(input.mode==='CANARY'&&(!input.paused||!input.killSwitch)&&(!Number.isInteger(input.dailyQuotaCap)||input.dailyQuotaCap<1||input.dailyQuotaCap>10||!Number.isInteger(input.totalQuotaCap)||input.totalQuotaCap<1||input.totalQuotaCap>100))throw new Error('CANARY_CAP_OUT_OF_RANGE');
   const db=await getDb();const r=await db.query(`UPDATE acquisition_adapter_controls SET mode=$1,paused=$2,kill_switch=$3,daily_quota_cap=$4,total_quota_cap=$5,max_fanout=LEAST(10,$6),configuration_version=configuration_version+1,updated_by=$7,updated_at=now() WHERE adapter_type='INSPECT_PLAYLIST' AND configuration_version=$8 RETURNING *`,[input.mode,input.paused,input.killSwitch,input.dailyQuotaCap,input.totalQuotaCap,input.maxFanout,input.actor,input.expectedVersion]);if(!r.rowCount)throw new Error('ADAPTER_CONFIGURATION_CONFLICT');return r.rows[0];
+}
+
+export async function configureFeaturedChannelCanary(input:{expectedVersion:number;mode:'SHADOW'|'CANARY';paused:boolean;killSwitch:boolean;dailyQuotaCap:number;totalQuotaCap:number;maxFanout:number;actor:string}){
+  if(!Number.isInteger(input.expectedVersion)||input.expectedVersion<1)throw new Error('INVALID_CONFIGURATION_VERSION');
+  if(input.mode==='CANARY'&&(!input.paused||!input.killSwitch)&&(!Number.isInteger(input.dailyQuotaCap)||input.dailyQuotaCap<1||input.dailyQuotaCap>10||!Number.isInteger(input.totalQuotaCap)||input.totalQuotaCap<1||input.totalQuotaCap>100))throw new Error('CANARY_CAP_OUT_OF_RANGE');
+  const db=await getDb(),r=await db.query(`UPDATE acquisition_adapter_controls SET mode=$1,paused=$2,kill_switch=$3,daily_quota_cap=$4,total_quota_cap=$5,max_depth=1,max_fanout=LEAST($6,$7),configuration_version=configuration_version+1,updated_by=$8,updated_at=now() WHERE adapter_type='INSPECT_FEATURED_CHANNELS' AND configuration_version=$9 RETURNING *`,[input.mode,input.paused,input.killSwitch,input.dailyQuotaCap,input.totalQuotaCap,input.maxFanout,FEATURED_CHANNEL_MAX_FANOUT,input.actor,input.expectedVersion]);if(!r.rowCount)throw new Error('ADAPTER_CONFIGURATION_CONFLICT');return r.rows[0];
 }

@@ -1,0 +1,33 @@
+{
+  "kind": "youtube#channelSectionListResponse",
+  "nextPageToken": "ignored-by-bounded-adapter",
+  "items": [
+    {
+      "id": "section-uploads",
+      "snippet": { "type": "uploads", "position": 0 },
+      "contentDetails": {}
+    },
+    {
+      "id": "section-featured-b",
+      "snippet": { "type": "multipleChannels", "title": "More creators", "position": 2 },
+      "contentDetails": {
+        "channels": [
+          "UCsXVk37bltHxD1rDPwtNM8Q",
+          "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+          "malformed"
+        ]
+      }
+    },
+    {
+      "id": "section-featured-a",
+      "snippet": { "type": "multipleChannels", "title": "Featured", "position": 1 },
+      "contentDetails": {
+        "channels": [
+          "UCX6OQ3DkcsbYNE6H8uQQuVA",
+          "UCsXVk37bltHxD1rDPwtNM8Q",
+          "UC9-y-6csu5WGm29I7JiwpnA"
+        ]
+      }
+    }
+  ]
+}
