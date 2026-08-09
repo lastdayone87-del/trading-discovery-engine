@@ -12,7 +12,7 @@ import {
 } from './contracts';
 import { projectShadowCreatorOutcomes } from './shadowProjection';
 import { projectShadowCreatorProgramState } from './shadowState';
-import { reconcilePlaylistLineage } from './playlistLineageReconciler';
+import { reconcileCreatorPlaylistLineage } from './playlistLineageReconciler';
 
 export const CREATOR_READINESS_POLICY_VERSION = 'creator-readiness-shadow-v1';
 export const CREATOR_ALLOCATION_PROJECTION_VERSION = 'creator-program-allocation-shadow-v1';
@@ -197,7 +197,6 @@ export function projectCreatorGuardrails(input: {
   const stale = !latestEvidenceAt || new Date(input.observationWindow.to).getTime() - new Date(latestEvidenceAt).getTime() > (input.maximumEvidenceAgeHours ?? 48) * 3600000;
   const ess = effectiveSampleSize(windowedOutcomes);
   return CREATOR_GUARDRAIL_METRICS.map(metric => {
-    const parts = metricParts(metric, windowedOutcomes);
     const value = parts.denominator ? parts.numerator / parts.denominator : null;
     const confidence = parts.confidence ? wilson(parts.numerator, parts.denominator) : null;
     const reasons: string[] = [];
@@ -298,7 +297,7 @@ export async function projectShadowAssignmentLineage(allocationRunId: string, cu
     const sourceChecksum = creatorIntelligenceChecksum({ allocationKey: allocation.allocation_key, outcomeIds, coverageRunIds, coverageSnapshotIds, coverageChanges, expectedCount, cutoffAt });
     const lineageKey = creatorIntelligenceChecksum({ allocationKey: allocation.allocation_key, sourceChecksum, policyVersion: CREATOR_READINESS_POLICY_VERSION });
     await db.query(`INSERT INTO creator_assignment_shadow_lineage(lineage_key,allocation_id,actual_query_run_id,outcome_projection_run_id,outcome_ids,coverage_projection_run_ids,coverage_snapshot_ids,coverage_changes,expected_outcome_count,attributed_outcome_count,attribution_completeness,source_checksum,policy_version,as_of,serving_authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,false) ON CONFLICT(lineage_key) DO NOTHING`, [lineageKey, allocation.id, allocation.actual_query_run_id, outcomeRun.rows[0]?.id || null, JSON.stringify(outcomeIds), JSON.stringify(coverageRunIds), JSON.stringify(coverageSnapshotIds), JSON.stringify(coverageChanges), expectedCount, attributedCount, completeness, sourceChecksum, CREATOR_READINESS_POLICY_VERSION, cutoffAt]);
-  }
+    }
   return { records: allocations.rows.length, completeness: allocations.rowCount ? complete / allocations.rowCount : 0 };
 }
 
@@ -345,7 +344,7 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
     const allocations = await projectShadowProgramAllocations(cutoffAt);
     const lineage = await projectShadowAssignmentLineage(allocations.runId, cutoffAt);
     const guardrails = await projectShadowGuardrails(allocations.runId, from, cutoffAt);
-    const playlistLineage = await reconcilePlaylistLineage(allocations.runId, cutoffAt);
+    const playlistLineage = await reconcileCreatorPlaylistLineage(allocations.runId, cutoffAt);
     const allocationRows = await db.query(`SELECT opportunity_count,decision_count,input_checksum,output_checksum FROM creator_program_allocation_shadow_runs WHERE id=$1`, [allocations.runId]);
     const outcomeRows = await db.query(`SELECT input_count,output_count,input_checksum,output_checksum FROM creator_outcome_projection_runs WHERE id=$1`, [outcomes.projectionRunId]);
     const replayVariants = await db.query(`SELECT COUNT(DISTINCT output_checksum)::int count FROM creator_program_allocation_shadow_runs WHERE cutoff_at=$1 AND projection_version=$2`, [cutoffAt, CREATOR_ALLOCATION_PROJECTION_VERSION]);
@@ -369,4 +368,4 @@ export async function runCreatorReadinessShadow(cutoffAt: string, windowDays = 3
     await db.query(`INSERT INTO creator_readiness_shadow_events(event_key,cutoff_at,event_type,result,reason_codes,detail,policy_version,serving_authority) VALUES($1,$2,'RUN_ABSTAINED','ABSTAIN',$3,$4,$5,false) ON CONFLICT(event_key) DO NOTHING`, [creatorIntelligenceChecksum({ readinessKey: record.readinessKey, event: 'RUN_ABSTAINED' }), cutoffAt, JSON.stringify([...record.reasonCodes, 'OPERATIONAL_SHADOW_FAILURE']), JSON.stringify({ error: message }), CREATOR_READINESS_POLICY_VERSION]);
     return record;
   }
-                   }
+}
