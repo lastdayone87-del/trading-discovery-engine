@@ -1,0 +1,165 @@
+name: Discover Admission V2 sealed datasets (temporary)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Read-only dataset discovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Find qualifying sealed dataset UUIDs
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          test -n "$DATABASE_URL"
+          node --import tsx --input-type=module <<'NODE'
+          import pg from 'pg';
+          import {
+            CREATOR_FOCUS_CLASSIFIER_VERSION,
+            CREATOR_FOCUS_POLICY_VERSION
+          } from './server/evidenceEngine/classifierV4.ts';
+          import { EVIDENCE_COVERAGE_POLICY_VERSION } from './server/evidenceEngine/coverage.ts';
+
+          const requiredTables = [
+            'decision_evaluation_datasets',
+            'decision_evaluation_examples',
+            'creator_focus_classification_snapshots',
+            'evidence_coverage_snapshots'
+          ];
+          const pool = new pg.Pool({
+            connectionString: process.env.DATABASE_URL,
+            max: 1,
+            connectionTimeoutMillis: 15_000,
+            ssl: process.env.PGSSL === 'disable' ? false : { rejectUnauthorized: false }
+          });
+          const db = await pool.connect();
+
+          try {
+            await db.query('BEGIN TRANSACTION READ ONLY');
+            const session = await db.query(
+              "SELECT current_setting('transaction_read_only') AS read_only"
+            );
+            if (session.rows[0]?.read_only !== 'on') {
+              throw new Error('READ_ONLY_TRANSACTION_REQUIRED');
+            }
+
+            const catalog = await db.query(
+              `SELECT table_name
+                 FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ANY($1::text[])`,
+              [requiredTables]
+            );
+            const found = new Set(catalog.rows.map(row => row.table_name));
+            const missing = requiredTables.filter(table => !found.has(table));
+            if (missing.length) {
+              console.log('No qualifying Admission V2 dataset UUIDs found.');
+              console.log(`Missing required tables: ${missing.join(', ')}`);
+            } else {
+              const result = await db.query(
+                `WITH test_examples AS (
+                   SELECT d.id AS dataset_uuid,d.dataset_key,d.version,d.cutoff_at,
+                          d.checksum,e.example_key,e.ground_truth_label,
+                          e.production_status,e.inclusion_probability,
+                          e.decision_diagnostic_id
+                     FROM decision_evaluation_datasets d
+                     JOIN decision_evaluation_examples e ON e.dataset_id=d.id
+                    WHERE d.status='SEALED' AND e.split='TEST'
+                 ), paired AS (
+                   SELECT t.*,
+                          focus.id AS focus_id,
+                          coverage.id AS coverage_id
+                     FROM test_examples t
+                     LEFT JOIN LATERAL (
+                       SELECT f.id
+                         FROM creator_focus_classification_snapshots f
+                        WHERE f.classification_diagnostic_id=t.decision_diagnostic_id
+                          AND f.observed_at<=t.cutoff_at
+                          AND f.classifier_version=$1
+                          AND f.policy_version=$2
+                        ORDER BY f.observed_at DESC,f.id DESC LIMIT 1
+                     ) focus ON true
+                     LEFT JOIN LATERAL (
+                       SELECT c.id
+                         FROM evidence_coverage_snapshots c
+                        WHERE c.classification_diagnostic_id=t.decision_diagnostic_id
+                          AND c.observed_at<=t.cutoff_at
+                          AND c.policy_version=$3
+                        ORDER BY c.observed_at DESC,c.id DESC LIMIT 1
+                     ) coverage ON true
+                 ), summarized AS (
+                   SELECT dataset_uuid,dataset_key,version,cutoff_at,checksum,
+                          count(*) AS test_examples,
+                          count(*) FILTER(WHERE focus_id IS NOT NULL AND coverage_id IS NOT NULL) AS eligible_examples,
+                          count(*) FILTER(WHERE focus_id IS NULL) AS missing_focus,
+                          count(*) FILTER(WHERE coverage_id IS NULL) AS missing_coverage,
+                          power(sum(1.0/inclusion_probability) FILTER(
+                            WHERE focus_id IS NOT NULL AND coverage_id IS NOT NULL
+                              AND ground_truth_label='TRADING_CONFIRMED'),2)
+                            / NULLIF(sum(power(1.0/inclusion_probability,2)) FILTER(
+                            WHERE focus_id IS NOT NULL AND coverage_id IS NOT NULL
+                              AND ground_truth_label='TRADING_CONFIRMED'),0) AS genuine_ess,
+                          power(sum(1.0/inclusion_probability) FILTER(
+                            WHERE focus_id IS NOT NULL AND coverage_id IS NOT NULL
+                              AND ground_truth_label='NON_TRADING'
+                              AND production_status NOT IN('NON_TRADING','HUMAN_REJECTED')),2)
+                            / NULLIF(sum(power(1.0/inclusion_probability,2)) FILTER(
+                            WHERE focus_id IS NOT NULL AND coverage_id IS NOT NULL
+                              AND ground_truth_label='NON_TRADING'
+                              AND production_status NOT IN('NON_TRADING','HUMAN_REJECTED')),0) AS baseline_false_positive_ess
+                     FROM paired
+                    GROUP BY dataset_uuid,dataset_key,version,cutoff_at,checksum
+                 )
+                 SELECT dataset_uuid,dataset_key,version,cutoff_at,checksum,
+                        test_examples,eligible_examples,missing_focus,missing_coverage,
+                        eligible_examples::double precision/NULLIF(test_examples,0) AS evidence_eligibility,
+                        genuine_ess,baseline_false_positive_ess
+                   FROM summarized
+                  WHERE eligible_examples::double precision/NULLIF(test_examples,0)>=0.9
+                    AND genuine_ess>=30
+                    AND baseline_false_positive_ess>=30
+                  ORDER BY cutoff_at DESC,dataset_uuid`,
+                [
+                  CREATOR_FOCUS_CLASSIFIER_VERSION,
+                  CREATOR_FOCUS_POLICY_VERSION,
+                  EVIDENCE_COVERAGE_POLICY_VERSION
+                ]
+              );
+
+              if (!result.rowCount) {
+                console.log('No qualifying Admission V2 dataset UUIDs found.');
+              } else {
+                console.log('Qualifying Admission V2 dataset UUIDs:');
+                for (const row of result.rows) {
+                  console.log(row.dataset_uuid);
+                }
+              }
+            }
+
+            await db.query('ROLLBACK');
+          } catch (error) {
+            await db.query('ROLLBACK').catch(() => undefined);
+            throw error;
+          } finally {
+            db.release();
+            await pool.end();
+          }
+          NODE
