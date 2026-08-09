@@ -55,6 +55,7 @@ test('scheduler preserves Query Intelligence selection and existing quota accoun
   const scheduler = readFileSync(new URL('../autonomousDiscovery.ts', import.meta.url), 'utf8');
   const db = readFileSync(new URL('../db.ts', import.meta.url), 'utf8');
   assert.ok(scheduler.indexOf('allocateCreatorSearchAuthority') < scheduler.indexOf('selectNextQueryForCountry(country)'));
+  assert.ok(scheduler.indexOf('allocateCreatorSearchCanary') < scheduler.indexOf('selectNextQueryForCountry(country)'));
   assert.match(scheduler, /await selectNextQueryForCountry\(country\)/); assert.match(scheduler, /CANARY_ALLOCATION_UNAVAILABLE/);
   assert.match(db, /quota_reserved,metadata[^]*VALUES\(\$1,\$2,'automated_query',\$3,\$4,\$5,\$6,100,\$7\)/);
   assert.doesNotMatch(readFileSync(new URL('./canary.ts', import.meta.url), 'utf8'), /INSERT INTO jobs|INSERT INTO quota_reservations|searchYouTube|allocateRetrievalLane|allocateSearchOrdering/);
@@ -62,6 +63,6 @@ test('scheduler preserves Query Intelligence selection and existing quota accoun
 
 test('rollback control is auditable and supports kill switch or zero rollout', () => {
   const source = readFileSync(new URL('./canary.ts', import.meta.url), 'utf8');
-  assert.match(source, /updateCreatorCanaryControl/); assert.match(source, /rollout_basis_points=\$1,playlist_rollout_basis_points=\$2,featured_channel_rollout_basis_points=\$3/); assert.match(source, /creator_search_canary_control_events/);
-  assert.match(source, /!enabled \|\| killSwitch \|\| !requestedAuthority \|\| rollout === 0 \? false/);
+  assert.match(source, /updateCreatorCanaryControl/); assert.match(source, /rollout_basis_points=\$1,kill_switch=\$2/); assert.match(source, /creator_search_canary_control_events/);
+  assert.match(source, /!enabled \|\| killSwitch \|\| rollout === 0 \? false/);
 });
