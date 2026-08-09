@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 import pg from 'pg';
 import { getDb } from './db';
 import { recordProductionClassification, type ProductionClassificationDiagnosticInput } from './classificationDiagnostics';
+import { recordEvaluationGroundTruth, recordRetrievalEvaluationAssignment, type EvaluationGroundTruthInput, type SamplingPolicy } from './decisionEvaluation';
+
+export const PHASE_B_OBSERVATION_OUTBOX_VERSION = 'phase-b-observation-outbox-v1';
+export type PhaseBObservationType = 'RETRIEVAL_ASSIGNMENT' | 'PRODUCTION_DIAGNOSTIC' | 'GROUND_TRUTH_LABEL';
 import { recordRetrievalEvaluationAssignment, type SamplingPolicy } from './decisionEvaluation';
 
 export const PHASE_B_OBSERVATION_OUTBOX_VERSION = 'phase-b-observation-outbox-v1';
@@ -18,11 +22,18 @@ export interface ProductionDiagnosticPayload {
   input: ProductionClassificationDiagnosticInput;
 }
 
+export interface GroundTruthLabelPayload {
+  type: 'GROUND_TRUTH_LABEL';
+  input: EvaluationGroundTruthInput & { reviewDecisionId: string; provenance: 'HUMAN_REVIEW' };
+}
+
+export type PhaseBObservationPayload = RetrievalAssignmentPayload | ProductionDiagnosticPayload | GroundTruthLabelPayload;
 export type PhaseBObservationPayload = RetrievalAssignmentPayload | ProductionDiagnosticPayload;
 
 export interface PhaseBObservationProcessorDependencies {
   recordAssignment: typeof recordRetrievalEvaluationAssignment;
   recordDiagnostic: typeof recordProductionClassification;
+  recordGroundTruth: typeof recordEvaluationGroundTruth;
 }
 
 const stable = (value: unknown): string => JSON.stringify(value, (_key, item) =>
@@ -38,6 +49,11 @@ export function retrievalAssignmentObservationKey(payload: RetrievalAssignmentPa
 
 export function productionDiagnosticObservationKey(payload: ProductionDiagnosticPayload): string {
   return `phase-b:diagnostic:${hash({ version: PHASE_B_OBSERVATION_OUTBOX_VERSION, ...payload })}`;
+}
+
+export function groundTruthLabelObservationKey(reviewDecisionId: string): string {
+  if (!reviewDecisionId.trim()) throw new Error('REVIEW_DECISION_ID_REQUIRED');
+  return `phase-b:ground-truth:${reviewDecisionId}`;
 }
 
 async function captureObservation(observationKey: string, channelId: string, payload: PhaseBObservationPayload): Promise<void> {
@@ -95,12 +111,21 @@ async function processObservation(observationKey: string): Promise<string | unde
 export async function executePhaseBObservation(
   payload: PhaseBObservationPayload,
   observationKey: string,
+  dependencies: PhaseBObservationProcessorDependencies = { recordAssignment: recordRetrievalEvaluationAssignment, recordDiagnostic: recordProductionClassification, recordGroundTruth: recordEvaluationGroundTruth }
   dependencies: PhaseBObservationProcessorDependencies = { recordAssignment: recordRetrievalEvaluationAssignment, recordDiagnostic: recordProductionClassification }
 ): Promise<string> {
   if (payload.type === 'RETRIEVAL_ASSIGNMENT') {
     const assignment = await dependencies.recordAssignment(payload.input, payload.policy);
     return assignment.assignmentKey;
   }
+  if (payload.type === 'PRODUCTION_DIAGNOSTIC') {
+    const diagnosticId = await dependencies.recordDiagnostic({ ...payload.input, observationKey });
+    if (!diagnosticId) throw new Error('PRODUCTION_DIAGNOSTIC_ID_REQUIRED');
+    return diagnosticId;
+  }
+  const label = await dependencies.recordGroundTruth(payload.input);
+  if (!label?.id) throw new Error('GROUND_TRUTH_LABEL_ID_REQUIRED');
+  return String(label.id);
   const diagnosticId = await dependencies.recordDiagnostic({ ...payload.input, observationKey });
   if (!diagnosticId) throw new Error('PRODUCTION_DIAGNOSTIC_ID_REQUIRED');
   return diagnosticId;
@@ -116,6 +141,33 @@ export async function observeProductionDiagnosticReliably(payload: ProductionDia
   const observationKey = productionDiagnosticObservationKey(payload);
   await captureObservation(observationKey, payload.input.channelId, payload);
   return processObservation(observationKey);
+}
+
+export async function observeGroundTruthLabelReliably(payload: GroundTruthLabelPayload): Promise<string | undefined> {
+  const observationKey = groundTruthLabelObservationKey(payload.input.reviewDecisionId);
+  await captureObservation(observationKey, payload.input.channelId, payload);
+  return processObservation(observationKey);
+}
+
+export async function reconcileMissingGroundTruthObservations(limit = 25): Promise<{ discovered: number; completed: number; failed: number }> {
+  const db = await getDb(), bounded = Math.min(100, Math.max(1, Math.trunc(limit)));
+  const missing = await db.query(
+    `SELECT d.id,d.channel_id,d.decision,d.evidence_snapshot
+       FROM channel_review_decisions d
+       LEFT JOIN evaluation_ground_truth_labels l ON l.review_decision_id=d.id
+       LEFT JOIN phase_b_observation_outbox o ON o.observation_key='phase-b:ground-truth:'||d.id::text
+      WHERE d.decision IN('APPROVE','REJECT') AND l.id IS NULL AND o.id IS NULL
+      ORDER BY d.decided_at,d.id LIMIT $1`,
+    [bounded]
+  );
+  let completed = 0, failed = 0;
+  for (const row of missing.rows) {
+    try {
+      await observeGroundTruthLabelReliably({ type: 'GROUND_TRUTH_LABEL', input: { channelId: String(row.channel_id), reviewDecisionId: String(row.id), label: row.decision === 'APPROVE' ? 'TRADING_CONFIRMED' : 'NON_TRADING', provenance: 'HUMAN_REVIEW', evidenceSnapshot: row.evidence_snapshot || {} } });
+      completed++;
+    } catch { failed++; }
+  }
+  return { discovered: missing.rowCount || 0, completed, failed };
 }
 
 export async function reconcilePendingPhaseBObservations(limit = 25): Promise<{ attempted: number; completed: number; failed: number }> {
@@ -137,6 +189,7 @@ let reconciliationInFlight = false;
 export function triggerPhaseBObservationReconciliation(limit = 25): boolean {
   if (reconciliationInFlight) return false;
   reconciliationInFlight = true;
+  void reconcileMissingGroundTruthObservations(limit).then(() => reconcilePendingPhaseBObservations(limit))
   void reconcilePendingPhaseBObservations(limit)
     .catch(error => console.warn('[PhaseB] Observation reconciliation failed:', error instanceof Error ? error.message : error))
     .finally(() => { reconciliationInFlight = false; });
@@ -147,6 +200,16 @@ export interface PhaseBObservationCompletenessReport {
   version: string;
   servingAuthority: false;
   totals: Record<PhaseBObservationType, { captured: number; completed: number; pending: number; missingResultReferences: number; oldestPendingAt?: string }>;
+  groundTruthReviews: { eligible: number; labeled: number; unreconciled: number };
+  complete: boolean;
+}
+
+export function buildPhaseBObservationCompleteness(rows: Array<{ observation_type: PhaseBObservationType; captured: number | string; completed: number | string; pending: number | string; missing_result_references?: number | string; oldest_pending_at?: string | Date | null }>, groundTruthReviews: { eligible: number; labeled: number; unreconciled: number } = { eligible: 0, labeled: 0, unreconciled: 0 }): PhaseBObservationCompletenessReport {
+  const totals = Object.fromEntries((['RETRIEVAL_ASSIGNMENT', 'PRODUCTION_DIAGNOSTIC', 'GROUND_TRUTH_LABEL'] as PhaseBObservationType[]).map(type => {
+    const row = rows.find(item => item.observation_type === type);
+    return [type, { captured: Number(row?.captured || 0), completed: Number(row?.completed || 0), pending: Number(row?.pending || 0), missingResultReferences: Number(row?.missing_result_references || 0), ...(row?.oldest_pending_at ? { oldestPendingAt: new Date(row.oldest_pending_at).toISOString() } : {}) }];
+  })) as PhaseBObservationCompletenessReport['totals'];
+  return { version: PHASE_B_OBSERVATION_OUTBOX_VERSION, servingAuthority: false, totals, groundTruthReviews, complete: groundTruthReviews.unreconciled === 0 && Object.values(totals).every(item => item.pending === 0 && item.missingResultReferences === 0 && item.captured === item.completed) };
   complete: boolean;
 }
 
@@ -167,11 +230,17 @@ export async function inspectPhaseBObservationCompleteness(): Promise<PhaseBObse
     const result = await db.query(
       `SELECT o.observation_type,count(*)::int captured,count(*) FILTER(WHERE o.status='COMPLETED')::int completed,
             count(*) FILTER(WHERE status<>'COMPLETED')::int pending,
+            count(*) FILTER(WHERE o.status='COMPLETED' AND ((o.observation_type='RETRIEVAL_ASSIGNMENT' AND a.id IS NULL) OR (o.observation_type='PRODUCTION_DIAGNOSTIC' AND d.id IS NULL) OR (o.observation_type='GROUND_TRUTH_LABEL' AND l.id IS NULL)))::int missing_result_references,
             count(*) FILTER(WHERE o.status='COMPLETED' AND ((o.observation_type='RETRIEVAL_ASSIGNMENT' AND a.id IS NULL) OR (o.observation_type='PRODUCTION_DIAGNOSTIC' AND d.id IS NULL)))::int missing_result_references,
             min(o.created_at) FILTER(WHERE o.status<>'COMPLETED') oldest_pending_at
        FROM phase_b_observation_outbox o
        LEFT JOIN evaluation_cohort_assignments a ON o.observation_type='RETRIEVAL_ASSIGNMENT' AND a.assignment_key=o.result_reference
        LEFT JOIN production_classification_diagnostics d ON o.observation_type='PRODUCTION_DIAGNOSTIC' AND d.id::text=o.result_reference
+       LEFT JOIN evaluation_ground_truth_labels l ON o.observation_type='GROUND_TRUTH_LABEL' AND l.id::text=o.result_reference
+       GROUP BY o.observation_type ORDER BY o.observation_type`
+    );
+    const reviewCoverage = await db.query(`SELECT count(*)::int eligible,count(l.id)::int labeled,count(*) FILTER(WHERE l.id IS NULL)::int unreconciled FROM channel_review_decisions d LEFT JOIN evaluation_ground_truth_labels l ON l.review_decision_id=d.id WHERE d.decision IN('APPROVE','REJECT')`);
+    const report = buildPhaseBObservationCompleteness(result.rows, { eligible: Number(reviewCoverage.rows[0]?.eligible || 0), labeled: Number(reviewCoverage.rows[0]?.labeled || 0), unreconciled: Number(reviewCoverage.rows[0]?.unreconciled || 0) });
        GROUP BY o.observation_type ORDER BY o.observation_type`
     );
     const report = buildPhaseBObservationCompleteness(result.rows);
