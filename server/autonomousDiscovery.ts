@@ -20,7 +20,6 @@ import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
-import { allocateCreatorSearchCanary, bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -148,6 +147,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     // delays the proven query scheduler, and serving remains separately gated.
     await runPersistentResearchCycle(`autonomous-research:${process.pid}`)
       .catch(error => console.warn('[PersistentResearch] Planning cycle failed; legacy query scheduling continues:', error));
+
     const config = await getDiscoveryConfig();
     const snapshot = await getAutonomousSchedulingSnapshot();
     const now = new Date();
@@ -205,12 +205,6 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         country = authority.country;
       } catch (error) {
         console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
-      const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country, attempt: attempts });
-      let creatorAllocation: CreatorCanaryAssignment | undefined;
-      try {
-        creatorAllocation = await allocateCreatorSearchCanary({ opportunityKey, country, assignedAt: now.toISOString(), estimatedQuotaUnits: 100 });
-      } catch (error) {
-        console.warn('[CreatorIntelligence] Canary allocation unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       }
       const research = await getAllocatedResearchQuery(country);
       const selected = research ? {
@@ -237,13 +231,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
           treatmentPropensityBasisPoints: creatorAllocation.treatmentPropensityBasisPoints,
           policyVersion: creatorAllocation.policyVersion,
           queryAuthority: 'QUERY_INTELLIGENCE'
-        } : { status: 'LEGACY_FALLBACK', reason: 'CANARY_ALLOCATION_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
+        } : { status: 'LEGACY_FALLBACK', reason: 'CREATOR_AUTHORITY_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
       }], workerId, cooldownMinutes);
       if (created.length) {
         scheduled.push(...created);
         if (creatorAllocation?.assignmentId) await bindCreatorCanaryQueryRun({ assignmentId: creatorAllocation.assignmentId, assignmentKey: creatorAllocation.assignmentKey, queryRunId: created[0].runId, queryId: created[0].query.id, selectionStrategy: selected.selectionStrategy, boundAt: now.toISOString() })
           .catch(error => console.warn('[CreatorIntelligence] Assignment binding failed without affecting scheduled query:', error instanceof Error ? error.message : error));
-        if (research) await markResearchActionQueued(research.actionId,created[0].runId);
+        if (research) await markResearchActionQueued(research.actionId, created[0].runId);
         usedIntents.add(intent);
         usedPrimaryTerms.add(primaryTerm);
       }
