@@ -29,6 +29,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Materialize Stage 0 evaluator from chunked payload
+        run: |
+          set -euo pipefail
+          cat scripts/stage0_module.b64.part* | tr -d '\n' | base64 -d > server/candidateAdmission/stage0OperatorVisible.ts
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path("server/candidateAdmission/stage0OperatorVisible.ts").read_text()
+          assert "evaluateOfflineAdmissionV2" in text
+          assert "BEGIN TRANSACTION READ ONLY" in text
+          assert "PLACEHOLDER" not in text
+          print("materialized bytes", Path("server/candidateAdmission/stage0OperatorVisible.ts").stat().st_size)
+          PY
+
       - name: Run Stage 0 operator-visible counterfactual
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -37,7 +50,6 @@ jobs:
           test -n "$DATABASE_URL"
           mkdir -p stage0-output
           npm run stage0:operator-visible > stage0-output/stage0-console.json
-          # Ensure artifact file exists even if console redirect differed
           test -f stage0-output/stage0-operator-visible-counterfactual.json
 
       - name: Upload Stage 0 report
