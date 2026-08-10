@@ -12,6 +12,7 @@ on:
           - persisted
           - assertion-replay
           - evidence-diagnosis
+          - gemini-failure-diagnosis
 
 permissions:
   contents: read
@@ -52,6 +53,10 @@ jobs:
             FILE=scripts/diagnoseStage0EvidenceGeneration.ts
             grep -q 'providerCallsPerformed: false' "$FILE"
             grep -q 'provider_availability' "$FILE"
+          elif [ "$EVIDENCE_MODE" = "gemini-failure-diagnosis" ]; then
+            FILE=scripts/diagnoseGeminiProviderFailure.ts
+            grep -q 'providerCallsPerformed: false' "$FILE"
+            grep -q 'provider_call_events' "$FILE"
           else
             FILE=server/candidateAdmission/stage0OperatorVisible.ts
             grep -q 'evaluateOfflineAdmissionV2' "$FILE"
@@ -76,6 +81,9 @@ jobs:
           elif [ "$EVIDENCE_MODE" = "evidence-diagnosis" ]; then
             npx tsx scripts/diagnoseStage0EvidenceGeneration.ts > stage0-output/stage0-console.json
             REPORT=stage0-output/stage0-evidence-generation-diagnosis.json
+          elif [ "$EVIDENCE_MODE" = "gemini-failure-diagnosis" ]; then
+            npx tsx scripts/diagnoseGeminiProviderFailure.ts > stage0-output/stage0-console.json
+            REPORT=stage0-output/gemini-provider-failure-diagnosis.json
           else
             npm run stage0:operator-visible > stage0-output/stage0-console.json
             REPORT=stage0-output/stage0-operator-visible-counterfactual.json
@@ -90,10 +98,11 @@ jobs:
           if report.get('evidenceMode') == 'ASSERTION_REPLAY':
               assert report.get('historicalReplay') is True
               assert report.get('persisted') is False
-          if report.get('reportType') == 'STAGE0_EVIDENCE_GENERATION_DIAGNOSIS':
+          if report.get('reportType') in ('STAGE0_EVIDENCE_GENERATION_DIAGNOSIS', 'GEMINI_PROVIDER_FAILURE_DIAGNOSIS'):
               assert report.get('providerCallsPerformed') is False
           print('reportType', report.get('reportType', 'PERSISTED_STAGE0'))
           print('totals', report.get('totals'))
+          print('providerCallEventSummary', report.get('providerCallEventSummary'))
           PY
 
       - name: Upload Stage 0 report
