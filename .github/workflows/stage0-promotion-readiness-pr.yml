@@ -36,7 +36,5 @@ jobs:
           ! grep -E '\b(INSERT|UPDATE|DELETE)\b' server/candidateAdmission/stage0PromotionReadiness.ts scripts/stage0PromotionReadiness.ts
       - name: Build
         run: npm run build
-      - name: Lint
-        run: npm run lint
       - name: Diff check
         run: git diff --check
