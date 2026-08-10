@@ -1,83 +1,106 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateClassificationStages } from './stagedClassification';
-import { evaluateUnifiedDecisionPolicy } from './decisionPolicy';
+import { evaluateUnifiedDecisionPolicy, SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE } from './decisionPolicy';
+import { calibrateSemanticConfidence, SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 import type { EvidenceCollectionReport, EvidenceItem } from './types';
 
-function semanticUnrelated(calibratedConfidence = 92): EvidenceItem {
+function semanticUnrelated(rawConfidence = 96, fields: any[] = [{ field: 'channel_bio', sourceId: 'about' }], taxonomyLabel = 'UNRELATED'): EvidenceItem {
+  const calibratedConfidence = calibrateSemanticConfidence(rawConfidence);
+  const rawWeight = 26;
   return {
     id: 'semantic-unrelated',
     source: 'gemini_semantic',
     polarity: 'NEGATIVE',
-    category: 'IRRELEVANT_DOMAIN',
-    fact: 'Creator is a sports podcast unrelated to trading.',
-    rawMatches: ['sports', 'podcast'],
-    confidence: 96,
+    category: taxonomyLabel === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT',
+    fact: 'Multilingual semantic evidence [UNRELATED]: The content is a sports and entertainment podcast with no financial or trading focus.',
+    rawMatches: ['sports podcast', 'entertainment', 'NFL history'],
+    confidence: calibratedConfidence,
     reliability: 'MEDIUM',
     reliabilityMultiplier: 0.65,
-    rawWeight: 26,
-    finalWeight: -14.2,
+    rawWeight,
+    finalWeight: -(rawWeight * 0.65 * (calibratedConfidence / 100)),
     timestamp: new Date(0).toISOString(),
     provenance: {
       provider: 'gemini_semantic',
-      type: 'structured-semantic',
-      matchedTerm: 'sports',
-      sourceRef: 'channel_bio',
-      fields: [{ field: 'channel_bio', sourceId: 'about' }],
+      type: taxonomyLabel === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT',
+      matchedTerm: 'sports podcast, entertainment, NFL history',
+      sourceRef: 'structured-semantic:gemini-3.6-flash',
+      fields,
       semantic: {
         modelVersion: 'gemini-3.6-flash',
-        promptVersion: 'test',
-        featureVersion: 'test',
-        calibrationVersion: 'test',
-        taxonomyLabel: 'UNRELATED',
-        rawConfidence: 96,
+        promptVersion: 'priority2-multilingual-structured-1',
+        featureVersion: 'field-aware-evidence-1',
+        calibrationVersion: 'multilingual-semantic-calibration-bootstrap-1',
+        taxonomyLabel,
+        rawConfidence,
         calibratedConfidence,
         detectedLanguages: [],
         reasonCodes: ['CREATOR_FOCUS_UNRELATED']
       }
     }
+  } as EvidenceItem;
+}
+
+function makeCollection(status: 'SUFFICIENT' | 'INSUFFICIENT' = 'SUFFICIENT'): EvidenceCollectionReport {
+  return {
+    sufficiency: 'SUFFICIENT',
+    sparseMetadata: false,
+    degraded: false,
+    fieldsPresent: ['description', 'video_titles'],
+    reasonCodes: [],
+    providers: [{ provider: 'gemini_semantic', availability: 'AVAILABLE', evidenceCount: 1, outcome: 'EXECUTED_WITH_EVIDENCE', reasonCodes: ['PROVIDER_EVIDENCE_EMITTED'] }],
+    terminalNegativeSufficiency: {
+      status,
+      creatorLevelCoverage: status === 'SUFFICIENT',
+      independentSourceFamilies: 0,
+      independentObservations: 1,
+      reasonCodes: status === 'SUFFICIENT' ? ['CREATOR_LEVEL_NEGATIVE_COVERAGE'] : ['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT']
+    }
   };
 }
 
-const collection: EvidenceCollectionReport = {
-  sufficiency: 'SUFFICIENT',
-  sparseMetadata: false,
-  degraded: false,
-  fieldsPresent: ['description'],
-  reasonCodes: [],
-  providers: [{ provider: 'gemini_semantic', availability: 'AVAILABLE', evidenceCount: 1, outcome: 'EXECUTED_WITH_EVIDENCE', reasonCodes: ['PROVIDER_EVIDENCE_EMITTED'] }],
-  terminalNegativeSufficiency: {
-    status: 'SUFFICIENT',
-    creatorLevelCoverage: true,
-    independentSourceFamilies: 0,
-    independentObservations: 1,
-    reasonCodes: ['CREATOR_LEVEL_NEGATIVE_COVERAGE']
-  }
+const input = {
+  channel_name: 'Games With Names',
+  description: 'Games With Names is a sports and entertainment podcast focused on NFL history, wrestling, classic games, and interviews with athletes.'
 };
 
-const input = { channel_name: 'Games With Names', description: 'A sports podcast focused on football history and athletes.' };
-
-test('high-confidence creator-level UNRELATED can become NON_TRADING below the global negative-weight threshold', () => {
-  const evidence = [semanticUnrelated(92)];
+function decide(evidence: EvidenceItem[], collection = makeCollection()) {
   const stages = evaluateClassificationStages(input, evidence, collection);
-  assert.equal(stages.lifecycleAction, 'REJECT');
+  return {
+    stages,
+    decision: evaluateUnifiedDecisionPolicy({
+      evidence,
+      collection,
+      lifecycleAction: stages.lifecycleAction,
+      minimumPositiveWeight: 25,
+      minimumTradingScore: 68
+    })
+  };
+}
 
-  const decision = evaluateUnifiedDecisionPolicy({
-    evidence,
-    collection,
-    lifecycleAction: stages.lifecycleAction,
-    minimumPositiveWeight: 25,
-    minimumTradingScore: 68
-  });
+test('terminal floor matches the highest confidence tier the production calibration can emit', () => {
+  assert.equal(calibrateSemanticConfidence(100), 84);
+  assert.equal(SEMANTIC_TOP_CALIBRATED_CONFIDENCE, 84);
+  assert.equal(SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE, SEMANTIC_TOP_CALIBRATED_CONFIDENCE);
+});
+
+test('production-shaped Games With Names evidence becomes NON_TRADING below the global negative-weight threshold', () => {
+  const evidence = [semanticUnrelated(96)];
+  assert.equal(evidence[0].confidence, 84);
+  assert.ok(Math.abs(evidence[0].finalWeight + 14.196) < 0.001);
+
+  const { stages, decision } = decide(evidence);
+  assert.equal(stages.lifecycleAction, 'REJECT');
   assert.equal(decision.status, 'NON_TRADING');
   assert.ok(decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 });
 
-test('semantic UNRELATED below the confidence floor remains UNCERTAIN even when stages route REJECT', () => {
-  const evidence = [semanticUnrelated(84)];
-  const stages = evaluateClassificationStages(input, evidence, collection);
+test('semantic UNRELATED below the top calibrated confidence tier remains UNCERTAIN', () => {
+  const evidence = [semanticUnrelated(88)];
+  assert.equal(evidence[0].confidence, 75);
+  const { stages, decision } = decide(evidence);
   assert.equal(stages.lifecycleAction, 'REJECT');
-  const decision = evaluateUnifiedDecisionPolicy({ evidence, collection, lifecycleAction: stages.lifecycleAction, minimumPositiveWeight: 25, minimumTradingScore: 68 });
   assert.equal(decision.status, 'UNCERTAIN');
   assert.ok(decision.reasonCodes.includes('SCORE_BOUNDARY_NOT_SATISFIED'));
 });
@@ -88,9 +111,33 @@ test('substantive positive trading evidence blocks the semantic shortcut', () =>
     reliability: 'HIGH', reliabilityMultiplier: 0.8, rawWeight: 10, finalWeight: 6.4, timestamp: new Date(0).toISOString(),
     provenance: { provider: 'channel_metadata', type: 'metadata', matchedTerm: 'futures', sourceRef: 'channel_bio', fields: [{ field: 'channel_bio', sourceId: 'about' }] }
   };
-  const evidence = [semanticUnrelated(92), positive];
-  const stages = evaluateClassificationStages(input, evidence, collection);
-  const decision = evaluateUnifiedDecisionPolicy({ evidence, collection, lifecycleAction: stages.lifecycleAction, minimumPositiveWeight: 25, minimumTradingScore: 68 });
+  const { decision } = decide([semanticUnrelated(96), positive]);
   assert.equal(decision.status, 'UNCERTAIN');
   assert.ok(!decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
+});
+
+test('semantic evidence without creator-level attribution cannot use the shortcut', () => {
+  const { decision } = decide([semanticUnrelated(96, [{ field: 'video_title', sourceId: 'video-1' }])]);
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('taxonomy other than UNRELATED cannot use the shortcut', () => {
+  const { decision } = decide([semanticUnrelated(96, [{ field: 'channel_bio', sourceId: 'about' }], 'PERSONAL_FINANCE')]);
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('insufficient terminal-negative coverage cannot use the shortcut', () => {
+  const collection = makeCollection('INSUFFICIENT');
+  const { decision } = decide([semanticUnrelated(96)], collection);
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('ordinary negative evidence below -25 remains UNCERTAIN without semantic terminal conditions', () => {
+  const evidence: EvidenceItem[] = [{
+    id: 'ordinary-negative', source: 'channel_metadata', polarity: 'NEGATIVE', category: 'IRRELEVANT_DOMAIN', fact: 'Non-trading hint', rawMatches: ['sports'], confidence: 90,
+    reliability: 'MEDIUM', reliabilityMultiplier: 0.65, rawWeight: 20, finalWeight: -14.2, timestamp: new Date(0).toISOString(),
+    provenance: { provider: 'channel_metadata', type: 'metadata', matchedTerm: 'sports', sourceRef: 'channel_bio', fields: [{ field: 'channel_bio', sourceId: 'about' }] }
+  }];
+  const { decision } = decide(evidence);
+  assert.equal(decision.status, 'UNCERTAIN');
 });
