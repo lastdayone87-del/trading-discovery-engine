@@ -1,0 +1,35 @@
+name: Phase B Assertion Replay PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/candidateAdmission/stage0AssertionReplay.ts'
+      - 'server/candidateAdmission/stage0AssertionReplay.test.ts'
+      - 'server/candidateAdmission/stage0OperatorVisibleAssertionReplay.ts'
+      - 'server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts'
+      - 'scripts/stage0OperatorVisibleAssertionReplay.ts'
+      - 'package.json'
+      - '.github/workflows/stage0-operator-visible-counterfactual.yml'
+      - '.github/workflows/phaseb-assertion-replay-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Assertion replay tests
+        run: node --import tsx --test server/candidateAdmission/stage0AssertionReplay.test.ts server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts
+      - name: Build
+        run: npm run build

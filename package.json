@@ -13,34 +13,35 @@
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
-    "phase3:baseline": "tsx scripts/phase3Baseline.ts"
-    ,"admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts"
-    ,"phaseb:admission-v2-poc": "tsx scripts/phaseBAdmissionV2Poc.ts"
-    ,"phaseb:validate-documents": "tsx scripts/phaseBValidateDocuments.ts"
-    ,"phaseb:activate-assertions": "tsx scripts/phaseBActivateAssertions.ts"
-    ,"phaseb:seal-preflight": "tsx scripts/phaseBSealPreflight.ts"
-    ,"phaseb:seal-benchmark": "tsx scripts/phaseBSealBenchmark.ts"
-    ,"phaseb:disable-control": "tsx scripts/phaseBDisableControl.ts"
-    ,"phaseb:history-readiness": "tsx scripts/phaseBHistoryReadiness.ts"
-    ,"phaseb:observation-completeness": "tsx scripts/phaseBObservationCompleteness.ts"
-    ,"phaseb:document-completeness": "tsx scripts/phaseBDocumentCompleteness.ts"
-    ,"phaseb:declare-collection-epoch": "tsx scripts/phaseBDeclareCollectionEpoch.ts"
-    ,"phaseb:collection-epoch-readiness": "tsx scripts/phaseBCollectionEpochReadiness.ts"
-    ,"phaseb:prospective-monitoring": "tsx scripts/phaseBProspectiveMonitoring.ts"
-    ,"phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts"
-    ,"phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts"
-    ,"creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts"
-    ,"phase4:replay": "tsx scripts/phase4Replay.ts",
+    "phase3:baseline": "tsx scripts/phase3Baseline.ts",
+    "admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts",
+    "phaseb:admission-v2-poc": "tsx scripts/phaseBAdmissionV2Poc.ts",
+    "phaseb:validate-documents": "tsx scripts/phaseBValidateDocuments.ts",
+    "phaseb:activate-assertions": "tsx scripts/phaseBActivateAssertions.ts",
+    "phaseb:seal-preflight": "tsx scripts/phaseBSealPreflight.ts",
+    "phaseb:seal-benchmark": "tsx scripts/phaseBSealBenchmark.ts",
+    "phaseb:disable-control": "tsx scripts/phaseBDisableControl.ts",
+    "phaseb:history-readiness": "tsx scripts/phaseBHistoryReadiness.ts",
+    "phaseb:observation-completeness": "tsx scripts/phaseBObservationCompleteness.ts",
+    "phaseb:document-completeness": "tsx scripts/phaseBDocumentCompleteness.ts",
+    "phaseb:declare-collection-epoch": "tsx scripts/phaseBDeclareCollectionEpoch.ts",
+    "phaseb:collection-epoch-readiness": "tsx scripts/phaseBCollectionEpochReadiness.ts",
+    "phaseb:prospective-monitoring": "tsx scripts/phaseBProspectiveMonitoring.ts",
+    "phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts",
+    "phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts",
+    "creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts",
+    "phase4:replay": "tsx scripts/phase4Replay.ts",
     "phase5:verify": "npm test && npm run lint && npm run build",
     "phase6:verify": "npm test && npm run lint && npm run build",
     "phase7:verify": "npm test && npm run lint && npm run build",
-    "phase8:verify": "npm test && npm run lint && npm run build"
-    ,"phase9:verify": "npm test && npm run lint && npm run build",
+    "phase8:verify": "npm test && npm run lint && npm run build",
+    "phase9:verify": "npm test && npm run lint && npm run build",
     "phase10:verify": "npm test && npm run lint && npm run build",
     "phase11:verify": "npm test && npm run lint && npm run build",
     "phase12:verify": "npm test && npm run lint && npm run build",
-    "phase13:verify": "npm test && npm run lint && npm run build"
-    ,"stage0:operator-visible": "tsx scripts/stage0OperatorVisibleCounterfactual.ts"
+    "phase13:verify": "npm test && npm run lint && npm run build",
+    "stage0:operator-visible": "tsx scripts/stage0OperatorVisibleCounterfactual.ts",
+    "stage0:operator-visible-assertion-replay": "tsx scripts/stage0OperatorVisibleAssertionReplay.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
