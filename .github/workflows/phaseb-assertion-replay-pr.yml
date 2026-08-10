@@ -6,8 +6,10 @@ on:
     paths:
       - 'server/candidateAdmission/stage0AssertionReplay.ts'
       - 'server/candidateAdmission/stage0AssertionReplay.test.ts'
-      - 'server/candidateAdmission/stage0OperatorVisible.ts'
-      - 'scripts/stage0OperatorVisibleCounterfactual.ts'
+      - 'server/candidateAdmission/stage0OperatorVisibleAssertionReplay.ts'
+      - 'server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts'
+      - 'scripts/stage0OperatorVisibleAssertionReplay.ts'
+      - 'package.json'
       - '.github/workflows/phaseb-assertion-replay-pr.yml'
   workflow_dispatch:
 
@@ -27,6 +29,6 @@ jobs:
       - name: Install dependencies
         run: npm install
       - name: Assertion replay tests
-        run: node --import tsx --test server/candidateAdmission/stage0AssertionReplay.test.ts
+        run: node --import tsx --test server/candidateAdmission/stage0AssertionReplay.test.ts server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts
       - name: Build
         run: npm run build
