@@ -1,0 +1,32 @@
+name: Gemini Semantic Fallback PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/evidenceEngine/providers/GeminiSemanticProvider.ts'
+      - 'server/evidenceEngine/providers/GeminiSemanticProvider.test.ts'
+      - '.github/workflows/gemini-semantic-fallback-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Gemini semantic fallback tests
+        run: node --import tsx --test server/evidenceEngine/providers/GeminiSemanticProvider.test.ts server/providerResilience.test.ts server/evidenceEngine/providerFailureDiagnostics.test.ts
+      - name: Build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
