@@ -1,0 +1,364 @@
+name: Stage 0 Creator Focus diagnosis (temporary)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage0-creator-focus-diagnosis
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    name: Read-only Creator Focus diagnosis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run read-only diagnosis
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          mkdir -p diagnosis-output
+          node --import tsx --input-type=module <<'NODE' > diagnosis-output/creator-focus-diagnosis.json
+          import pg from 'pg';
+
+          const OPERATOR_VISIBLE = `country_status <> 'REJECTED'
+            AND scan_status <> 'SKIPPED_EXCLUDED'
+            AND trading_status <> 'NON_TRADING'
+            AND NOT EXISTS (
+              SELECT 1 FROM excluded_countries excluded
+              WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) =
+                lower(regexp_replace(trim(channels.country), '\\s+', ' ', 'g'))
+            )`;
+
+          const pool = new pg.Pool({
+            connectionString: process.env.DATABASE_URL,
+            max: 1,
+            connectionTimeoutMillis: 20000,
+            ssl: process.env.PGSSL === 'disable' ? false : { rejectUnauthorized: false }
+          });
+          const db = await pool.connect();
+          try {
+            await db.query('BEGIN TRANSACTION READ ONLY');
+            const ro = await db.query("SELECT current_setting('transaction_read_only') AS read_only");
+            if (ro.rows[0]?.read_only !== 'on') throw new Error('READ_ONLY_REQUIRED');
+
+            const cohort = await db.query(`
+              WITH visible AS (
+                SELECT channel_id, channel_name, country, discovery_source, trading_status,
+                       COALESCE(trading_confidence_score,0)::float AS score,
+                       COALESCE(trading_category,'General Trading') AS trading_category
+                FROM channels WHERE ${OPERATOR_VISIBLE}
+              ),
+              latest_focus AS (
+                SELECT DISTINCT ON (f.channel_id)
+                  f.channel_id, f.id AS focus_id, f.proposed_status, f.probability,
+                  f.lower_confidence_bound, f.creator_focus_distribution, f.stage_report,
+                  f.reason_codes AS focus_reason_codes, f.document_keys, f.assertion_keys,
+                  f.document_assertions, f.evidence_coverage_snapshot_id, f.mode,
+                  f.classifier_version, f.policy_version, f.observed_at AS focus_observed_at
+                FROM creator_focus_classification_snapshots f
+                INNER JOIN visible v ON v.channel_id = f.channel_id
+                ORDER BY f.channel_id, f.observed_at DESC, f.id DESC
+              ),
+              latest_coverage AS (
+                SELECT DISTINCT ON (c.channel_id)
+                  c.channel_id, c.id AS coverage_id, c.completeness_disposition,
+                  c.observed_document_count, c.expected_document_count,
+                  c.independent_family_count, c.observed_document_counts,
+                  c.language_coverage, c.temporal_coverage, c.provider_availability,
+                  c.acquisition_failures, c.reason_codes AS coverage_reason_codes,
+                  c.policy_version AS coverage_policy_version, c.observed_at AS coverage_observed_at
+                FROM evidence_coverage_snapshots c
+                INNER JOIN visible v ON v.channel_id = c.channel_id
+                ORDER BY c.channel_id, c.observed_at DESC, c.id DESC
+              )
+              SELECT v.*, lf.*,
+                     COALESCE(fc.id, lc.coverage_id) AS coverage_id,
+                     COALESCE(fc.completeness_disposition, lc.completeness_disposition) AS completeness_disposition,
+                     COALESCE(fc.observed_document_count, lc.observed_document_count) AS observed_document_count,
+                     COALESCE(fc.expected_document_count, lc.expected_document_count) AS expected_document_count,
+                     COALESCE(fc.independent_family_count, lc.independent_family_count) AS independent_family_count,
+                     COALESCE(fc.observed_document_counts, lc.observed_document_counts) AS observed_document_counts,
+                     COALESCE(fc.language_coverage, lc.language_coverage) AS language_coverage,
+                     COALESCE(fc.temporal_coverage, lc.temporal_coverage) AS temporal_coverage,
+                     COALESCE(fc.provider_availability, lc.provider_availability) AS provider_availability,
+                     COALESCE(fc.acquisition_failures, lc.acquisition_failures) AS acquisition_failures,
+                     COALESCE(fc.reason_codes, lc.coverage_reason_codes) AS coverage_reason_codes
+              FROM visible v
+              LEFT JOIN latest_focus lf ON lf.channel_id = v.channel_id
+              LEFT JOIN evidence_coverage_snapshots fc ON fc.id = lf.evidence_coverage_snapshot_id
+              LEFT JOIN latest_coverage lc ON lc.channel_id = v.channel_id
+              ORDER BY v.trading_status, v.score DESC, v.channel_id
+            `);
+
+            const TRADING = ['ACTIVE_TRADING_CREATOR','TRADING_EDUCATOR'];
+            const ALT = ['INVESTING_EDUCATOR','FINANCIAL_NEWS','PERSONAL_FINANCE','MARKET_INSTITUTION','TRADING_ADJACENT','HYPE_OR_PROMOTION','UNRELATED_CREATOR'];
+
+            function parseJson(v) {
+              if (v == null) return null;
+              return typeof v === 'string' ? JSON.parse(v) : v;
+            }
+
+            function sumKeys(dist, keys) {
+              if (!dist || typeof dist !== 'object') return 0;
+              return keys.reduce((s, k) => s + Number(dist[k] || 0), 0);
+            }
+
+            function stageDisp(stageReport, name) {
+              const stages = parseJson(stageReport)?.stages;
+              if (!Array.isArray(stages)) return null;
+              const s = stages.find(x => x.stage === name);
+              return s ? { disposition: s.disposition, reasonCodes: s.reasonCodes, metrics: s.metrics } : null;
+            }
+
+            const rows = cohort.rows.map(r => {
+              const dist = parseJson(r.creator_focus_distribution) || {};
+              const docKeys = parseJson(r.document_keys) || [];
+              const assertionKeys = parseJson(r.assertion_keys) || [];
+              const docAssertions = parseJson(r.document_assertions) || [];
+              const tradingMass = sumKeys(dist, TRADING);
+              const alternativeMass = sumKeys(dist, ALT);
+              const otherMass = Object.entries(dist).reduce((s, [k, v]) => {
+                if (!TRADING.includes(k) && !ALT.includes(k)) return s + Number(v || 0);
+                return s;
+              }, 0);
+              const observed = Number(r.observed_document_count) || 0;
+              const independent = Number(r.independent_family_count) || 0;
+              const disposition = r.completeness_disposition || null;
+              const coverageSufficient = disposition === 'SUFFICIENT' && observed >= 2;
+              const lang = stageDisp(r.stage_report, 'LANGUAGE_CAPABILITY');
+              const temporal = stageDisp(r.stage_report, 'TEMPORAL_RELEVANCE');
+              const supportedLanguage = lang?.disposition === 'PASS';
+              const recentEvidence = temporal?.disposition === 'PASS';
+              const independentOk = independent >= 2;
+
+              let firstFail = null;
+              if (!r.focus_id) firstFail = 'CREATOR_FOCUS_SNAPSHOT_MISSING';
+              else if (!r.coverage_id) firstFail = 'COVERAGE_SNAPSHOT_MISSING';
+              else if (!coverageSufficient) firstFail = 'EVIDENCE_COVERAGE_INCOMPLETE';
+              else if (!supportedLanguage) firstFail = 'LANGUAGE_CAPABILITY_REQUIRED';
+              else if (!recentEvidence) firstFail = 'TEMPORAL_EVIDENCE_REQUIRED';
+              else if (!independentOk) firstFail = 'INDEPENDENT_SOURCE_FAMILIES_REQUIRED';
+              else if (alternativeMass >= 0.8 && tradingMass < 0.2 && r.proposed_status === 'NON_TRADING') firstFail = 'WOULD_WITHHOLD';
+              else if (Number(r.lower_confidence_bound) >= 0.7 && tradingMass >= 0.7 && alternativeMass < 0.6 && r.proposed_status === 'TRADING_CONFIRMED') firstFail = 'WOULD_ADMIT_CONFIRMED';
+              else if (tradingMass >= 0.35) firstFail = 'WOULD_ADMIT_REVIEW';
+              else firstFail = 'TRADING_HYPOTHESIS_NOT_YET_PLAUSIBLE';
+
+              // Top non-zero distribution keys
+              const distTop = Object.entries(dist)
+                .map(([k, v]) => [k, Number(v) || 0])
+                .filter(([, v]) => v > 0)
+                .sort((a, b) => b[1] - a[1]);
+
+              return {
+                channelId: r.channel_id,
+                channelName: r.channel_name,
+                country: r.country,
+                discoverySource: r.discovery_source,
+                tradingStatus: r.trading_status,
+                score: Number(r.score),
+                tradingCategory: r.trading_category,
+                focusId: r.focus_id || null,
+                coverageId: r.coverage_id || null,
+                proposedStatus: r.proposed_status || null,
+                probability: r.probability != null ? Number(r.probability) : null,
+                lowerConfidenceBound: r.lower_confidence_bound != null ? Number(r.lower_confidence_bound) : null,
+                tradingMass,
+                alternativeMass,
+                otherMass,
+                distTop,
+                distAllZero: distTop.length === 0,
+                documentKeyCount: Array.isArray(docKeys) ? docKeys.length : 0,
+                assertionKeyCount: Array.isArray(assertionKeys) ? assertionKeys.length : 0,
+                documentAssertionCount: Array.isArray(docAssertions) ? docAssertions.length : 0,
+                completenessDisposition: disposition,
+                observedDocumentCount: observed,
+                expectedDocumentCount: Number(r.expected_document_count) || 0,
+                independentFamilyCount: independent,
+                observedDocumentCounts: parseJson(r.observed_document_counts),
+                languageCoverage: parseJson(r.language_coverage),
+                temporalCoverage: parseJson(r.temporal_coverage),
+                coverageReasonCodes: parseJson(r.coverage_reason_codes) || [],
+                focusReasonCodes: parseJson(r.focus_reason_codes) || [],
+                languageStage: lang,
+                temporalStage: temporal,
+                coverageSufficient,
+                supportedLanguage,
+                recentEvidence,
+                independentOk,
+                firstFailGate: firstFail,
+                classifierVersion: r.classifier_version || null,
+                mode: r.mode || null
+              };
+            });
+
+            function countBy(items, keyFn) {
+              const out = {};
+              for (const item of items) {
+                const k = keyFn(item) ?? 'NULL';
+                out[k] = (out[k] || 0) + 1;
+              }
+              return Object.fromEntries(Object.entries(out).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
+            }
+
+            const confirmed = rows.filter(r => r.tradingStatus === 'TRADING_CONFIRMED');
+            const needsReview = rows.filter(r => r.tradingStatus === 'NEEDS_REVIEW');
+
+            // Sample genuine confirmed with highest scores
+            const genuineSamples = confirmed.slice(0, 8).map(r => ({
+              channelId: r.channelId,
+              channelName: r.channelName,
+              country: r.country,
+              score: r.score,
+              category: r.tradingCategory,
+              proposedStatus: r.proposedStatus,
+              tradingMass: r.tradingMass,
+              alternativeMass: r.alternativeMass,
+              otherMass: r.otherMass,
+              distTop: r.distTop,
+              distAllZero: r.distAllZero,
+              documentKeyCount: r.documentKeyCount,
+              assertionKeyCount: r.assertionKeyCount,
+              documentAssertionCount: r.documentAssertionCount,
+              completenessDisposition: r.completenessDisposition,
+              observedDocumentCount: r.observedDocumentCount,
+              expectedDocumentCount: r.expectedDocumentCount,
+              independentFamilyCount: r.independentFamilyCount,
+              observedDocumentCounts: r.observedDocumentCounts,
+              coverageReasonCodes: r.coverageReasonCodes,
+              languageStage: r.languageStage,
+              temporalStage: r.temporalStage,
+              firstFailGate: r.firstFailGate
+            }));
+
+            // Sample NEEDS_REVIEW ~40-50 general trading
+            const oodSamples = needsReview
+              .filter(r => r.score >= 40 && r.score < 50 && r.tradingCategory === 'General Trading')
+              .slice(0, 10)
+              .map(r => ({
+                channelId: r.channelId,
+                channelName: r.channelName,
+                country: r.country,
+                score: r.score,
+                category: r.tradingCategory,
+                proposedStatus: r.proposedStatus,
+                tradingMass: r.tradingMass,
+                alternativeMass: r.alternativeMass,
+                otherMass: r.otherMass,
+                distTop: r.distTop,
+                distAllZero: r.distAllZero,
+                documentKeyCount: r.documentKeyCount,
+                assertionKeyCount: r.assertionKeyCount,
+                documentAssertionCount: r.documentAssertionCount,
+                completenessDisposition: r.completenessDisposition,
+                observedDocumentCount: r.observedDocumentCount,
+                expectedDocumentCount: r.expectedDocumentCount,
+                independentFamilyCount: r.independentFamilyCount,
+                observedDocumentCounts: r.observedDocumentCounts,
+                coverageReasonCodes: r.coverageReasonCodes,
+                languageStage: r.languageStage,
+                temporalStage: r.temporalStage,
+                firstFailGate: r.firstFailGate
+              }));
+
+            // Document type counts across cohort
+            const docTypeTotals = {};
+            for (const r of rows) {
+              const counts = r.observedDocumentCounts || {};
+              for (const [t, n] of Object.entries(counts)) {
+                docTypeTotals[t] = (docTypeTotals[t] || 0) + Number(n || 0);
+              }
+            }
+
+            const report = {
+              generatedAt: new Date().toISOString(),
+              readOnly: true,
+              servingAuthority: false,
+              totals: {
+                operatorVisible: rows.length,
+                withFocusSnapshot: rows.filter(r => r.focusId).length,
+                withCoverageSnapshot: rows.filter(r => r.coverageId).length,
+                tradingConfirmed: confirmed.length,
+                needsReview: needsReview.length
+              },
+              firstFailGateCounts: countBy(rows, r => r.firstFailGate),
+              firstFailGateByStatus: {
+                TRADING_CONFIRMED: countBy(confirmed, r => r.firstFailGate),
+                NEEDS_REVIEW: countBy(needsReview, r => r.firstFailGate)
+              },
+              coverageDispositionCounts: countBy(rows, r => r.completenessDisposition),
+              coverageDispositionByStatus: {
+                TRADING_CONFIRMED: countBy(confirmed, r => r.completenessDisposition),
+                NEEDS_REVIEW: countBy(needsReview, r => r.completenessDisposition)
+              },
+              observedDocumentCountHistogram: countBy(rows, r => String(r.observedDocumentCount)),
+              independentFamilyHistogram: countBy(rows, r => String(r.independentFamilyCount)),
+              proposedStatusCounts: countBy(rows, r => r.proposedStatus),
+              distAllZeroCounts: {
+                all: rows.filter(r => r.distAllZero).length,
+                TRADING_CONFIRMED: confirmed.filter(r => r.distAllZero).length,
+                NEEDS_REVIEW: needsReview.filter(r => r.distAllZero).length
+              },
+              massStats: {
+                tradingMassZero: rows.filter(r => r.tradingMass === 0).length,
+                alternativeMassZero: rows.filter(r => r.alternativeMass === 0).length,
+                bothZero: rows.filter(r => r.tradingMass === 0 && r.alternativeMass === 0).length,
+                tradingMassGe035: rows.filter(r => r.tradingMass >= 0.35).length,
+                alternativeMassGe08: rows.filter(r => r.alternativeMass >= 0.8).length,
+                maxTradingMass: Math.max(0, ...rows.map(r => r.tradingMass)),
+                maxAlternativeMass: Math.max(0, ...rows.map(r => r.alternativeMass)),
+                maxOtherMass: Math.max(0, ...rows.map(r => r.otherMass))
+              },
+              documentKeyCountHistogram: countBy(rows, r => String(r.documentKeyCount)),
+              assertionKeyCountHistogram: countBy(rows, r => String(r.assertionKeyCount)),
+              documentAssertionCountHistogram: countBy(rows, r => String(r.documentAssertionCount)),
+              documentTypeTotals: Object.fromEntries(Object.entries(docTypeTotals).sort((a,b)=>b[1]-a[1])),
+              languageStageCounts: countBy(rows, r => r.languageStage?.disposition || 'MISSING_STAGE'),
+              temporalStageCounts: countBy(rows, r => r.temporalStage?.disposition || 'MISSING_STAGE'),
+              coverageReasonCodeCounts: (() => {
+                const c = {};
+                for (const r of rows) for (const code of r.coverageReasonCodes || []) c[code] = (c[code]||0)+1;
+                return Object.fromEntries(Object.entries(c).sort((a,b)=>b[1]-a[1]));
+              })(),
+              genuineTradingConfirmedSamples: genuineSamples,
+              needsReviewOodSamples: oodSamples,
+              note: 'Snapshot existence != evidence sufficiency. Stage 0 eligibility only required rows to exist.'
+            };
+
+            console.log(JSON.stringify(report, null, 2));
+            await db.query('COMMIT');
+          } catch (e) {
+            await db.query('ROLLBACK').catch(() => undefined);
+            throw e;
+          } finally {
+            db.release();
+            await pool.end();
+          }
+          NODE
+
+      - name: Upload diagnosis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: creator-focus-diagnosis-${{ github.run_id }}
+          path: diagnosis-output/*.json
+          if-no-files-found: error
+          retention-days: 14
