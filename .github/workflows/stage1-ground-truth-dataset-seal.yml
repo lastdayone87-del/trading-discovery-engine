@@ -1,0 +1,104 @@
+name: Stage 1 ground-truth dataset seal
+
+on:
+  pull_request:
+    paths:
+      - 'server/candidateAdmission/stage1GroundTruthSealer.ts'
+      - 'server/candidateAdmission/stage1GroundTruthSealer.test.ts'
+      - 'scripts/stage1GroundTruthDatasetSeal.ts'
+      - '.github/workflows/stage1-ground-truth-dataset-seal.yml'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREVIEW performs no writes. SEAL creates an immutable dataset only if all guards pass.'
+        required: true
+        default: 'PREVIEW'
+        type: choice
+        options:
+          - PREVIEW
+          - SEAL
+      cutoff_at:
+        description: 'ISO-8601 cutoff timestamp. Leave blank to use workflow start time.'
+        required: false
+        type: string
+      dataset_key:
+        description: 'Immutable dataset family key'
+        required: true
+        default: 'stage1-independent-ground-truth'
+        type: string
+      minimum_per_class:
+        description: 'Minimum eligible sampled labels required for EACH class'
+        required: true
+        default: '30'
+        type: string
+      confirmation:
+        description: 'For SEAL only, type SEAL_STAGE1_EVALUATION_DATASET'
+        required: false
+        type: string
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Stage 1 ground-truth sealer tests
+        run: node --import tsx --test server/candidateAdmission/stage1GroundTruthSealer.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify governed write boundary
+        run: |
+          set -euo pipefail
+          FILE=server/candidateAdmission/stage1GroundTruthSealer.ts
+          grep -q "provenance IN ('HUMAN_REVIEW','ADJUDICATION')" "$FILE"
+          grep -q 'SEAL_STAGE1_EVALUATION_DATASET' "$FILE"
+          grep -q 'INSERT INTO decision_evaluation_datasets' "$FILE"
+          grep -q 'INSERT INTO decision_evaluation_examples' "$FILE"
+          ! grep -E '\b(UPDATE|DELETE|TRUNCATE|ALTER|DROP)\b' "$FILE"
+
+  preview-or-seal:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Preview or seal independent Stage 1 cohort
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+          STAGE1_DATASET_KEY: ${{ inputs.dataset_key }}
+          STAGE1_CUTOFF_AT: ${{ inputs.cutoff_at }}
+          STAGE1_MINIMUM_PER_CLASS: ${{ inputs.minimum_per_class }}
+          STAGE1_SEAL_CONFIRMATION: ${{ inputs.confirmation }}
+          STAGE1_SEAL_ACTOR: github-actions:${{ github.actor }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          if [ -z "${STAGE1_CUTOFF_AT}" ]; then
+            export STAGE1_CUTOFF_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          if [ "$MODE" = "SEAL" ]; then
+            test "$STAGE1_SEAL_CONFIRMATION" = "SEAL_STAGE1_EVALUATION_DATASET"
+            npx tsx scripts/stage1GroundTruthDatasetSeal.ts --seal
+            test -f stage1-output/stage1-ground-truth-seal-result.json
+          else
+            npx tsx scripts/stage1GroundTruthDatasetSeal.ts
+            test -f stage1-output/stage1-ground-truth-seal-preview.json
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage1-ground-truth-dataset-${{ github.run_id }}
+          path: stage1-output/*.json
+          retention-days: 30
