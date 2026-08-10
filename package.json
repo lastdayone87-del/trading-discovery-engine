@@ -41,7 +41,8 @@
     "phase12:verify": "npm test && npm run lint && npm run build",
     "phase13:verify": "npm test && npm run lint && npm run build",
     "stage0:operator-visible": "tsx scripts/stage0OperatorVisibleCounterfactual.ts",
-    "stage0:operator-visible-assertion-replay": "tsx scripts/stage0OperatorVisibleAssertionReplay.ts"
+    "stage0:operator-visible-assertion-replay": "tsx scripts/stage0OperatorVisibleAssertionReplay.ts",
+    "stage0:promotion-readiness": "tsx scripts/stage0PromotionReadiness.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
