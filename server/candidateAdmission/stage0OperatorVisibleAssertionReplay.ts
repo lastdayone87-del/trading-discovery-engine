@@ -72,6 +72,20 @@ function languageFromCoverage(coverage: EvidenceCoverageSnapshot): string {
   return 'UNKNOWN';
 }
 
+function replayInputGaps(row: any): string[] {
+  const gaps: string[] = [];
+  if (!row.classification_diagnostic_id) gaps.push('CLASSIFICATION_DIAGNOSTIC_LINK_MISSING');
+  if (!row.coverage_snapshot_id) gaps.push('COVERAGE_SNAPSHOT_LINK_MISSING');
+  if (!row.normalized_input) gaps.push('NORMALIZED_INPUT_MISSING');
+  if (row.evidence_items == null) gaps.push('EVIDENCE_ITEMS_MISSING');
+  if (!row.document_keys || (Array.isArray(row.document_keys) && row.document_keys.length === 0)) gaps.push('DOCUMENT_KEYS_MISSING');
+  return gaps;
+}
+
+function increment(counts: Record<string, number>, key: string, amount = 1) {
+  counts[key] = (counts[key] || 0) + amount;
+}
+
 export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<string, unknown>> {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required for Stage 0 assertion replay.');
   const pool = new Pool({
@@ -129,25 +143,47 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
     const labeledExamples: OfflineAdmissionExample[] = [];
     const excludedExamples: Array<{exampleKey:string;channelId:string;reasonCode:string}> = [];
     const decisionCounts: Record<OfflineAdmissionV2Decision, number> = { ADMIT_CONFIRMED:0, ADMIT_REVIEW:0, WITHHOLD:0, DEFER_INVESTIGATION:0 };
+    const exclusionGapCounts: Record<string, number> = {};
+    const projectionTotals: Record<string, number> = {
+      evidenceItems: 0, positiveEvidenceItems: 0, negativeEvidenceItems: 0, abstentionEvidenceItems: 0,
+      projectableEvidenceItems: 0, droppedNoRawMatches: 0, droppedNoSupportingDocument: 0, assertions: 0
+    };
+    const projectedTaxonomyTotals: Record<string, number> = {};
+    const droppedTaxonomyTotals: Record<string, number> = {};
 
     for (const row of result.rows) {
       const channelId = String(row.channel_id);
       const exampleKey = `operator-visible-replay:${channelId}`;
-      if (!row.classification_diagnostic_id || !row.coverage_snapshot_id || !row.normalized_input || !row.evidence_items) {
+      const inputGaps = replayInputGaps(row);
+      if (inputGaps.length) {
+        inputGaps.forEach(gap => increment(exclusionGapCounts, gap));
         excludedExamples.push({ exampleKey, channelId, reasonCode: 'REPLAY_INPUT_INCOMPLETE' });
-        rows.push({ channelId, channelName: row.channel_name, exclusionReason: 'REPLAY_INPUT_INCOMPLETE' });
+        rows.push({ channelId, channelName: row.channel_name, exclusionReason: 'REPLAY_INPUT_INCOMPLETE', replayInputGaps: inputGaps });
         continue;
       }
       const coverage = coverageFromRow(row);
       const documents = (json<any[]>(row.evidence_documents) || []).map(documentFromRow);
       if (!documents.length) {
+        increment(exclusionGapCounts, 'REPLAY_DOCUMENTS_MISSING');
         excludedExamples.push({ exampleKey, channelId, reasonCode: 'REPLAY_DOCUMENTS_MISSING' });
-        rows.push({ channelId, channelName: row.channel_name, exclusionReason: 'REPLAY_DOCUMENTS_MISSING' });
+        rows.push({ channelId, channelName: row.channel_name, exclusionReason: 'REPLAY_DOCUMENTS_MISSING', replayInputGaps: ['REPLAY_DOCUMENTS_MISSING'] });
         continue;
       }
       const rawInput = json<RawChannelInput>(row.normalized_input);
       const evidenceItems = json<EvidenceItem[]>(row.evidence_items) || [];
       const replay = replayCreatorFocusFromDiagnostic({ channelId, rawInput, evidenceItems, documents, coverage });
+      const diagnostics = replay.projectionDiagnostics;
+      projectionTotals.evidenceItems += diagnostics.evidenceItemCount;
+      projectionTotals.positiveEvidenceItems += diagnostics.positiveEvidenceItemCount;
+      projectionTotals.negativeEvidenceItems += diagnostics.negativeEvidenceItemCount;
+      projectionTotals.abstentionEvidenceItems += diagnostics.abstentionEvidenceItemCount;
+      projectionTotals.projectableEvidenceItems += diagnostics.projectableEvidenceItemCount;
+      projectionTotals.droppedNoRawMatches += diagnostics.droppedNoRawMatches;
+      projectionTotals.droppedNoSupportingDocument += diagnostics.droppedNoSupportingDocument;
+      projectionTotals.assertions += replay.assertionCount;
+      Object.entries(diagnostics.projectedSemanticTaxonomyLabels).forEach(([key, value]) => increment(projectedTaxonomyTotals, key, value));
+      Object.entries(diagnostics.droppedSemanticTaxonomyLabels).forEach(([key, value]) => increment(droppedTaxonomyTotals, key, value));
+
       const groundTruth: OfflineAdmissionGroundTruth | null = row.review_decision === 'APPROVE' ? 'TRADING_CONFIRMED'
         : row.review_decision === 'REJECT' ? 'NON_TRADING'
         : row.trading_status === 'TRADING_CONFIRMED' ? 'TRADING_CONFIRMED' : null;
@@ -182,6 +218,13 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
         channelId, channelName:String(row.channel_name||''), country:String(row.country||'UNKNOWN'),
         discoverySource:String(row.discovery_source||'UNKNOWN'), tradingStatus:String(row.trading_status||'UNKNOWN'),
         productionScore:Number(row.trading_confidence_score)||0, tradingCategory:String(row.trading_category||'General Trading'),
+        evidenceItemCount:diagnostics.evidenceItemCount, positiveEvidenceItemCount:diagnostics.positiveEvidenceItemCount,
+        negativeEvidenceItemCount:diagnostics.negativeEvidenceItemCount, abstentionEvidenceItemCount:diagnostics.abstentionEvidenceItemCount,
+        projectableEvidenceItemCount:diagnostics.projectableEvidenceItemCount, droppedNoRawMatches:diagnostics.droppedNoRawMatches,
+        droppedNoSupportingDocument:diagnostics.droppedNoSupportingDocument,
+        semanticTaxonomyLabels:diagnostics.semanticTaxonomyLabels,
+        projectedSemanticTaxonomyLabels:diagnostics.projectedSemanticTaxonomyLabels,
+        droppedSemanticTaxonomyLabels:diagnostics.droppedSemanticTaxonomyLabels,
         assertionCount:replay.assertionCount, tradingMass:replay.aggregate.tradingMass,
         alternativeMass:replay.aggregate.alternativeMass, lowerConfidenceBound:replay.aggregate.lowerConfidenceBound,
         creatorFocusProposedStatus:replay.decision.proposedStatus, decision:admission.decision,
@@ -202,10 +245,11 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
       persisted:false, readOnly:true, servingAuthority:false, automaticPromotion:false,
       totals:{ operatorVisibleChannels:operatorVisible, evaluated, excluded:operatorVisible-evaluated,
         historicalEvidenceEligibilityRate:operatorVisible ? evaluated/operatorVisible : null, decisionCounts,
-        projectedDashboardVisible:decisionCounts.ADMIT_CONFIRMED+decisionCounts.ADMIT_REVIEW },
+        projectedDashboardVisible:decisionCounts.ADMIT_CONFIRMED+decisionCounts.ADMIT_REVIEW,
+        exclusionGapCounts, projectionTotals, projectedTaxonomyTotals, droppedTaxonomyTotals },
       labeledMetrics:labeledReport?.metrics || null, hypothesisAssessment:labeledReport?.hypothesisAssessment || null,
       rows,
-      inputChecksum:checksum(rows.map(row=>({channelId:row.channelId,assertionCount:row.assertionCount,decision:row.decision})))
+      inputChecksum:checksum(rows.map(row=>({channelId:row.channelId,assertionCount:row.assertionCount,decision:row.decision,exclusionReason:row.exclusionReason})))
     };
   } catch (error) {
     await db.query('ROLLBACK').catch(()=>undefined);
