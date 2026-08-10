@@ -29,3 +29,19 @@ test('replay inputs are sourced from immutable diagnostics and persisted documen
   assert.match(source, /evidence_documents/);
   assert.match(source, /document_keys/);
 });
+
+test('missing direct coverage lineage may recover only from one exact diagnostic match', () => {
+  assert.match(source, /ec\.classification_diagnostic_id=lf\.classification_diagnostic_id/);
+  assert.match(source, /count\(\*\)::int AS candidate_count/);
+  assert.match(source, /exact_coverage\.candidate_count=1/);
+  assert.match(source, /RECOVERED_EXACT_DIAGNOSTIC/);
+  assert.match(source, /AMBIGUOUS_DIAGNOSTIC_COVERAGE/);
+  assert.match(source, /COVERAGE_SNAPSHOT_LINEAGE_AMBIGUOUS/);
+});
+
+test('direct coverage lineage remains preferred and lineage source is auditable', () => {
+  assert.match(source, /lf\.evidence_coverage_snapshot_id IS NOT NULL THEN 'DIRECT_LINK'/);
+  assert.match(source, /COALESCE\(\s*lf\.evidence_coverage_snapshot_id::text/);
+  assert.match(source, /coverageLineageSource/);
+  assert.match(source, /coverageLineageCounts/);
+});
