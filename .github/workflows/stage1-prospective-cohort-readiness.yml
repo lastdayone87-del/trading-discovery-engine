@@ -8,6 +8,8 @@ on:
       - 'scripts/stage1ProspectiveCohortReadiness.ts'
       - '.github/workflows/stage1-prospective-cohort-readiness.yml'
       - 'server/candidateAdmission/stage1ReviewHistoryStorageAudit.ts'
+      - 'server/operatorAuth.ts'
+      - 'server/operatorAuth.test.ts'
   workflow_dispatch:
     inputs:
       minimum_per_class:
@@ -29,7 +31,7 @@ jobs:
           cache: npm
       - run: npm install
       - name: Prospective readiness tests
-        run: node --import tsx --test server/candidateAdmission/stage1ProspectiveCohortReadiness.test.ts
+        run: node --import tsx --test server/candidateAdmission/stage1ProspectiveCohortReadiness.test.ts server/operatorAuth.test.ts
       - name: Build
         run: npm run build
       - name: Verify read-only boundary
