@@ -54,6 +54,7 @@ type GeminiCapacityConfig = {
   vocabularyRateLimitSuppressionMs: number;
   vocabularySemanticQuietMs: number;
   vocabularyMinIntervalMs: number;
+  maxInlineWaitMs?: number;
 };
 
 export type GeminiCapacityDecision = { action:'RUN'|'WAIT'|'DEFER'; waitMs:number; reasonCode?:string };
@@ -69,22 +70,26 @@ function geminiCapacityConfig():GeminiCapacityConfig {
     semanticRateLimitCooldownMs: envMs('GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS', 90000),
     vocabularyRateLimitSuppressionMs: envMs('GEMINI_VOCABULARY_RATE_LIMIT_SUPPRESSION_MS', 15*60*1000),
     vocabularySemanticQuietMs: envMs('GEMINI_VOCABULARY_SEMANTIC_QUIET_MS', 2*60*1000),
-    vocabularyMinIntervalMs: envMs('GEMINI_VOCABULARY_MIN_INTERVAL_MS', 30000)
+    vocabularyMinIntervalMs: envMs('GEMINI_VOCABULARY_MIN_INTERVAL_MS', 30000),
+    maxInlineWaitMs: envMs('GEMINI_CAPACITY_MAX_INLINE_WAIT_MS', 8000)
   };
 }
 
 export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySnapshot, config:GeminiCapacityConfig=geminiCapacityConfig()):GeminiCapacityDecision {
   const age=(value?:number)=>value==null?Number.POSITIVE_INFINITY:Math.max(0,snapshot.nowMs-value);
+  const maxInlineWaitMs=config.maxInlineWaitMs??8000;
   const globalWait=Math.max(0,config.globalMinIntervalMs-age(snapshot.lastGeminiAtMs));
   if(operation===GEMINI_VOCABULARY_OPERATION){
     if(age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
     if(age(snapshot.lastSemanticAtMs)<config.vocabularySemanticQuietMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_SEMANTIC_PRIORITY'};
     const vocabularyWait=Math.max(0,config.vocabularyMinIntervalMs-age(snapshot.lastVocabularyAtMs));
     const waitMs=Math.max(globalWait,vocabularyWait);
+    if(waitMs>maxInlineWaitMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_CAPACITY_WAIT'};
     return {action:waitMs>0?'WAIT':'RUN',waitMs};
   }
   const rateLimitWait=age(snapshot.lastRateLimitAtMs)<config.semanticRateLimitCooldownMs?config.semanticRateLimitCooldownMs-age(snapshot.lastRateLimitAtMs):0;
   const waitMs=Math.max(globalWait,rateLimitWait);
+  if(waitMs>maxInlineWaitMs) return {action:'DEFER',waitMs:0,reasonCode:'SEMANTIC_DEFERRED_RATE_PRESSURE'};
   return {action:waitMs>0?'WAIT':'RUN',waitMs};
 }
 
@@ -117,7 +122,11 @@ async function acquireGeminiCapacity(context:ProviderCallContext):Promise<Gemini
     if(decision.action==='DEFER'){
       await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);
       client.release(); client=undefined;
-      throw new ProviderCallError('Gemini vocabulary extraction deferred to protect semantic classification capacity.','RATE_LIMIT',true,{status:429,providerReasons:[decision.reasonCode||'GEMINI_CAPACITY_DEFERRED']});
+      const isVocabulary=context.operation===GEMINI_VOCABULARY_OPERATION;
+      throw new ProviderCallError(
+        isVocabulary?'Gemini vocabulary extraction deferred to protect semantic classification capacity.':'Gemini semantic classification deferred during provider rate pressure.',
+        'RATE_LIMIT',true,{status:429,providerReasons:[decision.reasonCode||'GEMINI_CAPACITY_DEFERRED']}
+      );
     }
     if(decision.waitMs>0) await sleep(decision.waitMs);
     return {release:async()=>{
