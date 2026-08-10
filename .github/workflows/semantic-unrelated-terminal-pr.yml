@@ -1,0 +1,33 @@
+name: Semantic Unrelated Terminal Reject PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/evidenceEngine/decisionPolicy.ts'
+      - 'server/evidenceEngine/stagedClassification.ts'
+      - 'server/evidenceEngine/semanticTerminalReject.test.ts'
+      - '.github/workflows/semantic-unrelated-terminal-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Semantic terminal rejection regression tests
+        run: node --import tsx --test server/evidenceEngine/semanticTerminalReject.test.ts
+      - name: Build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
