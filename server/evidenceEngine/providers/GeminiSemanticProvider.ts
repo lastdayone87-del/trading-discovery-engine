@@ -104,8 +104,8 @@ export class GeminiSemanticProvider implements EvidenceProvider {
   async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const client = this.client();
     if (!client) return [];
-    const candidateModel = process.env.MULTILINGUAL_CANDIDATE_MODEL || 'gemini-2.5-flash-lite';
-    const adjudicatorModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL || 'gemini-2.5-flash';
+    const candidateModel = process.env.MULTILINGUAL_CANDIDATE_MODEL || 'gemini-3.6-flash';
+    const adjudicatorModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL || 'gemini-3.6-flash';
     const candidatePrompt = prompt(input, 'CANDIDATE');
     const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel);
     let result = parse(candidate.value);
