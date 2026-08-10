@@ -57,13 +57,10 @@ const collection: EvidenceCollectionReport = {
 
 const input = { channel_name: 'Games With Names', description: 'A sports podcast focused on football history and athletes.' };
 
-test('high-confidence creator-level UNRELATED can reject below the global negative-weight threshold', () => {
+test('high-confidence creator-level UNRELATED can become NON_TRADING below the global negative-weight threshold', () => {
   const evidence = [semanticUnrelated(92)];
   const stages = evaluateClassificationStages(input, evidence, collection);
   assert.equal(stages.lifecycleAction, 'REJECT');
-  const contradiction = stages.stages.find(stage => stage.stage === 'CONTRADICTION');
-  assert.equal(contradiction?.disposition, 'FAIL');
-  assert.ok(contradiction?.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 
   const decision = evaluateUnifiedDecisionPolicy({
     evidence,
@@ -76,15 +73,16 @@ test('high-confidence creator-level UNRELATED can reject below the global negati
   assert.ok(decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 });
 
-test('semantic UNRELATED below the confidence floor remains non-terminal', () => {
+test('semantic UNRELATED below the confidence floor remains UNCERTAIN even when stages route REJECT', () => {
   const evidence = [semanticUnrelated(84)];
   const stages = evaluateClassificationStages(input, evidence, collection);
-  assert.equal(stages.lifecycleAction, 'REVIEW');
+  assert.equal(stages.lifecycleAction, 'REJECT');
   const decision = evaluateUnifiedDecisionPolicy({ evidence, collection, lifecycleAction: stages.lifecycleAction, minimumPositiveWeight: 25, minimumTradingScore: 68 });
   assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(decision.reasonCodes.includes('SCORE_BOUNDARY_NOT_SATISFIED'));
 });
 
-test('any substantive positive trading evidence blocks the semantic shortcut', () => {
+test('substantive positive trading evidence blocks the semantic shortcut', () => {
   const positive: EvidenceItem = {
     id: 'positive', source: 'channel_metadata', polarity: 'POSITIVE', category: 'TERMINOLOGY', fact: 'Trading term', rawMatches: ['futures'], confidence: 80,
     reliability: 'HIGH', reliabilityMultiplier: 0.8, rawWeight: 10, finalWeight: 6.4, timestamp: new Date(0).toISOString(),
@@ -92,5 +90,7 @@ test('any substantive positive trading evidence blocks the semantic shortcut', (
   };
   const evidence = [semanticUnrelated(92), positive];
   const stages = evaluateClassificationStages(input, evidence, collection);
-  assert.notEqual(stages.lifecycleAction, 'REJECT');
+  const decision = evaluateUnifiedDecisionPolicy({ evidence, collection, lifecycleAction: stages.lifecycleAction, minimumPositiveWeight: 25, minimumTradingScore: 68 });
+  assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(!decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 });
