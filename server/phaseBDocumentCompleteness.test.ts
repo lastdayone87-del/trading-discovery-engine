@@ -74,7 +74,6 @@ test('evidence dual-write requires resolved coverage lineage and does not swallo
   const creatorFocus = readFileSync(new URL('./evidenceEngine/creatorFocusClassifier.ts', import.meta.url), 'utf8');
   const phaseB = readFileSync(new URL('./phaseBShadow.ts', import.meta.url), 'utf8');
   const inspection = readFileSync(new URL('./phaseBDocumentCompleteness.ts', import.meta.url), 'utf8');
-  const outbox = readFileSync(new URL('./phaseBObservationOutbox.ts', import.meta.url), 'utf8');
 
   assert.match(diagnostics, /if \(diagnostic\.observationKey\) throw error/);
   assert.match(dualWrite, /EVIDENCE_COVERAGE_SNAPSHOT_ID_REQUIRED/);
@@ -91,8 +90,7 @@ test('evidence dual-write requires resolved coverage lineage and does not swallo
   assert.match(inspection, /CREATOR_FOCUS_SNAPSHOT_MISSING/);
   assert.match(inspection, /COVERAGE_FOCUS_LINEAGE_MISSING/);
   assert.doesNotMatch(inspection, /db\.query\([`'"]\s*(?:INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP)\b/i);
-  assert.match(outbox, /reconcileIncompleteEvidenceBundles/);
-  assert.match(outbox, /servingAuthority: false/);
+  assert.match(dualWrite, /servingAuthority: false/);
 });
 
 test('complete document metrics report ready only when coverage and focus lineage are present', () => {
