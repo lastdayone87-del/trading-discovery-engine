@@ -137,12 +137,13 @@ async function acquireGeminiCapacity(context:ProviderCallContext):Promise<Gemini
   }catch(error){
     if(client){await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();}
     if(error instanceof ProviderCallError) throw error;
-    // Semantic evidence is more important than the governor itself. If the
-    // capacity ledger is temporarily unavailable, fail open for semantic work
-    // but fail closed for optional vocabulary extraction.
     if(context.operation===GEMINI_VOCABULARY_OPERATION) throw new ProviderCallError('Gemini vocabulary extraction deferred because capacity state is unavailable.','TRANSIENT',true,{cause:error,providerReasons:['VOCABULARY_CAPACITY_STATE_UNAVAILABLE']});
     return undefined;
   }
+}
+
+function safeProviderReasons(values?:string[]):string[]{
+  return Array.isArray(values)?values.map(String).filter(value=>/^[A-Z0-9_.:-]{1,80}$/.test(value)).slice(0,6):[];
 }
 
 /** Bounds the caller, propagates cancellation, and emits metadata only (never payloads). */
@@ -157,13 +158,20 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     args.trace?.('before provider-call at server/providerResilience.ts');
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
-    // Telemetry is observational. A telemetry-sink failure must never turn a
-    // successful provider response into a provider failure.
     await args.emit({...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0}).catch(()=>undefined);
     return value;
   }catch(error){
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
+    if(args.context.provider==='gemini'){
+      console.warn('[Gemini Provider Diagnostic]',JSON.stringify({
+        operation:args.context.operation,
+        errorClass:typed.errorClass,
+        status:typed.status??null,
+        retryable:typed.retryable,
+        providerReasons:safeProviderReasons(typed.providerReasons)
+      }));
+    }
     await args.emit({...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass}).catch(()=>undefined);
     throw typed;
   }finally{
