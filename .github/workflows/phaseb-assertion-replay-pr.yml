@@ -8,6 +8,8 @@ on:
       - 'server/candidateAdmission/stage0AssertionReplay.test.ts'
       - 'server/candidateAdmission/stage0OperatorVisibleAssertionReplay.ts'
       - 'server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts'
+      - 'server/providerResilience.ts'
+      - 'server/providerResilience.test.ts'
       - 'scripts/stage0OperatorVisibleAssertionReplay.ts'
       - 'package.json'
       - '.github/workflows/stage0-operator-visible-counterfactual.yml'
@@ -29,7 +31,7 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm install
-      - name: Assertion replay tests
-        run: node --import tsx --test server/candidateAdmission/stage0AssertionReplay.test.ts server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts
+      - name: Assertion replay and provider-capacity tests
+        run: node --import tsx --test server/candidateAdmission/stage0AssertionReplay.test.ts server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts server/providerResilience.test.ts
       - name: Build
         run: npm run build
