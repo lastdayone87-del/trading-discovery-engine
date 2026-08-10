@@ -1,0 +1,39 @@
+name: Stage 0 Coverage Lineage Audit PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/candidateAdmission/stage0CoverageLineageAudit.ts'
+      - 'server/candidateAdmission/stage0CoverageLineageAudit.test.ts'
+      - 'scripts/stage0CoverageLineageAudit.ts'
+      - '.github/workflows/stage0-coverage-lineage-audit.yml'
+      - '.github/workflows/stage0-coverage-lineage-audit-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Lineage audit tests
+        run: node --import tsx --test server/candidateAdmission/stage0CoverageLineageAudit.test.ts
+      - name: Verify read-only contract
+        run: |
+          set -euo pipefail
+          grep -q 'BEGIN TRANSACTION READ ONLY' server/candidateAdmission/stage0CoverageLineageAudit.ts
+          ! grep -E '\b(INSERT|UPDATE|DELETE)\b' server/candidateAdmission/stage0CoverageLineageAudit.ts scripts/stage0CoverageLineageAudit.ts
+      - name: Build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
