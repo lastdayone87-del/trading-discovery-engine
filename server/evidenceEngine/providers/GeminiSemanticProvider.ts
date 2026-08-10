@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { appendProviderCallEvent } from '../../db';
-import { executeProviderCall } from '../../providerResilience';
+import { executeProviderCall, ProviderCallError } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { documentRef } from '../canonicalEvidencePlane';
@@ -84,6 +84,17 @@ function parse(value: any): SemanticModelResult {
   };
 }
 
+async function classifyCandidateWith404Fallback(client: SemanticModelClient, candidatePrompt: string, candidateModel: string, fallbackModel: string) {
+  try {
+    return { value: await client.classify(candidatePrompt, candidateModel), model: candidateModel, fallbackUsed: false };
+  } catch (error) {
+    const isModel404 = error instanceof ProviderCallError && error.errorClass === 'PERMANENT_INPUT' && error.status === 404;
+    if (!isModel404 || candidateModel === fallbackModel) throw error;
+    console.warn('[Gemini Semantic] Candidate model returned 404; retrying once with configured adjudicator model.', { candidateModel, fallbackModel });
+    return { value: await client.classify(candidatePrompt, fallbackModel), model: fallbackModel, fallbackUsed: true };
+  }
+}
+
 export class GeminiSemanticProvider implements EvidenceProvider {
   name = 'gemini_semantic' as const;
   constructor(private readonly injectedClient?: SemanticModelClient) {}
@@ -95,9 +106,12 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     if (!client) return [];
     const candidateModel = process.env.MULTILINGUAL_CANDIDATE_MODEL || 'gemini-2.5-flash-lite';
     const adjudicatorModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL || 'gemini-2.5-flash';
-    let result = parse(await client.classify(prompt(input, 'CANDIDATE'), candidateModel));
-    let model = candidateModel;
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true') {
+    const candidatePrompt = prompt(input, 'CANDIDATE');
+    const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel);
+    let result = parse(candidate.value);
+    let model = candidate.model;
+    const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
+    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && model !== adjudicatorModel) {
       result = parse(await client.classify(prompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
@@ -106,7 +120,7 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
-    const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : [])] };
+    const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : [])] };
     const citations=result.citations.map(ref=>{const video=ref.field==='video_title'||ref.field==='video_description'?input.videos?.[ref.index||0]:undefined,family=video?.source_family_id||(ref.field==='channel_title'||ref.field==='channel_bio'?input.channel_source_family_id:undefined),entity=video?.source_entity_id||((video||ref.field==='channel_title'||ref.field==='channel_bio')?input.channel_entity_id:undefined);return {...ref,...(family?{sourceFamilyId:family}:{}),...(entity?{sourceEntityId:entity}:{})};});
     return [{
       id: `semantic_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, source: this.name, polarity: positive || abstained ? 'POSITIVE' : 'NEGATIVE', category,
