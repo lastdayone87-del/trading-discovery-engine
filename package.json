@@ -3,9 +3,6 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "engines": {
-    "node": ">=22 <23"
-  },
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
@@ -25,6 +22,8 @@
     ,"phaseb:history-readiness": "tsx scripts/phaseBHistoryReadiness.ts"
     ,"phaseb:observation-completeness": "tsx scripts/phaseBObservationCompleteness.ts"
     ,"phaseb:document-completeness": "tsx scripts/phaseBDocumentCompleteness.ts"
+    ,"phaseb:declare-collection-epoch": "tsx scripts/phaseBDeclareCollectionEpoch.ts"
+    ,"phaseb:collection-epoch-readiness": "tsx scripts/phaseBCollectionEpochReadiness.ts"
     ,"phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts"
     ,"phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts"
     ,"creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts"
@@ -37,35 +36,39 @@
     "phase10:verify": "npm test && npm run lint && npm run build",
     "phase11:verify": "npm test && npm run lint && npm run build",
     "phase12:verify": "npm test && npm run lint && npm run build",
-    "phase13:verify": "npm test && npm run lint && npm run build",
-    "phase14:verify": "npm test && npm run lint && npm run build",
-    "phase15:verify": "npm test && npm run lint && npm run build"
+    "phase13:verify": "npm test && npm run lint && npm run build"
   },
   "dependencies": {
-    "@google/genai": "^2.4.0",
+    "@google/generative-ai": "^0.24.1",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
-    "cheerio": "^1.2.0",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
-    "react": "^19.0.1",
-    "react-dom": "^19.0.1",
-    "sql.js": "^1.14.1",
-    "vite": "^6.2.3",
-    "pg": "^8.13.1"
+    "pg": "^8.16.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sql.js": "^1.13.0",
+    "tailwind-merge": "^3.5.0",
+    "vite": "^6.2.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
-    "@types/sql.js": "^1.4.11",
+    "@types/pg": "^8.15.5",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
-    "vite": "^6.2.3",
-    "@types/pg": "^8.11.10"
+    "vite": "^6.2.0"
+  },
+  "engines": {
+    "node": ">=22 <23"
   }
 }
