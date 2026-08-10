@@ -22,3 +22,87 @@ export function projectDiscordValidation(current:ChannelRecord,validation:Discor
     discord_discovery_status:validation.validationStatus==='SUCCEEDED'||validation.validationStatus==='COMPLETED'?'VALIDATED':'DISCOVERED_VALIDATION_FAILED'
   };
 }
+
+/**
+ * Fail-closed reconciliation of Discord discovery state against the *current*
+ * inspection result. Called on success, absence safety, and catch paths of
+ * inspectAndValidateChannel before persistence.
+ *
+ * Invariant: if the current inspection structurally discovered a native
+ * Discord candidate, the channel must not remain NOT_FOUND / NOT_DISCOVERED.
+ * Historical pure-absence is overwritten by current discovery evidence.
+ * Successful VALIDATED states (ACTIVE/DEAD) are never downgraded.
+ * Genuine complete inspections that retained zero candidates are left alone
+ * so the absence path can still project NOT_FOUND / NOT_DISCOVERED.
+ */
+export function reconcileDiscordDiscoveryFromInspection(
+  channel: ChannelRecord,
+  inspection: {
+    discordCandidates?: DiscordCandidate[] | null;
+    foundInvite?: string | null;
+    steps?: Array<{ status?: string; detectedInvite?: string | null; details?: string | string[] }> | null;
+  } | null | undefined,
+  options?: { validationProjected?: boolean }
+): void {
+  const candidates = (inspection?.discordCandidates || []).filter(
+    (c): c is DiscordCandidate & { nativeInviteCode: string } => !!c?.nativeInviteCode
+  );
+  const hasStructured = candidates.length > 0 || !!inspection?.foundInvite;
+
+  const trail = inspection?.steps || channel.inspection_trail || [];
+  const trailFound = Array.isArray(trail) && trail.some((step: any) => {
+    if (!step || step.status !== 'FOUND') return false;
+    if (step.detectedInvite) return true;
+    const details = Array.isArray(step.details) ? step.details.join('\n') : String(step.details || '');
+    return /discord\.(gg|com\/invite|app\.com\/invite)/i.test(details) || /Invite Code\s*["']?[a-zA-Z0-9_-]+/i.test(details);
+  });
+
+  if (!hasStructured && !trailFound) {
+    return;
+  }
+
+  const isPureAbsence =
+    channel.discord_status === 'NOT_FOUND' ||
+    channel.discord_discovery_status === 'NOT_DISCOVERED' ||
+    channel.discord_discovery_status == null;
+
+  const alreadyValidatedSuccess =
+    channel.discord_discovery_status === 'VALIDATED' &&
+    (channel.discord_status === 'ACTIVE' || channel.discord_status === 'DEAD');
+
+  if (alreadyValidatedSuccess) {
+    return;
+  }
+
+  if (isPureAbsence || channel.discord_status === 'PENDING' || !channel.discord_status) {
+    channel.discord_status = 'UNCERTAIN';
+  }
+  if (channel.discord_discovery_status !== 'VALIDATED') {
+    channel.discord_discovery_status = 'DISCOVERED_VALIDATION_FAILED';
+  }
+
+  if (candidates.length > 0 && !channel.discord_candidate_locator) {
+    const primary = candidates[0];
+    channel.discord_candidate_locator =
+      primary.normalizedLocator || `https://discord.gg/${primary.nativeInviteCode}`;
+    channel.discord_candidate_id = primary.candidateId;
+    channel.discord_candidate_raw_locator = primary.rawLocator;
+    channel.discord_candidate_type = primary.locatorType;
+  }
+
+  if (!options?.validationProjected) {
+    if (
+      !channel.discord_validation_status ||
+      channel.discord_validation_status === 'NOT_STARTED' ||
+      channel.discord_validation_status === 'COMPLETED'
+    ) {
+      channel.discord_validation_status = 'RETRY_PENDING';
+    }
+    if (!channel.discord_liveness_status || channel.discord_liveness_status === 'NOT_CHECKED') {
+      channel.discord_liveness_status = 'UNCERTAIN';
+    }
+    if (!channel.discord_resolution_status || channel.discord_resolution_status === 'NOT_ATTEMPTED') {
+      channel.discord_resolution_status = 'RESOLVED';
+    }
+  }
+}
