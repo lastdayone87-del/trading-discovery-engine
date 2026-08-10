@@ -1,0 +1,59 @@
+name: Stage 1 review history storage-origin audit
+
+on:
+  pull_request:
+    paths:
+      - 'server/candidateAdmission/stage1ReviewHistoryStorageAudit.ts'
+      - 'server/candidateAdmission/stage1ReviewHistoryStorageAudit.test.ts'
+      - 'scripts/stage1ReviewHistoryStorageAudit.ts'
+      - '.github/workflows/stage1-review-history-storage-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Audit tests
+        run: node --import tsx --test server/candidateAdmission/stage1ReviewHistoryStorageAudit.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify read-only boundary
+        run: |
+          set -euo pipefail
+          FILE=server/candidateAdmission/stage1ReviewHistoryStorageAudit.ts
+          grep -q 'BEGIN TRANSACTION READ ONLY' "$FILE"
+          ! grep -Eiq '\b(INSERT|UPDATE|DELETE|ALTER|DROP|TRUNCATE)\b' "$FILE"
+
+  production-audit:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Run Stage 1 review history storage-origin audit
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage1ReviewHistoryStorageAudit.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage1-review-history-storage-audit-${{ github.run_id }}
+          path: stage1-output/stage1-review-history-storage-audit.json
+          retention-days: 30
