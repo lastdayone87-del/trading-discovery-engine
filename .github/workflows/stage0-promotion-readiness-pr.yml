@@ -1,0 +1,42 @@
+name: Stage 0 Promotion Readiness PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/candidateAdmission/stage0PromotionReadiness.ts'
+      - 'server/candidateAdmission/stage0PromotionReadiness.test.ts'
+      - 'scripts/stage0PromotionReadiness.ts'
+      - 'package.json'
+      - '.github/workflows/stage0-promotion-readiness-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Stage 0 promotion gate tests
+        run: node --import tsx --test server/candidateAdmission/stage0PromotionReadiness.test.ts
+      - name: Verify gate cannot serve or auto-promote
+        run: |
+          set -euo pipefail
+          grep -q "servingAuthority: false" server/candidateAdmission/stage0PromotionReadiness.ts
+          grep -q "automaticPromotion: false" server/candidateAdmission/stage0PromotionReadiness.ts
+          ! grep -E '\b(INSERT|UPDATE|DELETE)\b' server/candidateAdmission/stage0PromotionReadiness.ts scripts/stage0PromotionReadiness.ts
+      - name: Build
+        run: npm run build
+      - name: Lint
+        run: npm run lint
+      - name: Diff check
+        run: git diff --check
