@@ -24,6 +24,7 @@
     ,"phaseb:document-completeness": "tsx scripts/phaseBDocumentCompleteness.ts"
     ,"phaseb:declare-collection-epoch": "tsx scripts/phaseBDeclareCollectionEpoch.ts"
     ,"phaseb:collection-epoch-readiness": "tsx scripts/phaseBCollectionEpochReadiness.ts"
+    ,"phaseb:prospective-monitoring": "tsx scripts/phaseBProspectiveMonitoring.ts"
     ,"phased:calibrate-voi": "tsx scripts/phaseDCalibrateVoi.ts"
     ,"phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts"
     ,"creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts"
