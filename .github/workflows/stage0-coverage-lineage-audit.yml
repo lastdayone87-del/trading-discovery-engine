@@ -1,0 +1,52 @@
+name: Stage 0 coverage lineage audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Verify read-only contract
+        run: |
+          set -euo pipefail
+          grep -q 'BEGIN TRANSACTION READ ONLY' server/candidateAdmission/stage0CoverageLineageAudit.ts
+          grep -q 'classification_diagnostic_id=lf.classification_diagnostic_id' server/candidateAdmission/stage0CoverageLineageAudit.ts
+          ! grep -E '\b(INSERT|UPDATE|DELETE)\b' server/candidateAdmission/stage0CoverageLineageAudit.ts scripts/stage0CoverageLineageAudit.ts
+      - name: Run coverage lineage audit
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage0CoverageLineageAudit.ts > stage0-console.json
+          test -f stage0-output/stage0-coverage-lineage-audit.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('stage0-output/stage0-coverage-lineage-audit.json').read_text())
+          assert report['readOnly'] is True
+          assert report['servingAuthority'] is False
+          assert report['automaticPromotion'] is False
+          print(json.dumps(report['totals'], indent=2))
+          PY
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-coverage-lineage-audit-${{ github.run_id }}
+          path: |
+            stage0-output/stage0-coverage-lineage-audit.json
+            stage0-console.json
+          retention-days: 30
