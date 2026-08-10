@@ -1,0 +1,33 @@
+name: Manual Recheck Classification PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/queueManager.ts'
+      - 'server/ingestionPipeline.ts'
+      - 'server/manualRecheckClassification.test.ts'
+      - '.github/workflows/manual-recheck-classification-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Manual recheck and provider regression tests
+        run: node --import tsx --test server/manualRecheckClassification.test.ts server/providerResilience.test.ts server/evidenceEngine/providerFailureDiagnostics.test.ts
+      - name: Build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check HEAD~1 HEAD || git diff --check
