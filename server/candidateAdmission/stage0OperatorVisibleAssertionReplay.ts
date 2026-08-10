@@ -28,6 +28,8 @@ const json = <T>(value: T | string | null | undefined): T => {
 
 const checksum = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
+type CoverageLineageSource = 'DIRECT_LINK' | 'RECOVERED_EXACT_DIAGNOSTIC' | 'AMBIGUOUS_DIAGNOSTIC_COVERAGE' | 'COVERAGE_MISSING';
+
 function documentFromRow(row: any): EvidenceDocumentObservation {
   return {
     documentKey: String(row.document_key), canonicalDocumentId: String(row.canonical_document_id),
@@ -75,7 +77,11 @@ function languageFromCoverage(coverage: EvidenceCoverageSnapshot): string {
 function replayInputGaps(row: any): string[] {
   const gaps: string[] = [];
   if (!row.classification_diagnostic_id) gaps.push('CLASSIFICATION_DIAGNOSTIC_LINK_MISSING');
-  if (!row.coverage_snapshot_id) gaps.push('COVERAGE_SNAPSHOT_LINK_MISSING');
+  if (!row.coverage_snapshot_id) {
+    gaps.push(row.coverage_lineage_source === 'AMBIGUOUS_DIAGNOSTIC_COVERAGE'
+      ? 'COVERAGE_SNAPSHOT_LINEAGE_AMBIGUOUS'
+      : 'COVERAGE_SNAPSHOT_LINK_MISSING');
+  }
   if (!row.normalized_input) gaps.push('NORMALIZED_INPUT_MISSING');
   if (row.evidence_items == null) gaps.push('EVIDENCE_ITEMS_MISSING');
   if (!row.document_keys || (Array.isArray(row.document_keys) && row.document_keys.length === 0)) gaps.push('DOCUMENT_KEYS_MISSING');
@@ -115,6 +121,12 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
       )
       SELECT v.*, lr.review_decision, lf.classification_diagnostic_id, lf.document_keys,
              d.normalized_input, d.evidence_items, d.created_at AS diagnostic_created_at,
+             CASE
+               WHEN lf.evidence_coverage_snapshot_id IS NOT NULL THEN 'DIRECT_LINK'
+               WHEN exact_coverage.candidate_count = 1 THEN 'RECOVERED_EXACT_DIAGNOSTIC'
+               WHEN exact_coverage.candidate_count > 1 THEN 'AMBIGUOUS_DIAGNOSTIC_COVERAGE'
+               ELSE 'COVERAGE_MISSING'
+             END AS coverage_lineage_source,
              c.id AS coverage_snapshot_id, c.snapshot_key AS coverage_snapshot_key,
              c.subject_entity_id AS coverage_subject_entity_id, c.requested_sampling_strategy,
              c.observed_document_counts, c.temporal_coverage, c.language_coverage,
@@ -134,7 +146,16 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
         FROM visible v
         LEFT JOIN latest_focus lf ON lf.channel_id=v.channel_id
         LEFT JOIN production_classification_diagnostics d ON d.id=lf.classification_diagnostic_id
-        LEFT JOIN evidence_coverage_snapshots c ON c.id=lf.evidence_coverage_snapshot_id
+        LEFT JOIN LATERAL (
+          SELECT count(*)::int AS candidate_count, min(ec.id::text) AS sole_coverage_id
+            FROM evidence_coverage_snapshots ec
+           WHERE ec.classification_diagnostic_id=lf.classification_diagnostic_id
+        ) exact_coverage ON true
+        LEFT JOIN evidence_coverage_snapshots c
+          ON c.id::text = COALESCE(
+            lf.evidence_coverage_snapshot_id::text,
+            CASE WHEN exact_coverage.candidate_count=1 THEN exact_coverage.sole_coverage_id END
+          )
         LEFT JOIN latest_review lr ON lr.channel_id=v.channel_id
        ORDER BY v.channel_id`);
     await db.query('ROLLBACK');
@@ -144,6 +165,9 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
     const excludedExamples: Array<{exampleKey:string;channelId:string;reasonCode:string}> = [];
     const decisionCounts: Record<OfflineAdmissionV2Decision, number> = { ADMIT_CONFIRMED:0, ADMIT_REVIEW:0, WITHHOLD:0, DEFER_INVESTIGATION:0 };
     const exclusionGapCounts: Record<string, number> = {};
+    const coverageLineageCounts: Record<CoverageLineageSource, number> = {
+      DIRECT_LINK:0, RECOVERED_EXACT_DIAGNOSTIC:0, AMBIGUOUS_DIAGNOSTIC_COVERAGE:0, COVERAGE_MISSING:0
+    };
     const projectionTotals: Record<string, number> = {
       evidenceItems: 0, positiveEvidenceItems: 0, negativeEvidenceItems: 0, abstentionEvidenceItems: 0,
       projectableEvidenceItems: 0, droppedNoRawMatches: 0, droppedNoSupportingDocument: 0, assertions: 0
@@ -154,11 +178,13 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
     for (const row of result.rows) {
       const channelId = String(row.channel_id);
       const exampleKey = `operator-visible-replay:${channelId}`;
+      const coverageLineageSource = String(row.coverage_lineage_source || 'COVERAGE_MISSING') as CoverageLineageSource;
+      coverageLineageCounts[coverageLineageSource] = (coverageLineageCounts[coverageLineageSource] || 0) + 1;
       const inputGaps = replayInputGaps(row);
       if (inputGaps.length) {
         inputGaps.forEach(gap => increment(exclusionGapCounts, gap));
         excludedExamples.push({ exampleKey, channelId, reasonCode: 'REPLAY_INPUT_INCOMPLETE' });
-        rows.push({ channelId, channelName: row.channel_name, exclusionReason: 'REPLAY_INPUT_INCOMPLETE', replayInputGaps: inputGaps });
+        rows.push({ channelId, channelName: row.channel_name, coverageLineageSource, exclusionReason: 'REPLAY_INPUT_INCOMPLETE', replayInputGaps: inputGaps });
         continue;
       }
       const coverage = coverageFromRow(row);
@@ -166,7 +192,7 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
       if (!documents.length) {
         increment(exclusionGapCounts, 'REPLAY_DOCUMENTS_MISSING');
         excludedExamples.push({ exampleKey, channelId, reasonCode: 'REPLAY_DOCUMENTS_MISSING' });
-        rows.push({ channelId, channelName: row.channel_name, exclusionReason: 'REPLAY_DOCUMENTS_MISSING', replayInputGaps: ['REPLAY_DOCUMENTS_MISSING'] });
+        rows.push({ channelId, channelName: row.channel_name, coverageLineageSource, exclusionReason: 'REPLAY_DOCUMENTS_MISSING', replayInputGaps: ['REPLAY_DOCUMENTS_MISSING'] });
         continue;
       }
       const rawInput = json<RawChannelInput>(row.normalized_input);
@@ -208,7 +234,7 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
         creatorFocusProbability:replay.decision.probability,
         creatorFocusLowerConfidenceBound:replay.decision.lowerConfidenceBound,
         creatorFocusReasonCodes:replay.decision.reasonCodes,
-        creatorFocusStageReport:{ stages: replay.decision.stages, historicalReplay:true, persisted:false },
+        creatorFocusStageReport:{ stages: replay.decision.stages, historicalReplay:true, persisted:false, coverageLineageSource },
         creatorFocusPolicyVersion:replay.decision.policyVersion, coverage:offlineCoverage
       };
       const admission = evaluateOfflineAdmissionV2(example);
@@ -218,6 +244,7 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
         channelId, channelName:String(row.channel_name||''), country:String(row.country||'UNKNOWN'),
         discoverySource:String(row.discovery_source||'UNKNOWN'), tradingStatus:String(row.trading_status||'UNKNOWN'),
         productionScore:Number(row.trading_confidence_score)||0, tradingCategory:String(row.trading_category||'General Trading'),
+        coverageLineageSource, coverageSnapshotId:String(row.coverage_snapshot_id),
         evidenceItemCount:diagnostics.evidenceItemCount, positiveEvidenceItemCount:diagnostics.positiveEvidenceItemCount,
         negativeEvidenceItemCount:diagnostics.negativeEvidenceItemCount, abstentionEvidenceItemCount:diagnostics.abstentionEvidenceItemCount,
         projectableEvidenceItemCount:diagnostics.projectableEvidenceItemCount, droppedNoRawMatches:diagnostics.droppedNoRawMatches,
@@ -246,10 +273,10 @@ export async function evaluateOperatorVisibleAssertionReplay(): Promise<Record<s
       totals:{ operatorVisibleChannels:operatorVisible, evaluated, excluded:operatorVisible-evaluated,
         historicalEvidenceEligibilityRate:operatorVisible ? evaluated/operatorVisible : null, decisionCounts,
         projectedDashboardVisible:decisionCounts.ADMIT_CONFIRMED+decisionCounts.ADMIT_REVIEW,
-        exclusionGapCounts, projectionTotals, projectedTaxonomyTotals, droppedTaxonomyTotals },
+        coverageLineageCounts, exclusionGapCounts, projectionTotals, projectedTaxonomyTotals, droppedTaxonomyTotals },
       labeledMetrics:labeledReport?.metrics || null, hypothesisAssessment:labeledReport?.hypothesisAssessment || null,
       rows,
-      inputChecksum:checksum(rows.map(row=>({channelId:row.channelId,assertionCount:row.assertionCount,decision:row.decision,exclusionReason:row.exclusionReason})))
+      inputChecksum:checksum(rows.map(row=>({channelId:row.channelId,coverageLineageSource:row.coverageLineageSource,assertionCount:row.assertionCount,decision:row.decision,exclusionReason:row.exclusionReason})))
     };
   } catch (error) {
     await db.query('ROLLBACK').catch(()=>undefined);
