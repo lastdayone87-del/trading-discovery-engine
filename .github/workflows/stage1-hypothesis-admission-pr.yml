@@ -1,0 +1,33 @@
+name: Stage 1 Hypothesis Admission PR
+
+on:
+  pull_request:
+    paths:
+      - 'server/candidateAdmission/offlineStage1.ts'
+      - 'server/candidateAdmission/offlineStage1.test.ts'
+      - '.github/workflows/stage1-hypothesis-admission-pr.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Stage 1 policy tests
+        run: node --import tsx --test server/candidateAdmission/offlineStage1.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify non-serving contract
+        run: |
+          set -euo pipefail
+          grep -q 'servingAuthority: false' server/candidateAdmission/offlineStage1.ts
+          ! grep -E '\b(INSERT|UPDATE|DELETE)\b' server/candidateAdmission/offlineStage1.ts
