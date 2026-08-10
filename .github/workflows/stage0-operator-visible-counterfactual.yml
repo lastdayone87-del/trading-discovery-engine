@@ -29,28 +29,39 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Materialize Stage 0 evaluator from chunked payload
+      - name: Verify Stage 0 evaluator is read-only and reuses Offline V2
         run: |
           set -euo pipefail
-          cat scripts/stage0_module.b64.part* | tr -d '\n' | base64 -d > server/candidateAdmission/stage0OperatorVisible.ts
-          python3 - <<'PY'
-          from pathlib import Path
-          text = Path("server/candidateAdmission/stage0OperatorVisible.ts").read_text()
-          assert "evaluateOfflineAdmissionV2" in text
-          assert "BEGIN TRANSACTION READ ONLY" in text
-          assert "PLACEHOLDER" not in text
-          print("materialized bytes", Path("server/candidateAdmission/stage0OperatorVisible.ts").stat().st_size)
-          PY
+          test -f server/candidateAdmission/stage0OperatorVisible.ts
+          grep -q 'evaluateOfflineAdmissionV2' server/candidateAdmission/stage0OperatorVisible.ts
+          grep -q 'BEGIN TRANSACTION READ ONLY' server/candidateAdmission/stage0OperatorVisible.ts
+          grep -q 'OPERATOR_VISIBLE_CHANNEL_SQL\|country_status <> .REJECTED' server/candidateAdmission/stage0OperatorVisible.ts
+          ! grep -E 'PLACEHOLDER' server/candidateAdmission/stage0OperatorVisible.ts
+          ! grep -E '\b(INSERT|UPDATE|DELETE)\b' server/candidateAdmission/stage0OperatorVisible.ts
+          echo "Stage 0 evaluator checks passed"
 
       - name: Run Stage 0 operator-visible counterfactual
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           NODE_ENV: production
         run: |
-          test -n "$DATABASE_URL"
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
           mkdir -p stage0-output
           npm run stage0:operator-visible > stage0-output/stage0-console.json
           test -f stage0-output/stage0-operator-visible-counterfactual.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("stage0-output/stage0-operator-visible-counterfactual.json").read_text())
+          assert report.get("servingAuthority") is False
+          assert report.get("readOnly") is True
+          print("operatorVisible", report["totals"]["operatorVisibleChannels"])
+          print("evaluated", report["totals"]["evaluatedWithFocusAndCoverage"])
+          print("eligibility", report["totals"]["historicalEvidenceEligibilityRate"])
+          print("reliable", report["totals"]["reliableForPopulationInference"])
+          print("decisions", report["totals"]["decisionCounts"])
+          PY
 
       - name: Upload Stage 0 report
         uses: actions/upload-artifact@v4
