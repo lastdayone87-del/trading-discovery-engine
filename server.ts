@@ -427,7 +427,15 @@ async function startServer() {
       const result = await triggerManualRecheck(req.params.id, req.query.debug === 'true');
       res.json(result);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      console.error('[Manual Re-scan Failed]', { requestId: req.requestId, channelId: req.params.id, error: err?.message || String(err) });
+      res.status(500).json({
+        success: false,
+        message: 'Manual re-scan failed due to an operational upstream error. Retry the scan.',
+        error: 'Manual re-scan could not complete.',
+        code: 'MANUAL_RESCAN_OPERATIONAL_FAILURE',
+        retryable: true,
+        requestId: req.requestId
+      });
     }
   });
 

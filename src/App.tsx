@@ -190,13 +190,23 @@ export default function App() {
 
   const handleRecheck = async (channelId: string) => {
     try {
-      const res = await apiFetch(`/api/channels/${channelId}/recheck`, {
+      const res = await apiFetch(`/api/channels/${encodeURIComponent(channelId)}/recheck`, {
         method: 'POST'
       });
-      const data = await res.json();
+      const contentType = res.headers.get('content-type') || '';
+      const data = contentType.toLowerCase().includes('json') ? await res.json().catch(() => null) : null;
+      const requestId = res.headers.get('x-request-id');
+      const requestSuffix = requestId ? ` (request ${requestId})` : '';
+      if (!data) {
+        throw new Error(`Manual re-scan API returned a non-JSON response (HTTP ${res.status})${requestSuffix}. The upstream provider may be temporarily unavailable; retry the scan.`);
+      }
+      if (!res.ok) {
+        throw new Error(data.error || data.message || `Manual re-scan failed (HTTP ${res.status})${requestSuffix}.`);
+      }
       if (data.channel) {
         setInspectingChannel(data.channel);
-      } else if (!data.success && data.message) {
+      }
+      if (data.success === false && data.message) {
         alert(data.message);
       }
       await fetchChannels();

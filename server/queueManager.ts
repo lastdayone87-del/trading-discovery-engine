@@ -424,7 +424,7 @@ export async function inspectAndValidateChannel(
   isManualScan: boolean = false,
   enableDebug: boolean = false,
   scheduleRetry: boolean = true
-): Promise<{ debugLog?: any } | void> {
+): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>> } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
     return;
@@ -599,7 +599,7 @@ export async function inspectAndValidateChannel(
   } finally {
     await upsertChannel(channel);
   }
-  if (enableDebug) return { debugLog: finalDebugLog };
+  return { debugLog: enableDebug ? finalDebugLog : undefined, inspection };
 }
 
 export function communityAcquisitionRetryKey(channelId:string):string{return `community-acquisition-retry:${channelId}`;}
@@ -668,7 +668,7 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
  * Runs 4-step inspection synchronously with force live YouTube scraping.
  * Does NOT schedule any automatic future rechecks.
  */
-export async function triggerManualRecheck(channelId: string, enableDebug?: boolean): Promise<{ success: boolean; message: string; channel?: ChannelRecord; debugLog?: any }> {
+export async function triggerManualRecheck(channelId: string, enableDebug?: boolean): Promise<{ success: boolean; message: string; channel?: ChannelRecord; debugLog?: any; code?: string; retryable?: boolean }> {
   const channel = await getChannelById(channelId);
   if (!channel) {
     return { success: false, message: 'Channel not found in database.' };
@@ -710,6 +710,20 @@ export async function triggerManualRecheck(channelId: string, enableDebug?: bool
 
   const updatedChannel = await getChannelById(channelId);
   console.log(`[Manual Scan Completed] Channel: ${channel.channel_name}, Discord Status: ${updatedChannel?.discord_status || 'NOT_FOUND'}`);
+
+  const inspectionResult=(inspectRes as any)?.inspection as Awaited<ReturnType<typeof runChannelInspection>>|undefined;
+  const incompleteAcquisition=inspectionResult?.acquisitionStatus==='ACQUISITION_FAILED'||inspectionResult?.acquisitionStatus==='PARTIALLY_INSPECTED';
+  if(incompleteAcquisition){
+    const failureDetail=inspectionResult?.acquisitionOutcomes?.find(item=>item.outcome==='ACQUISITION_FAILED')?.detail;
+    return {
+      success:false,
+      message:`Manual re-scan could not complete because an upstream acquisition failed. Previously collected inspection and Discord discovery evidence was preserved; retry is recommended.${failureDetail?` ${failureDetail}`:''}`,
+      code:'MANUAL_RESCAN_UPSTREAM_FAILURE',
+      retryable:true,
+      channel:updatedChannel||undefined,
+      debugLog:inspectRes ? (inspectRes as any).debugLog : undefined
+    };
+  }
 
   return {
     success: true,
