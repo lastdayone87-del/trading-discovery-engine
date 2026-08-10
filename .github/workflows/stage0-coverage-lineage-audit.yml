@@ -2,6 +2,12 @@ name: Stage 0 coverage lineage audit
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'server/candidateAdmission/stage0CoverageLineageAudit.ts'
+      - 'scripts/stage0CoverageLineageAudit.ts'
+      - '.github/workflows/stage0-coverage-lineage-audit.yml'
 
 permissions:
   contents: read
