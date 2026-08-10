@@ -1,3 +1,41 @@
-import {getDb} from '../db';import type {EvidenceCoverageSnapshot} from './documentTypes';
-export async function persistEvidenceCoverage(snapshot:EvidenceCoverageSnapshot){const db=await getDb();const result=await db.query(`INSERT INTO evidence_coverage_snapshots(snapshot_key,channel_id,subject_entity_id,classification_diagnostic_id,requested_sampling_strategy,observed_document_counts,temporal_coverage,language_coverage,independent_family_count,provider_availability,acquisition_failures,oldest_document_at,latest_document_at,expected_document_count,observed_document_count,completeness_disposition,reason_codes,input_checksum,policy_version,schema_version,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) ON CONFLICT(snapshot_key) DO NOTHING RETURNING id`,[snapshot.snapshotKey,snapshot.channelId,snapshot.subjectEntityId,snapshot.classificationDiagnosticId||null,JSON.stringify(snapshot.requestedSamplingStrategy),JSON.stringify(snapshot.observedDocumentCounts),JSON.stringify(snapshot.temporalCoverage),JSON.stringify(snapshot.languageCoverage),snapshot.independentFamilyCount,JSON.stringify(snapshot.providerAvailability),JSON.stringify(snapshot.acquisitionFailures),snapshot.oldestDocumentAt||null,snapshot.latestDocumentAt||null,snapshot.expectedDocumentCount,snapshot.observedDocumentCount,snapshot.completenessDisposition,JSON.stringify(snapshot.reasonCodes),snapshot.inputChecksum,snapshot.policyVersion,snapshot.schemaVersion,snapshot.observedAt]);return {inserted:!!result.rowCount,id:result.rows[0]?.id};}
-export async function listEvidenceCoverage(input:{channelId?:string;limit?:number;offset?:number;cutoff?:string}={}){const db=await getDb(),limit=Math.min(250,Math.max(1,input.limit||100)),offset=Math.max(0,input.offset||0);const result=await db.query(`SELECT * FROM evidence_coverage_snapshots WHERE ($1::text IS NULL OR channel_id=$1) AND ($2::timestamptz IS NULL OR observed_at<=$2) ORDER BY observed_at DESC,id LIMIT $3 OFFSET $4`,[input.channelId||null,input.cutoff||null,limit,offset]);return result.rows;}
+import { getDb } from '../db';
+import type { EvidenceCoverageSnapshot } from './documentTypes';
+
+export async function persistEvidenceCoverage(snapshot: EvidenceCoverageSnapshot): Promise<{ inserted: boolean; id?: string }> {
+  const db = await getDb();
+  const result = await db.query(
+    `INSERT INTO evidence_coverage_snapshots(
+      snapshot_key,channel_id,subject_entity_id,classification_diagnostic_id,requested_sampling_strategy,
+      observed_document_counts,temporal_coverage,language_coverage,independent_family_count,provider_availability,
+      acquisition_failures,oldest_document_at,latest_document_at,expected_document_count,observed_document_count,
+      completeness_disposition,reason_codes,input_checksum,policy_version,schema_version,observed_at
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+    ON CONFLICT(snapshot_key) DO NOTHING RETURNING id`,
+    [
+      snapshot.snapshotKey, snapshot.channelId, snapshot.subjectEntityId, snapshot.classificationDiagnosticId || null,
+      JSON.stringify(snapshot.requestedSamplingStrategy), JSON.stringify(snapshot.observedDocumentCounts),
+      JSON.stringify(snapshot.temporalCoverage), JSON.stringify(snapshot.languageCoverage), snapshot.independentFamilyCount,
+      JSON.stringify(snapshot.providerAvailability), JSON.stringify(snapshot.acquisitionFailures),
+      snapshot.oldestDocumentAt || null, snapshot.latestDocumentAt || null, snapshot.expectedDocumentCount,
+      snapshot.observedDocumentCount, snapshot.completenessDisposition, JSON.stringify(snapshot.reasonCodes),
+      snapshot.inputChecksum, snapshot.policyVersion, snapshot.schemaVersion, snapshot.observedAt
+    ]
+  );
+  if (result.rows[0]?.id) return { inserted: true, id: String(result.rows[0].id) };
+  const existing = await db.query('SELECT id FROM evidence_coverage_snapshots WHERE snapshot_key=$1', [snapshot.snapshotKey]);
+  return { inserted: false, id: existing.rows[0]?.id ? String(existing.rows[0].id) : undefined };
+}
+
+export async function listEvidenceCoverage(input: { channelId?: string; limit?: number; offset?: number; cutoff?: string } = {}) {
+  const db = await getDb();
+  const limit = Math.min(250, Math.max(1, input.limit || 100));
+  const offset = Math.max(0, input.offset || 0);
+  const result = await db.query(
+    `SELECT * FROM evidence_coverage_snapshots
+      WHERE ($1::text IS NULL OR channel_id=$1)
+        AND ($2::timestamptz IS NULL OR observed_at<=$2)
+      ORDER BY observed_at DESC,id LIMIT $3 OFFSET $4`,
+    [input.channelId || null, input.cutoff || null, limit, offset]
+  );
+  return result.rows;
+}
