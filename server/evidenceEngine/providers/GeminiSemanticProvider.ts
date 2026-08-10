@@ -8,6 +8,8 @@ import { documentRef } from '../canonicalEvidencePlane';
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = ['ACTIVE_TRADING', 'INVESTING_EDUCATION', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'HYPE', 'UNRELATED', 'AMBIGUOUS'] as const;
+export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
+export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
 type SemanticLabel = typeof SEMANTIC_TAXONOMY[number];
 
 export interface SemanticModelResult {
@@ -104,8 +106,8 @@ export class GeminiSemanticProvider implements EvidenceProvider {
   async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const client = this.client();
     if (!client) return [];
-    const candidateModel = process.env.MULTILINGUAL_CANDIDATE_MODEL || 'gemini-2.5-flash-lite';
-    const adjudicatorModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL || 'gemini-2.5-flash';
+    const candidateModel = process.env.MULTILINGUAL_CANDIDATE_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL;
+    const adjudicatorModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL || DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL;
     const candidatePrompt = prompt(input, 'CANDIDATE');
     const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel);
     let result = parse(candidate.value);
