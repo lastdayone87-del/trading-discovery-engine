@@ -12,6 +12,21 @@ import { evaluateClassificationStages } from './stagedClassification';
 import { buildCanonicalEvidenceCorpus, validateEvidenceProvenance } from './canonicalEvidencePlane';
 import { contentLanguagePacks } from './multilingualTerminology';
 
+function safeProviderFailureReasonCodes(err: any, timeout: boolean): string[] {
+  const errorClass = String(err?.errorClass || '');
+  const primary = timeout || errorClass === 'TIMEOUT' ? 'PROVIDER_TIMEOUT'
+    : errorClass === 'RATE_LIMIT' ? 'PROVIDER_RATE_LIMIT'
+    : errorClass === 'PERMANENT_INPUT' ? 'PROVIDER_PERMANENT_INPUT'
+    : errorClass === 'CANCELLED' ? 'PROVIDER_CANCELLED'
+    : errorClass === 'CREDENTIALS_EXHAUSTED' ? 'PROVIDER_CREDENTIALS_EXHAUSTED'
+    : errorClass === 'TRANSIENT' ? 'PROVIDER_TRANSIENT_FAILURE'
+    : 'PROVIDER_EXECUTION_FAILED';
+  const providerReasons = Array.isArray(err?.providerReasons)
+    ? err.providerReasons.map(String).filter((value: string) => /^[A-Z0-9_.:-]{1,80}$/.test(value)).slice(0, 6)
+    : [];
+  return [primary, ...providerReasons.filter((value: string) => value !== primary)];
+}
+
 export class EvidenceBasedTradingEngine {
   private providers: EvidenceProvider[];
   private decisionStrategy: ConfigurableWeightedStrategy;
@@ -63,9 +78,12 @@ export class EvidenceBasedTradingEngine {
           reasonCodes: abstention ? semanticReasons : [items.length ? 'PROVIDER_EVIDENCE_EMITTED' : 'PROVIDER_NO_GOVERNED_MATCH'], durationMs:Date.now()-started } };
       } catch (err: any) {
         console.warn(`[EvidenceEngine] Provider ${provider.name} error:`, err?.message || err);
-        const timeout=/timeout|timed out|abort/i.test(String(err?.message||err));
+        const timeout=err?.errorClass==='TIMEOUT'||/timeout|timed out|abort/i.test(String(err?.message||err));
+        const errorClass=String(err?.errorClass||'UNKNOWN');
         return { items: [] as EvidenceItem[], report: { provider: provider.name, availability: 'FAILED' as const, evidenceCount: 0,
-          outcome:timeout?'FAILED_TIMEOUT' as const:'FAILED_PROVIDER' as const,reasonCodes:[timeout?'PROVIDER_TIMEOUT':'PROVIDER_EXECUTION_FAILED'],reason: String(err?.message || err || 'Unknown provider failure'),durationMs:Date.now()-started } };
+          outcome:timeout?'FAILED_TIMEOUT' as const:'FAILED_PROVIDER' as const,
+          reasonCodes:safeProviderFailureReasonCodes(err,timeout),
+          reason:`Provider failure (${errorClass}).`,durationMs:Date.now()-started } };
       }
     });
 

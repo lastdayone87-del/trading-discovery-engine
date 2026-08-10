@@ -1,0 +1,32 @@
+name: Gemini Capacity Governor PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/providerResilience.ts'
+      - 'server/providerResilience.test.ts'
+      - 'server/evidenceEngine/index.ts'
+      - 'server/evidenceEngine/providerFailureDiagnostics.test.ts'
+      - '.github/workflows/gemini-capacity-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Provider resilience and diagnostics tests
+        run: node --import tsx --test server/providerResilience.test.ts server/evidenceEngine/providerFailureDiagnostics.test.ts
+      - name: Build
+        run: npm run build
