@@ -1,7 +1,13 @@
 import type { EvidenceCollectionReport, EvidenceItem, LifecycleAction } from './types';
+import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v1';
-export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=85;
+/**
+ * Terminal UNRELATED requires the highest confidence tier emitted by the active
+ * governed semantic calibration artifact. The bootstrap artifact tops out at
+ * 84, so a hard-coded floor of 85 is an impossible predicate in production.
+ */
+export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=SEMANTIC_TOP_CALIBRATED_CONFIDENCE;
 
 export interface UnifiedDecisionPolicyInput {evidence:EvidenceItem[];collection:EvidenceCollectionReport;lifecycleAction:LifecycleAction;minimumPositiveWeight:number;minimumTradingScore:number}
 export interface UnifiedDecisionPolicyResult {status:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';confidenceScore:number;tradingProbability:number;nonTradingProbability:number;coverageConfidence:number;reasonCodes:string[]}
@@ -13,9 +19,9 @@ export function calibrateDecisionScore(raw:number):number{const n=clamp(raw);if(
 /**
  * Narrow terminal-negative escape hatch for creator-level semantic evidence.
  * It deliberately does not lower the global negative-weight threshold. The
- * semantic model must explicitly classify the creator as UNRELATED, meet a high
- * calibrated-confidence floor, be attributable to the creator bio, have
- * terminal-negative sufficiency, and face no substantive positive trading
+ * semantic model must explicitly classify the creator as UNRELATED, meet the
+ * top governed calibrated-confidence tier, be attributable to the creator bio,
+ * have terminal-negative sufficiency, and face no substantive positive trading
  * evidence.
  */
 export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[], collection:EvidenceCollectionReport):boolean{
