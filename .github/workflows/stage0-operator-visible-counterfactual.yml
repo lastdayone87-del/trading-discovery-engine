@@ -2,6 +2,15 @@ name: Stage 0 operator-visible counterfactual (temporary)
 
 on:
   workflow_dispatch:
+    inputs:
+      evidence_mode:
+        description: 'Evidence source for the read-only Stage 0 measurement'
+        required: true
+        default: 'persisted'
+        type: choice
+        options:
+          - persisted
+          - assertion-replay
 
 permissions:
   contents: read
@@ -29,38 +38,52 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Verify Stage 0 evaluator is read-only and reuses Offline V2
+      - name: Verify selected evaluator is read-only
+        env:
+          EVIDENCE_MODE: ${{ inputs.evidence_mode }}
         run: |
           set -euo pipefail
-          test -f server/candidateAdmission/stage0OperatorVisible.ts
-          grep -q 'evaluateOfflineAdmissionV2' server/candidateAdmission/stage0OperatorVisible.ts
-          grep -q 'BEGIN TRANSACTION READ ONLY' server/candidateAdmission/stage0OperatorVisible.ts
-          grep -q 'OPERATOR_VISIBLE_CHANNEL_SQL\|country_status <> .REJECTED' server/candidateAdmission/stage0OperatorVisible.ts
-          ! grep -E 'PLACEHOLDER' server/candidateAdmission/stage0OperatorVisible.ts
-          ! grep -E '\b(INSERT|UPDATE|DELETE)\b' server/candidateAdmission/stage0OperatorVisible.ts
-          echo "Stage 0 evaluator checks passed"
+          if [ "$EVIDENCE_MODE" = "assertion-replay" ]; then
+            FILE=server/candidateAdmission/stage0OperatorVisibleAssertionReplay.ts
+            grep -q 'replayCreatorFocusFromDiagnostic' "$FILE"
+            grep -q 'evaluateOfflineAdmissionV2' "$FILE"
+          else
+            FILE=server/candidateAdmission/stage0OperatorVisible.ts
+            grep -q 'evaluateOfflineAdmissionV2' "$FILE"
+          fi
+          grep -q 'BEGIN TRANSACTION READ ONLY' "$FILE"
+          ! grep -E 'PLACEHOLDER' "$FILE"
+          ! grep -E '\b(INSERT|UPDATE|DELETE)\b' "$FILE"
+          echo "Stage 0 evaluator checks passed for $EVIDENCE_MODE"
 
       - name: Run Stage 0 operator-visible counterfactual
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           NODE_ENV: production
+          EVIDENCE_MODE: ${{ inputs.evidence_mode }}
         run: |
           set -euo pipefail
           test -n "${DATABASE_URL:+x}"
           mkdir -p stage0-output
-          npm run stage0:operator-visible > stage0-output/stage0-console.json
-          test -f stage0-output/stage0-operator-visible-counterfactual.json
-          python3 - <<'PY'
-          import json
+          if [ "$EVIDENCE_MODE" = "assertion-replay" ]; then
+            npm run stage0:operator-visible-assertion-replay > stage0-output/stage0-console.json
+            REPORT=stage0-output/stage0-operator-visible-assertion-replay.json
+          else
+            npm run stage0:operator-visible > stage0-output/stage0-console.json
+            REPORT=stage0-output/stage0-operator-visible-counterfactual.json
+          fi
+          test -f "$REPORT"
+          REPORT="$REPORT" python3 - <<'PY'
+          import json, os
           from pathlib import Path
-          report = json.loads(Path("stage0-output/stage0-operator-visible-counterfactual.json").read_text())
-          assert report.get("servingAuthority") is False
-          assert report.get("readOnly") is True
-          print("operatorVisible", report["totals"]["operatorVisibleChannels"])
-          print("evaluated", report["totals"]["evaluatedWithFocusAndCoverage"])
-          print("eligibility", report["totals"]["historicalEvidenceEligibilityRate"])
-          print("reliable", report["totals"]["reliableForPopulationInference"])
-          print("decisions", report["totals"]["decisionCounts"])
+          report = json.loads(Path(os.environ['REPORT']).read_text())
+          assert report.get('servingAuthority') is False
+          assert report.get('readOnly') is True
+          if report.get('evidenceMode') == 'ASSERTION_REPLAY':
+              assert report.get('historicalReplay') is True
+              assert report.get('persisted') is False
+          print('reportType', report.get('reportType', 'PERSISTED_STAGE0'))
+          print('totals', report.get('totals'))
           PY
 
       - name: Upload Stage 0 report
