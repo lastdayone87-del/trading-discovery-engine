@@ -24,9 +24,27 @@ export function extractDiscordCandidates(text:string,sourceSurface:AcquisitionSu
   for(let match;(match=alternative.exec(clean))!==null;)push(match[0],'ALTERNATIVE_REDIRECT',undefined,'EXPLICIT');
   const directory=/(?:https?:\/\/)?(?:www\.)?disboard\.org\/server\/([^\s"'<>\)\\/?#&]+)/gi;
   for(let match;(match=directory.exec(clean))!==null;)push(match[0],'DIRECTORY_PAGE',undefined,'EXPLICIT');
-  const deobfuscated=clean.replace(/discord\s*(?:\[|\()?dot(?:\]|\))?\s*gg\s*[\/\\]\s*/gi,'discord.gg/').replace(/discord\s*\[?\.\]?\s*gg\s*[\/\\]\s*/gi,'discord.gg/');
-  if(deobfuscated!==clean)for(let match;(match=native.exec(deobfuscated))!==null;)push(match[0],'OBFUSCATED_NATIVE',match[2],'RESOLVED');
-  const heuristic=/discord(?:\.gg)?\s*[:=\-]\s*([a-zA-Z0-9_-]{4,128})(?![a-zA-Z0-9_-])/gi;
-  for(let match;(match=heuristic.exec(clean))!==null;){const code=match[1];if(!['http','https','com','org','net','join','server','link'].includes(code.toLowerCase()))push(match[0],'HEURISTIC_TOKEN',code,'HEURISTIC');}
-  return found.slice(0,10);
+  return found;
+}
+
+/** Build a retained native-invite candidate from a structured invite code (not from log prose). */
+export function candidateFromNativeInvite(input:{
+  nativeInviteCode:string;
+  sourceSurface:AcquisitionSurface;
+  sourceUrl?:string;
+  rawLocator?:string;
+  extractionConfidence?:DiscordCandidate['extractionConfidence'];
+}):DiscordCandidate|null{
+  const code=String(input.nativeInviteCode||'').trim();
+  if(!code||code.length<2||code.length>128||reserved.has(code.toLowerCase()))return null;
+  const raw=input.rawLocator||`https://discord.gg/${code}`;
+  return candidate({
+    locatorType:'NATIVE_INVITE',
+    sourceSurface:input.sourceSurface,
+    rawLocator:raw,
+    nativeInviteCode:code,
+    normalizedLocator:`https://discord.gg/${code}`,
+    sourceUrl:input.sourceUrl,
+    extractionConfidence:input.extractionConfidence||'EXPLICIT'
+  });
 }
