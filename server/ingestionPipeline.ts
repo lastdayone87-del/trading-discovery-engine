@@ -195,6 +195,19 @@ export async function processChannelThroughPipeline(
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
+  // Manual rechecks are operator-requested semantic refreshes. A runtime provider
+  // failure must not turn incomplete evidence into a replacement classification.
+  // Fail before diagnostic/admission/channel writes so the prior production
+  // decision remains authoritative until a complete recheck can run.
+  if (source === 'recheck' && isManualScan && productionClassification.decision.evidenceCollection.degraded) {
+    const failedProviders = productionClassification.decision.evidenceCollection.providers.filter(provider => provider.availability === 'FAILED');
+    const reasonCodes = failedProviders.flatMap(provider => provider.reasonCodes || []);
+    const error = Object.assign(
+      new Error(`Manual recheck classification provider coverage is degraded: ${failedProviders.map(provider => provider.provider).join(', ') || 'unknown provider'}.`),
+      { code: 'MANUAL_RESCAN_CLASSIFICATION_DEGRADED', retryable: true, providerReasons: reasonCodes }
+    );
+    throw error;
+  }
   const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:candidate.discoveryJobId,queryRunId:candidate.queryRunId,nominationId:candidate.nominationId}})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
   let tradingVal = productionClassification.result;
