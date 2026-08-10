@@ -7,7 +7,7 @@ test('Phase 3 dual-write is observational, failure-contained, and linked after i
   const [diagnostics, dual, settings] = await Promise.all([
     read('../classificationDiagnostics.ts'), read('./dualWrite.ts'), read('../db/migrations/055_evidence_documents_and_assertions.sql')
   ]);
-  assert.match(diagnostics, /persistClassificationEvidenceBundle[\s\S]+\.catch/);
+  assert.match(diagnostics, /try \{[\s\S]*persistClassificationEvidenceBundle[\s\S]*catch \(error\)/);
   assert.match(dual, /servingAuthority:\s*false/);
   assert.match(settings, /dual_write_enabled','false'/);
 });
