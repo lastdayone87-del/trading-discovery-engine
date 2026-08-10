@@ -1,0 +1,26 @@
+name: Gemini REST Version Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Verify credential is configured
+        run: test -n "${GEMINI_API_KEY:+x}"
+      - name: Run raw Gemini REST version probe
+        run: npx tsx scripts/geminiRestVersionProbe.ts
