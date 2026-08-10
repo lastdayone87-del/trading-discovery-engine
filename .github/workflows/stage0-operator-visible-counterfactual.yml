@@ -11,6 +11,7 @@ on:
         options:
           - persisted
           - assertion-replay
+          - evidence-diagnosis
 
 permissions:
   contents: read
@@ -47,6 +48,10 @@ jobs:
             FILE=server/candidateAdmission/stage0OperatorVisibleAssertionReplay.ts
             grep -q 'replayCreatorFocusFromDiagnostic' "$FILE"
             grep -q 'evaluateOfflineAdmissionV2' "$FILE"
+          elif [ "$EVIDENCE_MODE" = "evidence-diagnosis" ]; then
+            FILE=scripts/diagnoseStage0EvidenceGeneration.ts
+            grep -q 'providerCallsPerformed: false' "$FILE"
+            grep -q 'provider_availability' "$FILE"
           else
             FILE=server/candidateAdmission/stage0OperatorVisible.ts
             grep -q 'evaluateOfflineAdmissionV2' "$FILE"
@@ -68,6 +73,9 @@ jobs:
           if [ "$EVIDENCE_MODE" = "assertion-replay" ]; then
             npm run stage0:operator-visible-assertion-replay > stage0-output/stage0-console.json
             REPORT=stage0-output/stage0-operator-visible-assertion-replay.json
+          elif [ "$EVIDENCE_MODE" = "evidence-diagnosis" ]; then
+            npx tsx scripts/diagnoseStage0EvidenceGeneration.ts > stage0-output/stage0-console.json
+            REPORT=stage0-output/stage0-evidence-generation-diagnosis.json
           else
             npm run stage0:operator-visible > stage0-output/stage0-console.json
             REPORT=stage0-output/stage0-operator-visible-counterfactual.json
@@ -82,6 +90,8 @@ jobs:
           if report.get('evidenceMode') == 'ASSERTION_REPLAY':
               assert report.get('historicalReplay') is True
               assert report.get('persisted') is False
+          if report.get('reportType') == 'STAGE0_EVIDENCE_GENERATION_DIAGNOSIS':
+              assert report.get('providerCallsPerformed') is False
           print('reportType', report.get('reportType', 'PERSISTED_STAGE0'))
           print('totals', report.get('totals'))
           PY
