@@ -1,0 +1,29 @@
+name: Gemini GenerateContent Probe PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/geminiGenerateContentProbe.ts'
+      - '.github/workflows/gemini-generate-content-probe.yml'
+      - '.github/workflows/gemini-generate-content-probe-pr.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Type/build verification
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
