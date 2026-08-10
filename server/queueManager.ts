@@ -684,53 +684,62 @@ export async function triggerManualRecheck(channelId: string, enableDebug?: bool
     return { success: false, message: `Manual re-scan blocked because ${exclusion.country} is excluded: ${exclusion.reason}`, channel };
   }
 
-  // Acquire Lock and Reset Attempt Counter
-  channel.scan_status = 'LOCKED';
-  channel.scan_attempts = 0;
-  channel.discovery_source = 'recheck';
-  await upsertChannel(channel);
+  // A manual recheck is a true creator reclassification, not merely a
+  // Discord/community recrawl. Acquire fresh authoritative YouTube
+  // creator metadata first. If acquisition is unavailable, preserve
+  // the existing trading classification and return a retryable
+  // operational failure rather than classifying placeholder data.
+  const fallback: DiscoveredChannelRaw = {
+    channelId: channel.channel_id,
+    channelName: channel.channel_name,
+    youtubeUrl: channel.youtube_url,
+    description: channel.channel_name,
+    videoTitles: [channel.channel_name],
+    channelLinks: channel.discord_invite ? [channel.discord_invite] : [],
+    channelThumbnailUrl: channel.channel_thumbnail_url
+  };
 
-  console.log(`[Manual Scan Started] Channel: ${channel.channel_name} (${channel.channel_id})`);
-
-  // Run inspection synchronously with force live YouTube page scrape
-  const inspectRes = await inspectAndValidateChannel(
-    channel,
-    {
-      channelId: channel.channel_id,
-      channelName: channel.channel_name,
-      youtubeUrl: channel.youtube_url,
-      description: channel.channel_name,
-      videoTitles: [channel.channel_name],
-      channelLinks: channel.discord_invite ? [channel.discord_invite] : [],
-      channelThumbnailUrl: channel.channel_thumbnail_url
-    },
-    true, // isManualScan = true (force live YouTube scraping & quota increment)
-    enableDebug
-  );
-
-  const updatedChannel = await getChannelById(channelId);
-  console.log(`[Manual Scan Completed] Channel: ${channel.channel_name}, Discord Status: ${updatedChannel?.discord_status || 'NOT_FOUND'}`);
-
-  const inspectionResult=(inspectRes as any)?.inspection as Awaited<ReturnType<typeof runChannelInspection>>|undefined;
-  const incompleteAcquisition=inspectionResult?.acquisitionStatus==='ACQUISITION_FAILED'||inspectionResult?.acquisitionStatus==='PARTIALLY_INSPECTED';
-  if(incompleteAcquisition){
-    const failureDetail=inspectionResult?.acquisitionOutcomes?.find(item=>item.outcome==='ACQUISITION_FAILED')?.detail;
+  let freshCandidate: DiscoveredChannelRaw;
+  try {
+    freshCandidate = await fetchYouTubeChannelEnrichment(channelId, fallback, 1);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`[Manual Recheck] Fresh YouTube creator acquisition failed for ${channelId}; preserving prior trading classification: ${detail}`);
     return {
-      success:false,
-      message:`Manual re-scan could not complete because an upstream acquisition failed. Previously collected inspection and Discord discovery evidence was preserved; retry is recommended.${failureDetail?` ${failureDetail}`:''}`,
-      code:'MANUAL_RESCAN_UPSTREAM_FAILURE',
-      retryable:true,
-      channel:updatedChannel||undefined,
-      debugLog:inspectRes ? (inspectRes as any).debugLog : undefined
+      success: false,
+      message: `Manual re-scan could not acquire fresh YouTube creator evidence. Existing trading classification was preserved; retry is recommended. ${detail}`,
+      code: 'MANUAL_RESCAN_UPSTREAM_FAILURE',
+      retryable: true,
+      channel
     };
   }
 
-  return {
-    success: true,
-    message: `Manual re-scan completed for ${channel.channel_name}.`,
-    channel: updatedChannel || undefined,
-    debugLog: inspectRes ? (inspectRes as any).debugLog : undefined
-  };
+  freshCandidate.enrichmentStage = Math.max(1, freshCandidate.enrichmentStage || 0);
+  freshCandidate.matchedDocument = { type: 'MANUAL', locator: `recheck:${channelId}` };
+  console.log(`[Manual Reclassification Started] Channel: ${channel.channel_name} (${channel.channel_id})`);
+
+  try {
+    const outcome = await processChannelThroughPipeline(freshCandidate, channel.country, 'recheck', true, true);
+    const updatedChannel = outcome.channelRecord || await getChannelById(channelId) || undefined;
+    console.log(`[Manual Reclassification Completed] Channel: ${channel.channel_name}, Trading Status: ${updatedChannel?.trading_status || outcome.tradingStatus}, Score: ${updatedChannel?.trading_confidence_score ?? 'unknown'}, Discord Status: ${updatedChannel?.discord_status || outcome.discordStatus}`);
+    return {
+      success: true,
+      message: `Manual re-scan completed for ${channel.channel_name}. Trading classification and downstream inspection were refreshed from current evidence.`,
+      channel: updatedChannel
+    };
+  } catch (error: any) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const preserved = await getChannelById(channelId) || channel;
+    const code = String(error?.code || 'MANUAL_RESCAN_OPERATIONAL_FAILURE');
+    console.warn(`[Manual Recheck] Reclassification failed operationally for ${channelId}; preserving prior decision where no complete classification was produced: ${detail}`);
+    return {
+      success: false,
+      message: `Manual re-scan could not complete a reliable trading reclassification. Existing classification was preserved where the classifier had incomplete provider coverage; retry is recommended. ${detail}`,
+      code,
+      retryable: error?.retryable !== false,
+      channel: preserved
+    };
+  }
 }
 
 export interface SearchExecutionResult {
