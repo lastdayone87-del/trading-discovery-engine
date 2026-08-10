@@ -16,8 +16,9 @@ test('route inventory is explicit and public surface contains only health',()=>{
  assert.deepEqual(routePolicyInventory.filter(x=>x.policy==='public').map(x=>x.pattern),['^\\/api\\/health$']);
 });
 test('governed review reason catalog is authorized for authenticated operators',()=>{
- const route=routePolicyInventory.find(item=>item.method==='GET'&&new RegExp(item.pattern).test('/api/review-reasons'));
- assert.ok(route,'/api/review-reasons must be present in the explicit route-policy inventory');
+ const matchingRoutes=routePolicyInventory.filter(item=>item.method==='GET'&&new RegExp(item.pattern).test('/api/review-reasons'));
+ assert.equal(matchingRoutes.length,1,'/api/review-reasons must resolve to exactly one explicit route policy');
+ const route=matchingRoutes[0];
  assert.equal(route.policy,'operator');
  assert.equal(route.action,'administration.read');
 });
