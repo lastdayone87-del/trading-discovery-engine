@@ -3,6 +3,7 @@ import type {
   LifecycleAction, RawChannelInput, StagedClassificationReport
 } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
+import { qualifiesSemanticUnrelatedTerminalReject } from './decisionPolicy';
 
 export const STAGED_CLASSIFICATION_VERSION = '3.0.0';
 
@@ -55,7 +56,8 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
-  const negativeWouldDominate = negative.length > 0 && (negativeWeight >= 25 || negativeWeight > positiveWeight * 1.5);
+  const semanticUnrelatedTerminal=qualifiesSemanticUnrelatedTerminalReject(evidence,collection);
+  const negativeWouldDominate = negative.length > 0 && (negativeWeight >= 25 || negativeWeight > positiveWeight * 1.5 || semanticUnrelatedTerminal);
   const terminalNegativeSufficient=collection.terminalNegativeSufficiency?.status==='SUFFICIENT';
   const dominantContradiction = negativeWouldDominate && terminalNegativeSufficient;
 
@@ -78,7 +80,7 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     ? result('CORROBORATION', 'PASS', ['SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated })
     : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated });
   const contradiction = dominantContradiction
-    ? result('CONTRADICTION', 'FAIL', ['DOMINANT_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight })
+    ? result('CONTRADICTION', 'FAIL', [semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight })
     : negativeWouldDominate
       ? result('CONTRADICTION','ABSTAIN',['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT'],negative,{negativeWeight,positiveWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
       : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight });
