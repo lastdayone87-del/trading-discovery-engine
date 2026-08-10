@@ -100,7 +100,7 @@ function segmentBreakdown(
     DEFER_INVESTIGATION: number;
     ADMIT_REVIEW: number;
     ADMIT_CONFIRMED: number;
-    futureDashboardVisible: number;
+  futureDashboardVisible: number;
   }> = {};
   for (const row of rows) {
     const k = key(row) || 'UNKNOWN';
@@ -126,9 +126,6 @@ function segmentBreakdown(
   return Object.fromEntries(Object.entries(map).sort(([a], [b]) => a.localeCompare(b)));
 }
 
-/**
- * Read-only Stage 0 evaluation of the current operator-visible population.
- */
 export async function evaluateOperatorVisibleStage0(): Promise<Record<string, unknown>> {
   if (!process.env.DATABASE_URL) {
     throw new Error('DATABASE_URL is required for Stage 0 operator-visible counterfactual.');
@@ -152,13 +149,13 @@ export async function evaluateOperatorVisibleStage0(): Promise<Record<string, un
       `
       WITH visible AS (
         SELECT
-          c.channel_id,
-          c.channel_name,
-          c.country,
-          c.discovery_source,
-          c.trading_status,
-          COALESCE(c.trading_confidence_score, 0)::float AS trading_confidence_score,
-          COALESCE(c.trading_category, 'General Trading') AS trading_category
+          channels.channel_id,
+          channels.channel_name,
+          channels.country,
+          channels.discovery_source,
+          channels.trading_status,
+          COALESCE(channels.trading_confidence_score, 0)::float AS trading_confidence_score,
+          COALESCE(channels.trading_category, 'General Trading') AS trading_category
         FROM channels
         WHERE ${OPERATOR_VISIBLE_CHANNEL_SQL}
       ),
@@ -181,24 +178,24 @@ export async function evaluateOperatorVisibleStage0(): Promise<Record<string, un
         ORDER BY f.channel_id, f.observed_at DESC, f.id DESC
       ),
       latest_coverage AS (
-        SELECT DISTINCT ON (c.channel_id)
-          c.channel_id,
-          c.id AS coverage_snapshot_id,
-          c.completeness_disposition,
-          c.observed_document_count,
-          c.expected_document_count,
-          c.independent_family_count,
-          c.language_coverage,
-          c.temporal_coverage,
-          c.provider_availability,
-          c.acquisition_failures,
-          c.reason_codes AS coverage_reason_codes,
-          c.input_checksum AS coverage_input_checksum,
-          c.policy_version AS coverage_policy_version,
-          c.observed_at AS coverage_observed_at
-        FROM evidence_coverage_snapshots c
-        INNER JOIN visible v ON v.channel_id = c.channel_id
-        ORDER BY c.channel_id, c.observed_at DESC, c.id DESC
+        SELECT DISTINCT ON (cov.channel_id)
+          cov.channel_id,
+          cov.id AS coverage_snapshot_id,
+          cov.completeness_disposition,
+          cov.observed_document_count,
+          cov.expected_document_count,
+          cov.independent_family_count,
+          cov.language_coverage,
+          cov.temporal_coverage,
+          cov.provider_availability,
+          cov.acquisition_failures,
+          cov.reason_codes AS coverage_reason_codes,
+          cov.input_checksum AS coverage_input_checksum,
+          cov.policy_version AS coverage_policy_version,
+          cov.observed_at AS coverage_observed_at
+        FROM evidence_coverage_snapshots cov
+        INNER JOIN visible v ON v.channel_id = cov.channel_id
+        ORDER BY cov.channel_id, cov.observed_at DESC, cov.id DESC
       ),
       latest_review AS (
         SELECT DISTINCT ON (d.channel_id)
@@ -499,8 +496,7 @@ export async function evaluateOperatorVisibleStage0(): Promise<Record<string, un
           ADMIT_CONFIRMED: needsReviewBandEvaluated.filter((r) => r.decision === 'ADMIT_CONFIRMED').length,
           ADMIT_REVIEW: needsReviewBandEvaluated.filter((r) => r.decision === 'ADMIT_REVIEW').length,
           WITHHOLD: needsReviewBandEvaluated.filter((r) => r.decision === 'WITHHOLD').length,
-          DEFER_INVESTIGATION: needsReviewBandEvaluated.filter((r) => r.decision === 'DEFER_INVESTIGATION')
-            .length
+          DEFER_INVESTIGATION: needsReviewBandEvaluated.filter((r) => r.decision === 'DEFER_INVESTIGATION').length
         },
         futureDashboardVisible: needsReviewBandEvaluated.filter((r) => r.futureDashboardVisible).length
       },
