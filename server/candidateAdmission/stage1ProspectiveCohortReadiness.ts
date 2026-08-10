@@ -1,4 +1,4 @@
-import pg from 'pg';
+import pg, { type PoolClient } from 'pg';
 import { CREATOR_FOCUS_CLASSIFIER_VERSION, CREATOR_FOCUS_POLICY_VERSION } from '../evidenceEngine/classifierV4';
 import { EVIDENCE_COVERAGE_POLICY_VERSION } from '../evidenceEngine/coverage';
 
@@ -86,7 +86,7 @@ export function summarizeProspectiveReadiness(rows: ProspectiveCandidate[], mini
   };
 }
 
-async function loadCandidates(client: pg.PoolClient): Promise<ProspectiveCandidate[]> {
+async function loadCandidates(client: PoolClient): Promise<ProspectiveCandidate[]> {
   const result = await client.query(`
     WITH latest_labels AS (
       SELECT DISTINCT ON (l.channel_id)
