@@ -10,6 +10,7 @@ on:
       - 'server/candidateAdmission/stage0OperatorVisibleAssertionReplay.test.ts'
       - 'scripts/stage0OperatorVisibleAssertionReplay.ts'
       - 'package.json'
+      - '.github/workflows/stage0-operator-visible-counterfactual.yml'
       - '.github/workflows/phaseb-assertion-replay-pr.yml'
   workflow_dispatch:
 
