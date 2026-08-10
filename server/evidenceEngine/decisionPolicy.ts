@@ -1,6 +1,7 @@
 import type { EvidenceCollectionReport, EvidenceItem, LifecycleAction } from './types';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v1';
+export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=85;
 
 export interface UnifiedDecisionPolicyInput {evidence:EvidenceItem[];collection:EvidenceCollectionReport;lifecycleAction:LifecycleAction;minimumPositiveWeight:number;minimumTradingScore:number}
 export interface UnifiedDecisionPolicyResult {status:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';confidenceScore:number;tradingProbability:number;nonTradingProbability:number;coverageConfidence:number;reasonCodes:string[]}
@@ -8,6 +9,28 @@ export interface UnifiedDecisionPolicyResult {status:'TRADING_CONFIRMED'|'NON_TR
 const clamp=(n:number)=>Math.max(0,Math.min(100,n));
 /** Conservative bootstrap calibration. Replace only with a governed time-split artifact. */
 export function calibrateDecisionScore(raw:number):number{const n=clamp(raw);if(n<25)return Math.round(n*.8);if(n<50)return Math.round(20+(n-25)*.9);if(n<65)return Math.round(43+(n-50)*.8);if(n<80)return Math.round(55+(n-65)*1.4);return Math.round(Math.min(96,76+(n-80)));}
+
+/**
+ * Narrow terminal-negative escape hatch for creator-level semantic evidence.
+ * It deliberately does not lower the global negative-weight threshold. The
+ * semantic model must explicitly classify the creator as UNRELATED, meet a high
+ * calibrated-confidence floor, be attributable to the creator bio, have
+ * terminal-negative sufficiency, and face no substantive positive trading
+ * evidence.
+ */
+export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[], collection:EvidenceCollectionReport):boolean{
+  if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT') return false;
+  const positiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  if(positiveWeight>0) return false;
+  return evidence.some(item=>
+    item.source==='gemini_semantic' &&
+    item.polarity==='NEGATIVE' &&
+    item.category==='IRRELEVANT_DOMAIN' &&
+    item.provenance?.semantic?.taxonomyLabel==='UNRELATED' &&
+    Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE &&
+    (item.provenance?.fields||[]).some(field=>field.field==='channel_bio')
+  );
+}
 
 export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):UnifiedDecisionPolicyResult{
   const positive=input.evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length),negative=input.evidence.filter(item=>item.polarity==='NEGATIVE');
@@ -18,8 +41,12 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const coverageConfidence=input.collection.sufficiency==='MISSING'?0:input.collection.sufficiency==='INSUFFICIENT'?30:Math.min(100,55+Math.min(20,substantiveProviders*5)+Math.min(25,documentFamilies*5));
   const reasons:string[]=[];let status:UnifiedDecisionPolicyResult['status']='UNCERTAIN';
   const positiveBoundary=positiveWeight>=input.minimumPositiveWeight&&raw>=input.minimumTradingScore;
+  const semanticUnrelatedTerminal=qualifiesSemanticUnrelatedTerminalReject(input.evidence,input.collection);
   if(input.lifecycleAction==='CONFIRM'&&positiveBoundary){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED');}
-  else if(input.lifecycleAction==='REJECT'&&negative.length&&negativeWeight>=25){status='NON_TRADING';reasons.push('DOMINANT_ATTRIBUTED_CONTRADICTION');}
+  else if(input.lifecycleAction==='REJECT'&&negative.length&&(negativeWeight>=25||semanticUnrelatedTerminal)){
+    status='NON_TRADING';
+    reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_ATTRIBUTED_CONTRADICTION');
+  }
   else {reasons.push(input.lifecycleAction==='ENRICH'?'EVIDENCE_COVERAGE_INCOMPLETE':input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED':'SCORE_BOUNDARY_NOT_SATISFIED');}
   const confidenceScore=status==='TRADING_CONFIRMED'?Math.max(82,tradingProbability):status==='NON_TRADING'?Math.min(22,100-nonTradingProbability):Math.min(79,Math.max(23,tradingProbability));
   return {status,confidenceScore,tradingProbability,nonTradingProbability,coverageConfidence,reasonCodes:reasons};
