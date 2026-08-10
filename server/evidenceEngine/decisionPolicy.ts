@@ -17,17 +17,33 @@ const clamp=(n:number)=>Math.max(0,Math.min(100,n));
 export function calibrateDecisionScore(raw:number):number{const n=clamp(raw);if(n<25)return Math.round(n*.8);if(n<50)return Math.round(20+(n-25)*.9);if(n<65)return Math.round(43+(n-50)*.8);if(n<80)return Math.round(55+(n-65)*1.4);return Math.round(Math.min(96,76+(n-80)));}
 
 /**
+ * A lexical terminology hit from an isolated video title is not, by itself,
+ * substantive evidence that the creator is a trading creator. Terms such as
+ * "options", "futures", "position", "margin", and "volume" are polysemous.
+ * Creator/bio evidence, semantic trading evidence, and richer/non-terminology
+ * observations remain substantive and therefore still block terminal rejection.
+ */
+function isWeakVideoTerminologyEvidence(item:EvidenceItem):boolean{
+  if(item.polarity!=='POSITIVE'||item.category!=='TERMINOLOGY') return false;
+  const fields=item.provenance?.fields||[];
+  return fields.length>0&&fields.every(field=>field.field==='video_title');
+}
+
+/**
  * Narrow terminal-negative escape hatch for creator-level semantic evidence.
  * It deliberately does not lower the global negative-weight threshold. The
  * semantic model must explicitly classify the creator as UNRELATED, meet the
  * top governed calibrated-confidence tier, be attributable to the creator bio,
  * have terminal-negative sufficiency, and face no substantive positive trading
- * evidence.
+ * evidence. Isolated video-title terminology is treated as weak lexical evidence
+ * rather than a creator-identity contradiction.
  */
 export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[], collection:EvidenceCollectionReport):boolean{
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT') return false;
-  const positiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
-  if(positiveWeight>0) return false;
+  const substantivePositiveWeight=evidence
+    .filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item))
+    .reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  if(substantivePositiveWeight>0) return false;
   return evidence.some(item=>
     item.source==='gemini_semantic' &&
     item.polarity==='NEGATIVE' &&
