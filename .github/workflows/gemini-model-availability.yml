@@ -1,0 +1,28 @@
+name: Gemini Model Availability Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      MULTILINGUAL_CANDIDATE_MODEL: ${{ vars.MULTILINGUAL_CANDIDATE_MODEL }}
+      MULTILINGUAL_ADJUDICATOR_MODEL: ${{ vars.MULTILINGUAL_ADJUDICATOR_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Verify credential is configured
+        run: test -n "${GEMINI_API_KEY:+x}"
+      - name: List Gemini models visible to configured credential
+        run: npx tsx scripts/geminiModelAvailabilityDiagnostic.ts
