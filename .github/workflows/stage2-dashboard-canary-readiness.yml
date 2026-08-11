@@ -9,6 +9,8 @@ on:
         type: string
   pull_request:
     paths:
+      - 'server/candidateAdmission/stage1SealedDatasetReplay.ts'
+      - 'server/candidateAdmission/stage1SealedDatasetReplay.test.ts'
       - 'server/release5/stage2DashboardCanaryReadiness.ts'
       - 'server/release5/stage2DashboardCanaryReadiness.test.ts'
       - 'server/release5/stage2DashboardCanaryContract.test.ts'
@@ -26,8 +28,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm install
-      - name: Stage 2 readiness and serving-contract tests
-        run: node --import tsx --test server/release5/stage2DashboardCanaryReadiness.test.ts server/release5/stage2DashboardCanaryContract.test.ts
+      - name: Stage 1 replay integrity and Stage 2 readiness tests
+        run: node --import tsx --test server/candidateAdmission/stage1SealedDatasetReplay.test.ts server/release5/stage2DashboardCanaryReadiness.test.ts server/release5/stage2DashboardCanaryContract.test.ts
       - name: Build
         run: npm run build
       - name: Verify dormant authority contract

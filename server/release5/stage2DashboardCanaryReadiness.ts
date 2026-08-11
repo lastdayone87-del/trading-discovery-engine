@@ -1,4 +1,4 @@
-export const STAGE2_DASHBOARD_CANARY_READINESS_VERSION = 'stage2-dashboard-canary-readiness-v1';
+export const STAGE2_DASHBOARD_CANARY_READINESS_VERSION = 'stage2-dashboard-canary-readiness-v2';
 
 export interface Stage1SealedReplaySummary {
   servingAuthority?: boolean;
@@ -9,6 +9,7 @@ export interface Stage1SealedReplaySummary {
     falsePositiveWithhold?: { rate?: number | null; effectiveSampleSize?: number };
     genuineCreatorRecall?: { rate?: number | null; effectiveSampleSize?: number };
     projectedReviewReduction?: { rate?: number | null };
+    decisiveDecisionRate?: { rate?: number | null; evaluated?: number; decisive?: number; deferred?: number };
   };
 }
 
@@ -27,6 +28,7 @@ export interface Stage2DashboardCanaryReadinessPolicy {
   minimumGenuineRecall: number;
   minimumFalsePositiveWithholdRate: number;
   minimumProjectedReviewReduction: number;
+  minimumDecisiveDecisionRate: number;
 }
 
 export const DEFAULT_STAGE2_DASHBOARD_CANARY_READINESS_POLICY: Stage2DashboardCanaryReadinessPolicy = {
@@ -35,7 +37,8 @@ export const DEFAULT_STAGE2_DASHBOARD_CANARY_READINESS_POLICY: Stage2DashboardCa
   minimumGenuineEffectiveSampleSize: 30,
   minimumGenuineRecall: 0.95,
   minimumFalsePositiveWithholdRate: Number.EPSILON,
-  minimumProjectedReviewReduction: Number.EPSILON
+  minimumProjectedReviewReduction: Number.EPSILON,
+  minimumDecisiveDecisionRate: Number.EPSILON
 };
 
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
@@ -53,6 +56,7 @@ export function evaluateStage2DashboardCanaryReadiness(
   const genuineEss = metrics.genuineCreatorRecall?.effectiveSampleSize;
   const genuineRecall = metrics.genuineCreatorRecall?.rate;
   const reviewReduction = metrics.projectedReviewReduction?.rate;
+  const decisiveDecisionRate = metrics.decisiveDecisionRate?.rate;
 
   // Stage 2 is a first authority transfer. Its input must itself be a non-serving
   // Stage 1 measurement artifact; this prevents a serving report from grading
@@ -66,6 +70,7 @@ export function evaluateStage2DashboardCanaryReadiness(
   if (!finite(genuineRecall) || genuineRecall < policy.minimumGenuineRecall) reasons.push('GENUINE_CREATOR_RECALL');
   if (!finite(falsePositiveWithhold) || falsePositiveWithhold < policy.minimumFalsePositiveWithholdRate) reasons.push('FALSE_POSITIVE_WITHHOLD_NOT_DEMONSTRATED');
   if (!finite(reviewReduction) || reviewReduction < policy.minimumProjectedReviewReduction) reasons.push('REVIEW_REDUCTION_NOT_DEMONSTRATED');
+  if (!finite(decisiveDecisionRate) || decisiveDecisionRate < policy.minimumDecisiveDecisionRate) reasons.push('DECISIVE_STAGE1_DECISIONS_NOT_DEMONSTRATED');
 
   // Preparation is deliberately dormant. A readiness check must never be run
   // while dashboard serving is already enabled or while treatment assignments
@@ -92,10 +97,11 @@ export function evaluateStage2DashboardCanaryReadiness(
       genuineRecall: finite(genuineRecall) ? genuineRecall : null,
       falsePositiveWithholdRate: finite(falsePositiveWithhold) ? falsePositiveWithhold : null,
       projectedReviewReduction: finite(reviewReduction) ? reviewReduction : null,
+      decisiveDecisionRate: finite(decisiveDecisionRate) ? decisiveDecisionRate : null,
       runtime
     },
     nextAction: readyForPromotionGate
       ? 'CREATE_EXPLICIT_STAGE2_PROMOTION_GATE; DO_NOT_ACTIVATE SERVING AUTOMATICALLY'
-      : 'HOLD_STAGE1_AND_CONTINUE_INDEPENDENT_EVIDENCE_COLLECTION'
+      : 'HOLD_STAGE1_AND_REPAIR_REPLAY_EVIDENCE_BEFORE_STAGE2_PROMOTION'
   };
 }

@@ -14,6 +14,10 @@ const GATE_FAILURE_REASONS = new Set([
 const checksum = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const rate = (n: number, d: number) => d > 0 ? n / d : null;
 
+export function stage1DecisionRequiresFollowup(decision: Decision): boolean {
+  return decision === 'ADMIT_REVIEW' || decision === 'DEFER_INVESTIGATION';
+}
+
 export function applyStage1ToSealedResult(result: any): { decision: Decision; reasonCodes: string[] } {
   const baselineDecision = result.decision as Decision;
   const baselineReasons = Array.isArray(result.reasonCodes) ? result.reasonCodes as string[] : [];
@@ -46,7 +50,11 @@ export async function evaluateStage1SealedDatasetReplay(datasetId: string): Prom
   const retainedGenuine = genuine.filter(row => row.stage1Decision !== 'WITHHOLD');
   const withheldNonTrading = nonTrading.filter(row => row.stage1Decision === 'WITHHOLD');
   const baselineReview = rows.filter(row => ['UNCERTAIN', 'NEEDS_REVIEW'].includes(String(row.production?.status || '')));
-  const proposedReview = baselineReview.filter(row => row.stage1Decision === 'ADMIT_REVIEW');
+  // DEFER_INVESTIGATION is still unresolved work. Treating it as avoided review would
+  // make an all-deferred replay look like a 100% review reduction even though no
+  // creator received a decisive admission/withhold outcome.
+  const proposedReview = baselineReview.filter(row => stage1DecisionRequiresFollowup(row.stage1Decision as Decision));
+  const decisive = rows.filter(row => row.stage1Decision === 'ADMIT_CONFIRMED' || row.stage1Decision === 'WITHHOLD');
   const sealedExamples = rows.length + baseline.excludedExamples.length;
 
   return {
@@ -63,7 +71,8 @@ export async function evaluateStage1SealedDatasetReplay(datasetId: string): Prom
       historicalEvidenceEligibility: { sealedExamples, evaluated: rows.length, excluded: baseline.excludedExamples.length, rate: rate(rows.length, sealedExamples) },
       falsePositiveWithhold: { nonTradingCreators: nonTrading.length, withheldNonTrading: withheldNonTrading.length, rate: rate(withheldNonTrading.length, nonTrading.length), effectiveSampleSize: nonTrading.length },
       genuineCreatorRecall: { genuineCreators: genuine.length, retainedCreators: retainedGenuine.length, rate: rate(retainedGenuine.length, genuine.length), effectiveSampleSize: genuine.length },
-      projectedReviewReduction: { baselineEligible: baselineReview.length, proposedReview: proposedReview.length, avoided: baselineReview.length - proposedReview.length, rate: rate(baselineReview.length - proposedReview.length, baselineReview.length) }
+      projectedReviewReduction: { baselineEligible: baselineReview.length, proposedReview: proposedReview.length, avoided: baselineReview.length - proposedReview.length, rate: rate(baselineReview.length - proposedReview.length, baselineReview.length) },
+      decisiveDecisionRate: { evaluated: rows.length, decisive: decisive.length, deferred: decisionCounts.DEFER_INVESTIGATION, rate: rate(decisive.length, rows.length) }
     },
     excludedExamples: baseline.excludedExamples,
     rows,
