@@ -1,0 +1,56 @@
+name: Review reject persistence probe
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/probeReviewRejectPersistence.ts'
+      - '.github/workflows/review-reject-persistence-probe.yml'
+  workflow_dispatch:
+    inputs:
+      channel_name:
+        description: 'Exact pending-review channel name to probe'
+        required: true
+        default: 'The Behavior Panel'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - run: npm run build
+
+  production-probe:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      REVIEW_PROBE_CHANNEL_NAME: ${{ inputs.channel_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Run rollback-only review rejection persistence probe
+        run: |
+          set +e
+          npx tsx scripts/probeReviewRejectPersistence.ts | tee review-probe.json
+          status=${PIPESTATUS[0]}
+          echo "probe_exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-reject-persistence-probe-${{ github.run_id }}
+          path: review-probe.json
+          retention-days: 7
