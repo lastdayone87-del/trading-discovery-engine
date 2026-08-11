@@ -48,13 +48,21 @@ async function main() {
              f.probability AS creator_focus_probability,
              f.lower_confidence_bound AS creator_focus_lower_confidence_bound,
              e.id AS coverage_snapshot_id,
+             l.id AS independent_label_id,l.label AS independent_label,l.provenance AS independent_label_provenance,
              CASE
                WHEN r.state<>'PENDING' THEN 'NOT_PENDING_REVIEW'
                WHEN d.diagnostic_id IS NULL THEN 'DIAGNOSTIC_MISSING_AFTER_ASSIGNMENT'
                WHEN f.id IS NULL THEN 'CREATOR_FOCUS_SNAPSHOT_MISSING'
                WHEN e.id IS NULL THEN 'EVIDENCE_COVERAGE_SNAPSHOT_MISSING'
                ELSE 'READY_FOR_PROSPECTIVE_HUMAN_REVIEW'
-             END AS readiness
+             END AS readiness,
+             CASE
+               WHEN l.id IS NOT NULL THEN 'INDEPENDENT_LABEL_ALREADY_EXISTS'
+               WHEN d.diagnostic_id IS NULL THEN 'DIAGNOSTIC_MISSING_AFTER_ASSIGNMENT'
+               WHEN f.id IS NULL THEN 'CREATOR_FOCUS_SNAPSHOT_MISSING'
+               WHEN e.id IS NULL THEN 'EVIDENCE_COVERAGE_SNAPSHOT_MISSING'
+               ELSE 'READY_FOR_INDEPENDENT_ADJUDICATION'
+             END AS adjudication_readiness
         FROM latest_diag d
         JOIN channels c ON c.channel_id=d.channel_id
         LEFT JOIN channel_reviews r ON r.channel_id=d.channel_id
@@ -73,13 +81,31 @@ async function main() {
              AND x.policy_version=$4
            ORDER BY x.observed_at DESC,x.id DESC LIMIT 1
         ) e ON true
-       ORDER BY CASE WHEN r.state='PENDING' AND d.diagnostic_id IS NOT NULL AND f.id IS NOT NULL AND e.id IS NOT NULL THEN 0 ELSE 1 END,
-                r.pending_since NULLS LAST,d.assigned_at DESC,c.channel_id
-       LIMIT 100`, [POLICY_KEY, CREATOR_FOCUS_CLASSIFIER_VERSION, CREATOR_FOCUS_POLICY_VERSION, EVIDENCE_COVERAGE_POLICY_VERSION]);
+        LEFT JOIN LATERAL (
+          SELECT x.id,x.label,x.provenance
+            FROM evaluation_ground_truth_labels x
+           WHERE x.channel_id=d.channel_id
+             AND x.provenance IN ('HUMAN_REVIEW','ADJUDICATION')
+           ORDER BY x.labeled_at DESC,x.id DESC LIMIT 1
+        ) l ON true
+       ORDER BY CASE
+                  WHEN l.id IS NULL AND d.diagnostic_id IS NOT NULL AND f.id IS NOT NULL AND e.id IS NOT NULL THEN 0
+                  WHEN r.state='PENDING' AND d.diagnostic_id IS NOT NULL AND f.id IS NOT NULL AND e.id IS NOT NULL THEN 1
+                  ELSE 2
+                END,
+                d.assigned_at DESC,c.channel_id
+       LIMIT 250`, [POLICY_KEY, CREATOR_FOCUS_CLASSIFIER_VERSION, CREATOR_FOCUS_POLICY_VERSION, EVIDENCE_COVERAGE_POLICY_VERSION]);
 
     const rows = result.rows;
     const ready = rows.filter(row => row.readiness === 'READY_FOR_PROSPECTIVE_HUMAN_REVIEW');
+    const adjudicationReady = rows.filter(row => row.adjudication_readiness === 'READY_FOR_INDEPENDENT_ADJUDICATION');
     const balancedRecommendations = selectBalancedProspectiveCandidates(ready);
+    const adjudicationRecommendations = {
+      operationalTradingConfirmed: adjudicationReady.find(row => row.trading_status === 'TRADING_CONFIRMED') || null,
+      operationalUncertain: adjudicationReady.find(row => row.trading_status === 'UNCERTAIN' || row.trading_status === 'NEEDS_REVIEW') || null,
+      operationalNonTrading: adjudicationReady.find(row => row.trading_status === 'NON_TRADING' || row.trading_status === 'HUMAN_REJECTED') || null,
+      note: 'Operational trading_status is a triage hint only. Independent human adjudication remains the ground-truth decision.'
+    };
     const report = {
       reportType: 'STAGE1_PROSPECTIVE_REVIEW_CANDIDATE_AUDIT',
       readOnly: true,
@@ -87,13 +113,18 @@ async function main() {
       policyKey: POLICY_KEY,
       totals: {
         prospectiveAssignments: rows.length,
-        readyPendingReview: ready.length
+        readyPendingReview: ready.length,
+        readyIndependentAdjudication: adjudicationReady.length,
+        independentLabelsAlreadyPresent: rows.filter(row => row.adjudication_readiness === 'INDEPENDENT_LABEL_ALREADY_EXISTS').length,
+        missingPostAssignmentDiagnostic: rows.filter(row => row.adjudication_readiness === 'DIAGNOSTIC_MISSING_AFTER_ASSIGNMENT').length
       },
       recommendedCandidate: ready[0] || null,
       balancedRecommendations,
+      adjudicationRecommendations,
       safety: {
         humanDecisionRequired: true,
         candidateHintsAreNotGroundTruth: true,
+        operationalStatusIsNotGroundTruth: true,
         candidateSelectionDoesNotChangeCohortAssignment: true,
         noLabelWrite: true
       },
