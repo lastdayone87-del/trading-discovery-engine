@@ -105,7 +105,7 @@ export function decideCreatorCanaryArm(input: {
 }
 
 function rowControl(row: any): CreatorCanaryControl {
-  return { enabled: row.enabled, killSwitch: row.kill_switch, servingAuthorityEnabled: row.serving_authority_enabled, topLevelAuthorityEnabled: row.top_level_authority_enabled || false, playlistAuthorityEnabled: row.playlist_authority_enabled || false, playlistRolloutBasisPoints: Number(row.playlist_rollout_basis_points || 0),
+  return { enabled: row.enabled, killSwitch: row.kill_switch, servingAuthorityEnabled: row.serving_authority_enabled, topLevelAuthorityEnabled: row.top_level_authority_enabled || false, playlistAuthorityEnabled: row.playlist_authority_enabled || false, playlistRolloutBasisPoints: Number(row.playlist_rollout_basis_points || 0), featuredChannelAuthorityEnabled: row.featured_channel_authority_enabled || false, featuredChannelRolloutBasisPoints: Number(row.featured_channel_rollout_basis_points || 0),
     rolloutBasisPoints: Number(row.rollout_basis_points), globalDailyAllocationCap: Number(row.global_daily_allocation_cap),
     globalDailyQuotaCap: Number(row.global_daily_quota_cap), maximumReadinessAgeHours: Number(row.maximum_readiness_age_hours),
     minimumAttributionCompleteness: Number(row.minimum_attribution_completeness), readinessPolicyVersion: row.readiness_policy_version,
