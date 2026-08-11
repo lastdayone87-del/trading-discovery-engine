@@ -1,6 +1,13 @@
 name: Stage 2 rate-pressure shadow evaluation
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/stage2-rate-pressure-shadow-evaluation.yml'
+      - 'scripts/stage2RatePressureShadowEvaluation.ts'
+      - 'server/release5/stage2RatePressureShadowPolicy.ts'
+      - 'server/release5/stage2PostFixShadowEvaluation.ts'
+      - 'server/candidateAdmission/offlineV2.ts'
   workflow_dispatch:
     inputs:
       dataset_id:
@@ -28,6 +35,7 @@ jobs:
           grep -q "mutatesOperationalState: false" server/release5/stage2RatePressureShadowPolicy.ts
 
   production-shadow:
+    if: github.event_name == 'workflow_dispatch'
     needs: verify
     runs-on: ubuntu-latest
     env:
