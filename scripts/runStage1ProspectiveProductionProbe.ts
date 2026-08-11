@@ -137,8 +137,7 @@ const report = {
     persisted: outcome.persisted,
     wasKnown: outcome.wasKnown,
     countryStatus: outcome.countryStatus,
-    tradingStatus: outcome.tradingStatus,
-    skippedTerminalState: Boolean(outcome.skippedTerminalState)
+    tradingStatus: outcome.tradingStatus
   },
   lineage,
   readyForIndependentAdjudication,
