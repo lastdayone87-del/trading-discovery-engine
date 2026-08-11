@@ -51,7 +51,8 @@ test('candidate lookup requires a diagnostic created after the Stage 1 prospecti
   assert.match(source, /x\.provenance IN \('HUMAN_REVIEW','ADJUDICATION'\)/);
 });
 
-test('candidate lookup normalizes accidental outer whitespace in stored channel names and selectors', () => {
+test('candidate lookup normalizes accidental outer and repeated whitespace in channel names', () => {
   const source = readFileSync(new URL('./stage1ProspectiveAdjudication.ts', import.meta.url), 'utf8');
-  assert.match(source, /lower\(btrim\(channel_name\)\)=lower\(btrim\(\$1\)\)/);
+  assert.match(source, /regexp_replace\(btrim\(channel_name\), '\\\\s\+', ' ', 'g'\)/);
+  assert.match(source, /regexp_replace\(btrim\(\$1\), '\\\\s\+', ' ', 'g'\)/);
 });
