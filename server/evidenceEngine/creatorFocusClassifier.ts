@@ -10,10 +10,12 @@ const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).d
 export function assignCreatorFocusCanary(subject:string,basisPoints:number){if(!subject||basisPoints<0||basisPoints>10000)throw new Error('INVALID_CANARY_ASSIGNMENT');const randomizationValue=parseInt(hash(subject).slice(0,8),16)%10000;return {randomizationValue,assigned:randomizationValue<basisPoints};}
 
 /** Runs only over the persisted Phase-3 plane and never changes the production decision. */
-export async function runCreatorFocusShadow(input:{channelId:string;subjectEntityId:string;diagnosticId:string;productionStatus:string;documents:EvidenceDocumentObservation[];assertions:EvidenceAssertionObservation[];coverage:EvidenceCoverageSnapshot;coverageSnapshotId?:string;calibrationArtifactId?:string;calibrationApproved?:boolean}){
+export async function runCreatorFocusShadow(input:{channelId:string;subjectEntityId:string;diagnosticId:string;productionStatus:string;documents:EvidenceDocumentObservation[];assertions:EvidenceAssertionObservation[];coverage:EvidenceCoverageSnapshot;coverageSnapshotId?:string;calibrationArtifactId?:string;calibrationApproved?:boolean;forceShadowObservation?:boolean}){
   const configured=String(await getAppSetting('creator_focus_classifier_mode','OFF')).toUpperCase();
-  if(configured==='OFF')return {enabled:false,servingAuthority:false};
-  const mode:'SHADOW'|'CANARY'=configured==='CANARY'?'CANARY':'SHADOW',basis=Math.min(10000,Math.max(0,Number(await getAppSetting('creator_focus_classifier_canary_basis_points','0'))||0));
+  if(configured==='OFF'&&!input.forceShadowObservation)return {enabled:false,servingAuthority:false};
+  // A forced observation is always SHADOW, even if the production rollout setting
+  // is OFF or CANARY. This is evaluation lineage only and can never assign serving authority.
+  const mode:'SHADOW'|'CANARY'=input.forceShadowObservation?'SHADOW':configured==='CANARY'?'CANARY':'SHADOW',basis=input.forceShadowObservation?0:Math.min(10000,Math.max(0,Number(await getAppSetting('creator_focus_classifier_canary_basis_points','0'))||0));
   const assignment=assignCreatorFocusCanary(`${input.channelId}|${input.diagnosticId}|creator-focus-v4`,basis);
   const documentAssertions=classifyEvidenceDocuments(input.documents,input.assertions),aggregate=aggregateCreatorFocus(documentAssertions,input.coverage.observedAt);
   const decision=evaluateCreatorFocusV4({channelId:input.channelId,identityResolved:!!input.subjectEntityId,coverage:input.coverage,aggregate,calibrationApproved:!!input.calibrationApproved});

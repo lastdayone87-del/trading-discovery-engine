@@ -1,0 +1,33 @@
+name: Stage 1 complete observational chain
+
+on:
+  pull_request:
+    paths:
+      - 'server/classificationDiagnostics.ts'
+      - 'server/evidenceEngine/dualWrite.ts'
+      - 'server/evidenceEngine/creatorFocusClassifier.ts'
+      - 'server/stage1ProspectiveObservationChain.test.ts'
+      - '.github/workflows/stage1-observational-chain.yml'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Stage 1 observational chain contract tests
+        run: node --import tsx --test server/stage1ProspectiveObservationChain.test.ts server/phaseBObservationOutbox.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify non-serving boundary
+        run: |
+          set -euo pipefail
+          grep -q "requireCompleteObservation: Boolean(diagnostic.observationKey)" server/classificationDiagnostics.ts
+          grep -q "forceShadowObservation: options.requireCompleteObservation === true" server/evidenceEngine/dualWrite.ts
+          grep -q "input.forceShadowObservation?'SHADOW'" server/evidenceEngine/creatorFocusClassifier.ts
+          ! grep -E "servingAuthority:true|terminalAuthority:true" server/evidenceEngine/dualWrite.ts server/evidenceEngine/creatorFocusClassifier.ts

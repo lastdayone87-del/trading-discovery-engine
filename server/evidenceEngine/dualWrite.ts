@@ -16,16 +16,17 @@ export const EVIDENCE_DUAL_WRITE_VERSION = 'evidence-dual-write-v1';
 
 /**
  * Observation-only dual write. Failures are contained by the production caller
- * unless a Phase B observation key forces diagnostic-task completion after the
- * document/coverage/Creator Focus observational bundle succeeds.
+ * unless a durable Phase B diagnostic requires the complete observational bundle.
  */
 export async function persistClassificationEvidenceBundle(
   input: RawChannelInput,
   decision: VerificationDecision,
-  classificationDiagnosticId?: string
+  classificationDiagnosticId?: string,
+  options: { requireCompleteObservation?: boolean } = {}
 ) {
   const started = Date.now();
-  const documentsEnabled = await getAppSetting('evidence_document_dual_write_enabled', 'false') === 'true';
+  const configuredDocumentsEnabled = await getAppSetting('evidence_document_dual_write_enabled', 'false') === 'true';
+  const documentsEnabled = configuredDocumentsEnabled || options.requireCompleteObservation === true;
   const assertionsEnabled = await getAppSetting('evidence_assertion_dual_write_enabled', 'false') === 'true';
   if (!documentsEnabled) {
     return { enabled: false, documents: 0, assertions: 0, coverage: false, servingAuthority: false as const };
@@ -72,9 +73,14 @@ export async function persistClassificationEvidenceBundle(
         documents,
         assertions,
         coverage,
-        coverageSnapshotId: coverageResult.id
+        coverageSnapshotId: coverageResult.id,
+        forceShadowObservation: options.requireCompleteObservation === true
       })
     : { enabled: false, servingAuthority: false as const };
+
+  if (options.requireCompleteObservation && !creatorFocus.enabled) {
+    throw new Error('CREATOR_FOCUS_SNAPSHOT_REQUIRED_FOR_DURABLE_DIAGNOSTIC');
+  }
 
   // Gap-specific planning remains failure-contained and non-authoritative.
   const gapPlan = creatorFocus.enabled && 'decision' in creatorFocus
@@ -104,7 +110,8 @@ export async function persistClassificationEvidenceBundle(
     reasonCodes: [
       'PROJECTION_EQUIVALENT',
       'DOCUMENT_COVERAGE_PERSISTED',
-      ...(creatorFocus.enabled ? ['CREATOR_FOCUS_SNAPSHOT_PERSISTED'] : ['CREATOR_FOCUS_OBSERVER_DISABLED'])
+      ...(creatorFocus.enabled ? ['CREATOR_FOCUS_SNAPSHOT_PERSISTED'] : ['CREATOR_FOCUS_OBSERVER_DISABLED']),
+      ...(options.requireCompleteObservation ? ['DURABLE_DIAGNOSTIC_COMPLETE_OBSERVATION_REQUIRED'] : [])
     ],
     observedAt
   });
