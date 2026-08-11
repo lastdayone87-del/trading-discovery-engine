@@ -28,5 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           grep -q "protectedAuditBasisPoints: 10000" server/candidateAdmission/stage1ProspectiveSampling.ts
+          grep -q "stage1ProspectiveNominationEligible" server/candidateAdmission/store.ts
+          grep -q "SELECT country_status,trading_status,scan_status FROM channels" server/candidateAdmission/store.ts
           grep -q "observeRetrievalAssignmentReliably" server/candidateAdmission/store.ts
           ! grep -E "release5_dashboard_serving_mode|servingAuthority: true|automaticPromotion: true" server/candidateAdmission/stage1ProspectiveSampling.ts server/candidateAdmission/store.ts
