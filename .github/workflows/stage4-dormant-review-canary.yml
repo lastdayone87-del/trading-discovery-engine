@@ -1,0 +1,31 @@
+name: Stage 4 dormant review canary
+
+on:
+  pull_request:
+    paths:
+      - 'server/release5/stage4ReviewCanaryContract.test.ts'
+      - 'server/release5/rollout.ts'
+      - 'server/reviewEligibility/policy.ts'
+      - '.github/workflows/stage4-dormant-review-canary.yml'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Stage 4 dormant review canary contracts
+        run: node --import tsx --test server/release5/stage4ReviewCanaryContract.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify no Stage 4 serving activation is introduced
+        run: |
+          set -euo pipefail
+          grep -q "servingAuthority:false" server/reviewEligibility/policy.ts
+          grep -q "getAppSetting(settingKey,'OFF')" server/release5/rollout.ts
+          ! git diff origin/main...HEAD -- server/release5/rollout.ts server/reviewEligibility/policy.ts | grep -E '^\+.*(setRelease5KillSwitch|activateRelease5Capability)\('
