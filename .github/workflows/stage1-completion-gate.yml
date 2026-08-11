@@ -1,0 +1,142 @@
+name: Stage 1 completion gate
+
+on:
+  pull_request:
+    paths:
+      - 'server/terminalPreservationPolicy.ts'
+      - 'server/terminalPreservationPolicy.test.ts'
+      - 'server/ingestionPipeline.ts'
+      - '.github/workflows/stage1-completion-gate.yml'
+  workflow_dispatch:
+    inputs:
+      minimum_per_class:
+        description: 'Independent eligible labels required for each class'
+        required: true
+        default: '30'
+        type: string
+      finalize_when_ready:
+        description: 'When READY, seal the immutable dataset and immediately replay it'
+        required: true
+        default: false
+        type: boolean
+      seal_confirmation:
+        description: 'Required only when finalize_when_ready=true: SEAL_STAGE1_EVALUATION_DATASET'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Terminal preservation regression tests
+        run: node --import tsx --test server/terminalPreservationPolicy.test.ts
+      - name: Existing Stage 1 governance tests
+        run: |
+          node --import tsx --test \
+            server/candidateAdmission/stage1ProspectiveCohortReadiness.test.ts \
+            server/candidateAdmission/stage1GroundTruthSealer.test.ts \
+            server/candidateAdmission/stage1SealedDatasetReplay.test.ts \
+            server/candidateAdmission/offlineStage1.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify evaluation/serving separation
+        run: |
+          set -euo pipefail
+          grep -q 'servingAuthority: false' server/candidateAdmission/stage1ProspectiveCohortReadiness.ts
+          grep -q 'servingAuthority: false' server/candidateAdmission/offlineStage1.ts
+          grep -q 'SEAL_STAGE1_EVALUATION_DATASET' server/candidateAdmission/stage1GroundTruthSealer.ts
+          grep -q "source !== 'recheck'" server/terminalPreservationPolicy.ts
+
+  readiness-finalize-replay:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      STAGE1_MINIMUM_PER_CLASS: ${{ inputs.minimum_per_class }}
+      STAGE1_DATASET_KEY: stage1-independent-ground-truth
+      STAGE1_SEAL_ACTOR: github-actions:${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Run authoritative readiness audit once
+        id: readiness
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage1ProspectiveCohortReadiness.ts
+          node - <<'NODE'
+          const fs = require('fs');
+          const report = JSON.parse(fs.readFileSync('stage1-output/stage1-prospective-cohort-readiness.json','utf8'));
+          const s = report.summary;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `ready=${s.ready}\ntrading=${s.eligible.tradingConfirmed}\nnon_trading=${s.eligible.nonTrading}\nremaining_trading=${s.remaining.tradingConfirmed}\nremaining_non_trading=${s.remaining.nonTrading}\n`);
+          console.log(`Stage 1: trading ${s.eligible.tradingConfirmed}/${s.minimumPerClass}; non-trading ${s.eligible.nonTrading}/${s.minimumPerClass}; ready=${s.ready}`);
+          NODE
+      - name: Stop cleanly when human ground truth is still incomplete
+        if: steps.readiness.outputs.ready != 'true'
+        run: |
+          echo "Stage 1 remains gated by independent human ground truth."
+          echo "Trading remaining: ${{ steps.readiness.outputs.remaining_trading }}"
+          echo "Non-trading remaining: ${{ steps.readiness.outputs.remaining_non_trading }}"
+          echo "No seal, replay, serving promotion, or operational mutation was attempted."
+      - name: Require explicit immutable-seal confirmation
+        if: steps.readiness.outputs.ready == 'true' && inputs.finalize_when_ready
+        env:
+          STAGE1_SEAL_CONFIRMATION: ${{ inputs.seal_confirmation }}
+        run: test "$STAGE1_SEAL_CONFIRMATION" = 'SEAL_STAGE1_EVALUATION_DATASET'
+      - name: Seal eligible Stage 1 ground truth
+        if: steps.readiness.outputs.ready == 'true' && inputs.finalize_when_ready
+        env:
+          STAGE1_SEAL_CONFIRMATION: ${{ inputs.seal_confirmation }}
+          STAGE1_CUTOFF_AT: ${{ github.event.repository.updated_at }}
+        run: |
+          set -euo pipefail
+          export STAGE1_CUTOFF_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          npx tsx scripts/stage1GroundTruthDatasetSeal.ts --seal
+      - name: Replay the newly sealed labeled cohort
+        if: steps.readiness.outputs.ready == 'true' && inputs.finalize_when_ready
+        run: npx tsx scripts/stage1SealedDatasetReplay.ts
+      - name: Write consolidated completion summary
+        if: always()
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          fs.mkdirSync('stage1-output',{recursive:true});
+          const readinessPath='stage1-output/stage1-prospective-cohort-readiness.json';
+          const replayPath='stage1-output/stage1-sealed-labeled-cohort-replay.json';
+          const readiness=fs.existsSync(readinessPath)?JSON.parse(fs.readFileSync(readinessPath,'utf8')):null;
+          const replay=fs.existsSync(replayPath)?JSON.parse(fs.readFileSync(replayPath,'utf8')):null;
+          const out={
+            reportType:'STAGE1_COMPLETION_GATE',
+            servingAuthority:false,
+            automaticPromotion:false,
+            readiness:readiness?.summary||null,
+            finalized:Boolean(replay),
+            replay:replay?{datasetId:replay.datasetId||null,totals:replay.totals,metrics:replay.metrics}:null,
+            nextAction: !readiness?.summary?.ready ? 'CONTINUE_INDEPENDENT_HUMAN_GROUND_TRUTH' : replay ? 'REVIEW_STAGE1_REPLAY_AND_BEGIN_STAGE2' : 'READY_TO_SEAL_AND_REPLAY'
+          };
+          fs.writeFileSync('stage1-output/stage1-completion-gate.json',JSON.stringify(out,null,2)+'\n');
+          console.log(JSON.stringify(out,null,2));
+          NODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage1-completion-gate-${{ github.run_id }}
+          path: stage1-output/*.json
+          retention-days: 30
