@@ -8,9 +8,12 @@ test('durable production diagnostics require the complete non-serving evidence b
   assert.match(diagnostics, /if \(diagnostic\.observationKey\) throw error/);
 });
 
-test('forced evidence observation bypasses only observational feature flags', () => {
+test('forced evidence observation bypasses all observational feature flags needed by Creator Focus', () => {
   const dualWrite = readFileSync(new URL('./evidenceEngine/dualWrite.ts', import.meta.url), 'utf8');
   assert.match(dualWrite, /configuredDocumentsEnabled \|\| options\.requireCompleteObservation === true/);
+  assert.match(dualWrite, /configuredAssertionsEnabled \|\| options\.requireCompleteObservation === true/);
+  assert.match(dualWrite, /const assertions = assertionsEnabled \? comparison\.assertions : \[\]/);
+  assert.match(dualWrite, /EVIDENCE_ASSERTIONS_PERSISTED/);
   assert.match(dualWrite, /forceShadowObservation: options\.requireCompleteObservation === true/);
   assert.match(dualWrite, /CREATOR_FOCUS_SNAPSHOT_REQUIRED_FOR_DURABLE_DIAGNOSTIC/);
   assert.match(dualWrite, /servingAuthority: false as const/);
