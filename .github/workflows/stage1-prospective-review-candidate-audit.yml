@@ -1,0 +1,55 @@
+name: Stage 1 prospective review candidate audit
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'scripts/stage1ProspectiveReviewCandidateAudit.ts'
+      - '.github/workflows/stage1-prospective-review-candidate-audit.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Build
+        run: npm run build
+      - name: Verify read-only boundary
+        run: |
+          set -euo pipefail
+          grep -q "BEGIN TRANSACTION READ ONLY" scripts/stage1ProspectiveReviewCandidateAudit.ts
+          grep -q "servingAuthority: false" scripts/stage1ProspectiveReviewCandidateAudit.ts
+          ! grep -E "\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP)\b" scripts/stage1ProspectiveReviewCandidateAudit.ts
+
+  production-audit:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Inspect prospective review candidates
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage1ProspectiveReviewCandidateAudit.ts | tee stage1-prospective-review-candidate-console.json
+          test -f stage1-output/stage1-prospective-review-candidate-audit.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage1-prospective-review-candidate-audit-${{ github.run_id }}
+          path: |
+            stage1-output/stage1-prospective-review-candidate-audit.json
+            stage1-prospective-review-candidate-console.json
+          retention-days: 30
