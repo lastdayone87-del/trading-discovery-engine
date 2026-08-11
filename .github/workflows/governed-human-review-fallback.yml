@@ -5,6 +5,8 @@ on:
     paths:
       - 'scripts/commitHumanReviewDecision.ts'
       - 'server/reviewFallbackContract.test.ts'
+      - 'server/reviewStore.ts'
+      - 'server/reviewStoreSqlContract.test.ts'
       - '.github/workflows/governed-human-review-fallback.yml'
   workflow_dispatch:
     inputs:
@@ -46,7 +48,7 @@ jobs:
           cache: npm
       - run: npm install
       - name: Fallback safety tests
-        run: node --import tsx --test server/reviewFallbackContract.test.ts
+        run: node --import tsx --test server/reviewFallbackContract.test.ts server/reviewStoreSqlContract.test.ts
       - name: Build
         run: npm run build
 
@@ -73,8 +75,12 @@ jobs:
       - name: Verify explicit confirmation
         run: test "$REVIEW_CONFIRMATION" = "COMMIT_HUMAN_REVIEW_DECISION"
       - name: Commit one governed human review decision
-        run: npx tsx scripts/commitHumanReviewDecision.ts | tee governed-human-review-result.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tsx scripts/commitHumanReviewDecision.ts | tee governed-human-review-result.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: governed-human-review-${{ github.run_id }}
           path: governed-human-review-result.json
