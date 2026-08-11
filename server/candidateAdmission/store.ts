@@ -7,9 +7,12 @@ import {buildStage1ProspectiveRetrievalAssignment,stage1ProspectiveNominationEli
 const normalize=(value:string)=>value.normalize('NFKC').trim().replace(/\s+/g,' ').toLocaleLowerCase('en');
 export function nominationIdentity(input:NominationInput){const observedAt=new Date(input.observedAt||new Date().toISOString()).toISOString();const matchedDocumentChecksum=admissionChecksum(input.matchedDocument),normalizedQuery=normalize(input.query);const key=admissionChecksum({sourceType:input.sourceType,sourceActionId:input.sourceActionId,queryRunId:input.queryRunId,queryCatalogVersion:input.queryCatalogVersion,normalizedQuery,pageNumber:input.pageNumber,resultRank:input.resultRank,channelId:input.channelId,matchedDocumentChecksum});return {key,observedAt,matchedDocumentChecksum};}
 
-export interface RecordNominationOptions { requireStage1AssignmentBeforeClassification?: boolean }
+/** Production search sources classify immediately after nomination, so Stage 1 assignment persistence is a hard ordering barrier for them. */
+export function requiresStage1AssignmentBeforeClassification(sourceType:string):boolean{
+ return sourceType==='manual_search'||sourceType==='automated_query'||sourceType==='automated_search';
+}
 
-export async function recordNomination(input:NominationInput,initialState:NominationState='OBSERVED',options:RecordNominationOptions={}):Promise<{id:string;nominationKey:string;created:boolean;ledgerEnabled:boolean}>{
+export async function recordNomination(input:NominationInput,initialState:NominationState='OBSERVED'):Promise<{id:string;nominationKey:string;created:boolean;ledgerEnabled:boolean}>{
  const identity=nominationIdentity(input),db=await getDb();
  // Stage 1 prospective evaluation capture must correspond to a channel that will
  // actually cross the automated classification boundary. Stable/terminal
@@ -18,10 +21,10 @@ export async function recordNomination(input:NominationInput,initialState:Nomina
  const existingChannel=await db.query('SELECT country_status,trading_status,scan_status FROM channels WHERE channel_id=$1',[input.channelId]);
  if(stage1ProspectiveNominationEligible(existingChannel.rows[0])){
   const assignmentCapture=()=>observeRetrievalAssignmentReliably(buildStage1ProspectiveRetrievalAssignment(input,identity.observedAt));
-  // Production discovery paths that classify this nomination immediately use the
-  // strict mode so classification can never outrun the prospective assignment.
-  // Other nomination-only callers retain the historical failure-contained behavior.
-  if(options.requireStage1AssignmentBeforeClassification)await assignmentCapture();
+  // Normal/manual production discovery classifies immediately after this call.
+  // It must retry/fail before classification if the prospective assignment cannot
+  // be persisted; nomination-only sources retain the historical fail-contained path.
+  if(requiresStage1AssignmentBeforeClassification(input.sourceType))await assignmentCapture();
   else await assignmentCapture().catch(error=>console.warn(`[Stage1Prospective] Retrieval assignment capture failed for ${input.channelId}:`,error instanceof Error?error.message:error));
  }
  const ledgerEnabled=await getAppSetting('nomination_ledger_enabled','false')==='true';
