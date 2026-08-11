@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { selectBalancedProspectiveCandidates } from '../server/stage1/balancedProspectiveCandidateSelector';
+import {
+  selectBalancedAdjudicationQueue,
+  selectBalancedProspectiveCandidates,
+} from '../server/stage1/balancedProspectiveCandidateSelector';
 
 test('returns distinct likely trading and likely non-trading candidates', () => {
   const result = selectBalancedProspectiveCandidates([
@@ -69,4 +72,70 @@ test('never recommends a non-ready row', () => {
 
   assert.equal(result.likelyTrading?.channel_id, 'ready');
   assert.equal(result.likelyNonTrading, null);
+});
+
+test('builds a finite disjoint queue only from independent-adjudication-ready rows', () => {
+  const candidates = [
+    {
+      channel_id: 'trading-1',
+      readiness: 'NOT_PENDING_REVIEW',
+      adjudication_readiness: 'READY_FOR_INDEPENDENT_ADJUDICATION',
+      creator_focus_proposed_status: 'TRADING_CONFIRMED',
+      creator_focus_probability: 0.95,
+      creator_focus_lower_confidence_bound: 0.82,
+      assigned_at: '2026-08-01T00:00:00Z',
+    },
+    {
+      channel_id: 'trading-2',
+      readiness: 'NOT_PENDING_REVIEW',
+      adjudication_readiness: 'READY_FOR_INDEPENDENT_ADJUDICATION',
+      creator_focus_proposed_status: 'TRADING_CONFIRMED',
+      creator_focus_probability: 0.88,
+      creator_focus_lower_confidence_bound: 0.71,
+      assigned_at: '2026-08-02T00:00:00Z',
+    },
+    {
+      channel_id: 'non-trading-1',
+      readiness: 'NOT_PENDING_REVIEW',
+      adjudication_readiness: 'READY_FOR_INDEPENDENT_ADJUDICATION',
+      creator_focus_proposed_status: 'NON_TRADING',
+      creator_focus_probability: 0.04,
+      creator_focus_lower_confidence_bound: 0.01,
+      assigned_at: '2026-08-03T00:00:00Z',
+    },
+    {
+      channel_id: 'not-ready',
+      readiness: 'NOT_PENDING_REVIEW',
+      adjudication_readiness: 'DIAGNOSTIC_MISSING_AFTER_ASSIGNMENT',
+      creator_focus_proposed_status: 'NON_TRADING',
+      creator_focus_probability: 0.01,
+    },
+  ];
+
+  const result = selectBalancedAdjudicationQueue(candidates, 1);
+  assert.deepEqual(result.likelyTrading.map(row => row.channel_id), ['trading-1']);
+  assert.deepEqual(result.likelyNonTrading.map(row => row.channel_id), ['non-trading-1']);
+  assert.equal(result.methodology.humanDecisionRequired, true);
+  assert.equal(result.methodology.hintsAreGroundTruth, false);
+  assert.equal(result.methodology.operationalStatusIsGroundTruth, false);
+  assert.equal(result.methodology.servingAuthority, false);
+  assert.equal(result.methodology.queueMutation, false);
+});
+
+test('caps adjudication queue size and never duplicates a candidate across hint lanes', () => {
+  const candidates = Array.from({ length: 80 }, (_, index) => ({
+    channel_id: `candidate-${index}`,
+    readiness: 'NOT_PENDING_REVIEW',
+    adjudication_readiness: 'READY_FOR_INDEPENDENT_ADJUDICATION',
+    creator_focus_proposed_status: 'UNCERTAIN',
+    creator_focus_probability: index / 100,
+    creator_focus_lower_confidence_bound: index / 200,
+  }));
+
+  const result = selectBalancedAdjudicationQueue(candidates, 1000);
+  assert.equal(result.requestedPerClass, 50);
+  assert.equal(result.likelyTrading.length, 50);
+  assert.equal(result.likelyNonTrading.length, 30);
+  const tradingIds = new Set(result.likelyTrading.map(row => row.channel_id));
+  assert.equal(result.likelyNonTrading.some(row => tradingIds.has(row.channel_id)), false);
 });
