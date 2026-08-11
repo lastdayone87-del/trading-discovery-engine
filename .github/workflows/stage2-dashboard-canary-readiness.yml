@@ -1,0 +1,82 @@
+name: Stage 2 dashboard canary readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage1_dataset_id:
+        description: Optional sealed Stage 1 dataset UUID. Leave blank for latest.
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'server/release5/stage2DashboardCanaryReadiness.ts'
+      - 'server/release5/stage2DashboardCanaryReadiness.test.ts'
+      - 'server/release5/stage2DashboardCanaryContract.test.ts'
+      - 'scripts/stage2DashboardCanaryReadiness.ts'
+      - '.github/workflows/stage2-dashboard-canary-readiness.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Stage 2 readiness and serving-contract tests
+        run: node --import tsx --test server/release5/stage2DashboardCanaryReadiness.test.ts server/release5/stage2DashboardCanaryContract.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify dormant authority contract
+        run: |
+          set -euo pipefail
+          grep -q 'servingAuthority: false' server/release5/stage2DashboardCanaryReadiness.ts
+          grep -q 'automaticActivation: false' server/release5/stage2DashboardCanaryReadiness.ts
+          grep -q "requestedServingMode: 'OFF'" server/release5/stage2DashboardCanaryReadiness.ts
+          ! grep -E '\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP)\b' scripts/stage2DashboardCanaryReadiness.ts server/release5/stage2DashboardCanaryReadiness.ts
+
+  production-readiness:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Run read-only Stage 2 dashboard readiness check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+          STAGE1_DATASET_ID: ${{ inputs.stage1_dataset_id }}
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage2DashboardCanaryReadiness.ts | tee stage2-dashboard-canary-console.json
+          test -f stage2-output/stage2-dashboard-canary-readiness.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report=json.loads(Path('stage2-output/stage2-dashboard-canary-readiness.json').read_text())
+          assert report['servingAuthority'] is False
+          assert report['automaticActivation'] is False
+          assert report['requestedServingMode'] == 'OFF'
+          print(json.dumps({
+            'readyForPromotionGate': report['readyForPromotionGate'],
+            'reasons': report['reasons'],
+            'observed': report['observed']
+          }, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-dashboard-canary-readiness-${{ github.run_id }}
+          path: |
+            stage2-output/stage2-dashboard-canary-readiness.json
+            stage2-dashboard-canary-console.json
+          retention-days: 30
