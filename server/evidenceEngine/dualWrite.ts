@@ -27,7 +27,12 @@ export async function persistClassificationEvidenceBundle(
   const started = Date.now();
   const configuredDocumentsEnabled = await getAppSetting('evidence_document_dual_write_enabled', 'false') === 'true';
   const documentsEnabled = configuredDocumentsEnabled || options.requireCompleteObservation === true;
-  const assertionsEnabled = await getAppSetting('evidence_assertion_dual_write_enabled', 'false') === 'true';
+  const configuredAssertionsEnabled = await getAppSetting('evidence_assertion_dual_write_enabled', 'false') === 'true';
+  // A durable diagnostic is only complete if Creator Focus receives the
+  // projected assertions as well as documents/coverage. Leaving assertions
+  // behind the ordinary feature flag creates a valid-looking snapshot whose
+  // trading/alternative mass is identically zero.
+  const assertionsEnabled = configuredAssertionsEnabled || options.requireCompleteObservation === true;
   if (!documentsEnabled) {
     return { enabled: false, documents: 0, assertions: 0, coverage: false, servingAuthority: false as const };
   }
@@ -110,6 +115,7 @@ export async function persistClassificationEvidenceBundle(
     reasonCodes: [
       'PROJECTION_EQUIVALENT',
       'DOCUMENT_COVERAGE_PERSISTED',
+      ...(assertionsEnabled ? ['EVIDENCE_ASSERTIONS_PERSISTED'] : ['EVIDENCE_ASSERTION_OBSERVER_DISABLED']),
       ...(creatorFocus.enabled ? ['CREATOR_FOCUS_SNAPSHOT_PERSISTED'] : ['CREATOR_FOCUS_OBSERVER_DISABLED']),
       ...(options.requireCompleteObservation ? ['DURABLE_DIAGNOSTIC_COMPLETE_OBSERVATION_REQUIRED'] : [])
     ],
