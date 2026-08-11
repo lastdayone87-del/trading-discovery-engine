@@ -1,0 +1,63 @@
+name: Stage 2 rate-pressure shadow evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: 'Optional sealed Stage 1 dataset UUID. Leave blank for latest.'
+        required: false
+        type: string
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Build
+        run: npm run build
+      - name: Verify shadow-only boundary
+        run: |
+          grep -q "servingAuthority: false" server/release5/stage2RatePressureShadowPolicy.ts
+          grep -q "automaticPromotion: false" server/release5/stage2RatePressureShadowPolicy.ts
+          grep -q "mutatesOperationalState: false" server/release5/stage2RatePressureShadowPolicy.ts
+
+  production-shadow:
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      NODE_ENV: production
+      STAGE1_DATASET_ID: ${{ inputs.dataset_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Evaluate rate-pressure fallback against sealed cohort
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage2RatePressureShadowEvaluation.ts
+          test -f stage2-output/stage2-rate-pressure-shadow-evaluation.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const report=JSON.parse(fs.readFileSync('stage2-output/stage2-rate-pressure-shadow-evaluation.json','utf8'));
+          if(report.servingAuthority!==false || report.automaticPromotion!==false || report.mutatesOperationalState!==false) process.exit(1);
+          if(report.metrics.genuineCreatorFalseWithhold.withheldGenuine>0) process.exit(1);
+          console.log(JSON.stringify({totals:report.totals,metrics:report.metrics,nextAction:report.nextAction},null,2));
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-rate-pressure-shadow-evaluation-${{ github.run_id }}
+          path: stage2-output/stage2-rate-pressure-shadow-evaluation.json
+          retention-days: 30
