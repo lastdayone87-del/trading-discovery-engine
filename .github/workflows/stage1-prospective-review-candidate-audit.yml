@@ -5,6 +5,8 @@ on:
   pull_request:
     paths:
       - 'scripts/stage1ProspectiveReviewCandidateAudit.ts'
+      - 'server/stage1/balancedProspectiveCandidateSelector.ts'
+      - 'tests/stage1BalancedProspectiveCandidateSelector.test.ts'
       - '.github/workflows/stage1-prospective-review-candidate-audit.yml'
 
 jobs:
@@ -19,11 +21,16 @@ jobs:
       - run: npm install
       - name: Build
         run: npm run build
+      - name: Test balanced candidate selector
+        run: node --import tsx --test tests/stage1BalancedProspectiveCandidateSelector.test.ts
       - name: Verify read-only boundary
         run: |
           set -euo pipefail
           grep -q "BEGIN TRANSACTION READ ONLY" scripts/stage1ProspectiveReviewCandidateAudit.ts
           grep -q "servingAuthority: false" scripts/stage1ProspectiveReviewCandidateAudit.ts
+          grep -q "humanDecisionRequired: true" scripts/stage1ProspectiveReviewCandidateAudit.ts
+          grep -q "hintsAreGroundTruth: false" server/stage1/balancedProspectiveCandidateSelector.ts
+          grep -q "servingAuthority: false" server/stage1/balancedProspectiveCandidateSelector.ts
           ! grep -E "\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP)\b" scripts/stage1ProspectiveReviewCandidateAudit.ts
 
   production-audit:

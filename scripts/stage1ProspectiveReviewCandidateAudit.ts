@@ -2,6 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import pg from 'pg';
 import { CREATOR_FOCUS_CLASSIFIER_VERSION, CREATOR_FOCUS_POLICY_VERSION } from '../server/evidenceEngine/classifierV4';
 import { EVIDENCE_COVERAGE_POLICY_VERSION } from '../server/evidenceEngine/coverage';
+import { selectBalancedProspectiveCandidates } from '../server/stage1/balancedProspectiveCandidateSelector';
 
 const POLICY_KEY = 'stage1-prospective-census';
 
@@ -43,6 +44,9 @@ async function main() {
              d.assignment_id,d.assigned_at,d.inclusion_basis_points,d.stratum,d.discovery_context,
              d.diagnostic_id,d.diagnostic_at,
              f.id AS focus_snapshot_id,
+             f.proposed_status AS creator_focus_proposed_status,
+             f.probability AS creator_focus_probability,
+             f.lower_confidence_bound AS creator_focus_lower_confidence_bound,
              e.id AS coverage_snapshot_id,
              CASE
                WHEN r.state<>'PENDING' THEN 'NOT_PENDING_REVIEW'
@@ -55,7 +59,7 @@ async function main() {
         JOIN channels c ON c.channel_id=d.channel_id
         LEFT JOIN channel_reviews r ON r.channel_id=d.channel_id
         LEFT JOIN LATERAL (
-          SELECT x.id
+          SELECT x.id,x.proposed_status,x.probability,x.lower_confidence_bound
             FROM creator_focus_classification_snapshots x
            WHERE x.classification_diagnostic_id=d.diagnostic_id
              AND x.classifier_version=$2
@@ -75,6 +79,7 @@ async function main() {
 
     const rows = result.rows;
     const ready = rows.filter(row => row.readiness === 'READY_FOR_PROSPECTIVE_HUMAN_REVIEW');
+    const balancedRecommendations = selectBalancedProspectiveCandidates(ready);
     const report = {
       reportType: 'STAGE1_PROSPECTIVE_REVIEW_CANDIDATE_AUDIT',
       readOnly: true,
@@ -85,6 +90,13 @@ async function main() {
         readyPendingReview: ready.length
       },
       recommendedCandidate: ready[0] || null,
+      balancedRecommendations,
+      safety: {
+        humanDecisionRequired: true,
+        candidateHintsAreNotGroundTruth: true,
+        candidateSelectionDoesNotChangeCohortAssignment: true,
+        noLabelWrite: true
+      },
       rows
     };
     await db.query('ROLLBACK');
