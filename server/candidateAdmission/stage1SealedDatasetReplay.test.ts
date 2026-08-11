@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyStage1ToSealedResult } from './stage1SealedDatasetReplay';
+import { applyStage1ToSealedResult, stage1DecisionRequiresFollowup } from './stage1SealedDatasetReplay';
 
 const base = (overrides: any = {}) => ({
   decision: 'ADMIT_REVIEW',
@@ -27,4 +27,11 @@ test('ambiguous review candidate defers rather than being admitted', () => {
 test('capability failure cannot be promoted to WITHHOLD', () => {
   const result = applyStage1ToSealedResult(base({ reasonCodes: ['EVIDENCE_COVERAGE_INCOMPLETE'], creatorFocus: { tradingMass: .05, alternativeMass: .95 }, decision: 'DEFER_INVESTIGATION' }));
   assert.equal(result.decision, 'DEFER_INVESTIGATION');
+});
+
+test('deferred investigations remain part of projected follow-up workload', () => {
+  assert.equal(stage1DecisionRequiresFollowup('ADMIT_REVIEW'), true);
+  assert.equal(stage1DecisionRequiresFollowup('DEFER_INVESTIGATION'), true);
+  assert.equal(stage1DecisionRequiresFollowup('ADMIT_CONFIRMED'), false);
+  assert.equal(stage1DecisionRequiresFollowup('WITHHOLD'), false);
 });
