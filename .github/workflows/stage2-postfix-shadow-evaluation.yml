@@ -1,0 +1,84 @@
+name: Stage 2 post-fix sealed cohort shadow evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage1_dataset_id:
+        description: Optional sealed Stage 1 dataset UUID. Leave blank for latest.
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'server/release5/stage2PostFixShadowEvaluation.ts'
+      - 'server/release5/stage2PostFixShadowEvaluation.test.ts'
+      - 'scripts/stage2PostFixShadowEvaluation.ts'
+      - '.github/workflows/stage2-postfix-shadow-evaluation.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage2-postfix-shadow-evaluation
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Post-fix evaluation safety contracts
+        run: node --import tsx --test server/release5/stage2PostFixShadowEvaluation.test.ts server/stage1ProspectiveObservationChain.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify non-serving boundary
+        run: |
+          set -euo pipefail
+          grep -q 'servingAuthority: false' server/release5/stage2PostFixShadowEvaluation.ts
+          grep -q 'automaticPromotion: false' server/release5/stage2PostFixShadowEvaluation.ts
+          grep -q 'mutatesOperationalState: false' server/release5/stage2PostFixShadowEvaluation.ts
+          ! grep -E 'processDiscoveredChannel|triggerManualRecheck|decideReview' server/release5/stage2PostFixShadowEvaluation.ts
+
+  production-shadow:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Evaluate sealed cohort through repaired observation path
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NODE_ENV: production
+          STAGE1_DATASET_ID: ${{ inputs.stage1_dataset_id }}
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage2PostFixShadowEvaluation.ts | tee stage2-postfix-shadow-console.json
+          test -f stage2-output/stage2-postfix-shadow-evaluation.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const report=JSON.parse(fs.readFileSync('stage2-output/stage2-postfix-shadow-evaluation.json','utf8'));
+          if(report.servingAuthority!==false || report.automaticPromotion!==false || report.mutatesOperationalState!==false) process.exit(1);
+          console.log(JSON.stringify({totals:report.totals,metrics:report.metrics,nextAction:report.nextAction},null,2));
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-postfix-shadow-evaluation-${{ github.run_id }}
+          path: |
+            stage2-output/stage2-postfix-shadow-evaluation.json
+            stage2-postfix-shadow-console.json
+          retention-days: 30
