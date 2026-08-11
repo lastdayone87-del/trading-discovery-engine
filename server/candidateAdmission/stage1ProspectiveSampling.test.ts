@@ -7,6 +7,7 @@ import {
   stage1ProspectiveNominationEligible,
   STAGE1_PROSPECTIVE_SAMPLING_POLICY
 } from './stage1ProspectiveSampling';
+import { requiresStage1AssignmentBeforeClassification } from './store';
 import type { NominationInput } from './types';
 
 const nomination: NominationInput = {
@@ -59,9 +60,19 @@ test('prospective assignment excludes channels ingestion will short-circuit befo
   assert.equal(stage1ProspectiveNominationEligible({ scan_status: 'COMPLETED' }), false);
 });
 
-test('recordNomination guards Stage 1 capture with current channel state', () => {
+test('normal production discovery sources require the Stage 1 assignment before classification', () => {
+  assert.equal(requiresStage1AssignmentBeforeClassification('manual_search'), true);
+  assert.equal(requiresStage1AssignmentBeforeClassification('automated_query'), true);
+  assert.equal(requiresStage1AssignmentBeforeClassification('automated_search'), true);
+  assert.equal(requiresStage1AssignmentBeforeClassification('external_provider'), false);
+  assert.equal(requiresStage1AssignmentBeforeClassification('recheck'), false);
+});
+
+test('recordNomination guards Stage 1 capture with current channel state and fails closed for production search ordering', () => {
   const source = readFileSync(new URL('./store.ts', import.meta.url), 'utf8');
   assert.match(source, /SELECT country_status,trading_status,scan_status FROM channels/);
   assert.match(source, /stage1ProspectiveNominationEligible\(existingChannel\.rows\[0\]\)/);
   assert.match(source, /observeRetrievalAssignmentReliably\(buildStage1ProspectiveRetrievalAssignment/);
+  assert.match(source, /if\(requiresStage1AssignmentBeforeClassification\(input\.sourceType\)\)await assignmentCapture\(\)/);
+  assert.match(source, /else await assignmentCapture\(\)\.catch/);
 });
