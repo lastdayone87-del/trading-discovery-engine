@@ -10,7 +10,8 @@ const passingStage1 = () => ({
     historicalEvidenceEligibility: { rate: 0.95 },
     falsePositiveWithhold: { rate: 0.4, effectiveSampleSize: 30 },
     genuineCreatorRecall: { rate: 0.97, effectiveSampleSize: 30 },
-    projectedReviewReduction: { rate: 0.2 }
+    projectedReviewReduction: { rate: 0.2 },
+    decisiveDecisionRate: { rate: 0.5, evaluated: 60, decisive: 30, deferred: 30 }
   }
 });
 
@@ -62,14 +63,27 @@ test('stage 2 preparation fails closed if dashboard serving is already enabled',
   assert.ok(report.reasons.includes('DASHBOARD_TREATMENT_ASSIGNMENTS_ALREADY_PRESENT'));
 });
 
-test('stage 2 keeps recall, false-positive withholding, and review-reduction floors explicit', () => {
+test('stage 2 keeps recall, false-positive withholding, review-reduction, and decisive-decision floors explicit', () => {
   const stage1 = passingStage1();
   stage1.metrics.genuineCreatorRecall.rate = 0.94;
   stage1.metrics.falsePositiveWithhold.rate = 0;
   stage1.metrics.projectedReviewReduction.rate = 0;
+  stage1.metrics.decisiveDecisionRate.rate = 0;
   const report = evaluateStage2DashboardCanaryReadiness(stage1, dormantRuntime());
   assert.equal(report.readyForPromotionGate, false);
   assert.ok(report.reasons.includes('GENUINE_CREATOR_RECALL'));
   assert.ok(report.reasons.includes('FALSE_POSITIVE_WITHHOLD_NOT_DEMONSTRATED'));
   assert.ok(report.reasons.includes('REVIEW_REDUCTION_NOT_DEMONSTRATED'));
+  assert.ok(report.reasons.includes('DECISIVE_STAGE1_DECISIONS_NOT_DEMONSTRATED'));
+});
+
+test('an all-deferred Stage 1 replay cannot be promoted to Stage 2', () => {
+  const stage1 = passingStage1();
+  stage1.metrics.falsePositiveWithhold.rate = 0;
+  stage1.metrics.projectedReviewReduction.rate = 0;
+  stage1.metrics.decisiveDecisionRate = { rate: 0, evaluated: 60, decisive: 0, deferred: 60 };
+  const report = evaluateStage2DashboardCanaryReadiness(stage1, dormantRuntime());
+  assert.equal(report.readyForPromotionGate, false);
+  assert.ok(report.reasons.includes('DECISIVE_STAGE1_DECISIONS_NOT_DEMONSTRATED'));
+  assert.equal(report.nextAction, 'HOLD_STAGE1_AND_REPAIR_REPLAY_EVIDENCE_BEFORE_STAGE2_PROMOTION');
 });
