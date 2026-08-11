@@ -2,9 +2,54 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import pg from 'pg';
 import { CREATOR_FOCUS_CLASSIFIER_VERSION, CREATOR_FOCUS_POLICY_VERSION } from '../server/evidenceEngine/classifierV4';
 import { EVIDENCE_COVERAGE_POLICY_VERSION } from '../server/evidenceEngine/coverage';
-import { selectBalancedProspectiveCandidates } from '../server/stage1/balancedProspectiveCandidateSelector';
+import {
+  selectBalancedAdjudicationQueue,
+  selectBalancedProspectiveCandidates,
+  type ProspectiveReviewCandidate,
+} from '../server/stage1/balancedProspectiveCandidateSelector';
 
 const POLICY_KEY = 'stage1-prospective-census';
+const requestedQueuePerClass = Math.max(1, Math.min(50, Number.parseInt(process.env.STAGE1_ADJUDICATION_QUEUE_PER_CLASS || '10', 10) || 10));
+
+const formatProbability = (value: unknown): string => {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(3) : 'n/a';
+};
+
+const queueMarkdown = (
+  likelyTrading: ProspectiveReviewCandidate[],
+  likelyNonTrading: ProspectiveReviewCandidate[],
+): string => {
+  const lines = [
+    '# Stage 1 independent adjudication worklist',
+    '',
+    '> Human review required. Lane placement is a triage hint only and is not ground truth.',
+    '> Independently inspect every creator before choosing TRADING_CONFIRMED or NON_TRADING.',
+    '',
+    '## Likely trading lane',
+    '',
+    '| Channel | Creator Focus | Probability | Lower bound | YouTube |',
+    '|---|---:|---:|---:|---|',
+  ];
+
+  if (!likelyTrading.length) lines.push('| _none_ | | | | |');
+  for (const row of likelyTrading) {
+    const url = String(row.youtube_url || '').trim();
+    const link = url ? `[open](${url})` : '';
+    lines.push(`| ${String(row.channel_name || row.channel_id)} | ${String(row.creator_focus_proposed_status || 'UNKNOWN')} | ${formatProbability(row.creator_focus_probability)} | ${formatProbability(row.creator_focus_lower_confidence_bound)} | ${link} |`);
+  }
+
+  lines.push('', '## Likely non-trading lane', '', '| Channel | Creator Focus | Probability | Lower bound | YouTube |', '|---|---:|---:|---:|---|');
+  if (!likelyNonTrading.length) lines.push('| _none_ | | | | |');
+  for (const row of likelyNonTrading) {
+    const url = String(row.youtube_url || '').trim();
+    const link = url ? `[open](${url})` : '';
+    lines.push(`| ${String(row.channel_name || row.channel_id)} | ${String(row.creator_focus_proposed_status || 'UNKNOWN')} | ${formatProbability(row.creator_focus_probability)} | ${formatProbability(row.creator_focus_lower_confidence_bound)} | ${link} |`);
+  }
+
+  lines.push('', 'These lanes never write labels, mutate operational state, or create serving authority.', '');
+  return lines.join('\n');
+};
 
 async function main() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required.');
@@ -96,10 +141,11 @@ async function main() {
                 d.assigned_at DESC,c.channel_id
        LIMIT 250`, [POLICY_KEY, CREATOR_FOCUS_CLASSIFIER_VERSION, CREATOR_FOCUS_POLICY_VERSION, EVIDENCE_COVERAGE_POLICY_VERSION]);
 
-    const rows = result.rows;
+    const rows = result.rows as ProspectiveReviewCandidate[];
     const ready = rows.filter(row => row.readiness === 'READY_FOR_PROSPECTIVE_HUMAN_REVIEW');
     const adjudicationReady = rows.filter(row => row.adjudication_readiness === 'READY_FOR_INDEPENDENT_ADJUDICATION');
     const balancedRecommendations = selectBalancedProspectiveCandidates(ready);
+    const adjudicationQueue = selectBalancedAdjudicationQueue(adjudicationReady, requestedQueuePerClass);
     const adjudicationRecommendations = {
       operationalTradingConfirmed: adjudicationReady.find(row => row.trading_status === 'TRADING_CONFIRMED') || null,
       operationalUncertain: adjudicationReady.find(row => row.trading_status === 'UNCERTAIN' || row.trading_status === 'NEEDS_REVIEW') || null,
@@ -121,6 +167,7 @@ async function main() {
       recommendedCandidate: ready[0] || null,
       balancedRecommendations,
       adjudicationRecommendations,
+      adjudicationQueue,
       safety: {
         humanDecisionRequired: true,
         candidateHintsAreNotGroundTruth: true,
@@ -133,7 +180,15 @@ async function main() {
     await db.query('ROLLBACK');
     await mkdir('stage1-output', { recursive: true });
     await writeFile('stage1-output/stage1-prospective-review-candidate-audit.json', `${JSON.stringify(report, null, 2)}\n`, 'utf8');
-    console.log(JSON.stringify(report, null, 2));
+    await writeFile(
+      'stage1-output/stage1-independent-adjudication-worklist.md',
+      queueMarkdown(adjudicationQueue.likelyTrading, adjudicationQueue.likelyNonTrading),
+      'utf8',
+    );
+    console.log(JSON.stringify({
+      ...report,
+      rows: `[${rows.length} rows omitted from console; full rows retained in JSON artifact]`,
+    }, null, 2));
   } catch (error) {
     await db.query('ROLLBACK').catch(() => undefined);
     throw error;
