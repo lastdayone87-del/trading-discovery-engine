@@ -48,7 +48,7 @@ test('creator-level positive terminology still blocks creator-level UNRELATED sh
 
 test('non-terminology positive video evidence remains substantive',()=>{
   const positive=terminology('video_title','options');
-  positive.category='STRATEGY';
+  positive.category='METHODOLOGY_CONCEPT';
   positive.fact='Video explicitly teaches an options trading strategy with calls, puts, strikes and expiration.';
   const evidence=[semanticUnrelated(),positive];
   assert.equal(qualifiesSemanticUnrelatedTerminalReject(evidence,collection),false);
