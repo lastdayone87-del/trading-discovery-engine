@@ -2,6 +2,11 @@ name: Stage 1 prospective review candidate audit
 
 on:
   workflow_dispatch:
+    inputs:
+      adjudication_queue_per_class:
+        description: 'Number of read-only human-review candidates to surface in each hint lane'
+        required: false
+        default: '10'
   pull_request:
     paths:
       - 'scripts/stage1ProspectiveReviewCandidateAudit.ts'
@@ -33,12 +38,15 @@ jobs:
           grep -q "operationalStatusIsNotGroundTruth: true" scripts/stage1ProspectiveReviewCandidateAudit.ts
           grep -q "hintsAreGroundTruth: false" server/stage1/balancedProspectiveCandidateSelector.ts
           grep -q "servingAuthority: false" server/stage1/balancedProspectiveCandidateSelector.ts
+          grep -q "queueMutation: false" server/stage1/balancedProspectiveCandidateSelector.ts
           ! grep -E "\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP)\b" scripts/stage1ProspectiveReviewCandidateAudit.ts
 
   production-audit:
     if: github.event_name == 'workflow_dispatch'
     needs: verify
     runs-on: ubuntu-latest
+    env:
+      STAGE1_ADJUDICATION_QUEUE_PER_CLASS: ${{ inputs.adjudication_queue_per_class || '10' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,10 +63,12 @@ jobs:
           test -n "${DATABASE_URL:+x}"
           npx tsx scripts/stage1ProspectiveReviewCandidateAudit.ts | tee stage1-prospective-review-candidate-console.json
           test -f stage1-output/stage1-prospective-review-candidate-audit.json
+          test -f stage1-output/stage1-independent-adjudication-worklist.md
       - uses: actions/upload-artifact@v4
         with:
           name: stage1-prospective-review-candidate-audit-${{ github.run_id }}
           path: |
             stage1-output/stage1-prospective-review-candidate-audit.json
+            stage1-output/stage1-independent-adjudication-worklist.md
             stage1-prospective-review-candidate-console.json
           retention-days: 30
