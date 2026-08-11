@@ -1,0 +1,56 @@
+name: Stage 5 expensive-work shadow audit
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'scripts/stage5ExpensiveWorkShadowAudit.ts'
+      - '.github/workflows/stage5-expensive-work-shadow-audit.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Build
+        run: npm run build
+      - name: Verify read-only Stage 5 boundary
+        run: |
+          set -euo pipefail
+          grep -q "BEGIN TRANSACTION READ ONLY" scripts/stage5ExpensiveWorkShadowAudit.ts
+          grep -q "servingAuthority: false" scripts/stage5ExpensiveWorkShadowAudit.ts
+          grep -q "automaticDeferral: false" scripts/stage5ExpensiveWorkShadowAudit.ts
+          ! grep -E "\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP)\b" scripts/stage5ExpensiveWorkShadowAudit.ts
+
+  production-audit:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Measure hypothetical expensive-work deferral
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage5ExpensiveWorkShadowAudit.ts | tee stage5-expensive-work-shadow-console.json
+          test -f stage5-output/stage5-expensive-work-shadow-audit.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage5-expensive-work-shadow-audit-${{ github.run_id }}
+          path: |
+            stage5-output/stage5-expensive-work-shadow-audit.json
+            stage5-expensive-work-shadow-console.json
+          retention-days: 30
