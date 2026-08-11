@@ -20,12 +20,12 @@ const db = await getDb();
 const client = await db.connect();
 let began = false;
 try {
-  const columns = await client.query<{ column_name: string }>(`
+  const columns = await client.query(`
     SELECT column_name FROM information_schema.columns
     WHERE table_schema='public' AND table_name='channel_review_decisions'
       AND column_name IN ('reason_code','reason_catalog_version','reason_other_text')
   `);
-  const present = new Set(columns.rows.map(row => row.column_name));
+  const present = new Set(columns.rows.map((row: { column_name: string }) => row.column_name));
   for (const name of ['reason_code','reason_catalog_version','reason_other_text']) report.schema[name] = present.has(name);
 
   const lookup = await client.query(`
