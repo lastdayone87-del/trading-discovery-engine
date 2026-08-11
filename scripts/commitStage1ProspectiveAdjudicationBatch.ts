@@ -25,7 +25,13 @@ const preflight = [] as Array<{
 }>;
 
 for (const entry of entries) {
-  const candidate = await inspectStage1ProspectiveAdjudicationCandidate(entry.channel);
+  let candidate;
+  try {
+    candidate = await inspectStage1ProspectiveAdjudicationCandidate(entry.channel);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`BATCH_ENTRY_LOOKUP_FAILED:${JSON.stringify(entry.channel)}:${message}`);
+  }
   if (candidate.readiness === 'INDEPENDENT_LABEL_ALREADY_EXISTS') {
     if (candidate.existing_label !== entry.label) {
       throw new Error(`BATCH_CONFLICTING_EXISTING_LABEL:${candidate.channel_id}:${candidate.existing_label}:${entry.label}`);
