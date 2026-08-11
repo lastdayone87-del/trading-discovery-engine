@@ -1,15 +1,25 @@
 import {getAppSetting,getDb} from '../db';
+import {observeRetrievalAssignmentReliably} from '../phaseBObservationOutbox';
 import {admissionChecksum,deterministicUuid} from './versioning';
 import {NOMINATION_FEATURE_VERSION,NOMINATION_POLICY_VERSION,type NominationInput,type NominationState} from './types';
+import {buildStage1ProspectiveRetrievalAssignment} from './stage1ProspectiveSampling';
 
 const normalize=(value:string)=>value.normalize('NFKC').trim().replace(/\s+/g,' ').toLocaleLowerCase('en');
 export function nominationIdentity(input:NominationInput){const observedAt=new Date(input.observedAt||new Date().toISOString()).toISOString();const matchedDocumentChecksum=admissionChecksum(input.matchedDocument),normalizedQuery=normalize(input.query);const key=admissionChecksum({sourceType:input.sourceType,sourceActionId:input.sourceActionId,queryRunId:input.queryRunId,queryCatalogVersion:input.queryCatalogVersion,normalizedQuery,pageNumber:input.pageNumber,resultRank:input.resultRank,channelId:input.channelId,matchedDocumentChecksum});return {key,observedAt,matchedDocumentChecksum};}
 
 export async function recordNomination(input:NominationInput,initialState:NominationState='OBSERVED'):Promise<{id:string;nominationKey:string;created:boolean;ledgerEnabled:boolean}>{
+ const identity=nominationIdentity(input);
+ // Stage 1 prospective evaluation capture happens at the retrieval boundary,
+ // before classification and independently of whether the Release-1 nomination
+ // ledger is currently materializing. Failure remains observational and cannot
+ // block production discovery; the Phase B outbox retains it for reconciliation.
+ await observeRetrievalAssignmentReliably(buildStage1ProspectiveRetrievalAssignment(input,identity.observedAt))
+  .catch(error=>console.warn(`[Stage1Prospective] Retrieval assignment capture failed for ${input.channelId}:`,error instanceof Error?error.message:error));
  const ledgerEnabled=await getAppSetting('nomination_ledger_enabled','false')==='true';
- // OFF controls materialization for rollback. Callers still preserve existing sighting telemetry.
- if(!ledgerEnabled)return {id:'',nominationKey:nominationIdentity(input).key,created:false,ledgerEnabled:false};
- const db=await getDb(),client=await db.connect(),identity=nominationIdentity(input);
+ // OFF controls nomination materialization for rollback. Prospective evaluation
+ // capture above is measurement-only and remains independent of this serving flag.
+ if(!ledgerEnabled)return {id:'',nominationKey:identity.key,created:false,ledgerEnabled:false};
+ const db=await getDb(),client=await db.connect();
  try{await client.query('BEGIN');
   const existingSubject=await client.query('SELECT 1 FROM candidate_subjects WHERE channel_id=$1',[input.channelId]);const effectiveInitialState:NominationState=existingSubject.rowCount?'DUPLICATE_ENTITY':initialState;
   const inserted=await client.query(`INSERT INTO discovery_nominations(nomination_key,channel_id,channel_entity_id,source_type,source_action_id,query_id,query_run_id,job_id,query_catalog_version,normalized_query,query_semantic_classes,query_generation_mode,country,declared_language,retrieval_lane,search_ordering,page_number,result_rank,matched_document_locator,matched_document_checksum,raw_observation,observed_at,policy_version,feature_version)

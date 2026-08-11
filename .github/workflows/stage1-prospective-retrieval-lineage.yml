@@ -1,0 +1,32 @@
+name: Stage 1 prospective retrieval lineage
+
+on:
+  pull_request:
+    paths:
+      - 'server/candidateAdmission/store.ts'
+      - 'server/candidateAdmission/stage1ProspectiveSampling.ts'
+      - 'server/candidateAdmission/stage1ProspectiveSampling.test.ts'
+      - 'server/phaseBObservationOutbox.ts'
+      - 'server/decisionEvaluation.ts'
+      - '.github/workflows/stage1-prospective-retrieval-lineage.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Prospective retrieval lineage tests
+        run: node --import tsx --test server/candidateAdmission/stage1ProspectiveSampling.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify measurement-only boundary
+        run: |
+          set -euo pipefail
+          grep -q "protectedAuditBasisPoints: 10000" server/candidateAdmission/stage1ProspectiveSampling.ts
+          grep -q "observeRetrievalAssignmentReliably" server/candidateAdmission/store.ts
+          ! grep -E "release5_dashboard_serving_mode|servingAuthority: true|automaticPromotion: true" server/candidateAdmission/stage1ProspectiveSampling.ts server/candidateAdmission/store.ts
