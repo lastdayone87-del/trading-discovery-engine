@@ -4,6 +4,7 @@ export interface ProspectiveReviewCandidate {
   channel_id: string;
   channel_name?: string | null;
   youtube_url?: string | null;
+  trading_status?: string | null;
   readiness: string;
   adjudication_readiness?: string | null;
   creator_focus_proposed_status?: string | null;
@@ -61,10 +62,25 @@ const candidateTime = (row: ProspectiveReviewCandidate): number => {
 const proposedRank = (row: ProspectiveReviewCandidate, target: 'TRADING_CONFIRMED' | 'NON_TRADING'): number =>
   row.creator_focus_proposed_status === target ? 0 : row.creator_focus_proposed_status === 'UNCERTAIN' ? 1 : 2;
 
+const operationalRank = (row: ProspectiveReviewCandidate, target: 'TRADING_CONFIRMED' | 'NON_TRADING'): number => {
+  const status = row.trading_status;
+  if (target === 'TRADING_CONFIRMED') {
+    if (status === 'TRADING_CONFIRMED') return 0;
+    if (status === 'NEEDS_REVIEW' || status === 'UNCERTAIN' || status == null) return 1;
+    if (status === 'NON_TRADING' || status === 'HUMAN_REJECTED') return 2;
+    return 1;
+  }
+  if (status === 'NON_TRADING' || status === 'HUMAN_REJECTED') return 0;
+  if (status === 'NEEDS_REVIEW' || status === 'UNCERTAIN' || status == null) return 1;
+  if (status === 'TRADING_CONFIRMED') return 2;
+  return 1;
+};
+
 const tradingOrdering = (a: ProspectiveReviewCandidate, b: ProspectiveReviewCandidate): number =>
   proposedRank(a, 'TRADING_CONFIRMED') - proposedRank(b, 'TRADING_CONFIRMED') ||
   probability(b) - probability(a) ||
   lowerBound(b) - lowerBound(a) ||
+  operationalRank(a, 'TRADING_CONFIRMED') - operationalRank(b, 'TRADING_CONFIRMED') ||
   candidateTime(a) - candidateTime(b) ||
   String(a.channel_id).localeCompare(String(b.channel_id));
 
@@ -72,6 +88,7 @@ const nonTradingOrdering = (a: ProspectiveReviewCandidate, b: ProspectiveReviewC
   proposedRank(a, 'NON_TRADING') - proposedRank(b, 'NON_TRADING') ||
   probability(a) - probability(b) ||
   lowerBound(a) - lowerBound(b) ||
+  operationalRank(a, 'NON_TRADING') - operationalRank(b, 'NON_TRADING') ||
   candidateTime(a) - candidateTime(b) ||
   String(a.channel_id).localeCompare(String(b.channel_id));
 
@@ -100,8 +117,8 @@ export function selectBalancedProspectiveCandidates(
       humanDecisionRequired: true,
       hintsAreGroundTruth: false,
       servingAuthority: false,
-      tradingOrdering: 'proposed TRADING_CONFIRMED, then probability desc, lower bound desc, oldest pending/assigned',
-      nonTradingOrdering: 'proposed NON_TRADING, then probability asc, lower bound asc, oldest pending/assigned',
+      tradingOrdering: 'creator-focus proposal, probability desc, lower bound desc; operational status only breaks otherwise-uninformative ties; then oldest pending/assigned',
+      nonTradingOrdering: 'creator-focus proposal, probability asc, lower bound asc; operational status only breaks otherwise-uninformative ties; then oldest pending/assigned',
     },
   };
 }
@@ -135,8 +152,8 @@ export function selectBalancedAdjudicationQueue(
       operationalStatusIsGroundTruth: false,
       servingAuthority: false,
       queueMutation: false,
-      tradingOrdering: 'proposed TRADING_CONFIRMED, then probability desc, lower bound desc, oldest pending/assigned',
-      nonTradingOrdering: 'proposed NON_TRADING, then probability asc, lower bound asc, oldest pending/assigned',
+      tradingOrdering: 'creator-focus proposal, probability desc, lower bound desc; operational status only breaks otherwise-uninformative ties; then oldest pending/assigned',
+      nonTradingOrdering: 'creator-focus proposal, probability asc, lower bound asc; operational status only breaks otherwise-uninformative ties; then oldest pending/assigned',
       distinctAcrossHintLanes: true,
     },
   };
