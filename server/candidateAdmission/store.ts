@@ -7,15 +7,23 @@ import {buildStage1ProspectiveRetrievalAssignment,stage1ProspectiveNominationEli
 const normalize=(value:string)=>value.normalize('NFKC').trim().replace(/\s+/g,' ').toLocaleLowerCase('en');
 export function nominationIdentity(input:NominationInput){const observedAt=new Date(input.observedAt||new Date().toISOString()).toISOString();const matchedDocumentChecksum=admissionChecksum(input.matchedDocument),normalizedQuery=normalize(input.query);const key=admissionChecksum({sourceType:input.sourceType,sourceActionId:input.sourceActionId,queryRunId:input.queryRunId,queryCatalogVersion:input.queryCatalogVersion,normalizedQuery,pageNumber:input.pageNumber,resultRank:input.resultRank,channelId:input.channelId,matchedDocumentChecksum});return {key,observedAt,matchedDocumentChecksum};}
 
-export async function recordNomination(input:NominationInput,initialState:NominationState='OBSERVED'):Promise<{id:string;nominationKey:string;created:boolean;ledgerEnabled:boolean}>{
+export interface RecordNominationOptions { requireStage1AssignmentBeforeClassification?: boolean }
+
+export async function recordNomination(input:NominationInput,initialState:NominationState='OBSERVED',options:RecordNominationOptions={}):Promise<{id:string;nominationKey:string;created:boolean;ledgerEnabled:boolean}>{
  const identity=nominationIdentity(input),db=await getDb();
  // Stage 1 prospective evaluation capture must correspond to a channel that will
  // actually cross the automated classification boundary. Stable/terminal
  // duplicates are short-circuited by ingestion and therefore must not receive a
  // fresh assignment that can never acquire a post-assignment diagnostic.
  const existingChannel=await db.query('SELECT country_status,trading_status,scan_status FROM channels WHERE channel_id=$1',[input.channelId]);
- if(stage1ProspectiveNominationEligible(existingChannel.rows[0]))await observeRetrievalAssignmentReliably(buildStage1ProspectiveRetrievalAssignment(input,identity.observedAt))
-  .catch(error=>console.warn(`[Stage1Prospective] Retrieval assignment capture failed for ${input.channelId}:`,error instanceof Error?error.message:error));
+ if(stage1ProspectiveNominationEligible(existingChannel.rows[0])){
+  const assignmentCapture=()=>observeRetrievalAssignmentReliably(buildStage1ProspectiveRetrievalAssignment(input,identity.observedAt));
+  // Production discovery paths that classify this nomination immediately use the
+  // strict mode so classification can never outrun the prospective assignment.
+  // Other nomination-only callers retain the historical failure-contained behavior.
+  if(options.requireStage1AssignmentBeforeClassification)await assignmentCapture();
+  else await assignmentCapture().catch(error=>console.warn(`[Stage1Prospective] Retrieval assignment capture failed for ${input.channelId}:`,error instanceof Error?error.message:error));
+ }
  const ledgerEnabled=await getAppSetting('nomination_ledger_enabled','false')==='true';
  // OFF controls nomination materialization for rollback. Prospective evaluation
  // capture above is measurement-only and remains independent of this serving flag.
