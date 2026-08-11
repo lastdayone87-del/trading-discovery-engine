@@ -1,0 +1,27 @@
+name: Review decision UI contract
+
+on:
+  pull_request:
+    paths:
+      - 'src/components/ResultsTable.tsx'
+      - 'src/reviewDecision.ts'
+      - 'src/index.css'
+      - 'server/reviewDecisionUiContract.test.ts'
+      - '.github/workflows/review-decision-ui-contract.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Review decision UI transaction contracts
+        run: node --import tsx --test server/reviewDecisionUiContract.test.ts
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
