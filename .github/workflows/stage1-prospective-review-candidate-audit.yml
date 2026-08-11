@@ -29,6 +29,8 @@ jobs:
           grep -q "BEGIN TRANSACTION READ ONLY" scripts/stage1ProspectiveReviewCandidateAudit.ts
           grep -q "servingAuthority: false" scripts/stage1ProspectiveReviewCandidateAudit.ts
           grep -q "humanDecisionRequired: true" scripts/stage1ProspectiveReviewCandidateAudit.ts
+          grep -q "READY_FOR_INDEPENDENT_ADJUDICATION" scripts/stage1ProspectiveReviewCandidateAudit.ts
+          grep -q "operationalStatusIsNotGroundTruth: true" scripts/stage1ProspectiveReviewCandidateAudit.ts
           grep -q "hintsAreGroundTruth: false" server/stage1/balancedProspectiveCandidateSelector.ts
           grep -q "servingAuthority: false" server/stage1/balancedProspectiveCandidateSelector.ts
           ! grep -E "\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP)\b" scripts/stage1ProspectiveReviewCandidateAudit.ts
@@ -44,7 +46,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
-      - name: Inspect prospective review candidates
+      - name: Inspect prospective review and independent-adjudication candidates
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           NODE_ENV: production

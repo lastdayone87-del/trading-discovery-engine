@@ -1,0 +1,122 @@
+name: Stage 1 prospective independent adjudication
+
+on:
+  pull_request:
+    paths:
+      - 'server/candidateAdmission/stage1ProspectiveSampling.ts'
+      - 'server/candidateAdmission/store.ts'
+      - 'server/candidateAdmission/stage1ProspectiveSampling.test.ts'
+      - 'server/candidateAdmission/stage1ProspectiveAdjudication.ts'
+      - 'server/candidateAdmission/stage1ProspectiveAdjudication.test.ts'
+      - 'scripts/commitStage1ProspectiveAdjudication.ts'
+      - '.github/workflows/stage1-prospective-independent-adjudication.yml'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Exact channel name or channel_id with complete Stage 1 prospective lineage'
+        required: true
+        type: string
+      label:
+        description: 'Independent human ground-truth decision'
+        required: true
+        type: choice
+        options:
+          - TRADING_CONFIRMED
+          - NON_TRADING
+      creator_type:
+        description: 'Closed creator-type taxonomy'
+        required: true
+        type: choice
+        options:
+          - ACTIVE_TRADING_CREATOR
+          - TRADING_EDUCATOR
+          - INVESTING_EDUCATOR
+          - FINANCIAL_NEWS
+          - PERSONAL_FINANCE
+          - MARKET_INSTITUTION
+          - CORPORATE_BRAND
+          - GAMING_CREATOR
+          - ENTERTAINMENT_CREATOR
+          - TRADING_ADJACENT
+          - INCIDENTAL_TRADING_CONTENT
+          - HYPE_OR_PROMOTION
+          - UNRELATED_OTHER
+          - INSUFFICIENT_EVIDENCE
+          - IDENTITY_DISPUTED
+      reason_codes:
+        description: 'Comma-separated human reason codes supporting the adjudication'
+        required: true
+        type: string
+      notes:
+        description: 'Optional human reviewer notes'
+        required: false
+        type: string
+      confirmation:
+        description: 'Type COMMIT_STAGE1_PROSPECTIVE_ADJUDICATION to persist evaluation ground truth'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Stage 1 prospective lineage and adjudication tests
+        run: node --import tsx --test server/candidateAdmission/stage1ProspectiveSampling.test.ts server/candidateAdmission/stage1ProspectiveAdjudication.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify evaluation-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "stage1ProspectiveNominationEligible" server/candidateAdmission/store.ts
+          grep -q "provenance: 'ADJUDICATION'" server/candidateAdmission/stage1ProspectiveAdjudication.ts
+          grep -q "operationalStateMutation: false" server/candidateAdmission/stage1ProspectiveAdjudication.ts
+          grep -q "COMMIT_STAGE1_PROSPECTIVE_ADJUDICATION" server/candidateAdmission/stage1ProspectiveAdjudication.ts
+          ! grep -E "decideReview\(|UPDATE channels|UPDATE channel_reviews" server/candidateAdmission/stage1ProspectiveAdjudication.ts scripts/commitStage1ProspectiveAdjudication.ts
+
+  commit-adjudication:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      STAGE1_ADJUDICATION_CHANNEL: ${{ inputs.channel }}
+      STAGE1_ADJUDICATION_LABEL: ${{ inputs.label }}
+      STAGE1_ADJUDICATION_CREATOR_TYPE: ${{ inputs.creator_type }}
+      STAGE1_ADJUDICATION_REASON_CODES: ${{ inputs.reason_codes }}
+      STAGE1_ADJUDICATION_NOTES: ${{ inputs.notes }}
+      STAGE1_ADJUDICATION_CONFIRMATION: ${{ inputs.confirmation }}
+      STAGE1_ADJUDICATION_REVIEWER: github-actions:${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Verify explicit confirmation
+        run: test "$STAGE1_ADJUDICATION_CONFIRMATION" = "COMMIT_STAGE1_PROSPECTIVE_ADJUDICATION"
+      - name: Commit one independent Stage 1 adjudication
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tsx scripts/commitStage1ProspectiveAdjudication.ts | tee stage1-prospective-adjudication-console.json
+          test -f stage1-output/stage1-prospective-adjudication-result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage1-prospective-adjudication-${{ github.run_id }}
+          path: |
+            stage1-output/stage1-prospective-adjudication-result.json
+            stage1-prospective-adjudication-console.json
+          retention-days: 30
