@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { assignEvaluationCohort } from '../decisionEvaluation';
-import { buildStage1ProspectiveRetrievalAssignment, STAGE1_PROSPECTIVE_SAMPLING_POLICY } from './stage1ProspectiveSampling';
+import {
+  buildStage1ProspectiveRetrievalAssignment,
+  stage1ProspectiveNominationEligible,
+  STAGE1_PROSPECTIVE_SAMPLING_POLICY
+} from './stage1ProspectiveSampling';
 import type { NominationInput } from './types';
 
 const nomination: NominationInput = {
@@ -45,12 +49,19 @@ test('prospective assignment preserves nomination time and retrieval context', (
   assert.equal(payload.input.context && (payload.input.context as any).resultRank, nomination.resultRank);
 });
 
-test('recordNomination captures Stage 1 assignment before any ledger-off return', () => {
+test('prospective assignment excludes channels ingestion will short-circuit before classification', () => {
+  assert.equal(stage1ProspectiveNominationEligible(null), true);
+  assert.equal(stage1ProspectiveNominationEligible({ trading_status: 'UNCERTAIN', scan_status: 'PENDING' }), true);
+  assert.equal(stage1ProspectiveNominationEligible({ trading_status: 'TRADING_CONFIRMED', scan_status: 'COMPLETED' }), false);
+  assert.equal(stage1ProspectiveNominationEligible({ trading_status: 'NON_TRADING', scan_status: 'SKIPPED_NON_TRADING' }), false);
+  assert.equal(stage1ProspectiveNominationEligible({ trading_status: 'HUMAN_REJECTED' }), false);
+  assert.equal(stage1ProspectiveNominationEligible({ country_status: 'REJECTED' }), false);
+  assert.equal(stage1ProspectiveNominationEligible({ scan_status: 'COMPLETED' }), false);
+});
+
+test('recordNomination guards Stage 1 capture with current channel state', () => {
   const source = readFileSync(new URL('./store.ts', import.meta.url), 'utf8');
-  const capture = source.indexOf('observeRetrievalAssignmentReliably(buildStage1ProspectiveRetrievalAssignment');
-  const ledgerCheck = source.indexOf("getAppSetting('nomination_ledger_enabled'");
-  const earlyReturn = source.indexOf('if(!ledgerEnabled)return');
-  assert.ok(capture >= 0, 'prospective retrieval capture must be wired');
-  assert.ok(capture < ledgerCheck, 'capture must occur before nomination-ledger serving flag lookup');
-  assert.ok(capture < earlyReturn, 'capture must occur before the ledger-off early return');
+  assert.match(source, /SELECT country_status,trading_status,scan_status FROM channels/);
+  assert.match(source, /stage1ProspectiveNominationEligible\(existingChannel\.rows\[0\]\)/);
+  assert.match(source, /observeRetrievalAssignmentReliably\(buildStage1ProspectiveRetrievalAssignment/);
 });
