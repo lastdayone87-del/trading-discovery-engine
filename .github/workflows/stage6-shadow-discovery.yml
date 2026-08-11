@@ -1,0 +1,35 @@
+name: Stage 6 shadow discovery contracts
+
+on:
+  pull_request:
+    paths:
+      - 'server/discovery/**'
+      - 'tests/stage6ShadowDiscovery.test.ts'
+      - 'docs/stage6-shadow-discovery.md'
+      - '.github/workflows/stage6-shadow-discovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Build
+        run: npm run build
+      - name: Run Stage 6 shadow contract tests
+        run: node --import tsx --test tests/stage6ShadowDiscovery.test.ts
+      - name: Verify Stage 6 remains non-serving
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -R "servingAuthority: false" server/discovery/creatorFrontier.ts server/discovery/outcomeFeedback.ts >/dev/null
+          ! grep -R "servingAuthority: true" server/discovery/creatorFrontier.ts server/discovery/outcomeFeedback.ts
+          ! grep -R "release5_.*serving_mode" server/discovery/creatorFrontier.ts server/discovery/outcomeFeedback.ts
