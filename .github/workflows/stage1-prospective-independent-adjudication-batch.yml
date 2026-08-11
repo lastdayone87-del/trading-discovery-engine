@@ -1,0 +1,81 @@
+name: Stage 1 prospective independent adjudication batch
+
+on:
+  pull_request:
+    paths:
+      - 'server/candidateAdmission/stage1ProspectiveAdjudication.ts'
+      - 'server/candidateAdmission/stage1ProspectiveAdjudicationBatch.ts'
+      - 'server/candidateAdmission/stage1ProspectiveAdjudicationBatch.test.ts'
+      - 'scripts/commitStage1ProspectiveAdjudicationBatch.ts'
+      - '.github/workflows/stage1-prospective-independent-adjudication-batch.yml'
+  workflow_dispatch:
+    inputs:
+      adjudications_json:
+        description: 'JSON array of reviewed human decisions (max 20). Each entry: channel,label,creator_type,reason_codes,optional notes.'
+        required: true
+        type: string
+      confirmation:
+        description: 'Type COMMIT_STAGE1_PROSPECTIVE_ADJUDICATION_BATCH to persist the reviewed batch'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Stage 1 adjudication and batch-validation tests
+        run: node --import tsx --test server/candidateAdmission/stage1ProspectiveAdjudication.test.ts server/candidateAdmission/stage1ProspectiveAdjudicationBatch.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify evaluation-only batch boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "humanDecisionRequired: true" scripts/commitStage1ProspectiveAdjudicationBatch.ts
+          grep -q "operationalStateMutation: false" scripts/commitStage1ProspectiveAdjudicationBatch.ts
+          grep -q "COMMIT_STAGE1_PROSPECTIVE_ADJUDICATION_BATCH" server/candidateAdmission/stage1ProspectiveAdjudicationBatch.ts
+          grep -q "READY_FOR_INDEPENDENT_ADJUDICATION" scripts/commitStage1ProspectiveAdjudicationBatch.ts
+          ! grep -E "decideReview\(|UPDATE channels|UPDATE channel_reviews" server/candidateAdmission/stage1ProspectiveAdjudicationBatch.ts scripts/commitStage1ProspectiveAdjudicationBatch.ts
+
+  commit-batch:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      STAGE1_BATCH_ADJUDICATIONS: ${{ inputs.adjudications_json }}
+      STAGE1_BATCH_ADJUDICATION_CONFIRMATION: ${{ inputs.confirmation }}
+      STAGE1_ADJUDICATION_REVIEWER: github-actions:${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Verify explicit batch confirmation
+        run: test "$STAGE1_BATCH_ADJUDICATION_CONFIRMATION" = "COMMIT_STAGE1_PROSPECTIVE_ADJUDICATION_BATCH"
+      - name: Preflight and commit reviewed independent adjudications
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tsx scripts/commitStage1ProspectiveAdjudicationBatch.ts | tee stage1-prospective-adjudication-batch-console.json
+          test -f stage1-output/stage1-prospective-adjudication-batch-result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage1-prospective-adjudication-batch-${{ github.run_id }}
+          path: |
+            stage1-output/stage1-prospective-adjudication-batch-result.json
+            stage1-prospective-adjudication-batch-console.json
+          retention-days: 30
