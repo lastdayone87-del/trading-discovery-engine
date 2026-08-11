@@ -22,6 +22,7 @@ import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
+import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -79,8 +80,9 @@ export async function processChannelThroughPipeline(
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);
   if (existing) {
-    // Check for TRUE TERMINAL STATES or ALREADY PROCESSED STABLE STATES
-    if ((isTerminalState(existing) || existing.trading_status === 'TRADING_CONFIRMED' || existing.scan_status === 'COMPLETED') && !isManualScan) {
+    // Preserve terminal rows for every ordinary discovery lane. Explicit
+    // operator recheck is the only supported terminal override.
+    if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
       console.log(
         `[Unified Ingestion Pipeline] Channel '${candidate.channelName}' (${candidate.channelId}) is already in database (Country: ${existing.country_status}, Trading: ${existing.trading_status}, Scan: ${existing.scan_status}). Preserving existing record.`
       );
