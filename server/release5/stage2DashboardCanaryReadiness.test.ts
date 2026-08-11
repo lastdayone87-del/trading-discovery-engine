@@ -28,7 +28,7 @@ test('stage 2 readiness remains non-serving even when evidence is sufficient', (
   assert.equal(report.servingAuthority, false);
   assert.equal(report.automaticActivation, false);
   assert.equal(report.requestedServingMode, 'OFF');
-  assert.match(report.nextAction, /DO NOT ACTIVATE/);
+  assert.match(report.nextAction, /DO_NOT_ACTIVATE/);
 });
 
 test('stage 2 cannot advance without independent non-trading and genuine ESS floors', () => {
