@@ -1,0 +1,88 @@
+name: Stage 1 prospective production-path probe
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/runStage1ProspectiveProductionProbe.ts'
+      - 'server/stage1ProspectiveProductionProbe.test.ts'
+      - '.github/workflows/stage1-prospective-production-path-probe.yml'
+  workflow_dispatch:
+    inputs:
+      country:
+        description: 'Allowed target country used by normal production discovery'
+        required: true
+        default: 'United States'
+        type: string
+      query:
+        description: 'Trading-creator retrieval query; exactly one fresh result is selected'
+        required: true
+        default: 'futures day trading education'
+        type: string
+      confirmation:
+        description: 'Type RUN_STAGE1_PROSPECTIVE_PRODUCTION_PROBE to execute one real production-path candidate'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Stage 1 prospective production probe contracts
+        run: node --import tsx --test server/stage1ProspectiveProductionProbe.test.ts server/stage1ProspectiveObservationChain.test.ts server/candidateAdmission/stage1ProspectiveSampling.test.ts
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Verify Stage 1 authority remains unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "servingAuthorityGrantedByProbe: false" scripts/runStage1ProspectiveProductionProbe.ts
+          grep -q "stage1AuthorityChanged: false" scripts/runStage1ProspectiveProductionProbe.ts
+          grep -q "await recordNomination" scripts/runStage1ProspectiveProductionProbe.ts
+          grep -q "await processDiscoveredChannel" scripts/runStage1ProspectiveProductionProbe.ts
+          ! grep -E "activateRelease5Capability|setRelease5KillSwitch|persistPromotionGate" scripts/runStage1ProspectiveProductionProbe.ts
+
+  production-probe:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+      STAGE1_PROBE_COUNTRY: ${{ inputs.country }}
+      STAGE1_PROBE_QUERY: ${{ inputs.query }}
+      STAGE1_PROBE_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Verify explicit confirmation
+        run: test "$STAGE1_PROBE_CONFIRMATION" = "RUN_STAGE1_PROSPECTIVE_PRODUCTION_PROBE"
+      - name: Run exactly one fresh candidate through production discovery
+        shell: bash
+        run: |
+          set -o pipefail
+          npx tsx scripts/runStage1ProspectiveProductionProbe.ts | tee stage1-prospective-production-probe-console.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage1-prospective-production-path-probe-${{ github.run_id }}
+          path: |
+            stage1-output/stage1-prospective-production-path-probe.json
+            stage1-prospective-production-probe-console.json
+          retention-days: 30
