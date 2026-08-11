@@ -1,0 +1,81 @@
+name: Governed human review fallback
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/commitHumanReviewDecision.ts'
+      - 'server/reviewFallbackContract.test.ts'
+      - '.github/workflows/governed-human-review-fallback.yml'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Exact pending channel name or channel_id'
+        required: true
+        type: string
+      action:
+        description: 'Human review decision'
+        required: true
+        type: choice
+        options:
+          - REJECT
+          - APPROVE
+      reason_code:
+        description: 'Governed reason code from the current review catalog'
+        required: true
+        type: string
+      notes:
+        description: 'Optional reviewer notes'
+        required: false
+        type: string
+      confirmation:
+        description: 'Type COMMIT_HUMAN_REVIEW_DECISION to persist the decision'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Fallback safety tests
+        run: node --import tsx --test server/reviewFallbackContract.test.ts
+      - name: Build
+        run: npm run build
+
+  commit-review:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      REVIEW_CHANNEL: ${{ inputs.channel }}
+      REVIEW_ACTION: ${{ inputs.action }}
+      REVIEW_REASON_CODE: ${{ inputs.reason_code }}
+      REVIEW_NOTES: ${{ inputs.notes }}
+      REVIEW_CONFIRMATION: ${{ inputs.confirmation }}
+      REVIEW_ACTOR: github-actions:${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Verify explicit confirmation
+        run: test "$REVIEW_CONFIRMATION" = "COMMIT_HUMAN_REVIEW_DECISION"
+      - name: Commit one governed human review decision
+        run: npx tsx scripts/commitHumanReviewDecision.ts | tee governed-human-review-result.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: governed-human-review-${{ github.run_id }}
+          path: governed-human-review-result.json
+          retention-days: 30
