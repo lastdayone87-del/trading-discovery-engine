@@ -6,13 +6,14 @@ import type { NominationInput } from './types';
  * Temporary Stage 1 measurement policy.
  *
  * Stage 1 needs independent labels with a retrieval-bound assignment that exists
- * before classification. We capture the full prospective nomination population
- * (100% inclusion) so human review does not have to guess which cases were
- * sampled. This remains evaluation-only: it does not change classification,
- * review eligibility, dashboard visibility, or any serving authority.
+ * before classification. We capture the full prospective population that will
+ * actually cross the classification boundary (100% inclusion). Already terminal
+ * or stable channels are excluded because the ingestion pipeline short-circuits
+ * them before producing a new diagnostic; assigning those rows would create
+ * unusable assignment-without-diagnostic lineage.
  *
- * The salt is intentionally stable but has no selection effect while inclusion
- * is 100%. It only makes assignment identity/randomization reproducible.
+ * This remains evaluation-only: it does not change classification, review
+ * eligibility, dashboard visibility, or any serving authority.
  */
 export const STAGE1_PROSPECTIVE_SAMPLING_POLICY: SamplingPolicy = {
   policyKey: 'stage1-prospective-census',
@@ -21,6 +22,26 @@ export const STAGE1_PROSPECTIVE_SAMPLING_POLICY: SamplingPolicy = {
   protectedAuditBasisPoints: 10000,
   targetedAuditBasisPoints: 0
 };
+
+export interface ExistingStage1ChannelState {
+  country_status?: string | null;
+  trading_status?: string | null;
+  scan_status?: string | null;
+}
+
+/** Mirrors the automated-ingestion short-circuit boundary. */
+export function stage1ProspectiveNominationEligible(existing?: ExistingStage1ChannelState | null): boolean {
+  if (!existing) return true;
+  return !(
+    existing.country_status === 'REJECTED' ||
+    existing.trading_status === 'NON_TRADING' ||
+    existing.trading_status === 'HUMAN_REJECTED' ||
+    existing.trading_status === 'TRADING_CONFIRMED' ||
+    existing.scan_status === 'SKIPPED_EXCLUDED' ||
+    existing.scan_status === 'SKIPPED_NON_TRADING' ||
+    existing.scan_status === 'COMPLETED'
+  );
+}
 
 export function buildStage1ProspectiveRetrievalAssignment(
   input: NominationInput,
