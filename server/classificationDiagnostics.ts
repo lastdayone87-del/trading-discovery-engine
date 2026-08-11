@@ -28,8 +28,10 @@ function normalize(input: RawChannelInput) {
 }
 
 /**
- * Persists the authoritative diagnostic exactly once, then invokes the
- * Release 2/3 evidence plane as a failure-contained observational write.
+ * Persists the authoritative diagnostic exactly once. Durable Phase B diagnostic
+ * observations are not complete until coverage and Creator Focus shadow snapshots
+ * tied to this diagnostic also exist; ordinary production callers retain the
+ * legacy failure-contained dual-write behavior.
  */
 export async function recordProductionClassification(
   diagnostic: ProductionClassificationDiagnosticInput
@@ -78,12 +80,16 @@ export async function recordProductionClassification(
     : undefined);
 
   try {
-    await persistClassificationEvidenceBundle(diagnostic.input, diagnostic.decision, diagnosticId);
+    await persistClassificationEvidenceBundle(
+      diagnostic.input,
+      diagnostic.decision,
+      diagnosticId,
+      { requireCompleteObservation: Boolean(diagnostic.observationKey) }
+    );
   } catch (error) {
     console.warn(`[EvidenceDualWrite] observational write failed for ${diagnostic.channelId}:`, error instanceof Error ? error.message : error);
-    // Durable Phase B diagnostic tasks are complete only after their document
-    // projection and validation observation complete. Production callers without
-    // an observation key preserve the legacy failure-contained behavior.
+    // A durable Phase B observation must remain retryable until the entire
+    // diagnostic -> coverage -> Creator Focus lineage is present.
     if (diagnostic.observationKey) throw error;
   }
 
