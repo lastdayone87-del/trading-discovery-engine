@@ -56,7 +56,9 @@ export async function inspectStage1ProspectiveAdjudicationCandidate(selector: st
     WITH selected_channel AS (
       SELECT channel_id,channel_name,youtube_url,country,trading_status,scan_status
       FROM channels
-      WHERE channel_id=$1 OR lower(btrim(channel_name))=lower(btrim($1))
+      WHERE channel_id=$1
+         OR lower(regexp_replace(btrim(channel_name), '\\s+', ' ', 'g'))
+            = lower(regexp_replace(btrim($1), '\\s+', ' ', 'g'))
       ORDER BY channel_id
       LIMIT 2
     )
