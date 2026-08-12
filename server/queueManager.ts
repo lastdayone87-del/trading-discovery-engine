@@ -266,15 +266,17 @@ export async function processNextSearchJob(
       await upsertChannel(channel);
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
+      const hybridEnrichmentEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true')==='true';
+      const enrichmentQuotaUnits=hybridEnrichmentEnabled?1:(enrichmentStage>=2?202:101);
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-        units: enrichmentStage>=2?202:101, dailyBudget, allocationPercent: enrichmentPercent
+        units: enrichmentQuotaUnits, dailyBudget, allocationPercent: enrichmentPercent
       });
       if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
         const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage);
         const pipelineOutcome=await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
-        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentStage>=2?202:101,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
       } catch (error) {
