@@ -5,11 +5,12 @@ import fs from 'node:fs';
 const workflow = fs.readFileSync('.github/workflows/stage2-manual-canary-activation.yml', 'utf8');
 const script = fs.readFileSync('scripts/stage2ManualCanaryActivation.ts', 'utf8');
 
-test('activation workflow is manual-only and main-only', () => {
+test('activation job is manual-only and main-only while PRs may run verification', () => {
+  assert.match(workflow, /pull_request:/);
   assert.match(workflow, /workflow_dispatch:/);
   assert.doesNotMatch(workflow, /\bpush:/);
   assert.doesNotMatch(workflow, /\bschedule:/);
-  assert.match(workflow, /github\.ref == 'refs\/heads\/main'/);
+  assert.match(workflow, /if: github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main'/);
 });
 
 test('activation requires exact typed authorization and production environment', () => {
