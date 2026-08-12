@@ -1,0 +1,33 @@
+name: YouTube provider bake-off
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/youtubeProviderBakeoff.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/youtube-provider-bakeoff.yml'
+
+jobs:
+  static-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Shadow runner smoke test
+        env:
+          BAKEOFF_QUERY_LIMIT: '1'
+          BAKEOFF_MAX_PAGES: '1'
+        run: npm run youtube:provider-bakeoff
+      - name: Verify shadow-mode contract
+        run: |
+          node -e "const r=require('./youtube-provider-bakeoff.json'); if(r.shadowMode!==true||r.productionWrites!==false) process.exit(1);"
