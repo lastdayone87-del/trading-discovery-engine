@@ -60,6 +60,16 @@ function fieldDocuments(input: RawChannelInput) {
   ].filter(document => document.text?.trim()).map(document => ({ ...document, text: document.text.slice(0, 1200) }));
 }
 
+function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
+  const retrievalOnly = !!input.search_match_context && (input.enrichment_stage || 0) === 0;
+  if (!retrievalOnly) return true;
+  return (input.description?.trim().length || 0) >= 20 ||
+    (input.external_links?.length || 0) > 0 ||
+    (input.playlists?.length || 0) > 0 ||
+    (input.transcript_excerpts?.length || 0) > 0 ||
+    (input.videos?.length || 0) > 0;
+}
+
 function prompt(input: RawChannelInput, tier: 'CANDIDATE' | 'ADJUDICATION') {
   return JSON.stringify({
     task: tier, promptVersion: SEMANTIC_PROMPT_VERSION, closedTaxonomy: SEMANTIC_TAXONOMY,
@@ -101,7 +111,13 @@ export class GeminiSemanticProvider implements EvidenceProvider {
   name = 'gemini_semantic' as const;
   constructor(private readonly injectedClient?: SemanticModelClient) {}
   private client() { return this.injectedClient || defaultClient(); }
-  availability() { return this.client() ? { availability: 'AVAILABLE' as const } : { availability: 'UNAVAILABLE' as const, reason: 'GEMINI_API_KEY is not configured.' }; }
+  availability(input: RawChannelInput) {
+    if (!this.client()) return { availability: 'UNAVAILABLE' as const, reason: 'GEMINI_API_KEY is not configured.' };
+    if (!hasCreatorLevelSemanticContext(input)) {
+      return { availability: 'NOT_APPLICABLE' as const, reason: 'Retrieval-only candidate has no independent creator-level semantic context yet.' };
+    }
+    return { availability: 'AVAILABLE' as const };
+  }
 
   async collectEvidence(input: RawChannelInput, _knowledge: LayeredKnowledgeContext): Promise<EvidenceItem[]> {
     const client = this.client();

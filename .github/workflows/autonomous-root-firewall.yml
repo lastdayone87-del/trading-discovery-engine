@@ -1,0 +1,29 @@
+name: Autonomous root firewall
+
+on:
+  pull_request:
+    paths:
+      - 'server/autonomousDiscovery.ts'
+      - 'server/autonomousQueryAuthority.ts'
+      - 'server/candidateTriage.ts'
+      - 'server/ingestionPipeline.ts'
+      - 'server/evidenceEngine/providers/GeminiSemanticProvider.ts'
+      - 'server/autonomousRootFirewall.test.ts'
+      - '.github/workflows/autonomous-root-firewall.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Root firewall tests
+        run: node --import tsx --test server/autonomousRootFirewall.test.ts server/autonomousRetrievalSafety.test.ts server/queryPlanner.test.ts server/queryEvidenceIndependence.test.ts server/countryAwareRetrieval.test.ts
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build

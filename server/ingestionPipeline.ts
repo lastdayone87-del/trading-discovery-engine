@@ -23,6 +23,7 @@ import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceF
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
+import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -116,6 +117,25 @@ export async function processChannelThroughPipeline(
     }
   }
 
+  // Search-result content is routing provenance, not creator evidence. Before an
+  // autonomous result can trigger country hydration, semantic AI, enrichment or
+  // Discord work, require a cheap plausible trading hypothesis from the matched
+  // retrieval document. Withheld candidates remain preserved in the nomination
+  // ledger and can be rediscovered later by independent evidence.
+  const retrievalTriage = triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
+  if (retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
+    console.log(`[Unified Ingestion Pipeline - Triage] Withholding '${candidate.channelName}' before provider spend: ${retrievalTriage.reasonCodes.join(', ')}.`);
+    void recordAdmissionShadow({
+      channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'COMPLETED',
+      candidateHypothesis:{plausibleTradingHypothesis:false,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION,matchedSignals:retrievalTriage.matchedSignals},
+      evidenceCoverage:{stage:'RETRIEVAL_TRIAGE',reasonCodes:retrievalTriage.reasonCodes,enrichmentStage:candidate.enrichmentStage||0}
+    }).catch(error=>console.warn(`[CandidateAdmission] retrieval-triage shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+    return {
+      channelId:candidate.channelId, channelName:candidate.channelName, isNew:!existing, wasKnown:!!existing, persisted:false,
+      countryStatus:'UNCERTAIN', tradingStatus:'UNCERTAIN', discordStatus:'NOT_FOUND', discordInvite:null, channelRecord:undefined
+    };
+  }
+
   // Step 1: GATE 1 - Country Validation Hard Gate
   let countryVal = await validateChannelCountry(
     {
@@ -174,8 +194,6 @@ export async function processChannelThroughPipeline(
       tradingStatus: 'UNCERTAIN',
       discordStatus: 'NOT_FOUND',
       discordInvite: null,
-      // Exclusion audit is emitted to logs; excluded candidates do not create or
-      // mutate channel records and never reach trading AI or Discord inspection.
       channelRecord: undefined
     };
   }
@@ -197,10 +215,6 @@ export async function processChannelThroughPipeline(
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
-  // Manual rechecks are operator-requested semantic refreshes. A runtime provider
-  // failure must not turn incomplete evidence into a replacement classification.
-  // Fail before diagnostic/admission/channel writes so the prior production
-  // decision remains authoritative until a complete recheck can run.
   if (source === 'recheck' && isManualScan && productionClassification.decision.evidenceCollection.degraded) {
     const failedProviders = productionClassification.decision.evidenceCollection.providers.filter(provider => provider.availability === 'FAILED');
     const reasonCodes = failedProviders.flatMap(provider => provider.reasonCodes || []);
@@ -218,15 +232,10 @@ export async function processChannelThroughPipeline(
     candidateHypothesis:{category:productionClassification.decision.category,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length},
     evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent}})
     .catch(error=>console.warn(`[CandidateAdmission] shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-  // Governed evidence remains independently observable and is rollout-gated. It
-  // may corroborate existing production-positive evidence, never confirm alone.
   try {
     const shadow=await runAndRecordAdaptiveShadow(candidate.channelId,productionClassification.input,productionClassification.decision);
     const governedEnabled=await getAppSetting('governed_classifier_production_enabled','false')==='true';
     if(governedEnabled&&shadow.evidence.length>0&&productionClassification.decision.positiveEvidence.length>0&&productionClassification.decision.negativeEvidence.length===0){
-      // Governed knowledge is an evidence provider, not a post-classification
-      // status override. Transport it through the same scoring, corroboration,
-      // contradiction and lifecycle gates as every other provider.
       const evidence=[...productionClassification.decision.positiveEvidence,...productionClassification.decision.negativeEvidence,...shadow.evidence];
       const governedReports=shadow.evidence.map(item=>item.source).filter((source,index,all)=>all.indexOf(source)===index).map(provider=>({provider,availability:'AVAILABLE' as const,evidenceCount:shadow.evidence.filter(item=>item.source===provider).length,outcome:'EXECUTED_WITH_EVIDENCE' as const,reasonCodes:['GOVERNED_PRODUCTION_EVIDENCE_TRANSPORTED']}));
       const collection:EvidenceCollectionReport={...productionClassification.decision.evidenceCollection,providers:[...productionClassification.decision.evidenceCollection.providers,...governedReports]};
@@ -298,7 +307,43 @@ export async function processChannelThroughPipeline(
       `[Unified Ingestion Pipeline - Gate 2] Channel '${candidate.channelName}' classified as UNCERTAIN (${tradingVal.confidenceScore}/100). Evaluating the governed enrichment/review route.`
     );
 
-    const currentStage=candidate.enrichmentStage||0,legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
+    const currentStage=candidate.enrichmentStage||0;
+    const independentHypothesis=hasIndependentTradingHypothesis(productionClassification.decision);
+
+    // Once creator-level enrichment has run, absence of any independent trading
+    // hypothesis is a routing stop, not a reason to buy more evidence. Preserve
+    // the auditable channel/nominations internally, withhold it from further
+    // enrichment, and do not call Discord. This is deliberately not a terminal
+    // NON_TRADING label: later independent evidence or an operator recheck may
+    // reopen it.
+    if (currentStage > 0 && !independentHypothesis) {
+      console.log(`[Unified Ingestion Pipeline - Gate 2] Withholding '${candidate.channelName}' after enrichment: no independent trading hypothesis; no further provider quota will be spent.`);
+      const withheldChannel: ChannelRecord = existing || {
+        channel_id:candidate.channelId, channel_name:candidate.channelName, youtube_url:candidate.youtubeUrl,
+        country:resolvedCountry, country_status:countryVal.status, confidence_score:countryVal.score,
+        discord_status:'UNCERTAIN', discord_invite:null, scan_status:'COMPLETED', scan_attempts:0,
+        discovery_source:source, first_seen:now, last_checked:now, inspection_trail:[countryValidationStep],
+        subscriber_count:candidate.subscriberCount,
+        channel_thumbnail_url:candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
+        trading_status:'UNCERTAIN', trading_confidence_score:tradingVal.confidenceScore,
+        trading_category:tradingVal.category, trading_relevance_breakdown:tradingVal.breakdown
+      };
+      withheldChannel.country=resolvedCountry; withheldChannel.country_status=countryVal.status; withheldChannel.confidence_score=countryVal.score;
+      withheldChannel.trading_status='UNCERTAIN'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
+      withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
+      withheldChannel.scan_status='COMPLETED'; withheldChannel.discord_status='UNCERTAIN'; withheldChannel.discord_invite=null; withheldChannel.last_checked=now;
+      applyCandidateObservability(withheldChannel,candidate);
+      await upsertChannel(withheldChannel);
+      void recordAdmissionShadow({channelId:candidate.channelId,priorState:'WITHHELD_INVESTIGATING',classificationStatus:'UNCERTAIN',investigationState:'COMPLETED',classificationDiagnosticId,
+        candidateHypothesis:{plausibleTradingHypothesis:false,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION},
+        evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent,enrichmentStage:currentStage,reasonCodes:['NO_INDEPENDENT_TRADING_HYPOTHESIS_AFTER_ENRICHMENT']}})
+        .catch(error=>console.warn(`[CandidateAdmission] post-enrichment withholding write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false})
+        .catch(error=>console.warn(`[ReviewEligibility] withholding shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'UNCERTAIN',discordStatus:'UNCERTAIN',discordInvite:null,channelRecord:withheldChannel};
+    }
+
+    const legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
     let evidencePlan:EvidenceActionPlan|undefined;
     try {const quota=await getQuota();evidencePlan=await planAndRecordEvidenceAction({channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,decision:productionClassification.decision,rawInput:productionClassification.input,legacyAction,providerQuotaRemaining:Math.max(0,quota.dailyLimit-quota.unitsUsed)});} catch(error){console.warn(`[VOI Evidence] Planning failed for ${candidate.channelId}; preserving legacy enrichment.`,error instanceof Error?error.message:error);}
     const appliedAction=evidencePlan?.appliedAction||legacyAction,shouldReview=appliedAction==='HUMAN_REVIEW';
@@ -306,7 +351,7 @@ export async function processChannelThroughPipeline(
     const finalUncertainStatus = lifecycle.tradingStatus;
     const finalScanStatus = lifecycle.scanStatus;
     const corroboration=productionClassification.decision.stagedClassification?.stages.find(stage=>stage.stage==='CORROBORATION');
-    void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:productionClassification.decision.positiveEvidence.length>0,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false}).catch(error=>console.warn(`[ReviewEligibility] shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+    void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false}).catch(error=>console.warn(`[ReviewEligibility] shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
 
     const uncertainChannel: ChannelRecord = existing || {
       channel_id: candidate.channelId,
