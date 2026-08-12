@@ -1,4 +1,6 @@
 import type { DiscoveredChannelRaw } from './youtube';
+import { appendProviderCallEvent } from './db';
+import { classifyProviderError, executeProviderCall, type ProviderCallContext, type ProviderCallError } from './providerResilience';
 
 export type InnerTubeDiscoveryLane = 'MONTH' | 'YEAR' | 'DEFAULT';
 
@@ -20,6 +22,7 @@ export interface InnerTubeDiscoveryResult {
   lane: InnerTubeDiscoveryLane;
   query: string;
   pagesFetched: number;
+  rawCandidateCount: number;
   channels: DiscoveredChannelRaw[];
   exhausted: boolean;
   health: InnerTubeProviderHealth;
@@ -30,6 +33,7 @@ export interface InnerTubeDiscoveryOptions {
   maxPages?: number;
   maxChannels?: number;
   timeoutMs?: number;
+  telemetry?: Pick<ProviderCallContext, 'requestId' | 'runId' | 'jobId' | 'attempt'>;
 }
 
 type SearchPage = {
@@ -69,12 +73,11 @@ export function getInnerTubeProviderHealth(): InnerTubeProviderHealth[] {
 
 export function resetInnerTubeProviderHealthForTests(): void {
   healthByLane.clear();
+  clientPromise = null;
 }
 
 async function getClient(): Promise<InnerTubeClient> {
-  if (!clientPromise) {
-    clientPromise = import('youtubei.js').then(async (mod: any) => mod.Innertube.create());
-  }
+  if (!clientPromise) clientPromise = import('youtubei.js').then(async (mod: any) => mod.Innertube.create());
   return clientPromise;
 }
 
@@ -106,12 +109,19 @@ function normalizePublishedAt(value: unknown, nowMs = Date.now()): string | unde
   return new Date(nowMs - amount * days[unit] * 86_400_000).toISOString();
 }
 
+function isLiveLike(item: any): boolean {
+  const text = `${textValue(item?.title)} ${textValue(item?.published)} ${textValue(item?.badges)}`.toLowerCase();
+  return Boolean(item?.is_live || item?.is_upcoming || /\b(live now|watching now|scheduled|upcoming)\b/.test(text));
+}
+
 function toCandidate(item: any): DiscoveredChannelRaw | null {
   const channelId = textValue(item?.author?.id || item?.channel?.id || item?.channel_id);
   const channelName = textValue(item?.author?.name || item?.channel?.name || item?.author);
   const title = textValue(item?.title);
   if (!channelId || !channelName || !title) return null;
-  const publishedAt = normalizePublishedAt(item?.published || item?.published_time || item?.metadata?.published);
+  const publishedAt = normalizePublishedAt(item?.published || item?.published_time || item?.metadata?.published)
+    || (isLiveLike(item) ? new Date().toISOString() : undefined);
+  const videoId = textValue(item?.id);
   return {
     channelId,
     channelName,
@@ -121,10 +131,10 @@ function toCandidate(item: any): DiscoveredChannelRaw | null {
     videoDescriptions: [],
     matchedDocument: {
       type: 'VIDEO',
-      providerNativeId: textValue(item?.id) || undefined,
+      providerNativeId: videoId || undefined,
       title,
       publishedAt,
-      locator: textValue(item?.id) ? `https://www.youtube.com/watch?v=${textValue(item.id)}` : undefined
+      locator: videoId ? `https://www.youtube.com/watch?v=${videoId}` : undefined
     }
   };
 }
@@ -133,18 +143,16 @@ function bounded(value: number | undefined, fallback: number, min: number, max: 
   return Math.min(max, Math.max(min, Number.isFinite(value) ? Math.trunc(value!) : fallback));
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(() => reject(Object.assign(new Error('YOUTUBE_JS_TIMEOUT'), { code: 'YOUTUBE_JS_TIMEOUT' })), timeoutMs);
-      })
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+function cooldownError(lane: InnerTubeDiscoveryLane, retryAt: string): Error {
+  return Object.assign(new Error(`YouTube.js ${lane} lane is cooling down until ${retryAt}.`), {
+    code: 'YOUTUBE_PROVIDERS_COOLING_DOWN', retryAt: Date.parse(retryAt), retryable: true
+  });
+}
+
+function cooldownMsFor(error: ProviderCallError): number {
+  if (error.errorClass === 'RATE_LIMIT') return 5 * 60_000;
+  if (error.errorClass === 'TIMEOUT' || error.errorClass === 'TRANSIENT') return 60_000;
+  return 0;
 }
 
 export async function discoverWithInnerTube(
@@ -158,52 +166,78 @@ export async function discoverWithInnerTube(
   const timeoutMs = bounded(options.timeoutMs, 15_000, 1_000, 30_000);
   const state = health(lane);
   if (state.coolingDownUntil && Date.parse(state.coolingDownUntil) > Date.now()) {
-    throw Object.assign(new Error('YOUTUBE_JS_COOLING_DOWN'), { retryAt: state.coolingDownUntil });
+    throw cooldownError(lane, state.coolingDownUntil);
   }
 
   const started = Date.now();
   const seen = new Map<string, DiscoveredChannelRaw>();
+  let rawCandidateCount = 0;
   let pagesFetched = 0;
   let page: SearchPage | undefined;
+  const context: ProviderCallContext = {
+    provider: 'youtube_js', operation: `search-${lane.toLowerCase()}`,
+    requestId: options.telemetry?.requestId,
+    runId: options.telemetry?.runId,
+    jobId: options.telemetry?.jobId,
+    attempt: options.telemetry?.attempt,
+    reservedCost: 0,
+    actualCost: 0,
+    policyVersion: 'youtube-js-autonomous-v1'
+  };
+
   try {
     const client = injectedClient || await getClient();
-    page = await withTimeout(client.search(query, searchOptions(lane)), timeoutMs);
+    page = await executeProviderCall({
+      context,
+      timeoutMs,
+      call: async () => client.search(query, searchOptions(lane)),
+      emit: appendProviderCallEvent
+    });
     while (page && pagesFetched < maxPages && seen.size < maxChannels) {
       pagesFetched++;
       const items = page.videos || page.results || [];
+      rawCandidateCount += items.length;
       for (const item of items) {
         const candidate = toCandidate(item);
         if (candidate && !seen.has(candidate.channelId)) seen.set(candidate.channelId, candidate);
         if (seen.size >= maxChannels) break;
       }
       if (!page.has_continuation || !page.getContinuation || pagesFetched >= maxPages || seen.size >= maxChannels) break;
-      page = await withTimeout(page.getContinuation(), timeoutMs);
+      page = await executeProviderCall({
+        context: { ...context, operation: `search-${lane.toLowerCase()}-continuation`, attempt: (options.telemetry?.attempt || 1) + pagesFetched },
+        timeoutMs,
+        call: async () => page!.getContinuation!(),
+        emit: appendProviderCallEvent
+      });
     }
     const current = health(lane);
     updateHealth(lane, {
       requests: current.requests + pagesFetched,
-      candidates: current.candidates + seen.size,
+      candidates: current.candidates + rawCandidateCount,
       uniqueChannels: current.uniqueChannels + seen.size,
       lastLatencyMs: Date.now() - started,
       lastSuccessAt: new Date().toISOString(),
       coolingDownUntil: null
     });
     return {
-      provider: 'YOUTUBE_JS', lane, query, pagesFetched,
+      provider: 'YOUTUBE_JS', lane, query, pagesFetched, rawCandidateCount,
       channels: [...seen.values()],
       exhausted: !page?.has_continuation,
       health: { ...health(lane) }
     };
   } catch (error) {
+    const typed = classifyProviderError(error);
+    const cooldownMs = cooldownMsFor(typed);
+    const retryAt = cooldownMs ? new Date(Date.now() + cooldownMs).toISOString() : null;
     const current = health(lane);
-    const cooldownMs = 60_000;
     updateHealth(lane, {
       failures: current.failures + 1,
       lastLatencyMs: Date.now() - started,
       lastFailureAt: new Date().toISOString(),
-      coolingDownUntil: new Date(Date.now() + cooldownMs).toISOString()
+      coolingDownUntil: retryAt
     });
-    throw error;
+    if (typed.errorClass === 'RATE_LIMIT' && retryAt) throw cooldownError(lane, retryAt);
+    throw typed;
   }
 }
 
