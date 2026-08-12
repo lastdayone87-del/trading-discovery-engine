@@ -1,0 +1,43 @@
+name: Apply YouTube.js production routing patch
+
+on:
+  push:
+    branches:
+      - feature/youtubejs-production-provider
+    paths:
+      - scripts/applyYoutubeJsProductionPatch.mjs
+      - .github/workflows/apply-youtubejs-production-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/youtubejs-production-provider
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply exact queue routing patch
+        run: node scripts/applyYoutubeJsProductionPatch.mjs
+      - name: Provider regression tests
+        run: node --import tsx --test server/youtubeInnerTubeProvider.test.ts
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Commit production routing and remove one-time helper
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/queueManager.ts
+          git rm scripts/applyYoutubeJsProductionPatch.mjs .github/workflows/apply-youtubejs-production-patch.yml
+          git commit -m "Wire YouTube.js into autonomous discovery"
+          git push origin HEAD:feature/youtubejs-production-provider
