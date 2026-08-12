@@ -1,0 +1,149 @@
+name: Apply active discovery fixes
+
+on:
+  push:
+    branches:
+      - fix/discord-candidate-selection-and-discovery-depth
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/discord-candidate-selection-and-discovery-depth
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Apply focused source patches
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+
+          function patch(path, oldText, newText) {
+            let content = fs.readFileSync(path, 'utf8');
+            if (!content.includes(oldText)) {
+              throw new Error(`Expected patch target not found in ${path}: ${oldText.slice(0, 120)}`);
+            }
+            content = content.replace(oldText, newText);
+            fs.writeFileSync(path, content);
+          }
+
+          // 1) Discord candidate selection: operational success is not the same
+          // as trading relevance success. Keep evaluating bounded candidates
+          // until a live, trading-relevant server is found.
+          patch(
+            'server/queueManager.ts',
+            "      let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0];\n      const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];",
+            "      let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0];\n      let selectedRank=-1;\n      const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];"
+          );
+          patch(
+            'server/queueManager.ts',
+            "        if(validation.operationalOutcome==='SUCCEEDED'){selected=validation;selectedCandidate=candidate;break;}\n        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}\n        if(!selected||validation.operationalOutcome==='INVALID_OBSERVED'){selected=validation;selectedCandidate=candidate;}",
+            "        if(validation.operationalOutcome==='SUCCEEDED'){\n          const fullyTradingRelevant=validation.relevanceStatus==='TRADING_RELEVANT'&&(validation.status==='ACTIVE'||validation.status==='ACTIVE_LOW_VOLUME');\n          const rank=fullyTradingRelevant?100:validation.relevanceStatus==='UNCERTAIN'&&validation.livenessStatus==='ACTIVE'?80:validation.relevanceStatus==='NON_TRADING'?40:60;\n          if(rank>selectedRank){selected=validation;selectedCandidate=candidate;selectedRank=rank;}\n          if(fullyTradingRelevant)break;\n          continue;\n        }\n        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}\n        const fallbackRank=validation.operationalOutcome==='INVALID_OBSERVED'?20:10;\n        if(fallbackRank>selectedRank){selected=validation;selectedCandidate=candidate;selectedRank=fallbackRank;}"
+          );
+
+          // 2) Partial website acquisition is not a total crawler error.
+          patch(
+            'src/types/index.ts',
+            "  status: 'FOUND' | 'NOT_FOUND' | 'SKIPPED' | 'ERROR' | 'REJECTED';",
+            "  status: 'FOUND' | 'NOT_FOUND' | 'SKIPPED' | 'PARTIAL' | 'ERROR' | 'REJECTED';"
+          );
+          patch(
+            'server/inspector.ts',
+            "      addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', failed?(inspected?'ERROR':'ERROR'):'NOT_FOUND', step5Logs);",
+            "      addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', failed?(inspected?'PARTIAL':'ERROR'):'NOT_FOUND', step5Logs);"
+          );
+
+          // 3) Broaden the bounded website crawler. This remains intentionally
+          // finite: common community/about/contact paths plus relevant anchors,
+          // up to depth 3 and at most 12 subpages per creator-owned root.
+          patch(
+            'server/inspector.ts',
+            "      // Check for community subpages on custom website domains\n      if (\n        (href.includes('/discord') || href.includes('/community') || href.includes('/join') || href.includes('/chat')) &&\n        !href.includes('youtube.com') && !href.includes('twitter.com')\n      ) {\n        let fullSub = href;\n        if (href.startsWith('/')) {\n          try {\n            const parsed = new URL(page.finalUrl);\n            fullSub = `${parsed.origin}${href}`;\n          } catch (e) {}\n        }\n        if (fullSub.startsWith('http') && !subpagesToVisit.includes(fullSub)) {\n          subpagesToVisit.push(fullSub);\n        }\n      }",
+            "      // Prioritize pages a human would naturally inspect for a community link.\n      const anchorText = ($(el).text() || '').toLowerCase();\n      const hrefLower = href.toLowerCase();\n      const communityHint = ['discord','community','join','members','member','chat','contact','about','links','social'].some(term => hrefLower.includes(term) || anchorText.includes(term));\n      if (communityHint && !hrefLower.includes('youtube.com') && !hrefLower.includes('twitter.com')) {\n        try {\n          const fullSub = new URL(href, page.finalUrl).toString();\n          if (fullSub.startsWith('http') && !subpagesToVisit.includes(fullSub)) subpagesToVisit.push(fullSub);\n        } catch {}\n      }"
+          );
+          patch(
+            'server/inspector.ts',
+            "    // Level 2 depth crawl for community subpages\n    for (const subUrl of subpagesToVisit.slice(0, 3)) {\n      logDetails.push(`Subpage crawl level 2: ${subUrl}`);\n      const subPage = await fetchWithTimeout(subUrl, 1);\n      if (subPage) {\n        if (debugLog) debugLog.redirectsFollowed.push({ from: subUrl, to: subPage.finalUrl });\n        const subFinalInv = extractDiscordInvite(subPage.finalUrl);\n        if (debugLog) debugLog.discordRegexAttempts.push({ source: 'crawlExternalLinks_subPage_finalUrl', url: subPage.finalUrl, result: subFinalInv });\n        if (subFinalInv) {\n          logDetails.push(`Subpage redirect reached Discord invite: ${subPage.finalUrl} (Invite: ${subFinalInv})`);\n          observations.push({requestedUrl:url,finalUrl:subPage.finalUrl,wrapperUrl,surface,required,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found on community subpage redirect',observedAt:new Date().toISOString()});\n          return { foundInvite: subFinalInv, details: logDetails.join('\\n'),outcome:'FOUND',observations };\n        }\n        const subInv = extractDiscordInvite(subPage.html);\n        if (subInv) {\n          logDetails.push(`Discord invite extracted from subpage ${subUrl} (Invite: ${subInv})`);\n          observations.push({requestedUrl:url,finalUrl:subUrl,wrapperUrl,surface,required,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found on community subpage',observedAt:new Date().toISOString()});\n          return { foundInvite: subInv, details: logDetails.join('\\n'),outcome:'FOUND',observations };\n        }\n      }\n    }",
+            "    // Bounded depth-first community crawl. Seed common paths even when a\n    // site's navigation hides them behind menus or generic link text.\n    try {\n      const root = new URL(page.finalUrl);\n      for (const path of ['/discord','/community','/join','/members','/chat','/contact','/about','/links']) {\n        const candidate = new URL(path, root.origin).toString();\n        if (!subpagesToVisit.includes(candidate)) subpagesToVisit.push(candidate);\n      }\n    } catch {}\n    const crawlQueue = subpagesToVisit.slice(0, 12).map(subUrl => ({ subUrl, depth: 2 }));\n    const visitedSubpages = new Set<string>();\n    while (crawlQueue.length > 0 && visitedSubpages.size < 12) {\n      const next = crawlQueue.shift()!;\n      if (visitedSubpages.has(next.subUrl)) continue;\n      visitedSubpages.add(next.subUrl);\n      logDetails.push(`Subpage crawl level ${next.depth}: ${next.subUrl}`);\n      const subPage = await fetchWithTimeout(next.subUrl, 1);\n      if (!subPage) continue;\n      if (debugLog) debugLog.redirectsFollowed.push({ from: next.subUrl, to: subPage.finalUrl });\n      const subFinalInv = extractDiscordInvite(subPage.finalUrl);\n      if (debugLog) debugLog.discordRegexAttempts.push({ source: 'crawlExternalLinks_subPage_finalUrl', url: subPage.finalUrl, result: subFinalInv });\n      if (subFinalInv) {\n        logDetails.push(`Subpage redirect reached Discord invite: ${subPage.finalUrl} (Invite: ${subFinalInv})`);\n        observations.push({requestedUrl:url,finalUrl:subPage.finalUrl,wrapperUrl,surface,required,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found on community subpage redirect',observedAt:new Date().toISOString()});\n        return { foundInvite: subFinalInv, details: logDetails.join('\\n'),outcome:'FOUND',observations };\n      }\n      const subInv = extractDiscordInvite(subPage.html);\n      if (subInv) {\n        logDetails.push(`Discord invite extracted from subpage ${next.subUrl} (Invite: ${subInv})`);\n        observations.push({requestedUrl:url,finalUrl:next.subUrl,wrapperUrl,surface,required,outcome:'FOUND',retryable:false,httpStatus:200,detail:'Discord invite found on community subpage',observedAt:new Date().toISOString()});\n        return { foundInvite: subInv, details: logDetails.join('\\n'),outcome:'FOUND',observations };\n      }\n      if (next.depth < 3) {\n        const sub$ = cheerio.load(subPage.html);\n        sub$('a[href]').each((_, el) => {\n          const childHref = (sub$(el).attr('href') || '').trim();\n          const childText = (sub$(el).text() || '').toLowerCase();\n          const childLower = childHref.toLowerCase();\n          const relevant = ['discord','community','join','members','member','chat','contact','about','links','social'].some(term => childLower.includes(term) || childText.includes(term));\n          if (!relevant) return;\n          try {\n            const childUrl = new URL(childHref, subPage.finalUrl);\n            const rootUrl = new URL(page.finalUrl);\n            if (childUrl.origin === rootUrl.origin && !visitedSubpages.has(childUrl.toString()) && crawlQueue.length + visitedSubpages.size < 12) {\n              crawlQueue.push({ subUrl: childUrl.toString(), depth: next.depth + 1 });\n            }\n          } catch {}\n        });\n      }\n    }"
+          );
+
+          // 4) Freshness must come from observed upload activity, not from the
+          // mere existence of historical video titles.
+          patch(
+            'server/queryIntelligence.ts',
+            "  // 2. Freshness & Activity (Max 25)\n  let freshnessScore = 20; // Default active assumption\n  if (videoTitles.length > 0) {\n    freshnessScore = 25;\n    reasons.push(`Active content stream with ${videoTitles.length} recent video titles analyzed`);\n  } else {\n    reasons.push('Standard activity level');\n  }",
+            "  // 2. Freshness & Activity (Max 25). Unknown activity is neutral,\n  // never assumed active merely because historical titles exist.\n  const band = channel.activity_band || 'UNKNOWN';\n  let freshnessScore = band === 'VERY_ACTIVE' ? 25 : band === 'ACTIVE' ? 22 : band === 'OCCASIONAL' ? 15 : band === 'DORMANT' ? 3 : 10;\n  if (channel.latest_upload_at) {\n    const ageDays = Math.max(0, (Date.now() - Date.parse(channel.latest_upload_at)) / 86_400_000);\n    if (Number.isFinite(ageDays)) {\n      if (ageDays > 1095) freshnessScore = Math.min(freshnessScore, 1);\n      else if (ageDays > 365) freshnessScore = Math.min(freshnessScore, 4);\n      else if (ageDays > 180) freshnessScore = Math.min(freshnessScore, 10);\n      else if (ageDays > 90) freshnessScore = Math.min(freshnessScore, 15);\n      reasons.push(`Latest observed upload ${Math.round(ageDays)} day(s) ago (${band.replaceAll('_',' ').toLowerCase()})`);\n    }\n  } else {\n    reasons.push('Upload recency has not yet been independently observed');\n  }"
+          );
+
+          // 5) Use more of each YouTube search response and allow productive
+          // autonomous runs to continue through the existing low-yield policy.
+          patch(
+            'server/youtube.ts',
+            "  const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));\n  const maxResults = Math.min(50, Math.max(10, Number.isFinite(configuredMaxResults) ? configuredMaxResults : 25));",
+            "  const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '50'));\n  const maxResults = Math.min(50, Math.max(10, Number.isFinite(configuredMaxResults) ? configuredMaxResults : 50));"
+          );
+          patch(
+            'server/queueManager.ts',
+            "      const enabled=await getAppSetting('autonomous_pagination_enabled','false')==='true';",
+            "      const enabled=await getAppSetting('autonomous_pagination_enabled','true')==='true';"
+          );
+          patch(
+            'server/db.ts',
+            "  const configuredVideoPercent = Number(await getAppSetting('discovery_video_lane_percent', process.env.DISCOVERY_VIDEO_LANE_PERCENT || '70'));\n  const videoLanePercent = Math.min(100, Math.max(0, Number.isFinite(configuredVideoPercent) ? configuredVideoPercent : 70));\n  const configuredDatePercent = Number(await getAppSetting('discovery_date_ordering_video_percent', process.env.DISCOVERY_DATE_ORDERING_VIDEO_PERCENT || '10'));\n  const datePercent = Math.min(100, Math.max(0, Number.isFinite(configuredDatePercent) ? configuredDatePercent : 10));",
+            "  const configuredVideoPercent = Number(await getAppSetting('discovery_video_lane_percent', process.env.DISCOVERY_VIDEO_LANE_PERCENT || '85'));\n  const videoLanePercent = Math.min(100, Math.max(0, Number.isFinite(configuredVideoPercent) ? configuredVideoPercent : 85));\n  const configuredDatePercent = Number(await getAppSetting('discovery_date_ordering_video_percent', process.env.DISCOVERY_DATE_ORDERING_VIDEO_PERCENT || '50'));\n  const datePercent = Math.min(100, Math.max(0, Number.isFinite(configuredDatePercent) ? configuredDatePercent : 50));"
+          );
+          patch(
+            'server/db.ts',
+            "JSON.stringify({provider:'external-link',boundedDepth:2,surface:observation.surface,required:observation.required,wrapperUrl:observation.wrapperUrl||null})",
+            "JSON.stringify({provider:'external-link',boundedDepth:3,surface:observation.surface,required:observation.required,wrapperUrl:observation.wrapperUrl||null})"
+          );
+
+          // 6) Operator wording: distinguish a verified live invite whose trading
+          // relevance is still unresolved.
+          patch(
+            'src/components/ResultsTable.tsx',
+            "                        {c.discord_status}\n                      </span>",
+            "                        {c.discord_liveness_status === 'ACTIVE' && c.discord_relevance_status === 'UNCERTAIN' ? 'ACTIVE · RELEVANCE UNCERTAIN' : c.discord_status}\n                      </span>"
+          );
+          patch(
+            'src/components/ResultsTable.tsx',
+            "                          ? 'Discovered · validation ambiguous'",
+            "                          ? 'Invite verified · trading relevance unresolved'"
+          );
+          patch(
+            'src/components/InspectionModal.tsx',
+            "                      : step.status === 'REJECTED'\n                      ? 'border-rose-500 text-rose-500'",
+            "                      : step.status === 'REJECTED'\n                      ? 'border-rose-500 text-rose-500'\n                      : step.status === 'PARTIAL'\n                      ? 'border-amber-500 text-amber-500'"
+          );
+          patch(
+            'src/components/InspectionModal.tsx',
+            "                      : step.status === 'REJECTED'\n                      ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/60 dark:text-rose-300'\n                      : step.status === 'SKIPPED'",
+            "                      : step.status === 'REJECTED'\n                      ? 'bg-rose-100 text-rose-800 dark:bg-rose-900/60 dark:text-rose-300'\n                      : step.status === 'PARTIAL'\n                      ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-300'\n                      : step.status === 'SKIPPED'"
+          );
+          NODE
+      - name: Install dependencies
+        run: npm ci
+      - name: Test
+        run: npm test
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Commit verified fixes
+        shell: bash
+        run: |
+          rm -f .github/workflows/apply-active-discovery-fixes.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix Discord selection and deepen active creator discovery [autofix applied]"
+          git push origin HEAD:fix/discord-candidate-selection-and-discovery-depth
