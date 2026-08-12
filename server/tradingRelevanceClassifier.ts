@@ -89,9 +89,18 @@ export async function classifyTradingRelevanceDetailed(
   return {result, decision, input};
 }
 
-/** Preserves the complete field-aware schema at the production boundary. */
-function normalizeFieldAwareInput(value: RawChannelInput): RawChannelInput {
-  const videos=value.videos?.map(video=>({...video})) || (value.video_titles||[]).map((title,index)=>({title,description:value.video_descriptions?.[index]}));
+/**
+ * Preserves the complete field-aware schema at the production boundary while
+ * enforcing evidence independence. A search-match document is retrieval
+ * provenance, not an independent sample of the creator's content. Until a
+ * channel has completed enrichment, the titles/descriptions copied from that
+ * search result must not be promoted into the video-evidence providers.
+ */
+export function normalizeFieldAwareInput(value: RawChannelInput): RawChannelInput {
+  const retrievalOnly = !!value.search_match_context && (value.enrichment_stage || 0) === 0;
+  const videos = retrievalOnly
+    ? []
+    : value.videos?.map(video=>({...video})) || (value.video_titles||[]).map((title,index)=>({title,description:value.video_descriptions?.[index]}));
   return {
     ...value,
     channel_name:value.channel_name.normalize('NFKC').trim(),
