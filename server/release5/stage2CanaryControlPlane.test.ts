@@ -12,11 +12,19 @@ test('control plane defaults the production kill switch to OFF', () => {
   assert.match(source, /defaultMode: 'OFF'/);
 });
 
-test('treatment capacity is physically bounded to 50 unique slots', () => {
-  assert.match(migration, /treatment_slot SMALLINT NOT NULL UNIQUE CHECK \(treatment_slot BETWEEN 1 AND 50\)/);
+test('treatment capacity is physically bounded to 50 unique slots per generation', () => {
+  assert.match(migration, /treatment_slot SMALLINT NOT NULL CHECK \(treatment_slot BETWEEN 1 AND 50\)/);
+  assert.match(migration, /UNIQUE \(canary_generation, treatment_slot\)/);
   assert.match(source, /maximumTreatmentSubjects/);
   assert.match(source, /pg_advisory_xact_lock/);
   assert.match(source, /FOR UPDATE/);
+  assert.match(source, /canary_generation=\$1 AND t\.treatment_slot=s\.slot/);
+});
+
+test('canary cohorts are generation-scoped and restart-safe', () => {
+  assert.match(migration, /PRIMARY KEY \(canary_generation, subject_key\)/);
+  assert.match(source, /Number\(row\.generation\) !== canaryGeneration/);
+  assert.match(source, /WHERE canary_generation=\$1 AND subject_key=\$2/);
 });
 
 test('enabling CANARY requires explicit manual approval and optimistic generation', () => {
@@ -38,7 +46,9 @@ test('human-confirmed genuine trading creator triggers immediate abort', () => {
   assert.match(source, /return abortStage2Canary\('ANY_HUMAN_CONFIRMED_TRADING_CREATOR_WITHHELD'/);
 });
 
-test('missing evidence fails closed and aborts the canary', () => {
-  assert.match(source, /REQUIRED_EVIDENCE_SNAPSHOT_MISSING/);
+test('missing evidence fails closed only after CANARY is confirmed active', () => {
+  const modeCheck = source.indexOf("if (state.mode !== 'CANARY')");
+  const evidenceCheck = source.indexOf("if (!evidenceSnapshotChecksum.trim())");
+  assert.ok(modeCheck >= 0 && evidenceCheck > modeCheck);
   assert.match(source, /await abortStage2Canary\('REQUIRED_EVIDENCE_SNAPSHOT_MISSING'\)/);
 });
