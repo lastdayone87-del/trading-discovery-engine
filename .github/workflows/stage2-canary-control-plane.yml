@@ -1,0 +1,35 @@
+name: Stage 2 canary control plane
+
+on:
+  pull_request:
+    paths:
+      - 'server/release5/stage2CanaryControlPlane.ts'
+      - 'server/release5/stage2CanaryControlPlane.test.ts'
+      - 'server/db/migrations/084_stage2_rate_pressure_canary_control_plane.sql'
+      - '.github/workflows/stage2-canary-control-plane.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Test Stage 2 control plane
+        run: node --import tsx --test server/release5/stage2CanaryControlPlane.test.ts server/release5/stage2LimitedCanaryDesign.test.ts
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Verify fail-closed production defaults
+        run: |
+          set -euo pipefail
+          grep -q "mode TEXT NOT NULL DEFAULT 'OFF'" server/db/migrations/084_stage2_rate_pressure_canary_control_plane.sql
+          grep -q "UNIQUE (canary_generation, treatment_slot)" server/db/migrations/084_stage2_rate_pressure_canary_control_plane.sql
+          grep -q "manualApproval: true" server/release5/stage2CanaryControlPlane.ts
+          grep -q "automaticEnableForbidden: true" server/release5/stage2CanaryControlPlane.ts
+          ! grep -q "servingAuthority: true" server/release5/stage2CanaryControlPlane.ts
