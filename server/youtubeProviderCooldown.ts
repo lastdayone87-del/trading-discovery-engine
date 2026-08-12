@@ -27,6 +27,12 @@ function zonedOffsetMs(timestamp: number, timeZone: string): number {
   return representedAsUtc - rounded;
 }
 
+/** Calendar key for the YouTube quota day, which follows Pacific Time. */
+export function youtubeQuotaDateKey(now: number = Date.now()): string {
+  const parts = zonedParts(now, YOUTUBE_QUOTA_TIME_ZONE);
+  return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+}
+
 /** YouTube Data API daily quota resets at midnight Pacific Time. */
 export function nextYouTubeDailyQuotaResetAt(now: number): number {
   const pacific = zonedParts(now, YOUTUBE_QUOTA_TIME_ZONE);
