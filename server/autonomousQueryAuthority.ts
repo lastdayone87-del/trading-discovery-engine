@@ -2,13 +2,15 @@ import type { QueryRecord } from '../src/types';
 import { isRetrievalOrientedQuery } from './queryPlanner';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
 
-export const AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION = 'autonomous-query-authority-v1';
+export const AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION = 'autonomous-query-authority-v2';
 
 export interface AutonomousQueryAuthorityDecision {
   eligible: boolean;
   reasonCodes: string[];
   retrievalPolicyVersion?: string;
 }
+
+const EXPLICIT_STANDALONE_METHOD_CONTEXT = /\b(trading|trader|day\s*trading|swing\s*trading|forex|futures?|options?|spread\s*betting|prop\s*firm|funded\s*trader|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse\s+schweiz|futures\s*handel|trading\s*psychology)\b/iu;
 
 function metadataOf(query: QueryRecord): Record<string, any> {
   const raw = (query as QueryRecord & { generation_metadata?: unknown }).generation_metadata;
@@ -51,6 +53,16 @@ export function evaluateAutonomousQueryAuthority(query: QueryRecord): Autonomous
     const anchor = atoms[0]?.retrievalPolicy?.eligibility;
     if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor))) {
       return { eligible: false, reasonCodes: ['QUERY_ANCHOR_NOT_CURRENTLY_AUTHORIZED'], retrievalPolicyVersion: specificity.policyVersion };
+    }
+
+    // A generic method can be semantically trading-related while still being a
+    // poor global retrieval surface (for example "Order Flow" or "Price Action").
+    // Country-targeted autonomous retrieval therefore requires a concrete market/
+    // instrument companion unless the standalone method carries explicit trading
+    // context in the surface itself.
+    const primaryType = String(atoms[0]?.type || '').toUpperCase();
+    if (template === 'SINGLE_ATOM' && primaryType === 'METHOD' && !EXPLICIT_STANDALONE_METHOD_CONTEXT.test(query.query)) {
+      return { eligible: false, reasonCodes: ['STANDALONE_METHOD_REQUIRES_CONCRETE_TRADING_ANCHOR'], retrievalPolicyVersion: specificity.policyVersion };
     }
   } else if (!['SINGLE_ATOM', 'ORGANIC_STANDALONE'].includes(template)) {
     return { eligible: false, reasonCodes: ['COMPOUND_QUERY_ATOM_PROVENANCE_MISSING'], retrievalPolicyVersion: specificity.policyVersion };
