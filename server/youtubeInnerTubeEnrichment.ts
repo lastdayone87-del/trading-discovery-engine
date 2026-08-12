@@ -87,13 +87,13 @@ function playlistName(item: any): string {
   return textValue(item?.title || item?.name);
 }
 
-async function mapWithConcurrency<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const output = new Array<R>(items.length);
   let cursor = 0;
   const runners = Array.from({ length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) }, async () => {
     while (cursor < items.length) {
       const index = cursor++;
-      output[index] = await worker(items[index]);
+      output[index] = await worker(items[index], index);
     }
   });
   await Promise.all(runners);
@@ -154,7 +154,7 @@ export async function fetchInnerTubeChannelEnrichment(
   }
 
   const selected = rawVideos.slice(0, maxVideos);
-  const detailed = await mapWithConcurrency(selected, 4, async (item, index) => {
+  const detailed: InnerTubeEnrichmentVideo[] = await mapWithConcurrency<any, InnerTubeEnrichmentVideo>(selected, 4, async (item, index) => {
     const id = videoId(item);
     const base: InnerTubeEnrichmentVideo = { id, title: titleOf(item), published_at: publishedOf(item), content_type: 'youtube_video' };
     if (!id || index >= detailVideos) return base;
