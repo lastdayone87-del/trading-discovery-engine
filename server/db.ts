@@ -380,8 +380,10 @@ export function isRetryableInfrastructureFailure(error:any):boolean{
   const code=String(error?.code||error?.cause?.code||'').toUpperCase();
   const status=Number(error?.status||error?.statusCode||error?.response?.status);
   const name=String(error?.name||'');
+  const errorClass=String(error?.errorClass||'').toUpperCase();
   if(TRANSIENT_PROVIDER_CODES.has(code)||TRANSIENT_HTTP_STATUS.has(status))return true;
   if(name==='TimeoutError')return true;
+  if(error?.retryable===true&&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(errorClass))return true;
   return false;
 }
 export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now()):{disposition:JobFailureDisposition;runAfter?:number}{

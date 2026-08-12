@@ -22,6 +22,25 @@ test('common network/provider outages are retryable infrastructure failures',()=
   }
 });
 
+
+test('normalized provider resilience failures stay attempt-free when marked retryable',()=>{
+  for(const error of [
+    {name:'ProviderCallError',errorClass:'TIMEOUT',retryable:true},
+    {name:'ProviderCallError',errorClass:'TRANSIENT',retryable:true},
+    {name:'ProviderCallError',errorClass:'RATE_LIMIT',retryable:true,status:429},
+    {name:'ProviderCallError',errorClass:'CANCELLED',retryable:true}
+  ]){
+    assert.equal(isRetryableInfrastructureFailure(error),true,JSON.stringify(error));
+    assert.equal(decideJobFailure(error,3,3,now).disposition,'RETRYING_WITHOUT_ATTEMPT');
+  }
+});
+
+test('normalized permanent provider input failures remain bounded',()=>{
+  const error={name:'ProviderCallError',errorClass:'PERMANENT_INPUT',retryable:false,status:400};
+  assert.equal(isRetryableInfrastructureFailure(error),false);
+  assert.equal(decideJobFailure(error,3,3,now).disposition,'FAILED');
+});
+
 test('application/logic failures still consume the bounded retry budget',()=>{
   assert.equal(decideJobFailure(new Error('classifier invariant failed'),1,3,now).disposition,'RETRYING');
   assert.equal(decideJobFailure(new Error('classifier invariant failed'),3,3,now).disposition,'FAILED');
