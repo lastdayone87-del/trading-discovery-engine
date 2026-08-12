@@ -2,7 +2,7 @@ import type { DiscoverySource } from '../src/types';
 import type { VerificationDecision } from './evidenceEngine';
 import type { DiscoveredChannelRaw } from './youtube';
 
-export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v2';
+export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v3-freshness';
 
 export type SearchCandidateTriageDisposition = 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'NOT_APPLICABLE';
 
@@ -22,6 +22,16 @@ const STRONG_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['JAPANESE_TRADING', /(トレード|デイトレード|先物|テクニカル分析|板読み|オーダーフロー)/u]
 ];
 
+function staleMatchedVideo(candidate: DiscoveredChannelRaw, now = Date.now()): boolean {
+  if (candidate.matchedDocument?.type !== 'VIDEO' || !candidate.matchedDocument.publishedAt) return false;
+  const publishedAt = Date.parse(candidate.matchedDocument.publishedAt);
+  if (!Number.isFinite(publishedAt)) return false;
+  const configured = Number(process.env.DISCOVERY_MAX_MATCH_AGE_DAYS ?? '730');
+  const maxAgeDays = Number.isFinite(configured) ? Math.max(0, configured) : 730;
+  if (maxAgeDays === 0) return false;
+  return now - publishedAt > maxAgeDays * 86_400_000;
+}
+
 /**
  * Cheap routing-only firewall. Search-match content is never promoted to
  * creator-level evidence; it is used only to decide whether an autonomous
@@ -34,6 +44,19 @@ export function triageAutonomousSearchCandidate(
 ): SearchCandidateTriageDecision {
   if (source !== 'automated_query' || isEnrichmentPass || (candidate.enrichmentStage || 0) > 0) {
     return { disposition: 'NOT_APPLICABLE', reasonCodes: ['NON_INITIAL_AUTONOMOUS_RESULT'], matchedSignals: [] };
+  }
+
+  // A search hit from many years ago is weak evidence for the user's actual
+  // target: active traders publishing now. Withhold stale VIDEO matches before
+  // country hydration, semantic classification, enrichment, or Discord crawling.
+  // CHANNEL-lane results are not rejected here because they have no trustworthy
+  // publication timestamp and can still receive creator-level evidence later.
+  if (staleMatchedVideo(candidate)) {
+    return {
+      disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
+      reasonCodes: ['STALE_RETRIEVAL_DOCUMENT', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
+      matchedSignals: []
+    };
   }
 
   const retrievalText = [
