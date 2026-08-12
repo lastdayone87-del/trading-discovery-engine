@@ -22,3 +22,10 @@ test('preserves feed evidence if a detail lookup fails',async()=>{
   assert.equal(result.videos[0].title,'One');
   assert.equal(result.videos[1].description,'two');
 });
+
+test('empty upload feed is a successful evidence acquisition result',async()=>{
+  const client:any={getChannel:async()=>({has_videos:false,videos:[]}),getBasicInfo:async()=>{throw new Error('should not run');}};
+  const result=await fetchInnerTubeChannelEnrichment('UCempty',{},client);
+  assert.deepEqual(result.videos,[]);
+  assert.equal(result.detailCalls,0);
+});
