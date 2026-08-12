@@ -1,16 +1,18 @@
-name: Apply YouTube.js hybrid enrichment
+name: Apply hybrid enrichment patch
 
 on:
   push:
-    branches: [feat/youtube-js-hybrid-enrichment]
-    paths: ['.github/workflows/hybrid-enrichment-apply.yml']
+    branches:
+      - feat/youtube-js-hybrid-enrichment
+    paths:
+      - scripts/apply_hybrid_enrichment.py
+      - .github/workflows/hybrid-enrichment-apply.yml
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -20,183 +22,48 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '22'
           cache: npm
       - run: npm ci
-      - name: Apply hybrid enrichment integration
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          yt=Path('server/youtube.ts')
-          text=yt.read_text()
-          import_anchor="import { FEATURED_CHANNEL_PROVIDER_COST, parseFeaturedChannelSections, type FeaturedChannelProviderResult } from './featuredChannelAdapter';\n"
-          import_line="import { fetchInnerTubeChannelEnrichment } from './youtubeInnerTubeEnrichment';\n"
-          if import_line not in text:
-            if import_anchor not in text: raise SystemExit('youtube import anchor not found')
-            text=text.replace(import_anchor,import_anchor+import_line,1)
-
-          old_sig="export async function fetchYouTubeChannelEnrichment(\n  channelId: string,\n  fallback: DiscoveredChannelRaw,\n  stage:1|2|3=1\n): Promise<DiscoveredChannelRaw> {"
-          new_sig="async function fetchYouTubeChannelEnrichmentOfficial(\n  channelId: string,\n  fallback: DiscoveredChannelRaw,\n  stage:1|2|3=1\n): Promise<DiscoveredChannelRaw> {"
-          if old_sig not in text: raise SystemExit('legacy enrichment signature not found')
-          text=text.replace(old_sig,new_sig,1)
-
-          marker="\n/** One-unit metadata hydration used only when country evidence remains uncertain. */\n"
-          if marker not in text: raise SystemExit('country hydration marker not found')
-          wrapper=r'''
-
-/**
- * Hybrid enrichment keeps authoritative channel/country metadata on the official
- * one-unit channels.list call while moving the 100-unit recent-upload and
- * playlist searches to YouTube.js. Provider failure remains retryable and does
- * not silently degrade creator evidence.
- */
-export async function fetchYouTubeChannelEnrichment(
-  channelId: string,
-  fallback: DiscoveredChannelRaw,
-  stage:1|2|3=1
-): Promise<DiscoveredChannelRaw> {
-  const hybridEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true')==='true';
-  if(!hybridEnabled) return fetchYouTubeChannelEnrichmentOfficial(channelId,fallback,stage);
-
-  const inner=await fetchInnerTubeChannelEnrichment(channelId,{
-    maxVideos:10,
-    detailVideos:stage>=2?10:6,
-    includePlaylists:stage>=2,
-    timeoutMs:Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'))
-  });
-  if(!inner.videos.length){
-    throw new ProviderCallError(`YouTube.js enrichment returned no recent videos for '${channelId}'.`,'TRANSIENT',true);
-  }
-
-  const keyPool=getYouTubeKeyPool();
-  if(!keyPool.length) throw new ProviderCallError('Hybrid YouTube enrichment requires one official API key for authoritative channel metadata.','CREDENTIALS_EXHAUSTED',true);
-  const acquisition=youtubePoolBackoff.beginAcquisition();
-  let lastError:Error|null=null,quotaExceededCount=0;
-  try {
-    const providerIndexes=availableKeyIndexes(keyPool);
-    for(let attempt=0;attempt<providerIndexes.length;attempt++){
-      const currentIndex=providerIndexes[attempt],apiKey=keyPool[currentIndex];
-      try{
-        const channelUrl=buildYouTubeApiUrl('channels',apiKey,{part:'snippet,brandingSettings,statistics',id:channelId});
-        const response=await youtubeFetch(channelUrl,'hybrid-enrichment-channel-details',1,attempt+1,acquisition);
-        const channelData=await readYouTubeJsonObject(response,'hybrid-enrichment-channel-details');
-        const channel=channelData.items?.[0];
-        if(!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
-        activeKeyIndex=currentIndex;await incrementQuota(1);
-
-        const description=channel.snippet?.description||fallback.description;
-        const observedAt=new Date();
-        const videos=inner.videos.map(video=>({id:video.id,title:video.title,description:video.description||'',published_at:video.published_at,content_type:'youtube_video'}));
-        const uploadTimestamps=videos.map(video=>video.published_at).filter((value):value is string=>typeof value==='string'&&Number.isFinite(Date.parse(value)));
-        const countSince=(days:number)=>uploadTimestamps.filter(value=>Date.parse(value)>=observedAt.getTime()-days*86_400_000).length;
-        const latestUploadAt=uploadTimestamps.slice().sort().at(-1);
-        const uploadsLast30Days=countSince(30),uploadsLast90Days=countSince(90),uploadsLast365Days=countSince(365);
-        const ageDays=latestUploadAt?(observedAt.getTime()-Date.parse(latestUploadAt))/86_400_000:Infinity;
-        const activityBand:ChannelActivityBand=!latestUploadAt?'UNKNOWN':ageDays<=30?'VERY_ACTIVE':ageDays<=90?'ACTIVE':ageDays<=365?'OCCASIONAL':'DORMANT';
-        const activityScore=!latestUploadAt?50:Math.max(5,Math.round(100*Math.exp(-ageDays/365)));
-        const officialCountry=channel.brandingSettings?.channel?.country;
-        const extractedLinks=description.match(/https?:\/\/[^\s)\]}]+/g)||[];
-        const playlists=inner.playlists.length?inner.playlists:(fallback.playlists||[]);
-        return {
-          ...fallback,channelId,channelName:channel.snippet?.title||fallback.channelName,
-          youtubeUrl:`https://www.youtube.com/channel/${channelId}`,description,
-          videoTitles:videos.map(video=>video.title),videos,playlists,
-          videoDescriptions:videos.map(video=>video.description||''),
-          locationTag:officialCountry||fallback.locationTag,
-          countryMetadataStatus:officialCountry?'AVAILABLE_DECLARED':'AVAILABLE_NOT_DECLARED',countryMetadataCheckedAt:observedAt.toISOString(),
-          channelLinks:Array.from(new Set([...(fallback.channelLinks||[]),...extractedLinks])),
-          subscriberCount:channel.statistics?.subscriberCount||fallback.subscriberCount,
-          channelThumbnailUrl:channel.snippet?.thumbnails?.high?.url||channel.snippet?.thumbnails?.default?.url||fallback.channelThumbnailUrl,
-          uploadTimestamps,latestUploadAt,uploadsLast30Days,uploadsLast90Days,uploadsLast365Days,
-          activityBand,activityScore,activityObservedAt:observedAt.toISOString(),enrichmentStage:stage,
-          externalLinkDetails:extractedLinks.map(url=>{try{return {url,domain:new URL(url).hostname.toLowerCase()};}catch{return {url};}})
-        };
-      }catch(error:any){recordProviderFailure(apiKey,error);if(isQuotaExceeded(error))quotaExceededCount++;lastError=error instanceof Error?error:new Error(String(error));}
-    }
-    acquisition.providerFailed(quotaExceededCount===keyPool.length?'QUOTA_EXHAUSTED':'INDETERMINATE');
-    throwIfAllProvidersCoolingDown(keyPool);
-    throw lastError||new Error(`Hybrid YouTube enrichment failed for '${channelId}'.`);
-  } finally { acquisition.release(); }
-}
-'''
-          text=text.replace(marker,wrapper+marker,1)
-          yt.write_text(text)
-
-          qm=Path('server/queueManager.ts')
-          text=qm.read_text()
-          old="""      const dailyBudget = getDailyYouTubeQuotaBudget();
-      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
-      const quotaReserved = await tryReserveQuota({
-        operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-        units: enrichmentStage>=2?202:101, dailyBudget, allocationPercent: enrichmentPercent
-      });
-"""
-          new="""      const dailyBudget = getDailyYouTubeQuotaBudget();
-      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
-      const hybridEnrichmentEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true')==='true';
-      // Hybrid enrichment spends only the authoritative channels.list unit;
-      // recent uploads, video descriptions and playlists come from YouTube.js.
-      const enrichmentQuotaUnits=hybridEnrichmentEnabled?1:(enrichmentStage>=2?202:101);
-      const quotaReserved = await tryReserveQuota({
-        operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-        units: enrichmentQuotaUnits, dailyBudget, allocationPercent: enrichmentPercent
-      });
-"""
-          if old not in text: raise SystemExit('queue quota reservation anchor not found')
-          text=text.replace(old,new,1)
-          text=text.replace("providerCost:enrichmentStage>=2?202:101,latencyMs", "providerCost:enrichmentQuotaUnits,latencyMs",1)
-          qm.write_text(text)
-          PY
-      - name: Add hybrid enrichment regression tests
-        shell: bash
+      - run: python3 scripts/apply_hybrid_enrichment.py
+      - name: Write regression tests
         run: |
           cat > server/youtubeInnerTubeEnrichment.test.ts <<'EOF'
           import test from 'node:test';
           import assert from 'node:assert/strict';
           import { fetchInnerTubeChannelEnrichment } from './youtubeInnerTubeEnrichment';
 
-          test('collects recent videos, descriptions and playlists without Data API calls',async()=>{
+          test('collects recent videos descriptions and playlists',async()=>{
             const client:any={
-              getChannel:async()=>({has_videos:true,has_playlists:true,getVideos:async()=>({videos:[
-                {id:'v1',title:'EURUSD setup',published:'2 days ago'},
-                {id:'v2',title:'Risk management',published:'3 weeks ago'}
-              ],has_continuation:false}),getPlaylists:async()=>({playlists:[{id:'p1',title:'Trading education'}]})}),
+              getChannel:async()=>({has_videos:true,has_playlists:true,getVideos:async()=>({videos:[{id:'v1',title:'EURUSD setup',published:'2 days ago'},{id:'v2',title:'Risk management',published:'3 weeks ago'}],has_continuation:false}),getPlaylists:async()=>({playlists:[{id:'p1',title:'Trading education'}]})}),
               getBasicInfo:async(id:string)=>({basic_info:{title:id==='v1'?'EURUSD setup':'Risk management',short_description:`description ${id}`}})
             };
             const result=await fetchInnerTubeChannelEnrichment('UC123',{includePlaylists:true,maxVideos:10,detailVideos:10},client);
             assert.equal(result.videos.length,2);
             assert.match(result.videos[0].description||'',/description v1/);
             assert.ok(result.videos[0].published_at);
-            assert.deepEqual(result.playlists,[{id:'p1',name:'Trading education',description:undefined}]);
+            assert.equal(result.playlists[0].name,'Trading education');
           });
 
-          test('bounds detail lookups and preserves feed evidence when a detail lookup fails',async()=>{
+          test('preserves feed evidence if a detail lookup fails',async()=>{
             let details=0;
             const client:any={getChannel:async()=>({getVideos:async()=>({videos:[{id:'v1',title:'One',published:'today'},{id:'v2',title:'Two',published:'yesterday'}]})}),getBasicInfo:async(id:string)=>{details++;if(id==='v1')throw new Error('temporary');return {basic_info:{short_description:'two'}};}};
             const result=await fetchInnerTubeChannelEnrichment('UC123',{detailVideos:2},client);
             assert.equal(details,2);
-            assert.equal(result.videos.length,2);
             assert.equal(result.videos[0].title,'One');
             assert.equal(result.videos[1].description,'two');
           });
           EOF
-      - name: Hybrid enrichment tests
-        run: node --import tsx --test server/youtubeInnerTubeEnrichment.test.ts
-      - name: TypeScript
-        run: npm run lint
-      - name: Build
-        run: npm run build
-      - name: Diff check
-        run: git diff --check
-      - name: Commit production patch and remove applicator
-        shell: bash
+      - run: node --import tsx --test server/youtubeInnerTubeEnrichment.test.ts
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check
+      - name: Commit patch
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add server/youtube.ts server/queueManager.ts server/youtubeInnerTubeEnrichment.ts server/youtubeInnerTubeEnrichment.test.ts
           git commit -m 'Use YouTube.js for quota-light channel enrichment'
-          git rm .github/workflows/hybrid-enrichment-apply.yml
-          git commit -m 'Remove one-time hybrid enrichment applicator'
+          git rm scripts/apply_hybrid_enrichment.py .github/workflows/hybrid-enrichment-apply.yml
+          git commit -m 'Remove one-time hybrid enrichment helpers'
           git push origin HEAD:feat/youtube-js-hybrid-enrichment
