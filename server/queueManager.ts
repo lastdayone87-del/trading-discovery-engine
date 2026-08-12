@@ -192,7 +192,7 @@ export async function processNextSearchJob(
       if(!channel){await completeJob(job.id);return true;}
       await inspectAndValidateChannel(channel,undefined,false,false,false);
       const refreshed=await getChannelById(channel.channel_id);
-      if(refreshed?.scan_status==='FAILED')throw new Error('Retryable community acquisition remains unresolved');
+      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT')throw new Error('Retryable community acquisition remains unresolved');
       await completeJob(job.id);return true;
     }
     if(job.type==='TERM_HARVEST'){await processTermHarvestJob(job);return true;}
@@ -407,6 +407,11 @@ export async function processNextSearchJob(
         void recordAdmissionShadow({channelId,priorState:'NOT_EVALUATED',classificationStatus:'UNCERTAIN',investigationState:'OPERATIONALLY_BLOCKED',operationalFailure:true,candidateHypothesis:{},evidenceCoverage:{failureClass:String(err?.code||err?.name||'WORKER_FAILURE')}})
           .catch(error=>console.warn(`[CandidateAdmission] operational-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
       }
+    }
+    if (job.type === 'RETRY_COMMUNITY_ACQUISITION' && terminal) {
+      const channelId=String(job.payload?.channelId||'');
+      const channel=channelId?await getChannelById(channelId):null;
+      if(channel){channel.scan_status='FAILED_PERMANENT';channel.scan_attempts=Math.max(channel.scan_attempts||0,job.attempts);channel.last_checked=new Date().toISOString();await upsertChannel(channel);}
     }
     const runId = String(job.payload?.queryRunId || '');
     if (runId) await failQueryRun(runId, err, terminal);
@@ -631,11 +636,10 @@ export async function inspectAndValidateChannel(
     // processing throws. This must run before catch persistence and retry.
     reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
     channel.scan_attempts++;
-    if (channel.scan_attempts >= 3) {
-      channel.scan_status = 'FAILED_PERMANENT';
-    } else {
-      channel.scan_status = 'FAILED';
-    }
+    // Durable RETRY_COMMUNITY_ACQUISITION owns the retry budget. Keep channel
+    // state retryable here so an internal scan counter cannot prematurely stop
+    // a job that still has durable attempts remaining.
+    channel.scan_status = 'FAILED';
     if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
   } finally {
     await upsertChannel(channel);
