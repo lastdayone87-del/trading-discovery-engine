@@ -29,7 +29,7 @@ import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
-import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
+import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelEnrichmentQuotaFree, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
@@ -267,6 +267,23 @@ export async function processNextSearchJob(
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
       const hybridEnrichmentEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true')==='true';
+      // If country attribution is already independently CONFIRMED, the expensive
+      // creator-evidence portion can proceed entirely through YouTube.js. Official
+      // channels.list remains required for unresolved country attribution and for
+      // manual authoritative refreshes, but exhausted official quota must not freeze
+      // confirmed-country creator evidence acquisition.
+      if(hybridEnrichmentEnabled&&channel.country_status==='CONFIRMED'){
+        try {
+          const enriched=await fetchYouTubeChannelEnrichmentQuotaFree(channelId,candidate,enrichmentStage);
+          const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true);
+          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
+          if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus,quotaFreeHybrid:true}});else await completeJob(job.id);
+          return true;
+        } catch(error){
+          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
+          throw error;
+        }
+      }
       const enrichmentQuotaUnits=hybridEnrichmentEnabled?1:(enrichmentStage>=2?202:101);
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
