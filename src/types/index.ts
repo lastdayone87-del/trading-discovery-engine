@@ -69,8 +69,8 @@ export interface RawChannelInput {
 }
 
 export interface TradingRelevanceBreakdown {
-  stage_a_score: number;       // 0 to 100
-  consistency_ratio: number;  // 0.0 to 1.0
+  stage_a_score: number;
+  consistency_ratio: number;
   ai_reviewed: boolean;
   fast_heuristic_status?: 'FAST_ACCEPT' | 'FAST_REJECT' | 'UNCERTAIN';
   classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER';
@@ -83,7 +83,7 @@ export interface TradingRelevanceBreakdown {
 export interface InspectionStep {
   step: 'COUNTRY_VALIDATION' | 'BIO' | 'EXTERNAL_LINKS' | 'PINNED_COMMENT' | 'VIDEO_DESCRIPTIONS' | 'SOCIAL_BIO' | 'CUSTOM_DOMAINS';
   title: string;
-  status: 'FOUND' | 'NOT_FOUND' | 'SKIPPED' | 'ERROR' | 'REJECTED';
+  status: 'FOUND' | 'NOT_FOUND' | 'SKIPPED' | 'PARTIAL' | 'ERROR' | 'REJECTED';
   details?: string;
   detectedInvite?: string;
   inviteLocation?: string;
@@ -115,10 +115,10 @@ export type QueryIntent =
   | 'prop_firm';
 
 export interface QualityScoreBreakdown {
-  educational_authenticity: number; // 0 to 35
-  freshness_activity: number;        // 0 to 25
-  community_presence: number;        // 0 to 25
-  low_fluff_score: number;           // 0 to 15
+  educational_authenticity: number;
+  freshness_activity: number;
+  community_presence: number;
+  low_fluff_score: number;
   reasons: string[];
 }
 
@@ -128,7 +128,7 @@ export interface ChannelRecord {
   youtube_url: string;
   country: string;
   country_status: CountryStatus;
-  confidence_score: number; // 0 to 100
+  confidence_score: number;
   discord_status: DiscordStatus;
   discord_invite?: string | null;
   discord_discovery_status?: DiscordDiscoveryStatus;
@@ -150,10 +150,10 @@ export interface ChannelRecord {
   inspection_trail?: InspectionStep[];
   subscriber_count?: string;
   channel_thumbnail_url?: string;
-  quality_score?: number; // 0 to 100
+  quality_score?: number;
   quality_breakdown?: QualityScoreBreakdown;
   trading_status?: TradingStatus;
-  trading_confidence_score?: number; // 0 to 100
+  trading_confidence_score?: number;
   trading_category?: TradingCategory | string;
   trading_relevance_breakdown?: TradingRelevanceBreakdown;
   country_metadata_status?: CountryMetadataStatus;
@@ -180,7 +180,7 @@ export interface QueryRecord {
   quality_channels_found: number;
   community_channels_found: number;
   avg_quality_score: number;
-  performance_score: number; // 0 to 100
+  performance_score: number;
   created_at: string;
   status: 'ACTIVE' | 'ARCHIVED';
   ucb_score?: number;
@@ -311,15 +311,15 @@ export interface RegressionRunMetrics {
   true_negatives: number;
   false_positives: number;
   false_negatives: number;
-  precision: number;            // percentage 0 to 100
-  recall: number;               // percentage 0 to 100
-  f1_score: number;             // percentage 0 to 100
+  precision: number;
+  recall: number;
+  f1_score: number;
   discord_target_total: number;
   discord_discovered: number;
-  discord_discovery_rate: number; // percentage 0 to 100
+  discord_discovery_rate: number;
   avg_processing_time_ms: number;
   api_quota_consumed: number;
-  query_performance_index: number; // 0 to 100
+  query_performance_index: number;
 }
 
 export interface RegressionRunRecord {
