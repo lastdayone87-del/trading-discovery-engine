@@ -1,0 +1,74 @@
+name: Stage 2 limited canary design
+
+on:
+  pull_request:
+    paths:
+      - 'server/release5/stage2LimitedCanaryDesign.ts'
+      - 'server/release5/stage2LimitedCanaryDesign.test.ts'
+      - 'scripts/stage2LimitedCanaryDesign.ts'
+      - '.github/workflows/stage2-limited-canary-design.yml'
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: 'Optional sealed Stage 1 dataset UUID. Leave blank for latest.'
+        required: false
+        type: string
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Test limited canary contract
+        run: node --import tsx --test server/release5/stage2LimitedCanaryDesign.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify design-only boundary
+        run: |
+          grep -q "servingAuthority: false" server/release5/stage2LimitedCanaryDesign.ts
+          grep -q "automaticPromotion: false" server/release5/stage2LimitedCanaryDesign.ts
+          grep -q "productionActivation: false" server/release5/stage2LimitedCanaryDesign.ts
+          grep -q "defaultMode: 'OFF'" server/release5/stage2LimitedCanaryDesign.ts
+
+  production-design:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      NODE_ENV: production
+      STAGE1_DATASET_ID: ${{ inputs.dataset_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Generate canary design from guarded gate
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npx tsx scripts/stage2LimitedCanaryDesign.ts
+          test -f stage2-output/stage2-limited-canary-design.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const report=JSON.parse(fs.readFileSync('stage2-output/stage2-limited-canary-design.json','utf8'));
+          if(report.servingAuthority!==false || report.automaticPromotion!==false || report.productionActivation!==false) process.exit(1);
+          if(report.designStatus!=='READY_FOR_EXPLICIT_ACTIVATION_IMPLEMENTATION') process.exit(1);
+          if(report.killSwitch?.defaultMode!=='OFF') process.exit(1);
+          console.log(JSON.stringify({designStatus:report.designStatus,allocation:report.allocation,killSwitch:report.killSwitch,nextAction:report.nextAction},null,2));
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-limited-canary-design-${{ github.run_id }}
+          path: stage2-output/stage2-limited-canary-design.json
+          retention-days: 30
