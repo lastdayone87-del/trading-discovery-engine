@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 
-export const STAGED_CLASSIFICATION_VERSION = '3.0.0';
+export const STAGED_CLASSIFICATION_VERSION = '3.1.0';
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
   if (item.provenance?.fields?.length) return item.provenance.fields;
@@ -50,8 +50,19 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const observations=new Set(attributableFields.map(ref=>`${ref.field}:${ref.sourceId || ref.index || ''}`));
   const observationFamilies=new Set(attributableFields.map(ref=>ref.field==='video_title'||ref.field==='video_description'?'video':ref.field==='playlist_name'||ref.field==='playlist_description'?'playlist':ref.field));
   const independence=collapseSourceIndependentObservations(attributableFields.map((ref,index)=>({observationId:`${ref.field}:${ref.sourceId||ref.index||index}`,sourceFamilyId:ref.sourceFamilyId,sourceEntityId:ref.sourceEntityId})));
-  const repeatedItems=evidence.filter(item => item.category === 'MULTI_VIDEO_CONSISTENCY' && item.polarity === 'POSITIVE'),repeatedFields=repeatedItems.flatMap(item=>item.provenance?.fields||[]),repeatedIndependence=collapseSourceIndependentObservations(repeatedFields.map((ref,index)=>({observationId:`${ref.field}:${ref.sourceId||ref.index||index}`,sourceFamilyId:ref.sourceFamilyId,sourceEntityId:ref.sourceEntityId})));
+  const repeatedItems=evidence.filter(item => item.category === 'MULTI_VIDEO_CONSISTENCY' && item.polarity === 'POSITIVE');
+  const repeatedFields=repeatedItems.flatMap(item=>item.provenance?.fields||[]);
+  const repeatedIndependence=collapseSourceIndependentObservations(repeatedFields.map((ref,index)=>({observationId:`${ref.field}:${ref.sourceId||ref.index||index}`,sourceFamilyId:ref.sourceFamilyId,sourceEntityId:ref.sourceEntityId})));
   const repeated = repeatedItems.length>0&&(repeatedFields.length===0||repeatedIndependence.independentFamilyCount>=2);
+  // Repeated creator-owned uploads are qualitatively different from a single
+  // retrieval-title keyword hit. When at least 70% of the sampled recent videos
+  // are trading-focused and those observations span at least three independent
+  // video source families, the repeated behavior itself is a creator-level
+  // trading hypothesis. This prevents obvious real traders with generic titles
+  // such as "Live Trading" or "Morning Session" from being forced to review
+  // merely because no instrument/methodology token happened to be present.
+  const repeatedCreatorHypothesis = repeatedItems.filter(item => item.confidence >= 70 && Math.abs(item.finalWeight) >= 18);
+  const repeatedCreatorIndependent = repeatedCreatorHypothesis.length > 0 && repeatedIndependence.independentFamilyCount >= 3;
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
@@ -66,17 +77,19 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const availability = collection.sufficiency === 'SUFFICIENT'
     ? result('AVAILABILITY', 'PASS', [collection.degraded ? 'STAGE_EVIDENCE_SUFFICIENT_WITH_PROVIDER_DEGRADATION' : 'STAGE_EVIDENCE_SUFFICIENT'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded })
     : result('AVAILABILITY', 'ABSTAIN', collection.reasonCodes.length ? collection.reasonCodes : ['STAGE_EVIDENCE_NOT_READY'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded });
-  const candidate = semantic.length > 0
-    ? result('CANDIDATE_DETECTION', 'PASS', ['SEMANTIC_CANDIDATE_FOUND'], semantic, { candidateSignals: semantic.length })
-    : result('CANDIDATE_DETECTION', 'ABSTAIN', ['NO_SEMANTIC_CANDIDATE'], [], { candidateSignals: 0 });
+  const candidateEvidence = semantic.length > 0 ? semantic : repeatedCreatorIndependent ? repeatedCreatorHypothesis : [];
+  const candidate = candidateEvidence.length > 0
+    ? result('CANDIDATE_DETECTION', 'PASS', [semantic.length > 0 ? 'SEMANTIC_CANDIDATE_FOUND' : 'REPEATED_INDEPENDENT_TRADING_UPLOADS'], candidateEvidence, { candidateSignals: candidateEvidence.length, repeatedIndependentFamilies: repeatedIndependence.independentFamilyCount })
+    : result('CANDIDATE_DETECTION', 'ABSTAIN', ['NO_SEMANTIC_OR_REPEATED_CREATOR_CANDIDATE'], [], { candidateSignals: 0, repeatedIndependentFamilies: repeatedIndependence.independentFamilyCount });
   // Independence is established by separately attributable observations, not by
   // duplicate provider emissions of the same lexical match. Multiple videos,
   // an About page plus a video, or another distinct document family qualify.
   const independentObservations=independence.independentFamilyCount>=2 && observations.size>=2 && (observationFamilies.size>=2 || attributableFields.filter(f=>f.field==='video_title'||f.field==='video_description').length>=2);
-  const corroborated = corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2));
+  const corroborated = repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2)));
+  const corroborationEvidence = repeatedCreatorIndependent ? [...corroborating, ...repeatedCreatorHypothesis] : corroborating;
   const corroboration = corroborated
-    ? result('CORROBORATION', 'PASS', ['SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated })
-    : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated });
+    ? result('CORROBORATION', 'PASS', [repeatedCreatorIndependent ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED' : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
+    : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
   const contradiction = dominantContradiction
     ? result('CONTRADICTION', 'FAIL', ['DOMINANT_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight })
     : negativeWouldDominate

@@ -2,7 +2,7 @@ import type { DiscoverySource } from '../src/types';
 import type { VerificationDecision } from './evidenceEngine';
 import type { DiscoveredChannelRaw } from './youtube';
 
-export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v1';
+export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v2';
 
 export type SearchCandidateTriageDisposition = 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'NOT_APPLICABLE';
 
@@ -75,6 +75,10 @@ export function triageAutonomousSearchCandidate(
  */
 export function hasIndependentTradingHypothesis(decision: VerificationDecision): boolean {
   if (decision.status === 'TRADING_CONFIRMED') return true;
+  // Operational provider failure is not negative evidence. Preserve the case
+  // for one bounded retry rather than converting missing provider output into a
+  // durable "no trading hypothesis" withholding decision.
+  if (decision.evidenceCollection.degraded) return true;
   const substantivePositive = decision.positiveEvidence.some(item =>
     item.rawMatches.length > 0 &&
     item.category !== 'SEMANTIC_ABSTENTION' &&
