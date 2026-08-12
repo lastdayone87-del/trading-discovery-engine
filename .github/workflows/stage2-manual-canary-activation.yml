@@ -1,0 +1,72 @@
+name: Stage 2 explicit manual canary activation
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type AUTHORIZE_STAGE2_5_PERCENT_CANARY_MAX_50 exactly'
+        required: true
+        type: string
+      expected_generation:
+        description: 'Persisted generation observed in the latest readiness report'
+        required: true
+        default: '0'
+        type: string
+      reason:
+        description: 'Operator reason for activating the bounded canary'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage2-explicit-manual-canary-activation
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Test Stage 2 control plane
+        run: node --import tsx --test server/release5/stage2CanaryControlPlane.test.ts server/release5/stage2CanaryActivationContract.test.ts
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+
+  activate:
+    needs: verify
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+      STAGE2_CANARY_CONFIRMATION: ${{ inputs.confirmation }}
+      STAGE2_CANARY_EXPECTED_GENERATION: ${{ inputs.expected_generation }}
+      STAGE2_CANARY_REASON: ${{ inputs.reason }}
+      STAGE2_CANARY_ACTOR: ${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Require exact explicit authorization
+        run: test "$STAGE2_CANARY_CONFIRMATION" = "AUTHORIZE_STAGE2_5_PERCENT_CANARY_MAX_50"
+      - name: Activate bounded Stage 2 canary
+        run: npx tsx scripts/stage2ManualCanaryActivation.ts
+      - name: Upload activation record
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-canary-activation-${{ github.run_id }}
+          path: stage2-output/stage2-canary-activation.json
+          retention-days: 90
