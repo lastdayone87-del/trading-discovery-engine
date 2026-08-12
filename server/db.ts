@@ -207,7 +207,7 @@ export async function getAllChannels(): Promise<ChannelRecord[]> {
   return res.rows.map(rowToChannel);
 }
 
-export interface ChannelListingFilter {includeRejected:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
+export interface ChannelListingFilter {includeRejected:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
 // The NOT EXISTS check makes policy changes effective immediately, even for a
@@ -232,8 +232,14 @@ async function dashboardServingPredicate(db:InstanceType<typeof Pool>):Promise<{
   const assigned=`EXISTS(SELECT 1 FROM release5_serving_assignments rsa WHERE rsa.capability='DASHBOARD_CORPUS' AND rsa.channel_id=channels.channel_id AND rsa.activation_id=(SELECT activation_id FROM release5_rollout_projection WHERE capability='DASHBOARD_CORPUS') AND rsa.assigned=true)`;
   return {predicate:`((${assigned}) AND (${projected}) OR (NOT (${assigned}) AND (${OPERATOR_VISIBLE_CHANNEL_SQL})))`,scope:'RELEASE5_CANARY_DASHBOARD_CORPUS'};
 }
+export function resolveChannelListingServingScope(defaultServing:{predicate:string;scope:string},includeRejected:boolean,diagnosticsOnly=false):{predicate:string;scope:string}{
+  if(diagnosticsOnly)return {predicate:`NOT (${defaultServing.predicate})`,scope:`DIAGNOSTICS_ONLY:${defaultServing.scope}`};
+  if(includeRejected)return {predicate:'TRUE',scope:'ALL_CHANNELS'};
+  return defaultServing;
+}
 async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelListingFilter):Promise<{where:string;values:string[];scope:string}> {
-  const serving=args.includeRejected?{predicate:'TRUE',scope:'ALL_CHANNELS'}:await dashboardServingPredicate(db);
+  const defaultServing=await dashboardServingPredicate(db);
+  const serving=resolveChannelListingServingScope(defaultServing,args.includeRejected,Boolean(args.diagnosticsOnly));
   const clauses=[serving.predicate]; const values:string[]=[];
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
