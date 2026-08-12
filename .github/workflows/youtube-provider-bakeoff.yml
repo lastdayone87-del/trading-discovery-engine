@@ -14,7 +14,7 @@ on:
 jobs:
   static-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,7 +32,24 @@ jobs:
         env:
           BAKEOFF_QUERY_LIMIT: '1'
           BAKEOFF_MAX_PAGES: '1'
+          BAKEOFF_OUTPUT: youtube-provider-bakeoff-smoke.json
         run: npm run youtube:provider-bakeoff
-      - name: Verify shadow-mode contract
+      - name: Verify smoke shadow-mode contract
         run: |
-          node -e "const r=require('./youtube-provider-bakeoff.json'); if(r.shadowMode!==true||r.productionWrites!==false||r.productionConfirmationMeasured!==false) process.exit(1); if(!r.summary.every(x=>x.productionWrites===false&&x.productionConfirmationMeasured===false)) process.exit(1);"
+          node -e "const r=require('./youtube-provider-bakeoff-smoke.json'); if(r.shadowMode!==true||r.productionWrites!==false||r.productionConfirmationMeasured!==false) process.exit(1); if(!r.summary.every(x=>x.productionWrites===false&&x.productionConfirmationMeasured===false)) process.exit(1);"
+      - name: Larger multilingual shadow bake-off
+        env:
+          BAKEOFF_QUERY_LIMIT: '20'
+          BAKEOFF_MAX_PAGES: '2'
+          BAKEOFF_OUTPUT: youtube-provider-bakeoff-large.json
+        run: npm run youtube:provider-bakeoff
+      - name: Verify larger bake-off safety contract
+        run: |
+          node -e "const r=require('./youtube-provider-bakeoff-large.json'); if(r.shadowMode!==true||r.productionWrites!==false||r.productionConfirmationMeasured!==false) process.exit(1); if(r.queryCount!==20||r.maxPages!==2) process.exit(1); if(!r.summary.every(x=>x.productionWrites===false&&x.productionConfirmationMeasured===false)) process.exit(1);"
+      - name: Upload larger bake-off report
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-provider-bakeoff-large
+          path: youtube-provider-bakeoff-large.json
+          if-no-files-found: error
+          retention-days: 7
