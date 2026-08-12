@@ -3,6 +3,7 @@ import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEve
 import { executeProviderCall, ProviderCallError } from './providerResilience';
 import { RetrievalLane } from './retrievalLanes';
 import { SearchOrdering, youtubeOrder } from './searchOrdering';
+import { countrySearchHints } from './countrySearchHints';
 import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from './youtubePoolBackoff';
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler } from './youtubeRequestScheduler';
@@ -333,6 +334,7 @@ export async function searchYouTubeChannelPage(
 ): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
+  const searchHints = countrySearchHints(countryName, vocab?.languages || []);
 
   const keyPool = getYouTubeKeyPool();
   const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));
@@ -357,7 +359,8 @@ export async function searchYouTubeChannelPage(
         const searchType = lane === 'VIDEO' ? 'video' : 'channel';
         const searchUrl = buildYouTubeApiUrl('search', apiKey, {
           part: 'snippet', type: searchType, order: youtubeOrder(ordering),
-          q: sanitizedQuery, maxResults, pageToken: pageToken || undefined
+          q: sanitizedQuery, maxResults, pageToken: pageToken || undefined,
+          regionCode: searchHints.regionCode, relevanceLanguage: searchHints.relevanceLanguage
         });
 
         console.log(`[YouTube Outbound Trace] search-${attempt + 1} before youtubeFetch at server/youtube.ts:255`);
