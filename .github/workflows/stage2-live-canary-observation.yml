@@ -1,0 +1,59 @@
+name: Stage 2 live canary observation
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/stage2CanaryLiveObservation.ts'
+      - 'server/release5/stage2CanaryLiveObservationContract.test.ts'
+      - '.github/workflows/stage2-live-canary-observation.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage2-live-canary-observation
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Test Stage 2 live observation contracts
+        run: node --import tsx --test server/release5/stage2CanaryLiveObservationContract.test.ts server/release5/stage2CanaryControlPlane.test.ts
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+
+  observe:
+    needs: verify
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Collect bounded Stage 2 live observations
+        run: npx tsx scripts/stage2CanaryLiveObservation.ts
+      - name: Upload observation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-live-canary-observation-${{ github.run_id }}
+          path: stage2-output/stage2-live-canary-observation.json
+          retention-days: 90
