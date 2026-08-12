@@ -555,6 +555,31 @@ async function fetchYouTubeChannelEnrichmentOfficial(
 }
 
 
+/**
+ * Quota-free hybrid evidence acquisition for channels whose country attribution
+ * is already independently CONFIRMED. This deliberately does not invent or
+ * upgrade official country metadata; it only supplies creator-owned recent
+ * uploads/activity/playlists from YouTube.js so official quota exhaustion cannot
+ * block trading-evidence processing.
+ */
+export async function fetchYouTubeChannelEnrichmentQuotaFree(
+  channelId: string,
+  fallback: DiscoveredChannelRaw,
+  stage:1|2|3=1
+): Promise<DiscoveredChannelRaw> {
+  const inner=await fetchInnerTubeChannelEnrichment(channelId,{maxVideos:10,detailVideos:stage>=2?10:6,includePlaylists:stage>=2,timeoutMs:Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'))});
+  const observedAt=new Date();
+  const videos=inner.videos.map(video=>({id:video.id,title:video.title,description:video.description||'',published_at:video.published_at,content_type:'youtube_video'}));
+  const uploadTimestamps=videos.map(video=>video.published_at).filter((value):value is string=>typeof value==='string'&&Number.isFinite(Date.parse(value)));
+  const countSince=(days:number)=>uploadTimestamps.filter(value=>Date.parse(value)>=observedAt.getTime()-days*86_400_000).length;
+  const latestUploadAt=uploadTimestamps.slice().sort().at(-1);
+  const uploadsLast30Days=countSince(30),uploadsLast90Days=countSince(90),uploadsLast365Days=countSince(365);
+  const ageDays=latestUploadAt?(observedAt.getTime()-Date.parse(latestUploadAt))/86_400_000:Infinity;
+  const activityBand:ChannelActivityBand=!latestUploadAt?'UNKNOWN':ageDays<=30?'VERY_ACTIVE':ageDays<=90?'ACTIVE':ageDays<=365?'OCCASIONAL':'DORMANT';
+  const activityScore=!latestUploadAt?50:Math.max(5,Math.round(100*Math.exp(-ageDays/365)));
+  return {...fallback,channelId,youtubeUrl:`https://www.youtube.com/channel/${channelId}`,videoTitles:videos.map(video=>video.title),videos,playlists:inner.playlists.length?inner.playlists:(fallback.playlists||[]),videoDescriptions:videos.map(video=>video.description||''),uploadTimestamps,latestUploadAt,uploadsLast30Days,uploadsLast90Days,uploadsLast365Days,activityBand,activityScore,activityObservedAt:observedAt.toISOString(),enrichmentStage:stage,countryMetadataStatus:fallback.countryMetadataStatus||'NOT_REQUESTED'};
+}
+
 /** Hybrid quota-light enrichment: YouTube.js for expensive creator evidence; official channels.list for authoritative metadata. */
 export async function fetchYouTubeChannelEnrichment(
   channelId: string,

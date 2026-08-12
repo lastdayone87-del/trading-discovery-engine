@@ -25,6 +25,9 @@ interface ProviderMetricRow {
 interface QueueLatencyRow {
   type: string;
   depth: number;
+  runnable_depth?: number;
+  deferred_depth?: number;
+  next_run_at?: string | null;
   average_age_ms: number;
   oldest_age_ms: number;
 }
@@ -148,6 +151,9 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
 
     return {
       pending: Number(queue?.depth || 0),
+      runnablePending: Number(queue?.runnable_depth || 0),
+      deferredPending: Number(queue?.deferred_depth || 0),
+      nextRunAt: queue?.next_run_at || null,
       oldestAgeMs: Number(queue?.oldest_age_ms || 0),
       averageAgeMs: Number(queue?.average_age_ms || 0),
       youtubeJsCalls,
@@ -267,7 +273,7 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
               <div className="bg-white dark:bg-slate-900 p-4">
                 <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-500"><Gauge className="w-3.5 h-3.5" /> Pending</div>
                 <div className="mt-1 text-2xl font-extrabold font-mono">{enrichmentHealth.pending}</div>
-                <div className="text-[10px] text-slate-500">ENRICH_CHANNEL jobs</div>
+                <div className="text-[10px] text-slate-500">{enrichmentHealth.runnablePending} runnable · {enrichmentHealth.deferredPending} deferred</div>
               </div>
               <div className="bg-white dark:bg-slate-900 p-4">
                 <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-500"><Clock3 className="w-3.5 h-3.5" /> Oldest pending</div>
