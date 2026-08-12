@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import pg from 'pg';
+import pg, { type PoolClient } from 'pg';
 import { verifyChannelTradingRelevance, type RawChannelInput } from '../evidenceEngine';
 import { recordProductionClassification } from '../classificationDiagnostics';
 import { evaluateOfflineAdmissionV2, type OfflineAdmissionExample, type OfflineAdmissionV2Decision } from '../candidateAdmission/offlineV2';
@@ -30,7 +30,7 @@ function cleanInput(value: Record<string, unknown>): RawChannelInput {
   return input as unknown as RawChannelInput;
 }
 
-async function loadCohort(client: pg.PoolClient, datasetId: string): Promise<CohortRow[]> {
+async function loadCohort(client: PoolClient, datasetId: string): Promise<CohortRow[]> {
   const dataset = await client.query(`SELECT id,status FROM decision_evaluation_datasets WHERE id=$1`, [datasetId]);
   if (!dataset.rowCount) throw new Error('SEALED_EVALUATION_DATASET_NOT_FOUND');
   if (String(dataset.rows[0].status) !== 'SEALED') throw new Error('STAGE2_REQUIRES_SEALED_STAGE1_DATASET');
@@ -57,13 +57,13 @@ async function loadCohort(client: pg.PoolClient, datasetId: string): Promise<Coh
   }));
 }
 
-async function latestDatasetId(client: pg.PoolClient): Promise<string> {
+async function latestDatasetId(client: PoolClient): Promise<string> {
   const result = await client.query(`SELECT id FROM decision_evaluation_datasets WHERE status='SEALED' ORDER BY cutoff_at DESC,version DESC,id DESC LIMIT 1`);
   if (!result.rowCount) throw new Error('NO_SEALED_EVALUATION_DATASET');
   return String(result.rows[0].id);
 }
 
-async function loadFreshExample(client: pg.PoolClient, row: CohortRow, diagnosticId: string): Promise<OfflineAdmissionExample> {
+async function loadFreshExample(client: PoolClient, row: CohortRow, diagnosticId: string): Promise<OfflineAdmissionExample> {
   const snapshot = await client.query(`
     SELECT
       f.id creator_focus_snapshot_id,f.input_checksum creator_focus_input_checksum,
