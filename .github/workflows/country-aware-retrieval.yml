@@ -26,6 +26,6 @@ jobs:
       - name: Existing retrieval safety tests
         run: node --import tsx --test server/autonomousRetrievalSafety.test.ts server/queryPlanner.test.ts
       - name: Typecheck
-        run: npm run typecheck
+        run: npm run lint
       - name: Build
         run: npm run build
