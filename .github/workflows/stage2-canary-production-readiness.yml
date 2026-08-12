@@ -1,0 +1,74 @@
+name: Stage 2 canary production readiness
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/stage2CanaryProductionReadiness.ts'
+      - 'server/release5/stage2CanaryProductionReadiness.test.ts'
+      - '.github/workflows/stage2-canary-production-readiness.yml'
+      - 'server/db/migrations/084_stage2_rate_pressure_canary_control_plane.sql'
+      - 'server/release5/stage2CanaryControlPlane.ts'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Test production readiness contract
+        run: node --import tsx --test server/release5/stage2CanaryProductionReadiness.test.ts server/release5/stage2CanaryControlPlane.test.ts
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Verify no activation path
+        run: |
+          set -euo pipefail
+          ! grep -q "setStage2CanaryMode" scripts/stage2CanaryProductionReadiness.ts
+          grep -q "servingAuthority: false" scripts/stage2CanaryProductionReadiness.ts
+          grep -q "productionActivation: false" scripts/stage2CanaryProductionReadiness.ts
+
+  production-readiness:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NODE_ENV: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Apply current migrations
+        run: |
+          set -euo pipefail
+          test -n "${DATABASE_URL:+x}"
+          npm run migrate
+      - name: Verify persisted Stage 2 canary remains OFF
+        run: |
+          set -euo pipefail
+          npx tsx scripts/stage2CanaryProductionReadiness.ts
+          test -f stage2-output/stage2-canary-production-readiness.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const report=JSON.parse(fs.readFileSync('stage2-output/stage2-canary-production-readiness.json','utf8'));
+          if(report.readinessStatus!=='READY_FOR_SEPARATE_MANUAL_ACTIVATION_AUTHORIZATION') process.exit(1);
+          if(report.control?.mode!=='OFF') process.exit(1);
+          if(report.servingAuthority!==false || report.productionActivation!==false || report.mutatesCanaryControlState!==false) process.exit(1);
+          console.log(JSON.stringify({readinessStatus:report.readinessStatus,migration:report.migration,control:report.control,observations:report.observations,nextAction:report.nextAction},null,2));
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-canary-production-readiness-${{ github.run_id }}
+          path: stage2-output/stage2-canary-production-readiness.json
+          retention-days: 30
