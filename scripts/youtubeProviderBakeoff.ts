@@ -2,7 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { evaluateProviderShadowCandidate, summarizeProviderShadowQuality, type ProviderShadowCandidateQuality } from '../server/youtubeProviderShadowQuality';
 
-type ProviderName = 'YOUTUBE_DATA_API' | 'YOUTUBE_JS' | 'YOUTUBE_SEARCH_API';
+type ProviderName = 'YOUTUBE_DATA_API' | 'YOUTUBE_JS' | 'YOUTUBE_JS_MONTH' | 'YOUTUBE_JS_YEAR' | 'YOUTUBE_SEARCH_API';
 type Candidate = { videoId?: string; channelId?: string; title?: string; channelTitle?: string; publishedAt?: string };
 type Page = { candidates: Candidate[]; next?: unknown };
 type Provider = { name: ProviderName; available(): boolean; search(query: string, page?: unknown): Promise<Page> };
@@ -26,7 +26,7 @@ const selectedQueries = queries.slice(0, Math.max(1, Math.min(30, Number(process
 
 function relativePublishedAt(value: unknown, nowMs = Date.now()): string | undefined {
   if (!value) return undefined;
-  const raw = typeof value === 'string' ? value : (value as any)?.text || (value as any)?.toString?.();
+  const raw = typeof value === 'string' ? value : (value as any)?.text || (value as any)?.simpleText || (value as any)?.toString?.();
   if (!raw || typeof raw !== 'string') return undefined;
   const direct = Date.parse(raw);
   if (Number.isFinite(direct)) return new Date(direct).toISOString();
@@ -38,6 +38,48 @@ function relativePublishedAt(value: unknown, nowMs = Date.now()): string | undef
   const amount = Number(match[1]);
   const unitDays: Record<string, number> = { second: 1 / 86_400, minute: 1 / 1_440, hour: 1 / 24, day: 1, week: 7, month: 30.4375, year: 365.25 };
   return new Date(nowMs - amount * unitDays[match[2]] * 86_400_000).toISOString();
+}
+
+function textValue(value: any): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  const text = value?.text || value?.simpleText || value?.runs?.map((r: any) => r?.text).filter(Boolean).join('');
+  return typeof text === 'string' && text.trim() ? text.trim() : undefined;
+}
+
+function firstString(...values: any[]): string | undefined {
+  for (const value of values) {
+    const text = textValue(value);
+    if (text) return text;
+  }
+  return undefined;
+}
+
+function youtubeSearchApiCandidate(x: any): Candidate {
+  const channel = x?.channel || x?.author || x?.owner || x?.shortBylineText;
+  return {
+    videoId: firstString(x?.id, x?.videoId),
+    channelId: firstString(
+      x?.channelId,
+      channel?.id,
+      channel?.channelId,
+      x?.authorId,
+      x?.ownerChannelId,
+      x?.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
+    ),
+    title: firstString(x?.title),
+    channelTitle: firstString(
+      x?.channelTitle,
+      channel?.title,
+      channel?.name,
+      x?.channel,
+      x?.author,
+      x?.shortBylineText,
+      x?.shortBylineText?.runs?.[0]?.text
+    ),
+    publishedAt: relativePublishedAt(
+      x?.publishedAt || x?.publishedTime || x?.publishTime || x?.published || x?.publishedText || x?.metadata?.publishedAt
+    )
+  };
 }
 
 function dataApiProvider(): Provider {
@@ -55,17 +97,17 @@ function dataApiProvider(): Provider {
   };
 }
 
-function youtubeJsProvider(): Provider {
+function youtubeJsProvider(name: 'YOUTUBE_JS' | 'YOUTUBE_JS_MONTH' | 'YOUTUBE_JS_YEAR', uploadDate?: 'month' | 'year'): Provider {
   let clientPromise: Promise<any> | null = null;
   const getClient = async () => {
     if (!clientPromise) clientPromise = import('youtubei.js').then(async (mod: any) => mod.Innertube.create());
     return clientPromise;
   };
   return {
-    name: 'YOUTUBE_JS', available: () => true,
+    name, available: () => true,
     async search(query, page) {
       const yt = await getClient();
-      const result: any = page ? await (page as any).getContinuation() : await yt.search(query, { type: 'video' });
+      const result: any = page ? await (page as any).getContinuation() : await yt.search(query, { type: 'video', ...(uploadDate ? { upload_date: uploadDate } : {}) });
       const items = result.videos || result.results || [];
       const candidates = items.map((x: any) => ({
         videoId: x.id,
@@ -85,21 +127,24 @@ function youtubeSearchApiProvider(): Provider {
     async search(query, page) {
       const mod: any = await import('youtube-search-api'); const api = mod.default || mod;
       const j: any = page ? await api.NextPage(page, false, 50) : await api.GetListByKeyword(query, false, 50, [{ type: 'video' }]);
-      return {
-        candidates: (j.items || []).filter((x: any) => x.type === 'video').map((x: any) => ({
-          videoId: x.id,
-          channelId: x.channelId,
-          title: x.title,
-          channelTitle: x.channelTitle,
-          publishedAt: relativePublishedAt(x.publishedAt || x.publishedTime || x.publishTime)
-        })),
-        next: j.nextPage
-      };
+      const rawItems = (j.items || []).filter((x: any) => x.type === 'video');
+      const candidates = rawItems.map(youtubeSearchApiCandidate);
+      const missingChannelIds = candidates.reduce((n: number, c: Candidate) => n + (c.channelId ? 0 : 1), 0);
+      if (process.env.BAKEOFF_DEBUG_PROVIDER_SHAPES === '1' && rawItems.length && missingChannelIds) {
+        console.log(JSON.stringify({ provider: 'YOUTUBE_SEARCH_API', query, missingChannelIds, itemKeys: Object.keys(rawItems[0] || {}), sample: rawItems[0] }, null, 2));
+      }
+      return { candidates, next: j.nextPage };
     }
   };
 }
 
-const providers: Provider[] = [dataApiProvider(), youtubeJsProvider(), youtubeSearchApiProvider()];
+const providers: Provider[] = [
+  dataApiProvider(),
+  youtubeJsProvider('YOUTUBE_JS'),
+  youtubeJsProvider('YOUTUBE_JS_MONTH', 'month'),
+  youtubeJsProvider('YOUTUBE_JS_YEAR', 'year'),
+  youtubeSearchApiProvider()
+];
 const rows: any[] = [];
 for (const provider of providers) {
   if (!provider.available()) { rows.push({ provider: provider.name, skipped: true, reason: 'missing credentials' }); continue; }
