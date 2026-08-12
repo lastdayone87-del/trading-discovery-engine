@@ -53,7 +53,6 @@ replaceOnce(
       const maxProviderPages=Math.max(1,Math.min(3,Number(await getAppSetting('youtube_inner_tube_pages_per_lane',process.env.YOUTUBE_INNERTUBE_PAGES_PER_LANE||'2'))));
       const result=await discoverWithInnerTube(query,{lane:innerTubeLane,maxPages:maxProviderPages,maxChannels:100,telemetry:{requestId:traceId||undefined,runId:queryRunId,jobId:job.id,attempt:job.attempts}});
       searchPage={channels:result.channels,rawResultCount:result.rawCandidateCount,nextPageToken:null};
-      await recordExecutionStage('PROVIDER_DISCOVERY','REACHED',{provider:'YOUTUBE_JS',lane:innerTubeLane,pagesFetched:result.pagesFetched,rawCandidates:result.rawCandidateCount,uniqueChannels:result.channels.length,quotaUnits:0});
     } else if (queryRunId) {
       providerQuotaUnits=100;
       const budget=getDailyYouTubeQuotaBudget();
