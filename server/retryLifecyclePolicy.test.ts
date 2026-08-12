@@ -22,7 +22,6 @@ test('common network/provider outages are retryable infrastructure failures',()=
   }
 });
 
-
 test('normalized provider resilience failures stay attempt-free when marked retryable',()=>{
   for(const error of [
     {name:'ProviderCallError',errorClass:'TIMEOUT',retryable:true},
