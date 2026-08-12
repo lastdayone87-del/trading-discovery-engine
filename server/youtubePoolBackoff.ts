@@ -3,6 +3,12 @@ export interface YouTubePoolBackoffOptions {
   maxBackoffMs: number;
   now?: () => number;
   log?: (level: 'warn' | 'info', message: string) => void;
+  /**
+   * Legacy whole-pool breaker. Production keeps this disabled because per-key
+   * cooldown state is authoritative and a single provider failure must never
+   * suspend otherwise healthy projects.
+   */
+  enabled?: boolean;
 }
 
 export type YouTubeProviderFailure = 'QUOTA_EXHAUSTED' | 'INDETERMINATE';
@@ -15,7 +21,7 @@ export interface YouTubePoolAcquisition {
   release(): void;
 }
 
-/** A process-local circuit breaker for the shared YouTube API-project pool. */
+/** A process-local circuit breaker retained for explicitly enabled legacy use. */
 export class YouTubePoolBackoff {
   private retryAt = 0;
   private backoffMs = 0;
@@ -26,9 +32,10 @@ export class YouTubePoolBackoff {
   constructor(private readonly options: YouTubePoolBackoffOptions) {}
 
   beginAcquisition(): YouTubePoolAcquisition {
+    const enabled = this.options.enabled !== false;
     const now = (this.options.now ?? Date.now)();
     let probeId: symbol | null = null;
-    if (this.exhausted) {
+    if (enabled && this.exhausted) {
       if (now < this.retryAt || this.probeInFlight) throw new YouTubePoolExhaustedError(this.retryAt);
       // Only one caller may probe after the window. The scoped handle releases
       // this lease even when the caller exits before it can classify an outcome.
@@ -48,6 +55,7 @@ export class YouTubePoolBackoff {
       generation: acquisitionGeneration,
       providerSucceeded: () => {
         if (released || acquisitionGeneration !== this.generation) return;
+        if (!enabled) { release(); return; }
         const wasExhausted = this.exhausted;
         // Advancing the generation makes every older concurrent failure stale.
         this.generation++;
@@ -59,6 +67,9 @@ export class YouTubePoolBackoff {
       },
       providerFailed: failure => {
         if (released || acquisitionGeneration !== this.generation) return;
+        // Per-provider cooldown is the production authority. With this legacy
+        // breaker disabled, a quota failure only affects the key that failed.
+        if (!enabled) { release(); return; }
         // Generic failures open/extend the breaker only for an admitted recovery
         // probe. Normal closed-state transport failures retain the retry path.
         if (failure !== 'QUOTA_EXHAUSTED' && !this.exhausted) return;
@@ -93,6 +104,9 @@ const positiveNumber = (value: string | undefined, fallback: number): number => 
 export const youtubePoolBackoff = new YouTubePoolBackoff({
   initialBackoffMs: positiveNumber(process.env.YOUTUBE_POOL_BACKOFF_MS, 15 * 60_000),
   maxBackoffMs: positiveNumber(process.env.YOUTUBE_POOL_MAX_BACKOFF_MS, 6 * 60 * 60_000),
+  // Individual provider cooldown owns production availability. This prevents a
+  // single exhausted project from freezing healthy keys for 15 minutes.
+  enabled: process.env.YOUTUBE_ENABLE_LEGACY_POOL_BREAKER === 'true',
   log: (level, message) => level === 'warn' ? console.warn(message) : console.info(message)
 });
 
