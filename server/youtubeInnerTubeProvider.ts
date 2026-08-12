@@ -241,6 +241,17 @@ export async function discoverWithInnerTube(
   }
 }
 
+/**
+ * Recent-first policy. MONTH is always first; YEAR is the only automatic broadening.
+ * DEFAULT is deliberately opt-in because the bake-off showed much more stale material.
+ */
+export function nextInnerTubeLane(current: InnerTubeDiscoveryLane, lowYield: boolean, allowDefault = false): InnerTubeDiscoveryLane | null {
+  if (!lowYield) return null;
+  if (current === 'MONTH') return 'YEAR';
+  if (current === 'YEAR' && allowDefault) return 'DEFAULT';
+  return null;
+}
+
 export function chooseInnerTubeLane(input: { monthAttempts: number; monthUniqueYield: number; yearAttempts?: number }): InnerTubeDiscoveryLane {
   if (input.monthAttempts < 2) return 'MONTH';
   if (input.monthUniqueYield >= 5) return 'MONTH';
