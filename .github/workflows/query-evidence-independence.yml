@@ -1,0 +1,29 @@
+name: Query evidence independence
+
+on:
+  pull_request:
+    paths:
+      - 'server/countryValidator.ts'
+      - 'server/tradingRelevanceClassifier.ts'
+      - 'server/queryEvidenceIndependence.test.ts'
+      - '.github/workflows/query-evidence-independence.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Evidence independence tests
+        run: node --import tsx --test server/queryEvidenceIndependence.test.ts
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
