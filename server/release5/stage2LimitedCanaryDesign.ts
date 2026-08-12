@@ -15,15 +15,65 @@ export const STAGE2_LIMITED_CANARY_POLICY = Object.freeze({
 });
 
 export type Stage2CanaryKillSwitchMode = 'OFF' | 'CANARY';
+export type Stage2TreatmentSlotReservation = (
+  subjectKey: string,
+  maximumTreatmentSubjects: number
+) => boolean | Promise<boolean>;
 
 const checksum = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-export function assignStage2LimitedCanary(subjectKey: string, killSwitchMode: Stage2CanaryKillSwitchMode) {
+export async function assignStage2LimitedCanary(
+  subjectKey: string,
+  killSwitchMode: Stage2CanaryKillSwitchMode,
+  reserveTreatmentSlot?: Stage2TreatmentSlotReservation
+) {
   if (killSwitchMode !== 'CANARY') {
-    return { assigned: false, mode: 'OFF' as const, basisPoints: 0, randomizationValue: null, servingAuthority: false as const };
+    return {
+      assigned: false,
+      mode: 'OFF' as const,
+      basisPoints: 0,
+      randomizationValue: null,
+      servingAuthority: false as const,
+      reason: 'KILL_SWITCH_OFF' as const
+    };
   }
-  const assignment = assignAdmissionCanary(`${STAGE2_LIMITED_CANARY_DESIGN_VERSION}:${subjectKey}`, STAGE2_LIMITED_CANARY_POLICY.allocationBasisPoints);
-  return { ...assignment, mode: 'CANARY' as const };
+
+  const assignment = assignAdmissionCanary(
+    `${STAGE2_LIMITED_CANARY_DESIGN_VERSION}:${subjectKey}`,
+    STAGE2_LIMITED_CANARY_POLICY.allocationBasisPoints
+  );
+
+  if (!assignment.assigned) {
+    return { ...assignment, mode: 'CANARY' as const, reason: 'OUTSIDE_ALLOCATION_BUCKET' as const };
+  }
+
+  // A bucket hit is not sufficient to enter treatment. The activation control
+  // plane must atomically reserve one of the bounded treatment slots first.
+  // Failing closed here prevents a caller from bypassing the hard cap.
+  if (!reserveTreatmentSlot) {
+    return {
+      ...assignment,
+      assigned: false,
+      mode: 'CANARY' as const,
+      reason: 'ATOMIC_TREATMENT_SLOT_RESERVATION_REQUIRED' as const
+    };
+  }
+
+  const reserved = await reserveTreatmentSlot(
+    subjectKey,
+    STAGE2_LIMITED_CANARY_POLICY.maximumTreatmentSubjects
+  );
+
+  if (!reserved) {
+    return {
+      ...assignment,
+      assigned: false,
+      mode: 'CANARY' as const,
+      reason: 'TREATMENT_SUBJECT_CAP_REACHED' as const
+    };
+  }
+
+  return { ...assignment, mode: 'CANARY' as const, reason: 'TREATMENT_SLOT_RESERVED' as const };
 }
 
 export function buildStage2LimitedCanaryDesign(gate: any) {
@@ -56,7 +106,8 @@ export function buildStage2LimitedCanaryDesign(gate: any) {
       basisPoints: STAGE2_LIMITED_CANARY_POLICY.allocationBasisPoints,
       percent: STAGE2_LIMITED_CANARY_POLICY.allocationBasisPoints / 100,
       deterministicAssignment: true,
-      maximumTreatmentSubjects: STAGE2_LIMITED_CANARY_POLICY.maximumTreatmentSubjects
+      maximumTreatmentSubjects: STAGE2_LIMITED_CANARY_POLICY.maximumTreatmentSubjects,
+      hardCapEnforcement: 'ATOMIC_SLOT_RESERVATION_REQUIRED'
     },
     candidateEligibility: {
       originalDecision: 'DEFER_INVESTIGATION',
