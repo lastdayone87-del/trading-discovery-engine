@@ -42,7 +42,7 @@ function semanticUnrelated(rawConfidence = 96, fields: any[] = [{ field: 'channe
   } as EvidenceItem;
 }
 
-function makeCollection(status: 'SUFFICIENT' | 'INSUFFICIENT' = 'SUFFICIENT'): EvidenceCollectionReport {
+function makeCollection(status: 'SUFFICIENT' | 'INSUFFICIENT' = 'SUFFICIENT', creatorLevelCoverage = status === 'SUFFICIENT'): EvidenceCollectionReport {
   return {
     sufficiency: 'SUFFICIENT',
     sparseMetadata: false,
@@ -52,9 +52,9 @@ function makeCollection(status: 'SUFFICIENT' | 'INSUFFICIENT' = 'SUFFICIENT'): E
     providers: [{ provider: 'gemini_semantic', availability: 'AVAILABLE', evidenceCount: 1, outcome: 'EXECUTED_WITH_EVIDENCE', reasonCodes: ['PROVIDER_EVIDENCE_EMITTED'] }],
     terminalNegativeSufficiency: {
       status,
-      creatorLevelCoverage: status === 'SUFFICIENT',
-      independentSourceFamilies: 0,
-      independentObservations: 1,
+      creatorLevelCoverage,
+      independentSourceFamilies: creatorLevelCoverage ? 2 : 0,
+      independentObservations: creatorLevelCoverage ? 2 : 1,
       reasonCodes: status === 'SUFFICIENT' ? ['CREATOR_LEVEL_NEGATIVE_COVERAGE'] : ['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT']
     }
   };
@@ -116,8 +116,51 @@ test('substantive positive trading evidence blocks the semantic shortcut', () =>
   assert.ok(!decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 });
 
-test('semantic evidence without creator-level attribution cannot use the shortcut', () => {
-  const { decision } = decide([semanticUnrelated(96, [{ field: 'video_title', sourceId: 'video-1' }])]);
+test('semantic evidence from one isolated video cannot use the shortcut', () => {
+  const { decision } = decide([semanticUnrelated(96, [{ field: 'video_title', sourceId: 'video-1', sourceFamilyId: 'youtube-video:1' }])]);
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('repeated independent creator videos can establish creator-level UNRELATED', () => {
+  const repeated = semanticUnrelated(96, [
+    { field: 'video_title', sourceId: 'video-1', sourceFamilyId: 'youtube-video:1' },
+    { field: 'video_description', sourceId: 'video-2', sourceFamilyId: 'youtube-video:2' },
+    { field: 'video_title', sourceId: 'video-3', sourceFamilyId: 'youtube-video:3' }
+  ]);
+  const { decision } = decide([repeated]);
+  assert.equal(decision.status, 'NON_TRADING');
+  assert.ok(decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
+});
+
+test('multiple fields from the same video family are still one observation', () => {
+  const correlated = semanticUnrelated(96, [
+    { field: 'video_title', sourceId: 'video-1-title', sourceFamilyId: 'youtube-video:1' },
+    { field: 'video_description', sourceId: 'video-1-description', sourceFamilyId: 'youtube-video:1' }
+  ]);
+  const { decision } = decide([correlated]);
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('repeated video semantics cannot bypass missing creator-level negative coverage', () => {
+  const repeated = semanticUnrelated(96, [
+    { field: 'video_title', sourceId: 'video-1', sourceFamilyId: 'youtube-video:1' },
+    { field: 'video_title', sourceId: 'video-2', sourceFamilyId: 'youtube-video:2' }
+  ]);
+  const { decision } = decide([repeated], makeCollection('SUFFICIENT', false));
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('substantive creator trading evidence also blocks repeated-video rejection', () => {
+  const repeated = semanticUnrelated(96, [
+    { field: 'video_title', sourceId: 'video-1', sourceFamilyId: 'youtube-video:1' },
+    { field: 'video_title', sourceId: 'video-2', sourceFamilyId: 'youtube-video:2' }
+  ]);
+  const positive: EvidenceItem = {
+    id: 'creator-trading-positive', source: 'channel_metadata', polarity: 'POSITIVE', category: 'METHODOLOGY_CONCEPT', fact: 'Creator teaches trading methodology', rawMatches: ['risk management'], confidence: 90,
+    reliability: 'HIGH', reliabilityMultiplier: 0.8, rawWeight: 12, finalWeight: 8.64, timestamp: new Date(0).toISOString(),
+    provenance: { provider: 'channel_metadata', type: 'methodology', matchedTerm: 'risk management', sourceRef: 'channel_bio', fields: [{ field: 'channel_bio', sourceId: 'about' }] }
+  };
+  const { decision } = decide([repeated, positive]);
   assert.equal(decision.status, 'UNCERTAIN');
 });
 
