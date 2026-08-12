@@ -1,8 +1,9 @@
 import * as cheerio from 'cheerio';
 import { InspectionStep } from '../src/types';
-import { incrementQuota } from './db';
+import { getChannelById, incrementQuota } from './db';
 import { fetchRecentVideoDescriptionsFromAPI } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,type DiscordCandidate} from './discordCandidates';
+import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 export interface InspectionResult {
   debugLog?: any;
@@ -272,12 +273,17 @@ async function fetchLiveYouTubeChannelData(youtubeUrl: string, enableDebug?: boo
 }
 
 export async function runChannelInspection(channelData: {
-  enableDebug?: boolean;channelId: string;channelBio: string;channelLinks?: string[];pinnedComment?: string;videoDescriptions?: string[];socialLinks?: string[];youtubeUrl?: string;forceLiveFetch?: boolean;liveChannelDataLoader?: typeof fetchLiveYouTubeChannelData;externalFetchImpl?: typeof fetch;
+  enableDebug?: boolean;channelId: string;channelBio: string;channelLinks?: string[];pinnedComment?: string;videoDescriptions?: string[];socialLinks?: string[];youtubeUrl?: string;forceLiveFetch?: boolean;liveChannelDataLoader?: typeof fetchLiveYouTubeChannelData;externalFetchImpl?: typeof fetch;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string)=>Promise<BrowserFallbackResult>;
 }): Promise<InspectionResult> {
   const steps: InspectionStep[] = [];const now = new Date().toISOString();let extractedThumbnailUrl: string | undefined;const acquisitionOutcomes:ExternalAcquisitionObservation[]=[];let acquiredAboutUrl:string|undefined;const acquiredRecentDescriptionSurfaces:string[]=[];
   let debugLog: any = channelData.enableDebug ? {rawAboutPageHtml: null,fetchLog: null,extractedUrls: [],redirectsFollowed: [],discordRegexAttempts: [],failureStep: null} : undefined;
   let bio = channelData.channelBio || '';let links = channelData.channelLinks || [];let videoDescs = channelData.videoDescriptions || [];
-
+  let creatorLikelyTrading=channelData.creatorLikelyTrading;
+  if(creatorLikelyTrading===undefined&&channelData.channelId){
+    try{creatorLikelyTrading=(await getChannelById(channelData.channelId))?.trading_status==='TRADING_CONFIRMED';}
+    catch{creatorLikelyTrading=false;}
+  }
+  creatorLikelyTrading=creatorLikelyTrading===true;
   if (channelData.youtubeUrl || channelData.channelId) {
     if (channelData.youtubeUrl && (channelData.forceLiveFetch || links.length === 0 || bio.length < 20)) {
       try {if(!channelData.liveChannelDataLoader)await incrementQuota(25);const liveData = await (channelData.liveChannelDataLoader || fetchLiveYouTubeChannelData)(channelData.youtubeUrl, channelData.enableDebug);if (liveData) {acquiredAboutUrl=channelData.youtubeUrl;if (liveData.bio) bio = `${bio} ${liveData.bio}`.trim();if (liveData.channelLinks && liveData.channelLinks.length > 0) links = Array.from(new Set([...links, ...liveData.channelLinks]));if (liveData.thumbnailUrl) extractedThumbnailUrl = liveData.thumbnailUrl;if (debugLog) {debugLog.rawAboutPageHtml = liveData.rawHtml;debugLog.fetchLog = liveData.fetchLog;}} else acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'YOUTUBE_ABOUT_ACQUISITION_FAILED',detail:'YouTube About page could not be acquired',observedAt:now});} catch (e) {acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'YOUTUBE_ABOUT_ACQUISITION_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});console.warn('Live YouTube channel scrape failed:', e);}
@@ -303,7 +309,65 @@ export async function runChannelInspection(channelData: {
 
   const uniqueUrls = new Map<string, { url: string; wrapperUrl?:string; kind:'WEBSITE'|'SOCIAL'; contextMatches: boolean; source: string }>();for (const item of collectedExternalUrls) {const existing = uniqueUrls.get(item.url);if (existing) {if (item.contextMatches) existing.contextMatches = true;} else uniqueUrls.set(item.url, item);}const allCollectedUrls = Array.from(uniqueUrls.values());let websiteUrls = allCollectedUrls.filter(u => u.kind==='WEBSITE');let socialBioUrls = allCollectedUrls.filter(u => u.kind==='SOCIAL');websiteUrls.sort((a, b) => (a.contextMatches === b.contextMatches ? 0 : a.contextMatches ? -1 : 1));
 
-  const step5Logs: string[] = [];if (websiteUrls.length > 0) {step5Logs.push(`Crawling ${websiteUrls.length} website URLs...`);for (const item of websiteUrls) {step5Logs.push(`[Crawling] ${item.url} (Context Match: ${item.contextMatches}, Source: ${item.source})`);const locName = item.url.includes('linktr.ee') ? 'LINKTREE' : 'CUSTOM_DOMAIN';const crawlRes = await crawlExternalLinks([item.url], [], debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',false,item.wrapperUrl);acquisitionOutcomes.push(...crawlRes.observations);if (crawlRes.foundInvite) {step5Logs.push(`Discord invite found! ${crawlRes.details}`);const structured=candidateFromNativeInvite({nativeInviteCode:crawlRes.foundInvite,sourceSurface:'CREATOR_WEBSITES',sourceUrl:item.url,rawLocator:item.url,extractionConfidence:'RESOLVED'});let retained=structured?[structured]:[];const alternative=extractDiscordCandidates(item.url,'CREATOR_WEBSITES',item.url).find(candidate=>candidate.locatorType==='ALTERNATIVE_REDIRECT'||candidate.locatorType==='DIRECTORY_PAGE');if(alternative&&structured){const {candidateId:_,...base}=alternative;retained=[makeDiscordCandidate({...base,nativeInviteCode:structured.nativeInviteCode,normalizedLocator:structured.normalizedLocator,extractionConfidence:'RESOLVED'})];}retainCandidates(retained);addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', 'FOUND', step5Logs, crawlRes.foundInvite, locName);break;}}const websiteOutcomes=acquisitionOutcomes.filter(item=>item.surface==='CREATOR_WEBSITES');const websiteFound=discoveredCandidates.some(c=>c.sourceSurface==='CREATOR_WEBSITES')||websiteOutcomes.some(item=>item.outcome==='FOUND');if(!websiteFound){const failed=websiteOutcomes.some(item=>item.outcome==='ACQUISITION_FAILED'),inspected=websiteOutcomes.some(item=>item.outcome==='INSPECTED_NO_MATCH');step5Logs.push(failed&&inspected?'Some linked website surfaces were inspected successfully while others could not be acquired.':failed?'Linked website acquisition failed; absence of an invite is not confirmed.':'No Discord invite found in successfully inspected linked websites.');addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', failed?(inspected?'PARTIAL':'ERROR'):'NOT_FOUND', step5Logs);}} else addStep('CUSTOM_DOMAINS', 'Step 4 — Linked Websites', 'SKIPPED', ['No website URLs to crawl.']);
+  const step5Logs:string[]=[];
+  if(websiteUrls.length>0){
+    step5Logs.push(`Crawling ${websiteUrls.length} website URLs...`);
+    for(const item of websiteUrls){
+      step5Logs.push(`[Crawling] ${item.url} (Context Match: ${item.contextMatches}, Source: ${item.source})`);
+      const locName=item.url.includes('linktr.ee')?'LINKTREE':'CUSTOM_DOMAIN';
+      const crawlRes=await crawlExternalLinks([item.url],[],debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',false,item.wrapperUrl);
+      acquisitionOutcomes.push(...crawlRes.observations);
+      let resolvedInvite=crawlRes.foundInvite;
+      let resolvedLocation=crawlRes.foundLocation||item.url;
+
+      if(!resolvedInvite&&creatorLikelyTrading){
+        const {crawlRenderedCommunitySurface,shouldEscalateToRenderedFallback}=await import('./browserCommunityFallback');
+        if(shouldEscalateToRenderedFallback({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'CREATOR_WEBSITES'})){
+          const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url);
+          const renderedOutcome:ExternalAcquisitionStatus=rendered.foundInvite?'FOUND':rendered.complete?'INSPECTED_NO_MATCH':'ACQUISITION_FAILED';
+          acquisitionOutcomes.push({
+            requestedUrl:item.url,
+            finalUrl:rendered.foundLocation,
+            wrapperUrl:item.wrapperUrl,
+            surface:'CREATOR_WEBSITES',
+            required:true,
+            outcome:renderedOutcome,
+            retryable:rendered.retryable,
+            failureClass:rendered.complete?undefined:'RENDERED_ACQUISITION_INCOMPLETE',
+            detail:rendered.detail,
+            observedAt:now
+          });
+          if(rendered.foundInvite){
+            resolvedInvite=rendered.foundInvite;
+            resolvedLocation=rendered.foundLocation||item.url;
+            step5Logs.push(`Rendered fallback found Discord invite at ${resolvedLocation}.`);
+          }else if(!rendered.complete){
+            step5Logs.push(`Rendered fallback incomplete and retryable: ${rendered.detail}`);
+          }else{
+            step5Logs.push(`Rendered fallback completed without a Discord invite: ${rendered.detail}`);
+          }
+        }
+      }
+
+      if(resolvedInvite){
+        step5Logs.push(`Discord invite found! ${crawlRes.details}`);
+        const structured=candidateFromNativeInvite({nativeInviteCode:resolvedInvite,sourceSurface:'CREATOR_WEBSITES',sourceUrl:resolvedLocation,rawLocator:item.url,extractionConfidence:'RESOLVED'});
+        let retained=structured?[structured]:[];
+        const alternative=extractDiscordCandidates(item.url,'CREATOR_WEBSITES',item.url).find(candidate=>candidate.locatorType==='ALTERNATIVE_REDIRECT'||candidate.locatorType==='DIRECTORY_PAGE');
+        if(alternative&&structured){const {candidateId:_,...base}=alternative;retained=[makeDiscordCandidate({...base,nativeInviteCode:structured.nativeInviteCode,normalizedLocator:structured.normalizedLocator,extractionConfidence:'RESOLVED'})];}
+        retainCandidates(retained);
+        addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites','FOUND',step5Logs,resolvedInvite,locName);
+        break;
+      }
+    }
+    const websiteOutcomes=acquisitionOutcomes.filter(item=>item.surface==='CREATOR_WEBSITES');
+    const websiteFound=discoveredCandidates.some(c=>c.sourceSurface==='CREATOR_WEBSITES')||websiteOutcomes.some(item=>item.outcome==='FOUND');
+    if(!websiteFound){
+      const failed=websiteOutcomes.some(item=>item.outcome==='ACQUISITION_FAILED'),inspected=websiteOutcomes.some(item=>item.outcome==='INSPECTED_NO_MATCH');
+      step5Logs.push(failed&&inspected?'Some linked website surfaces were inspected successfully while others could not be acquired.':failed?'Linked website acquisition failed; absence of an invite is not confirmed.':'No Discord invite found in successfully inspected linked websites.');
+      addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites',failed?(inspected?'PARTIAL':'ERROR'):'NOT_FOUND',step5Logs);
+    }
+  }else addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites','SKIPPED',['No website URLs to crawl.']);
 
   const step6Logs: string[] = [];if (socialBioUrls.length > 0) {step6Logs.push(`Crawling ${socialBioUrls.length} social profile URLs...`);for (const item of socialBioUrls) {step6Logs.push(`[Crawling] ${item.url} (Source: ${item.source})`);let locName = 'SOCIAL_BIO';if (item.url.includes('twitter.com') || item.url.includes('x.com')) locName = 'X_BIO';if (item.url.includes('instagram.com')) locName = 'INSTAGRAM_BIO';if (item.url.includes('tiktok.com')) locName = 'TIKTOK_BIO';const crawlRes = await crawlExternalLinks([item.url], [], debugLog,channelData.externalFetchImpl||fetch,'SOCIAL_PROFILES',false,item.wrapperUrl);acquisitionOutcomes.push(...crawlRes.observations);if (crawlRes.foundInvite) {step6Logs.push(`Discord invite found! ${crawlRes.details}`);const structured=candidateFromNativeInvite({nativeInviteCode:crawlRes.foundInvite,sourceSurface:'SOCIAL_PROFILES',sourceUrl:item.url,rawLocator:item.url,extractionConfidence:'RESOLVED'});let retained=structured?[structured]:[];const alternative=extractDiscordCandidates(item.url,'SOCIAL_PROFILES',item.url).find(candidate=>candidate.locatorType==='ALTERNATIVE_REDIRECT'||candidate.locatorType==='DIRECTORY_PAGE');if(alternative&&structured){const {candidateId:_,...base}=alternative;retained=[makeDiscordCandidate({...base,nativeInviteCode:structured.nativeInviteCode,normalizedLocator:structured.normalizedLocator,extractionConfidence:'RESOLVED'})];}retainCandidates(retained);addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', 'FOUND', step6Logs, crawlRes.foundInvite, locName);break;}}const socialFound=discoveredCandidates.some(c=>c.sourceSurface==='SOCIAL_PROFILES')||acquisitionOutcomes.some(item=>item.surface==='SOCIAL_PROFILES'&&item.outcome==='FOUND');if(!socialFound){const failed=acquisitionOutcomes.some(item=>item.surface==='SOCIAL_PROFILES'&&item.outcome==='ACQUISITION_FAILED');step6Logs.push(failed?'Social profile acquisition was incomplete; absence of an invite is not confirmed.':'No Discord invite found in inspected social profile bios.');addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', failed?'ERROR':'NOT_FOUND', step6Logs);}} else addStep('SOCIAL_BIO', 'Step 5 — Social Profile Bios', 'SKIPPED', ['No social profile URLs to crawl.']);
 
