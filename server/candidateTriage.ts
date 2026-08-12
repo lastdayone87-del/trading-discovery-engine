@@ -2,7 +2,7 @@ import type { DiscoverySource } from '../src/types';
 import type { VerificationDecision } from './evidenceEngine';
 import type { DiscoveredChannelRaw } from './youtube';
 
-export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v2';
+export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v3';
 
 export type SearchCandidateTriageDisposition = 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'NOT_APPLICABLE';
 
@@ -22,6 +22,15 @@ const STRONG_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['JAPANESE_TRADING', /(トレード|デイトレード|先物|テクニカル分析|板読み|オーダーフロー)/u]
 ];
 
+const STALE_AUTONOMOUS_VIDEO_AGE_MS = 3 * 365.25 * 24 * 60 * 60 * 1000;
+
+function staleAutonomousVideo(candidate: DiscoveredChannelRaw): boolean {
+  if (candidate.matchedDocument?.type !== 'VIDEO' || !candidate.matchedDocument.publishedAt) return false;
+  const publishedAt = Date.parse(candidate.matchedDocument.publishedAt);
+  if (!Number.isFinite(publishedAt)) return false;
+  return Date.now() - publishedAt > STALE_AUTONOMOUS_VIDEO_AGE_MS;
+}
+
 /**
  * Cheap routing-only firewall. Search-match content is never promoted to
  * creator-level evidence; it is used only to decide whether an autonomous
@@ -34,6 +43,18 @@ export function triageAutonomousSearchCandidate(
 ): SearchCandidateTriageDecision {
   if (source !== 'automated_query' || isEnrichmentPass || (candidate.enrichmentStage || 0) > 0) {
     return { disposition: 'NOT_APPLICABLE', reasonCodes: ['NON_INITIAL_AUTONOMOUS_RESULT'], matchedSignals: [] };
+  }
+
+  // A very old video can still be relevant to a query while saying nothing
+  // useful about whether the creator is active today. Withhold this particular
+  // retrieval observation instead of blacklisting the channel: an active
+  // creator can still be nominated later by a recent upload or another lane.
+  if (staleAutonomousVideo(candidate)) {
+    return {
+      disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
+      reasonCodes: ['STALE_RETRIEVAL_DOCUMENT', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
+      matchedSignals: []
+    };
   }
 
   const retrievalText = [
