@@ -62,12 +62,16 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
   const [metricsError, setMetricsError] = useState<string | null>(null);
   const [metricsUpdatedAt, setMetricsUpdatedAt] = useState<number | null>(null);
   const depthHistory = useRef<DepthSnapshot[]>([]);
+  const metricsRequestSequence = useRef(0);
 
   const fetchProviderMetrics = useCallback(async () => {
+    const requestSequence = ++metricsRequestSequence.current;
     try {
       const response = await apiFetch('/api/provider-metrics?hours=1');
       if (!response.ok) throw new Error(`Provider metrics returned HTTP ${response.status}`);
       const data = await response.json() as ProviderMetricsResponse;
+      if (requestSequence !== metricsRequestSequence.current) return;
+
       setProviderMetrics(data);
       setMetricsError(null);
       setMetricsUpdatedAt(Date.now());
@@ -78,6 +82,7 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
       recent.push({ depth: Number(enrichment?.depth || 0), observedAt: now });
       depthHistory.current = recent.slice(-60);
     } catch (error: any) {
+      if (requestSequence !== metricsRequestSequence.current) return;
       setMetricsError(error?.message || 'Unable to load provider metrics.');
     }
   }, []);
@@ -116,6 +121,7 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
     const providerRows = providerMetrics?.providers || [];
     const youtubeJsRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube_js' && row.operation.includes('channel-enrichment'));
     const officialRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube' && isOfficialEnrichmentOperation(row.operation));
+    const hybridOfficialRows = officialRows.filter(row => row.operation === 'hybrid-enrichment-channel-details');
     const displayedRows = [...youtubeJsRows, ...officialRows];
 
     const sum = (rows: ProviderMetricRow[], key: keyof ProviderMetricRow) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
@@ -124,9 +130,10 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
     const youtubeJsErrors = sum(youtubeJsRows, 'errors') + sum(youtubeJsRows, 'timeouts');
     const officialActualCost = sum(officialRows, 'actual_cost');
     const officialReservedCost = sum(officialRows, 'reserved_cost');
+    const hybridOfficialActualCost = sum(hybridOfficialRows, 'actual_cost');
     const baseAcquisitions = youtubeJsRows.filter(row => row.operation === 'channel-enrichment');
     const baseSuccesses = sum(baseAcquisitions, 'successes');
-    const averageOfficialUnits = baseSuccesses > 0 ? officialActualCost / baseSuccesses : null;
+    const averageOfficialUnits = baseSuccesses > 0 ? hybridOfficialActualCost / baseSuccesses : null;
     const weightedLatency = youtubeJsCalls > 0
       ? youtubeJsRows.reduce((total, row) => total + Number(row.average_latency_ms || 0) * Number(row.calls || 0), 0) / youtubeJsCalls
       : 0;
