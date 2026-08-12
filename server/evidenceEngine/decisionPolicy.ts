@@ -30,16 +30,34 @@ function isWeakVideoTerminologyEvidence(item:EvidenceItem):boolean{
 }
 
 /**
+ * Creator-level semantic UNRELATED evidence can be established either directly
+ * from the channel bio or by repeated independent creator videos. A single
+ * unrelated matched/search video is intentionally insufficient: repeated video
+ * support must span at least two source families, and the collection-level
+ * terminal-negative sufficiency check must independently agree that creator
+ * coverage is adequate.
+ */
+function hasCreatorLevelUnrelatedAttribution(item:EvidenceItem):boolean{
+  const fields=item.provenance?.fields||[];
+  if(fields.some(field=>field.field==='channel_bio')) return true;
+  const videoFamilies=new Set(fields
+    .filter(field=>field.field==='video_title'||field.field==='video_description')
+    .map(field=>field.sourceFamilyId||field.sourceId)
+    .filter((value):value is string=>Boolean(value)));
+  return videoFamilies.size>=2;
+}
+
+/**
  * Narrow terminal-negative escape hatch for creator-level semantic evidence.
  * It deliberately does not lower the global negative-weight threshold. The
  * semantic model must explicitly classify the creator as UNRELATED, meet the
- * top governed calibrated-confidence tier, be attributable to the creator bio,
- * have terminal-negative sufficiency, and face no substantive positive trading
- * evidence. Isolated video-title terminology is treated as weak lexical evidence
- * rather than a creator-identity contradiction.
+ * top governed calibrated-confidence tier, have terminal-negative sufficiency,
+ * and face no substantive positive trading evidence. Creator attribution may
+ * come from the About bio or from repeated independent recent/video documents;
+ * one isolated video can never make the creator terminally NON_TRADING.
  */
 export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[], collection:EvidenceCollectionReport):boolean{
-  if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT') return false;
+  if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
   const substantivePositiveWeight=evidence
     .filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item))
     .reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
@@ -50,7 +68,7 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
     item.category==='IRRELEVANT_DOMAIN' &&
     item.provenance?.semantic?.taxonomyLabel==='UNRELATED' &&
     Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE &&
-    (item.provenance?.fields||[]).some(field=>field.field==='channel_bio')
+    hasCreatorLevelUnrelatedAttribution(item)
   );
 }
 
