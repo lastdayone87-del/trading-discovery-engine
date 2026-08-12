@@ -332,7 +332,7 @@ export async function processNextSearchJob(
       const maxPages=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_pages','3')));const maxLow=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_low_yield_pages','2')));
       const prior=await getAutonomousContinuationState(queryRunId);
       const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
-      const enabled=await getAppSetting('autonomous_pagination_enabled','false')==='true';
+      const enabled=await getAppSetting('autonomous_pagination_enabled','true')==='true';
       const pageObservation={queryRunId,pageNumber,inputPageToken:pageToken,nextPageToken:searchPage?.nextPageToken||null,retrievalLane,searchOrdering,rawResultCount:metrics.rawResults,distinctCreatorCount:metrics.distinctResults,knownCreators:metrics.knownChannels,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,averageQualityScore:metrics.averageQualityScore,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,noveltyRatio:metrics.noveltyRatio,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,quotaUnits:100,decision,stoppingReason:decision.shouldContinue?null:decision.primaryReason,pageMetrics:metrics};
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
@@ -526,20 +526,35 @@ export async function inspectAndValidateChannel(
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
     const discoveredInvite=structuredCandidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||inspection.foundInvite||null;
     if (discoveredInvite) {
-      // Validate every bounded native candidate until one is live. A stale or
-      // invalid first match must not suppress a later valid locator.
+      // Validate bounded native candidates until a high-confidence trading
+      // community is found. A live-but-ambiguous or live-but-non-trading first
+      // invite is a fallback, not a reason to suppress a stronger later invite.
       const candidates=structuredCandidates.length?structuredCandidates:[{candidateId:`legacy:${discoveredInvite}`,locatorType:'NATIVE_INVITE' as const,sourceSurface:'CHANNEL_EXTERNAL_LINKS' as const,rawLocator:discoveredInvite,nativeInviteCode:discoveredInvite,normalizedLocator:`https://discord.gg/${discoveredInvite}`,extractionConfidence:'EXPLICIT' as const}];
-      let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0];
+      let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
+      const validationRank=(validation:Awaited<ReturnType<typeof validateDiscordInvite>>):number=>{
+        if(validation.operationalOutcome==='SUCCEEDED'){
+          if(validation.relevanceStatus==='TRADING_RELEVANT'&&(validation.status==='ACTIVE'||validation.status==='ACTIVE_LOW_VOLUME'))return 100;
+          if(validation.relevanceStatus==='TRADING_RELEVANT')return 90;
+          if(validation.relevanceStatus==='UNCERTAIN'||validation.status==='UNCERTAIN')return 60;
+          if(validation.status==='NON_TRADING'||validation.relevanceStatus==='NON_TRADING')return 40;
+          if(validation.status==='DEAD')return 30;
+          return 50;
+        }
+        if(validation.operationalOutcome==='INVALID_OBSERVED')return 20;
+        if(validation.operationalOutcome==='CONFIRMED_INVALID')return 10;
+        return 0;
+      };
       for(const candidate of candidates){
         if(!candidate.nativeInviteCode)continue;
         const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
         const priorInvalidObservations=await countDiscordInvalidObservations(channel.channel_id,candidate.candidateId,locator);
         const validation=await validateDiscordInvite(candidate.nativeInviteCode,{parentChannelIsTrading:channel.trading_status==='TRADING_CONFIRMED',channelName:channel.channel_name,priorInvalidObservations});
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
-        if(validation.operationalOutcome==='SUCCEEDED'){selected=validation;selectedCandidate=candidate;break;}
         if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}
-        if(!selected||validation.operationalOutcome==='INVALID_OBSERVED'){selected=validation;selectedCandidate=candidate;}
+        const rank=validationRank(validation);
+        if(rank>selectedRank){selected=validation;selectedCandidate=candidate;selectedRank=rank;}
+        if(rank>=100)break;
       }
       if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0];selectedCandidate=candidates[0];}
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');
