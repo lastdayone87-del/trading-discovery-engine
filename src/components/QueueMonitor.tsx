@@ -49,6 +49,14 @@ function formatDuration(ms: number): string {
   return remaining ? `${hours}h ${remaining}m` : `${hours}h`;
 }
 
+function isOfficialEnrichmentOperation(operation: string): boolean {
+  return operation === 'hybrid-enrichment-channel-details'
+    || operation === 'channel-details'
+    || operation === 'channel-uploads'
+    || operation === 'enrichment-video-details'
+    || operation === 'enrichment-playlists';
+}
+
 export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onTogglePause, onRefresh }) => {
   const [providerMetrics, setProviderMetrics] = useState<ProviderMetricsResponse | null>(null);
   const [metricsError, setMetricsError] = useState<string | null>(null);
@@ -65,12 +73,10 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
       setMetricsUpdatedAt(Date.now());
 
       const enrichment = data.queueLatency.find(row => row.type === 'ENRICH_CHANNEL');
-      if (enrichment) {
-        const now = Date.now();
-        const recent = depthHistory.current.filter(snapshot => now - snapshot.observedAt <= 15 * 60_000);
-        recent.push({ depth: Number(enrichment.depth || 0), observedAt: now });
-        depthHistory.current = recent.slice(-60);
-      }
+      const now = Date.now();
+      const recent = depthHistory.current.filter(snapshot => now - snapshot.observedAt <= 15 * 60_000);
+      recent.push({ depth: Number(enrichment?.depth || 0), observedAt: now });
+      depthHistory.current = recent.slice(-60);
     } catch (error: any) {
       setMetricsError(error?.message || 'Unable to load provider metrics.');
     }
@@ -107,9 +113,10 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
 
   const enrichmentHealth = useMemo(() => {
     const queue = providerMetrics?.queueLatency.find(row => row.type === 'ENRICH_CHANNEL');
-    const enrichmentRows = (providerMetrics?.providers || []).filter(row => row.operation.includes('channel-enrichment'));
-    const youtubeJsRows = enrichmentRows.filter(row => row.provider.toLowerCase() === 'youtube_js');
-    const officialRows = enrichmentRows.filter(row => row.provider.toLowerCase() !== 'youtube_js' && row.provider.toLowerCase().includes('youtube'));
+    const providerRows = providerMetrics?.providers || [];
+    const youtubeJsRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube_js' && row.operation.includes('channel-enrichment'));
+    const officialRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube' && isOfficialEnrichmentOperation(row.operation));
+    const displayedRows = [...youtubeJsRows, ...officialRows];
 
     const sum = (rows: ProviderMetricRow[], key: keyof ProviderMetricRow) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
     const youtubeJsCalls = sum(youtubeJsRows, 'calls');
@@ -145,7 +152,7 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
       averageOfficialUnits,
       trend,
       delta,
-      elapsedMs
+      displayedRows
     };
   }, [providerMetrics, metricsUpdatedAt]);
 
@@ -292,14 +299,14 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
               </div>
             </div>
 
-            {(providerMetrics?.providers || []).filter(row => row.operation.includes('channel-enrichment')).length > 0 && (
+            {enrichmentHealth.displayedRows.length > 0 && (
               <div className="border-t border-slate-200 dark:border-slate-800 overflow-x-auto">
                 <table className="w-full text-[11px] min-w-[680px]">
                   <thead className="bg-slate-50 dark:bg-slate-800/50 text-slate-500 uppercase tracking-wider">
                     <tr><th className="text-left px-3 py-2">Provider</th><th className="text-left px-3 py-2">Operation</th><th className="text-right px-3 py-2">Calls</th><th className="text-right px-3 py-2">Success</th><th className="text-right px-3 py-2">Errors</th><th className="text-right px-3 py-2">Avg ms</th><th className="text-right px-3 py-2">Actual cost</th></tr>
                   </thead>
                   <tbody>
-                    {(providerMetrics?.providers || []).filter(row => row.operation.includes('channel-enrichment')).map(row => (
+                    {enrichmentHealth.displayedRows.map(row => (
                       <tr key={`${row.provider}:${row.operation}`} className="border-t border-slate-100 dark:border-slate-800">
                         <td className="px-3 py-2 font-mono">{row.provider}</td><td className="px-3 py-2 font-mono">{row.operation}</td><td className="px-3 py-2 text-right font-mono">{row.calls}</td><td className="px-3 py-2 text-right font-mono">{row.successes}</td><td className="px-3 py-2 text-right font-mono">{Number(row.errors || 0) + Number(row.timeouts || 0)}</td><td className="px-3 py-2 text-right font-mono">{row.average_latency_ms}</td><td className="px-3 py-2 text-right font-mono">{row.actual_cost}</td>
                       </tr>
