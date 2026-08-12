@@ -9,6 +9,7 @@ on:
       - 'server/inspector.ts'
       - 'package.json'
       - 'package-lock.json'
+      - 'nixpacks.toml'
       - '.github/workflows/browser-community-fallback.yml'
   workflow_dispatch:
 
@@ -22,7 +23,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install --ignore-scripts
-      - run: npx playwright install chromium
+      - run: npm ci
+      - name: Install Chromium and Linux browser dependencies
+        run: npx playwright install --with-deps chromium
+      - name: Verify Chromium is installed
+        run: npx playwright install --list
       - run: node --import tsx --test server/browserCommunityFallback.test.ts server/browserCommunityFallback.integration.test.ts
       - run: npm run lint
