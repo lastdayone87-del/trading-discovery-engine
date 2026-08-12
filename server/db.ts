@@ -21,6 +21,46 @@ const MIGRATION_ADVISORY_LOCK = 741963284;
 let pool: InstanceType<typeof Pool> | null = null;
 let initPromise: Promise<InstanceType<typeof Pool>> | null = null;
 
+const TRANSIENT_PG_STARTUP_CODES = new Set(['57P03','57P01','53300','08000','08001','08003','08006']);
+const TRANSIENT_PG_NETWORK_CODES = new Set(['ECONNREFUSED','ECONNRESET','ETIMEDOUT','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH']);
+
+function isTransientPostgresStartupError(error: any): boolean {
+  const code = String(error?.code || '');
+  if (TRANSIENT_PG_STARTUP_CODES.has(code) || TRANSIENT_PG_NETWORK_CODES.has(code)) return true;
+  const message = String(error?.message || error || '').toLowerCase();
+  return message.includes('database system is starting up') ||
+    message.includes('consistent recovery state has not been yet reached') ||
+    message.includes('cannot connect now') ||
+    message.includes('the database system is in recovery mode');
+}
+
+function sleep(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function waitForPostgresReady(db: InstanceType<typeof Pool>): Promise<void> {
+  const configuredMaxWaitMs = Number(process.env.POSTGRES_STARTUP_MAX_WAIT_MS || '300000');
+  const maxWaitMs = Number.isFinite(configuredMaxWaitMs) && configuredMaxWaitMs >= 30_000 ? configuredMaxWaitMs : 300_000;
+  const started = Date.now();
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      await db.query('SELECT 1');
+      if (attempt > 1) console.log(`[PostgreSQL] Ready after ${attempt} startup checks.`);
+      return;
+    } catch (error: any) {
+      if (!isTransientPostgresStartupError(error)) throw error;
+      const elapsed = Date.now() - started;
+      if (elapsed >= maxWaitMs) {
+        console.error(`[PostgreSQL] Still unavailable after ${elapsed}ms; giving up startup retry.`, { code: error?.code, message: error?.message });
+        throw error;
+      }
+      const delayMs = Math.min(10_000, 1_000 * Math.pow(2, Math.min(attempt - 1, 3)));
+      console.warn(`[PostgreSQL] Database temporarily unavailable during startup (code=${error?.code || 'unknown'}). Retrying in ${delayMs}ms.`);
+      await sleep(delayMs);
+    }
+  }
+}
+
 function requireDatabaseUrl(): string {
   const url = process.env.DATABASE_URL;
   if (!url) {
@@ -40,7 +80,7 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
     const connectionString = requireDatabaseUrl();
     pool = new Pool({ connectionString, ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined });
     try {
-      await pool.query('SELECT 1');
+      await waitForPostgresReady(pool);
       await runMigrations();
       await seedDefaults();
       return pool;
