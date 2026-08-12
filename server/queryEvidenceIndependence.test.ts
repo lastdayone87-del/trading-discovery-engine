@@ -11,7 +11,10 @@ test('country attribution ignores retrieval-selected market and instrument title
     externalLinks: []
   });
   assert.deepEqual(evidence.videoTitles, []);
-  assert.equal(evidence.aboutBio, 'Academy by SMI ');
+  // The ambiguous retrieval token is intentionally removed from creator-level
+  // country evidence as well. The remaining generic identity words must not
+  // become independent geographic evidence.
+  assert.equal(evidence.aboutBio.trim(), '');
 });
 
 test('creator-level country evidence still preserves independent channel metadata', () => {
