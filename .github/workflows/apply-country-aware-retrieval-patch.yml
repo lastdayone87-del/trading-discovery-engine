@@ -1,0 +1,55 @@
+name: Apply country-aware retrieval integration
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-country-aware-retrieval-patch.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: autonomous/country-aware-retrieval
+      - name: Integrate retrieval hints
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('server/youtube.ts')
+          text = path.read_text()
+
+          import_anchor = "import { SearchOrdering, youtubeOrder } from './searchOrdering';\n"
+          import_line = "import { countrySearchHints } from './countrySearchHints';\n"
+          if import_line not in text:
+              if import_anchor not in text:
+                  raise SystemExit('youtube import anchor not found')
+              text = text.replace(import_anchor, import_anchor + import_line, 1)
+
+          sanitize_anchor = "  const sanitizedQuery = sanitizeSearchQuery(query, countryName);\n  if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };\n"
+          sanitize_replacement = sanitize_anchor + "  const searchHints = countrySearchHints(countryName, vocab?.languages || []);\n"
+          if "const searchHints = countrySearchHints" not in text:
+              if sanitize_anchor not in text:
+                  raise SystemExit('youtube sanitize anchor not found')
+              text = text.replace(sanitize_anchor, sanitize_replacement, 1)
+
+          request_anchor = "          q: sanitizedQuery, maxResults, pageToken: pageToken || undefined\n"
+          request_replacement = "          q: sanitizedQuery, maxResults, pageToken: pageToken || undefined,\n          regionCode: searchHints.regionCode, relevanceLanguage: searchHints.relevanceLanguage\n"
+          if "regionCode: searchHints.regionCode" not in text:
+              if request_anchor not in text:
+                  raise SystemExit('youtube request anchor not found')
+              text = text.replace(request_anchor, request_replacement, 1)
+
+          path.write_text(text)
+      - name: Remove one-shot patch workflow and commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-country-aware-retrieval-patch.yml
+          git add server/youtube.ts
+          git commit -m "feat: bias autonomous YouTube search by target market"
+          git push origin HEAD:autonomous/country-aware-retrieval
