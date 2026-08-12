@@ -1,0 +1,94 @@
+name: Apply selective quota-deferred enrichment wakeup
+
+on:
+  push:
+    branches:
+      - fix/wake-quota-deferred-enrichment
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Apply patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          db = Path('server/db.ts')
+          s = db.read_text()
+          anchor = "export async function getProviderOperationalMetrics(hours=24):Promise<any>{"
+          assert anchor in s
+          helper = """/**
+ * Wake only legacy ENRICH_CHANNEL deferrals that were scheduled to the next
+ * UTC quota reset before quota-free confirmed-country enrichment existed.
+ * Other provider/cooldown deferrals remain untouched.
+ */
+export async function wakeQuotaDeferredConfirmedCountryEnrichmentJobs():Promise<number>{
+  const db=await getDb();
+  const res=await db.query(`UPDATE jobs j
+    SET run_after=now(),updated_at=now()
+    FROM channels c
+    WHERE j.type='ENRICH_CHANNEL'
+      AND j.status='PENDING'
+      AND j.run_after>now()
+      AND j.payload->>'channelId'=c.channel_id
+      AND c.country_status='CONFIRMED'
+      AND j.last_error LIKE 'ENRICHMENT YouTube quota allocation is exhausted;%'
+    RETURNING j.id`);
+  return res.rowCount||0;
+}
+
+"""
+          s = s.replace(anchor, helper + anchor, 1)
+          db.write_text(s)
+
+          q = Path('server/queueManager.ts')
+          s = q.read_text()
+          old = "  appendExternalAcquisitionObservations\n} from './db';"
+          new = "  appendExternalAcquisitionObservations,\n  wakeQuotaDeferredConfirmedCountryEnrichmentJobs\n} from './db';"
+          assert old in s
+          s = s.replace(old, new, 1)
+          old = "  workersStarted = true;\n  startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)));"
+          new = """  workersStarted = true;
+  // #211 made confirmed-country enrichment independent of official quota, but
+  // jobs deferred before that change still carry a run_after at the next UTC
+  // quota reset. Wake only those quota-specific legacy deferrals; do not disturb
+  // YouTube.js/provider cooldowns or unrelated retry schedules.
+  void wakeQuotaDeferredConfirmedCountryEnrichmentJobs()
+    .then(count => { if (count > 0) console.log(`[Queue Worker] Woke ${count} confirmed-country enrichment job(s) deferred only by obsolete official quota gating.`); })
+    .catch(error => console.error('[Queue Worker] Failed to reconcile legacy quota-deferred enrichment jobs:', error));
+  startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)));"""
+          assert old in s
+          q.write_text(s.replace(old, new, 1))
+          PY
+      - name: Install dependencies
+        run: npm ci
+      - name: Retry classification regression
+        run: node --import tsx --test server/jobRetryClassification.test.ts || true
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
+      - name: Commit production patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-wake-quota-deferred-enrichment.yml
+          git add server/db.ts server/queueManager.ts
+          git commit -m "Wake obsolete quota-deferred enrichment jobs"
+          git push origin HEAD:fix/wake-quota-deferred-enrichment
