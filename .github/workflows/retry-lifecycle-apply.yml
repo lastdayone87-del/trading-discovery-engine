@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   apply:
-    if: github.actor != 'github-actions[bot]'
+    if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -24,146 +24,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Apply retry lifecycle patch
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          db = Path('server/db.ts')
-          text = db.read_text()
-          old = """export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
-export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now()):{disposition:JobFailureDisposition;runAfter?:number}{if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};const retryAt=Number(error?.retryAt);const retryCode=['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED'].includes(String(error?.code||''));if(Number.isFinite(retryAt)&&(retryAt>now||retryCode))return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:Math.max(now,retryAt)};return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};}
-"""
-          new = """export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
-const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT']);
-const TRANSIENT_HTTP_STATUS=new Set([408,425,429,500,502,503,504]);
-export function isRetryableInfrastructureFailure(error:any):boolean{
-  const code=String(error?.code||error?.cause?.code||'').toUpperCase();
-  const status=Number(error?.status||error?.statusCode||error?.response?.status);
-  const name=String(error?.name||'');
-  if(TRANSIENT_PROVIDER_CODES.has(code)||TRANSIENT_HTTP_STATUS.has(status))return true;
-  if(name==='TimeoutError')return true;
-  return false;
-}
-export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now()):{disposition:JobFailureDisposition;runAfter?:number}{
-  if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
-  if(isRetryableInfrastructureFailure(error)){
-    const retryAt=Number(error?.retryAt);
-    const retryAfterMs=Number(error?.retryAfterMs);
-    const scheduled=Number.isFinite(retryAt)&&retryAt>now?retryAt:Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+5*60_000;
-    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:scheduled};
-  }
-  return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
-}
-"""
-          if old not in text:
-              raise SystemExit('db.ts retry policy anchor not found')
-          db.write_text(text.replace(old,new,1))
-
-          qm = Path('server/queueManager.ts')
-          text = qm.read_text()
-          old = """      const refreshed=await getChannelById(channel.channel_id);
-      if(refreshed?.scan_status==='FAILED')throw new Error('Retryable community acquisition remains unresolved');
-      await completeJob(job.id);return true;
-"""
-          new = """      const refreshed=await getChannelById(channel.channel_id);
-      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT')throw new Error('Retryable community acquisition remains unresolved');
-      await completeJob(job.id);return true;
-"""
-          if old not in text:
-              raise SystemExit('queueManager retry dispatcher anchor not found')
-          text = text.replace(old,new,1)
-
-          old = """    channel.scan_attempts++;
-    if (channel.scan_attempts >= 3) {
-      channel.scan_status = 'FAILED_PERMANENT';
-    } else {
-      channel.scan_status = 'FAILED';
-    }
-    if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
-"""
-          new = """    channel.scan_attempts++;
-    // Durable RETRY_COMMUNITY_ACQUISITION owns the retry budget. Keep channel
-    // state retryable here so an internal scan counter cannot prematurely stop
-    // a job that still has durable attempts remaining.
-    channel.scan_status = 'FAILED';
-    if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
-"""
-          if old not in text:
-              raise SystemExit('queueManager channel permanence anchor not found')
-          text = text.replace(old,new,1)
-
-          old = """    if (job.type === 'ENRICH_CHANNEL' && terminal) {
-      const channelId = String(job.payload?.channelId || '');
-      const channel = channelId ? await getChannelById(channelId) : null;
-      if (channel && channel.trading_status === 'UNCERTAIN') {
-        channel.scan_status = 'NEEDS_REVIEW';
-        channel.trading_status = 'NEEDS_REVIEW';
-        channel.scan_attempts = job.attempts;
-        channel.last_checked = new Date().toISOString();
-        await upsertChannel(channel);
-        void recordAdmissionShadow({channelId,priorState:'NOT_EVALUATED',classificationStatus:'UNCERTAIN',investigationState:'OPERATIONALLY_BLOCKED',operationalFailure:true,candidateHypothesis:{},evidenceCoverage:{failureClass:String(err?.code||err?.name||'WORKER_FAILURE')}})
-          .catch(error=>console.warn(`[CandidateAdmission] operational-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
-      }
-    }
-"""
-          new = """    if (job.type === 'ENRICH_CHANNEL' && terminal) {
-      const channelId = String(job.payload?.channelId || '');
-      const channel = channelId ? await getChannelById(channelId) : null;
-      if (channel && channel.trading_status === 'UNCERTAIN') {
-        channel.scan_status = 'NEEDS_REVIEW';
-        channel.trading_status = 'NEEDS_REVIEW';
-        channel.scan_attempts = job.attempts;
-        channel.last_checked = new Date().toISOString();
-        await upsertChannel(channel);
-        void recordAdmissionShadow({channelId,priorState:'NOT_EVALUATED',classificationStatus:'UNCERTAIN',investigationState:'OPERATIONALLY_BLOCKED',operationalFailure:true,candidateHypothesis:{},evidenceCoverage:{failureClass:String(err?.code||err?.name||'WORKER_FAILURE')}})
-          .catch(error=>console.warn(`[CandidateAdmission] operational-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
-      }
-    }
-    if (job.type === 'RETRY_COMMUNITY_ACQUISITION' && terminal) {
-      const channelId=String(job.payload?.channelId||'');
-      const channel=channelId?await getChannelById(channelId):null;
-      if(channel){channel.scan_status='FAILED_PERMANENT';channel.scan_attempts=Math.max(channel.scan_attempts||0,job.attempts);channel.last_checked=new Date().toISOString();await upsertChannel(channel);}
-    }
-"""
-          if old not in text:
-              raise SystemExit('queueManager terminal handling anchor not found')
-          qm.write_text(text.replace(old,new,1))
-
-          Path('server/retryLifecyclePolicy.test.ts').write_text("""import test from 'node:test';
-import assert from 'node:assert/strict';
-import { decideJobFailure, isRetryableInfrastructureFailure } from './db';
-
-const now=1_700_000_000_000;
-
-test('quota/provider capacity waits without consuming an attempt even without retryAt',()=>{
-  const result=decideJobFailure({code:'QUOTA_ALLOCATION_EXHAUSTED'},3,3,now);
-  assert.equal(result.disposition,'RETRYING_WITHOUT_ATTEMPT');
-  assert.ok((result.runAfter||0)>now);
-});
-
-test('provider cooldown honors retryAt without consuming an attempt',()=>{
-  const retryAt=now+60_000;
-  assert.deepEqual(decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt},2,3,now),{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:retryAt});
-});
-
-test('common network/provider outages are retryable infrastructure failures',()=>{
-  for(const error of [{code:'ETIMEDOUT'},{code:'ECONNRESET'},{code:'EAI_AGAIN'},{status:429},{statusCode:503},{name:'TimeoutError'}]){
-    assert.equal(isRetryableInfrastructureFailure(error),true,JSON.stringify(error));
-    assert.equal(decideJobFailure(error,3,3,now).disposition,'RETRYING_WITHOUT_ATTEMPT');
-  }
-});
-
-test('application/logic failures still consume the bounded retry budget',()=>{
-  assert.equal(decideJobFailure(new Error('classifier invariant failed'),1,3,now).disposition,'RETRYING');
-  assert.equal(decideJobFailure(new Error('classifier invariant failed'),3,3,now).disposition,'FAILED');
-});
-
-test('investigation deadline remains terminal and cannot loop forever',()=>{
-  assert.equal(decideJobFailure({code:'INVESTIGATION_DEADLINE_EXCEEDED'},1,5,now).disposition,'FAILED');
-});
-""")
-          PY
+        run: python3 scripts/apply_retry_patch.py
       - name: Retry lifecycle regression tests
         run: node --import tsx --test server/retryLifecyclePolicy.test.ts
       - name: TypeScript
@@ -179,6 +40,6 @@ test('investigation deadline remains terminal and cannot loop forever',()=>{
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add server/db.ts server/queueManager.ts server/retryLifecyclePolicy.test.ts
           git commit -m 'Harden transient retries and community acquisition lifecycle'
-          git rm .github/workflows/retry-lifecycle-apply.yml
+          git rm .github/workflows/retry-lifecycle-apply.yml scripts/apply_retry_patch.py
           git commit -m 'Remove one-time retry lifecycle applicator'
           git push origin HEAD:fix/retry-lifecycle-hardening
