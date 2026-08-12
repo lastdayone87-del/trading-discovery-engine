@@ -84,8 +84,24 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
   };
 }
 
+/**
+ * A query that produces a sufficiently large, overwhelmingly unresolved or
+ * non-trading cohort is unsafe to recycle through autonomous exploration.
+ * Quarantine it after the first bad run instead of requiring a second flood to
+ * cross the historical performance threshold. This is country-neutral and is
+ * based only on observed retrieval outcomes.
+ */
+export function isSeverelyContaminatedQuery(metrics: QueryFunnelMetrics): boolean {
+  const evaluated = metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed;
+  if (metrics.distinctResults < 8 || evaluated < 8) return false;
+  const unresolvedOrNonTrading = metrics.nonTrading + metrics.uncertain + metrics.needsReview;
+  const contaminationRatio = ratio(unresolvedOrNonTrading, evaluated);
+  return contaminationRatio >= 0.8 && metrics.tradingPrecision <= 0.1 && metrics.qualityChannels === 0;
+}
+
 export function selectQueryCollection(current: QueryCollection, priorRuns: number, metrics: QueryFunnelMetrics): QueryCollection {
   const totalRuns = priorRuns + 1;
+  if (isSeverelyContaminatedQuery(metrics)) return 'REJECTED';
   if (metrics.performanceScore >= 60) return 'PROVEN';
   if (metrics.performanceScore < 25 && totalRuns >= 2) return 'REJECTED';
   return current === 'REJECTED' ? 'REJECTED' : 'EXPERIMENTAL';

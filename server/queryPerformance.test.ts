@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateQueryFunnel, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, isSeverelyContaminatedQuery, selectQueryCollection, type QueryObservation } from './queryPerformance';
 
 test('query funnel keeps duplicates, known channels, exclusions, and classifications separate', () => {
   const observations: QueryObservation[] = [
@@ -35,4 +35,32 @@ test('excluded candidates never count as new database channels', () => {
   assert.equal(metrics.newChannels, 0);
   assert.equal(metrics.performanceScore, 0);
   assert.equal(selectQueryCollection('EXPERIMENTAL', 1, metrics), 'REJECTED');
+});
+
+test('severely contaminated retrieval is quarantined after its first run', () => {
+  const observations: QueryObservation[] = Array.from({ length: 10 }, (_, index) => ({
+    channelId: `junk-${index}`,
+    wasKnown: false,
+    persisted: true,
+    funnelOutcome: index === 0 ? 'TRADING_CONFIRMED' as const : index < 6 ? 'UNCERTAIN' as const : 'NEEDS_REVIEW' as const,
+    qualityScore: index === 0 ? 20 : 0,
+    hasCommunity: false
+  }));
+  const metrics = calculateQueryFunnel(10, observations);
+  assert.equal(isSeverelyContaminatedQuery(metrics), true);
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
+});
+
+test('mixed but useful exploratory retrieval is not prematurely quarantined', () => {
+  const observations: QueryObservation[] = Array.from({ length: 10 }, (_, index) => ({
+    channelId: `candidate-${index}`,
+    wasKnown: false,
+    persisted: true,
+    funnelOutcome: index < 3 ? 'TRADING_CONFIRMED' as const : 'UNCERTAIN' as const,
+    qualityScore: index < 3 ? 70 : 35,
+    hasCommunity: index === 0
+  }));
+  const metrics = calculateQueryFunnel(10, observations);
+  assert.equal(isSeverelyContaminatedQuery(metrics), false);
+  assert.notEqual(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
 });

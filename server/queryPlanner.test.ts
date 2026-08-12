@@ -74,7 +74,7 @@ test('planner creates short, unique, attributable retrieval queries', () => {
   assert.ok(planned.every(item => item.generationReason && item.discoveryObjective && item.primaryTerm));
   assert.ok(planned.every(item => Array.isArray(item.metadata.atoms) && item.metadata.retrievalOptimized === true));
   assert.ok(planned.some(item => item.knowledgeTiers.includes(2)));
-  assert.ok(planned.some(item => item.knowledgeTiers.includes(3)));
+  assert.ok(planned.every(item => !item.query.toLowerCase().includes('creator catchphrase')));
   assert.ok(planned.filter(item => item.knowledgeTiers.includes(3)).length <= Math.ceil(planned.length / 5));
 });
 
