@@ -1,0 +1,38 @@
+name: Dashboard Diagnostics View PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server.ts'
+      - 'server/db.ts'
+      - 'server/dashboardDiagnosticsPolicy.test.ts'
+      - 'src/App.tsx'
+      - 'src/channelListingQuery.ts'
+      - 'src/channelListingQuery.test.ts'
+      - '.github/workflows/dashboard-diagnostics-view-pr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Diagnostics view regression tests
+        run: node --import tsx --test server/dashboardDiagnosticsPolicy.test.ts src/channelListingQuery.test.ts
+      - name: TypeScript
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
