@@ -9,6 +9,7 @@ import {
   releaseSchedulerLock,
   scheduleAutonomousQueryRuns,
   setAppSetting,
+  setQueryCollection,
   updateSchedulerState,
   getDailyYouTubeQuotaBudget
 } from './db';
@@ -20,6 +21,7 @@ import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -212,13 +214,25 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         selectionStrategy: 'UCB1_EXPLORATION' as const,
         reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
       } : await selectNextQueryForCountry(country);
+
+      // Every query source is revalidated immediately before scheduling. Stored
+      // PROVEN/EXPERIMENTAL queries and research allocations are not grandfathered
+      // across retrieval-policy upgrades.
+      const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord);
+      if (!queryAuthority.eligible) {
+        log(`Withheld autonomous query #${selected.queryRecord.id} "${selected.queryRecord.query}" (${selected.queryRecord.country}) before YouTube: ${queryAuthority.reasonCodes.join(', ')}.`);
+        await setQueryCollection(selected.queryRecord.id, 'REJECTED')
+          .catch(error => console.warn('[Autonomous Producer] Failed to quarantine unsafe query:', error));
+        continue;
+      }
+
       const intent = selected.queryRecord.intent;
       const primaryTerm = selected.queryRecord.primary_term || selected.queryRecord.query;
       if ((usedIntents.has(intent) || usedPrimaryTerms.has(primaryTerm)) && attempts < countries.length * 2) continue;
       const created = await scheduleAutonomousQueryRuns([{
         query: selected.queryRecord,
         strategy: selected.selectionStrategy,
-        reason: selected.reason,
+        reason: `${selected.reason} Execution authority: ${queryAuthority.reasonCodes.join(', ')}.`,
         allocationProvenance: creatorAllocation ? {
           assignmentId: creatorAllocation.assignmentId,
           assignmentKey: creatorAllocation.assignmentKey,
