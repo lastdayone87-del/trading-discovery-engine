@@ -37,7 +37,8 @@ function isTransientPostgresStartupError(error: any): boolean {
 function sleep(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function waitForPostgresReady(db: InstanceType<typeof Pool>): Promise<void> {
-  const maxWaitMs = Math.max(30_000, Number(process.env.POSTGRES_STARTUP_MAX_WAIT_MS || '300000'));
+  const configuredMaxWaitMs = Number(process.env.POSTGRES_STARTUP_MAX_WAIT_MS || '300000');
+  const maxWaitMs = Number.isFinite(configuredMaxWaitMs) && configuredMaxWaitMs >= 30_000 ? configuredMaxWaitMs : 300_000;
   const started = Date.now();
   let attempt = 0;
   while (true) {
