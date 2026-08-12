@@ -70,7 +70,10 @@ const SPAM_HYPE_KEYWORDS = [
 ];
 
 /**
- * Calculates a non-engagement-dominant Creator Quality Score (0 - 100)
+ * Calculates a non-engagement-dominant Creator Quality Score (0 - 100).
+ * Freshness must come from observed publication timestamps/activity metadata;
+ * merely receiving one or more search-result titles is not proof that a creator
+ * is currently active.
  */
 export function calculateCreatorQualityScore(
   channel: Partial<ChannelRecord> & { channel_name: string },
@@ -115,13 +118,29 @@ export function calculateCreatorQualityScore(
 
   educationalScore = Math.min(35, Math.max(0, educationalScore));
 
-  // 2. Freshness & Activity (Max 25)
-  let freshnessScore = 20; // Default active assumption
-  if (videoTitles.length > 0) {
+  // 2. Freshness & Activity (Max 25). Unknown is deliberately neutral-low:
+  // search result titles can be 5, 10, or 15 years old and must not earn a
+  // maximum freshness score without an observed upload timestamp.
+  let freshnessScore = 8;
+  const band = channel.activity_band || 'UNKNOWN';
+  if (band === 'VERY_ACTIVE') {
     freshnessScore = 25;
-    reasons.push(`Active content stream with ${videoTitles.length} recent video titles analyzed`);
+    reasons.push('Very active creator: latest observed upload is within 30 days');
+  } else if (band === 'ACTIVE') {
+    freshnessScore = 22;
+    reasons.push('Active creator: latest observed upload is within 90 days');
+  } else if (band === 'OCCASIONAL') {
+    freshnessScore = 14;
+    reasons.push('Occasionally active creator: latest observed upload is within one year');
+  } else if (band === 'DORMANT') {
+    freshnessScore = 2;
+    reasons.push('Dormant creator: latest observed upload is older than one year');
+  } else if (channel.latest_upload_at && Number.isFinite(Date.parse(channel.latest_upload_at))) {
+    const ageDays = Math.max(0, (Date.now() - Date.parse(channel.latest_upload_at)) / 86_400_000);
+    freshnessScore = ageDays <= 30 ? 25 : ageDays <= 90 ? 22 : ageDays <= 365 ? 14 : 2;
+    reasons.push(`Freshness derived from latest observed upload (${Math.round(ageDays)} days ago)`);
   } else {
-    reasons.push('Standard activity level');
+    reasons.push('Creator activity has not yet been verified; no freshness bonus awarded from search titles alone');
   }
 
   // 3. Community Presence (Max 25)

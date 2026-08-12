@@ -1,0 +1,31 @@
+name: Discovery depth regression
+
+on:
+  pull_request:
+    paths:
+      - 'server/candidateTriage.ts'
+      - 'server/inspector.ts'
+      - 'server/queryIntelligence.ts'
+      - 'server/queueManager.ts'
+      - 'server/searchOrdering.ts'
+      - 'server/continuationPolicy.ts'
+      - 'server/discoveryDepthRegression.test.ts'
+      - 'src/types/index.ts'
+      - '.github/workflows/discovery-depth-regression.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Discovery depth regression tests
+        run: node --import tsx --test server/discoveryDepthRegression.test.ts
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
