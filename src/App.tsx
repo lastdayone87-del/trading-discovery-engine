@@ -314,7 +314,7 @@ export default function App() {
           <div className="space-y-4">
             <div className="flex items-center justify-between px-1">
               <h2 className="text-sm font-bold text-slate-800 dark:text-slate-200">
-                Matching Results: {channelTotal} {includeRejected ? '(including diagnostics / excluded channels)' : '(validated active channels)'}
+                Matching Results: {channelTotal} {includeRejected ? '(diagnostics / excluded only)' : '(validated active channels)'}
 
               </h2>
               <label className="flex items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-400 cursor-pointer bg-white dark:bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-xs">
@@ -328,10 +328,11 @@ export default function App() {
                   }}
                   className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                 />
-                <span>Show Diagnostics / Excluded Channels</span>
+                <span>Show Diagnostics / Excluded Only</span>
               </label>
             </div>
             <ResultsTable
+              key={includeRejected ? 'diagnostics' : 'active'}
               channels={channels}
               onRecheck={handleRecheck}
               onInspect={inspectChannel}
