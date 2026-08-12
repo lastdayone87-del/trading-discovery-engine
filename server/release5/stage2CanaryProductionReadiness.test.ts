@@ -29,5 +29,5 @@ test('production workflow is manual-only for database readiness', () => {
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /npm run migrate/);
   assert.match(workflow, /stage2CanaryProductionReadiness\.ts/);
-  assert.doesNotMatch(workflow, /setStage2CanaryMode/);
+  assert.doesNotMatch(script, /setStage2CanaryMode/);
 });
