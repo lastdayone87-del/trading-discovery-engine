@@ -1,0 +1,28 @@
+name: Repeated trading focus detection
+
+on:
+  pull_request:
+    paths:
+      - 'server/evidenceEngine/providers/VideoMetadataProvider.ts'
+      - 'server/evidenceEngine/multilingualTerminology.ts'
+      - 'server/evidenceEngine/stagedClassification.ts'
+      - 'server/repeatedTradingFocusDetection.test.ts'
+      - '.github/workflows/repeated-trading-focus-detection.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Repeated trading focus regression tests
+        run: node --import tsx --test server/repeatedTradingFocusDetection.test.ts server/enrichmentOutcomeLifecycle.test.ts
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build

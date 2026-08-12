@@ -2,6 +2,40 @@ import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContex
 import { textMatchesTerm } from '../utils/textMatching';
 import { isTradingFocusedText } from '../multilingualTerminology';
 
+/**
+ * Cheap creator-owned upload signal used only after enrichment. The broader
+ * multilingual classifier intentionally uses narrow phrases, which meant obvious
+ * titles such as "Trading Strategia" / "Live Trading" could fail the repeated-
+ * upload route. Repeated upload evidence is already guarded by the 70% + three
+ * independent-video requirement upstream, so this helper may safely recognize
+ * explicit active-trading language while excluding common non-financial uses.
+ */
+export function isExplicitCreatorTradingText(text: string, context: LayeredKnowledgeContext): boolean {
+  const normalized = text.normalize('NFKC');
+  const unrelatedTradingUsage = /\b(trading\s*cards?|card\s*trading|pok[eé]mon|yugioh|steam\s*trading|skin\s*trading|sports?\s*card)\b/iu;
+  const genericTradingLiteral = /\b(trading|trader)\b/iu;
+  const explicitFinancialTradingLiteral = /\b(day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|intraday|scalp(?:ing|er)|forex|fx\s*trading|futures?|options?|0dte|prop\s*firm|funded\s*trader|stocks?|equities|shares?|crypto|bitcoin|ethereum|btc|eth|nasdaq|s&p\s*500|sp500)\b/iu;
+  const nativeTradingLiteral = /(トレード|デイトレード|先物|株式取引|تداول|交易|交易策略|交易计划)/u;
+
+  const hasGenericTradingLiteral = genericTradingLiteral.test(normalized);
+  const hasExplicitFinancialLiteral = explicitFinancialTradingLiteral.test(normalized) || nativeTradingLiteral.test(normalized);
+  const hasKnownMethod = context.globalAdvancedConcepts.some(term => textMatchesTerm(normalized, term));
+  const hasKnownPlatform = context.globalPlatformsPropFirms.some(term => textMatchesTerm(normalized, term));
+  const languagePositiveTerms = (context.languageKnowledgePacks || [context.languageKnowledge]).flatMap(pack => pack?.positiveTerms || []);
+  const hasLanguageTradingSignal = languagePositiveTerms.some(term => textMatchesTerm(normalized, term));
+  const hasCountryTradingSignal = (context.countryKnowledge?.nativeTradingTerminology || []).some(term => textMatchesTerm(normalized, term));
+
+  // Generic uses of the word "trading" are ambiguous. When the same text is
+  // clearly about cards, game items, or skins, only explicit financial-market
+  // evidence may override the exclusion. Broad language-pack terms such as the
+  // literal word "trading" are intentionally not sufficient for that override.
+  if (unrelatedTradingUsage.test(normalized)) {
+    return hasExplicitFinancialLiteral || hasKnownMethod || hasKnownPlatform || hasCountryTradingSignal;
+  }
+
+  return hasGenericTradingLiteral || hasExplicitFinancialLiteral || hasKnownMethod || hasKnownPlatform || hasLanguageTradingSignal || hasCountryTradingSignal;
+}
+
 export class VideoMetadataProvider implements EvidenceProvider {
   name = 'video_metadata' as const;
 
@@ -32,7 +66,7 @@ export class VideoMetadataProvider implements EvidenceProvider {
       const desc = descriptions[i] || '';
       const combo = `${title} ${desc}`;
 
-      const isTrading = isTradingFocusedText(combo, knowledgeContext);
+      const isTrading = isTradingFocusedText(combo, knowledgeContext) || isExplicitCreatorTradingText(combo, knowledgeContext);
       if (isTrading) {
         tradingFocusedCount++;
       }
