@@ -266,7 +266,7 @@ export async function processNextSearchJob(
       await upsertChannel(channel);
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
-      const hybridEnrichmentEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true')==='true';
+      const hybridEnrichmentEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'false')==='true';
       // If country attribution is already independently CONFIRMED, the expensive
       // creator-evidence portion can proceed entirely through YouTube.js. Official
       // channels.list remains required for unresolved country attribution and for
@@ -316,7 +316,7 @@ export async function processNextSearchJob(
 
     // Only durable autonomous query runs are eligible for quota-free InnerTube
     // discovery. Manual/operator searches keep the official Data API path.
-    const innerTubeEnabled = !!queryRunId && await getAppSetting('youtube_inner_tube_autonomous_enabled', process.env.YOUTUBE_INNERTUBE_AUTONOMOUS_ENABLED || 'true') === 'true';
+    const innerTubeEnabled = !!queryRunId && await getAppSetting('youtube_inner_tube_autonomous_enabled', process.env.YOUTUBE_INNERTUBE_AUTONOMOUS_ENABLED || 'false') === 'true';
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
     let providerQuotaUnits = 0;
     let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null } | null = null;
