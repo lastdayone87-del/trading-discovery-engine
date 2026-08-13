@@ -1,0 +1,38 @@
+name: Apply queue diagnostics panel
+
+on:
+  push:
+    branches: [feat/queue-diagnostics-panel]
+    paths:
+      - 'scripts/applyQueueBacklogPanel.mjs'
+      - '.github/workflows/apply-queue-diagnostics-panel.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/queue-diagnostics-panel
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: node scripts/applyQueueBacklogPanel.mjs
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check
+      - name: Commit panel implementation
+        run: |
+          git config user.name 'lastdayone87-del'
+          git config user.email 'lastdayone87@gmail.com'
+          git add src/components/QueueMonitor.tsx
+          git diff --cached --quiet && exit 0
+          git commit -m 'Show enrichment backlog diagnosis in queue monitor'
+          git push origin HEAD:feat/queue-diagnostics-panel
