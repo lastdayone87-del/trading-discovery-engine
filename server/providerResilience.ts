@@ -73,7 +73,7 @@ function geminiCapacityConfig():GeminiCapacityConfig {
     vocabularySemanticQuietMs: envMs('GEMINI_VOCABULARY_SEMANTIC_QUIET_MS', 2*60*1000),
     vocabularyMinIntervalMs: envMs('GEMINI_VOCABULARY_MIN_INTERVAL_MS', 30000),
     maxInlineWaitMs: envMs('GEMINI_CAPACITY_MAX_INLINE_WAIT_MS', 8000),
-    semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 120000)
+    semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 90000)
   };
 }
 
@@ -98,7 +98,16 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   return {action:waitMs>0?'WAIT':'RUN',waitMs};
 }
 
-const sleep=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
+function waitForCapacity(ms:number,signal?:AbortSignal):Promise<void>{
+  if(ms<=0)return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    let timer:ReturnType<typeof setTimeout>;
+    const onAbort=()=>{clearTimeout(timer);const error=new Error('aborted');error.name='AbortError';reject(error)};
+    if(signal?.aborted)return onAbort();
+    timer=setTimeout(()=>{signal?.removeEventListener('abort',onAbort);resolve()},ms);
+    signal?.addEventListener('abort',onAbort,{once:true});
+  });
+}
 
 type GeminiCapacityLease={release:()=>Promise<void>};
 
@@ -113,7 +122,7 @@ export function geminiCapacityDeferralError(operation:string, reasonCode?:string
   return new ProviderCallError(message,'TRANSIENT',true,{providerReasons:[reasonCode||'GEMINI_CAPACITY_DEFERRED']});
 }
 
-async function acquireGeminiCapacity(context:ProviderCallContext):Promise<GeminiCapacityLease|undefined>{
+async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSignal):Promise<GeminiCapacityLease|undefined>{
   if(context.provider!=='gemini') return undefined;
   let client:any;
   try{
@@ -128,27 +137,18 @@ async function acquireGeminiCapacity(context:ProviderCallContext):Promise<Gemini
       client.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION])
     ]);
     const at=(row:any)=>row?.occurred_at?new Date(row.occurred_at).getTime():undefined;
-    const decision=decideGeminiCapacity(context.operation,{
-      nowMs:Date.now(),
-      lastGeminiAtMs:at(lastAny.rows[0]),
-      lastRateLimitAtMs:at(lastRate.rows[0]),
-      lastSemanticAtMs:at(lastSemantic.rows[0]),
-      lastVocabularyAtMs:at(lastVocabulary.rows[0])
-    });
+    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});
     if(decision.action==='DEFER'){
       await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);
       client.release(); client=undefined;
       throw geminiCapacityDeferralError(context.operation,decision.reasonCode);
     }
-    if(decision.waitMs>0) await sleep(decision.waitMs);
-    return {release:async()=>{
-      if(!client)return;
-      await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);
-      client.release(); client=undefined;
-    }};
+    if(decision.waitMs>0) await waitForCapacity(decision.waitMs,signal);
+    return {release:async()=>{if(!client)return;await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();client=undefined;}};
   }catch(error){
     if(client){await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();}
     if(error instanceof ProviderCallError) throw error;
+    if((error as any)?.name==='AbortError')throw error;
     if(context.operation===GEMINI_VOCABULARY_OPERATION) throw new ProviderCallError('Gemini vocabulary extraction deferred because capacity state is unavailable.','TRANSIENT',true,{cause:error,providerReasons:['VOCABULARY_CAPACITY_STATE_UNAVAILABLE']});
     return undefined;
   }
@@ -164,9 +164,9 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   let capacityLease:GeminiCapacityLease|undefined;
   let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
   const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
+  if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
   try{
-    capacityLease=await acquireGeminiCapacity(args.context);
-    if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
+    capacityLease=await acquireGeminiCapacity(args.context,controller.signal);
     args.trace?.('before provider-call at server/providerResilience.ts');
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
@@ -175,9 +175,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   }catch(error){
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
-    if(args.context.provider==='gemini'){
-      console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
-    }
+    if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
     await args.emit({...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()}).catch(()=>undefined);
     throw typed;
   }finally{
