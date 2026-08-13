@@ -38,6 +38,30 @@ interface ProviderMetricsResponse {
   queueLatency: QueueLatencyRow[];
 }
 
+interface EnrichmentBacklogJob {
+  jobId: string;
+  channelId: string | null;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  runAfter: string;
+  attempts: number;
+  maxAttempts: number;
+  runnable: boolean;
+  lastError: string | null;
+  diagnosis: 'RUNNABLE_WAITING'|'PROVIDER_BACKOFF'|'ACTIVE_LEASE'|'OPERATIONAL_RETRY'|'INVESTIGATION_DEADLINE_RISK'|'UNKNOWN';
+  investigation?: { state?: string; deadlineAt?: string; step?: { state?: string; failureClass?: string; leaseExpiresAt?: string } } | null;
+  provider?: { provider?: string; operation?: string; status?: string; errorClass?: string; occurredAt?: string } | null;
+}
+
+interface EnrichmentBacklogResponse {
+  generatedAt: string;
+  readOnly: boolean;
+  aggregate: { pending?: number; runnable?: number; deferred?: number; running?: number; failed?: number; completed?: number; oldest_noncompleted_created_at?: string | null; next_deferred_run_at?: string | null };
+  throughput: Array<{ label: string; attempts_started?: number; attempts_finished?: number; jobs_completed?: number; jobs_failed_current?: number; currently_deferred_recently_updated?: number }>;
+  oldest: EnrichmentBacklogJob[];
+}
+
 interface DepthSnapshot {
   depth: number;
   observedAt: number;
@@ -64,8 +88,21 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
   const [providerMetrics, setProviderMetrics] = useState<ProviderMetricsResponse | null>(null);
   const [metricsError, setMetricsError] = useState<string | null>(null);
   const [metricsUpdatedAt, setMetricsUpdatedAt] = useState<number | null>(null);
+  const [backlogDiagnostics, setBacklogDiagnostics] = useState<EnrichmentBacklogResponse | null>(null);
+  const [backlogError, setBacklogError] = useState<string | null>(null);
   const depthHistory = useRef<DepthSnapshot[]>([]);
   const metricsRequestSequence = useRef(0);
+
+  const fetchBacklogDiagnostics = useCallback(async () => {
+    try {
+      const response = await apiFetch('/api/diagnostics/enrichment-backlog?limit=10');
+      if (!response.ok) throw new Error('Backlog diagnostic returned HTTP '+response.status);
+      setBacklogDiagnostics(await response.json() as EnrichmentBacklogResponse);
+      setBacklogError(null);
+    } catch (error: any) {
+      setBacklogError(error?.message || 'Unable to load enrichment backlog diagnosis.');
+    }
+  }, []);
 
   const fetchProviderMetrics = useCallback(async () => {
     const requestSequence = ++metricsRequestSequence.current;
@@ -92,11 +129,12 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
 
   useEffect(() => {
     void fetchProviderMetrics();
+    void fetchBacklogDiagnostics();
     const interval = window.setInterval(() => {
-      if (!document.hidden) void fetchProviderMetrics();
+      if (!document.hidden) { void fetchProviderMetrics(); void fetchBacklogDiagnostics(); }
     }, 15_000);
     return () => window.clearInterval(interval);
-  }, [fetchProviderMetrics]);
+  }, [fetchProviderMetrics, fetchBacklogDiagnostics]);
 
   const queues = queueStatus ? [
     {
@@ -188,7 +226,11 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
   const refreshAll = () => {
     onRefresh();
     void fetchProviderMetrics();
+    void fetchBacklogDiagnostics();
   };
+
+  const diagnosisCounts = (backlogDiagnostics?.oldest || []).reduce<Record<string,number>>((acc,job)=>{acc[job.diagnosis]=(acc[job.diagnosis]||0)+1;return acc;},{});
+  const throughput1h = backlogDiagnostics?.throughput.find(row=>row.label==='1h');
 
   return (
     <div className="space-y-6">
@@ -331,6 +373,27 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
             <div className="px-4 pb-3 text-[10px] text-slate-400">Last refreshed: {metricsUpdatedAt ? new Date(metricsUpdatedAt).toLocaleTimeString() : 'loading…'}</div>
           </>
         )}
+      </section>
+
+      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800">
+          <div className="flex items-center gap-2"><Gauge className="w-4 h-4 text-indigo-600 dark:text-indigo-400" /><h3 className="text-sm font-bold">Enrichment Backlog Diagnosis</h3></div>
+          <p className="text-[11px] text-slate-500 mt-1">Authenticated, read-only persisted queue evidence. Oldest sample is limited to 10 jobs.</p>
+        </div>
+        {backlogError ? <div className="p-4 text-xs text-rose-600 dark:text-rose-400">{backlogError}</div> : backlogDiagnostics ? <>
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-px bg-slate-200 dark:bg-slate-800">
+            {[['Pending',backlogDiagnostics.aggregate.pending||0],['Runnable',backlogDiagnostics.aggregate.runnable||0],['Deferred',backlogDiagnostics.aggregate.deferred||0],['Running',backlogDiagnostics.aggregate.running||0],['Completed 1h',throughput1h?.jobs_completed||0]].map(([label,value])=><div key={String(label)} className="bg-white dark:bg-slate-900 p-3"><div className="text-[9px] uppercase tracking-wider font-bold text-slate-500">{label}</div><div className="mt-1 text-xl font-extrabold font-mono">{value}</div></div>)}
+          </div>
+          <div className="p-4 flex flex-wrap gap-2">
+            {['RUNNABLE_WAITING','PROVIDER_BACKOFF','OPERATIONAL_RETRY','ACTIVE_LEASE','INVESTIGATION_DEADLINE_RISK','UNKNOWN'].map(label=><span key={label} className="rounded border border-slate-200 dark:border-slate-700 px-2 py-1 text-[10px] font-mono">{label}: {diagnosisCounts[label]||0}</span>)}
+          </div>
+          <div className="border-t border-slate-200 dark:border-slate-800 overflow-x-auto">
+            <table className="w-full text-[10px] min-w-[900px]"><thead className="bg-slate-50 dark:bg-slate-800/50 text-slate-500 uppercase"><tr><th className="text-left px-3 py-2">Diagnosis</th><th className="text-left px-3 py-2">Status</th><th className="text-left px-3 py-2">Channel</th><th className="text-right px-3 py-2">Attempts</th><th className="text-left px-3 py-2">Run after</th><th className="text-left px-3 py-2">Step</th><th className="text-left px-3 py-2">Provider</th><th className="text-left px-3 py-2">Last error</th></tr></thead>
+              <tbody>{backlogDiagnostics.oldest.map(job=><tr key={job.jobId} className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 font-mono font-semibold">{job.diagnosis}</td><td className="px-3 py-2 font-mono">{job.status}</td><td className="px-3 py-2 font-mono max-w-[180px] truncate">{job.channelId||'—'}</td><td className="px-3 py-2 text-right font-mono">{job.attempts}/{job.maxAttempts}</td><td className="px-3 py-2 font-mono">{job.runAfter ? new Date(job.runAfter).toLocaleString() : '—'}</td><td className="px-3 py-2 font-mono">{job.investigation?.step?.state||'—'}</td><td className="px-3 py-2 font-mono">{job.provider?.provider ? job.provider.provider+':'+(job.provider.status||'') : '—'}</td><td className="px-3 py-2 max-w-[320px] truncate" title={job.lastError||undefined}>{job.lastError||'—'}</td></tr>)}</tbody>
+            </table>
+          </div>
+          <div className="px-4 py-2 text-[10px] text-slate-400">Generated: {new Date(backlogDiagnostics.generatedAt).toLocaleString()} · readOnly={String(backlogDiagnostics.readOnly)}</div>
+        </> : <div className="p-4 text-xs text-slate-500">Loading backlog diagnosis…</div>}
       </section>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
