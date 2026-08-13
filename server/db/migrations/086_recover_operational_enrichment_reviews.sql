@@ -2,6 +2,46 @@
 -- latest enrichment outcome is operationally degraded. Historical failures are
 -- deliberately ignored when a newer enrichment outcome exists.
 
+-- Recovery generations preserve the immutable event ledger when an historical
+-- investigation step is deliberately executed again. Existing generations are
+-- zero; only the exact recovered step/investigation is incremented below.
+ALTER TABLE investigation_steps
+  ADD COLUMN IF NOT EXISTS recovery_generation INTEGER NOT NULL DEFAULT 0
+  CHECK (recovery_generation >= 0);
+ALTER TABLE investigations
+  ADD COLUMN IF NOT EXISTS recovery_generation INTEGER NOT NULL DEFAULT 0
+  CHECK (recovery_generation >= 0);
+
+-- Runtime workflow event keys predate recovery generations. Namespace events for
+-- recovered steps/investigations at INSERT time so old immutable keys remain
+-- untouched and a recovered execution cannot disappear via ON CONFLICT DO NOTHING.
+CREATE OR REPLACE FUNCTION namespace_recovered_investigation_event_key()
+RETURNS TRIGGER AS $$
+DECLARE
+  generation INTEGER := 0;
+BEGIN
+  IF NEW.step_id IS NOT NULL THEN
+    SELECT recovery_generation INTO generation
+    FROM investigation_steps
+    WHERE id=NEW.step_id;
+  ELSE
+    SELECT recovery_generation INTO generation
+    FROM investigations
+    WHERE id=NEW.investigation_id;
+  END IF;
+
+  IF COALESCE(generation,0) > 0 THEN
+    NEW.event_key := NEW.event_key || ':recovery:' || generation::text;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS investigation_events_recovery_namespace ON investigation_events;
+CREATE TRIGGER investigation_events_recovery_namespace
+BEFORE INSERT ON investigation_events
+FOR EACH ROW EXECUTE FUNCTION namespace_recovered_investigation_event_key();
+
 CREATE TEMP TABLE recover_operational_enrichment_reviews ON COMMIT DROP AS
 WITH latest_enrichment AS (
   SELECT DISTINCT ON (j.payload->>'channelId')
@@ -67,24 +107,63 @@ FROM recover_operational_enrichment_reviews recover
 WHERE c.channel_id=recover.channel_id;
 
 -- If the recovered job is owned by a resumable investigation, reopen the exact
--- step before the job becomes runnable. Otherwise startInvestigationStep() sees
--- the old COMPLETED/FAILED projection and safely-but-incorrectly skips the job.
+-- step before the job becomes runnable. Increment recovery_generation first so
+-- all subsequent workflow events for this execution receive a fresh identity.
 UPDATE investigation_steps s
 SET state='PENDING',attempt_count=0,worker_id=NULL,lease_expires_at=NULL,
     started_at=NULL,completed_at=NULL,resulting_status=NULL,output_checksum=NULL,
-    failure_class=NULL,updated_at=now()
+    failure_class=NULL,recovery_generation=recovery_generation+1,updated_at=now()
 FROM recover_operational_enrichment_reviews recover
 WHERE s.job_id=recover.job_id
   AND s.state IN ('COMPLETED','FAILED','SKIPPED','RETRYING','RUNNING');
 
--- Reopen only investigations that own one of those exact recovered jobs. Keep
--- current_step_id pointing at the same step so the existing workflow resumes it.
+-- Reopen only investigations owning those exact recovered steps. Refresh the
+-- deadline from the existing investigation_deadline_minutes policy (30 minutes
+-- if the setting is absent/malformed), and align the investigation generation
+-- with the recovered step so terminal events are namespaced too.
 UPDATE investigations i
-SET state='ACTIVE',completed_at=NULL,updated_at=now()
+SET state='ACTIVE',
+    completed_at=NULL,
+    deadline_at=now()+(
+      COALESCE(
+        (SELECT CASE
+           WHEN setting_value ~ '^[0-9]+$' AND setting_value::INTEGER > 0
+             THEN setting_value::INTEGER
+           ELSE NULL
+         END
+         FROM app_settings
+         WHERE setting_key='investigation_deadline_minutes'
+         LIMIT 1),
+        30
+      )::text || ' minutes'
+    )::interval,
+    recovery_generation=recovered.max_generation,
+    updated_at=now()
+FROM (
+  SELECT s.investigation_id,MAX(s.recovery_generation) AS max_generation
+  FROM investigation_steps s
+  JOIN recover_operational_enrichment_reviews recover ON recover.job_id=s.job_id
+  GROUP BY s.investigation_id
+) recovered
+WHERE i.id=recovered.investigation_id
+  AND i.state IN ('COMPLETED','NEEDS_REVIEW','FAILED');
+
+-- Record the recovery itself as immutable history. The trigger above appends the
+-- current recovery generation, making this key distinct from any previous run.
+INSERT INTO investigation_events(
+  event_key,investigation_id,step_id,event_type,payload,policy_version
+)
+SELECT
+  'investigation:'||s.investigation_id::text||':step:'||s.id::text||':recovered',
+  s.investigation_id,
+  s.id,
+  'INVESTIGATION_RECOVERED',
+  jsonb_build_object('jobId',s.job_id,'recoveryGeneration',s.recovery_generation),
+  s.policy_version
 FROM investigation_steps s
 JOIN recover_operational_enrichment_reviews recover ON recover.job_id=s.job_id
-WHERE i.id=s.investigation_id
-  AND i.state IN ('COMPLETED','NEEDS_REVIEW','FAILED');
+WHERE s.recovery_generation > 0
+ON CONFLICT(event_key) DO NOTHING;
 
 UPDATE jobs j
 SET status='PENDING',attempts=0,run_after=now(),locked_by=NULL,locked_at=NULL,
