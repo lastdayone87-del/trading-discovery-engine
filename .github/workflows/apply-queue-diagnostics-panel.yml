@@ -24,6 +24,16 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Repair applicator quoting
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/applyQueueBacklogPanel.mjs')
+          s=p.read_text()
+          s=s.replace("throw new Error(`Backlog diagnostic returned HTTP ${response.status}`);", "throw new Error('Backlog diagnostic returned HTTP '+response.status);")
+          s=s.replace("`${job.provider.provider}:${job.provider.status||''}`", "job.provider.provider+':'+(job.provider.status||'')")
+          p.write_text(s)
+          PY
       - run: node scripts/applyQueueBacklogPanel.mjs
       - run: npm run lint
       - run: npm run build
@@ -32,7 +42,7 @@ jobs:
         run: |
           git config user.name 'lastdayone87-del'
           git config user.email 'lastdayone87@gmail.com'
-          git add src/components/QueueMonitor.tsx
+          git add src/components/QueueMonitor.tsx scripts/applyQueueBacklogPanel.mjs
           git diff --cached --quiet && exit 0
           git commit -m 'Show enrichment backlog diagnosis in queue monitor'
           git push origin HEAD:feat/queue-diagnostics-panel
