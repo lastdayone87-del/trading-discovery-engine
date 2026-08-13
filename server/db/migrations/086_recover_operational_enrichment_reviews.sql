@@ -66,6 +66,26 @@ SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',updated_at=now()
 FROM recover_operational_enrichment_reviews recover
 WHERE c.channel_id=recover.channel_id;
 
+-- If the recovered job is owned by a resumable investigation, reopen the exact
+-- step before the job becomes runnable. Otherwise startInvestigationStep() sees
+-- the old COMPLETED/FAILED projection and safely-but-incorrectly skips the job.
+UPDATE investigation_steps s
+SET state='PENDING',attempt_count=0,worker_id=NULL,lease_expires_at=NULL,
+    started_at=NULL,completed_at=NULL,resulting_status=NULL,output_checksum=NULL,
+    failure_class=NULL,updated_at=now()
+FROM recover_operational_enrichment_reviews recover
+WHERE s.job_id=recover.job_id
+  AND s.state IN ('COMPLETED','FAILED','SKIPPED','RETRYING','RUNNING');
+
+-- Reopen only investigations that own one of those exact recovered jobs. Keep
+-- current_step_id pointing at the same step so the existing workflow resumes it.
+UPDATE investigations i
+SET state='ACTIVE',completed_at=NULL,updated_at=now()
+FROM investigation_steps s
+JOIN recover_operational_enrichment_reviews recover ON recover.job_id=s.job_id
+WHERE i.id=s.investigation_id
+  AND i.state IN ('COMPLETED','NEEDS_REVIEW','FAILED');
+
 UPDATE jobs j
 SET status='PENDING',attempts=0,run_after=now(),locked_by=NULL,locked_at=NULL,
     last_error=NULL,completed_at=NULL,updated_at=now()
