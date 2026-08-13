@@ -7,6 +7,30 @@
 -- refreshes cannot collide with an earlier event and be discarded by
 -- ON CONFLICT(event_key) DO NOTHING.
 
+-- Migration 039 created an inline CHECK constraint for the original event set.
+-- The runtime now emits INVESTIGATION_DEADLINE_REFRESHED, so extend that ledger
+-- constraint before installing the trigger below. The generated PostgreSQL name
+-- for the inline column constraint is deterministic for this table/column.
+ALTER TABLE investigation_events
+  DROP CONSTRAINT IF EXISTS investigation_events_event_type_check;
+ALTER TABLE investigation_events
+  ADD CONSTRAINT investigation_events_event_type_check
+  CHECK(event_type IN(
+    'INVESTIGATION_STARTED',
+    'STEP_SCHEDULED',
+    'STEP_STARTED',
+    'STEP_HEARTBEAT',
+    'STEP_RETRYING',
+    'STEP_COMPLETED',
+    'STEP_FAILED',
+    'STEP_SKIPPED',
+    'INVESTIGATION_COMPLETED',
+    'INVESTIGATION_REVIEW',
+    'INVESTIGATION_RECOVERED',
+    'INVESTIGATION_SUPERSEDED',
+    'INVESTIGATION_DEADLINE_REFRESHED'
+  ));
+
 CREATE SEQUENCE IF NOT EXISTS investigation_deadline_refresh_event_seq;
 
 CREATE OR REPLACE FUNCTION namespace_investigation_deadline_refresh_event_key()
