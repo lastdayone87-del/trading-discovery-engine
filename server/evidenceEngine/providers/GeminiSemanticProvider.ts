@@ -36,7 +36,7 @@ function defaultClient(): SemanticModelClient | undefined {
     const response = await executeProviderCall({
       context: { provider: 'gemini', operation: 'multilingual-semantic-classification' },
       timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
-      enabled: process.env.PROVIDER_DEADLINES_ENABLED === 'true', emit: appendProviderCallEvent,
+      enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent,
       call: (signal) => sdk!.models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
     });
     return JSON.parse(response.text || '{}');
