@@ -7,10 +7,10 @@ export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
       COUNT(*) FILTER (WHERE status='PENDING')::int AS pending,
       COUNT(*) FILTER (WHERE status='PENDING' AND run_after<=now())::int AS runnable,
       COUNT(*) FILTER (WHERE status='PENDING' AND run_after>now())::int AS deferred,
-      COUNT(*) FILTER (WHERE status='RUNNING')::int AS running,
+      COUNT(*) FILTER (WHERE status='PROCESSING')::int AS running,
       COUNT(*) FILTER (WHERE status='FAILED')::int AS failed,
       COUNT(*) FILTER (WHERE status='COMPLETED')::int AS completed,
-      MIN(created_at) FILTER (WHERE status IN ('PENDING','RUNNING')) AS oldest_noncompleted_created_at,
+      MIN(created_at) FILTER (WHERE status IN ('PENDING','PROCESSING')) AS oldest_noncompleted_created_at,
       MIN(run_after) FILTER (WHERE status='PENDING' AND run_after>now()) AS next_deferred_run_at
     FROM jobs
     WHERE type='ENRICH_CHANNEL'
@@ -73,7 +73,7 @@ export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
       ORDER BY occurred_at DESC
       LIMIT 1
     ) p ON true
-    WHERE j.type='ENRICH_CHANNEL' AND j.status IN ('PENDING','RUNNING')
+    WHERE j.type='ENRICH_CHANNEL' AND j.status IN ('PENDING','PROCESSING')
     ORDER BY j.created_at ASC,j.id ASC
     LIMIT $1
   `
