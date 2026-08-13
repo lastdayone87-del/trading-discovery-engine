@@ -1,4 +1,5 @@
 name: Provider2 Fail Closed Applicator
+# rerun after correcting the focused regression contract
 on:
   push:
     branches: [hardening/provider2-fail-closed]
