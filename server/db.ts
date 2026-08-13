@@ -6,6 +6,7 @@ import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src
 import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 import { calculateYouTubeDailyBudget } from './quotaPolicy';
+import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { getConfiguredYouTubeKeys } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
@@ -379,7 +380,7 @@ export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(
 export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);}
 export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
-export async function getQuota():Promise<QuotaInfoExtended>{const db=await getDb(); const today=new Date().toISOString().split('T')[0]; const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey); let res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'"); if(!res.rowCount){await db.query("INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset) VALUES('youtube',0,$1,$2)",[limit,today]); res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'");} let row=res.rows[0]; if(row.last_reset!==today){await db.query("UPDATE quota_tracker SET units_used=0,daily_limit=$1,last_reset=$2 WHERE id='youtube'",[limit,today]); row={...row,units_used:0,daily_limit:limit,last_reset:today};} else await db.query("UPDATE quota_tracker SET daily_limit=$1 WHERE id='youtube'",[limit]); return {unitsUsed:row.units_used||0,dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:keys.map((k,i)=>{const provider=youtubeProviderCooldown.status(k);return {keyIndex:i+1,maskedKey:k.length>8?`${k.slice(0,4)}...${k.slice(-4)}`:'****',unitsUsed:Math.max(0,Math.min(perKey,(row.units_used||0)-i*perKey)),limit:perKey,isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};}
+export async function getQuota():Promise<QuotaInfoExtended>{const db=await getDb(); const today=getYouTubeQuotaDay(); const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey); let res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'"); if(!res.rowCount){await db.query("INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset) VALUES('youtube',0,$1,$2)",[limit,today]); res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'");} let row=res.rows[0]; if(row.last_reset!==today){await db.query("UPDATE quota_tracker SET units_used=0,daily_limit=$1,last_reset=$2 WHERE id='youtube'",[limit,today]); row={...row,units_used:0,daily_limit:limit,last_reset:today};} else await db.query("UPDATE quota_tracker SET daily_limit=$1 WHERE id='youtube'",[limit]); return {unitsUsed:row.units_used||0,dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:keys.map((k,i)=>{const provider=youtubeProviderCooldown.status(k);return {keyIndex:i+1,maskedKey:k.length>8?`${k.slice(0,4)}...${k.slice(-4)}`:'****',unitsUsed:Math.max(0,Math.min(perKey,(row.units_used||0)-i*perKey)),limit:perKey,isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};}
 export async function incrementQuota(units:number):Promise<void>{const db=await getDb(); await getQuota(); await db.query("UPDATE quota_tracker SET units_used=units_used+$1 WHERE id='youtube'",[units]);}
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
@@ -718,8 +719,8 @@ export async function tryReserveQuota(args: {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const quotaDay = new Date().toISOString().slice(0, 10);
-    // Rollover belongs to admission so the first worker after UTC midnight can
+    const quotaDay = getYouTubeQuotaDay();
+    // Rollover belongs to admission so the first worker after the YouTube Pacific quota-day rollover can
     // recover without relying on a dashboard/read request. The upsert holds the
     // tracker row lock for the rest of this reservation transaction.
     await client.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
@@ -747,7 +748,7 @@ export async function tryReserveQuota(args: {
     const row = totals.rows[0];
     // Allocation percentages are scheduling preferences, not hard partitions.
     // Hard partitions strand usable provider capacity and can defer executable
-    // work until the next UTC day while the shared pool still has quota.
+    // work until the next YouTube Pacific quota day while the shared pool still has quota.
     if (row.actual_used + row.reserved_total + args.units > args.dailyBudget) {
       await client.query('ROLLBACK');
       return false;
