@@ -73,7 +73,7 @@ export const ENRICHMENT_DIAGNOSTIC_QUERIES = {
       ORDER BY occurred_at DESC
       LIMIT 1
     ) p ON true
-    WHERE j.type='ENRICH_CHANNEL' AND j.status<>'COMPLETED'
+    WHERE j.type='ENRICH_CHANNEL' AND j.status IN ('PENDING','RUNNING')
     ORDER BY j.created_at ASC,j.id ASC
     LIMIT $1
   `
