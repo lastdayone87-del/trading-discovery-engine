@@ -112,7 +112,10 @@ function waitForCapacity(ms:number,signal?:AbortSignal):Promise<void>{
   });
 }
 
-type GeminiCapacityLease={release:()=>Promise<void>};
+type GeminiCapacityLease={
+  persistOutcome:(event:ProviderCallEvent)=>Promise<void>;
+  release:()=>Promise<void>;
+};
 
 export function geminiCapacityDeferralError(operation:string, reasonCode?:string):ProviderCallError {
   const isVocabulary=operation===GEMINI_VOCABULARY_OPERATION;
@@ -172,7 +175,13 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     }
     if(decision.waitMs>0) await waitForCapacity(decision.waitMs,signal);
     if(signal?.aborted)throw abortError();
-    return {release:async()=>{if(!client)return;await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();client=undefined;}};
+    return {
+      persistOutcome:async(event:ProviderCallEvent)=>{
+        if(!client)return;
+        await client.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);
+      },
+      release:async()=>{if(!client)return;await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();client=undefined;}
+    };
   }catch(error){
     if(client){await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();}
     if(error instanceof ProviderCallError) throw error;
@@ -194,21 +203,26 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
   if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
   const releaseCapacity=async()=>{if(!capacityLease)return;const lease=capacityLease;capacityLease=undefined;await lease.release();};
+  const persistCapacityOutcome=async(event:ProviderCallEvent)=>{if(capacityLease)await capacityLease.persistOutcome(event);};
   try{
     capacityLease=await acquireGeminiCapacity(args.context,controller.signal);
     if(controller.signal.aborted)throw abortError();
     args.trace?.('before provider-call at server/providerResilience.ts');
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
+    const event:ProviderCallEvent={...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0,occurredAt:new Date().toISOString()};
+    await persistCapacityOutcome(event);
     await releaseCapacity();
-    await args.emit({...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0,occurredAt:new Date().toISOString()}).catch(()=>undefined);
+    await args.emit(event).catch(()=>undefined);
     return value;
   }catch(error){
-    await releaseCapacity();
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
-    await args.emit({...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()}).catch(()=>undefined);
+    const event:ProviderCallEvent={...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
+    await persistCapacityOutcome(event).catch(()=>undefined);
+    await releaseCapacity();
+    await args.emit(event).catch(()=>undefined);
     throw typed;
   }finally{
     if(timer)clearTimeout(timer); args.signal?.removeEventListener('abort',abort);
