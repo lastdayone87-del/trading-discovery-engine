@@ -123,26 +123,31 @@ WHERE s.job_id=recover.job_id
 -- investigation generation with the recovered step so terminal events are
 -- namespaced too. ACTIVE owners are included because stale RUNNING/RETRYING
 -- steps can legitimately still belong to an ACTIVE investigation with an expired
--- original deadline. Bound digit text before any numeric cast so arbitrary TEXT
--- cannot overflow PostgreSQL numeric types during this transactional migration.
+-- original deadline. Normalize leading zeros and bound the normalized digit text
+-- before any integer cast, so arbitrarily long TEXT can never overflow.
 UPDATE investigations i
 SET state='ACTIVE',
     completed_at=NULL,
     deadline_at=now()+(
       COALESCE(
         (SELECT CASE
-           WHEN setting_value ~ '^[0-9]+$'
-             AND length(setting_value) BETWEEN 1 AND 10
-             AND (length(setting_value) < 10 OR setting_value <= '2147483647')
-             THEN CASE
-               WHEN setting_value::INTEGER > 0 THEN setting_value::INTEGER
-               ELSE NULL
-             END
+           WHEN normalized_value <> '0'
+             AND length(normalized_value) BETWEEN 1 AND 10
+             AND (length(normalized_value) < 10 OR normalized_value <= '2147483647')
+             THEN normalized_value::INTEGER
            ELSE NULL
          END
-         FROM app_settings
-         WHERE setting_key='investigation_deadline_minutes'
-         LIMIT 1),
+         FROM (
+           SELECT CASE
+             WHEN setting_value ~ '^[0-9]+$'
+               THEN COALESCE(NULLIF(regexp_replace(setting_value,'^0+','','g'),''),'0')
+             ELSE '0'
+           END AS normalized_value
+           FROM app_settings
+           WHERE setting_key='investigation_deadline_minutes'
+           LIMIT 1
+         ) setting
+        ),
         30
       )::text || ' minutes'
     )::interval,
