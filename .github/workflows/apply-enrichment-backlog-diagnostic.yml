@@ -1,0 +1,38 @@
+name: Apply enrichment backlog diagnostic
+
+on:
+  push:
+    branches:
+      - diag/enrichment-backlog-readonly
+    paths:
+      - scripts/applyEnrichmentBacklogDiagnostic.mjs
+      - .github/workflows/apply-enrichment-backlog-diagnostic.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diag/enrichment-backlog-readonly
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: node scripts/applyEnrichmentBacklogDiagnostic.mjs
+      - run: node --import tsx --test server/enrichmentBacklogDiagnostics.test.ts
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check
+      - name: Commit diagnostic implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Complete read-only enrichment backlog diagnostic"
+          git push origin HEAD:diag/enrichment-backlog-readonly
