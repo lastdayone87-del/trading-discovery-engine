@@ -165,14 +165,17 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
   const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
   if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
+  const releaseCapacity=async()=>{if(!capacityLease)return;const lease=capacityLease;capacityLease=undefined;await lease.release();};
   try{
     capacityLease=await acquireGeminiCapacity(args.context,controller.signal);
     args.trace?.('before provider-call at server/providerResilience.ts');
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
+    await releaseCapacity();
     await args.emit({...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0,occurredAt:new Date().toISOString()}).catch(()=>undefined);
     return value;
   }catch(error){
+    await releaseCapacity();
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
@@ -180,6 +183,6 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     throw typed;
   }finally{
     if(timer)clearTimeout(timer); args.signal?.removeEventListener('abort',abort);
-    await capacityLease?.release();
+    await releaseCapacity();
   }
 }
