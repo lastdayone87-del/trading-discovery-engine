@@ -1,0 +1,76 @@
+name: Official Enrichment Quota Accounting Applicator
+on:
+  push:
+    branches: [fix/official-enrichment-quota-accounting]
+    paths:
+      - '.github/workflows/official-enrichment-quota-accounting-apply.yml'
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/official-enrichment-quota-accounting
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Apply request ordering and accounting fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('server/youtube.ts')
+          s=p.read_text()
+          old="""      const [channelResponse, recentResponse] = await Promise.all([youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition),youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition)]);
+
+      activeKeyIndex = currentIndex;
+      await incrementQuota(101);
+      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');
+      const recentData = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
+"""
+          new="""      const recentResponse = await youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition);
+      const recentData = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
+      await incrementQuota(100);
+      const channelResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition);
+      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');
+      await incrementQuota(1);
+      activeKeyIndex = currentIndex;
+"""
+          if s.count(old)!=1: raise SystemExit('stage-one anchor mismatch')
+          s=s.replace(old,new,1)
+          old2="""        const requests:Promise<Response>[]=[];
+        if(ids)requests.push(youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition));
+        requests.push(youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition));
+        const detailResponses=await Promise.all(requests);await incrementQuota(requests.length===2?101:100);
+        for(const response of detailResponses){const payload=await readYouTubeJsonObject(response, 'enrichment-details');if(payload.items?.some((item:any)=>item.id?.kind==='youtube#playlist'||typeof item.id==='object'))playlists=payload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);else{const byId=new Map(payload.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}}
+"""
+          new2="""        const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition);
+        const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
+        await incrementQuota(100);
+        playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
+        if(ids){const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition);const videoPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await incrementQuota(1);const byId=new Map(videoPayload.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}
+"""
+          if s.count(old2)!=1: raise SystemExit('stage-two anchor mismatch')
+          s=s.replace(old2,new2,1)
+          p.write_text(s)
+          PY
+      - name: Focused regression
+        run: node --import tsx --test server/officialEnrichmentQuotaAccounting.test.ts
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
+      - name: Commit implementation and remove applicator
+        run: |
+          rm .github/workflows/official-enrichment-quota-accounting-apply.yml
+          git config user.name 'youtube-quota-accounting-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add server/youtube.ts server/officialEnrichmentQuotaAccounting.test.ts .github/workflows/official-enrichment-quota-accounting-apply.yml
+          git commit -m 'Account official enrichment quota per successful request'
+          git push origin HEAD:fix/official-enrichment-quota-accounting
