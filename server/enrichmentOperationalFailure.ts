@@ -10,15 +10,24 @@ const OPERATIONAL_PROVIDER_REASONS = new Set([
   'PROVIDER_EXECUTION_FAILED'
 ]);
 
+export interface OperationalProviderFailure {
+  provider: string;
+  reasonCodes: string[];
+}
+
 /**
  * Distinct error identity lets the investigation workflow preserve this exact
  * infrastructure retry across wall-clock deadline checks without weakening
  * deadlines for genuine ambiguity or unrelated failures.
  */
 export class OperationalEnrichmentProviderError extends ProviderCallError {
-  constructor(providerReasons: string[]) {
+  constructor(public readonly providerFailures: OperationalProviderFailure[]) {
+    const providerReasons = [...new Set(providerFailures.flatMap(failure => failure.reasonCodes))];
+    const evidence = providerFailures
+      .map(failure => `${failure.provider}[${failure.reasonCodes.join('|')}]`)
+      .join(', ');
     super(
-      'Enrichment classification provider coverage is operationally degraded; retry after provider recovery.',
+      `Enrichment classification provider coverage is operationally degraded (${evidence}); retry after provider recovery.`,
       'TRANSIENT',
       true,
       { providerReasons }
@@ -37,10 +46,13 @@ export function enrichmentOperationalFailure(
   isEnrichmentPass: boolean
 ): ProviderCallError | null {
   if (!isEnrichmentPass || !report.degraded) return null;
-  const reasonCodes = report.providers
+  const providerFailures = report.providers
     .filter(provider => provider.availability === 'FAILED')
-    .flatMap(provider => provider.reasonCodes || [])
-    .filter(code => OPERATIONAL_PROVIDER_REASONS.has(code));
-  if (!reasonCodes.length) return null;
-  return new OperationalEnrichmentProviderError([...new Set(reasonCodes)]);
+    .map(provider => ({
+      provider: provider.provider,
+      reasonCodes: [...new Set((provider.reasonCodes || []).filter(code => OPERATIONAL_PROVIDER_REASONS.has(code)))]
+    }))
+    .filter(provider => provider.reasonCodes.length > 0);
+  if (!providerFailures.length) return null;
+  return new OperationalEnrichmentProviderError(providerFailures);
 }
