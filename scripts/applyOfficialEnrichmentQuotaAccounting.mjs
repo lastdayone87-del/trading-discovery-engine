@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+const path='server/youtube.ts';
+let s=fs.readFileSync(path,'utf8');
+const pair="const [channelResponse, recentResponse] = await Promise.all([youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition),youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition)]);";
+if(!s.includes(pair)) throw new Error('stage-one request anchor missing');
+s=s.replace(pair,"const recentResponse = await youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition);\n      const recentData = await readYouTubeJsonObject(recentResponse, 'channel-uploads');\n      await incrementQuota(100);\n      const channelResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition);");
+const combined="      activeKeyIndex = currentIndex;\n      await incrementQuota(101);\n      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');\n      const recentData = await readYouTubeJsonObject(recentResponse, 'channel-uploads');";
+if(!s.includes(combined)) throw new Error('stage-one accounting anchor missing');
+s=s.replace(combined,"      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');\n      await incrementQuota(1);\n      activeKeyIndex = currentIndex;");
+const start=s.indexOf('        const requests:Promise<Response>[]=[];');
+const end=s.indexOf('      }\n\n      return {',start);
+if(start<0||end<0) throw new Error('stage-two anchor missing');
+const stage2=`        const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition);\n        const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');\n        await incrementQuota(100);\n        playlists=playlistPayload.items.map((item)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item)=>item.name);\n        if(ids){const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition);const videoPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await incrementQuota(1);const byId=new Map(videoPayload.items?.map((item)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String(byId.get(video.id)?.description||video.description||'')}));}\n`;
+s=s.slice(0,start)+stage2+s.slice(end);
+fs.writeFileSync(path,s);
