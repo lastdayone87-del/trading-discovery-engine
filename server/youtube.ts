@@ -586,7 +586,7 @@ export async function fetchYouTubeChannelEnrichment(
   fallback: DiscoveredChannelRaw,
   stage:1|2|3=1
 ): Promise<DiscoveredChannelRaw> {
-  const hybridEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true')==='true';
+  const hybridEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'false')==='true';
   if(!hybridEnabled) return fetchYouTubeChannelEnrichmentOfficial(channelId,fallback,stage);
   const inner=await fetchInnerTubeChannelEnrichment(channelId,{maxVideos:10,detailVideos:stage>=2?10:6,includePlaylists:stage>=2,timeoutMs:Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'))});
   const keyPool=getYouTubeKeyPool();
