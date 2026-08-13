@@ -1,40 +1,5 @@
 import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
-import { verifyChannelTradingRelevance, VerificationDecision, type EvidenceCollectionReport, type RawChannelInput } from './evidenceEngine';
-import { ProviderCallError } from './providerResilience';
-
-const OPERATIONAL_ENRICHMENT_REASON_CODES = new Set([
-  'PROVIDER_TIMEOUT',
-  'PROVIDER_RATE_LIMIT',
-  'PROVIDER_TRANSIENT_FAILURE',
-  'PROVIDER_CREDENTIALS_EXHAUSTED',
-  'PROVIDER_CANCELLED',
-  'PROVIDER_EXECUTION_FAILED'
-]);
-
-/**
- * Enrichment-stage provider degradation is an operational failure, not an
- * evidentiary conclusion. Returning a typed retryable error here ensures the
- * durable worker uses RETRYING_WITHOUT_ATTEMPT instead of persisting a false
- * NEEDS_REVIEW outcome. Permanent-input failures remain bounded/application
- * failures rather than being hidden inside this infrastructure retry policy.
- */
-export function enrichmentOperationalFailure(
-  report: EvidenceCollectionReport,
-  enrichmentStage: number | undefined
-): ProviderCallError | null {
-  if (!enrichmentStage || enrichmentStage <= 0 || !report.degraded) return null;
-  const reasonCodes = report.providers
-    .filter(provider => provider.availability === 'FAILED')
-    .flatMap(provider => provider.reasonCodes || [])
-    .filter(code => OPERATIONAL_ENRICHMENT_REASON_CODES.has(code));
-  if (!reasonCodes.length) return null;
-  return new ProviderCallError(
-    'Enrichment classification provider coverage is operationally degraded; retry after provider recovery.',
-    'TRANSIENT',
-    true,
-    { providerReasons: [...new Set(reasonCodes)] }
-  );
-}
+import { verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
 
 /**
  * Main Entry Point: Classifies a YouTube Channel's Trading Relevance
@@ -76,8 +41,6 @@ export async function classifyTradingRelevanceDetailed(
   };
 
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
-  const operationalFailure = enrichmentOperationalFailure(decision.evidenceCollection, input.enrichment_stage);
-  if (operationalFailure) throw operationalFailure;
 
   // Map to legacy breakdown format while adding rich evidence audit details
   const reasoningLogs: string[] = [
