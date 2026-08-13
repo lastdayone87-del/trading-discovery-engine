@@ -490,12 +490,14 @@ async function fetchYouTubeChannelEnrichmentOfficial(
     try {
       const channelUrl = buildYouTubeApiUrl('channels',apiKey,{part:'snippet,brandingSettings,statistics',id:channelId});
       const recentUrl = buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,order:'date',type:'video',maxResults:10});
-      const [channelResponse, recentResponse] = await Promise.all([youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition),youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition)]);
-
-      activeKeyIndex = currentIndex;
-      await incrementQuota(101);
-      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');
+      const recentResponse = await youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition);
       const recentData = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
+      await incrementQuota(100);
+      const channelResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition);
+
+      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');
+      await incrementQuota(1);
+      activeKeyIndex = currentIndex;
       const channel = channelData.items?.[0];
       if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
 
@@ -515,11 +517,11 @@ async function fetchYouTubeChannelEnrichmentOfficial(
       let playlists=fallback.playlists||[];
       if(stage>=2){
         const ids=videos.map(video=>video.id).filter(Boolean).join(',');
-        const requests:Promise<Response>[]=[];
-        if(ids)requests.push(youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition));
-        requests.push(youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition));
-        const detailResponses=await Promise.all(requests);await incrementQuota(requests.length===2?101:100);
-        for(const response of detailResponses){const payload=await readYouTubeJsonObject(response, 'enrichment-details');if(payload.items?.some((item:any)=>item.id?.kind==='youtube#playlist'||typeof item.id==='object'))playlists=payload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);else{const byId=new Map(payload.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}}
+        const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition);
+        const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
+        await incrementQuota(100);
+        playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
+        if(ids){const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition);const videoPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await incrementQuota(1);const byId=new Map(videoPayload.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}
       }
 
       return {
