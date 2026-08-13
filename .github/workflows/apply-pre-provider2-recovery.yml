@@ -1,0 +1,59 @@
+name: Apply pre-Provider-2 recovery
+
+on:
+  push:
+    branches:
+      - fix/pre-provider2-quota-and-lock-recovery
+    paths:
+      - .github/workflows/apply-pre-provider2-recovery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/pre-provider2-quota-and-lock-recovery
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Apply recovery patch
+        run: python .github/scripts/apply_pre_provider2_recovery.py
+      - name: Inspect stale lock ownership sites
+        run: |
+          echo 'LOCKED assignment references:'
+          grep -RIn --exclude-dir=node_modules --exclude-dir=.git "scan_status.*LOCKED\|scan_status.*'LOCKED'" server src || true
+      - name: Validate obsolete provider removal
+        run: |
+          if grep -RIn --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=migrations -E "youtubeInnerTube|youtube_inner_tube_|YOUTUBE_INNERTUBE_|youtube_js_hybrid_enrichment_enabled|YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED|youtubei\.js" server src package.json package-lock.json; then
+            echo 'Obsolete Provider #2 / hybrid references remain in runtime source.' >&2
+            exit 1
+          fi
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Relevant regression tests
+        run: |
+          npx tsx --test server/youtubeProviderCooldown.test.ts server/queueManager.test.ts 2>/dev/null || npm test
+      - name: Diff check
+        run: git diff --check
+      - name: Commit production patch and remove applicator
+        env:
+          BRANCH: fix/pre-provider2-quota-and-lock-recovery
+        run: |
+          rm -f .github/workflows/apply-pre-provider2-recovery.yml .github/scripts/apply_pre_provider2_recovery.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Restore official YouTube path and repair quota recovery"
+          git push origin HEAD:"$BRANCH"
