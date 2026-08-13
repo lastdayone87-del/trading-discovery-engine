@@ -55,6 +55,7 @@ type GeminiCapacityConfig = {
   vocabularySemanticQuietMs: number;
   vocabularyMinIntervalMs: number;
   maxInlineWaitMs?: number;
+  semanticMaxInlineWaitMs?: number;
 };
 
 export type GeminiCapacityDecision = { action:'RUN'|'WAIT'|'DEFER'; waitMs:number; reasonCode?:string };
@@ -71,13 +72,19 @@ function geminiCapacityConfig():GeminiCapacityConfig {
     vocabularyRateLimitSuppressionMs: envMs('GEMINI_VOCABULARY_RATE_LIMIT_SUPPRESSION_MS', 15*60*1000),
     vocabularySemanticQuietMs: envMs('GEMINI_VOCABULARY_SEMANTIC_QUIET_MS', 2*60*1000),
     vocabularyMinIntervalMs: envMs('GEMINI_VOCABULARY_MIN_INTERVAL_MS', 30000),
-    maxInlineWaitMs: envMs('GEMINI_CAPACITY_MAX_INLINE_WAIT_MS', 8000)
+    maxInlineWaitMs: envMs('GEMINI_CAPACITY_MAX_INLINE_WAIT_MS', 8000),
+    // Semantic classification is required for enrichment decisions. Let the one
+    // governed semantic caller pace through the provider cooldown instead of
+    // converting hundreds of ENRICH_CHANNEL jobs into five-minute durable
+    // backoffs. Optional vocabulary work keeps the short inline-wait ceiling.
+    semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 120000)
   };
 }
 
 export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySnapshot, config:GeminiCapacityConfig=geminiCapacityConfig()):GeminiCapacityDecision {
   const age=(value?:number)=>value==null?Number.POSITIVE_INFINITY:Math.max(0,snapshot.nowMs-value);
   const maxInlineWaitMs=config.maxInlineWaitMs??8000;
+  const semanticMaxInlineWaitMs=config.semanticMaxInlineWaitMs??120000;
   const globalWait=Math.max(0,config.globalMinIntervalMs-age(snapshot.lastGeminiAtMs));
   if(operation===GEMINI_VOCABULARY_OPERATION){
     if(age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
@@ -89,7 +96,7 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   }
   const rateLimitWait=age(snapshot.lastRateLimitAtMs)<config.semanticRateLimitCooldownMs?config.semanticRateLimitCooldownMs-age(snapshot.lastRateLimitAtMs):0;
   const waitMs=Math.max(globalWait,rateLimitWait);
-  if(waitMs>maxInlineWaitMs) return {action:'DEFER',waitMs:0,reasonCode:'SEMANTIC_DEFERRED_RATE_PRESSURE'};
+  if(waitMs>semanticMaxInlineWaitMs) return {action:'DEFER',waitMs:0,reasonCode:'SEMANTIC_DEFERRED_RATE_PRESSURE'};
   return {action:waitMs>0?'WAIT':'RUN',waitMs};
 }
 
@@ -148,13 +155,17 @@ function safeProviderReasons(values?:string[]):string[]{
 
 /** Bounds the caller, propagates cancellation, and emits metadata only (never payloads). */
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
-  const capacityLease=await acquireGeminiCapacity(args.context);
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
-  const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
-  let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
-  if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
   const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1',occurredAt:new Date().toISOString()};
+  let capacityLease:GeminiCapacityLease|undefined;
+  let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
+  const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
   try{
+    // Capacity admission is part of the provider boundary too. Keeping it inside
+    // the telemetry/error envelope makes governed deferrals observable instead
+    // of disappearing before provider_call_events can be emitted.
+    capacityLease=await acquireGeminiCapacity(args.context);
+    if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
     args.trace?.('before provider-call at server/providerResilience.ts');
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
