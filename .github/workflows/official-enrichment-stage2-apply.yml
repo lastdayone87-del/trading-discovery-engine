@@ -1,0 +1,47 @@
+name: Official Enrichment Stage2 Applicator
+on:
+  push:
+    branches: [fix/official-enrichment-quota-accounting]
+    paths: [.github/workflows/official-enrichment-stage2-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: fix/official-enrichment-quota-accounting, fetch-depth: 0}
+      - uses: actions/setup-node@v4
+        with: {node-version: 22, cache: npm}
+      - run: npm install
+      - name: Apply stage one and stage two accounting
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('server/youtube.ts'); s=p.read_text()
+          a="const [channelResponse, recentResponse] = await Promise.all([youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition),youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition)]);"
+          s=s.replace(a,"const recentResponse = await youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition);\n      const recentData = await readYouTubeJsonObject(recentResponse, 'channel-uploads');\n      await incrementQuota(100);\n      const channelResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition);",1)
+          s=s.replace("      activeKeyIndex = currentIndex;\n      await incrementQuota(101);\n      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');\n      const recentData = await readYouTubeJsonObject(recentResponse, 'channel-uploads');","      const channelData = await readYouTubeJsonObject(channelResponse, 'channel-details');\n      await incrementQuota(1);\n      activeKeyIndex = currentIndex;",1)
+          start=s.index('        const requests:Promise<Response>[]=[];')
+          end=s.index('      }\n\n      return {',start)
+          repl="""        const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition);
+        const playlistPayload=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
+        await incrementQuota(100);
+        playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
+        if(ids){const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition);const videoPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await incrementQuota(1);const byId=new Map(videoPayload.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}
+"""
+          s=s[:start]+repl+s[end:]
+          p.write_text(s)
+          PY
+      - run: node --import tsx --test server/officialEnrichmentQuotaAccounting.test.ts
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check
+      - name: Commit
+        run: |
+          rm .github/workflows/official-enrichment-stage2-apply.yml .github/workflows/official-enrichment-quota-accounting-apply.yml
+          git config user.name youtube-quota-accounting-bot
+          git config user.email actions@users.noreply.github.com
+          git add server/youtube.ts .github/workflows server/officialEnrichmentQuotaAccounting.test.ts
+          git commit -m 'Account official enrichment quota per successful request'
+          git push origin HEAD:fix/official-enrichment-quota-accounting
