@@ -211,7 +211,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
     const event:ProviderCallEvent={...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0,occurredAt:new Date().toISOString()};
-    await persistCapacityOutcome(event);
+    try { await persistCapacityOutcome(event); } catch (pacingStateError) { console.warn('[Gemini Capacity Diagnostic] Failed to persist successful pacing outcome before unlock.',String((pacingStateError as any)?.message||pacingStateError)); }
     await releaseCapacity();
     await args.emit(event).catch(()=>undefined);
     return value;
