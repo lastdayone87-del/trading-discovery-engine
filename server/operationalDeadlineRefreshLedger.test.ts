@@ -7,6 +7,11 @@ const migration = readFileSync(
   'utf8'
 );
 
+test('deadline refresh event type is allowed by the investigation ledger constraint', () => {
+  assert.match(migration, /DROP CONSTRAINT IF EXISTS investigation_events_event_type_check/);
+  assert.match(migration, /ADD CONSTRAINT investigation_events_event_type_check[\s\S]*INVESTIGATION_DEADLINE_REFRESHED/);
+});
+
 test('operational deadline refresh events use a database-owned monotonic identity', () => {
   assert.match(migration, /CREATE SEQUENCE IF NOT EXISTS investigation_deadline_refresh_event_seq/);
   assert.match(migration, /NEW\.event_type = 'INVESTIGATION_DEADLINE_REFRESHED'/);
@@ -14,7 +19,7 @@ test('operational deadline refresh events use a database-owned monotonic identit
   assert.match(migration, /NEW\.event_key := NEW\.event_key[\s\S]*':refresh:'[\s\S]*nextval/);
 });
 
-test('two refreshes with the same attempt cannot intentionally share the final event key', () => {
+test('two refreshes with the same attempt produce distinct final event keys', () => {
   const base = 'investigation:i:step:s:attempt:1:operational-deadline-refresh';
   const eventKey = (generation: number) => `${base}:refresh:${generation}`;
   assert.notEqual(eventKey(1), eventKey(2));
