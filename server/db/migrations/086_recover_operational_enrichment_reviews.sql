@@ -119,15 +119,19 @@ WHERE s.job_id=recover.job_id
 
 -- Reopen only investigations owning those exact recovered steps. Refresh the
 -- deadline from the existing investigation_deadline_minutes policy (30 minutes
--- if the setting is absent/malformed), and align the investigation generation
--- with the recovered step so terminal events are namespaced too.
+-- if the setting is absent/malformed/out of INTEGER range), and align the
+-- investigation generation with the recovered step so terminal events are
+-- namespaced too. ACTIVE owners are included because stale RUNNING/RETRYING
+-- steps can legitimately still belong to an ACTIVE investigation with an expired
+-- original deadline.
 UPDATE investigations i
 SET state='ACTIVE',
     completed_at=NULL,
     deadline_at=now()+(
       COALESCE(
         (SELECT CASE
-           WHEN setting_value ~ '^[0-9]+$' AND setting_value::INTEGER > 0
+           WHEN setting_value ~ '^[0-9]+$'
+             AND setting_value::NUMERIC BETWEEN 1 AND 2147483647
              THEN setting_value::INTEGER
            ELSE NULL
          END
@@ -146,7 +150,7 @@ FROM (
   GROUP BY s.investigation_id
 ) recovered
 WHERE i.id=recovered.investigation_id
-  AND i.state IN ('COMPLETED','NEEDS_REVIEW','FAILED');
+  AND i.state IN ('ACTIVE','COMPLETED','NEEDS_REVIEW','FAILED');
 
 -- Record the recovery itself as immutable history. The trigger above appends the
 -- current recovery generation, making this key distinct from any previous run.
