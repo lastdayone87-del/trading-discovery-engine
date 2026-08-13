@@ -16,6 +16,7 @@ function report(degraded:boolean, reasonCodes:string[]=[]):EvidenceCollectionRep
 test('degraded enrichment becomes an attempt-free infrastructure retry instead of review',()=>{
   const error=enrichmentOperationalFailure(report(true,['PROVIDER_TIMEOUT']),true);
   assert.ok(error);
+  assert.equal(error!.name,'OperationalEnrichmentProviderError');
   assert.equal(error!.retryable,true);
   assert.equal(error!.errorClass,'TRANSIENT');
   assert.equal(decideJobFailure(error,4,4,1_700_000_000_000).disposition,'RETRYING_WITHOUT_ATTEMPT');
@@ -23,7 +24,9 @@ test('degraded enrichment becomes an attempt-free infrastructure retry instead o
 
 test('all governed operational provider failure classes are retryable during enrichment',()=>{
   for(const reason of ['PROVIDER_TIMEOUT','PROVIDER_RATE_LIMIT','PROVIDER_TRANSIENT_FAILURE','PROVIDER_CREDENTIALS_EXHAUSTED','PROVIDER_CANCELLED','PROVIDER_EXECUTION_FAILED']) {
-    assert.ok(enrichmentOperationalFailure(report(true,[reason]),true),reason);
+    const error=enrichmentOperationalFailure(report(true,[reason]),true);
+    assert.ok(error,reason);
+    assert.equal(error!.name,'OperationalEnrichmentProviderError');
   }
 });
 
