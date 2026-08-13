@@ -1,0 +1,1 @@
+Implementation started. Added a persisted-state diagnosis helper on the diagnostic branch. Remaining work is to wire a bounded operator-authenticated read-only endpoint to existing queue and investigation telemetry without changing runtime behavior.
