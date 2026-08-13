@@ -39,6 +39,7 @@ export type ProviderEventSink=(event:ProviderCallEvent)=>Promise<void>;
 const GEMINI_CAPACITY_LOCK = 741963285;
 const GEMINI_SEMANTIC_OPERATION = 'multilingual-semantic-classification';
 const GEMINI_VOCABULARY_OPERATION = 'vocabulary-extraction';
+const GEMINI_LOCK_POLL_MS = 100;
 
 type GeminiCapacitySnapshot = {
   nowMs: number;
@@ -55,6 +56,7 @@ type GeminiCapacityConfig = {
   vocabularySemanticQuietMs: number;
   vocabularyMinIntervalMs: number;
   maxInlineWaitMs?: number;
+  semanticMaxInlineWaitMs?: number;
 };
 
 export type GeminiCapacityDecision = { action:'RUN'|'WAIT'|'DEFER'; waitMs:number; reasonCode?:string };
@@ -71,13 +73,15 @@ function geminiCapacityConfig():GeminiCapacityConfig {
     vocabularyRateLimitSuppressionMs: envMs('GEMINI_VOCABULARY_RATE_LIMIT_SUPPRESSION_MS', 15*60*1000),
     vocabularySemanticQuietMs: envMs('GEMINI_VOCABULARY_SEMANTIC_QUIET_MS', 2*60*1000),
     vocabularyMinIntervalMs: envMs('GEMINI_VOCABULARY_MIN_INTERVAL_MS', 30000),
-    maxInlineWaitMs: envMs('GEMINI_CAPACITY_MAX_INLINE_WAIT_MS', 8000)
+    maxInlineWaitMs: envMs('GEMINI_CAPACITY_MAX_INLINE_WAIT_MS', 8000),
+    semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 90000)
   };
 }
 
 export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySnapshot, config:GeminiCapacityConfig=geminiCapacityConfig()):GeminiCapacityDecision {
   const age=(value?:number)=>value==null?Number.POSITIVE_INFINITY:Math.max(0,snapshot.nowMs-value);
   const maxInlineWaitMs=config.maxInlineWaitMs??8000;
+  const semanticMaxInlineWaitMs=config.semanticMaxInlineWaitMs??maxInlineWaitMs;
   const globalWait=Math.max(0,config.globalMinIntervalMs-age(snapshot.lastGeminiAtMs));
   if(operation===GEMINI_VOCABULARY_OPERATION){
     if(age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
@@ -89,54 +93,110 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   }
   const rateLimitWait=age(snapshot.lastRateLimitAtMs)<config.semanticRateLimitCooldownMs?config.semanticRateLimitCooldownMs-age(snapshot.lastRateLimitAtMs):0;
   const waitMs=Math.max(globalWait,rateLimitWait);
-  if(waitMs>maxInlineWaitMs) return {action:'DEFER',waitMs:0,reasonCode:'SEMANTIC_DEFERRED_RATE_PRESSURE'};
+  const isSemantic=operation===GEMINI_SEMANTIC_OPERATION;
+  const waitCeiling=isSemantic?semanticMaxInlineWaitMs:maxInlineWaitMs;
+  if(waitMs>waitCeiling) return {action:'DEFER',waitMs:0,reasonCode:isSemantic?'SEMANTIC_DEFERRED_RATE_PRESSURE':'GEMINI_OPERATION_DEFERRED_RATE_PRESSURE'};
   return {action:waitMs>0?'WAIT':'RUN',waitMs};
 }
 
-const sleep=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
+function abortError():Error{const error=new Error('aborted');error.name='AbortError';return error;}
 
-type GeminiCapacityLease={release:()=>Promise<void>};
+function waitForCapacity(ms:number,signal?:AbortSignal):Promise<void>{
+  if(ms<=0)return signal?.aborted?Promise.reject(abortError()):Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    let timer:ReturnType<typeof setTimeout>;
+    const onAbort=()=>{clearTimeout(timer);reject(abortError())};
+    if(signal?.aborted)return onAbort();
+    timer=setTimeout(()=>{signal?.removeEventListener('abort',onAbort);resolve()},ms);
+    signal?.addEventListener('abort',onAbort,{once:true});
+  });
+}
 
-async function acquireGeminiCapacity(context:ProviderCallContext):Promise<GeminiCapacityLease|undefined>{
+async function queryWithDeadline(client:any,text:string,values:any[],signal?:AbortSignal,deadlineAtMs?:number):Promise<any>{
+  if(signal?.aborted)throw abortError();
+  const remainingMs=deadlineAtMs==null?undefined:deadlineAtMs-Date.now();
+  if(remainingMs!=null&&remainingMs<=0)throw abortError();
+  const query:any={text,values};
+  if(remainingMs!=null)query.query_timeout=Math.max(1,remainingMs);
+  const result=await client.query(query);
+  if(signal?.aborted)throw abortError();
+  return result;
+}
+
+type GeminiCapacityLease={
+  persistOutcome:(event:ProviderCallEvent)=>Promise<void>;
+  release:()=>Promise<void>;
+};
+
+export function geminiCapacityDeferralError(operation:string, reasonCode?:string):ProviderCallError {
+  const isVocabulary=operation===GEMINI_VOCABULARY_OPERATION;
+  const isSemantic=operation===GEMINI_SEMANTIC_OPERATION;
+  const message=isVocabulary
+    ? 'Gemini vocabulary extraction deferred to protect semantic classification capacity.'
+    : isSemantic
+      ? 'Gemini semantic classification deferred during provider rate pressure.'
+      : 'Gemini operation deferred during provider rate pressure.';
+  return new ProviderCallError(message,'TRANSIENT',true,{providerReasons:[reasonCode||'GEMINI_CAPACITY_DEFERRED']});
+}
+
+async function connectWithAbort(db:any,signal?:AbortSignal):Promise<any>{
+  if(!signal)return db.connect();
+  if(signal.aborted)throw abortError();
+  return new Promise((resolve,reject)=>{
+    let settled=false;
+    const onAbort=()=>{if(settled)return;settled=true;signal.removeEventListener('abort',onAbort);reject(abortError())};
+    signal.addEventListener('abort',onAbort,{once:true});
+    db.connect().then((client:any)=>{
+      if(settled){client.release();return;}
+      settled=true;signal.removeEventListener('abort',onAbort);resolve(client);
+    },(error:unknown)=>{
+      if(settled)return;
+      settled=true;signal.removeEventListener('abort',onAbort);reject(error);
+    });
+  });
+}
+
+async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSignal,deadlineAtMs?:number):Promise<GeminiCapacityLease|undefined>{
   if(context.provider!=='gemini') return undefined;
   let client:any;
   try{
     const { getDb }=await import('./db');
     const db=await getDb();
-    client=await db.connect();
-    await client.query('SELECT pg_advisory_lock($1)',[GEMINI_CAPACITY_LOCK]);
+    while(true){
+      if(signal?.aborted)throw abortError();
+      client=await connectWithAbort(db,signal);
+      const lock=await queryWithDeadline(client,'SELECT pg_try_advisory_lock($1) AS acquired',[GEMINI_CAPACITY_LOCK],signal,deadlineAtMs);
+      if(lock.rows[0]?.acquired)break;
+      client.release();client=undefined;
+      await waitForCapacity(GEMINI_LOCK_POLL_MS,signal);
+    }
+    if(signal?.aborted)throw abortError();
     const [lastAny,lastRate,lastSemantic,lastVocabulary]=await Promise.all([
-      client.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' ORDER BY occurred_at DESC LIMIT 1`),
-      client.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`),
-      client.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION]),
-      client.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION])
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' ORDER BY occurred_at DESC LIMIT 1`,[],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`,[],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION],signal,deadlineAtMs)
     ]);
     const at=(row:any)=>row?.occurred_at?new Date(row.occurred_at).getTime():undefined;
-    const decision=decideGeminiCapacity(context.operation,{
-      nowMs:Date.now(),
-      lastGeminiAtMs:at(lastAny.rows[0]),
-      lastRateLimitAtMs:at(lastRate.rows[0]),
-      lastSemanticAtMs:at(lastSemantic.rows[0]),
-      lastVocabularyAtMs:at(lastVocabulary.rows[0])
-    });
+    const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});
     if(decision.action==='DEFER'){
-      await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);
+      await client.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000}).catch(()=>undefined);
       client.release(); client=undefined;
-      const isVocabulary=context.operation===GEMINI_VOCABULARY_OPERATION;
-      throw new ProviderCallError(
-        isVocabulary?'Gemini vocabulary extraction deferred to protect semantic classification capacity.':'Gemini semantic classification deferred during provider rate pressure.',
-        'RATE_LIMIT',true,{status:429,providerReasons:[decision.reasonCode||'GEMINI_CAPACITY_DEFERRED']}
-      );
+      throw geminiCapacityDeferralError(context.operation,decision.reasonCode);
     }
-    if(decision.waitMs>0) await sleep(decision.waitMs);
-    return {release:async()=>{
-      if(!client)return;
-      await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);
-      client.release(); client=undefined;
-    }};
+    if(decision.waitMs>0) await waitForCapacity(decision.waitMs,signal);
+    if(signal?.aborted)throw abortError();
+    return {
+      persistOutcome:async(event:ProviderCallEvent)=>{
+        if(!client)return;
+        await queryWithDeadline(client,`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt],signal,deadlineAtMs);
+      },
+      release:async()=>{if(!client)return;const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
+    };
   }catch(error){
-    if(client){await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();}
+    if(client){const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
     if(error instanceof ProviderCallError) throw error;
+    if((error as any)?.name==='AbortError')throw error;
     if(context.operation===GEMINI_VOCABULARY_OPERATION) throw new ProviderCallError('Gemini vocabulary extraction deferred because capacity state is unavailable.','TRANSIENT',true,{cause:error,providerReasons:['VOCABULARY_CAPACITY_STATE_UNAVAILABLE']});
     return undefined;
   }
@@ -146,36 +206,38 @@ function safeProviderReasons(values?:string[]):string[]{
   return Array.isArray(values)?values.map(String).filter(value=>/^[A-Z0-9_.:-]{1,80}$/.test(value)).slice(0,6):[];
 }
 
-/** Bounds the caller, propagates cancellation, and emits metadata only (never payloads). */
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
-  const capacityLease=await acquireGeminiCapacity(args.context);
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
-  const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
+  const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
+  let capacityLease:GeminiCapacityLease|undefined;
   let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
-  if(args.enabled!==false && args.timeoutMs>0) timer=setTimeout(()=>{timedOut=true;controller.abort();},args.timeoutMs);
-  const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1',occurredAt:new Date().toISOString()};
+  const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});
+  const deadlineAtMs=args.enabled!==false&&args.timeoutMs>0?started+args.timeoutMs:undefined;
+  if(deadlineAtMs!=null) timer=setTimeout(()=>{timedOut=true;controller.abort();},Math.max(0,deadlineAtMs-Date.now()));
+  const releaseCapacity=async()=>{if(!capacityLease)return;const lease=capacityLease;capacityLease=undefined;await lease.release();};
+  const persistCapacityOutcome=async(event:ProviderCallEvent)=>{if(capacityLease)await capacityLease.persistOutcome(event);};
   try{
+    capacityLease=await acquireGeminiCapacity(args.context,controller.signal,deadlineAtMs);
+    if(controller.signal.aborted)throw abortError();
     args.trace?.('before provider-call at server/providerResilience.ts');
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
-    await args.emit({...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0}).catch(()=>undefined);
+    const event:ProviderCallEvent={...base,status:'SUCCESS',latencyMs:Date.now()-started,actualCost:args.context.actualCost||0,occurredAt:new Date().toISOString()};
+    try { await persistCapacityOutcome(event); } catch (pacingStateError) { console.warn('[Gemini Capacity Diagnostic] Failed to persist successful pacing outcome before unlock.',String((pacingStateError as any)?.message||pacingStateError)); }
+    await releaseCapacity();
+    await args.emit(event).catch(()=>undefined);
     return value;
   }catch(error){
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
-    if(args.context.provider==='gemini'){
-      console.warn('[Gemini Provider Diagnostic]',JSON.stringify({
-        operation:args.context.operation,
-        errorClass:typed.errorClass,
-        status:typed.status??null,
-        retryable:typed.retryable,
-        providerReasons:safeProviderReasons(typed.providerReasons)
-      }));
-    }
-    await args.emit({...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass}).catch(()=>undefined);
+    if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
+    const event:ProviderCallEvent={...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
+    await persistCapacityOutcome(event).catch(()=>undefined);
+    await releaseCapacity();
+    await args.emit(event).catch(()=>undefined);
     throw typed;
   }finally{
     if(timer)clearTimeout(timer); args.signal?.removeEventListener('abort',abort);
-    await capacityLease?.release();
+    await releaseCapacity();
   }
 }
