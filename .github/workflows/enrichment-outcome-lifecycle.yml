@@ -7,6 +7,9 @@ on:
       - 'server/voiEvidenceController.ts'
       - 'server/evidenceEngine/stagedClassification.ts'
       - 'server/enrichmentOutcomeLifecycle.test.ts'
+      - 'server/enrichmentBacklogDiagnostics.ts'
+      - 'server/enrichmentOperationalFailure.ts'
+      - 'server/enrichmentBacklogEvidence.test.ts'
       - '.github/workflows/enrichment-outcome-lifecycle.yml'
 
 jobs:
@@ -21,7 +24,7 @@ jobs:
           cache: npm
       - run: npm install
       - name: Enrichment outcome lifecycle tests
-        run: node --import tsx --test server/enrichmentOutcomeLifecycle.test.ts server/autonomousRootFirewall.test.ts server/queryEvidenceIndependence.test.ts
+        run: node --import tsx --test server/enrichmentOutcomeLifecycle.test.ts server/enrichmentBacklogEvidence.test.ts server/autonomousRootFirewall.test.ts server/queryEvidenceIndependence.test.ts
       - name: TypeScript validation
         run: npm run lint
       - name: Production build
