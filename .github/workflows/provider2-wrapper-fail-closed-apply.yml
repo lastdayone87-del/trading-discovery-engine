@@ -1,0 +1,49 @@
+name: Provider2 Wrapper Fail Closed Applicator
+on:
+  push:
+    branches:
+      - hardening/provider2-fail-closed
+    paths:
+      - .github/workflows/provider2-wrapper-fail-closed-apply.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hardening/provider2-fail-closed
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Fail closed inside retained enrichment wrapper
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('server/youtube.ts')
+          s=p.read_text()
+          old="process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true'"
+          if s.count(old)!=1: raise SystemExit(f'expected one hybrid wrapper fallback, found {s.count(old)}')
+          s=s.replace(old,"process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'false'",1)
+          p.write_text(s)
+          PY
+      - name: Validate fail-closed paths
+        run: |
+          node --import tsx --test server/provider2FailClosed.test.ts server/restoreOfficialEnrichmentFlow.test.ts
+          grep -F "process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'false'" server/youtube.ts
+          if grep -F "YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'true'" server/youtube.ts; then exit 1; fi
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check
+      - name: Commit implementation and remove applicator
+        run: |
+          rm .github/workflows/provider2-wrapper-fail-closed-apply.yml
+          git config user.name provider2-hardening-bot
+          git config user.email actions@users.noreply.github.com
+          git add server/youtube.ts .github/workflows/provider2-wrapper-fail-closed-apply.yml
+          git commit -m 'Fail closed inside retained hybrid enrichment wrapper'
+          git push origin HEAD:hardening/provider2-fail-closed
