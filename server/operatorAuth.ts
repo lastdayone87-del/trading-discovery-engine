@@ -1,5 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import { getEnrichmentBacklogDiagnostics } from './enrichmentBacklogDiagnostics';
 
 export type OperatorRole = 'operator' | 'admin';
 export type RoutePolicy = 'public' | OperatorRole;
@@ -12,6 +13,7 @@ declare global { namespace Express { interface Request { requestId: string; oper
 const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; action: string }> = [
   { method:'GET', pattern:/^\/api\/health$/, policy:'public', action:'health.read' },
   { method:'GET', pattern:/^\/api\/provider-metrics$/, policy:'operator', action:'providers.metrics.read' },
+  { method:'GET', pattern:/^\/api\/diagnostics\/enrichment-backlog$/, policy:'operator', action:'diagnostics.enrichment-backlog.read' },
   { method:'GET', pattern:/^\/api\/validation-status$/, policy:'operator', action:'validation.read' },
   { method:'GET', pattern:/^\/api\/measurement\/replay$/, policy:'operator', action:'measurement.replay.read' },
   { method:'GET', pattern:/^\/api\/research-programs(?:\/price-action-trading(?:\/coverage)?)?$/, policy:'operator', action:'research.read' },
@@ -71,7 +73,12 @@ export function operatorAuthorization(writeAudit:(event:AuditEvent)=>Promise<voi
     req.routePolicy=route.policy;
     if (route.policy==='public') return next();
     if (env.NODE_ENV!=='production' && env.OPERATOR_AUTH_BYPASS==='true') {
-      const actorId='local-development'; req.operator={actorId,actorHash:hashActor(actorId),role:'admin'}; return next();
+      const actorId='local-development'; req.operator={actorId,actorHash:hashActor(actorId),role:'admin'};
+      if (policyPath(req)==='/api/diagnostics/enrichment-backlog') {
+        try { return res.json(await getEnrichmentBacklogDiagnostics(Number(req.query.limit??10))); }
+        catch (error:any) { return res.status(500).json({error:error?.message||'Diagnostic query failed.',code:'ENRICHMENT_BACKLOG_DIAGNOSTIC_FAILED',requestId:req.requestId}); }
+      }
+      return next();
     }
     const principal=authenticate(bearer(req),env); req.operator=principal;
     const allowed=principal && (route.policy==='operator' || principal.role==='admin');
@@ -80,6 +87,10 @@ export function operatorAuthorization(writeAudit:(event:AuditEvent)=>Promise<voi
       const status=principal?403:401; return res.status(status).json({error:status===401?'Bearer authentication required.':'Administrator role required.',code:status===401?'UNAUTHENTICATED':'FORBIDDEN',requestId:req.requestId});
     }
     res.once('finish',()=>void writeAudit({actorId:principal.actorId,actorHash:principal.actorHash,role:principal.role,action:route.action,target:req.path,requestId:req.requestId,outcome:'ALLOWED',metadata:{...safeMetadata(req),statusCode:res.statusCode}}).catch(err=>console.error('[Operator Audit Write Failed]',{requestId:req.requestId,error:err instanceof Error?err.message:'unknown'})));
+    if (policyPath(req)==='/api/diagnostics/enrichment-backlog') {
+      try { return res.json(await getEnrichmentBacklogDiagnostics(Number(req.query.limit??10))); }
+      catch (error:any) { return res.status(500).json({error:error?.message||'Diagnostic query failed.',code:'ENRICHMENT_BACKLOG_DIAGNOSTIC_FAILED',requestId:req.requestId}); }
+    }
     next();
   };
 }
