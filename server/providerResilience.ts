@@ -80,7 +80,7 @@ function geminiCapacityConfig():GeminiCapacityConfig {
 export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySnapshot, config:GeminiCapacityConfig=geminiCapacityConfig()):GeminiCapacityDecision {
   const age=(value?:number)=>value==null?Number.POSITIVE_INFINITY:Math.max(0,snapshot.nowMs-value);
   const maxInlineWaitMs=config.maxInlineWaitMs??8000;
-  const semanticMaxInlineWaitMs=config.semanticMaxInlineWaitMs??120000;
+  const semanticMaxInlineWaitMs=config.semanticMaxInlineWaitMs??maxInlineWaitMs;
   const globalWait=Math.max(0,config.globalMinIntervalMs-age(snapshot.lastGeminiAtMs));
   if(operation===GEMINI_VOCABULARY_OPERATION){
     if(age(snapshot.lastRateLimitAtMs)<config.vocabularyRateLimitSuppressionMs) return {action:'DEFER',waitMs:0,reasonCode:'VOCABULARY_DEFERRED_RATE_PRESSURE'};
@@ -110,8 +110,6 @@ export function geminiCapacityDeferralError(operation:string, reasonCode?:string
     : isSemantic
       ? 'Gemini semantic classification deferred during provider rate pressure.'
       : 'Gemini operation deferred during provider rate pressure.';
-  // This is a local capacity decision, not a provider 429. Keep it out of the
-  // RATE_LIMITED history used by the next admission decision.
   return new ProviderCallError(message,'TRANSIENT',true,{providerReasons:[reasonCode||'GEMINI_CAPACITY_DEFERRED']});
 }
 
@@ -160,7 +158,6 @@ function safeProviderReasons(values?:string[]):string[]{
   return Array.isArray(values)?values.map(String).filter(value=>/^[A-Z0-9_.:-]{1,80}$/.test(value)).slice(0,6):[];
 }
 
-/** Bounds the caller, propagates cancellation, and emits metadata only (never payloads). */
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
   const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
@@ -179,13 +176,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     const typed=timedOut?new ProviderCallError(`Provider call exceeded ${args.timeoutMs}ms deadline.`,'TIMEOUT',true,{cause:error}):classifyProviderError(error);
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini'){
-      console.warn('[Gemini Provider Diagnostic]',JSON.stringify({
-        operation:args.context.operation,
-        errorClass:typed.errorClass,
-        status:typed.status??null,
-        retryable:typed.retryable,
-        providerReasons:safeProviderReasons(typed.providerReasons)
-      }));
+      console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
     }
     await args.emit({...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()}).catch(()=>undefined);
     throw typed;
