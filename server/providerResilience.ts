@@ -40,6 +40,7 @@ const GEMINI_CAPACITY_LOCK = 741963285;
 const GEMINI_SEMANTIC_OPERATION = 'multilingual-semantic-classification';
 const GEMINI_VOCABULARY_OPERATION = 'vocabulary-extraction';
 const GEMINI_LOCK_POLL_MS = 100;
+const GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS = 1000;
 
 type GeminiCapacitySnapshot = {
   nowMs: number;
@@ -123,8 +124,9 @@ async function queryWithDeadline(client:any,text:string,values:any[],signal?:Abo
   return result;
 }
 
+type GeminiPersistenceContext={signal?:AbortSignal;deadlineAtMs?:number};
 type GeminiCapacityLease={
-  persistOutcome:(event:ProviderCallEvent)=>Promise<void>;
+  persistOutcome:(event:ProviderCallEvent,persistenceContext?:GeminiPersistenceContext)=>Promise<void>;
   release:()=>Promise<void>;
 };
 
@@ -187,9 +189,9 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     if(decision.waitMs>0) await waitForCapacity(decision.waitMs,signal);
     if(signal?.aborted)throw abortError();
     return {
-      persistOutcome:async(event:ProviderCallEvent)=>{
+      persistOutcome:async(event:ProviderCallEvent,persistenceContext?:GeminiPersistenceContext)=>{
         if(!client)return;
-        await queryWithDeadline(client,`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt],signal,deadlineAtMs);
+        await queryWithDeadline(client,`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt],persistenceContext?.signal??signal,persistenceContext?.deadlineAtMs??deadlineAtMs);
       },
       release:async()=>{if(!client)return;const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
     };
@@ -215,7 +217,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   const deadlineAtMs=args.enabled!==false&&args.timeoutMs>0?started+args.timeoutMs:undefined;
   if(deadlineAtMs!=null) timer=setTimeout(()=>{timedOut=true;controller.abort();},Math.max(0,deadlineAtMs-Date.now()));
   const releaseCapacity=async()=>{if(!capacityLease)return;const lease=capacityLease;capacityLease=undefined;await lease.release();};
-  const persistCapacityOutcome=async(event:ProviderCallEvent)=>{if(capacityLease)await capacityLease.persistOutcome(event);};
+  const persistCapacityOutcome=async(event:ProviderCallEvent,persistenceContext?:GeminiPersistenceContext)=>{if(capacityLease)await capacityLease.persistOutcome(event,persistenceContext);};
   try{
     capacityLease=await acquireGeminiCapacity(args.context,controller.signal,deadlineAtMs);
     if(controller.signal.aborted)throw abortError();
@@ -232,7 +234,14 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     args.trace?.(`provider-call-caught (${typed.errorClass})`);
     if(args.context.provider==='gemini')console.warn('[Gemini Provider Diagnostic]',JSON.stringify({operation:args.context.operation,errorClass:typed.errorClass,status:typed.status??null,retryable:typed.retryable,providerReasons:safeProviderReasons(typed.providerReasons)}));
     const event:ProviderCallEvent={...base,status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
-    await persistCapacityOutcome(event).catch(()=>undefined);
+    if(capacityLease&&(typed.errorClass==='TIMEOUT'||typed.errorClass==='CANCELLED')){
+      const cleanupController=new AbortController();
+      const cleanupDeadlineAtMs=Date.now()+GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS;
+      const cleanupTimer=setTimeout(()=>cleanupController.abort(),GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS);
+      try { await persistCapacityOutcome(event,{signal:cleanupController.signal,deadlineAtMs:cleanupDeadlineAtMs}); } catch {} finally { clearTimeout(cleanupTimer); }
+    } else {
+      await persistCapacityOutcome(event).catch(()=>undefined);
+    }
     await releaseCapacity();
     await args.emit(event).catch(()=>undefined);
     throw typed;
