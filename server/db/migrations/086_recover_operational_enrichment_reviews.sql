@@ -123,7 +123,8 @@ WHERE s.job_id=recover.job_id
 -- investigation generation with the recovered step so terminal events are
 -- namespaced too. ACTIVE owners are included because stale RUNNING/RETRYING
 -- steps can legitimately still belong to an ACTIVE investigation with an expired
--- original deadline.
+-- original deadline. Bound digit text before any numeric cast so arbitrary TEXT
+-- cannot overflow PostgreSQL numeric types during this transactional migration.
 UPDATE investigations i
 SET state='ACTIVE',
     completed_at=NULL,
@@ -131,8 +132,12 @@ SET state='ACTIVE',
       COALESCE(
         (SELECT CASE
            WHEN setting_value ~ '^[0-9]+$'
-             AND setting_value::NUMERIC BETWEEN 1 AND 2147483647
-             THEN setting_value::INTEGER
+             AND length(setting_value) BETWEEN 1 AND 10
+             AND (length(setting_value) < 10 OR setting_value <= '2147483647')
+             THEN CASE
+               WHEN setting_value::INTEGER > 0 THEN setting_value::INTEGER
+               ELSE NULL
+             END
            ELSE NULL
          END
          FROM app_settings
