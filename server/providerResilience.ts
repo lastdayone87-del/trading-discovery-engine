@@ -39,6 +39,7 @@ export type ProviderEventSink=(event:ProviderCallEvent)=>Promise<void>;
 const GEMINI_CAPACITY_LOCK = 741963285;
 const GEMINI_SEMANTIC_OPERATION = 'multilingual-semantic-classification';
 const GEMINI_VOCABULARY_OPERATION = 'vocabulary-extraction';
+const GEMINI_LOCK_POLL_MS = 100;
 
 type GeminiCapacitySnapshot = {
   nowMs: number;
@@ -98,11 +99,13 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   return {action:waitMs>0?'WAIT':'RUN',waitMs};
 }
 
+function abortError():Error{const error=new Error('aborted');error.name='AbortError';return error;}
+
 function waitForCapacity(ms:number,signal?:AbortSignal):Promise<void>{
-  if(ms<=0)return Promise.resolve();
+  if(ms<=0)return signal?.aborted?Promise.reject(abortError()):Promise.resolve();
   return new Promise((resolve,reject)=>{
     let timer:ReturnType<typeof setTimeout>;
-    const onAbort=()=>{clearTimeout(timer);const error=new Error('aborted');error.name='AbortError';reject(error)};
+    const onAbort=()=>{clearTimeout(timer);reject(abortError())};
     if(signal?.aborted)return onAbort();
     timer=setTimeout(()=>{signal?.removeEventListener('abort',onAbort);resolve()},ms);
     signal?.addEventListener('abort',onAbort,{once:true});
@@ -122,14 +125,38 @@ export function geminiCapacityDeferralError(operation:string, reasonCode?:string
   return new ProviderCallError(message,'TRANSIENT',true,{providerReasons:[reasonCode||'GEMINI_CAPACITY_DEFERRED']});
 }
 
+async function connectWithAbort(db:any,signal?:AbortSignal):Promise<any>{
+  if(!signal)return db.connect();
+  if(signal.aborted)throw abortError();
+  return new Promise((resolve,reject)=>{
+    let settled=false;
+    const onAbort=()=>{if(settled)return;settled=true;signal.removeEventListener('abort',onAbort);reject(abortError())};
+    signal.addEventListener('abort',onAbort,{once:true});
+    db.connect().then((client:any)=>{
+      if(settled){client.release();return;}
+      settled=true;signal.removeEventListener('abort',onAbort);resolve(client);
+    },(error:unknown)=>{
+      if(settled)return;
+      settled=true;signal.removeEventListener('abort',onAbort);reject(error);
+    });
+  });
+}
+
 async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSignal):Promise<GeminiCapacityLease|undefined>{
   if(context.provider!=='gemini') return undefined;
   let client:any;
   try{
     const { getDb }=await import('./db');
     const db=await getDb();
-    client=await db.connect();
-    await client.query('SELECT pg_advisory_lock($1)',[GEMINI_CAPACITY_LOCK]);
+    while(true){
+      if(signal?.aborted)throw abortError();
+      client=await connectWithAbort(db,signal);
+      const lock=await client.query('SELECT pg_try_advisory_lock($1) AS acquired',[GEMINI_CAPACITY_LOCK]);
+      if(lock.rows[0]?.acquired)break;
+      client.release();client=undefined;
+      await waitForCapacity(GEMINI_LOCK_POLL_MS,signal);
+    }
+    if(signal?.aborted)throw abortError();
     const [lastAny,lastRate,lastSemantic,lastVocabulary]=await Promise.all([
       client.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' ORDER BY occurred_at DESC LIMIT 1`),
       client.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`),
@@ -144,6 +171,7 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
       throw geminiCapacityDeferralError(context.operation,decision.reasonCode);
     }
     if(decision.waitMs>0) await waitForCapacity(decision.waitMs,signal);
+    if(signal?.aborted)throw abortError();
     return {release:async()=>{if(!client)return;await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();client=undefined;}};
   }catch(error){
     if(client){await client.query('SELECT pg_advisory_unlock($1)',[GEMINI_CAPACITY_LOCK]).catch(()=>undefined);client.release();}
@@ -168,6 +196,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
   const releaseCapacity=async()=>{if(!capacityLease)return;const lease=capacityLease;capacityLease=undefined;await lease.release();};
   try{
     capacityLease=await acquireGeminiCapacity(args.context,controller.signal);
+    if(controller.signal.aborted)throw abortError();
     args.trace?.('before provider-call at server/providerResilience.ts');
     const value=await args.call(controller.signal);
     args.trace?.('after provider-call at server/providerResilience.ts');
