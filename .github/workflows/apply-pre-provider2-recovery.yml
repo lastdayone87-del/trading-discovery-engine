@@ -26,6 +26,9 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Remove obsolete Provider 2 and hybrid contract tests
+        run: |
+          grep -Rl --include='*.test.ts' --include='*.integration.test.ts' -E "youtubeInnerTube|youtube_inner_tube_|YOUTUBE_INNERTUBE_|youtube_js_hybrid_enrichment_enabled|YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED|youtubei\.js" server | xargs -r rm -f
       - name: Apply recovery patch
         run: python .github/scripts/apply_pre_provider2_recovery.py
       - name: Inspect stale lock ownership sites
