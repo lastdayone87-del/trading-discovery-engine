@@ -11,7 +11,31 @@ function schedulerClock() {
   };
 }
 
-test('runtime 429s automatically feed the shared exponential scheduler backoff', async () => {
+test('a provider 429 does not globally delay the next healthy provider attempt', async () => {
+  const clock = schedulerClock();
+  const starts: number[] = [];
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 100,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  const rateLimit = Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), {
+    status: 429,
+    quotaExceeded: false,
+    providerReasons: ['rateLimitExceeded'],
+  });
+
+  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit; }));
+  await scheduler.run(async () => { starts.push(clock.value()); });
+
+  assert.deepEqual(starts, [0, 100]);
+  assert.equal(scheduler.isRateLimited(), false);
+  assert.equal(scheduler.getCooldownUntil(), null);
+});
+
+test('repeated provider 429s retain ordinary shared pacing instead of exponential global backoff', async () => {
   const clock = schedulerClock();
   const starts: number[] = [];
   const scheduler = new YouTubeRequestScheduler({
@@ -31,10 +55,10 @@ test('runtime 429s automatically feed the shared exponential scheduler backoff',
   await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit(); }));
   await scheduler.run(async () => { starts.push(clock.value()); });
 
-  assert.deepEqual(starts, [0, 500, 1_300]);
+  assert.deepEqual(starts, [0, 100, 200]);
 });
 
-test('daily quota exhaustion does not trigger runtime request-rate backoff', async () => {
+test('daily quota exhaustion also leaves global pacing unchanged', async () => {
   const clock = schedulerClock();
   const starts: number[] = [];
   const scheduler = new YouTubeRequestScheduler({
@@ -54,24 +78,4 @@ test('daily quota exhaustion does not trigger runtime request-rate backoff', asy
   await scheduler.run(async () => { starts.push(clock.value()); });
 
   assert.deepEqual(starts, [0, 100]);
-});
-
-test('a successful request resets the exponential 429 backoff level', async () => {
-  const clock = schedulerClock();
-  const starts: number[] = [];
-  const scheduler = new YouTubeRequestScheduler({
-    minIntervalMs: 100,
-    initialRateLimitBackoffMs: 500,
-    maxRateLimitBackoffMs: 2_000,
-    now: clock.now,
-    sleep: clock.sleep,
-  });
-  const rateLimit = () => Object.assign(new Error('YouTube HTTP 429'), { status: 429, quotaExceeded: false });
-
-  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit(); }));
-  await scheduler.run(async () => { starts.push(clock.value()); });
-  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit(); }));
-  await scheduler.run(async () => { starts.push(clock.value()); });
-
-  assert.deepEqual(starts, [0, 500, 600, 1_100]);
 });
