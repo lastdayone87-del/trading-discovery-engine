@@ -207,7 +207,7 @@ export async function processNextSearchJob(
       const channelId=String(job.payload.channelId||'');
       const before=await getChannelById(channelId);
       if(!before) { await completeJob(job.id); return true; }
-      const result=await triggerManualRecheck(channelId, true);
+      const result=await triggerManualRecheck(channelId, true, true);
       if(!result.success) throw new Error(result.message);
       const refreshed=await getChannelById(channelId);
       if(refreshed && job.type==='POST_APPROVAL_ENRICH') {
@@ -701,82 +701,202 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
   }
 }
 
+export type ManualRecheckErrorClass = 'TIMEOUT' | 'CANCELLED' | 'RATE_LIMIT' | 'TRANSIENT' | 'PERMANENT_INPUT' | 'CREDENTIALS_EXHAUSTED';
+
+export interface ManualRecheckResult {
+  success: boolean;
+  message: string;
+  channel?: ChannelRecord;
+  debugLog?: any;
+  code?: string;
+  retryable?: boolean;
+  errorClass?: ManualRecheckErrorClass;
+  retryAt?: number;
+  retryAfterMs?: number;
+}
+
+const OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101;
+const MANUAL_RECHECK_ERROR_CLASSES = new Set<ManualRecheckErrorClass>([
+  'TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'PERMANENT_INPUT', 'CREDENTIALS_EXHAUSTED'
+]);
+const MANUAL_RECHECK_TRANSIENT_CLASSES = new Set<ManualRecheckErrorClass>([
+  'TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'
+]);
+
+
+export async function reserveOfficialRecheckQuota(operationType: string, operationId: string): Promise<boolean> {
+  const dailyBudget = getDailyYouTubeQuotaBudget();
+  const allocationPercent = Math.max(1, Math.min(100, Number(await getAppSetting('discovery_enrichment_quota_percent', '10')) || 10));
+  const maximumProviderAttempts = Math.max(1, getYouTubeKeyPool().length);
+  const reservedUnits = OFFICIAL_RECHECK_UNITS_PER_PROVIDER * maximumProviderAttempts;
+  return tryReserveQuota({
+    operationType,
+    operationId,
+    allocation: 'ENRICHMENT',
+    units: reservedUnits,
+    dailyBudget,
+    allocationPercent
+  });
+}
+
+function classifyManualRecheckAcquisitionFailure(error: any): {
+  errorClass?: ManualRecheckErrorClass;
+  retryable: boolean;
+  code: string;
+  retryAt?: number;
+  retryAfterMs?: number;
+} {
+  const message = String(error?.message || error || '');
+  const rawErrorClass = String(error?.errorClass || '').toUpperCase() as ManualRecheckErrorClass;
+  const code = String(error?.code || error?.cause?.code || 'MANUAL_RESCAN_UPSTREAM_FAILURE');
+  const status = Number(error?.status || error?.statusCode || error?.response?.status);
+  const retryAt = Number(error?.retryAt);
+  const retryAfterMs = Number(error?.retryAfterMs);
+
+  // Attempt-free infrastructure retries are deliberately opt-in. The
+  // upstream error itself must already carry a recognized transient
+  // class and explicitly say it is retryable. Status codes, messages,
+  // cooldown codes, and network-looking strings must never manufacture
+  // transient semantics for migration-091 recovery.
+  if (MANUAL_RECHECK_ERROR_CLASSES.has(rawErrorClass)) {
+    return {
+      errorClass: rawErrorClass,
+      retryable: error?.retryable === true && MANUAL_RECHECK_TRANSIENT_CLASSES.has(rawErrorClass),
+      code,
+      retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
+      retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
+    };
+  }
+
+  // Untyped permanent/not-found outcomes may still be identified for
+  // diagnostics, but they never receive attempt-free retry semantics.
+  if (status === 404 || /channel ['"][^'"]+['"] was not found|channel not found|does not exist|deleted channel/i.test(message)) {
+    return { errorClass: 'PERMANENT_INPUT', retryable: false, code };
+  }
+  if ([400, 422].includes(status)) {
+    return { errorClass: 'PERMANENT_INPUT', retryable: false, code };
+  }
+
+  // Every other untyped failure consumes the bounded normal attempt.
+  return {
+    retryable: false,
+    code,
+    retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
+    retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
+  };
+}
+
 /**
  * Triggers a manual re-scan for a specific channel.
  * Runs 4-step inspection synchronously with force live YouTube scraping.
  * Does NOT schedule any automatic future rechecks.
  */
-export async function triggerManualRecheck(channelId: string, enableDebug?: boolean): Promise<{ success: boolean; message: string; channel?: ChannelRecord; debugLog?: any; code?: string; retryable?: boolean }> {
+export async function triggerManualRecheck(
+  channelId: string,
+  enableDebug?: boolean,
+  quotaAlreadyReserved = false
+): Promise<ManualRecheckResult> {
   const channel = await getChannelById(channelId);
   if (!channel) {
-    return { success: false, message: 'Channel not found in database.' };
+    return { success: false, message: 'Channel not found in database.', code: 'MANUAL_RESCAN_CHANNEL_NOT_FOUND', retryable: false, errorClass: 'PERMANENT_INPUT' };
   }
 
   if (channel.trading_status === 'HUMAN_REJECTED') {
-    return { success: false, message: 'Human-rejected channels require the authenticated, audited force-rescan review action.', channel };
+    return { success: false, message: 'Human-rejected channels require the authenticated, audited force-rescan review action.', code: 'MANUAL_RESCAN_POLICY_INELIGIBLE', retryable: false, channel };
   }
 
   const exclusion = await getCountryExclusion(channel.country);
   if (exclusion) {
     console.warn(JSON.stringify({ event: 'excluded_country_blocked', country: exclusion.country, reason: exclusion.reason, context: 'manual_recheck', channelId, timestamp: new Date().toISOString() }));
-    return { success: false, message: `Manual re-scan blocked because ${exclusion.country} is excluded: ${exclusion.reason}`, channel };
+    return { success: false, message: `Manual re-scan blocked because ${exclusion.country} is excluded: ${exclusion.reason}`, code: 'MANUAL_RESCAN_POLICY_INELIGIBLE', retryable: false, channel };
   }
 
-  // A manual recheck is a true creator reclassification, not merely a
-  // Discord/community recrawl. Acquire fresh authoritative YouTube
-  // creator metadata first. If acquisition is unavailable, preserve
-  // the existing trading classification and return a retryable
-  // operational failure rather than classifying placeholder data.
-  const fallback: DiscoveredChannelRaw = {
-    channelId: channel.channel_id,
-    channelName: channel.channel_name,
-    youtubeUrl: channel.youtube_url,
-    description: channel.channel_name,
-    videoTitles: [channel.channel_name],
-    channelLinks: channel.discord_invite ? [channel.discord_invite] : [],
-    channelThumbnailUrl: channel.channel_thumbnail_url
-  };
+  const quotaOperationId = `manual-recheck:${channelId}:${randomUUID()}`;
+  let ownsQuotaReservation = false;
+  let providerAttempted = false;
 
-  let freshCandidate: DiscoveredChannelRaw;
-  try {
-    freshCandidate = await fetchYouTubeChannelEnrichment(channelId, fallback, 1);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    console.warn(`[Manual Recheck] Fresh YouTube creator acquisition failed for ${channelId}; preserving prior trading classification: ${detail}`);
-    return {
-      success: false,
-      message: `Manual re-scan could not acquire fresh YouTube creator evidence. Existing trading classification was preserved; retry is recommended. ${detail}`,
-      code: 'MANUAL_RESCAN_UPSTREAM_FAILURE',
-      retryable: true,
-      channel
-    };
+  if (!quotaAlreadyReserved) {
+    const quotaReserved = await reserveOfficialRecheckQuota('MANUAL_RECHECK', quotaOperationId);
+    if (!quotaReserved) {
+      return {
+        success: false,
+        message: 'Manual re-scan is temporarily unavailable because the official YouTube enrichment quota allocation is exhausted.',
+        code: 'QUOTA_ALLOCATION_EXHAUSTED',
+        retryable: true,
+        errorClass: 'RATE_LIMIT',
+        channel
+      };
+    }
+    ownsQuotaReservation = true;
   }
 
-  freshCandidate.enrichmentStage = Math.max(1, freshCandidate.enrichmentStage || 0);
-  freshCandidate.matchedDocument = { type: 'MANUAL', locator: `recheck:${channelId}` };
-  console.log(`[Manual Reclassification Started] Channel: ${channel.channel_name} (${channel.channel_id})`);
-
   try {
-    const outcome = await processChannelThroughPipeline(freshCandidate, channel.country, 'recheck', true, true);
-    const updatedChannel = outcome.channelRecord || await getChannelById(channelId) || undefined;
-    console.log(`[Manual Reclassification Completed] Channel: ${channel.channel_name}, Trading Status: ${updatedChannel?.trading_status || outcome.tradingStatus}, Score: ${updatedChannel?.trading_confidence_score ?? 'unknown'}, Discord Status: ${updatedChannel?.discord_status || outcome.discordStatus}`);
-    return {
-      success: true,
-      message: `Manual re-scan completed for ${channel.channel_name}. Trading classification and downstream inspection were refreshed from current evidence.`,
-      channel: updatedChannel
+    const fallback: DiscoveredChannelRaw = {
+      channelId: channel.channel_id,
+      channelName: channel.channel_name,
+      youtubeUrl: channel.youtube_url,
+      description: channel.channel_name,
+      videoTitles: [channel.channel_name],
+      channelLinks: channel.discord_invite ? [channel.discord_invite] : [],
+      channelThumbnailUrl: channel.channel_thumbnail_url
     };
-  } catch (error: any) {
-    const detail = error instanceof Error ? error.message : String(error);
-    const preserved = await getChannelById(channelId) || channel;
-    const code = String(error?.code || 'MANUAL_RESCAN_OPERATIONAL_FAILURE');
-    console.warn(`[Manual Recheck] Reclassification failed operationally for ${channelId}; preserving prior decision where no complete classification was produced: ${detail}`);
-    return {
-      success: false,
-      message: `Manual re-scan could not complete a reliable trading reclassification. Existing classification was preserved where the classifier had incomplete provider coverage; retry is recommended. ${detail}`,
-      code,
-      retryable: error?.retryable !== false,
-      channel: preserved
-    };
+
+    let freshCandidate: DiscoveredChannelRaw;
+    try {
+      providerAttempted = true;
+      freshCandidate = await fetchYouTubeChannelEnrichment(channelId, fallback, 1);
+    } catch (error: any) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const failure = classifyManualRecheckAcquisitionFailure(error);
+      console.warn(`[Manual Recheck] Fresh YouTube creator acquisition failed for ${channelId}; preserving prior trading classification: ${detail}`);
+      return {
+        success: false,
+        message: `Manual re-scan could not acquire fresh YouTube creator evidence. Existing trading classification was preserved. ${detail}`,
+        code: 'MANUAL_RESCAN_UPSTREAM_FAILURE',
+        retryable: failure.retryable,
+        errorClass: failure.errorClass,
+        retryAt: failure.retryAt,
+        retryAfterMs: failure.retryAfterMs,
+        channel
+      };
+    }
+
+    freshCandidate.enrichmentStage = Math.max(1, freshCandidate.enrichmentStage || 0);
+    freshCandidate.matchedDocument = { type: 'MANUAL', locator: `recheck:${channelId}` };
+    console.log(`[Manual Reclassification Started] Channel: ${channel.channel_name} (${channel.channel_id})`);
+
+    try {
+      const outcome = await processChannelThroughPipeline(freshCandidate, channel.country, 'recheck', true, true);
+      const updatedChannel = outcome.channelRecord || await getChannelById(channelId) || undefined;
+      console.log(`[Manual Reclassification Completed] Channel: ${channel.channel_name}, Trading Status: ${updatedChannel?.trading_status || outcome.tradingStatus}, Score: ${updatedChannel?.trading_confidence_score ?? 'unknown'}, Discord Status: ${updatedChannel?.discord_status || outcome.discordStatus}`);
+      return {
+        success: true,
+        message: `Manual re-scan completed for ${channel.channel_name}. Trading classification and downstream inspection were refreshed from current evidence.`,
+        channel: updatedChannel
+      };
+    } catch (error: any) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const preserved = await getChannelById(channelId) || channel;
+      const code = String(error?.code || 'MANUAL_RESCAN_OPERATIONAL_FAILURE');
+      const rawErrorClass = String(error?.errorClass || '').toUpperCase() as ManualRecheckErrorClass;
+      const typedTransient = MANUAL_RECHECK_TRANSIENT_CLASSES.has(rawErrorClass) && error?.retryable === true;
+      console.warn(`[Manual Recheck] Reclassification failed operationally for ${channelId}; preserving prior decision where no complete classification was produced: ${detail}`);
+      return {
+        success: false,
+        message: `Manual re-scan could not complete a reliable trading reclassification. Existing classification was preserved where the classifier had incomplete provider coverage. ${detail}`,
+        code,
+        retryable: typedTransient,
+        errorClass: MANUAL_RECHECK_ERROR_CLASSES.has(rawErrorClass) ? rawErrorClass : undefined,
+        retryAt: Number.isFinite(Number(error?.retryAt)) ? Number(error.retryAt) : undefined,
+        retryAfterMs: Number.isFinite(Number(error?.retryAfterMs)) ? Number(error.retryAfterMs) : undefined,
+        channel: preserved
+      };
+    }
+  } finally {
+    if (ownsQuotaReservation) {
+      await finishQuotaReservation('MANUAL_RECHECK', quotaOperationId, providerAttempted)
+        .catch(error => console.error(`[Manual Recheck] Failed to finalize quota reservation ${quotaOperationId}:`, error));
+    }
   }
 }
 

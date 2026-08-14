@@ -11,32 +11,29 @@ test('community retry has a continuously started dedicated consumer', () => {
   assert.match(workers, /startCommunityRetryWorker/);
 });
 
-test('ordinary official rescans reserve the ENRICHMENT worst case across configured provider rotation', () => {
+test('ordinary official rescans use the shared ENRICHMENT worst-case reservation', () => {
   assert.match(workers, /'POST_APPROVAL_ENRICH'/);
   assert.match(workers, /'FORCE_REVIEW_RESCAN'/);
-  assert.match(workers, /tryReserveQuota/);
-  assert.match(workers, /allocation: 'ENRICHMENT'/);
-  assert.match(workers, /OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101/);
-  assert.match(workers, /Math\.max\(1, getYouTubeKeyPool\(\)\.length\)/);
-  assert.match(workers, /reservedUnits = OFFICIAL_RECHECK_UNITS_PER_PROVIDER \* maximumProviderAttempts/);
-  assert.match(workers, /units: reservedUnits/);
+  assert.match(workers, /reserveOfficialRecheckQuota\('OPERATIONAL_RECHECK', operationId\)/);
   assert.match(workers, /finishQuotaReservation\('OPERATIONAL_RECHECK'/);
 });
 
 test('false-negative recovery reserves quota before claiming its custom job', () => {
-  const reserve = workers.indexOf('reserved = await reserveOfficialRecheck(operationId)');
+  const reserve = workers.indexOf("reserved = await reserveOfficialRecheckQuota('OPERATIONAL_RECHECK', operationId)");
   const claim = workers.indexOf('claimNextJob(workerId, [FALSE_NEGATIVE_RECOVERY_JOB])');
   assert.ok(reserve >= 0 && claim > reserve);
   assert.match(workers, /FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN'/);
-  assert.match(workers, /triggerManualRecheck\(channelId, true\)/);
+  assert.match(workers, /triggerManualRecheck\(channelId, true, true\)/);
   assert.match(workers, /completeJob\(job\.id\)/);
   assert.match(workers, /failJob\(claimedJobId, error\)/);
   assert.match(workers, /heartbeatJob\(job\.id, workerId\)/);
 });
 
-test('false-negative recovery maps wrapped upstream failures back to transient infrastructure retries', () => {
-  assert.match(workers, /const retryable = result\.retryable === true/);
-  assert.match(workers, /errorClass: retryable \? 'TRANSIENT' : undefined/);
+test('false-negative recovery grants attempt-free retries only to typed transient failures', () => {
+  assert.match(workers, /const typedTransient = result\.retryable === true/);
+  assert.match(workers, /result\.errorClass/);
+  assert.match(workers, /errorClass: typedTransient \? result\.errorClass : undefined/);
+  assert.doesNotMatch(workers, /errorClass: retryable \? 'TRANSIENT'/);
 });
 
 test('maintenance concurrency is bounded and starts after database readiness in server runtime', () => {

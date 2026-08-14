@@ -1,14 +1,10 @@
-import { processNextSearchJob, triggerManualRecheck } from './queueManager';
+import { processNextSearchJob, reserveOfficialRecheckQuota, triggerManualRecheck } from './queueManager';
 import {
   claimNextJob,
   completeJob,
   failJob,
   finishQuotaReservation,
-  getAppSetting,
-  getDailyYouTubeQuotaBudget,
-  getYouTubeKeyPool,
-  heartbeatJob,
-  tryReserveQuota
+  heartbeatJob
 } from './db';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
@@ -16,7 +12,6 @@ type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>
 const COMMUNITY_RETRY_TYPES: ClaimableOverride = ['RETRY_COMMUNITY_ACQUISITION'];
 const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORCE_REVIEW_RESCAN'];
 const FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN';
-const OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101;
 const QUOTA_BACKOFF_MS = 30_000;
 
 let started = false;
@@ -24,24 +19,6 @@ let started = false;
 function schedule(next: () => void, delayMs: number): void {
   const timer = setTimeout(next, delayMs);
   timer.unref?.();
-}
-
-async function reserveOfficialRecheck(operationId: string): Promise<boolean> {
-  const dailyBudget = getDailyYouTubeQuotaBudget();
-  const allocationPercent = Math.max(1, Math.min(100, Number(await getAppSetting('discovery_enrichment_quota_percent', '10')) || 10));
-  // A stage-1 manual recheck can rotate through every configured project key.
-  // Reserve the bounded worst case up front so successful expensive requests on
-  // an earlier key can never push actual consumption beyond the quota gate.
-  const maximumProviderAttempts = Math.max(1, getYouTubeKeyPool().length);
-  const reservedUnits = OFFICIAL_RECHECK_UNITS_PER_PROVIDER * maximumProviderAttempts;
-  return tryReserveQuota({
-    operationType: 'OPERATIONAL_RECHECK',
-    operationId,
-    allocation: 'ENRICHMENT',
-    units: reservedUnits,
-    dailyBudget,
-    allocationPercent
-  });
 }
 
 function startCommunityRetryWorker(workerId: string): void {
@@ -63,7 +40,7 @@ function startOfficialRecheckWorker(workerId: string): void {
     let reserved = false;
     let nextDelayMs = 1000;
     try {
-      reserved = await reserveOfficialRecheck(operationId);
+      reserved = await reserveOfficialRecheckQuota('OPERATIONAL_RECHECK', operationId);
       if (!reserved) {
         nextDelayMs = QUOTA_BACKOFF_MS;
         return;
@@ -94,7 +71,7 @@ function startFalseNegativeRecoveryWorker(workerId: string): void {
       // Reserve before claiming so a recovery job never becomes PROCESSING when
       // the production ENRICHMENT allocation cannot pay for its bounded official
       // Data API attempts.
-      reserved = await reserveOfficialRecheck(operationId);
+      reserved = await reserveOfficialRecheckQuota('OPERATIONAL_RECHECK', operationId);
       if (!reserved) {
         nextDelayMs = QUOTA_BACKOFF_MS;
         return;
@@ -114,16 +91,16 @@ function startFalseNegativeRecoveryWorker(workerId: string): void {
 
       const channelId = String(job.payload?.channelId || '');
       if (!channelId) throw new Error('False-negative recovery job is missing channelId.');
-      const result = await triggerManualRecheck(channelId, true);
+      const result = await triggerManualRecheck(channelId, true, true);
       if (!result.success) {
-        const retryable = result.retryable === true;
+        const typedTransient = result.retryable === true
+          && ['TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass || ''));
         const error = Object.assign(new Error(result.message), {
           code: result.code,
-          retryable,
-          // triggerManualRecheck intentionally wraps upstream provider errors in
-          // MANUAL_RESCAN_UPSTREAM_FAILURE. Restore infrastructure semantics for
-          // failJob so transient provider outages do not consume normal attempts.
-          errorClass: retryable ? 'TRANSIENT' : undefined
+          retryable: typedTransient,
+          errorClass: typedTransient ? result.errorClass : undefined,
+          retryAt: typedTransient ? result.retryAt : undefined,
+          retryAfterMs: typedTransient ? result.retryAfterMs : undefined
         });
         throw error;
       }
