@@ -5,8 +5,9 @@ import { readFileSync } from 'node:fs';
 const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
 
 test('official enrichment accounts expensive and cheap requests independently', () => {
-  const start = youtube.indexOf('async function fetchYouTubeChannelEnrichmentOfficial');
-  const end = youtube.indexOf('Quota-free hybrid evidence acquisition', start);
+  const start = youtube.indexOf('export async function fetchYouTubeChannelEnrichment(');
+  const end = youtube.indexOf('/** One-unit metadata hydration used only when country evidence remains uncertain. */', start);
+  assert.ok(start >= 0 && end > start, 'official enrichment function boundary must remain discoverable');
   const official = youtube.slice(start, end);
   const uploads = official.indexOf("youtubeFetch(recentUrl,'channel-uploads',100");
   const uploadsAccounting = official.indexOf('incrementQuota(100)', uploads);
