@@ -1,0 +1,65 @@
+name: Fix adaptive DISTINCT ordering
+on:
+  push:
+    branches: [fix/adaptive-classifier-distinct-order]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Fix PostgreSQL DISTINCT ordering expression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('server/adaptiveTradingClassifier.ts')
+          s=p.read_text()
+          old='ORDER BY s.normalized,c.id`,[country]);'
+          new='ORDER BY s.normalized,c.id::text`,[country]);'
+          if old not in s:
+              raise SystemExit('expected adaptive classifier ORDER BY not found')
+          p.write_text(s.replace(old,new,1))
+          PY
+      - name: Add regression assertion
+        run: |
+          cat >> server/adaptiveTradingClassifier.test.ts <<'EOF'
+
+          test('adaptive term DISTINCT query orders by the projected concept id expression', () => {
+            const source = readFileSync(new URL('./adaptiveTradingClassifier.ts', import.meta.url), 'utf8');
+            assert.match(source, /SELECT DISTINCT s\.id::text surface_id,c\.id::text concept_id/);
+            assert.match(source, /ORDER BY s\.normalized,c\.id::text/);
+            assert.doesNotMatch(source, /ORDER BY s\.normalized,c\.id`/);
+          });
+          EOF
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('server/adaptiveTradingClassifier.test.ts')
+          s=p.read_text()
+          if "from 'node:fs'" not in s:
+              lines=s.splitlines()
+              insert=0
+              while insert < len(lines) and lines[insert].startswith('import '): insert += 1
+              lines.insert(insert, "import { readFileSync } from 'node:fs';")
+              p.write_text('\n'.join(lines)+'\n')
+          PY
+      - name: Focused tests
+        run: node --import tsx --test server/adaptiveTradingClassifier.test.ts
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check
+      - name: Commit fix
+        run: |
+          git config user.name 'lastdayone87-del'
+          git config user.email 'lastdayone87@gmail.com'
+          git add server/adaptiveTradingClassifier.ts server/adaptiveTradingClassifier.test.ts
+          git diff --cached --quiet && exit 0
+          git commit -m 'Fix adaptive classifier DISTINCT ordering'
+          git push
