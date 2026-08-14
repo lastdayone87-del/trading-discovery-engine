@@ -16,6 +16,7 @@ import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
 import { observeProductionDiagnosticReliably, observeRetrievalAssignmentReliably } from './phaseBObservationOutbox';
+import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type EvidenceActionType, type EvidenceActionPlan } from './voiEvidenceController';
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
@@ -76,8 +77,26 @@ export async function processChannelThroughPipeline(
   isEnrichmentPass: boolean = false
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
-  if(await getAppSetting('decision_evaluation_sampling_enabled','false')==='true')await observeRetrievalAssignmentReliably({type:'RETRIEVAL_ASSIGNMENT',input:{channelId:candidate.channelId,targetCountry,discoveryOrigin:source,language:candidate.detectedLanguages?.[0]?.language,observedAt:now,context:{isManualScan,isEnrichmentPass}},policy:{policyKey:'protected-audit',version:1,salt:process.env.DECISION_EVALUATION_SAMPLING_SALT||'',protectedAuditBasisPoints:100,targetedAuditBasisPoints:0}})
-    .catch(error=>console.warn(`[DecisionEvaluation] Cohort assignment failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+  if (await getAppSetting('decision_evaluation_sampling_enabled', 'false') === 'true') {
+    const samplingPolicy = buildDecisionEvaluationSamplingPolicy(process.env.DECISION_EVALUATION_SAMPLING_SALT);
+    if (samplingPolicy) {
+      await observeRetrievalAssignmentReliably({
+        type: 'RETRIEVAL_ASSIGNMENT',
+        input: {
+          channelId: candidate.channelId,
+          targetCountry,
+          discoveryOrigin: source,
+          language: candidate.detectedLanguages?.[0]?.language,
+          observedAt: now,
+          context: { isManualScan, isEnrichmentPass },
+        },
+        policy: samplingPolicy,
+      }).catch(error => console.warn(
+        `[DecisionEvaluation] Cohort assignment failed for ${candidate.channelId}:`,
+        error instanceof Error ? error.message : error
+      ));
+    }
+  }
 
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);

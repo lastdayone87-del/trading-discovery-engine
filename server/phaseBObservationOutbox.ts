@@ -38,6 +38,23 @@ const stable = (value: unknown): string => JSON.stringify(value, (_key, item) =>
 );
 const hash = (value: unknown): string => createHash('sha256').update(stable(value)).digest('hex');
 
+export function normalizeRetrievalSamplingPolicy(policy: SamplingPolicy): SamplingPolicy | null {
+  if (typeof policy?.policyKey !== 'string'
+    || typeof policy?.salt !== 'string'
+    || !Number.isInteger(policy?.version)
+    || Number(policy.version) <= 0) {
+    return null;
+  }
+  const policyKey = policy.policyKey.trim();
+  const salt = policy.salt.trim();
+  if (!policyKey || !salt) return null;
+  return { ...policy, policyKey, salt };
+}
+
+export function isValidRetrievalSamplingPolicy(policy: SamplingPolicy): boolean {
+  return normalizeRetrievalSamplingPolicy(policy) !== null;
+}
+
 export function retrievalAssignmentObservationKey(payload: RetrievalAssignmentPayload): string {
   return `phase-b:assignment:${hash({ version: PHASE_B_OBSERVATION_OUTBOX_VERSION, ...payload })}`;
 }
@@ -77,6 +94,39 @@ async function processObservation(observationKey: string): Promise<string | unde
       return prior.rows[0]?.result_reference || undefined;
     }
     payload = claimed.rows[0].payload as PhaseBObservationPayload;
+
+    // Re-validate queued retrieval assignments at execution time. This closes
+    // rolling-deploy races where an old replica can enqueue malformed work after
+    // the one-shot retirement migration. Valid legacy identities are normalized
+    // before execution so cohort hashing matches the effective pinned policy.
+    if (payload.type === 'RETRIEVAL_ASSIGNMENT') {
+      const normalizedPolicy = normalizeRetrievalSamplingPolicy(payload.policy);
+      if (!normalizedPolicy) {
+        await client.query(
+          `INSERT INTO phase_b_observation_retirements(
+             observation_key,observation_type,channel_id,payload,prior_status,
+             attempts,run_after,last_error,result_reference,created_at,updated_at,
+             completed_at,retirement_reason
+           )
+           SELECT observation_key,observation_type,channel_id,payload,status,
+                  attempts,run_after,last_error,result_reference,created_at,updated_at,
+                  completed_at,'INVALID_RETRIEVAL_SAMPLING_POLICY'
+             FROM phase_b_observation_outbox
+            WHERE observation_key=$1
+           ON CONFLICT(observation_key) DO NOTHING`,
+          [observationKey]
+        );
+        await client.query(
+          `DELETE FROM phase_b_observation_outbox
+            WHERE observation_key=$1 AND observation_type='RETRIEVAL_ASSIGNMENT' AND status<>'COMPLETED'`,
+          [observationKey]
+        );
+        await client.query('COMMIT');
+        return undefined;
+      }
+      payload = { ...payload, policy: normalizedPolicy };
+    }
+
     await client.query(`UPDATE phase_b_observation_outbox SET status='PROCESSING',attempts=attempts+1,last_error=NULL,updated_at=now() WHERE observation_key=$1`, [observationKey]);
     await client.query('COMMIT');
   } catch (error) {
@@ -127,8 +177,13 @@ export async function executePhaseBObservation(
 }
 
 export async function observeRetrievalAssignmentReliably(payload: RetrievalAssignmentPayload): Promise<string | undefined> {
-  const observationKey = retrievalAssignmentObservationKey(payload);
-  await captureObservation(observationKey, payload.input.channelId, payload);
+  // Sampling is an optional audit side-channel. Invalid identity is terminal and
+  // must fail closed before persistence; no default salt is ever invented.
+  const normalizedPolicy = normalizeRetrievalSamplingPolicy(payload.policy);
+  if (!normalizedPolicy) return undefined;
+  const normalizedPayload: RetrievalAssignmentPayload = { ...payload, policy: normalizedPolicy };
+  const observationKey = retrievalAssignmentObservationKey(normalizedPayload);
+  await captureObservation(observationKey, normalizedPayload.input.channelId, normalizedPayload);
   return processObservation(observationKey);
 }
 
