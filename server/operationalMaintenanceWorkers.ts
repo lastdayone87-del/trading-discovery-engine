@@ -4,8 +4,10 @@ import {
   completeJob,
   failJob,
   finishQuotaReservation,
+  getQueueStatus,
   heartbeatJob
 } from './db';
+import { youtubeRequestScheduler } from './youtubeRequestScheduler';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
@@ -13,6 +15,17 @@ const COMMUNITY_RETRY_TYPES: ClaimableOverride = ['RETRY_COMMUNITY_ACQUISITION']
 const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORCE_REVIEW_RESCAN'];
 const FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN';
 const QUOTA_BACKOFF_MS = 30_000;
+const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
+  0,
+  Number(process.env.RECOVERY_MAX_PRODUCTION_BACKLOG || 2)
+);
+
+export async function isRecoveryAdmissionOpen(): Promise<boolean> {
+  const queue = await getQueueStatus();
+  const productionBacklog = queue.searchJobs.depth + queue.channelProcessing.depth;
+  return productionBacklog <= RECOVERY_MAX_PRODUCTION_BACKLOG
+    && !youtubeRequestScheduler.isRateLimited();
+}
 
 let started = false;
 
@@ -68,6 +81,11 @@ function startFalseNegativeRecoveryWorker(workerId: string): void {
     let heartbeat: NodeJS.Timeout | undefined;
     let nextDelayMs = 1000;
     try {
+      if (!await isRecoveryAdmissionOpen()) {
+        nextDelayMs = QUOTA_BACKOFF_MS;
+        return;
+      }
+
       // Reserve before claiming so a recovery job never becomes PROCESSING when
       // the production ENRICHMENT allocation cannot pay for its bounded official
       // Data API attempts.

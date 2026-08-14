@@ -1,3 +1,9 @@
+export type YouTubeRequestPriority =
+  | 'manual'
+  | 'autonomous'
+  | 'enrichment'
+  | 'incident-recovery';
+
 export interface YouTubeRequestSchedulerOptions {
   minIntervalMs: number;
   initialRateLimitBackoffMs: number;
@@ -6,13 +12,33 @@ export interface YouTubeRequestSchedulerOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+const PRIORITY: Record<YouTubeRequestPriority, number> = {
+  manual: 0,
+  autonomous: 1,
+  enrichment: 2,
+  'incident-recovery': 3
+};
+
+interface QueuedRequest<T> {
+  call: () => Promise<T>;
+  trace?: (stage: string) => void;
+  priority: YouTubeRequestPriority;
+  sequence: number;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+}
+
 function isRuntimeYouTubeRateLimit(error: unknown): boolean {
   let current: any = error;
   for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
     if (current.quotaExceeded === true) return false;
     if (current.status === 429) return true;
-    if (Array.isArray(current.providerReasons)
-      && current.providerReasons.some((reason: unknown) => /^rateLimitExceeded$/i.test(String(reason)))) return true;
+    if (
+      Array.isArray(current.providerReasons)
+      && current.providerReasons.some((reason: unknown) =>
+        /^rateLimitExceeded$/i.test(String(reason))
+      )
+    ) return true;
   }
   return false;
 }
@@ -23,56 +49,133 @@ function isRuntimeYouTubeRateLimit(error: unknown): boolean {
  * lookups cannot present one shared egress identity as a bursty client.
  */
 export class YouTubeRequestScheduler {
-  private tail: Promise<void> = Promise.resolve();
+  private readonly queue: QueuedRequest<unknown>[] = [];
+  private processing = false;
+  private sequence = 0;
   private nextStartAt = 0;
   private rateLimitBackoffMs = 0;
 
   constructor(private readonly options: YouTubeRequestSchedulerOptions) {}
 
-  run<T>(call: () => Promise<T>, trace?: (stage: string) => void): Promise<T> {
-    const scheduled = this.tail.then(async () => {
-      trace?.('scheduler-tail-released');
-      const now = (this.options.now ?? Date.now)();
-      const waitMs = Math.max(0, this.nextStartAt - now);
-      if (waitMs) {
-        trace?.(`before scheduler-delay (${waitMs}ms) at server/youtubeRequestScheduler.ts:28`);
-        await (this.options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))))(waitMs);
-        trace?.('after scheduler-delay at server/youtubeRequestScheduler.ts:28');
-      }
-      this.nextStartAt = (this.options.now ?? Date.now)() + Math.max(0, this.options.minIntervalMs);
-      trace?.('before scheduled-call at server/youtubeRequestScheduler.ts:33');
-      try {
-        const value = await call();
-        this.succeeded();
-        trace?.('after scheduled-call at server/youtubeRequestScheduler.ts:33');
-        return value;
-      } catch (error) {
-        if (isRuntimeYouTubeRateLimit(error)) this.rateLimited();
-        throw error;
-      }
+  run<T>(
+    call: () => Promise<T>,
+    trace?: (stage: string) => void,
+    priority: YouTubeRequestPriority = 'enrichment'
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push({
+        call,
+        trace,
+        priority,
+        sequence: this.sequence++,
+        resolve,
+        reject
+      });
+      this.queue.sort(
+        (left, right) =>
+          PRIORITY[left.priority] - PRIORITY[right.priority]
+          || left.sequence - right.sequence
+      );
+      void this.processQueue();
     });
-    this.tail = scheduled.then(() => undefined, () => undefined);
-    return scheduled;
+  }
+
+  isRateLimited(): boolean {
+    return this.rateLimitBackoffMs > 0
+      && this.nextStartAt > (this.options.now ?? Date.now)();
+  }
+
+  getCooldownUntil(): number | null {
+    return this.isRateLimited() ? this.nextStartAt : null;
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
+
+    try {
+      while (this.queue.length) {
+        const request = this.queue.shift()!;
+        request.trace?.('scheduler-tail-released');
+
+        const now = (this.options.now ?? Date.now)();
+        const waitMs = Math.max(0, this.nextStartAt - now);
+        if (waitMs) {
+          request.trace?.(
+            `before scheduler-delay (${waitMs}ms) at server/youtubeRequestScheduler.ts:76`
+          );
+          await (
+            this.options.sleep
+            ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
+          )(waitMs);
+          request.trace?.(
+            'after scheduler-delay at server/youtubeRequestScheduler.ts:76'
+          );
+        }
+
+        this.nextStartAt =
+          (this.options.now ?? Date.now)()
+          + Math.max(0, this.options.minIntervalMs);
+        request.trace?.(
+          'before scheduled-call at server/youtubeRequestScheduler.ts:88'
+        );
+
+        try {
+          const value = await request.call();
+          this.succeeded();
+          request.trace?.(
+            'after scheduled-call at server/youtubeRequestScheduler.ts:88'
+          );
+          request.resolve(value);
+        } catch (error) {
+          if (isRuntimeYouTubeRateLimit(error)) this.rateLimited();
+          request.reject(error);
+        }
+      }
+    } finally {
+      this.processing = false;
+      if (this.queue.length) void this.processQueue();
+    }
   }
 
   rateLimited(): void {
     const initial = Math.max(1, this.options.initialRateLimitBackoffMs);
     this.rateLimitBackoffMs = this.rateLimitBackoffMs
-      ? Math.min(Math.max(initial, this.options.maxRateLimitBackoffMs), this.rateLimitBackoffMs * 2)
+      ? Math.min(
+          Math.max(initial, this.options.maxRateLimitBackoffMs),
+          this.rateLimitBackoffMs * 2
+        )
       : initial;
-    this.nextStartAt = Math.max(this.nextStartAt, (this.options.now ?? Date.now)() + this.rateLimitBackoffMs);
+    this.nextStartAt = Math.max(
+      this.nextStartAt,
+      (this.options.now ?? Date.now)() + this.rateLimitBackoffMs
+    );
   }
 
-  succeeded(): void { this.rateLimitBackoffMs = 0; }
+  succeeded(): void {
+    this.rateLimitBackoffMs = 0;
+  }
 }
 
-const nonNegativeNumber = (value: string | undefined, fallback: number): number => {
+const nonNegativeNumber = (
+  value: string | undefined,
+  fallback: number
+): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
 export const youtubeRequestScheduler = new YouTubeRequestScheduler({
-  minIntervalMs: nonNegativeNumber(process.env.YOUTUBE_MIN_REQUEST_INTERVAL_MS, 250),
-  initialRateLimitBackoffMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_BACKOFF_MS, 5_000),
-  maxRateLimitBackoffMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS, 5 * 60_000)
+  minIntervalMs: nonNegativeNumber(
+    process.env.YOUTUBE_MIN_REQUEST_INTERVAL_MS,
+    250
+  ),
+  initialRateLimitBackoffMs: nonNegativeNumber(
+    process.env.YOUTUBE_RATE_LIMIT_BACKOFF_MS,
+    5_000
+  ),
+  maxRateLimitBackoffMs: nonNegativeNumber(
+    process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS,
+    5 * 60_000
+  )
 });

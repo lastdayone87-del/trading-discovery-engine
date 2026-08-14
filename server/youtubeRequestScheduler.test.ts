@@ -22,6 +22,25 @@ test('serializes concurrent outbound calls and spaces their starts', async () =>
   assert.deepEqual(starts, [0, 100, 200]);
 });
 
+test('serves queued work by priority while preserving the active request', async () => {
+  const order: string[] = [];
+  let releaseActive!: () => void;
+  const active = new Promise<void>(resolve => { releaseActive = resolve; });
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 0,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000
+  });
+  const running = scheduler.run(async () => { await active; order.push('active'); }, undefined, 'enrichment');
+  const recovery = scheduler.run(async () => { order.push('recovery'); }, undefined, 'incident-recovery');
+  const enrichment = scheduler.run(async () => { order.push('enrichment'); }, undefined, 'enrichment');
+  const autonomous = scheduler.run(async () => { order.push('autonomous'); }, undefined, 'autonomous');
+  const manual = scheduler.run(async () => { order.push('manual'); }, undefined, 'manual');
+  releaseActive();
+  await Promise.all([running, recovery, enrichment, autonomous, manual]);
+  assert.deepEqual(order, ['active', 'manual', 'autonomous', 'enrichment', 'recovery']);
+});
+
 test('applies shared exponential cooldown automatically after provider rate limiting', async () => {
   let now = 0;
   const starts: number[] = [];
