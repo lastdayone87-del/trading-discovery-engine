@@ -24,108 +24,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Apply bounded semantic wait and durable enriched-payload reuse
-        shell: python
-        run: |
-          from pathlib import Path
-
-          p = Path('server/providerResilience.ts')
-          s = p.read_text()
-          old = "semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 90000)"
-          new = "semanticMaxInlineWaitMs: envMs('GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 8000)"
-          if old not in s:
-              raise SystemExit('Gemini semantic inline-wait anchor not found')
-          p.write_text(s.replace(old, new, 1))
-
-          p = Path('server/queueManager.ts')
-          s = p.read_text()
-          old = """      const enrichmentQuotaUnits=enrichmentStage>=2?202:101;
-          const enrichmentReservationUnits=enrichmentQuotaUnits;
-          const quotaReserved = await tryReserveQuota({
-            operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-            units: enrichmentReservationUnits, dailyBudget, allocationPercent: enrichmentPercent
-          });
-          if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
-          try {
-            const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage,async additionalUnits=>{
-              const toppedUp=await topUpQuotaReservation({
-                operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
-                additionalUnits,dailyBudget,allocationPercent:enrichmentPercent
-              });
-              if(!toppedUp)throw new QuotaAllocationExhaustedError('ENRICHMENT');
-            });
-            const pipelineOutcome=await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
-            if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
-            await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
-            if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
-          } catch (error) {
-            if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
-            await finishQuotaReservation('ENRICH_CHANNEL', job.id, false);
-            throw error;
-          }
-"""
-          new = """      const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;
-          const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?202:101);
-          let quotaReserved=false;
-          if(!candidateAlreadyEnriched){
-            quotaReserved=await tryReserveQuota({
-              operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
-              units:enrichmentQuotaUnits,dailyBudget,allocationPercent:enrichmentPercent
-            });
-            if(!quotaReserved)throw new QuotaAllocationExhaustedError('ENRICHMENT');
-          }
-          try {
-            const enriched=candidateAlreadyEnriched?candidate:await fetchYouTubeChannelEnrichment(channelId,candidate,enrichmentStage,async additionalUnits=>{
-              const toppedUp=await topUpQuotaReservation({
-                operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
-                additionalUnits,dailyBudget,allocationPercent:enrichmentPercent
-              });
-              if(!toppedUp)throw new QuotaAllocationExhaustedError('ENRICHMENT');
-            });
-            if(!candidateAlreadyEnriched){
-              const db=await getDb();
-              await db.query(`UPDATE jobs SET payload=jsonb_set(payload,'{candidate}',$2::jsonb,true),updated_at=now() WHERE id=$1`,[job.id,JSON.stringify(enriched)]);
-            }
-            const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true);
-            if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
-            if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
-            if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
-          } catch (error) {
-            if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
-            if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
-            throw error;
-          }
-"""
-          if old not in s:
-              raise SystemExit('ENRICH_CHANNEL acquisition block anchor not found')
-          p.write_text(s.replace(old, new, 1))
-
-          Path('server/enrichmentBacklogDrain.contract.test.ts').write_text("""import test from 'node:test';
-          import assert from 'node:assert/strict';
-          import fs from 'node:fs';
-
-          test('Gemini rate pressure cannot monopolize an enrichment worker for the full cooldown by default',()=>{
-            const source=fs.readFileSync(new URL('./providerResilience.ts',import.meta.url),'utf8');
-            assert.match(source,/GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 8000/);
-            assert.doesNotMatch(source,/GEMINI_SEMANTIC_MAX_INLINE_WAIT_MS', 90000/);
-          });
-
-          test('job-level semantic retry reuses the already paid YouTube enrichment payload',()=>{
-            const source=fs.readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
-            assert.match(source,/candidateAlreadyEnriched=Number\(candidate\.enrichmentStage\|\|0\)>=enrichmentStage/);
-            assert.match(source,/candidateAlreadyEnriched\?candidate:await fetchYouTubeChannelEnrichment/);
-            assert.match(source,/payload=jsonb_set\(payload,'\{candidate\}'/);
-            assert.match(source,/if\(quotaReserved\)await finishQuotaReservation/);
-          });
-          """)
+      - name: Apply fix
+        run: python scripts/apply_enrichment_backlog_fix.py
       - name: Validate
         run: |
           set -euo pipefail
-          node --import tsx --test \
-            server/enrichmentOperationalFailure.test.ts \
-            server/enrichmentBacklogDrain.contract.test.ts \
-            server/providerResilience.test.ts \
-            server/quotaRecovery.test.ts
+          node --import tsx --test server/enrichmentOperationalFailure.test.ts server/enrichmentBacklogDrain.contract.test.ts server/providerResilience.test.ts server/quotaRecovery.test.ts
           npm run lint
           npm run build
           git diff --check
@@ -134,7 +38,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          rm .github/workflows/apply-enrichment-backlog-drain.yml
+          rm .github/workflows/apply-enrichment-backlog-drain.yml scripts/apply_enrichment_backlog_fix.py
           git add -A
           git commit -m "Drain enrichment backlog during semantic provider degradation"
           git push origin HEAD:fix/enrichment-backlog-gemini-degradation
