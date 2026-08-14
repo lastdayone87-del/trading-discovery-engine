@@ -11,13 +11,15 @@ test('community retry has a continuously started dedicated consumer', () => {
   assert.match(workers, /startCommunityRetryWorker/);
 });
 
-test('ordinary official rescans are gated by the ENRICHMENT quota allocation', () => {
+test('ordinary official rescans reserve the ENRICHMENT worst case across configured provider rotation', () => {
   assert.match(workers, /'POST_APPROVAL_ENRICH'/);
   assert.match(workers, /'FORCE_REVIEW_RESCAN'/);
   assert.match(workers, /tryReserveQuota/);
   assert.match(workers, /allocation: 'ENRICHMENT'/);
-  assert.match(workers, /units: OFFICIAL_RECHECK_UNITS/);
-  assert.match(workers, /OFFICIAL_RECHECK_UNITS = 101/);
+  assert.match(workers, /OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101/);
+  assert.match(workers, /Math\.max\(1, getYouTubeKeyPool\(\)\.length\)/);
+  assert.match(workers, /reservedUnits = OFFICIAL_RECHECK_UNITS_PER_PROVIDER \* maximumProviderAttempts/);
+  assert.match(workers, /units: reservedUnits/);
   assert.match(workers, /finishQuotaReservation\('OPERATIONAL_RECHECK'/);
 });
 
@@ -30,6 +32,11 @@ test('Provider2 false-negative recovery reserves quota before claiming its custo
   assert.match(workers, /completeJob\(job\.id\)/);
   assert.match(workers, /failJob\(claimedJobId, error\)/);
   assert.match(workers, /heartbeatJob\(job\.id, workerId\)/);
+});
+
+test('Provider2 recovery maps wrapped upstream failures back to transient infrastructure retries', () => {
+  assert.match(workers, /const retryable = result\.retryable !== false/);
+  assert.match(workers, /errorClass: retryable \? 'TRANSIENT' : undefined/);
 });
 
 test('maintenance concurrency is bounded and starts after database readiness in server runtime', () => {
