@@ -1,0 +1,25 @@
+name: PR230 validate
+
+on:
+  push:
+    branches:
+      - fix/post-merge-recheck-safety
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Focused regression tests
+        run: node --import tsx --test server/postMergeRecheckSafety.contract.test.ts server/operationalMaintenanceWorkers.test.ts server/manualRecheckClassification.test.ts server/browserCommunityFallback.test.ts server/browserCommunityFallback.integration.test.ts server/provider2Removal.contract.test.ts
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check origin/main...HEAD
