@@ -24,3 +24,12 @@ test('a crash after payload persistence cannot release already-consumed quota',(
   assert.match(source,/let acquisitionPersisted=candidateAlreadyEnriched/);
   assert.match(source,/if\(quotaReserved\)await finishQuotaReservation\('ENRICH_CHANNEL',job\.id,acquisitionPersisted\)/);
 });
+
+test('expired cached enrichment reservations are restored to consumed and retain provider cost',()=>{
+  const migration=fs.readFileSync(new URL('./db/migrations/093_recover_cached_enrichment_provider_cost.sql',import.meta.url),'utf8');
+  assert.match(migration,/OLD\.status = 'RESERVED'[\s\S]*?NEW\.status = 'EXPIRED'[\s\S]*?NEW\.operation_type = 'ENRICH_CHANNEL'/);
+  assert.match(migration,/payload->'candidate'->>'enrichmentStage'/);
+  assert.match(migration,/NEW\.status := 'CONSUMED'/);
+  assert.match(migration,/status IN \('RESERVED','EXPIRED'\)[\s\S]*?RETURNING units INTO recovered_units/);
+  assert.match(migration,/NEW\.provider_cost := recovered_units/);
+});
