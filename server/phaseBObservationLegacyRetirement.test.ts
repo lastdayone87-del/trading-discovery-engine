@@ -15,6 +15,10 @@ test('legacy invalid retrieval assignments are durably retired from the active r
   assert.match(migration, /policyKey/);
   assert.match(migration, /'salt'/);
   assert.match(migration, /'version'/);
+  assert.match(migration, /jsonb_typeof\(o\.payload->'policy'->'version'\) = 'number'/);
+  assert.match(migration, /::numeric <= 0/);
+  assert.match(migration, /trunc\(\(o\.payload->'policy'->>'version'\)::numeric\)/);
+  assert.doesNotMatch(migration, /version'.*\!~\s*'\^\[1-9\]/s);
   assert.match(migration, /ON CONFLICT \(observation_key\) DO NOTHING/);
   assert.match(migration, /DELETE FROM phase_b_observation_outbox/);
 });
