@@ -15,9 +15,10 @@ test('migration 088 remains historical and non-destructive', () => {
 });
 
 test('ENRICH_CHANNEL is unconditional official quota-governed enrichment', () => {
-  assert.match(queueManager, /const enrichmentQuotaUnits=enrichmentStage>=2\?202:101/);
+  assert.match(queueManager, /const candidateAlreadyEnriched=Number\(candidate\.enrichmentStage\|\|0\)>=enrichmentStage/);
+  assert.match(queueManager, /const enrichmentQuotaUnits=candidateAlreadyEnriched\?0:\(enrichmentStage>=2\?202:101\)/);
   assert.match(queueManager, /operationType:\s*'ENRICH_CHANNEL'/);
-  assert.match(queueManager, /fetchYouTubeChannelEnrichment\(channelId, candidate,enrichmentStage\)/);
+  assert.match(queueManager, /candidateAlreadyEnriched\?candidate:await fetchYouTubeChannelEnrichment\(channelId,candidate,enrichmentStage/);
   assert.doesNotMatch(queueManager, /hybridEnrichmentEnabled|fetchYouTubeChannelEnrichmentQuotaFree|youtube_js_hybrid_enrichment_enabled|YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED/);
   assert.match(youtube, /export async function fetchYouTubeChannelEnrichment\(/);
   assert.doesNotMatch(youtube, /fetchInnerTubeChannelEnrichment|youtube_js_hybrid_enrichment_enabled|YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED/);
