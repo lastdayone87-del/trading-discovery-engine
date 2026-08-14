@@ -48,9 +48,6 @@ jobs:
           test -n "$db_topup_id" || { echo "Corrected db.ts top-up export unavailable"; exit 1; }
           test -n "$youtube_id" || { echo "Corrected youtube.ts export unavailable"; exit 1; }
 
-          # scheduler.ts is already committed on this branch. Apply the remaining
-          # restoration changes. db-base establishes observability/retry semantics;
-          # db-topup then adds the atomic incremental quota contract.
           apply_comment_diff 5296957897 queueManager.ts
           apply_comment_diff 5296964722 db-base.ts
           apply_comment_diff "$db_topup_id" db-topup.ts
@@ -60,6 +57,20 @@ jobs:
           apply_comment_diff 5296980175 pre203-contract-test.ts
           apply_comment_diff 5296982146 providerRetryPolicy.test.ts
           apply_comment_diff 5296979506 youtubeRequestScheduler.test.ts
+
+          # A provider retryAt remains authoritative even when its timestamp has
+          # just elapsed: it is executable now, not a reason to inject a fresh
+          # exponential delay. Exponential fallback is only for missing hints.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('server/db.ts')
+          s = p.read_text()
+          old = "const scheduled=Number.isFinite(retryAt)&&retryAt>now?retryAt:Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;"
+          new = "const scheduled=Number.isFinite(retryAt)?Math.max(now,retryAt):Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;"
+          if old not in s:
+              raise SystemExit('Expected provider retry scheduling expression not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
 
           git diff --check
 
