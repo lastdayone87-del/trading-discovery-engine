@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { YouTubeProviderCooldown } from './youtubeProviderCooldown';
+import { YouTubeProviderCooldown, YouTubeProvidersCoolingDownError } from './youtubeProviderCooldown';
 
 test('rate-limited providers are skipped until their exponential cooldown expires', () => {
   let now = 1_000;
@@ -13,14 +13,30 @@ test('rate-limited providers are skipped until their exponential cooldown expire
   assert.equal(providers.eligible('project-a'), true);
 });
 
-test('daily quota exhaustion cools only that provider until the next UTC day', () => {
+test('repeated 429 after cooldown preserves provider-local exponential history until success', () => {
+  let now = 1_000;
+  const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,now:()=>now});
+  assert.equal(providers.failed('project-a', 'RATE_LIMITED'), 1_100);
+  now = 1_100;
+  assert.equal(providers.eligible('project-a'), true);
+  assert.equal(providers.failed('project-a', 'RATE_LIMITED'), 1_300);
+  now = 1_300;
+  assert.equal(providers.eligible('project-a'), true);
+  assert.equal(providers.failed('project-a', 'RATE_LIMITED'), 1_700);
+  now = 1_700;
+  providers.succeeded('project-a');
+  assert.equal(providers.failed('project-a', 'RATE_LIMITED'), 1_800);
+});
+
+test('daily quota exhaustion cools only that provider until the next Pacific quota day', () => {
   let now = Date.parse('2026-07-30T12:00:00Z');
   const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,now:()=>now});
-  assert.equal(providers.failed('project-a', 'DAILY_QUOTA_EXHAUSTED'), Date.parse('2026-07-31T00:00:00Z'));
+  const reset = providers.failed('project-a', 'DAILY_QUOTA_EXHAUSTED');
+  assert.ok(reset > now);
   assert.equal(providers.eligible('project-a'), false);
-  assert.deepEqual(providers.status('project-a'), { status: 'Daily Quota Exhausted', retryAt: Date.parse('2026-07-31T00:00:00Z') });
+  assert.deepEqual(providers.status('project-a'), { status: 'Daily Quota Exhausted', retryAt: reset });
   assert.equal(providers.eligible('project-b'), true);
-  now = Date.parse('2026-07-31T00:00:00Z');
+  now = reset;
   assert.equal(providers.eligible('project-a'), true);
   assert.deepEqual(providers.status('project-a'), { status: 'Active', retryAt: null });
 });
@@ -46,4 +62,14 @@ test('final eligible provider failure exposes the earliest pool retry time', () 
   assert.equal(providers.earliestRetryAtIfAllCooling(['project-a', 'project-b']), null);
   providers.failed('project-b', 'RATE_LIMITED');
   assert.equal(providers.earliestRetryAtIfAllCooling(['project-a', 'project-b']), now + 100);
+});
+
+test('all-provider cooldown error is explicitly retryable and typed as rate limit', () => {
+  const retryAt = Date.now() + 5_000;
+  const error = new YouTubeProvidersCoolingDownError(retryAt);
+  assert.equal(error.code, 'YOUTUBE_PROVIDERS_COOLING_DOWN');
+  assert.equal(error.retryable, true);
+  assert.equal(error.errorClass, 'RATE_LIMIT');
+  assert.equal(error.retryAt, retryAt);
+  assert.ok(error.retryAfterMs >= 0);
 });
