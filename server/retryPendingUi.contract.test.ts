@@ -7,4 +7,5 @@ const resultsTable=readFileSync(new URL('../src/components/ResultsTable.tsx',imp
 test('recoverable Discord validation is presented as retry required, not queued retry',()=>{
   assert.match(resultsTable,/Validation retry required/);
   assert.doesNotMatch(resultsTable,/Validation retry pending/);
+  assert.match(resultsTable,/discord_validation_status === 'RETRY_PENDING' && c\.scan_status === 'FAILED' \? 'RETRY REQUIRED'/);
 });

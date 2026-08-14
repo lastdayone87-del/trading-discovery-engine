@@ -520,7 +520,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           ? 'text-rose-600 dark:text-rose-400 font-bold'
                           : 'text-slate-500'
                       }`}>
-                        {c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status === 'ENRICHING' ? 'ENRICHING (Reclassifying)' : c.scan_status}
+                        {c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? 'RETRY REQUIRED' : c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status === 'ENRICHING' ? 'ENRICHING (Reclassifying)' : c.scan_status}
                       </span>
                       {c.scan_attempts > 0 && (
                         <span className="block text-[10px] text-slate-400 mt-0.5">
