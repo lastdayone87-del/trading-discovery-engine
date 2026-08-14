@@ -41,6 +41,62 @@ test('serves queued work by priority while preserving the active request', async
   assert.deepEqual(order, ['active', 'manual', 'autonomous', 'enrichment', 'recovery']);
 });
 
+test('aged enrichment cannot starve behind a continuous autonomous queue', async () => {
+  let now = 0;
+  const order: string[] = [];
+  let releaseActive!: () => void;
+  const active = new Promise<void>(resolve => { releaseActive = resolve; });
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 1_000,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    starvationMs: 1_500,
+    now: () => now,
+    sleep: async ms => { now += ms; }
+  });
+
+  const running = scheduler.run(async () => { await active; order.push('active'); }, undefined, 'enrichment');
+  const enrichment = scheduler.run(async () => { order.push('enrichment'); }, undefined, 'enrichment');
+  const autonomous1 = scheduler.run(async () => { order.push('autonomous-1'); }, undefined, 'autonomous');
+  const autonomous2 = scheduler.run(async () => { order.push('autonomous-2'); }, undefined, 'autonomous');
+  const autonomous3 = scheduler.run(async () => { order.push('autonomous-3'); }, undefined, 'autonomous');
+
+  releaseActive();
+  await Promise.all([running, enrichment, autonomous1, autonomous2, autonomous3]);
+
+  assert.deepEqual(order, [
+    'active',
+    'autonomous-1',
+    'enrichment',
+    'autonomous-2',
+    'autonomous-3'
+  ]);
+});
+
+test('starvation is re-evaluated after shared pacing delay before the next call starts', async () => {
+  let now = 0;
+  const order: string[] = [];
+  let releaseActive!: () => void;
+  const active = new Promise<void>(resolve => { releaseActive = resolve; });
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 1_000,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    starvationMs: 500,
+    now: () => now,
+    sleep: async ms => { now += ms; }
+  });
+
+  const running = scheduler.run(async () => { await active; order.push('active'); }, undefined, 'enrichment');
+  const enrichment = scheduler.run(async () => { order.push('enrichment'); }, undefined, 'enrichment');
+  const autonomous = scheduler.run(async () => { order.push('autonomous'); }, undefined, 'autonomous');
+
+  releaseActive();
+  await Promise.all([running, enrichment, autonomous]);
+
+  assert.deepEqual(order, ['active', 'enrichment', 'autonomous']);
+});
+
 test('applies shared exponential cooldown automatically after provider rate limiting', async () => {
   let now = 0;
   const starts: number[] = [];
