@@ -262,6 +262,7 @@ export interface QueueStatus {
   searchJobs: { depth: number; isPaused: boolean };
   channelProcessing: { depth: number; isPaused: boolean };
   discordValidation: { depth: number; isPaused: boolean };
+  pendingWork: Array<{ id: string; type: string; waitingReason: string; retryAt: string | null; priority: number; ageMs: number; lastProviderError: string | null }>;
 }
 
 export interface KeyQuotaUsage {

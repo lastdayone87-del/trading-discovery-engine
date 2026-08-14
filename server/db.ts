@@ -372,7 +372,10 @@ export async function getQueueStatus(): Promise<QueueStatus> {
   const controls=await db.query('SELECT queue_name,is_paused FROM queue_controls');
   const paused:Record<string,boolean>={}; controls.rows.forEach(r=>paused[r.queue_name]=!!r.is_paused);
   const typeCount=(types:string[])=>depths.rows.filter(r=>types.includes(r.type)).reduce((a,r)=>a+r.count,0);
-  return { searchJobs:{depth:typeCount(['SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE']),isPaused:!!paused.search_jobs}, channelProcessing:{depth:typeCount(['PROCESS_CHANNEL','ENRICH_CHANNEL']),isPaused:!!paused.channel_processing}, discordValidation:{depth:typeCount(['INSPECT_DISCORD']),isPaused:!!paused.discord_validation} };
+  const pending=await db.query(`SELECT id,type,status,priority,run_after,created_at,last_error FROM jobs WHERE status IN ('PENDING','PROCESSING') ORDER BY priority DESC,created_at ASC LIMIT 100`);
+  const now=Date.now();
+  const pendingWork=pending.rows.map(r=>({id:r.id,type:r.type,status:r.status,priority:r.priority||0,ageMs:Math.max(0,now-new Date(r.created_at).getTime()),waitingReason:r.status==='PROCESSING'?'waiting_for_worker':new Date(r.run_after).getTime()>now?(String(r.last_error||'').match(/rate.?limit|429/i)?'waiting_for_youtube_rate_limit':String(r.last_error||'').match(/quota|provider.*cool/i)?'waiting_for_quota':'retry_at'):'waiting_for_worker',retryAt:r.status==='PENDING'&&new Date(r.run_after).getTime()>now?iso(r.run_after):null,lastProviderError:r.last_error||null}));
+  return { searchJobs:{depth:typeCount(['SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE']),isPaused:!!paused.search_jobs}, channelProcessing:{depth:typeCount(['PROCESS_CHANNEL','ENRICH_CHANNEL']),isPaused:!!paused.channel_processing}, discordValidation:{depth:typeCount(['INSPECT_DISCORD']),isPaused:!!paused.discord_validation},pendingWork };
 }
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{const db=await getDb(); await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);}
 
@@ -417,6 +420,7 @@ export async function completeJob(jobId:string):Promise<void>{const db=await get
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT']);
 const TRANSIENT_HTTP_STATUS=new Set([408,425,429,500,502,503,504]);
+const MAX_TRANSIENT_RETRY_AGE_MS=Math.max(60_000,Number(process.env.MAX_TRANSIENT_RETRY_AGE_MS||6*60*60_000));
 export function isRetryableInfrastructureFailure(error:any):boolean{
   const code=String(error?.code||error?.cause?.code||'').toUpperCase();
   const status=Number(error?.status||error?.statusCode||error?.response?.status);
@@ -427,17 +431,19 @@ export function isRetryableInfrastructureFailure(error:any):boolean{
   if(error?.retryable===true&&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(errorClass))return true;
   return false;
 }
-export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now()):{disposition:JobFailureDisposition;runAfter?:number}{
+export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
   if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
   if(isRetryableInfrastructureFailure(error)){
+    if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
     const retryAt=Number(error?.retryAt);
     const retryAfterMs=Number(error?.retryAfterMs);
-    const scheduled=Number.isFinite(retryAt)&&retryAt>now?retryAt:Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+5*60_000;
+    const exponentialMs=Math.min(15*60_000,30_000*Math.pow(2,Math.max(0,attempts-1)));
+    const scheduled=Number.isFinite(retryAt)?Math.max(now,retryAt):Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;
     return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:scheduled};
   }
   return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
 }
-export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); const decision=decideJobFailure(error,attempts,max_attempts);if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,msg,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,msg]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,msg,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,msg]);return decision.disposition;}
+export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime());const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval RETURNING id`,[String(staleAfterMinutes)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[res.rows.map(row=>row.id)]); await client.query('COMMIT'); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 export async function heartbeatJob(jobId:string,workerId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET locked_at=now(),updated_at=now() WHERE id=$1 AND status='PROCESSING' AND locked_by=$2`,[jobId,workerId]);}
 
@@ -732,18 +738,20 @@ export async function tryReserveQuota(args: {
     await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
     await client.query(`UPDATE quota_reservations SET status='EXPIRED' WHERE status='RESERVED' AND expires_at<=now()`);
     const existing = await client.query(
-      `SELECT status FROM quota_reservations WHERE operation_type=$1 AND operation_id=$2`,
+      `SELECT status,units FROM quota_reservations WHERE operation_type=$1 AND operation_id=$2 FOR UPDATE`,
       [args.operationType, args.operationId]
     );
-    if (existing.rows[0]?.status === 'RESERVED') {
+    const existingUnits = existing.rows[0]?.status === 'RESERVED' ? Number(existing.rows[0].units) : 0;
+    if (existingUnits >= args.units) {
       await client.query('COMMIT');
       return true;
     }
     const totals = await client.query(
       `SELECT
          COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
-         COALESCE(SUM(units) FILTER (WHERE status='RESERVED'),0)::int AS reserved_total
-       FROM quota_reservations`
+         COALESCE(SUM(units) FILTER (WHERE status='RESERVED' AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS reserved_total
+       FROM quota_reservations`,
+      [args.operationType, args.operationId]
     );
     const row = totals.rows[0];
     // Allocation percentages are scheduling preferences, not hard partitions.
@@ -758,6 +766,78 @@ export async function tryReserveQuota(args: {
        VALUES($1,$2,$3,$4,now()+interval '20 minutes')
        ON CONFLICT(operation_type,operation_id) DO UPDATE SET status='RESERVED',units=excluded.units,reserved_at=now(),expires_at=excluded.expires_at`,
       [args.operationType, args.operationId, args.allocation, args.units]
+    );
+    await client.query('COMMIT');
+    return true;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function topUpQuotaReservation(args: {
+  operationType: string;
+  operationId: string;
+  allocation: 'MANUAL' | 'ENRICHMENT' | 'AUTONOMOUS';
+  additionalUnits: number;
+  dailyBudget: number;
+  allocationPercent: number;
+}): Promise<boolean> {
+  if (!Number.isFinite(args.additionalUnits) || args.additionalUnits <= 0) return false;
+
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const quotaDay = getYouTubeQuotaDay();
+    // Use the same tracker lock as initial admission so reservations, top-ups,
+    // actual usage, and Pacific quota-day rollover share one serialization point.
+    await client.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
+      VALUES('youtube',0,$1,$2)
+      ON CONFLICT(id) DO UPDATE SET
+        units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
+        daily_limit=excluded.daily_limit,
+        last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
+    await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
+
+    const existing = await client.query(
+      `SELECT units
+       FROM quota_reservations
+       WHERE operation_type=$1 AND operation_id=$2
+         AND allocation=$3 AND status='RESERVED' AND expires_at>now()
+       FOR UPDATE`,
+      [args.operationType, args.operationId, args.allocation]
+    );
+    if (!existing.rowCount) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+
+    const totals = await client.query(
+      `SELECT
+         COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
+         COALESCE(SUM(units) FILTER (
+           WHERE status='RESERVED' AND expires_at>now()
+             AND NOT (operation_type=$1 AND operation_id=$2)
+         ),0)::int AS other_reserved_total
+       FROM quota_reservations`,
+      [args.operationType, args.operationId]
+    );
+    const currentUnits = Number(existing.rows[0].units);
+    const { actual_used: actualUsed, other_reserved_total: otherReservedTotal } = totals.rows[0];
+    if (Number(actualUsed) + Number(otherReservedTotal) + currentUnits + args.additionalUnits > args.dailyBudget) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+
+    await client.query(
+      `UPDATE quota_reservations
+       SET units=units+$4,expires_at=now()+interval '20 minutes'
+       WHERE operation_type=$1 AND operation_id=$2
+         AND allocation=$3 AND status='RESERVED'`,
+      [args.operationType, args.operationId, args.allocation, args.additionalUnits]
     );
     await client.query('COMMIT');
     return true;

@@ -14,11 +14,13 @@ const maintenance = readFileSync(new URL('./operationalMaintenanceWorkers.ts', i
 test('normal search/enrichment admission is not multiplied by full key-pool size', () => {
   assert.doesNotMatch(queueManager, /enrichmentReservationUnits\s*=\s*enrichmentQuotaUnits\s*\*\s*Math\.max\(1,getYouTubeKeyPool\(\)\.length\)/);
   assert.doesNotMatch(queueManager, /providerReservationUnits\s*=\s*providerQuotaUnits\s*\*\s*Math\.max\(1,getYouTubeKeyPool\(\)\.length\)/);
+  assert.match(queueManager, /topUpQuotaReservation/);
 });
 
 test('official youtube retries preserve paid expensive steps instead of replaying them', () => {
-  assert.match(youtube, /incremental|checkpoint|completedSteps|spentSteps|resume/i);
-  assert.match(youtube, /channel-uploads/);
+  assert.match(youtube, /let uploadsCheckpoint/);
+  assert.match(youtube, /if\s*\(!uploadsCheckpoint\)/);
+  assert.match(youtube, /uploadsCheckpoint\s*=/);
 });
 
 test('shared youtube scheduler supports priority and exposes cooldown state', () => {
@@ -34,8 +36,9 @@ test('transient retries are provider-aware and bounded by wall-clock age', () =>
 });
 
 test('incident recovery is explicitly background-only behind production work', () => {
-  assert.match(maintenance, /CLASSIFICATION_FALSE_NEGATIVE_RESCAN/);
-  assert.match(maintenance, /queue|backlog|rate.?limit|cooldown/i);
+  assert.match(maintenance, /isRecoveryAdmissionOpen/);
+  assert.match(maintenance, /productionBacklog\s*<=\s*RECOVERY_MAX_PRODUCTION_BACKLOG/);
+  assert.match(maintenance, /youtubeRequestScheduler\.isRateLimited\(\)/);
 });
 
 test('manual and autonomous official searches use the same per-attempt quota contract', () => {

@@ -17,6 +17,7 @@ import {
   addQueryExecutionLog,
   tryReserveQuota,
   finishQuotaReservation,
+  topUpQuotaReservation,
   getAppSetting,
   heartbeatJob,
   recordQueryRunSightings,
@@ -267,14 +268,20 @@ export async function processNextSearchJob(
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
       const enrichmentQuotaUnits=enrichmentStage>=2?202:101;
-      const enrichmentReservationUnits=enrichmentQuotaUnits*Math.max(1,getYouTubeKeyPool().length);
+      const enrichmentReservationUnits=enrichmentQuotaUnits;
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
         units: enrichmentReservationUnits, dailyBudget, allocationPercent: enrichmentPercent
       });
       if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
-        const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage);
+        const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage,async additionalUnits=>{
+          const toppedUp=await topUpQuotaReservation({
+            operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
+            additionalUnits,dailyBudget,allocationPercent:enrichmentPercent
+          });
+          if(!toppedUp)throw new QuotaAllocationExhaustedError('ENRICHMENT');
+        });
         const pipelineOutcome=await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
@@ -302,12 +309,18 @@ export async function processNextSearchJob(
     let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null } | null = null;
     if (queryRunId) {
       providerQuotaUnits=100;
-      const providerReservationUnits=providerQuotaUnits*Math.max(1,getYouTubeKeyPool().length);
+      const providerReservationUnits=providerQuotaUnits;
       const budget=getDailyYouTubeQuotaBudget();
       const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
       if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerReservationUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
       try {
-        searchPage=await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering);
+        searchPage=await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering,async additionalUnits=>{
+          const toppedUp=await topUpQuotaReservation({
+            operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',
+            additionalUnits,dailyBudget:budget,allocationPercent:percent
+          });
+          if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
+        },'autonomous');
         await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
       } catch (error) {
         await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,false);
@@ -945,7 +958,13 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
   try {
     const vocabs = await getCountryVocabularies();
     const vocab = vocabs.find(v => v.country.toLowerCase() === session.country.toLowerCase());
-    const page = await searchYouTubeChannelPage(queryVariant, session.country, vocab, session.retrievalLane, pageToken);
+    const page = await searchYouTubeChannelPage(queryVariant, session.country, vocab, session.retrievalLane, pageToken,'RELEVANCE',async additionalUnits=>{
+      const toppedUp=await topUpQuotaReservation({
+        operationType:'MANUAL_SEARCH_PAGE',operationId,allocation:'MANUAL',
+        additionalUnits,dailyBudget,allocationPercent:quotaPercent
+      });
+      if(!toppedUp)throw new QuotaAllocationExhaustedError('MANUAL');
+    },'manual');
     await finishQuotaReservation('MANUAL_SEARCH_PAGE', operationId, true);
     const rawIds = page.channels.map(c => c.channelId);
     const unique = [...new Map(page.channels.map(c => [c.channelId, c])).values()];
