@@ -35,7 +35,12 @@ WITH invalid AS (
      AND (
        COALESCE(btrim(o.payload->'policy'->>'policyKey'), '') = ''
        OR COALESCE(btrim(o.payload->'policy'->>'salt'), '') = ''
-       OR COALESCE(o.payload->'policy'->>'version', '') !~ '^[1-9][0-9]*$'
+       OR CASE
+            WHEN jsonb_typeof(o.payload->'policy'->'version') = 'number' THEN
+              (o.payload->'policy'->>'version')::numeric <= 0
+              OR trunc((o.payload->'policy'->>'version')::numeric) <> (o.payload->'policy'->>'version')::numeric
+            ELSE TRUE
+          END
      )
 ), archived AS (
   INSERT INTO phase_b_observation_retirements (
@@ -59,5 +64,10 @@ DELETE FROM phase_b_observation_outbox o
    AND (
      COALESCE(btrim(o.payload->'policy'->>'policyKey'), '') = ''
      OR COALESCE(btrim(o.payload->'policy'->>'salt'), '') = ''
-     OR COALESCE(o.payload->'policy'->>'version', '') !~ '^[1-9][0-9]*$'
+     OR CASE
+          WHEN jsonb_typeof(o.payload->'policy'->'version') = 'number' THEN
+            (o.payload->'policy'->>'version')::numeric <= 0
+            OR trunc((o.payload->'policy'->>'version')::numeric) <> (o.payload->'policy'->>'version')::numeric
+          ELSE TRUE
+        END
    );
