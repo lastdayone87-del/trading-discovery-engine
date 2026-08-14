@@ -1,3 +1,4 @@
+# retrigger after corrected export comments became available
 name: Apply throughput restoration
 
 on:
