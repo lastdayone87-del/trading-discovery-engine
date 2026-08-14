@@ -12,6 +12,9 @@ const recheckRoute = server.slice(routeStart, routeEnd);
 const manualStart = queue.indexOf('export async function triggerManualRecheck');
 const manualEnd = queue.indexOf('export interface SearchExecutionResult', manualStart);
 const manualRecheck = queue.slice(manualStart, manualEnd);
+const classifierStart = queue.indexOf('function classifyManualRecheckAcquisitionFailure');
+const classifierEnd = queue.indexOf('/**\n * Triggers a manual re-scan', classifierStart);
+const failureClassifier = queue.slice(classifierStart, classifierEnd);
 
 test('direct HTTP rechecks cannot bypass official ENRICHMENT quota admission', () => {
   assert.ok(routeStart >= 0 && routeEnd > routeStart);
@@ -36,4 +39,13 @@ test('manual acquisition failures do not mark every upstream exception retryable
 test('false-negative recovery maps only typed transient failures to attempt-free retries', () => {
   assert.match(workers, /result\.errorClass|typedTransient|TRANSIENT/);
   assert.doesNotMatch(workers, /errorClass:\s*retryable\s*\?\s*'TRANSIENT'/);
+});
+
+test('attempt-free recovery requires explicit upstream transient typing', () => {
+  assert.ok(classifierStart >= 0 && classifierEnd > classifierStart);
+  assert.match(failureClassifier, /error\?\.retryable === true/);
+  assert.match(failureClassifier, /MANUAL_RECHECK_TRANSIENT_CLASSES\.has\(rawErrorClass\)/);
+  assert.doesNotMatch(failureClassifier, /status === 429/);
+  assert.doesNotMatch(failureClassifier, /MANUAL_RECHECK_TRANSIENT_CODES/);
+  assert.doesNotMatch(failureClassifier, /temporar|cooling down|network failure|socket hang up/i);
 });

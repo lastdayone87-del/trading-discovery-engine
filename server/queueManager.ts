@@ -722,20 +722,7 @@ const MANUAL_RECHECK_ERROR_CLASSES = new Set<ManualRecheckErrorClass>([
 const MANUAL_RECHECK_TRANSIENT_CLASSES = new Set<ManualRecheckErrorClass>([
   'TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'
 ]);
-const MANUAL_RECHECK_TRANSIENT_CODES = new Set([
-  'QUOTA_ALLOCATION_EXHAUSTED',
-  'YOUTUBE_PROVIDERS_COOLING_DOWN',
-  'YOUTUBE_PROVIDER_POOL_EXHAUSTED',
-  'ETIMEDOUT',
-  'ECONNRESET',
-  'ECONNREFUSED',
-  'EAI_AGAIN',
-  'ENETUNREACH',
-  'EHOSTUNREACH',
-  'UND_ERR_CONNECT_TIMEOUT',
-  'UND_ERR_HEADERS_TIMEOUT',
-  'UND_ERR_BODY_TIMEOUT'
-]);
+
 
 export async function reserveOfficialRecheckQuota(operationType: string, operationId: string): Promise<boolean> {
   const dailyBudget = getDailyYouTubeQuotaBudget();
@@ -762,63 +749,41 @@ function classifyManualRecheckAcquisitionFailure(error: any): {
   const message = String(error?.message || error || '');
   const rawErrorClass = String(error?.errorClass || '').toUpperCase() as ManualRecheckErrorClass;
   const code = String(error?.code || error?.cause?.code || 'MANUAL_RESCAN_UPSTREAM_FAILURE');
-  const upperCode = code.toUpperCase();
   const status = Number(error?.status || error?.statusCode || error?.response?.status);
   const retryAt = Number(error?.retryAt);
   const retryAfterMs = Number(error?.retryAfterMs);
 
+  // Attempt-free infrastructure retries are deliberately opt-in. The
+  // upstream error itself must already carry a recognized transient
+  // class and explicitly say it is retryable. Status codes, messages,
+  // cooldown codes, and network-looking strings must never manufacture
+  // transient semantics for migration-091 recovery.
   if (MANUAL_RECHECK_ERROR_CLASSES.has(rawErrorClass)) {
-    const explicitlyRetryable = error?.retryable === true && MANUAL_RECHECK_TRANSIENT_CLASSES.has(rawErrorClass);
     return {
       errorClass: rawErrorClass,
-      retryable: explicitlyRetryable,
+      retryable: error?.retryable === true && MANUAL_RECHECK_TRANSIENT_CLASSES.has(rawErrorClass),
       code,
       retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
       retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
     };
   }
 
+  // Untyped permanent/not-found outcomes may still be identified for
+  // diagnostics, but they never receive attempt-free retry semantics.
   if (status === 404 || /channel ['"][^'"]+['"] was not found|channel not found|does not exist|deleted channel/i.test(message)) {
     return { errorClass: 'PERMANENT_INPUT', retryable: false, code };
   }
-
   if ([400, 422].includes(status)) {
     return { errorClass: 'PERMANENT_INPUT', retryable: false, code };
   }
 
-  if (status === 429 || /resource_exhausted|rate.?limit|quota/i.test(message)) {
-    return {
-      errorClass: 'RATE_LIMIT',
-      retryable: true,
-      code,
-      retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
-      retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
-    };
-  }
-
-  if (MANUAL_RECHECK_TRANSIENT_CODES.has(upperCode)) {
-    return {
-      errorClass: upperCode === 'ETIMEDOUT' || upperCode.includes('TIMEOUT') ? 'TIMEOUT' : 'TRANSIENT',
-      retryable: true,
-      code,
-      retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
-      retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
-    };
-  }
-
-  if ([408, 425, 500, 502, 503, 504].includes(status) || /temporar|timed? ?out|timeout|cooling down|network failure|socket hang up/i.test(message)) {
-    return {
-      errorClass: /timed? ?out|timeout/i.test(message) ? 'TIMEOUT' : 'TRANSIENT',
-      retryable: true,
-      code,
-      retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
-      retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
-    };
-  }
-
-  // Unknown/untyped acquisition failures are deliberately not granted
-  // attempt-free infrastructure retry semantics. Migration 091 remains bounded.
-  return { retryable: false, code };
+  // Every other untyped failure consumes the bounded normal attempt.
+  return {
+    retryable: false,
+    code,
+    retryAt: Number.isFinite(retryAt) ? retryAt : undefined,
+    retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
+  };
 }
 
 /**
