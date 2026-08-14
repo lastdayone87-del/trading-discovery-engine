@@ -33,6 +33,63 @@ function nativeInvite(text: string): string | null {
   return extractDiscordCandidates(text).find(candidate => candidate.nativeInviteCode)?.nativeInviteCode || null;
 }
 
+function boundedEnvInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+export class RenderedFallbackGate {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(
+    readonly concurrency: number,
+    readonly maxPending: number,
+  ) {}
+
+  private acquire(): Promise<() => void> {
+    if (this.active >= this.concurrency && this.waiters.length >= this.maxPending) {
+      return Promise.reject(new Error('RENDERED_FALLBACK_SATURATED'));
+    }
+
+    return new Promise(resolve => {
+      const grant = () => {
+        this.active++;
+        let released = false;
+        resolve(() => {
+          if (released) return;
+          released = true;
+          this.active--;
+          const next = this.waiters.shift();
+          if (next) next();
+        });
+      };
+
+      if (this.active < this.concurrency) grant();
+      else this.waiters.push(grant);
+    });
+  }
+
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    const release = await this.acquire();
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  snapshot(): { active: number; pending: number; concurrency: number; maxPending: number } {
+    return { active: this.active, pending: this.waiters.length, concurrency: this.concurrency, maxPending: this.maxPending };
+  }
+}
+
+export const renderedFallbackGate = new RenderedFallbackGate(
+  boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, 1, 1, 2),
+  boundedEnvInt(process.env.RENDERED_FALLBACK_MAX_PENDING, 8, 0, 32),
+);
+
 /**
  * Expensive Tier-2 acquisition. The normal static crawler should always run first.
  * Playwright/Crawlee are loaded lazily so ordinary inspections do not launch a
@@ -43,7 +100,6 @@ export async function crawlRenderedCommunitySurface(
   budget: Partial<BrowserFallbackBudget> = {},
 ): Promise<BrowserFallbackResult> {
   const limits = { ...DEFAULT_BROWSER_FALLBACK_BUDGET, ...budget };
-  const startedAt = Date.now();
   let inspectedPages = 0;
   let scrolls = 0;
   let clicks = 0;
@@ -53,7 +109,10 @@ export async function crawlRenderedCommunitySurface(
   if (foundInvite) return { foundInvite, foundLocation, inspectedPages, scrolls, clicks, complete: true, retryable: false, detail: 'Direct Discord invite in seed URL' };
 
   try {
-    const { PlaywrightCrawler } = await import('crawlee');
+    return await renderedFallbackGate.run(async () => {
+      const startedAt = Date.now();
+      try {
+        const { PlaywrightCrawler } = await import('crawlee');
     const crawler = new PlaywrightCrawler({
       maxRequestsPerCrawl: limits.maxPages,
       maxConcurrency: 1,
@@ -145,6 +204,18 @@ export async function crawlRenderedCommunitySurface(
           ? 'Rendered acquisition budget expired before coverage completed'
           : `Rendered acquisition completed across ${inspectedPages} page(s) without an invite`,
     };
+      } catch (error: any) {
+        return {
+          foundInvite: null,
+          inspectedPages,
+          scrolls,
+          clicks,
+          complete: false,
+          retryable: true,
+          detail: `Rendered acquisition unavailable or failed: ${String(error?.message || error)}`,
+        };
+      }
+    });
   } catch (error: any) {
     return {
       foundInvite: null,
@@ -153,7 +224,9 @@ export async function crawlRenderedCommunitySurface(
       clicks,
       complete: false,
       retryable: true,
-      detail: `Rendered acquisition unavailable or failed: ${String(error?.message || error)}`,
+      detail: error?.message === 'RENDERED_FALLBACK_SATURATED'
+        ? 'Rendered acquisition deferred because the process-wide browser launch gate is saturated'
+        : `Rendered acquisition unavailable or failed: ${String(error?.message || error)}`,
     };
   }
 }

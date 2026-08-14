@@ -15,8 +15,12 @@ const manualRecheck = queue.slice(manualStart, manualEnd);
 
 test('direct HTTP rechecks cannot bypass official ENRICHMENT quota admission', () => {
   assert.ok(routeStart >= 0 && routeEnd > routeStart);
-  assert.doesNotMatch(recheckRoute, /await triggerManualRecheck\(req\.params\.id/);
-  assert.match(recheckRoute, /quota|Quota|gated|Gated/);
+  assert.match(recheckRoute, /await triggerManualRecheck\(req\.params\.id/);
+  const reserve = manualRecheck.indexOf("reserveOfficialRecheckQuota('MANUAL_RECHECK'");
+  const acquisition = manualRecheck.indexOf('fetchYouTubeChannelEnrichment');
+  assert.ok(reserve >= 0 && acquisition > reserve);
+  assert.match(manualRecheck, /quotaAlreadyReserved/);
+  assert.match(manualRecheck, /finishQuotaReservation\('MANUAL_RECHECK'/);
 });
 
 test('manual acquisition failures do not mark every upstream exception retryable', () => {
