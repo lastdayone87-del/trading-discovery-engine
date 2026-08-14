@@ -1,0 +1,82 @@
+name: Temporary PR235 review fixes
+
+on:
+  push:
+    branches:
+      - fix/enrichment-backlog-gemini-degradation
+
+permissions:
+  contents: write
+
+jobs:
+  apply-validate-cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/enrichment-backlog-gemini-degradation
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Apply surgical fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"Expected exactly one match in {path}, got {text.count(old)}")
+              p.write_text(text.replace(old, new, 1))
+
+          q = 'server/queueManager.ts'
+          replace_once(q,
+          """      const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;\n      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?202:101);\n      let quotaReserved=false;""",
+          """      const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;\n      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?202:101);\n      let enrichmentProviderCostUnits=candidateAlreadyEnriched\n        ? Math.max(0,Number((candidate as DiscoveredChannelRaw & {enrichmentProviderCostUnits?:number}).enrichmentProviderCostUnits||0))\n        : enrichmentQuotaUnits;\n      let quotaReserved=false;""")
+
+          replace_once(q,
+          """          if(!toppedUp)throw new QuotaAllocationExhaustedError('ENRICHMENT');\n        });\n        if(!candidateAlreadyEnriched){\n          const db=await getDb();""",
+          """          if(!toppedUp)throw new QuotaAllocationExhaustedError('ENRICHMENT');\n          enrichmentProviderCostUnits+=additionalUnits;\n        });\n        if(!candidateAlreadyEnriched){\n          (enriched as DiscoveredChannelRaw & {enrichmentProviderCostUnits?:number}).enrichmentProviderCostUnits=enrichmentProviderCostUnits;\n          const db=await getDb();""")
+
+          replace_once(q,
+          "providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt",
+          "providerCost:enrichmentProviderCostUnits,latencyMs:Date.now()-evidenceStartedAt")
+
+          t = 'server/enrichmentBacklogDrain.contract.test.ts'
+          p = Path(t)
+          text = p.read_text()
+          addition = """
+
+test('cached-payload recovery preserves the paid YouTube acquisition cost for VOI telemetry',()=>{
+  const source=fs.readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
+  assert.match(source,/let enrichmentProviderCostUnits=candidateAlreadyEnriched/);
+  assert.match(source,/enrichmentProviderCostUnits\+=additionalUnits/);
+  assert.match(source,/enrichmentProviderCostUnits=enrichmentProviderCostUnits/);
+  assert.match(source,/providerCost:enrichmentProviderCostUnits/);
+});
+"""
+          if "cached-payload recovery preserves the paid YouTube acquisition cost" not in text:
+              p.write_text(text.rstrip()+addition)
+          PY
+      - name: Install dependencies
+        run: npm install
+      - name: Focused tests
+        run: node --import tsx --test server/enrichmentOperationalFailure.test.ts server/enrichmentBacklogDrain.contract.test.ts server/restoreOfficialEnrichmentFlow.test.ts server/enrichmentOutcomeLifecycle.test.ts server/enrichmentBacklogEvidence.test.ts server/autonomousRootFirewall.test.ts server/queryEvidenceIndependence.test.ts server/providerRetryPolicy.test.ts server/youtubeRequestScheduler.test.ts server/quotaRecovery.test.ts
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
+      - name: Commit validated patch and remove temporary workflow
+        run: |
+          rm .github/workflows/temp-fix-pr235-review.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/queueManager.ts server/enrichmentBacklogDrain.contract.test.ts .github/workflows/temp-fix-pr235-review.yml
+          git commit -m "Preserve terminal decisions and enrichment acquisition cost"
+          git push origin HEAD:fix/enrichment-backlog-gemini-degradation
