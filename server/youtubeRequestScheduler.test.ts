@@ -93,12 +93,15 @@ test('youtubeFetch always bounds the scheduler head request', () => {
   assert.doesNotMatch(youtubeFetch, /provider_deadlines_enabled|PROVIDER_DEADLINES_ENABLED/);
 });
 
-test('youtubeFetch rechecks provider eligibility at dispatch and clears provider-local 429 history on success', () => {
+test('youtubeFetch reselects from the live provider pool at dispatch and clears the actual provider history on success', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
-  assert.match(youtubeFetch, /providerKey&&!youtubeProviderCooldown\.eligible\(providerKey\)/);
-  assert.match(youtubeFetch, /youtubeProviderCooldown\.succeeded\(providerKey\)/);
-  assert.match(youtubeFetch, /YOUTUBE_PROVIDER_COOLING_DOWN/);
+  assert.match(youtubeFetch, /const livePool=getYouTubeKeyPool\(\)/);
+  assert.match(youtubeFetch, /selectYouTubeDispatchProviderIndex\(livePool,providerKey\)/);
+  assert.match(youtubeFetch, /rebuiltUrl\.searchParams\.set\('key',dispatchedProviderKey\)/);
+  assert.match(youtubeFetch, /fetch\(dispatchedUrl,\{signal\}\)/);
+  assert.match(youtubeFetch, /youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
+  assert.match(youtubeFetch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey\}\)/);
 });
 
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
