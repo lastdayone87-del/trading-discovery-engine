@@ -51,10 +51,10 @@ function isRuntimeYouTubeRateLimit(error: unknown): boolean {
  * lookups cannot present one shared egress identity as a bursty client.
  *
  * Manual requests keep their explicit fast-path priority, but all other lanes
- * become FIFO once they have waited beyond the starvation ceiling. This restores
- * the pre-priority scheduler's fairness property while retaining responsive
- * operator-triggered searches. In particular, a continuous autonomous search
- * stream can no longer indefinitely sit ahead of enrichment backlog work.
+ * become FIFO once they have waited beyond the starvation ceiling. Selection is
+ * performed only after shared pacing/rate-limit delay has elapsed, so a request
+ * that becomes starved during a long cooldown is reconsidered before the next
+ * outbound call starts.
  */
 export class YouTubeRequestScheduler {
   private readonly queue: QueuedRequest<unknown>[] = [];
@@ -129,37 +129,31 @@ export class YouTubeRequestScheduler {
 
     try {
       while (this.queue.length) {
-        const request = this.takeNextRequest();
-        if (!request) break;
-        request.trace?.('scheduler-tail-released');
-
         const now = (this.options.now ?? Date.now)();
         const waitMs = Math.max(0, this.nextStartAt - now);
         if (waitMs) {
-          request.trace?.(
-            `before scheduler-delay (${waitMs}ms) at server/youtubeRequestScheduler.ts:118`
-          );
           await (
             this.options.sleep
             ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
           )(waitMs);
-          request.trace?.(
-            'after scheduler-delay at server/youtubeRequestScheduler.ts:118'
-          );
         }
+
+        const request = this.takeNextRequest();
+        if (!request) break;
+        request.trace?.('scheduler-tail-released');
 
         this.nextStartAt =
           (this.options.now ?? Date.now)()
           + Math.max(0, this.options.minIntervalMs);
         request.trace?.(
-          'before scheduled-call at server/youtubeRequestScheduler.ts:130'
+          'before scheduled-call at server/youtubeRequestScheduler.ts:127'
         );
 
         try {
           const value = await request.call();
           this.succeeded();
           request.trace?.(
-            'after scheduled-call at server/youtubeRequestScheduler.ts:130'
+            'after scheduled-call at server/youtubeRequestScheduler.ts:127'
           );
           request.resolve(value);
         } catch (error) {
