@@ -1,23 +1,77 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { YouTubeRequestScheduler } from './youtubeRequestScheduler';
 
-test('youtubeFetch feeds provider 429 outcomes back into the shared request scheduler', () => {
-  const source = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
-  const youtubeFetch = source.slice(
-    source.indexOf('async function youtubeFetch'),
-    source.indexOf('/** Preserve both legacy')
-  );
+function schedulerClock() {
+  let now = 0;
+  return {
+    now: () => now,
+    sleep: async (ms: number) => { now += ms; },
+    value: () => now,
+  };
+}
 
-  assert.match(youtubeFetch, /youtubeRequestScheduler\.succeeded\(\)/);
-  assert.match(youtubeFetch, /isYouTubeRateLimited\(error\)/);
-  assert.match(youtubeFetch, /youtubeRequestScheduler\.rateLimited\(\)/);
+test('runtime 429s automatically feed the shared exponential scheduler backoff', async () => {
+  const clock = schedulerClock();
+  const starts: number[] = [];
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 100,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 800,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  const rateLimit = () => Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), {
+    status: 429,
+    quotaExceeded: false,
+    providerReasons: ['rateLimitExceeded'],
+  });
+
+  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit(); }));
+  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit(); }));
+  await scheduler.run(async () => { starts.push(clock.value()); });
+
+  assert.deepEqual(starts, [0, 500, 1_300]);
 });
 
-test('YouTube scheduler keeps a process-wide exponential rate-limit backoff', () => {
-  const source = readFileSync(new URL('./youtubeRequestScheduler.ts', import.meta.url), 'utf8');
-  assert.match(source, /initialRateLimitBackoffMs/);
-  assert.match(source, /maxRateLimitBackoffMs/);
-  assert.match(source, /this\.rateLimitBackoffMs \* 2/);
-  assert.match(source, /this\.nextStartAt = Math\.max/);
+test('daily quota exhaustion does not trigger runtime request-rate backoff', async () => {
+  const clock = schedulerClock();
+  const starts: number[] = [];
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 100,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  const quota = Object.assign(new Error('YouTube HTTP 403 (quotaExceeded)'), {
+    status: 403,
+    quotaExceeded: true,
+    providerReasons: ['quotaExceeded'],
+  });
+
+  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw quota; }));
+  await scheduler.run(async () => { starts.push(clock.value()); });
+
+  assert.deepEqual(starts, [0, 100]);
+});
+
+test('a successful request resets the exponential 429 backoff level', async () => {
+  const clock = schedulerClock();
+  const starts: number[] = [];
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 100,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  const rateLimit = () => Object.assign(new Error('YouTube HTTP 429'), { status: 429, quotaExceeded: false });
+
+  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit(); }));
+  await scheduler.run(async () => { starts.push(clock.value()); });
+  await assert.rejects(scheduler.run(async () => { starts.push(clock.value()); throw rateLimit(); }));
+  await scheduler.run(async () => { starts.push(clock.value()); });
+
+  assert.deepEqual(starts, [0, 500, 600, 1_100]);
 });
