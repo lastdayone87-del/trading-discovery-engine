@@ -6,6 +6,17 @@ export interface YouTubeRequestSchedulerOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+function isRuntimeYouTubeRateLimit(error: unknown): boolean {
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    if (current.quotaExceeded === true) return false;
+    if (current.status === 429) return true;
+    if (Array.isArray(current.providerReasons)
+      && current.providerReasons.some((reason: unknown) => /^rateLimitExceeded$/i.test(String(reason)))) return true;
+  }
+  return false;
+}
+
 /**
  * YouTube applies request-rate limits independently from daily project quota.
  * Serialize requests from this runtime so concurrent workers and paired metadata
@@ -30,9 +41,15 @@ export class YouTubeRequestScheduler {
       }
       this.nextStartAt = (this.options.now ?? Date.now)() + Math.max(0, this.options.minIntervalMs);
       trace?.('before scheduled-call at server/youtubeRequestScheduler.ts:33');
-      const value = await call();
-      trace?.('after scheduled-call at server/youtubeRequestScheduler.ts:33');
-      return value;
+      try {
+        const value = await call();
+        this.succeeded();
+        trace?.('after scheduled-call at server/youtubeRequestScheduler.ts:33');
+        return value;
+      } catch (error) {
+        if (isRuntimeYouTubeRateLimit(error)) this.rateLimited();
+        throw error;
+      }
     });
     this.tail = scheduled.then(() => undefined, () => undefined);
     return scheduled;
