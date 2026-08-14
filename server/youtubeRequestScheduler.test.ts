@@ -26,11 +26,7 @@ test('serves queued work by priority while preserving the active request', async
   const order: string[] = [];
   let releaseActive!: () => void;
   const active = new Promise<void>(resolve => { releaseActive = resolve; });
-  const scheduler = new YouTubeRequestScheduler({
-    minIntervalMs: 0,
-    initialRateLimitBackoffMs: 500,
-    maxRateLimitBackoffMs: 2_000
-  });
+  const scheduler = new YouTubeRequestScheduler({ minIntervalMs: 0, initialRateLimitBackoffMs: 500, maxRateLimitBackoffMs: 2_000 });
   const running = scheduler.run(async () => { await active; order.push('active'); }, undefined, 'enrichment');
   const recovery = scheduler.run(async () => { order.push('recovery'); }, undefined, 'incident-recovery');
   const enrichment = scheduler.run(async () => { order.push('enrichment'); }, undefined, 'enrichment');
@@ -46,31 +42,15 @@ test('aged enrichment cannot starve behind a continuous autonomous queue', async
   const order: string[] = [];
   let releaseActive!: () => void;
   const active = new Promise<void>(resolve => { releaseActive = resolve; });
-  const scheduler = new YouTubeRequestScheduler({
-    minIntervalMs: 1_000,
-    initialRateLimitBackoffMs: 500,
-    maxRateLimitBackoffMs: 2_000,
-    starvationMs: 1_500,
-    now: () => now,
-    sleep: async ms => { now += ms; }
-  });
-
+  const scheduler = new YouTubeRequestScheduler({ minIntervalMs: 1_000, initialRateLimitBackoffMs: 500, maxRateLimitBackoffMs: 2_000, starvationMs: 1_500, now: () => now, sleep: async ms => { now += ms; } });
   const running = scheduler.run(async () => { await active; order.push('active'); }, undefined, 'enrichment');
   const enrichment = scheduler.run(async () => { order.push('enrichment'); }, undefined, 'enrichment');
   const autonomous1 = scheduler.run(async () => { order.push('autonomous-1'); }, undefined, 'autonomous');
   const autonomous2 = scheduler.run(async () => { order.push('autonomous-2'); }, undefined, 'autonomous');
   const autonomous3 = scheduler.run(async () => { order.push('autonomous-3'); }, undefined, 'autonomous');
-
   releaseActive();
   await Promise.all([running, enrichment, autonomous1, autonomous2, autonomous3]);
-
-  assert.deepEqual(order, [
-    'active',
-    'autonomous-1',
-    'enrichment',
-    'autonomous-2',
-    'autonomous-3'
-  ]);
+  assert.deepEqual(order, ['active', 'autonomous-1', 'enrichment', 'autonomous-2', 'autonomous-3']);
 });
 
 test('starvation is re-evaluated after shared pacing delay before the next call starts', async () => {
@@ -78,44 +58,25 @@ test('starvation is re-evaluated after shared pacing delay before the next call 
   const order: string[] = [];
   let releaseActive!: () => void;
   const active = new Promise<void>(resolve => { releaseActive = resolve; });
-  const scheduler = new YouTubeRequestScheduler({
-    minIntervalMs: 1_000,
-    initialRateLimitBackoffMs: 500,
-    maxRateLimitBackoffMs: 2_000,
-    starvationMs: 500,
-    now: () => now,
-    sleep: async ms => { now += ms; }
-  });
-
+  const scheduler = new YouTubeRequestScheduler({ minIntervalMs: 1_000, initialRateLimitBackoffMs: 500, maxRateLimitBackoffMs: 2_000, starvationMs: 500, now: () => now, sleep: async ms => { now += ms; } });
   const running = scheduler.run(async () => { await active; order.push('active'); }, undefined, 'enrichment');
   const enrichment = scheduler.run(async () => { order.push('enrichment'); }, undefined, 'enrichment');
   const autonomous = scheduler.run(async () => { order.push('autonomous'); }, undefined, 'autonomous');
-
   releaseActive();
   await Promise.all([running, enrichment, autonomous]);
-
   assert.deepEqual(order, ['active', 'enrichment', 'autonomous']);
 });
 
-test('applies shared exponential cooldown automatically after provider rate limiting', async () => {
+test('provider rate limiting does not impose shared exponential cooldown', async () => {
   let now = 0;
   const starts: number[] = [];
-  const scheduler = new YouTubeRequestScheduler({
-    minIntervalMs: 100,
-    initialRateLimitBackoffMs: 500,
-    maxRateLimitBackoffMs: 800,
-    now: () => now,
-    sleep: async ms => { now += ms; }
-  });
-  const rateLimit = () => Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), {
-    status: 429,
-    providerReasons: ['rateLimitExceeded'],
-    quotaExceeded: false
-  });
+  const scheduler = new YouTubeRequestScheduler({ minIntervalMs: 100, initialRateLimitBackoffMs: 500, maxRateLimitBackoffMs: 800, now: () => now, sleep: async ms => { now += ms; } });
+  const rateLimit = () => Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), { status: 429, providerReasons: ['rateLimitExceeded'], quotaExceeded: false });
   await assert.rejects(scheduler.run(async () => { starts.push(now); throw rateLimit(); }));
   await assert.rejects(scheduler.run(async () => { starts.push(now); throw rateLimit(); }));
   await scheduler.run(async () => { starts.push(now); });
-  assert.deepEqual(starts, [0, 500, 1_300]);
+  assert.deepEqual(starts, [0, 100, 200]);
+  assert.equal(scheduler.isRateLimited(), false);
 });
 
 test('distinguishes runtime rate limiting from project quota exhaustion through wrapped errors', () => {
