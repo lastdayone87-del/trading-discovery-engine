@@ -116,7 +116,7 @@ function startProvider2RecoveryWorker(workerId: string): void {
       if (!channelId) throw new Error('Provider2 recovery job is missing channelId.');
       const result = await triggerManualRecheck(channelId, true);
       if (!result.success) {
-        const retryable = result.retryable !== false;
+        const retryable = result.retryable === true;
         const error = Object.assign(new Error(result.message), {
           code: result.code,
           retryable,

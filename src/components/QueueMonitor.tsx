@@ -77,8 +77,7 @@ function formatDuration(ms: number): string {
 }
 
 function isOfficialEnrichmentOperation(operation: string): boolean {
-  return operation === 'hybrid-enrichment-channel-details'
-    || operation === 'channel-details'
+  return operation === 'channel-details'
     || operation === 'channel-uploads'
     || operation === 'enrichment-video-details'
     || operation === 'enrichment-playlists';
@@ -160,23 +159,20 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
   const enrichmentHealth = useMemo(() => {
     const queue = providerMetrics?.queueLatency.find(row => row.type === 'ENRICH_CHANNEL');
     const providerRows = providerMetrics?.providers || [];
-    const youtubeJsRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube_js' && row.operation.includes('channel-enrichment'));
     const officialRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube' && isOfficialEnrichmentOperation(row.operation));
-    const hybridOfficialRows = officialRows.filter(row => row.operation === 'hybrid-enrichment-channel-details');
-    const displayedRows = [...youtubeJsRows, ...officialRows];
+    const displayedRows = officialRows;
 
     const sum = (rows: ProviderMetricRow[], key: keyof ProviderMetricRow) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
-    const youtubeJsCalls = sum(youtubeJsRows, 'calls');
-    const youtubeJsSuccesses = sum(youtubeJsRows, 'successes');
-    const youtubeJsErrors = sum(youtubeJsRows, 'errors') + sum(youtubeJsRows, 'timeouts');
+    const officialCalls = sum(officialRows, 'calls');
+    const officialSuccesses = sum(officialRows, 'successes');
+    const officialErrors = sum(officialRows, 'errors') + sum(officialRows, 'timeouts');
     const officialActualCost = sum(officialRows, 'actual_cost');
     const officialReservedCost = sum(officialRows, 'reserved_cost');
-    const hybridOfficialActualCost = sum(hybridOfficialRows, 'actual_cost');
-    const baseAcquisitions = youtubeJsRows.filter(row => row.operation === 'channel-enrichment');
+    const baseAcquisitions = officialRows.filter(row => row.operation === 'channel-uploads');
     const baseSuccesses = sum(baseAcquisitions, 'successes');
-    const averageOfficialUnits = baseSuccesses > 0 ? hybridOfficialActualCost / baseSuccesses : null;
-    const weightedLatency = youtubeJsCalls > 0
-      ? youtubeJsRows.reduce((total, row) => total + Number(row.average_latency_ms || 0) * Number(row.calls || 0), 0) / youtubeJsCalls
+    const averageOfficialUnits = baseSuccesses > 0 ? officialActualCost / baseSuccesses : null;
+    const weightedLatency = officialCalls > 0
+      ? officialRows.reduce((total, row) => total + Number(row.average_latency_ms || 0) * Number(row.calls || 0), 0) / officialCalls
       : 0;
 
     const history = depthHistory.current;
@@ -194,10 +190,10 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
       nextRunAt: queue?.next_run_at || null,
       oldestAgeMs: Number(queue?.oldest_age_ms || 0),
       averageAgeMs: Number(queue?.average_age_ms || 0),
-      youtubeJsCalls,
-      youtubeJsSuccesses,
-      youtubeJsErrors,
-      youtubeJsLatencyMs: Math.round(weightedLatency),
+      officialCalls,
+      officialSuccesses,
+      officialErrors,
+      officialLatencyMs: Math.round(weightedLatency),
       officialActualCost,
       officialReservedCost,
       averageOfficialUnits,
@@ -323,9 +319,9 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
                 <div className="text-[10px] text-slate-500">Average {formatDuration(enrichmentHealth.averageAgeMs)}</div>
               </div>
               <div className="bg-white dark:bg-slate-900 p-4">
-                <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-500"><ShieldCheck className="w-3.5 h-3.5" /> YouTube.js</div>
-                <div className="mt-1 text-2xl font-extrabold font-mono">{enrichmentHealth.youtubeJsSuccesses}/{enrichmentHealth.youtubeJsCalls}</div>
-                <div className="text-[10px] text-slate-500">{enrichmentHealth.youtubeJsErrors} errors/timeouts · {enrichmentHealth.youtubeJsLatencyMs}ms avg</div>
+                <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-bold text-slate-500"><ShieldCheck className="w-3.5 h-3.5" /> YouTube Data API</div>
+                <div className="mt-1 text-2xl font-extrabold font-mono">{enrichmentHealth.officialSuccesses}/{enrichmentHealth.officialCalls}</div>
+                <div className="text-[10px] text-slate-500">{enrichmentHealth.officialErrors} errors/timeouts · {enrichmentHealth.officialLatencyMs}ms avg</div>
               </div>
               <div className="bg-white dark:bg-slate-900 p-4">
                 <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500">Official API cost</div>
@@ -345,12 +341,12 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
               <div className="rounded-lg bg-slate-50 dark:bg-slate-800/60 p-3 border border-slate-200 dark:border-slate-700">
                 <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Approx. official units / enrichment</div>
                 <div className="mt-2 text-lg font-extrabold font-mono">{enrichmentHealth.averageOfficialUnits === null ? '—' : enrichmentHealth.averageOfficialUnits.toFixed(2)}</div>
-                <div className="text-[10px] text-slate-500">Expected near 1 with hybrid enrichment; telemetry-window estimate.</div>
+                <div className="text-[10px] text-slate-500">Expected near 1 with official enrichment; telemetry-window estimate.</div>
               </div>
               <div className="rounded-lg bg-slate-50 dark:bg-slate-800/60 p-3 border border-slate-200 dark:border-slate-700">
                 <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Official reserved / actual</div>
                 <div className="mt-2 text-lg font-extrabold font-mono">{enrichmentHealth.officialReservedCost} / {enrichmentHealth.officialActualCost}</div>
-                <div className="text-[10px] text-slate-500">Provider-call telemetry only; zero-cost YouTube.js calls excluded.</div>
+                <div className="text-[10px] text-slate-500">Provider-call telemetry only; zero-cost YouTube Data API calls excluded.</div>
               </div>
             </div>
 

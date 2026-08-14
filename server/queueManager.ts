@@ -21,6 +21,7 @@ import {
   heartbeatJob,
   recordQueryRunSightings,
   getDailyYouTubeQuotaBudget,
+  getYouTubeKeyPool,
   appendDiscordCheckAttempts,
   countDiscordInvalidObservations,
   appendExternalAcquisitionObservations
@@ -153,8 +154,8 @@ export async function processNextSearchJob(
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('POST_APPROVAL_ENRICH'))) claimableTypes.push('POST_APPROVAL_ENRICH');
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('FORCE_REVIEW_RESCAN'))) claimableTypes.push('FORCE_REVIEW_RESCAN');
+  if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
+  if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
   if (!qStatus.discordValidation.isPaused && (!claimableOverride || claimableOverride.includes('RETRY_COMMUNITY_ACQUISITION'))) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
   if(!claimableOverride||claimableOverride.includes('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER')){const db=await getDb();const c=await db.query(`SELECT 1 FROM external_provider_adapter_controls WHERE mode IN('CANARY','ACTIVE') AND NOT paused AND NOT kill_switch LIMIT 1`);if(c.rowCount)claimableTypes.push('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_PLAYLIST')){const db=await getDb();const c=await db.query(`SELECT mode,paused,kill_switch FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_PLAYLIST'`);if(c.rows[0]?.mode==='CANARY'&&!c.rows[0].paused&&!c.rows[0].kill_switch)claimableTypes.push('INSPECT_PLAYLIST');}
@@ -266,9 +267,10 @@ export async function processNextSearchJob(
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
       const enrichmentQuotaUnits=enrichmentStage>=2?202:101;
+      const enrichmentReservationUnits=enrichmentQuotaUnits*Math.max(1,getYouTubeKeyPool().length);
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-        units: enrichmentQuotaUnits, dailyBudget, allocationPercent: enrichmentPercent
+        units: enrichmentReservationUnits, dailyBudget, allocationPercent: enrichmentPercent
       });
       if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
@@ -300,9 +302,10 @@ export async function processNextSearchJob(
     let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null } | null = null;
     if (queryRunId) {
       providerQuotaUnits=100;
+      const providerReservationUnits=providerQuotaUnits*Math.max(1,getYouTubeKeyPool().length);
       const budget=getDailyYouTubeQuotaBudget();
       const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
-      if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
+      if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerReservationUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
       try {
         searchPage=await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering);
         await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);

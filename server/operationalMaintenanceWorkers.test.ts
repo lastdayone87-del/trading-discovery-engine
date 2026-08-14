@@ -35,7 +35,7 @@ test('Provider2 false-negative recovery reserves quota before claiming its custo
 });
 
 test('Provider2 recovery maps wrapped upstream failures back to transient infrastructure retries', () => {
-  assert.match(workers, /const retryable = result\.retryable !== false/);
+  assert.match(workers, /const retryable = result\.retryable === true/);
   assert.match(workers, /errorClass: retryable \? 'TRANSIENT' : undefined/);
 });
 

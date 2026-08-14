@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 const queueManager = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
 const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+const queueMonitor = readFileSync(new URL('../src/components/QueueMonitor.tsx', import.meta.url), 'utf8');
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 const activeProvider2Symbols = [
@@ -44,4 +45,26 @@ test('channel enrichment remains official and stage-costed', () => {
   assert.match(queueManager, /fetchYouTubeChannelEnrichment\(channelId, candidate,enrichmentStage\)/);
   assert.match(youtube, /channel-uploads/);
   assert.match(youtube, /enrichment-playlists/);
+});
+
+
+test('operational rechecks cannot bypass their dedicated quota-gated workers', () => {
+  assert.match(queueManager, /claimableOverride\?\.includes\('POST_APPROVAL_ENRICH'\)/);
+  assert.match(queueManager, /claimableOverride\?\.includes\('FORCE_REVIEW_RESCAN'\)/);
+  assert.doesNotMatch(queueManager, /!claimableOverride \|\| claimableOverride\.includes\('POST_APPROVAL_ENRICH'\)/);
+  assert.doesNotMatch(queueManager, /!claimableOverride \|\| claimableOverride\.includes\('FORCE_REVIEW_RESCAN'\)/);
+});
+
+test('official enrichment and autonomous admission reserve the configured key-pool worst case', () => {
+  assert.match(queueManager, /getYouTubeKeyPool/);
+  assert.match(queueManager, /enrichmentReservationUnits=enrichmentQuotaUnits\*Math\.max\(1,getYouTubeKeyPool\(\)\.length\)/);
+  assert.match(queueManager, /units: enrichmentReservationUnits/);
+  assert.match(queueManager, /providerReservationUnits=providerQuotaUnits\*Math\.max\(1,getYouTubeKeyPool\(\)\.length\)/);
+  assert.match(queueManager, /units:providerReservationUnits/);
+});
+
+test('queue monitor reports only official Data API enrichment health', () => {
+  assert.doesNotMatch(queueMonitor, /youtube_js|YouTube\.js|hybrid-enrichment-channel-details/);
+  assert.match(queueMonitor, /YouTube Data API/);
+  assert.match(queueMonitor, /channel-uploads/);
 });
