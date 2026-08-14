@@ -23,8 +23,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
-      - name: Apply surgical fixes
-        run: python scripts/applyPr229FinalFixes.py
+      - name: Apply provider-neutral cleanup
+        run: python scripts/applyPr229Cleanup.py
       - name: Focused regression tests
         run: node --import tsx --test server/operationalMaintenanceWorkers.test.ts server/restoreOfficialEnrichmentFlow.test.ts server/officialEnrichmentQuotaAccounting.test.ts server/provider2Removal.contract.test.ts server/retryPendingUi.contract.test.ts
       - name: Typecheck
@@ -33,10 +33,10 @@ jobs:
         run: npm run build
       - name: Diff check
         run: git diff --check
-      - name: Commit fixes
+      - name: Commit cleanup
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add server/queueManager.ts server/operationalMaintenanceWorkers.ts server/operationalMaintenanceWorkers.test.ts server/provider2Removal.contract.test.ts src/components/QueueMonitor.tsx
-          git commit -m 'Close PR229 quota and monitoring gaps'
+          git add -A
+          git commit -m 'Make PR229 incident recovery provider-neutral'
           git push origin HEAD:fix/remove-provider2-runtime
