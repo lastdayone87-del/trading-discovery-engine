@@ -33,7 +33,9 @@ WITH invalid AS (
    WHERE o.observation_type = 'RETRIEVAL_ASSIGNMENT'
      AND o.status <> 'COMPLETED'
      AND (
-       COALESCE(btrim(o.payload->'policy'->>'policyKey'), '') = ''
+       jsonb_typeof(o.payload->'policy'->'policyKey') IS DISTINCT FROM 'string'
+       OR COALESCE(btrim(o.payload->'policy'->>'policyKey'), '') = ''
+       OR jsonb_typeof(o.payload->'policy'->'salt') IS DISTINCT FROM 'string'
        OR COALESCE(btrim(o.payload->'policy'->>'salt'), '') = ''
        OR CASE
             WHEN jsonb_typeof(o.payload->'policy'->'version') = 'number' THEN
@@ -62,7 +64,9 @@ DELETE FROM phase_b_observation_outbox o
    AND o.observation_type = 'RETRIEVAL_ASSIGNMENT'
    AND o.status <> 'COMPLETED'
    AND (
-     COALESCE(btrim(o.payload->'policy'->>'policyKey'), '') = ''
+     jsonb_typeof(o.payload->'policy'->'policyKey') IS DISTINCT FROM 'string'
+     OR COALESCE(btrim(o.payload->'policy'->>'policyKey'), '') = ''
+     OR jsonb_typeof(o.payload->'policy'->'salt') IS DISTINCT FROM 'string'
      OR COALESCE(btrim(o.payload->'policy'->>'salt'), '') = ''
      OR CASE
           WHEN jsonb_typeof(o.payload->'policy'->'version') = 'number' THEN
