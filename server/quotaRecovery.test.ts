@@ -36,7 +36,8 @@ test('shared capacity is not stranded behind hard allocation partitions', () => 
 test('every autonomous page reserves at worker execution rather than producer scheduling', () => {
   const queue = fs.readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const db = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
-  assert.match(queue, /if\(queryRunId\)\{[^\n]+tryReserveQuota\(\{operationType:'AUTONOMOUS_QUERY_PAGE'/);
+  const workerReservation = queue.slice(queue.indexOf('if (queryRunId)'), queue.indexOf('const extracted ='));
+  assert.match(workerReservation, /tryReserveQuota\(\{operationType:'AUTONOMOUS_QUERY_PAGE'/);
   assert.doesNotMatch(db, /VALUES\('SEARCH_YOUTUBE',\$1,'AUTONOMOUS',100/);
 });
 
