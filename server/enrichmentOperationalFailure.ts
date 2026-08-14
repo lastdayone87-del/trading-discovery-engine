@@ -51,6 +51,12 @@ export function hasDecisionGradeEvidenceWithoutFailedProviders(decision: Verific
   );
   const staged = decision.stagedClassification;
   if (!staged) return false;
+  const terminalStatusMatches = staged.lifecycleAction === 'CONFIRM'
+    ? decision.status === 'TRADING_CONFIRMED'
+    : staged.lifecycleAction === 'REJECT'
+      ? decision.status === 'NON_TRADING'
+      : false;
+  if (!terminalStatusMatches) return false;
   const expectedStages = staged.lifecycleAction === 'CONFIRM'
     ? [['CANDIDATE_DETECTION', 'PASS'], ['CORROBORATION', 'PASS']] as const
     : staged.lifecycleAction === 'REJECT'
