@@ -1,3 +1,4 @@
+# trigger after workflow registration
 name: Temporary PR235 expired reservation recovery fix
 on: push
 permissions:
