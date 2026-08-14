@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { fingerprintSamplingSalt } from './phaseBCollectionEpoch';
-import { isValidRetrievalSamplingPolicy } from './phaseBObservationOutbox';
+import { isValidRetrievalSamplingPolicy, normalizeRetrievalSamplingPolicy } from './phaseBObservationOutbox';
 
 test('phase b sampling salt fingerprint uses the normalized effective salt', () => {
   assert.equal(fingerprintSamplingSalt(' deployment-salt '), fingerprintSamplingSalt('deployment-salt'));
@@ -28,14 +28,26 @@ test('retrieval sampling policy validation rejects malformed queued identities',
   assert.equal(isValidRetrievalSamplingPolicy({ ...base, version: '1' as unknown as number }), false);
 });
 
+test('valid queued retrieval identities are normalized before cohort execution', () => {
+  const normalized = normalizeRetrievalSamplingPolicy({
+    policyKey: ' protected-audit ',
+    version: 1,
+    salt: ' deployment-salt ',
+    protectedAuditBasisPoints: 100,
+    targetedAuditBasisPoints: 0,
+  });
+  assert.ok(normalized);
+  assert.equal(normalized.policyKey, 'protected-audit');
+  assert.equal(normalized.salt, 'deployment-salt');
+});
+
 test('queued invalid retrieval assignments are retired before execution instead of retried', () => {
   const source = readFileSync(new URL('./phaseBObservationOutbox.ts', import.meta.url), 'utf8');
-  const validationIndex = source.indexOf("payload.type === 'RETRIEVAL_ASSIGNMENT' && !isValidRetrievalSamplingPolicy(payload.policy)");
+  const validationIndex = source.indexOf('const normalizedPolicy = normalizeRetrievalSamplingPolicy(payload.policy)');
   const processingIndex = source.indexOf("status='PROCESSING'");
-  assert.ok(validationIndex >= 0, 'queued retrieval assignments must be revalidated');
+  assert.ok(validationIndex >= 0, 'queued retrieval assignments must be revalidated and normalized');
   assert.ok(processingIndex > validationIndex, 'invalid retrieval assignments must retire before PROCESSING/attempt increment');
-  assert.match(source, /typeof policy\?\.policyKey === 'string'/);
-  assert.match(source, /typeof policy\?\.salt === 'string'/);
+  assert.match(source, /payload = \{ \.\.\.payload, policy: normalizedPolicy \}/);
   assert.match(source, /INSERT INTO phase_b_observation_retirements/);
   assert.match(source, /INVALID_RETRIEVAL_SAMPLING_POLICY/);
   assert.match(source, /DELETE FROM phase_b_observation_outbox/);
