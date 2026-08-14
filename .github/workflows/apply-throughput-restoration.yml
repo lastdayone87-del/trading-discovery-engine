@@ -38,19 +38,20 @@ jobs:
 
           # Stable exports from the same validated reconstruction.
           append_comment_diff 5296957897  # queueManager.ts
+          append_comment_diff 5296964722  # db.ts: observability/retry/base reservation changes
           append_comment_diff 5296967412  # operationalMaintenanceWorkers.ts
           append_comment_diff 5296960149  # src/types/index.ts
           append_comment_diff 5296980175  # restoration contract test
           append_comment_diff 5296982146  # provider retry policy test
           append_comment_diff 5296979506  # scheduler priority test
 
-          # The first db/youtube exports were internally inconsistent. Wait for
-          # the corrected exports that explicitly contain the missing contracts.
+          # Wait for corrected follow-ups that complete the missing atomic top-up
+          # and make youtube.ts agree with queueManager's callback contract.
           db_id=""
           youtube_id=""
           for _ in $(seq 1 90); do
             comments="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments")"
-            db_id="$(printf '%s' "$comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
+            db_id="$(printf '%s' "$comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("export async function topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
             youtube_id="$(printf '%s' "$comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/youtube.ts")) and (.body|contains("onAdditionalQuota")))] | sort_by(.created_at) | last | .id // empty')"
             if [[ -n "$db_id" && -n "$youtube_id" ]]; then break; fi
             sleep 10
