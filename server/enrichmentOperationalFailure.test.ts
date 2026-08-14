@@ -13,7 +13,7 @@ function report(degraded:boolean, reasonCodes:string[]=[], sufficiency:EvidenceC
   };
 }
 
-function decision(args:{lifecycle:'CONFIRM'|'REJECT'|'ENRICH'|'REVIEW'; source?:'video_metadata'|'gemini_semantic'; degraded?:boolean}):VerificationDecision {
+function decision(args:{lifecycle:'CONFIRM'|'REJECT'|'ENRICH'|'REVIEW'; source?:'video_metadata'|'gemini_semantic'; degraded?:boolean; status?:VerificationDecision['status']}):VerificationDecision {
   const source=args.source||'video_metadata';
   const positive={id:'p1',source,polarity:'POSITIVE' as const,category:'METHODOLOGY_CONCEPT' as const,fact:'trading',rawMatches:['trading'],confidence:90,reliability:'HIGH' as const,reliabilityMultiplier:1,rawWeight:10,finalWeight:9,timestamp:new Date(0).toISOString()};
   const negative={...positive,id:'n1',polarity:'NEGATIVE' as const,category:'IRRELEVANT_DOMAIN' as const,finalWeight:-9};
@@ -23,7 +23,7 @@ function decision(args:{lifecycle:'CONFIRM'|'REJECT'|'ENRICH'|'REVIEW'; source?:
       ? [{stage:'CONTRADICTION' as const,disposition:'FAIL' as const,reasonCodes:[],evidenceIds:['n1'],fields:[],metrics:{}}]
       : [{stage:'CANDIDATE_DETECTION' as const,disposition:'ABSTAIN' as const,reasonCodes:[],evidenceIds:[],fields:[],metrics:{}}];
   return {
-    status:args.lifecycle==='CONFIRM'?'TRADING_CONFIRMED':args.lifecycle==='REJECT'?'NON_TRADING':'UNCERTAIN',confidenceScore:50,category:'OTHER',multiVideoConsistencyRatio:0,
+    status:args.status??(args.lifecycle==='CONFIRM'?'TRADING_CONFIRMED':args.lifecycle==='REJECT'?'NON_TRADING':'UNCERTAIN'),confidenceScore:50,category:'OTHER',multiVideoConsistencyRatio:0,
     positiveEvidence:[positive],negativeEvidence:args.lifecycle==='REJECT'?[negative]:[],totalPositiveWeight:9,totalNegativeWeight:args.lifecycle==='REJECT'?9:0,
     countryContextUsed:{country:'US',language:'en',matchedTerms:[],matchedNegativeTerms:[]},
     versions:{evidenceEngineVersion:'t',decisionEngineVersion:'t',scoringEngineVersion:'t',knowledgePackVersion:'t',geminiModelVersion:'t'},
@@ -46,6 +46,20 @@ test('independent confirm evidence may proceed despite optional Gemini degradati
   const ready=hasDecisionGradeEvidenceWithoutFailedProviders(d);
   assert.equal(ready,true);
   assert.equal(enrichmentOperationalFailure(d.evidenceCollection,true,ready),null);
+});
+
+test('stage CONFIRM without a terminal confirmed decision still retries provider degradation',()=>{
+  const d=decision({lifecycle:'CONFIRM',source:'video_metadata',status:'UNCERTAIN'});
+  const ready=hasDecisionGradeEvidenceWithoutFailedProviders(d);
+  assert.equal(ready,false);
+  assert.ok(enrichmentOperationalFailure(d.evidenceCollection,true,ready));
+});
+
+test('stage REJECT without a terminal non-trading decision still retries provider degradation',()=>{
+  const d=decision({lifecycle:'REJECT',source:'video_metadata',status:'UNCERTAIN'});
+  const ready=hasDecisionGradeEvidenceWithoutFailedProviders(d);
+  assert.equal(ready,false);
+  assert.ok(enrichmentOperationalFailure(d.evidenceCollection,true,ready));
 });
 
 test('failed-provider evidence never qualifies as independent decision-grade support',()=>{
