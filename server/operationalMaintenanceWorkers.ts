@@ -15,7 +15,7 @@ type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>
 
 const COMMUNITY_RETRY_TYPES: ClaimableOverride = ['RETRY_COMMUNITY_ACQUISITION'];
 const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORCE_REVIEW_RESCAN'];
-const PROVIDER2_RECOVERY_JOB = 'PROVIDER2_FALSE_NEGATIVE_RESCAN';
+const FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN';
 const OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101;
 const QUOTA_BACKOFF_MS = 30_000;
 
@@ -83,7 +83,7 @@ function startOfficialRecheckWorker(workerId: string): void {
   void tick();
 }
 
-function startProvider2RecoveryWorker(workerId: string): void {
+function startFalseNegativeRecoveryWorker(workerId: string): void {
   const tick = async () => {
     const operationId = `${workerId}:${Date.now()}`;
     let reserved = false;
@@ -100,7 +100,7 @@ function startProvider2RecoveryWorker(workerId: string): void {
         return;
       }
 
-      const job = await claimNextJob(workerId, [PROVIDER2_RECOVERY_JOB]);
+      const job = await claimNextJob(workerId, [FALSE_NEGATIVE_RECOVERY_JOB]);
       if (!job) {
         await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, false);
         reserved = false;
@@ -113,7 +113,7 @@ function startProvider2RecoveryWorker(workerId: string): void {
       heartbeat.unref?.();
 
       const channelId = String(job.payload?.channelId || '');
-      if (!channelId) throw new Error('Provider2 recovery job is missing channelId.');
+      if (!channelId) throw new Error('False-negative recovery job is missing channelId.');
       const result = await triggerManualRecheck(channelId, true);
       if (!result.success) {
         const retryable = result.retryable === true;
@@ -136,7 +136,7 @@ function startProvider2RecoveryWorker(workerId: string): void {
       if (reserved) await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, false).catch(() => undefined);
       reserved = false;
       nextDelayMs = QUOTA_BACKOFF_MS;
-      console.error(`[Queue Worker:${workerId}] Provider2 false-negative recovery tick failed:`, error);
+      console.error(`[Queue Worker:${workerId}] False-negative recovery tick failed:`, error);
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       schedule(tick, nextDelayMs);
@@ -157,9 +157,9 @@ export function startOperationalMaintenanceWorkers(): void {
   }
   // Recovery is intentionally single-consumer and low-volume regardless of the
   // generic maintenance concurrency setting.
-  startProvider2RecoveryWorker(`provider2_recovery_${process.pid}_0`);
+  startFalseNegativeRecoveryWorker(`false_negative_recovery_${process.pid}_0`);
 }
 
 export function getOperationalMaintenanceJobTypesForTests(): string[] {
-  return [...COMMUNITY_RETRY_TYPES, ...OFFICIAL_RECHECK_TYPES, PROVIDER2_RECOVERY_JOB];
+  return [...COMMUNITY_RETRY_TYPES, ...OFFICIAL_RECHECK_TYPES, FALSE_NEGATIVE_RECOVERY_JOB];
 }

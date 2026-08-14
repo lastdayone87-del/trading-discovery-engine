@@ -23,18 +23,18 @@ test('ordinary official rescans reserve the ENRICHMENT worst case across configu
   assert.match(workers, /finishQuotaReservation\('OPERATIONAL_RECHECK'/);
 });
 
-test('Provider2 false-negative recovery reserves quota before claiming its custom job', () => {
+test('false-negative recovery reserves quota before claiming its custom job', () => {
   const reserve = workers.indexOf('reserved = await reserveOfficialRecheck(operationId)');
-  const claim = workers.indexOf('claimNextJob(workerId, [PROVIDER2_RECOVERY_JOB])');
+  const claim = workers.indexOf('claimNextJob(workerId, [FALSE_NEGATIVE_RECOVERY_JOB])');
   assert.ok(reserve >= 0 && claim > reserve);
-  assert.match(workers, /PROVIDER2_RECOVERY_JOB = 'PROVIDER2_FALSE_NEGATIVE_RESCAN'/);
+  assert.match(workers, /FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN'/);
   assert.match(workers, /triggerManualRecheck\(channelId, true\)/);
   assert.match(workers, /completeJob\(job\.id\)/);
   assert.match(workers, /failJob\(claimedJobId, error\)/);
   assert.match(workers, /heartbeatJob\(job\.id, workerId\)/);
 });
 
-test('Provider2 recovery maps wrapped upstream failures back to transient infrastructure retries', () => {
+test('false-negative recovery maps wrapped upstream failures back to transient infrastructure retries', () => {
   assert.match(workers, /const retryable = result\.retryable === true/);
   assert.match(workers, /errorClass: retryable \? 'TRANSIENT' : undefined/);
 });

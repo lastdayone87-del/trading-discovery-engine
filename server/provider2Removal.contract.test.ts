@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 const queueManager = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
 const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
 const queueMonitor = readFileSync(new URL('../src/components/QueueMonitor.tsx', import.meta.url), 'utf8');
+const operationalMaintenanceWorkers = readFileSync(new URL('./operationalMaintenanceWorkers.ts', import.meta.url), 'utf8');
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 const activeProvider2Symbols = [
@@ -67,4 +68,10 @@ test('queue monitor reports only official Data API enrichment health', () => {
   assert.doesNotMatch(queueMonitor, /youtube_js|YouTube\.js|hybrid-enrichment-channel-details/);
   assert.match(queueMonitor, /YouTube Data API/);
   assert.match(queueMonitor, /channel-uploads/);
+});
+
+
+test('active maintenance runtime is provider-neutral', () => {
+  assert.doesNotMatch(operationalMaintenanceWorkers, /PROVIDER2_|Provider2|provider2_/);
+  assert.match(operationalMaintenanceWorkers, /CLASSIFICATION_FALSE_NEGATIVE_RESCAN/);
 });

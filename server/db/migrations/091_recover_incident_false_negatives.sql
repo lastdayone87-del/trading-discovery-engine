@@ -1,8 +1,8 @@
--- Bounded recovery for machine NON_TRADING decisions made while Provider #2 was
--- active in autonomous discovery. This deliberately does NOT weaken the
+-- Bounded recovery for suspicious machine NON_TRADING decisions made during
+-- the incident window. This deliberately does NOT weaken the
 -- classifier and does NOT reopen human or country rejections.
 --
--- Provider #2 production window:
+-- Incident window:
 --   introduced: 2026-08-12T13:12:22Z (merge #203)
 --   official Data API routing restored: 2026-08-13T18:45:43Z (#222)
 --
@@ -69,12 +69,12 @@ INSERT INTO jobs(
   idempotency_key, created_at, updated_at
 )
 SELECT
-  'PROVIDER2_FALSE_NEGATIVE_RESCAN',
+  'CLASSIFICATION_FALSE_NEGATIVE_RESCAN',
   'PENDING',
   0,
   jsonb_build_object(
     'channelId', channel_id,
-    'incidentRecovery', 'provider2_false_negative_v1',
+    'incidentRecovery', 'classification_false_negative_v1',
     'diagnosticCreatedAt', diagnostic_created_at,
     'suspicionScore', suspicion_score,
     'enrichmentStage', enrichment_stage,
@@ -93,7 +93,7 @@ SELECT
   0,
   2,
   now() + ((recovery_order - 1) * INTERVAL '4 minutes'),
-  'provider2-false-negative-recovery-v1:' || channel_id,
+  'classification-false-negative-recovery-v1:' || channel_id,
   now(),
   now()
 FROM bounded

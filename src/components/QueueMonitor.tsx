@@ -341,12 +341,12 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
               <div className="rounded-lg bg-slate-50 dark:bg-slate-800/60 p-3 border border-slate-200 dark:border-slate-700">
                 <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Approx. official units / enrichment</div>
                 <div className="mt-2 text-lg font-extrabold font-mono">{enrichmentHealth.averageOfficialUnits === null ? '—' : enrichmentHealth.averageOfficialUnits.toFixed(2)}</div>
-                <div className="text-[10px] text-slate-500">Expected near 1 with official enrichment; telemetry-window estimate.</div>
+                <div className="text-[10px] text-slate-500">Stage 1 normally costs 101 official units; stage 2 normally costs 202. Telemetry-window estimate.</div>
               </div>
               <div className="rounded-lg bg-slate-50 dark:bg-slate-800/60 p-3 border border-slate-200 dark:border-slate-700">
                 <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Official reserved / actual</div>
                 <div className="mt-2 text-lg font-extrabold font-mono">{enrichmentHealth.officialReservedCost} / {enrichmentHealth.officialActualCost}</div>
-                <div className="text-[10px] text-slate-500">Provider-call telemetry only; zero-cost YouTube Data API calls excluded.</div>
+                <div className="text-[10px] text-slate-500">Official provider-call telemetry for enrichment operations.</div>
               </div>
             </div>
 
