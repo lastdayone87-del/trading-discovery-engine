@@ -1,3 +1,4 @@
+# retrigger with malformed-diff recount and coherent corrected exports
 name: Apply throughput restoration
 
 on:
@@ -37,18 +38,22 @@ jobs:
             echo "---- validating ${label} (${id}) ----"
             sed -n '1,8p' "$tmp"
             test -s "$tmp" || { echo "Empty diff for ${label}"; exit 1; }
-            git apply --check "$tmp" || { echo "FAILED DIFF: ${label} (${id})"; nl -ba "$tmp" | sed -n '1,160p'; exit 1; }
-            git apply "$tmp"
+            git apply --recount --check "$tmp" || { echo "FAILED DIFF: ${label} (${id})"; nl -ba "$tmp" | sed -n '1,220p'; exit 1; }
+            git apply --recount "$tmp"
           }
 
-          db_topup_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("export async function topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
+          db_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("export async function topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
           youtube_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/youtube.ts")) and (.body|contains("onAdditionalQuota")))] | sort_by(.created_at) | last | .id // empty')"
-          test -n "$db_topup_id" || { echo "Corrected db.ts top-up export unavailable"; exit 1; }
+          test -n "$db_id" || { echo "Corrected db.ts export unavailable"; exit 1; }
           test -n "$youtube_id" || { echo "Corrected youtube.ts export unavailable"; exit 1; }
+          echo "Using corrected db.ts comment ${db_id}"
+          echo "Using corrected youtube.ts comment ${youtube_id}"
 
+          # scheduler.ts is already committed on this branch. Apply the remaining
+          # coherent final-state diffs only once; corrected db.ts subsumes the
+          # earlier incomplete db export.
           apply_comment_diff 5296957897 queueManager.ts
-          apply_comment_diff 5296964722 db-base.ts
-          apply_comment_diff "$db_topup_id" db-topup.ts
+          apply_comment_diff "$db_id" db.ts
           apply_comment_diff 5296967412 operationalMaintenanceWorkers.ts
           apply_comment_diff 5296960149 src-types-index.ts
           apply_comment_diff "$youtube_id" youtube.ts
