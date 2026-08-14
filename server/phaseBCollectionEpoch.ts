@@ -75,8 +75,8 @@ const checksum = (value: unknown): string => createHash('sha256').update(stable(
 const normalized = (value: string | undefined): string => String(value || '').trim().toUpperCase();
 
 export function fingerprintSamplingSalt(salt: string | undefined): string {
-  const value = String(salt || '');
-  if (!value.trim()) return '';
+  const value = String(salt || '').trim();
+  if (!value) return '';
   return createHash('sha256').update(`phase-b-sampling-salt:${value}`).digest('hex');
 }
 
