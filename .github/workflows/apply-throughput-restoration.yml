@@ -1,4 +1,3 @@
-# retrigger after corrected export comments became available
 name: Apply throughput restoration
 
 on:
@@ -21,44 +20,42 @@ jobs:
           ref: fix/restore-pre203-throughput-semantics-v4
           fetch-depth: 0
 
-      - name: Collect validated per-file diffs
+      - name: Apply validated per-file diffs sequentially
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          : > /tmp/restore.patch
 
-          append_comment_diff() {
+          apply_comment_diff() {
             local id="$1"
+            local label="$2"
+            local tmp="/tmp/${id}.patch"
             gh api "repos/${GH_REPO}/issues/comments/${id}" --jq .body \
-              | awk '/^```diff$/{capture=1;next} /^```$/{if(capture)exit} capture' >> /tmp/restore.patch
-            printf '\n' >> /tmp/restore.patch
+              | awk '/^```diff$/{capture=1;next} /^```$/{if(capture)exit} capture' > "$tmp"
+            echo "---- validating ${label} (${id}) ----"
+            sed -n '1,8p' "$tmp"
+            test -s "$tmp" || { echo "Empty diff for ${label}"; exit 1; }
+            git apply --check "$tmp" || { echo "FAILED DIFF: ${label} (${id})"; nl -ba "$tmp" | sed -n '1,160p'; exit 1; }
+            git apply "$tmp"
           }
 
-          # Stable exports from the same validated reconstruction.
-          append_comment_diff 5296957897  # queueManager.ts
-          append_comment_diff 5296964722  # db.ts: observability/retry/base reservation changes
-          append_comment_diff 5296967412  # operationalMaintenanceWorkers.ts
-          append_comment_diff 5296960149  # src/types/index.ts
-          append_comment_diff 5296980175  # restoration contract test
-          append_comment_diff 5296982146  # provider retry policy test
-          append_comment_diff 5296979506  # scheduler priority test
-
-          # Corrected follow-ups that complete the missing atomic top-up and
-          # make youtube.ts agree with queueManager's callback contract.
-          db_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("export async function topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
+          db_topup_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("export async function topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
           youtube_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/youtube.ts")) and (.body|contains("onAdditionalQuota")))] | sort_by(.created_at) | last | .id // empty')"
-          test -n "$db_id" || { echo "Corrected db.ts export unavailable"; exit 1; }
+          test -n "$db_topup_id" || { echo "Corrected db.ts top-up export unavailable"; exit 1; }
           test -n "$youtube_id" || { echo "Corrected youtube.ts export unavailable"; exit 1; }
-          echo "Using corrected db.ts comment ${db_id}"
-          echo "Using corrected youtube.ts comment ${youtube_id}"
-          append_comment_diff "$db_id"
-          append_comment_diff "$youtube_id"
 
-          git apply --check /tmp/restore.patch
-          git apply /tmp/restore.patch
+          apply_comment_diff 5296957897 queueManager.ts
+          apply_comment_diff 5296964722 db-base.ts
+          apply_comment_diff "$db_topup_id" db-topup.ts
+          apply_comment_diff 5296967412 operationalMaintenanceWorkers.ts
+          apply_comment_diff 5296960149 src-types-index.ts
+          apply_comment_diff "$youtube_id" youtube.ts
+          apply_comment_diff 5296980175 pre203-contract-test.ts
+          apply_comment_diff 5296982146 providerRetryPolicy.test.ts
+          apply_comment_diff 5296979506 youtubeRequestScheduler.test.ts
+
           git diff --check
 
       - name: Validate restoration
