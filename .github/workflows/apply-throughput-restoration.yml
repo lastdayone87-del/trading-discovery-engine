@@ -58,11 +58,11 @@ jobs:
           apply_comment_diff 5296982146 providerRetryPolicy.test.ts
           apply_comment_diff 5296979506 youtubeRequestScheduler.test.ts
 
-          # A provider retryAt remains authoritative even when its timestamp has
-          # just elapsed: it is executable now, not a reason to inject a fresh
-          # exponential delay. Exponential fallback is only for missing hints.
           python3 - <<'PY'
           from pathlib import Path
+
+          # An elapsed retryAt means the provider is eligible now. Only a missing
+          # retry hint falls back to exponential scheduling.
           p = Path('server/db.ts')
           s = p.read_text()
           old = "const scheduled=Number.isFinite(retryAt)&&retryAt>now?retryAt:Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;"
@@ -70,6 +70,17 @@ jobs:
           if old not in s:
               raise SystemExit('Expected provider retry scheduling expression not found')
           p.write_text(s.replace(old, new, 1))
+
+          # QueueStatus is shared with the retained SQL.js legacy adapter. Keep
+          # that compatibility implementation structurally valid while the live
+          # PostgreSQL implementation supplies detailed pending-work rows.
+          legacy = Path('server/db.legacy.ts')
+          ls = legacy.read_text()
+          old_legacy = "    discordValidation: { depth: discordValidationDepth, isPaused: !!pausedMap['discord_validation'] }\n"
+          new_legacy = "    discordValidation: { depth: discordValidationDepth, isPaused: !!pausedMap['discord_validation'] },\n    pendingWork: []\n"
+          if old_legacy not in ls:
+              raise SystemExit('Expected legacy QueueStatus return not found')
+          legacy.write_text(ls.replace(old_legacy, new_legacy, 1))
           PY
 
           git diff --check
