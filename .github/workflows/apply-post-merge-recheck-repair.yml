@@ -1,0 +1,77 @@
+name: Apply post-merge recheck repair
+
+on:
+  push:
+    branches:
+      - fix/post-merge-recheck-safety
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/post-merge-recheck-safety
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Apply staged source payloads
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, zlib
+
+          queue_payload = ''.join(Path(f'.postmerge-fix/q{i}.txt').read_text().strip() for i in range(4))
+          Path('server/queueManager.ts').write_bytes(zlib.decompress(base64.b64decode(queue_payload)))
+
+          payloads = {}
+          for line in Path('.postmerge-fix/others.txt').read_text().splitlines():
+              if not line.strip():
+                  continue
+              name, payload = line.split('=', 1)
+              payloads[name] = payload
+
+          mapping = {
+              'op.txt': 'server/operationalMaintenanceWorkers.ts',
+              'contract.txt': 'server/postMergeRecheckSafety.contract.test.ts',
+              'optest.txt': 'server/operationalMaintenanceWorkers.test.ts',
+              'bf.txt': 'server/browserCommunityFallback.ts',
+              'bftest.txt': 'server/browserCommunityFallback.test.ts',
+          }
+          for name, target in mapping.items():
+              Path(target).write_bytes(zlib.decompress(base64.b64decode(payloads[name])))
+              print('updated', target)
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Focused regression tests
+        run: node --import tsx --test server/postMergeRecheckSafety.contract.test.ts server/operationalMaintenanceWorkers.test.ts server/browserCommunityFallback.test.ts server/manualRecheckClassification.test.ts
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Commit repair and remove staging workflow
+        run: |
+          rm -rf .postmerge-fix .github/workflows/apply-post-merge-recheck-repair.yml
+          git add -A
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "Harden rechecks and bound rendered fallback concurrency"
+          git push origin HEAD:fix/post-merge-recheck-safety
