@@ -1,0 +1,18 @@
+name: Temporary PR236 baseline validation
+on: push
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diag/pr236-baseline-validation
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run comparison tests on unmodified main baseline
+        run: node --import tsx --test server/youtubePoolBackoff.test.ts server/youtubeProviderCooldown.test.ts
