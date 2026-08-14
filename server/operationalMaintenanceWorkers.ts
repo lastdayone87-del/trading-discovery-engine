@@ -6,6 +6,7 @@ import {
   finishQuotaReservation,
   getAppSetting,
   getDailyYouTubeQuotaBudget,
+  getYouTubeKeyPool,
   heartbeatJob,
   tryReserveQuota
 } from './db';
@@ -15,7 +16,7 @@ type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>
 const COMMUNITY_RETRY_TYPES: ClaimableOverride = ['RETRY_COMMUNITY_ACQUISITION'];
 const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORCE_REVIEW_RESCAN'];
 const PROVIDER2_RECOVERY_JOB = 'PROVIDER2_FALSE_NEGATIVE_RESCAN';
-const OFFICIAL_RECHECK_UNITS = 101;
+const OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101;
 const QUOTA_BACKOFF_MS = 30_000;
 
 let started = false;
@@ -28,11 +29,16 @@ function schedule(next: () => void, delayMs: number): void {
 async function reserveOfficialRecheck(operationId: string): Promise<boolean> {
   const dailyBudget = getDailyYouTubeQuotaBudget();
   const allocationPercent = Math.max(1, Math.min(100, Number(await getAppSetting('discovery_enrichment_quota_percent', '10')) || 10));
+  // A stage-1 manual recheck can rotate through every configured project key.
+  // Reserve the bounded worst case up front so successful expensive requests on
+  // an earlier key can never push actual consumption beyond the quota gate.
+  const maximumProviderAttempts = Math.max(1, getYouTubeKeyPool().length);
+  const reservedUnits = OFFICIAL_RECHECK_UNITS_PER_PROVIDER * maximumProviderAttempts;
   return tryReserveQuota({
     operationType: 'OPERATIONAL_RECHECK',
     operationId,
     allocation: 'ENRICHMENT',
-    units: OFFICIAL_RECHECK_UNITS,
+    units: reservedUnits,
     dailyBudget,
     allocationPercent
   });
@@ -86,7 +92,8 @@ function startProvider2RecoveryWorker(workerId: string): void {
     let nextDelayMs = 1000;
     try {
       // Reserve before claiming so a recovery job never becomes PROCESSING when
-      // the production ENRICHMENT allocation cannot pay for its 100+1 requests.
+      // the production ENRICHMENT allocation cannot pay for its bounded official
+      // Data API attempts.
       reserved = await reserveOfficialRecheck(operationId);
       if (!reserved) {
         nextDelayMs = QUOTA_BACKOFF_MS;
@@ -109,7 +116,15 @@ function startProvider2RecoveryWorker(workerId: string): void {
       if (!channelId) throw new Error('Provider2 recovery job is missing channelId.');
       const result = await triggerManualRecheck(channelId, true);
       if (!result.success) {
-        const error = Object.assign(new Error(result.message), { code: result.code, retryable: result.retryable !== false });
+        const retryable = result.retryable !== false;
+        const error = Object.assign(new Error(result.message), {
+          code: result.code,
+          retryable,
+          // triggerManualRecheck intentionally wraps upstream provider errors in
+          // MANUAL_RESCAN_UPSTREAM_FAILURE. Restore infrastructure semantics for
+          // failJob so transient provider outages do not consume normal attempts.
+          errorClass: retryable ? 'TRANSIENT' : undefined
+        });
         throw error;
       }
       await completeJob(job.id);
