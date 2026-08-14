@@ -267,28 +267,35 @@ export async function processNextSearchJob(
       await upsertChannel(channel);
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
-      const enrichmentQuotaUnits=enrichmentStage>=2?202:101;
-      const enrichmentReservationUnits=enrichmentQuotaUnits;
-      const quotaReserved = await tryReserveQuota({
-        operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-        units: enrichmentReservationUnits, dailyBudget, allocationPercent: enrichmentPercent
-      });
-      if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
+      const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;
+      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?202:101);
+      let quotaReserved=false;
+      if(!candidateAlreadyEnriched){
+        quotaReserved=await tryReserveQuota({
+          operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
+          units:enrichmentQuotaUnits,dailyBudget,allocationPercent:enrichmentPercent
+        });
+        if(!quotaReserved)throw new QuotaAllocationExhaustedError('ENRICHMENT');
+      }
       try {
-        const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate,enrichmentStage,async additionalUnits=>{
+        const enriched=candidateAlreadyEnriched?candidate:await fetchYouTubeChannelEnrichment(channelId,candidate,enrichmentStage,async additionalUnits=>{
           const toppedUp=await topUpQuotaReservation({
             operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
             additionalUnits,dailyBudget,allocationPercent:enrichmentPercent
           });
           if(!toppedUp)throw new QuotaAllocationExhaustedError('ENRICHMENT');
         });
-        const pipelineOutcome=await processChannelThroughPipeline(enriched, targetCountry, source, false, true);
+        if(!candidateAlreadyEnriched){
+          const db=await getDb();
+          await db.query(`UPDATE jobs SET payload=jsonb_set(payload,'{candidate}',$2::jsonb,true),updated_at=now() WHERE id=$1`,[job.id,JSON.stringify(enriched)]);
+        }
+        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true);
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
-        await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+        if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
       } catch (error) {
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
-        await finishQuotaReservation('ENRICH_CHANNEL', job.id, false);
+        if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
         throw error;
       }
       return true;
