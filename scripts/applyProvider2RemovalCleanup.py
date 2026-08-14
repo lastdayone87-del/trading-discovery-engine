@@ -1,0 +1,115 @@
+from pathlib import Path
+import json
+import re
+
+FORBIDDEN = [
+    'youtubeInnerTubeProvider',
+    'youtubeInnerTubeEnrichment',
+    'innerTubeLane',
+    'YOUTUBE_INNERTUBE_',
+    'YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED',
+    'youtube_inner_tube_',
+    'youtube_js_hybrid_enrichment_enabled',
+    'fetchYouTubeChannelEnrichmentQuotaFree',
+]
+
+qpath = Path('server/queueManager.ts')
+q = qpath.read_text()
+q = q.replace(
+    "import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelEnrichmentQuotaFree, DiscoveredChannelRaw, RetrievalLane } from './youtube';",
+    "import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';",
+)
+q = q.replace("import { discoverWithInnerTube, nextInnerTubeLane, type InnerTubeDiscoveryLane } from './youtubeInnerTubeProvider';\n", '')
+q, n = re.subn(
+    r"\n      const hybridEnrichmentEnabled=.*?\n      const enrichmentQuotaUnits=hybridEnrichmentEnabled\?1:\(enrichmentStage>=2\?202:101\);",
+    "\n      const enrichmentQuotaUnits=enrichmentStage>=2?202:101;",
+    q,
+    count=1,
+    flags=re.S,
+)
+assert n == 1, f'hybrid enrichment block replacements={n}'
+q = q.replace(
+    "    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null, innerTubeLane = 'MONTH' } = job.payload as {\n      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null; innerTubeLane?:InnerTubeDiscoveryLane;\n    };",
+    "    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null } = job.payload as {\n      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null;\n    };",
+)
+q = re.sub(
+    r"\n    // Only durable autonomous query runs are eligible for quota-free InnerTube.*?\n    const innerTubeEnabled = .*?;\n",
+    "\n",
+    q,
+    count=1,
+    flags=re.S,
+)
+q, n = re.subn(
+    r"    const autonomousOperationId=queryRunId\?`\$\{queryRunId\}:\$\{pageNumber\}`:'';\n    let providerQuotaUnits = 0;\n    let searchPage: \{ channels: DiscoveredChannelRaw\[\]; rawResultCount: number; nextPageToken\?: string \| null \} \| null = null;\n    if \(queryRunId && innerTubeEnabled\) \{.*?\n    \}\n    const extracted =",
+    "    const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';\n    let providerQuotaUnits = 0;\n    let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null } | null = null;\n    if (queryRunId) {\n      providerQuotaUnits=100;\n      const budget=getDailyYouTubeQuotaBudget();\n      const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));\n      if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');\n      try {\n        searchPage=await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering);\n        await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);\n      } catch (error) {\n        await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,false);\n        throw error;\n      }\n    }\n    const extracted =",
+    q,
+    count=1,
+    flags=re.S,
+)
+assert n == 1, f'autonomous provider block replacements={n}'
+q = q.replace(
+    "      const allowDefaultInnerTube=await getAppSetting('youtube_inner_tube_default_backfill_enabled',process.env.YOUTUBE_INNERTUBE_DEFAULT_BACKFILL_ENABLED||'false')==='true';\n      const nextLane=innerTubeEnabled?nextInnerTubeLane(innerTubeLane,decision.lowYield,allowDefaultInnerTube):null;\n      const stoppingReason=nextLane?null:decision.shouldContinue?null:decision.primaryReason;",
+    "      const stoppingReason=decision.shouldContinue?null:decision.primaryReason;",
+)
+q = re.sub(r"\n      if\(enabled&&innerTubeEnabled&&nextLane\)\{.*?return true;\}", '', q, count=1)
+q = q.replace("if(enabled&&!innerTubeEnabled&&decision.shouldContinue&&searchPage?.nextPageToken)", "if(enabled&&decision.shouldContinue&&searchPage?.nextPageToken)")
+q = q.replace("const quotaConsumed=innerTubeEnabled?0:pageNumber*100;", "const quotaConsumed=pageNumber*100;")
+q = q.replace(
+    "logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via ${innerTubeEnabled ? `YOUTUBE_JS/${innerTubeLane}` : 'YOUTUBE_DATA_API'}.`, `Funnel: ${JSON.stringify(metrics)}`]",
+    "logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via YOUTUBE_DATA_API.`, `Funnel: ${JSON.stringify(metrics)}`]",
+)
+for symbol in FORBIDDEN:
+    assert symbol not in q, f'queueManager still contains {symbol}'
+qpath.write_text(q)
+
+ypath = Path('server/youtube.ts')
+y = ypath.read_text()
+y = y.replace("import { fetchInnerTubeChannelEnrichment } from './youtubeInnerTubeEnrichment';\n", '')
+y = y.replace('async function fetchYouTubeChannelEnrichmentOfficial(', 'export async function fetchYouTubeChannelEnrichment(', 1)
+y, n = re.subn(
+    r"\n\n/\*\*\n \* Quota-free hybrid evidence acquisition.*?\n/\*\* One-unit metadata hydration used only when country evidence remains uncertain\. \*/",
+    "\n\n/** One-unit metadata hydration used only when country evidence remains uncertain. */",
+    y,
+    count=1,
+    flags=re.S,
+)
+assert n == 1, f'quota-free/hybrid youtube block replacements={n}'
+if 'getAppSetting(' not in y:
+    y = y.replace('incrementQuota, getAppSetting, getYouTubeKeyPool', 'incrementQuota, getYouTubeKeyPool')
+if y.count('ProviderCallError') == 1:
+    y = y.replace('executeProviderCall, ProviderCallError', 'executeProviderCall')
+for symbol in FORBIDDEN:
+    assert symbol not in y, f'youtube runtime still contains {symbol}'
+ypath.write_text(y)
+
+rpath = Path('src/components/ResultsTable.tsx')
+r = rpath.read_text()
+assert 'Validation retry pending' in r
+rpath.write_text(r.replace('Validation retry pending', 'Validation retry required'))
+
+pkg_path = Path('package.json')
+pkg = json.loads(pkg_path.read_text())
+pkg.get('dependencies', {}).pop('youtubei.js', None)
+pkg.get('scripts', {}).pop('youtube:provider-bakeoff', None)
+pkg_path.write_text(json.dumps(pkg, indent=2) + '\n')
+
+Path('server/retryPendingUi.contract.test.ts').write_text("""import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const resultsTable=readFileSync(new URL('../src/components/ResultsTable.tsx',import.meta.url),'utf8');
+
+test('recoverable Discord validation is presented as retry required, not queued retry',()=>{
+  assert.match(resultsTable,/Validation retry required/);
+  assert.doesNotMatch(resultsTable,/Validation retry pending/);
+});
+""")
+
+for path in [
+    'server/youtubeInnerTubeProvider.ts',
+    'server/youtubeInnerTubeProvider.test.ts',
+    'server/youtubeInnerTubeEnrichment.ts',
+    'server/youtubeInnerTubeEnrichment.test.ts',
+    'scripts/youtubeProviderBakeoff.ts',
+]:
+    Path(path).unlink(missing_ok=True)
