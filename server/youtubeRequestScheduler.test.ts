@@ -93,6 +93,21 @@ test('youtubeFetch always bounds the scheduler head request', () => {
   assert.doesNotMatch(youtubeFetch, /provider_deadlines_enabled|PROVIDER_DEADLINES_ENABLED/);
 });
 
+test('youtubeFetch rechecks provider eligibility at dispatch and clears provider-local 429 history on success', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  assert.match(youtubeFetch, /providerKey&&!youtubeProviderCooldown\.eligible\(providerKey\)/);
+  assert.match(youtubeFetch, /youtubeProviderCooldown\.succeeded\(providerKey\)/);
+  assert.match(youtubeFetch, /YOUTUBE_PROVIDER_COOLING_DOWN/);
+});
+
+test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey\)/);
+  assert.match(source, /youtubeFetch\(recentUrl,'channel-uploads',100,attempt\+1,acquisition,priority,apiKey\)/);
+  assert.match(source, /youtubeFetch\(channelUrl,'channel-details',1,attempt\+1,acquisition,priority,apiKey\)/);
+});
+
 test('search provider loop retains key failover after a rate-limited attempt', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const search = source.slice(source.indexOf('export async function searchYouTubeChannelPage'), source.indexOf('/**\n * Fetches recent video titles'));
