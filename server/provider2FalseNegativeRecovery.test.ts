@@ -17,7 +17,7 @@ test('Provider2 false-negative recovery is incident-scoped, bounded and auditabl
   assert.match(migration, /cr\.state = 'REJECTED'/);
   assert.match(migration, /suspicion_score > 0/);
   assert.match(migration, /LIMIT 25/);
-  assert.match(migration, /'FORCE_REVIEW_RESCAN'/);
+  assert.match(migration, /'PROVIDER2_FALSE_NEGATIVE_RESCAN'/);
   assert.match(migration, /'provider2_false_negative_v1'/);
   assert.match(migration, /INTERVAL '4 minutes'/);
   assert.match(migration, /ON CONFLICT\(idempotency_key\) DO NOTHING/);
@@ -29,10 +29,12 @@ test('recovery does not mutate terminal classifications directly', () => {
   assert.doesNotMatch(migration, /SET\s+trading_status/i);
 });
 
-test('recovery requires evidence-quality suspicion rather than reopening every negative', () => {
+test('recovery uses persisted evidence_items for contradictory positive evidence', () => {
   assert.match(migration, /evidenceCollection/);
   assert.match(migration, /degraded/);
   assert.match(migration, /INSUFFICIENT/);
-  assert.match(migration, /positiveEvidence/);
+  assert.match(migration, /evidence_items/);
+  assert.match(migration, /item->>'polarity' = 'POSITIVE'/);
+  assert.doesNotMatch(migration, /decision->'positiveEvidence'/);
   assert.match(migration, /thinCreatorInput/);
 });
