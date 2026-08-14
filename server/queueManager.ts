@@ -270,6 +270,7 @@ export async function processNextSearchJob(
       const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;
       const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?202:101);
       let quotaReserved=false;
+      let acquisitionPersisted=candidateAlreadyEnriched;
       if(!candidateAlreadyEnriched){
         quotaReserved=await tryReserveQuota({
           operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
@@ -288,6 +289,13 @@ export async function processNextSearchJob(
         if(!candidateAlreadyEnriched){
           const db=await getDb();
           await db.query(`UPDATE jobs SET payload=jsonb_set(payload,'{candidate}',$2::jsonb,true),updated_at=now() WHERE id=$1`,[job.id,JSON.stringify(enriched)]);
+          acquisitionPersisted=true;
+          await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
+          quotaReserved=false;
+        } else {
+          // Idempotently reconcile a reservation left RESERVED if a prior worker
+          // crashed after persisting the paid enrichment payload.
+          await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         }
         const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true);
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
@@ -295,7 +303,7 @@ export async function processNextSearchJob(
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
       } catch (error) {
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
-        if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
+        if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,acquisitionPersisted);
         throw error;
       }
       return true;

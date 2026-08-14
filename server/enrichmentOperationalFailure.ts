@@ -1,4 +1,4 @@
-import type { EvidenceCollectionReport } from './evidenceEngine';
+import type { EvidenceCollectionReport, VerificationDecision } from './evidenceEngine';
 import { ProviderCallError } from './providerResilience';
 
 const OPERATIONAL_PROVIDER_REASONS = new Set([
@@ -43,11 +43,39 @@ export class OperationalEnrichmentProviderError extends ProviderCallError {
  * evidence is already sufficient; retrying those cases turns a Gemini outage
  * into a global enrichment outage.
  */
+export function hasDecisionGradeEvidenceWithoutFailedProviders(decision: VerificationDecision): boolean {
+  const failedProviders = new Set(
+    decision.evidenceCollection.providers
+      .filter(provider => provider.availability === 'FAILED')
+      .map(provider => provider.provider)
+  );
+  const staged = decision.stagedClassification;
+  if (!staged) return false;
+  const expectedStages = staged.lifecycleAction === 'CONFIRM'
+    ? [['CANDIDATE_DETECTION', 'PASS'], ['CORROBORATION', 'PASS']] as const
+    : staged.lifecycleAction === 'REJECT'
+      ? [['CONTRADICTION', 'FAIL']] as const
+      : [];
+  if (!expectedStages.length) return false;
+  const evidenceById = new Map(
+    [...decision.positiveEvidence, ...decision.negativeEvidence].map(item => [item.id, item])
+  );
+  return expectedStages.every(([stageName, disposition]) => {
+    const stage = staged.stages.find(item => item.stage === stageName);
+    if (!stage || stage.disposition !== disposition || stage.evidenceIds.length === 0) return false;
+    return stage.evidenceIds.every(id => {
+      const evidence = evidenceById.get(id);
+      return !!evidence && !failedProviders.has(evidence.source);
+    });
+  });
+}
+
 export function enrichmentOperationalFailure(
   report: EvidenceCollectionReport,
-  isEnrichmentPass: boolean
+  isEnrichmentPass: boolean,
+  decisionReadyWithoutFailedProvider: boolean = false
 ): ProviderCallError | null {
-  if (!isEnrichmentPass || !report.degraded || report.sufficiency === 'SUFFICIENT') return null;
+  if (!isEnrichmentPass || !report.degraded || decisionReadyWithoutFailedProvider) return null;
   const providerFailures = report.providers
     .filter(provider => provider.availability === 'FAILED')
     .map(provider => ({
