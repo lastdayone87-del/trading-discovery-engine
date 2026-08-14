@@ -3,7 +3,6 @@ import pg from 'pg';
 import { getDb } from './db';
 import { recordProductionClassification, type ProductionClassificationDiagnosticInput } from './classificationDiagnostics';
 import { recordEvaluationGroundTruth, recordRetrievalEvaluationAssignment, type EvaluationGroundTruthInput, type SamplingPolicy } from './decisionEvaluation';
-import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 
 export const PHASE_B_OBSERVATION_OUTBOX_VERSION = 'phase-b-observation-outbox-v1';
 export type PhaseBObservationType = 'RETRIEVAL_ASSIGNMENT' | 'PRODUCTION_DIAGNOSTIC' | 'GROUND_TRUTH_LABEL';
@@ -38,6 +37,13 @@ const stable = (value: unknown): string => JSON.stringify(value, (_key, item) =>
     : item
 );
 const hash = (value: unknown): string => createHash('sha256').update(stable(value)).digest('hex');
+
+export function isValidRetrievalSamplingPolicy(policy: SamplingPolicy): boolean {
+  return !!String(policy?.policyKey || '').trim()
+    && !!String(policy?.salt || '').trim()
+    && Number.isInteger(policy?.version)
+    && Number(policy.version) > 0;
+}
 
 export function retrievalAssignmentObservationKey(payload: RetrievalAssignmentPayload): string {
   return `phase-b:assignment:${hash({ version: PHASE_B_OBSERVATION_OUTBOX_VERSION, ...payload })}`;
@@ -78,6 +84,35 @@ async function processObservation(observationKey: string): Promise<string | unde
       return prior.rows[0]?.result_reference || undefined;
     }
     payload = claimed.rows[0].payload as PhaseBObservationPayload;
+
+    // Re-validate queued retrieval assignments at execution time. This closes
+    // the rolling-deploy race where an old replica can enqueue a saltless or
+    // otherwise malformed assignment after the one-shot retirement migration
+    // has already run. Such rows are terminal audit skips, not retryable work.
+    if (payload.type === 'RETRIEVAL_ASSIGNMENT' && !isValidRetrievalSamplingPolicy(payload.policy)) {
+      await client.query(
+        `INSERT INTO phase_b_observation_retirements(
+           observation_key,observation_type,channel_id,payload,prior_status,
+           attempts,run_after,last_error,result_reference,created_at,updated_at,
+           completed_at,retirement_reason
+         )
+         SELECT observation_key,observation_type,channel_id,payload,status,
+                attempts,run_after,last_error,result_reference,created_at,updated_at,
+                completed_at,'INVALID_RETRIEVAL_SAMPLING_POLICY'
+           FROM phase_b_observation_outbox
+          WHERE observation_key=$1
+         ON CONFLICT(observation_key) DO NOTHING`,
+        [observationKey]
+      );
+      await client.query(
+        `DELETE FROM phase_b_observation_outbox
+          WHERE observation_key=$1 AND observation_type='RETRIEVAL_ASSIGNMENT' AND status<>'COMPLETED'`,
+        [observationKey]
+      );
+      await client.query('COMMIT');
+      return undefined;
+    }
+
     await client.query(`UPDATE phase_b_observation_outbox SET status='PROCESSING',attempts=attempts+1,last_error=NULL,updated_at=now() WHERE observation_key=$1`, [observationKey]);
     await client.query('COMMIT');
   } catch (error) {
@@ -128,11 +163,9 @@ export async function executePhaseBObservation(
 }
 
 export async function observeRetrievalAssignmentReliably(payload: RetrievalAssignmentPayload): Promise<string | undefined> {
-  // Sampling is an optional audit side-channel. If the deployment-specific salt
-  // is absent, fail closed before persisting or retrying an invalid assignment.
-  // Never invent a shared/default salt because that would couple cohorts across
-  // deployments and violate the evaluation-population contract.
-  if (!buildDecisionEvaluationSamplingPolicy(payload.policy.salt)) return undefined;
+  // Sampling is an optional audit side-channel. Invalid identity is terminal and
+  // must fail closed before persistence; no default salt is ever invented.
+  if (!isValidRetrievalSamplingPolicy(payload.policy)) return undefined;
   const observationKey = retrievalAssignmentObservationKey(payload);
   await captureObservation(observationKey, payload.input.channelId, payload);
   return processObservation(observationKey);
