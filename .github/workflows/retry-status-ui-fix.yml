@@ -1,0 +1,62 @@
+name: Clarify recoverable retry scan status
+
+on:
+  push:
+    branches:
+      - fix/remove-provider2-runtime
+    paths:
+      - .github/workflows/retry-status-ui-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remove-provider2-runtime
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Clarify recoverable FAILED display
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/components/ResultsTable.tsx')
+          s=p.read_text()
+          old="{c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status === 'ENRICHING' ? 'ENRICHING (Reclassifying)' : c.scan_status}"
+          new="{c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? 'RETRY REQUIRED' : c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status === 'ENRICHING' ? 'ENRICHING (Reclassifying)' : c.scan_status}"
+          assert old in s
+          p.write_text(s.replace(old,new))
+
+          t=Path('server/retryPendingUi.contract.test.ts')
+          ts=t.read_text()
+          needle="  assert.doesNotMatch(resultsTable,/Validation retry pending/);"
+          assert needle in ts
+          ts=ts.replace(needle,needle+"\n  assert.match(resultsTable,/discord_validation_status === 'RETRY_PENDING' && c\\.scan_status === 'FAILED' \\? 'RETRY REQUIRED'/);")
+          t.write_text(ts)
+          PY
+      - name: Install dependencies
+        run: npm ci
+      - name: Retry UI contract
+        run: node --import tsx --test server/retryPendingUi.contract.test.ts
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
+      - name: Commit UI clarification
+        shell: bash
+        run: |
+          rm -f .github/workflows/retry-status-ui-fix.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Clarify recoverable validation retry status'
+          git push origin HEAD:fix/remove-provider2-runtime
