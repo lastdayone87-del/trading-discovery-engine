@@ -5,9 +5,10 @@ import {
   failJob,
   finishQuotaReservation,
   getQueueStatus,
+  getYouTubeKeyPool,
   heartbeatJob
 } from './db';
-import { youtubeRequestScheduler } from './youtubeRequestScheduler';
+import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
@@ -23,8 +24,11 @@ const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
 export async function isRecoveryAdmissionOpen(): Promise<boolean> {
   const queue = await getQueueStatus();
   const productionBacklog = queue.searchJobs.depth + queue.channelProcessing.depth;
+  const providerKeys = getYouTubeKeyPool();
+  const providerPoolCooling = providerKeys.length === 0
+    || youtubeProviderCooldown.earliestRetryAtIfAllCooling(providerKeys) !== null;
   return productionBacklog <= RECOVERY_MAX_PRODUCTION_BACKLOG
-    && !youtubeRequestScheduler.isRateLimited();
+    && !providerPoolCooling;
 }
 
 let started = false;
