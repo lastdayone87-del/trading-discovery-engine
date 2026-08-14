@@ -20,6 +20,10 @@ test('retrieval sampling policy validation rejects malformed queued identities',
   assert.equal(isValidRetrievalSamplingPolicy(base), true);
   assert.equal(isValidRetrievalSamplingPolicy({ ...base, policyKey: '   ' }), false);
   assert.equal(isValidRetrievalSamplingPolicy({ ...base, salt: '   ' }), false);
+  assert.equal(isValidRetrievalSamplingPolicy({ ...base, policyKey: 123 as unknown as string }), false);
+  assert.equal(isValidRetrievalSamplingPolicy({ ...base, policyKey: true as unknown as string }), false);
+  assert.equal(isValidRetrievalSamplingPolicy({ ...base, salt: 123 as unknown as string }), false);
+  assert.equal(isValidRetrievalSamplingPolicy({ ...base, salt: false as unknown as string }), false);
   assert.equal(isValidRetrievalSamplingPolicy({ ...base, version: 0 }), false);
   assert.equal(isValidRetrievalSamplingPolicy({ ...base, version: '1' as unknown as number }), false);
 });
@@ -30,6 +34,8 @@ test('queued invalid retrieval assignments are retired before execution instead 
   const processingIndex = source.indexOf("status='PROCESSING'");
   assert.ok(validationIndex >= 0, 'queued retrieval assignments must be revalidated');
   assert.ok(processingIndex > validationIndex, 'invalid retrieval assignments must retire before PROCESSING/attempt increment');
+  assert.match(source, /typeof policy\?\.policyKey === 'string'/);
+  assert.match(source, /typeof policy\?\.salt === 'string'/);
   assert.match(source, /INSERT INTO phase_b_observation_retirements/);
   assert.match(source, /INVALID_RETRIEVAL_SAMPLING_POLICY/);
   assert.match(source, /DELETE FROM phase_b_observation_outbox/);
