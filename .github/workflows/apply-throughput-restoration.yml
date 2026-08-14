@@ -1,0 +1,92 @@
+name: Apply throughput restoration
+
+on:
+  push:
+    branches:
+      - fix/restore-pre203-throughput-semantics-v4
+    paths:
+      - .github/workflows/apply-throughput-restoration.yml
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/restore-pre203-throughput-semantics-v4
+          fetch-depth: 0
+
+      - name: Collect validated per-file diffs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/restore.patch
+
+          append_comment_diff() {
+            local id="$1"
+            gh api "repos/${GH_REPO}/issues/comments/${id}" --jq .body \
+              | sed '1{/^```diff$/d};${/^```$/d;}' >> /tmp/restore.patch
+            printf '\n' >> /tmp/restore.patch
+          }
+
+          # Stable exports from the same validated reconstruction.
+          append_comment_diff 5296957897  # queueManager.ts
+          append_comment_diff 5296967412  # operationalMaintenanceWorkers.ts
+          append_comment_diff 5296960149  # src/types/index.ts
+          append_comment_diff 5296980175  # restoration contract test
+          append_comment_diff 5296982146  # provider retry policy test
+          append_comment_diff 5296979506  # scheduler priority test
+
+          # The first db/youtube exports were internally inconsistent. Wait for
+          # the corrected exports that explicitly contain the missing contracts.
+          db_id=""
+          youtube_id=""
+          for _ in $(seq 1 90); do
+            comments="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments")"
+            db_id="$(printf '%s' "$comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
+            youtube_id="$(printf '%s' "$comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/youtube.ts")) and (.body|contains("onAdditionalQuota")))] | sort_by(.created_at) | last | .id // empty')"
+            if [[ -n "$db_id" && -n "$youtube_id" ]]; then break; fi
+            sleep 10
+          done
+
+          test -n "$db_id" || { echo "Corrected db.ts export never arrived"; exit 1; }
+          test -n "$youtube_id" || { echo "Corrected youtube.ts export never arrived"; exit 1; }
+          echo "Using corrected db.ts comment ${db_id}"
+          echo "Using corrected youtube.ts comment ${youtube_id}"
+          append_comment_diff "$db_id"
+          append_comment_diff "$youtube_id"
+
+          git apply --check /tmp/restore.patch
+          git apply /tmp/restore.patch
+          git diff --check
+
+      - name: Validate restoration
+        run: |
+          set -euo pipefail
+          node --import tsx --test \
+            server/pre203ThroughputRestoration.contract.test.ts \
+            server/youtubeRequestScheduler.test.ts \
+            server/youtube429SchedulerFeedback.test.ts \
+            server/quotaRecovery.test.ts \
+            server/operationalMaintenanceWorkers.test.ts \
+            server/providerRetryPolicy.test.ts
+          npm run lint
+          npm run build
+          git diff --check
+
+      - name: Commit validated implementation
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm .github/workflows/apply-throughput-restoration.yml
+          git add -A
+          git commit -m "Restore safe incremental YouTube throughput"
+          git push origin HEAD:fix/restore-pre203-throughput-semantics-v4
