@@ -24,7 +24,7 @@ export async function loadAdaptiveTerms(country:string):Promise<AdaptiveTerm[]>{
       AND (EXISTS(SELECT 1 FROM terminology_observations o WHERE o.surface_id=s.id AND o.human_approved=true)
         OR EXISTS(SELECT 1 FROM serving_catalog_entries e JOIN serving_catalog_versions v ON v.id=e.catalog_version_id WHERE v.status='APPROVED' AND lower(e.surface_text)=lower(s.literal) AND (e.country=$1 OR e.country='GLOBAL'))
         OR EXISTS(SELECT 1 FROM concept_moderation_decisions m WHERE m.action='APPROVE_SENSE' AND m.target_id=cs.id))
-    ORDER BY s.normalized,c.id`,[country]);
+    ORDER BY s.normalized,c.id::text`,[country]);
   return r.rows.map((x:any)=>({surfaceId:x.surface_id,conceptId:x.concept_id,literal:x.literal,normalized:x.normalized,conceptClass:x.concept_class,origin:x.origin,catalogVersion:x.catalog_version}));
 }
 

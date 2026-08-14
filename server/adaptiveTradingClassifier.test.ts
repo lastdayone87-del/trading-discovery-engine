@@ -31,3 +31,10 @@ test('governed rollout is explicit, reversible, and cannot bypass production-pos
   assert.match(reviews,/await client\.query\('COMMIT'\);[\s\S]*void recordAdaptiveShadowLabel/);
   assert.doesNotMatch(reviews,/await recordAdaptiveShadowLabel/);
 });
+
+test('adaptive term DISTINCT query orders by the projected concept id expression', () => {
+  const source = fs.readFileSync(new URL('./adaptiveTradingClassifier.ts', import.meta.url), 'utf8');
+  assert.match(source, /SELECT DISTINCT s\.id::text surface_id,c\.id::text concept_id/);
+  assert.match(source, /ORDER BY s\.normalized,c\.id::text/);
+  assert.doesNotMatch(source, /ORDER BY s\.normalized,c\.id`/);
+});
