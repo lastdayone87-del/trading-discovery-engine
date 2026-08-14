@@ -37,15 +37,17 @@ export class OperationalEnrichmentProviderError extends ProviderCallError {
 }
 
 /**
- * An enrichment pass may only advance evidentiary uncertainty when provider
- * coverage was actually observed. Operational degradation is infrastructure,
- * not ambiguity, so surface it as an attempt-free durable retry instead.
+ * Runtime provider degradation is only blocking when the remaining evidence is
+ * not sufficient to make a governed decision. The evidence engine deliberately
+ * treats optional-provider loss as observable-but-non-vetoing when independent
+ * evidence is already sufficient; retrying those cases turns a Gemini outage
+ * into a global enrichment outage.
  */
 export function enrichmentOperationalFailure(
   report: EvidenceCollectionReport,
   isEnrichmentPass: boolean
 ): ProviderCallError | null {
-  if (!isEnrichmentPass || !report.degraded) return null;
+  if (!isEnrichmentPass || !report.degraded || report.sufficiency === 'SUFFICIENT') return null;
   const providerFailures = report.providers
     .filter(provider => provider.availability === 'FAILED')
     .map(provider => ({
