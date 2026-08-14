@@ -15,6 +15,8 @@ test('legacy invalid retrieval assignments are durably retired from the active r
   assert.match(migration, /policyKey/);
   assert.match(migration, /'salt'/);
   assert.match(migration, /'version'/);
+  assert.match(migration, /jsonb_typeof\(o\.payload->'policy'->'policyKey'\) IS DISTINCT FROM 'string'/);
+  assert.match(migration, /jsonb_typeof\(o\.payload->'policy'->'salt'\) IS DISTINCT FROM 'string'/);
   assert.match(migration, /jsonb_typeof\(o\.payload->'policy'->'version'\) = 'number'/);
   assert.match(migration, /::numeric <= 0/);
   assert.match(migration, /trunc\(\(o\.payload->'policy'->>'version'\)::numeric\)/);
