@@ -17,14 +17,17 @@ const activeProvider2Symbols = [
   'fetchYouTubeChannelEnrichmentQuotaFree'
 ];
 
-test('Provider2 is physically absent from active YouTube runtime', () => {
+test('Provider2 is physically absent from active YouTube runtime and tooling', () => {
   for (const symbol of activeProvider2Symbols) {
     assert.equal(queueManager.includes(symbol), false, `queueManager still contains ${symbol}`);
     assert.equal(youtube.includes(symbol), false, `youtube runtime still contains ${symbol}`);
   }
   assert.equal(existsSync(new URL('./youtubeInnerTubeProvider.ts', import.meta.url)), false);
   assert.equal(existsSync(new URL('./youtubeInnerTubeEnrichment.ts', import.meta.url)), false);
+  assert.equal(existsSync(new URL('../scripts/youtubeProviderBakeoff.ts', import.meta.url)), false);
+  assert.equal(existsSync(new URL('../.github/workflows/youtube-provider-bakeoff.yml', import.meta.url)), false);
   assert.equal(pkg.dependencies?.['youtubei.js'], undefined);
+  assert.equal(pkg.scripts?.['youtube:provider-bakeoff'], undefined);
 });
 
 test('durable autonomous discovery is official API only', () => {
