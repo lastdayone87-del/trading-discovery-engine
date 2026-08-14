@@ -54,7 +54,11 @@ export class YouTubeProviderCooldown {
     const state = this.providers.get(key);
     if (!state) return true;
     if ((this.options.now ?? Date.now)() < state.retryAt) return false;
-    this.providers.delete(key);
+    // Preserve RATE_LIMITED history after the provider becomes eligible again so
+    // another immediate 429 continues the provider-local exponential sequence.
+    // A successful call clears this history via succeeded(). Daily quota state is
+    // different: once the Pacific quota day rolls over, the exhaustion is stale.
+    if (state.kind === 'DAILY_QUOTA_EXHAUSTED') this.providers.delete(key);
     return true;
   }
 
@@ -67,7 +71,7 @@ export class YouTubeProviderCooldown {
       return retryAt;
     }
     const initial = Math.max(1, this.options.initialRateLimitCooldownMs);
-    const cooldown = previous?.rateLimitCooldownMs
+    const cooldown = previous?.kind === 'RATE_LIMITED' && previous.rateLimitCooldownMs
       ? Math.min(Math.max(initial, this.options.maxRateLimitCooldownMs), previous.rateLimitCooldownMs * 2)
       : initial;
     const retryAt = now + cooldown;
@@ -95,9 +99,13 @@ export class YouTubeProviderCooldown {
 
 export class YouTubeProvidersCoolingDownError extends Error {
   readonly code = 'YOUTUBE_PROVIDERS_COOLING_DOWN';
+  readonly retryable = true;
+  readonly errorClass = 'RATE_LIMIT';
+  readonly retryAfterMs: number;
   constructor(public readonly retryAt: number) {
     super(`Every configured YouTube provider is cooling down; retry is scheduled for ${new Date(retryAt).toISOString()}.`);
     this.name = 'YouTubeProvidersCoolingDownError';
+    this.retryAfterMs = Math.max(0, retryAt - Date.now());
   }
 }
 
