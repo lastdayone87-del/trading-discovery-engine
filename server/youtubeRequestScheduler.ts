@@ -8,6 +8,7 @@ export interface YouTubeRequestSchedulerOptions {
   minIntervalMs: number;
   initialRateLimitBackoffMs: number;
   maxRateLimitBackoffMs: number;
+  starvationMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -24,6 +25,7 @@ interface QueuedRequest<T> {
   trace?: (stage: string) => void;
   priority: YouTubeRequestPriority;
   sequence: number;
+  enqueuedAt: number;
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
 }
@@ -47,6 +49,12 @@ function isRuntimeYouTubeRateLimit(error: unknown): boolean {
  * YouTube applies request-rate limits independently from daily project quota.
  * Serialize requests from this runtime so concurrent workers and paired metadata
  * lookups cannot present one shared egress identity as a bursty client.
+ *
+ * Manual requests keep their explicit fast-path priority, but all other lanes
+ * become FIFO once they have waited beyond the starvation ceiling. This restores
+ * the pre-priority scheduler's fairness property while retaining responsive
+ * operator-triggered searches. In particular, a continuous autonomous search
+ * stream can no longer indefinitely sit ahead of enrichment backlog work.
  */
 export class YouTubeRequestScheduler {
   private readonly queue: QueuedRequest<unknown>[] = [];
@@ -68,14 +76,10 @@ export class YouTubeRequestScheduler {
         trace,
         priority,
         sequence: this.sequence++,
+        enqueuedAt: (this.options.now ?? Date.now)(),
         resolve,
         reject
       });
-      this.queue.sort(
-        (left, right) =>
-          PRIORITY[left.priority] - PRIORITY[right.priority]
-          || left.sequence - right.sequence
-      );
       void this.processQueue();
     });
   }
@@ -89,27 +93,58 @@ export class YouTubeRequestScheduler {
     return this.isRateLimited() ? this.nextStartAt : null;
   }
 
+  private takeNextRequest(): QueuedRequest<unknown> | undefined {
+    if (!this.queue.length) return undefined;
+    const now = (this.options.now ?? Date.now)();
+    const starvationMs = Math.max(0, this.options.starvationMs ?? 2_000);
+
+    const manual = this.queue
+      .filter(request => request.priority === 'manual')
+      .sort((left, right) => left.sequence - right.sequence)[0];
+    if (manual) {
+      this.queue.splice(this.queue.indexOf(manual), 1);
+      return manual;
+    }
+
+    const starved = this.queue
+      .filter(request => now - request.enqueuedAt >= starvationMs)
+      .sort((left, right) => left.sequence - right.sequence)[0];
+    if (starved) {
+      this.queue.splice(this.queue.indexOf(starved), 1);
+      return starved;
+    }
+
+    const prioritized = [...this.queue].sort(
+      (left, right) =>
+        PRIORITY[left.priority] - PRIORITY[right.priority]
+        || left.sequence - right.sequence
+    )[0];
+    this.queue.splice(this.queue.indexOf(prioritized), 1);
+    return prioritized;
+  }
+
   private async processQueue(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
 
     try {
       while (this.queue.length) {
-        const request = this.queue.shift()!;
+        const request = this.takeNextRequest();
+        if (!request) break;
         request.trace?.('scheduler-tail-released');
 
         const now = (this.options.now ?? Date.now)();
         const waitMs = Math.max(0, this.nextStartAt - now);
         if (waitMs) {
           request.trace?.(
-            `before scheduler-delay (${waitMs}ms) at server/youtubeRequestScheduler.ts:76`
+            `before scheduler-delay (${waitMs}ms) at server/youtubeRequestScheduler.ts:118`
           );
           await (
             this.options.sleep
             ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
           )(waitMs);
           request.trace?.(
-            'after scheduler-delay at server/youtubeRequestScheduler.ts:76'
+            'after scheduler-delay at server/youtubeRequestScheduler.ts:118'
           );
         }
 
@@ -117,14 +152,14 @@ export class YouTubeRequestScheduler {
           (this.options.now ?? Date.now)()
           + Math.max(0, this.options.minIntervalMs);
         request.trace?.(
-          'before scheduled-call at server/youtubeRequestScheduler.ts:88'
+          'before scheduled-call at server/youtubeRequestScheduler.ts:130'
         );
 
         try {
           const value = await request.call();
           this.succeeded();
           request.trace?.(
-            'after scheduled-call at server/youtubeRequestScheduler.ts:88'
+            'after scheduled-call at server/youtubeRequestScheduler.ts:130'
           );
           request.resolve(value);
         } catch (error) {
@@ -177,5 +212,9 @@ export const youtubeRequestScheduler = new YouTubeRequestScheduler({
   maxRateLimitBackoffMs: nonNegativeNumber(
     process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS,
     5 * 60_000
+  ),
+  starvationMs: nonNegativeNumber(
+    process.env.YOUTUBE_SCHEDULER_STARVATION_MS,
+    2_000
   )
 });
