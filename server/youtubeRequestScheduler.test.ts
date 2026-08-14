@@ -22,7 +22,7 @@ test('serializes concurrent outbound calls and spaces their starts', async () =>
   assert.deepEqual(starts, [0, 100, 200]);
 });
 
-test('applies shared exponential cooldown after provider rate limiting', async () => {
+test('applies shared exponential cooldown automatically after provider rate limiting', async () => {
   let now = 0;
   const starts: number[] = [];
   const scheduler = new YouTubeRequestScheduler({
@@ -32,10 +32,13 @@ test('applies shared exponential cooldown after provider rate limiting', async (
     now: () => now,
     sleep: async ms => { now += ms; }
   });
-  await scheduler.run(async () => { starts.push(now); });
-  scheduler.rateLimited();
-  await scheduler.run(async () => { starts.push(now); });
-  scheduler.rateLimited();
+  const rateLimit = () => Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), {
+    status: 429,
+    providerReasons: ['rateLimitExceeded'],
+    quotaExceeded: false
+  });
+  await assert.rejects(scheduler.run(async () => { starts.push(now); throw rateLimit(); }));
+  await assert.rejects(scheduler.run(async () => { starts.push(now); throw rateLimit(); }));
   await scheduler.run(async () => { starts.push(now); });
   assert.deepEqual(starts, [0, 500, 1_300]);
 });
