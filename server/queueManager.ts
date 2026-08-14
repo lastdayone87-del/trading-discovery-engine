@@ -21,6 +21,7 @@ import {
   heartbeatJob,
   recordQueryRunSightings,
   getDailyYouTubeQuotaBudget,
+  getYouTubeKeyPool,
   appendDiscordCheckAttempts,
   countDiscordInvalidObservations,
   appendExternalAcquisitionObservations
@@ -29,7 +30,7 @@ import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
-import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelEnrichmentQuotaFree, DiscoveredChannelRaw, RetrievalLane } from './youtube';
+import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
@@ -56,7 +57,6 @@ import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
-import { discoverWithInnerTube, nextInnerTubeLane, type InnerTubeDiscoveryLane } from './youtubeInnerTubeProvider';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -154,8 +154,8 @@ export async function processNextSearchJob(
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('POST_APPROVAL_ENRICH'))) claimableTypes.push('POST_APPROVAL_ENRICH');
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('FORCE_REVIEW_RESCAN'))) claimableTypes.push('FORCE_REVIEW_RESCAN');
+  if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
+  if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
   if (!qStatus.discordValidation.isPaused && (!claimableOverride || claimableOverride.includes('RETRY_COMMUNITY_ACQUISITION'))) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
   if(!claimableOverride||claimableOverride.includes('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER')){const db=await getDb();const c=await db.query(`SELECT 1 FROM external_provider_adapter_controls WHERE mode IN('CANARY','ACTIVE') AND NOT paused AND NOT kill_switch LIMIT 1`);if(c.rowCount)claimableTypes.push('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_PLAYLIST')){const db=await getDb();const c=await db.query(`SELECT mode,paused,kill_switch FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_PLAYLIST'`);if(c.rows[0]?.mode==='CANARY'&&!c.rows[0].paused&&!c.rows[0].kill_switch)claimableTypes.push('INSPECT_PLAYLIST');}
@@ -266,28 +266,11 @@ export async function processNextSearchJob(
       await upsertChannel(channel);
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
-      const hybridEnrichmentEnabled=await getAppSetting('youtube_js_hybrid_enrichment_enabled',process.env.YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED||'false')==='true';
-      // If country attribution is already independently CONFIRMED, the expensive
-      // creator-evidence portion can proceed entirely through YouTube.js. Official
-      // channels.list remains required for unresolved country attribution and for
-      // manual authoritative refreshes, but exhausted official quota must not freeze
-      // confirmed-country creator evidence acquisition.
-      if(hybridEnrichmentEnabled&&channel.country_status==='CONFIRMED'){
-        try {
-          const enriched=await fetchYouTubeChannelEnrichmentQuotaFree(channelId,candidate,enrichmentStage);
-          const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true);
-          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
-          if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus,quotaFreeHybrid:true}});else await completeJob(job.id);
-          return true;
-        } catch(error){
-          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'FAILED',providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'PROVIDER_OR_PIPELINE_FAILURE'}).catch(()=>undefined);
-          throw error;
-        }
-      }
-      const enrichmentQuotaUnits=hybridEnrichmentEnabled?1:(enrichmentStage>=2?202:101);
+      const enrichmentQuotaUnits=enrichmentStage>=2?202:101;
+      const enrichmentReservationUnits=enrichmentQuotaUnits*Math.max(1,getYouTubeKeyPool().length);
       const quotaReserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL', operationId: job.id, allocation: 'ENRICHMENT',
-        units: enrichmentQuotaUnits, dailyBudget, allocationPercent: enrichmentPercent
+        units: enrichmentReservationUnits, dailyBudget, allocationPercent: enrichmentPercent
       });
       if (!quotaReserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
       try {
@@ -304,8 +287,8 @@ export async function processNextSearchJob(
       return true;
     }
 
-    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null, innerTubeLane = 'MONTH' } = job.payload as {
-      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null; innerTubeLane?:InnerTubeDiscoveryLane;
+    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null } = job.payload as {
+      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null;
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
@@ -314,21 +297,15 @@ export async function processNextSearchJob(
     if (queryRunId) await startQueryRun(queryRunId);
     if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
 
-    // Only durable autonomous query runs are eligible for quota-free InnerTube
-    // discovery. Manual/operator searches keep the official Data API path.
-    const innerTubeEnabled = !!queryRunId && await getAppSetting('youtube_inner_tube_autonomous_enabled', process.env.YOUTUBE_INNERTUBE_AUTONOMOUS_ENABLED || 'false') === 'true';
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
     let providerQuotaUnits = 0;
     let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null } | null = null;
-    if (queryRunId && innerTubeEnabled) {
-      const maxProviderPages=Math.max(1,Math.min(3,Number(await getAppSetting('youtube_inner_tube_pages_per_lane',process.env.YOUTUBE_INNERTUBE_PAGES_PER_LANE||'2'))));
-      const result=await discoverWithInnerTube(query,{lane:innerTubeLane,maxPages:maxProviderPages,maxChannels:100,telemetry:{requestId:traceId||undefined,runId:queryRunId,jobId:job.id,attempt:job.attempts}});
-      searchPage={channels:result.channels,rawResultCount:result.rawCandidateCount,nextPageToken:null};
-    } else if (queryRunId) {
+    if (queryRunId) {
       providerQuotaUnits=100;
+      const providerReservationUnits=providerQuotaUnits*Math.max(1,getYouTubeKeyPool().length);
       const budget=getDailyYouTubeQuotaBudget();
       const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
-      if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
+      if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerReservationUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
       try {
         searchPage=await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering);
         await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
@@ -373,16 +350,13 @@ export async function processNextSearchJob(
       const prior=await getAutonomousContinuationState(queryRunId);
       const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
       const enabled=await getAppSetting('autonomous_pagination_enabled','true')==='true';
-      const allowDefaultInnerTube=await getAppSetting('youtube_inner_tube_default_backfill_enabled',process.env.YOUTUBE_INNERTUBE_DEFAULT_BACKFILL_ENABLED||'false')==='true';
-      const nextLane=innerTubeEnabled?nextInnerTubeLane(innerTubeLane,decision.lowYield,allowDefaultInnerTube):null;
-      const stoppingReason=nextLane?null:decision.shouldContinue?null:decision.primaryReason;
+      const stoppingReason=decision.shouldContinue?null:decision.primaryReason;
       const pageObservation={queryRunId,pageNumber,inputPageToken:pageToken,nextPageToken:searchPage?.nextPageToken||null,retrievalLane,searchOrdering,rawResultCount:metrics.rawResults,distinctCreatorCount:metrics.distinctResults,knownCreators:metrics.knownChannels,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,averageQualityScore:metrics.averageQualityScore,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,noveltyRatio:metrics.noveltyRatio,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,quotaUnits:providerQuotaUnits,decision,stoppingReason,pageMetrics:metrics};
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
-      if(enabled&&innerTubeEnabled&&nextLane){await enqueueJob('SEARCH_YOUTUBE',{...job.payload,pageNumber:pageNumber+1,pageToken:null,innerTubeLane:nextLane},{priority:20,maxAttempts:3,idempotencyKey:`search-run:${queryRunId}:page:${pageNumber+1}:youtube-js:${nextLane.toLowerCase()}`});await completeJob(job.id);return true;}
-      if(enabled&&!innerTubeEnabled&&decision.shouldContinue&&searchPage?.nextPageToken){await enqueueJob('SEARCH_YOUTUBE',{...job.payload,pageNumber:pageNumber+1,pageToken:searchPage.nextPageToken},{priority:20,maxAttempts:3,idempotencyKey:`search-run:${queryRunId}:page:${pageNumber+1}`});await completeJob(job.id);return true;}
+      if(enabled&&decision.shouldContinue&&searchPage?.nextPageToken){await enqueueJob('SEARCH_YOUTUBE',{...job.payload,pageNumber:pageNumber+1,pageToken:searchPage.nextPageToken},{priority:20,maxAttempts:3,idempotencyKey:`search-run:${queryRunId}:page:${pageNumber+1}`});await completeJob(job.id);return true;}
       const finalMetrics=await getAutonomousRunMetrics(queryRunId);
-      const quotaConsumed=innerTubeEnabled?0:pageNumber*100;
+      const quotaConsumed=pageNumber*100;
       const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed });
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
@@ -396,7 +370,7 @@ export async function processNextSearchJob(
         channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
         quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
         cycle_quality_score: performance.performanceScore,
-        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via ${innerTubeEnabled ? `YOUTUBE_JS/${innerTubeLane}` : 'YOUTUBE_DATA_API'}.`, `Funnel: ${JSON.stringify(metrics)}`]
+        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via YOUTUBE_DATA_API.`, `Funnel: ${JSON.stringify(metrics)}`]
       });
     }
     await completeJob(job.id);
