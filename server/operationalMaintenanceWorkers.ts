@@ -16,6 +16,7 @@ const COMMUNITY_RETRY_TYPES: ClaimableOverride = ['RETRY_COMMUNITY_ACQUISITION']
 const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORCE_REVIEW_RESCAN'];
 const PROVIDER2_RECOVERY_JOB = 'PROVIDER2_FALSE_NEGATIVE_RESCAN';
 const OFFICIAL_RECHECK_UNITS = 101;
+const QUOTA_BACKOFF_MS = 30_000;
 
 let started = false;
 
@@ -54,17 +55,23 @@ function startOfficialRecheckWorker(workerId: string): void {
   const tick = async () => {
     const operationId = `${workerId}:${Date.now()}`;
     let reserved = false;
+    let nextDelayMs = 1000;
     try {
       reserved = await reserveOfficialRecheck(operationId);
-      if (!reserved) return;
+      if (!reserved) {
+        nextDelayMs = QUOTA_BACKOFF_MS;
+        return;
+      }
       const processed = await processNextSearchJob(OFFICIAL_RECHECK_TYPES, workerId);
       await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, processed);
       reserved = false;
     } catch (error) {
       if (reserved) await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, false).catch(() => undefined);
+      reserved = false;
+      nextDelayMs = QUOTA_BACKOFF_MS;
       console.error(`[Queue Worker:${workerId}] Official recheck tick failed:`, error);
     } finally {
-      schedule(tick, reserved ? 30_000 : 1000);
+      schedule(tick, nextDelayMs);
     }
   };
   void tick();
@@ -76,11 +83,15 @@ function startProvider2RecoveryWorker(workerId: string): void {
     let reserved = false;
     let claimedJobId: string | undefined;
     let heartbeat: NodeJS.Timeout | undefined;
+    let nextDelayMs = 1000;
     try {
       // Reserve before claiming so a recovery job never becomes PROCESSING when
       // the production ENRICHMENT allocation cannot pay for its 100+1 requests.
       reserved = await reserveOfficialRecheck(operationId);
-      if (!reserved) return;
+      if (!reserved) {
+        nextDelayMs = QUOTA_BACKOFF_MS;
+        return;
+      }
 
       const job = await claimNextJob(workerId, [PROVIDER2_RECOVERY_JOB]);
       if (!job) {
@@ -108,10 +119,12 @@ function startProvider2RecoveryWorker(workerId: string): void {
     } catch (error) {
       if (claimedJobId) await failJob(claimedJobId, error).catch(() => undefined);
       if (reserved) await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, false).catch(() => undefined);
+      reserved = false;
+      nextDelayMs = QUOTA_BACKOFF_MS;
       console.error(`[Queue Worker:${workerId}] Provider2 false-negative recovery tick failed:`, error);
     } finally {
       if (heartbeat) clearInterval(heartbeat);
-      schedule(tick, reserved ? 30_000 : 1000);
+      schedule(tick, nextDelayMs);
     }
   };
   void tick();
