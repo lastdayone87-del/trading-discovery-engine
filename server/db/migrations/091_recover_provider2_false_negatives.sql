@@ -9,9 +9,10 @@
 -- Only the latest incident-window diagnostic for a channel is considered.
 -- A row is eligible only when the machine decision is NON_TRADING and the
 -- diagnostic is suspicious because evidence was degraded/insufficient, the
--- creator-level input was exceptionally thin, or positive trading evidence was
--- present despite the terminal negative decision. At most 25 channels are
--- queued, at low priority, staggered to protect official YouTube quota.
+-- creator-level input was exceptionally thin, or persisted evidence contains a
+-- contradictory POSITIVE trading item. At most 25 channels are queued. A
+-- dedicated recovery worker reserves 101 ENRICHMENT quota units before claiming
+-- each job, so this migration itself cannot bypass production quota allocation.
 
 WITH latest_incident_diagnostic AS (
   SELECT DISTINCT ON (d.channel_id)
@@ -19,11 +20,16 @@ WITH latest_incident_diagnostic AS (
     d.created_at AS diagnostic_created_at,
     d.enrichment_stage,
     d.normalized_input,
+    d.evidence_items,
     d.decision,
     (
       CASE WHEN COALESCE((d.decision->'evidenceCollection'->>'degraded')::boolean, false) THEN 8 ELSE 0 END
       + CASE WHEN COALESCE(d.decision->'evidenceCollection'->>'sufficiency', 'MISSING') IN ('MISSING','INSUFFICIENT') THEN 6 ELSE 0 END
-      + CASE WHEN COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(d.decision->'positiveEvidence')='array' THEN d.decision->'positiveEvidence' ELSE '[]'::jsonb END), 0) > 0 THEN 5 ELSE 0 END
+      + CASE WHEN EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(CASE WHEN jsonb_typeof(d.evidence_items)='array' THEN d.evidence_items ELSE '[]'::jsonb END) item
+          WHERE item->>'polarity' = 'POSITIVE'
+        ) THEN 5 ELSE 0 END
       + CASE WHEN COALESCE(length(trim(d.normalized_input->>'description')), 0) = 0
           AND COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(d.normalized_input->'video_titles')='array' THEN d.normalized_input->'video_titles' ELSE '[]'::jsonb END), 0) <= 1
         THEN 4 ELSE 0 END
@@ -63,9 +69,9 @@ INSERT INTO jobs(
   idempotency_key, created_at, updated_at
 )
 SELECT
-  'FORCE_REVIEW_RESCAN',
+  'PROVIDER2_FALSE_NEGATIVE_RESCAN',
   'PENDING',
-  5,
+  0,
   jsonb_build_object(
     'channelId', channel_id,
     'incidentRecovery', 'provider2_false_negative_v1',
@@ -75,7 +81,11 @@ SELECT
     'reasonCodes', jsonb_strip_nulls(jsonb_build_object(
       'providerDegraded', CASE WHEN COALESCE((decision->'evidenceCollection'->>'degraded')::boolean, false) THEN true ELSE NULL END,
       'evidenceSufficiency', CASE WHEN COALESCE(decision->'evidenceCollection'->>'sufficiency','MISSING') IN ('MISSING','INSUFFICIENT') THEN COALESCE(decision->'evidenceCollection'->>'sufficiency','MISSING') ELSE NULL END,
-      'positiveEvidenceCount', CASE WHEN jsonb_typeof(decision->'positiveEvidence')='array' THEN jsonb_array_length(decision->'positiveEvidence') ELSE 0 END,
+      'positiveEvidenceCount', (
+        SELECT count(*)::int
+        FROM jsonb_array_elements(CASE WHEN jsonb_typeof(evidence_items)='array' THEN evidence_items ELSE '[]'::jsonb END) item
+        WHERE item->>'polarity' = 'POSITIVE'
+      ),
       'thinCreatorInput', CASE WHEN COALESCE(length(trim(normalized_input->>'description')), 0) = 0
         AND COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(normalized_input->'video_titles')='array' THEN normalized_input->'video_titles' ELSE '[]'::jsonb END), 0) <= 1 THEN true ELSE NULL END
     ))
