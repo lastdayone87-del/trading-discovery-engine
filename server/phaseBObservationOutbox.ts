@@ -39,8 +39,10 @@ const stable = (value: unknown): string => JSON.stringify(value, (_key, item) =>
 const hash = (value: unknown): string => createHash('sha256').update(stable(value)).digest('hex');
 
 export function isValidRetrievalSamplingPolicy(policy: SamplingPolicy): boolean {
-  return !!String(policy?.policyKey || '').trim()
-    && !!String(policy?.salt || '').trim()
+  return typeof policy?.policyKey === 'string'
+    && policy.policyKey.trim().length > 0
+    && typeof policy?.salt === 'string'
+    && policy.salt.trim().length > 0
     && Number.isInteger(policy?.version)
     && Number(policy.version) > 0;
 }
