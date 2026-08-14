@@ -1,0 +1,27 @@
+name: Provider2 final restoration validation
+
+on:
+  push:
+    branches:
+      - fix/remove-provider2-runtime
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Focused restoration contracts
+        run: node --import tsx --test server/provider2Removal.contract.test.ts server/provider2FalseNegativeRecovery.test.ts server/operationalMaintenanceWorkers.test.ts server/officialEnrichmentQuotaAccounting.test.ts server/retryPendingUi.contract.test.ts
+      - name: Full test suite
+        run: npm test
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
+      - name: Diff check
+        run: git diff --check
