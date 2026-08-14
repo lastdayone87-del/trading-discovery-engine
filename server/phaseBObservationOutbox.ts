@@ -3,6 +3,7 @@ import pg from 'pg';
 import { getDb } from './db';
 import { recordProductionClassification, type ProductionClassificationDiagnosticInput } from './classificationDiagnostics';
 import { recordEvaluationGroundTruth, recordRetrievalEvaluationAssignment, type EvaluationGroundTruthInput, type SamplingPolicy } from './decisionEvaluation';
+import { buildDecisionEvaluationSamplingPolicy } from './decisionEvaluationSamplingPolicy';
 
 export const PHASE_B_OBSERVATION_OUTBOX_VERSION = 'phase-b-observation-outbox-v1';
 export type PhaseBObservationType = 'RETRIEVAL_ASSIGNMENT' | 'PRODUCTION_DIAGNOSTIC' | 'GROUND_TRUTH_LABEL';
@@ -127,6 +128,11 @@ export async function executePhaseBObservation(
 }
 
 export async function observeRetrievalAssignmentReliably(payload: RetrievalAssignmentPayload): Promise<string | undefined> {
+  // Sampling is an optional audit side-channel. If the deployment-specific salt
+  // is absent, fail closed before persisting or retrying an invalid assignment.
+  // Never invent a shared/default salt because that would couple cohorts across
+  // deployments and violate the evaluation-population contract.
+  if (!buildDecisionEvaluationSamplingPolicy(payload.policy.salt)) return undefined;
   const observationKey = retrievalAssignmentObservationKey(payload);
   await captureObservation(observationKey, payload.input.channelId, payload);
   return processObservation(observationKey);
