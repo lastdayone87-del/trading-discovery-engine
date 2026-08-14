@@ -21,7 +21,7 @@ import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type Ev
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
-import { enrichmentOperationalFailure } from './enrichmentOperationalFailure';
+import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders } from './enrichmentOperationalFailure';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
@@ -235,7 +235,12 @@ export async function processChannelThroughPipeline(
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
-  const enrichmentProviderFailure=enrichmentOperationalFailure(productionClassification.decision.evidenceCollection,isEnrichmentPass);
+  const decisionReadyWithoutFailedProvider=hasDecisionGradeEvidenceWithoutFailedProviders(productionClassification.decision);
+  const enrichmentProviderFailure=enrichmentOperationalFailure(
+    productionClassification.decision.evidenceCollection,
+    isEnrichmentPass,
+    decisionReadyWithoutFailedProvider
+  );
   if(enrichmentProviderFailure) throw enrichmentProviderFailure;
   if (source === 'recheck' && isManualScan && productionClassification.decision.evidenceCollection.degraded) {
     const failedProviders = productionClassification.decision.evidenceCollection.providers.filter(provider => provider.availability === 'FAILED');
