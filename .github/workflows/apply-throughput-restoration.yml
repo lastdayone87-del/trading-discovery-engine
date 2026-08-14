@@ -32,7 +32,7 @@ jobs:
           append_comment_diff() {
             local id="$1"
             gh api "repos/${GH_REPO}/issues/comments/${id}" --jq .body \
-              | sed '1{/^```diff$/d};${/^```$/d;}' >> /tmp/restore.patch
+              | awk '/^```diff$/{capture=1;next} /^```$/{if(capture)exit} capture' >> /tmp/restore.patch
             printf '\n' >> /tmp/restore.patch
           }
 
@@ -45,20 +45,12 @@ jobs:
           append_comment_diff 5296982146  # provider retry policy test
           append_comment_diff 5296979506  # scheduler priority test
 
-          # Wait for corrected follow-ups that complete the missing atomic top-up
-          # and make youtube.ts agree with queueManager's callback contract.
-          db_id=""
-          youtube_id=""
-          for _ in $(seq 1 90); do
-            comments="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments")"
-            db_id="$(printf '%s' "$comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("export async function topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
-            youtube_id="$(printf '%s' "$comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/youtube.ts")) and (.body|contains("onAdditionalQuota")))] | sort_by(.created_at) | last | .id // empty')"
-            if [[ -n "$db_id" && -n "$youtube_id" ]]; then break; fi
-            sleep 10
-          done
-
-          test -n "$db_id" || { echo "Corrected db.ts export never arrived"; exit 1; }
-          test -n "$youtube_id" || { echo "Corrected youtube.ts export never arrived"; exit 1; }
+          # Corrected follow-ups that complete the missing atomic top-up and
+          # make youtube.ts agree with queueManager's callback contract.
+          db_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/db.ts")) and (.body|contains("export async function topUpQuotaReservation")))] | sort_by(.created_at) | last | .id // empty')"
+          youtube_id="$(gh api --paginate "repos/${GH_REPO}/issues/234/comments" | jq -r '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and (.body|contains("diff --git a/server/youtube.ts")) and (.body|contains("onAdditionalQuota")))] | sort_by(.created_at) | last | .id // empty')"
+          test -n "$db_id" || { echo "Corrected db.ts export unavailable"; exit 1; }
+          test -n "$youtube_id" || { echo "Corrected youtube.ts export unavailable"; exit 1; }
           echo "Using corrected db.ts comment ${db_id}"
           echo "Using corrected youtube.ts comment ${youtube_id}"
           append_comment_diff "$db_id"
