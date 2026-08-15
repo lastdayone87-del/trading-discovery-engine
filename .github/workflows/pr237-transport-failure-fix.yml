@@ -1,5 +1,8 @@
 name: PR237 transport failure fix
 on:
+  push:
+    branches: [fix/restore-per-provider-429-failover]
+    paths: [.github/workflows/pr237-transport-failure-fix.yml]
   workflow_dispatch:
 permissions:
   contents: write
@@ -37,7 +40,6 @@ jobs:
           if old not in s:
               raise SystemExit('youtube fetch target not found')
           p.write_text(s.replace(old,new,1))
-
           p=Path('server/youtubeRequestScheduler.test.ts')
           s=p.read_text()
           anchor="""test('provider-loop requests carry the selected API key into scheduler dispatch', () => {"""
