@@ -11,7 +11,7 @@ BEGIN
     ) THEN
       NEW.trading_status := 'UNCERTAIN';
       NEW.scan_status := CASE
-        WHEN OLD.scan_status = 'ENRICHING' THEN 'FAILED'
+        WHEN TG_OP = 'UPDATE' AND OLD.scan_status = 'ENRICHING' THEN 'FAILED'
         ELSE 'COMPLETED'
       END;
     END IF;
@@ -21,7 +21,7 @@ END $$;
 
 DROP TRIGGER IF EXISTS channels_authoritative_needs_review ON channels;
 CREATE TRIGGER channels_authoritative_needs_review
-BEFORE UPDATE ON channels
+BEFORE INSERT OR UPDATE ON channels
 FOR EACH ROW EXECUTE FUNCTION enforce_authoritative_needs_review();
 
 -- Clean up legacy operational review debt only when there is no durable human
