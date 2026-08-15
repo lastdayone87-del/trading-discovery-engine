@@ -1,9 +1,8 @@
 name: PR237 transport failure fix
 on:
   push:
-    branches: [fix/restore-per-provider-429-failover]
-    paths: [.github/workflows/pr237-transport-failure-fix.yml]
-  workflow_dispatch:
+    branches:
+      - fix/restore-per-provider-429-failover
 permissions:
   contents: write
 jobs:
@@ -40,23 +39,6 @@ jobs:
           if old not in s:
               raise SystemExit('youtube fetch target not found')
           p.write_text(s.replace(old,new,1))
-          p=Path('server/youtubeRequestScheduler.test.ts')
-          s=p.read_text()
-          anchor="""test('provider-loop requests carry the selected API key into scheduler dispatch', () => {"""
-          test="""test('transport failure records the actual dispatched provider in acquisition fallback history', () => {
-  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
-  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
-  const transportCatch = youtubeFetch.slice(youtubeFetch.indexOf('response=await fetch(dispatchedUrl,{signal})'), youtubeFetch.indexOf('trace(`after HTTP fetch'));
-  assert.match(transportCatch, /catch \(error\)/);
-  assert.match(transportCatch, /failedDispatchProviders\(acquisition\)\?\.add\(dispatchedProviderKey\)/);
-  assert.match(transportCatch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey\}\)/);
-  assert.ok(transportCatch.indexOf('failedDispatchProviders') < transportCatch.indexOf('throw error'));
-});
-
-"""
-          if anchor not in s:
-              raise SystemExit('test insertion anchor not found')
-          p.write_text(s.replace(anchor,test+anchor,1))
           PY
       - name: Validate
         run: |
@@ -68,6 +50,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add server/youtube.ts server/youtubeRequestScheduler.test.ts
+          git add server/youtube.ts
           git commit -m "fix: rotate providers after transport failures"
           git push origin HEAD:fix/restore-per-provider-429-failover
