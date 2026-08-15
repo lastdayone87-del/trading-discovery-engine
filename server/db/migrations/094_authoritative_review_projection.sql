@@ -1,4 +1,9 @@
 -- Phase 1: NEEDS_REVIEW is a semantic serving state, not an operational fallback.
+-- Release 4 deliberately constrained this ledger to shadow-only decisions.
+-- Phase 1 promotes the same immutable ledger to serving authority.
+ALTER TABLE review_eligibility_decisions
+  DROP CONSTRAINT IF EXISTS review_eligibility_decisions_serving_authority_check;
+
 -- A channel may enter NEEDS_REVIEW only when the durable review queue already
 -- contains a pending review created from an authoritative eligibility decision.
 CREATE OR REPLACE FUNCTION enforce_authoritative_needs_review()
