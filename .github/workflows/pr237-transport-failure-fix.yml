@@ -1,0 +1,71 @@
+name: PR237 transport failure fix
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/restore-per-provider-429-failover
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Patch transport failure accounting
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('server/youtube.ts')
+          s=p.read_text()
+          old="""        const response=await fetch(dispatchedUrl,{signal});
+        trace(`after HTTP fetch at server/youtube.ts:131 (status=${response.status})`);"""
+          new="""        let response: Response;
+        try {
+          response=await fetch(dispatchedUrl,{signal});
+        } catch (error) {
+          if(dispatchedProviderKey){
+            failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
+            if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey});
+          }
+          throw error;
+        }
+        trace(`after HTTP fetch at server/youtube.ts:131 (status=${response.status})`);"""
+          if old not in s:
+              raise SystemExit('youtube fetch target not found')
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('server/youtubeRequestScheduler.test.ts')
+          s=p.read_text()
+          anchor="""test('provider-loop requests carry the selected API key into scheduler dispatch', () => {"""
+          test="""test('transport failure records the actual dispatched provider in acquisition fallback history', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  const transportCatch = youtubeFetch.slice(youtubeFetch.indexOf('response=await fetch(dispatchedUrl,{signal})'), youtubeFetch.indexOf('trace(`after HTTP fetch'));
+  assert.match(transportCatch, /catch \(error\)/);
+  assert.match(transportCatch, /failedDispatchProviders\(acquisition\)\?\.add\(dispatchedProviderKey\)/);
+  assert.match(transportCatch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey\}\)/);
+  assert.ok(transportCatch.indexOf('failedDispatchProviders') < transportCatch.indexOf('throw error'));
+});
+
+"""
+          if anchor not in s:
+              raise SystemExit('test insertion anchor not found')
+          p.write_text(s.replace(anchor,test+anchor,1))
+          PY
+      - name: Validate
+        run: |
+          npx tsx --test server/youtubeRequestScheduler.test.ts server/youtubeProviderCooldown.test.ts
+          npm run lint
+          npm run build
+          git diff --check
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/youtube.ts server/youtubeRequestScheduler.test.ts
+          git commit -m "fix: rotate providers after transport failures"
+          git push origin HEAD:fix/restore-per-provider-429-failover
