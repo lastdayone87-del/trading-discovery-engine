@@ -69,7 +69,7 @@ test('daily quota exhaustion cools only that provider until the next Pacific quo
   assert.deepEqual(providers.status('project-a'), { status: 'Active', retryAt: null });
 });
 
-test('runtime pause preserves daily-exhausted provider state after healthy projects resume', () => {
+test('runtime pause preserves daily-exhausted provider status and true recovery time', () => {
   let now = Date.parse('2026-07-30T12:00:00Z');
   const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,runtimeRateLimitPauseMs:100,now:()=>now});
   const dailyReset = providers.failed('project-a', 'DAILY_QUOTA_EXHAUSTED');
@@ -77,6 +77,10 @@ test('runtime pause preserves daily-exhausted provider state after healthy proje
   assert.equal(runtimeRetry, now + 100);
   assert.equal(providers.eligible('project-a'), false);
   assert.equal(providers.eligible('project-b'), false);
+  assert.deepEqual(providers.status('project-a'), { status: 'Daily Quota Exhausted', retryAt: dailyReset });
+  assert.deepEqual(providers.status('project-b'), { status: 'Cooling Down', retryAt: runtimeRetry });
+  assert.equal(providers.retryAt('project-a'), dailyReset);
+  assert.equal(providers.retryAt('project-b'), runtimeRetry);
   now += 100;
   assert.equal(providers.eligible('project-b'), true);
   assert.equal(providers.eligible('project-a'), false);
@@ -95,6 +99,16 @@ test('availability and recovery status scale across the configured provider pool
   now += 100;
   assert.equal(providers.status(keys[9]).status, 'Active');
   assert.equal(providers.earliestRetryAtIfAllCooling(keys), null);
+});
+
+test('runtime pause does not advertise recovery before daily reset when every provider is daily exhausted', () => {
+  let now = Date.parse('2026-07-30T12:00:00Z');
+  const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,runtimeRateLimitPauseMs:100,now:()=>now});
+  const retryA = providers.failed('project-a', 'DAILY_QUOTA_EXHAUSTED');
+  const retryB = providers.failed('project-b', 'DAILY_QUOTA_EXHAUSTED');
+  assert.equal(retryA, retryB);
+  providers.failed('project-a', 'RATE_LIMITED');
+  assert.equal(providers.earliestRetryAtIfAllCooling(['project-a', 'project-b']), retryA);
 });
 
 test('all-provider daily exhaustion exposes the earliest pool retry time', () => {
