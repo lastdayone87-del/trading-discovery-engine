@@ -34,7 +34,7 @@ jobs:
           test=Path('server/youtubeRequestScheduler.test.ts')
           tests=test.read_text()
           anchor="test('provider-loop requests carry the selected API key into scheduler dispatch', () => {\n"
-          addition="""test('youtubeFetch propagates providerFailureRecorded from ProviderCallError cause to prevent double cooldown', () => {\n  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');\n  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));\n  const catchBlock = youtubeFetch.slice(youtubeFetch.lastIndexOf('} catch(error) {'));\n  assert.match(catchBlock, /const wrappedCause=\\(error as any\\)\\.cause/);\n  assert.match(catchBlock, /wrappedCause as any\\)\\.providerFailureRecorded===true/);\n  assert.match(catchBlock, /providerFailureRecorded\\?\\{providerFailureRecorded:true\\}:\\{\\}/);\n});\n\n"""
+          addition="""test('youtubeFetch preserves the already-recorded provider failure marker through ProviderCallError wrapping', () => {\n  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');\n  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));\n  assert.match(youtubeFetch, /const wrappedCause=\\(error as any\\)\\.cause/);\n  assert.match(youtubeFetch, /providerFailureRecorded=.*wrappedCause/);\n  assert.match(youtubeFetch, /providerFailureRecorded:true/);\n});\n\n"""
           if addition not in tests:
               if anchor not in tests:
                   raise SystemExit('test anchor not found')
