@@ -4,8 +4,15 @@ on:
   pull_request:
     paths:
       - 'server/release5/stage4ReviewCanaryContract.test.ts'
-      - 'server/release5/rollout.ts'
-      - 'server/reviewEligibility/policy.ts'
+      - 'server/release5/reviewMaterializer.ts'
+      - 'server/reviewEligibility/**'
+      - 'server/enrichmentLifecycle.ts'
+      - 'server/enrichmentOperationalFailure.test.ts'
+      - 'server/ingestionPipeline.ts'
+      - 'server/queueManager.ts'
+      - 'server/investigationWorkflow.ts'
+      - 'server/investigationWorkflow.test.ts'
+      - 'server/db/migrations/094_authoritative_review_projection.sql'
       - '.github/workflows/stage4-dormant-review-canary.yml'
   workflow_dispatch:
 
@@ -19,13 +26,19 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
-      - name: Stage 4 dormant review canary contracts
-        run: node --import tsx --test server/release5/stage4ReviewCanaryContract.test.ts
+      - name: Review serving contracts
+        run: node --import tsx --test server/reviewEligibility/policy.test.ts server/enrichmentLifecycle.test.ts server/enrichmentOperationalFailure.test.ts server/reviewEligibility/servingIntegration.test.ts server/release5/stage4ReviewCanaryContract.test.ts server/investigationWorkflow.test.ts
       - name: Build
         run: npm run build
-      - name: Verify no Stage 4 serving activation is introduced
+      - name: Verify authoritative review boundary
         run: |
           set -euo pipefail
-          grep -q "servingAuthority:false" server/reviewEligibility/policy.ts
-          grep -q "getAppSetting(settingKey,'OFF')" server/release5/rollout.ts
-          ! git diff origin/main...HEAD -- server/release5/rollout.ts server/reviewEligibility/policy.ts | grep -E '^\+.*(setRelease5KillSwitch|activateRelease5Capability)\('
+          grep -q "servingAuthority:true" server/reviewEligibility/policy.ts
+          grep -q "review-eligibility-v2-serving-1" server/db/migrations/094_authoritative_review_projection.sql
+          grep -q "serving_authority!==true" server/release5/reviewMaterializer.ts
+          grep -q "evaluateReviewEligibilityV2(reviewEligibilityInput)" server/ingestionPipeline.ts
+          ! grep -q "authoritative write failed" server/ingestionPipeline.ts
+          grep -q "channel.scan_status = 'FAILED'" server/queueManager.ts
+          ! grep -q "channel?.trading_status||'NEEDS_REVIEW'" server/queueManager.ts
+          grep -q "state='OPERATIONALLY_BLOCKED'" server/investigationWorkflow.ts
+          ! git diff origin/main...HEAD -- server/youtube.ts server/youtubeProviderScheduler.ts | grep -E '^\+|^-'

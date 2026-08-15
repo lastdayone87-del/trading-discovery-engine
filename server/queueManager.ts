@@ -257,7 +257,7 @@ export async function processNextSearchJob(
       const channel = await getChannelById(channelId);
       if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel?.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'CASE_NO_LONGER_ELIGIBLE'}).catch(()=>undefined);
-        if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel?.trading_status||'NEEDS_REVIEW',output:{reason:'CASE_NO_LONGER_ELIGIBLE'}});else await completeJob(job.id);
+        if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel?.trading_status||'POLICY_REJECTED',output:{reason:channel?'CASE_NO_LONGER_ELIGIBLE':'CHANNEL_MISSING'}});else await completeJob(job.id);
         await completeJob(job.id);
         return true;
       }
@@ -420,8 +420,8 @@ export async function processNextSearchJob(
       const channelId = String(job.payload?.channelId || '');
       const channel = channelId ? await getChannelById(channelId) : null;
       if (channel && channel.trading_status === 'UNCERTAIN') {
-        channel.scan_status = 'NEEDS_REVIEW';
-        channel.trading_status = 'NEEDS_REVIEW';
+        channel.scan_status = 'FAILED';
+        channel.trading_status = 'UNCERTAIN';
         channel.scan_attempts = job.attempts;
         channel.last_checked = new Date().toISOString();
         await upsertChannel(channel);
