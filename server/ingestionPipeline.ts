@@ -418,8 +418,7 @@ export async function processChannelThroughPipeline(
     applyCandidateObservability(uncertainChannel, candidate);
 
     await upsertChannel(uncertainChannel);
-    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput})
-      .catch(error=>console.warn(`[ReviewEligibility] authoritative write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput});
     const authoritativeChannel=(await getChannelById(candidate.channelId))||uncertainChannel;
 
     if (lifecycle.shouldEnqueue) {

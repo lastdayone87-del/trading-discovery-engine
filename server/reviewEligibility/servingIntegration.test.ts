@@ -38,3 +38,7 @@ test('review decision store materializes eligible review inside the same databas
   const commit=source.indexOf("client.query('COMMIT')",materialize);
   assert.ok(materialize>=0&&commit>materialize,'eligible materialization must complete before transaction commit');
 });
+
+
+test('machine-owned authoritative projections supersede stale pending review debt',()=>{const source=read('server/reviewEligibility/store.ts');assert.match(source,/reconcileMachineOwnedReview/);assert.match(source,/state='SUPERSEDED'/);});
+test('production persistence failures propagate and missing channels never synthesize review',()=>{const ingestion=read('server/ingestionPipeline.ts'),queue=read('server/queueManager.ts');assert.doesNotMatch(ingestion,/authoritative write failed/);assert.doesNotMatch(queue,/channel\?\.trading_status\|\|'NEEDS_REVIEW'/);assert.match(queue,/channel\?\.trading_status\|\|'POLICY_REJECTED'/);});
