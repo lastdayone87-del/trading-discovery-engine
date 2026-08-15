@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders } from './enrichmentOperationalFailure';
 import { decideJobFailure } from './db';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
+import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 import type { EvidenceCollectionReport, VerificationDecision } from './evidenceEngine';
 
 function report(degraded:boolean, reasonCodes:string[]=[], sufficiency:EvidenceCollectionReport['sufficiency']='SUFFICIENT'):EvidenceCollectionReport {
@@ -90,5 +91,6 @@ test('non-enrichment and permanent-input degradation are not rewritten by this g
 
 test('fully observed genuine ambiguity can still reach human review when providers are healthy',()=>{
   assert.equal(enrichmentOperationalFailure(report(false),true,false),null);
-  assert.deepEqual(resolveUncertainLifecycle(true),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});
+  const eligibility=evaluateReviewEligibilityV2({classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false});
+  assert.deepEqual(resolveUncertainLifecycle(true,eligibility),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});
 });

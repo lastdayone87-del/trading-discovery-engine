@@ -33,10 +33,10 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
   if (!input.hasNextPage) reasons.push('NO_NEXT_PAGE');
   if (input.pageNumber >= input.maxPages) reasons.push('PAGE_CEILING');
   if (input.maxDistinctCreators && input.cumulativeDistinctCreators >= input.maxDistinctCreators) reasons.push('CREATOR_CEILING');
-  if (input.confirmedCreators === 0) reasons.push('ZERO_CONFIRMED_VALUE');
+  if (input.confirmedCreators === 0 && input.newCreators === 0) reasons.push('ZERO_CONFIRMED_VALUE');
   if (input.duplicateRatio >= 0.8) reasons.push('DUPLICATE_HEAVY');
   if (input.countryPrecision < 0.5) reasons.push('WRONG_COUNTRY');
-  const lowYield = marginalUtility < 0.2 || input.confirmedCreators === 0 || input.duplicateRatio >= 0.8 || input.countryPrecision < 0.5;
+  const lowYield = marginalUtility < 0.2 || (input.confirmedCreators === 0 && input.newCreators === 0) || input.duplicateRatio >= 0.8 || input.countryPrecision < 0.5;
   const lowYieldCount = lowYield ? input.consecutiveLowYieldPages + 1 : 0;
   if (lowYieldCount >= input.maxConsecutiveLowYieldPages) reasons.push('CONSECUTIVE_LOW_YIELD');
   const terminal = reasons.find(r => ['NO_NEXT_PAGE','PAGE_CEILING','CREATOR_CEILING','CONSECUTIVE_LOW_YIELD'].includes(r));

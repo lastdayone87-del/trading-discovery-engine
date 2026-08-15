@@ -269,3 +269,44 @@ export function planDiverseQueries(args: {
   }
   return planned;
 }
+
+export function reformulatePollutedQuery(args: {
+  pollutedQuery: string;
+  country: string;
+  intent: QueryIntent;
+  countryVocabulary?: CountryVocabulary;
+}): PlannedQuery | null {
+  const normalizedBase = normalizeQuery(args.pollutedQuery);
+  const anchors = countryAtoms(args.country, args.countryVocabulary);
+  const tradingMethods = anchors.filter(item => item.type === 'METHOD' || item.type === 'INSTRUMENT');
+
+  for (const method of tradingMethods) {
+    const candidateTerm = `${normalizedBase} ${method.term}`;
+    if (isRetrievalOrientedQuery(args.country, candidateTerm)) {
+      const primaryAtom = method;
+      return {
+        query: candidateTerm,
+        intent: args.intent,
+        primaryTerm: primaryAtom.term,
+        knowledgeTiers: [1],
+        generationMode: 'EXPLORATION',
+        generationReason: `Governed query reformulation from polluted term "${args.pollutedQuery}" toward specific trading anchor "${primaryAtom.term}".`,
+        discoveryObjective: 'Reformulate polluted query toward concrete, authentic local trading vocabulary.',
+        metadata: {
+          country: args.country,
+          queryTemplate: 'COMPACT_PAIR',
+          retrievalOptimized: true,
+          reformulatedFrom: args.pollutedQuery,
+          retrievalSpecificity: {
+            policyVersion: primaryAtom.retrievalPolicy.policyVersion,
+            eligibility: primaryAtom.retrievalPolicy.eligibility,
+            specificity: primaryAtom.retrievalPolicy.specificity,
+            ambiguity: primaryAtom.retrievalPolicy.ambiguity,
+            reasonCodes: primaryAtom.retrievalPolicy.reasonCodes
+          }
+        }
+      };
+    }
+  }
+  return null;
+}
