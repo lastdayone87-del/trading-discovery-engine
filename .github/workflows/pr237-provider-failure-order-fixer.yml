@@ -1,15 +1,10 @@
 name: PR237 provider failure ordering fix
-
 on:
   push:
-    branches:
-      - fix/restore-per-provider-429-failover
-    paths:
-      - .github/workflows/pr237-provider-failure-order-fixer.yml
-
+    branches: [fix/restore-per-provider-429-failover]
+    paths: [.github/workflows/pr237-provider-failure-order-fixer.yml]
 permissions:
   contents: write
-
 jobs:
   fix-and-validate:
     runs-on: ubuntu-latest
@@ -23,49 +18,12 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - name: Apply provider failure ordering fix
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('server/youtube.ts')
-          source = path.read_text()
-          old = """function recordProviderFailure(key: string, error: unknown): void {\n  const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;\n  if (isQuotaExceeded(error)) youtubeProviderCooldown.failed(dispatchedKey, 'DAILY_QUOTA_EXHAUSTED');\n  else if (isYouTubeRateLimited(error)) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');\n}\n"""
-          new = """function recordProviderFailure(key: string, error: unknown): void {\n  if ((error as any)?.providerFailureRecorded === true) return;\n  const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;\n  if (isQuotaExceeded(error)) youtubeProviderCooldown.failed(dispatchedKey, 'DAILY_QUOTA_EXHAUSTED');\n  else if (isYouTubeRateLimited(error)) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');\n}\n"""
-          if old not in source:
-              raise SystemExit('recordProviderFailure block not found')
-          source = source.replace(old, new, 1)
-
-          old = """        if(!response.ok){\n          trace('before HTTP-error-body-read at server/youtube.ts:135');\n          const error=await youtubeHttpError(response,trace);\n          trace('after HTTP-error-body-read at server/youtube.ts:135');\n          throw error;\n        }\n"""
-          new = """        if(!response.ok){\n          trace('before HTTP-error-body-read at server/youtube.ts:135');\n          const error=await youtubeHttpError(response,trace);\n          trace('after HTTP-error-body-read at server/youtube.ts:135');\n          if(dispatchedProviderKey){\n            if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');\n            else if(isYouTubeRateLimited(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');\n            if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});\n          }\n          throw error;\n        }\n"""
-          if old not in source:
-              raise SystemExit('youtubeFetch failure block not found')
-          source = source.replace(old, new, 1)
-          path.write_text(source)
-
-          test_path = Path('server/youtubeRequestScheduler.test.ts')
-          tests = test_path.read_text()
-          anchor = """test('provider-loop requests carry the selected API key into scheduler dispatch', () => {\n"""
-          addition = """test('youtubeFetch records the actual provider failure before scheduler release and prevents duplicate outer accounting', () => {\n  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');\n  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));\n  const failureBranch = youtubeFetch.slice(youtubeFetch.indexOf('if(!response.ok)'), youtubeFetch.indexOf('if(dispatchedProviderKey)youtubeProviderCooldown.succeeded'));\n  assert.match(failureBranch, /youtubeProviderCooldown\\.failed\\(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED'\\)/);\n  assert.match(failureBranch, /youtubeProviderCooldown\\.failed\\(dispatchedProviderKey,'RATE_LIMITED'\\)/);\n  assert.match(failureBranch, /providerFailureRecorded:true/);\n  assert.ok(failureBranch.indexOf('youtubeProviderCooldown.failed') < failureBranch.indexOf('throw error'));
-  const recorder = source.slice(source.indexOf('function recordProviderFailure'), source.indexOf('export function selectYouTubeDispatchProviderIndex'));
-  assert.match(recorder, /providerFailureRecorded === true\\) return/);
-});\n\n"""
-          if addition not in tests:
-              if anchor not in tests:
-                  raise SystemExit('test insertion anchor not found')
-              tests = tests.replace(anchor, addition + anchor, 1)
-              test_path.write_text(tests)
-          PY
-      - name: Validate focused tests
-        run: npx tsx --test server/youtubeRequestScheduler.test.ts server/youtubeProviderCooldown.test.ts
-      - name: Validate lint
-        run: npm run lint
-      - name: Validate build
-        run: npm run build
-      - name: Validate diff
-        run: git diff --check
-      - name: Commit fix
-        run: |
+      - run: python .github/scripts/pr237_provider_failure_order_fix.py
+      - run: npx tsx --test server/youtubeRequestScheduler.test.ts server/youtubeProviderCooldown.test.ts
+      - run: npm run lint
+      - run: npm run build
+      - run: git diff --check
+      - run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add server/youtube.ts server/youtubeRequestScheduler.test.ts
