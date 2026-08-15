@@ -29,6 +29,28 @@ test('releasing an unreported probe guarantees another probe can run',()=>{const
 
 test('successful provider outcome is not reversed by downstream database or JSON failures',()=>{for(const downstreamError of [new Error('database unavailable'),new SyntaxError('invalid JSON')]){const f=fixture();exhaust(f.pool);f.advance(100);const probe=f.pool.beginAcquisition();try{probe.providerSucceeded();throw downstreamError}catch{}finally{probe.release()}const normal=f.pool.beginAcquisition();normal.release();assert.equal(f.pool.getRetryAt(),0)}});
 
-test('every YouTube acquisition reports provider success at the HTTP boundary',()=>{const source=fs.readFileSync(new URL('./youtube.ts',import.meta.url),'utf8');assert.match(source,/if\(!response\.ok\)[\s\S]+acquisition\?\.providerSucceeded\(\);return response/);assert.doesNotMatch(source,/response\.json\([^)]*\)[\s\S]{0,120}providerSucceeded/);const callCount=(source.match(/youtubeFetch\(/g)||[]).length-1;const tokenCount=(source.match(/youtubeFetch\([^\n]+?acquisition\)/g)||[]).length;assert.ok(callCount>=9);assert.equal(tokenCount,callCount)});
+test('YouTube acquisition reports provider success only after validated JSON and uses provider-aware dispatch',()=>{
+  const source=fs.readFileSync(new URL('./youtube.ts',import.meta.url),'utf8');
+  const fetchStart=source.indexOf('async function youtubeFetch');
+  const readerStart=source.indexOf('export async function readYouTubeJsonObject');
+  assert.ok(fetchStart>=0&&readerStart>fetchStart);
+  const fetchBlock=source.slice(fetchStart,readerStart);
+  const readerEnd=source.indexOf('/** A request-rate limit',readerStart);
+  const readerBlock=source.slice(readerStart,readerEnd);
+
+  assert.doesNotMatch(fetchBlock,/providerSucceeded\(\)/);
+  assert.match(readerBlock,/context\?\.acquisition\?\.providerSucceeded\(\)/);
+  assert.match(readerBlock,/youtubeProviderCooldown\.succeeded\(context\.providerKey,context\.providerFailureGeneration\)/);
+  assert.match(readerBlock,/if\s*\(!Array\.isArray\(object\.items\)\)[\s\S]*context\?\.acquisition\?\.providerSucceeded\(\)/);
+
+  const calls=[...source.matchAll(/youtubeFetch\(([^\n]+)\)/g)]
+    .filter(match=>!match[1].includes('url:string'))
+    .map(match=>match[1]);
+  assert.ok(calls.length>=9);
+  for(const args of calls){
+    assert.match(args,/acquisition/);
+    assert.match(args,/keys\[index\]|keyPool\[index\]|apiKey/);
+  }
+});
 
 test('quota reason detection follows wrapped provider errors without treating generic failures as exhaustion',()=>{const quota=Object.assign(new Error('Provider rate limit reached.'),{cause:Object.assign(new Error('YouTube HTTP 403 (quotaExceeded)'),{quotaExceeded:true})});assert.equal(isQuotaExceeded(quota),true);assert.equal(isQuotaExceeded(Object.assign(new Error('YouTube HTTP 503'),{status:503})),false)});

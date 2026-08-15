@@ -37,8 +37,6 @@ export function youtubeQuotaDateKey(now: number = Date.now()): string {
 export function nextYouTubeDailyQuotaResetAt(now: number): number {
   const pacific = zonedParts(now, YOUTUBE_QUOTA_TIME_ZONE);
   const nextLocalMidnight = Date.UTC(pacific.year, pacific.month - 1, pacific.day + 1, 0, 0, 0);
-  // Resolve the Pacific UTC offset at the target instant. The second pass handles
-  // DST-boundary days where the offset at the UTC approximation differs.
   let candidate = nextLocalMidnight - zonedOffsetMs(nextLocalMidnight, YOUTUBE_QUOTA_TIME_ZONE);
   candidate = nextLocalMidnight - zonedOffsetMs(candidate, YOUTUBE_QUOTA_TIME_ZONE);
   return candidate;
@@ -47,6 +45,7 @@ export function nextYouTubeDailyQuotaResetAt(now: number): number {
 /** Process-local availability state for each configured API key/project. */
 export class YouTubeProviderCooldown {
   private readonly providers = new Map<string, { retryAt: number; rateLimitCooldownMs: number; kind: YouTubeProviderFailureKind }>();
+  private readonly failureGenerations = new Map<string, number>();
 
   constructor(private readonly options: YouTubeProviderCooldownOptions) {}
 
@@ -54,20 +53,21 @@ export class YouTubeProviderCooldown {
     const state = this.providers.get(key);
     if (!state) return true;
     if ((this.options.now ?? Date.now)() < state.retryAt) return false;
-    this.providers.delete(key);
+    if (state.kind === 'DAILY_QUOTA_EXHAUSTED') this.providers.delete(key);
     return true;
   }
 
   failed(key: string, kind: YouTubeProviderFailureKind): number {
     const now = (this.options.now ?? Date.now)();
     const previous = this.providers.get(key);
+    this.failureGenerations.set(key, this.failureGeneration(key) + 1);
     if (kind === 'DAILY_QUOTA_EXHAUSTED') {
       const retryAt = nextYouTubeDailyQuotaResetAt(now);
       this.providers.set(key, { retryAt, rateLimitCooldownMs: 0, kind });
       return retryAt;
     }
     const initial = Math.max(1, this.options.initialRateLimitCooldownMs);
-    const cooldown = previous?.rateLimitCooldownMs
+    const cooldown = previous?.kind === 'RATE_LIMITED' && previous.rateLimitCooldownMs
       ? Math.min(Math.max(initial, this.options.maxRateLimitCooldownMs), previous.rateLimitCooldownMs * 2)
       : initial;
     const retryAt = now + cooldown;
@@ -75,7 +75,19 @@ export class YouTubeProviderCooldown {
     return retryAt;
   }
 
-  succeeded(key: string): void { this.providers.delete(key); }
+  /** Monotonic per-provider failure generation for stale-success protection. */
+  failureGeneration(key: string): number { return this.failureGenerations.get(key) ?? 0; }
+
+  /**
+   * Clears provider cooldown/history only when no newer failure has occurred since
+   * the caller observed the supplied generation. Returns false for a stale success.
+   */
+  succeeded(key: string, expectedFailureGeneration?: number): boolean {
+    if (expectedFailureGeneration !== undefined && this.failureGeneration(key) !== expectedFailureGeneration) return false;
+    this.providers.delete(key);
+    return true;
+  }
+
   retryAt(key: string): number { return this.providers.get(key)?.retryAt ?? 0; }
 
   status(key: string): { status: YouTubeProviderOperationalStatus; retryAt: number | null } {
@@ -95,9 +107,13 @@ export class YouTubeProviderCooldown {
 
 export class YouTubeProvidersCoolingDownError extends Error {
   readonly code = 'YOUTUBE_PROVIDERS_COOLING_DOWN';
+  readonly retryable = true;
+  readonly errorClass = 'RATE_LIMIT';
+  readonly retryAfterMs: number;
   constructor(public readonly retryAt: number) {
     super(`Every configured YouTube provider is cooling down; retry is scheduled for ${new Date(retryAt).toISOString()}.`);
     this.name = 'YouTubeProvidersCoolingDownError';
+    this.retryAfterMs = Math.max(0, retryAt - Date.now());
   }
 }
 

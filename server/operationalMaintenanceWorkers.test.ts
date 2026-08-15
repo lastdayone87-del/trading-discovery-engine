@@ -29,6 +29,13 @@ test('false-negative recovery reserves quota before claiming its custom job', ()
   assert.match(workers, /heartbeatJob\(job\.id, workerId\)/);
 });
 
+test('false-negative recovery admission consults authoritative provider-pool cooldown state', () => {
+  assert.match(workers, /getYouTubeKeyPool\(\)/);
+  assert.match(workers, /youtubeProviderCooldown\.earliestRetryAtIfAllCooling\(providerKeys\)/);
+  assert.match(workers, /providerKeys\.length === 0/);
+  assert.doesNotMatch(workers, /youtubeRequestScheduler\.isRateLimited\(\)/);
+});
+
 test('false-negative recovery grants attempt-free retries only to typed transient failures', () => {
   assert.match(workers, /const typedTransient = result\.retryable === true/);
   assert.match(workers, /result\.errorClass/);
