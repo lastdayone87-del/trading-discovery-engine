@@ -246,7 +246,16 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         await recordFirstYouTubeRequest(operation);
         trace('after first-request-record at server/youtube.ts:128');
         trace('before HTTP fetch at server/youtube.ts:131');
-        const response=await fetch(dispatchedUrl,{signal});
+        let response: Response;
+        try {
+          response=await fetch(dispatchedUrl,{signal});
+        } catch (error) {
+          if(dispatchedProviderKey){
+            failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
+            if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey});
+          }
+          throw error;
+        }
         trace(`after HTTP fetch at server/youtube.ts:131 (status=${response.status})`);
         if(!response.ok){
           trace('before HTTP-error-body-read at server/youtube.ts:135');
