@@ -71,13 +71,19 @@ export class YouTubeProviderCooldown {
     return this.runtimeRateLimitRetryAt;
   }
 
+  private activeProviderState(key: string): { retryAt: number; kind: 'DAILY_QUOTA_EXHAUSTED' } | undefined {
+    const state = this.providers.get(key);
+    if (!state) return undefined;
+    if (this.now() >= state.retryAt) {
+      this.providers.delete(key);
+      return undefined;
+    }
+    return state;
+  }
+
   eligible(key: string): boolean {
     if (this.activeRuntimeRateLimitRetryAt() > 0) return false;
-    const state = this.providers.get(key);
-    if (!state) return true;
-    if (this.now() < state.retryAt) return false;
-    this.providers.delete(key);
-    return true;
+    return !this.activeProviderState(key);
   }
 
   failed(key: string, kind: YouTubeProviderFailureKind): number {
@@ -114,28 +120,34 @@ export class YouTubeProviderCooldown {
   }
 
   retryAt(key: string): number {
-    return Math.max(this.activeRuntimeRateLimitRetryAt(), this.providers.get(key)?.retryAt ?? 0);
+    return Math.max(this.activeRuntimeRateLimitRetryAt(), this.activeProviderState(key)?.retryAt ?? 0);
   }
 
   status(key: string): { status: YouTubeProviderOperationalStatus; retryAt: number | null } {
+    // A provider-specific daily exhaustion is more authoritative than a shorter
+    // runtime-wide pause. QueueMonitor must continue to show the true provider
+    // recovery boundary instead of implying the key becomes usable when the
+    // shared runtime pause expires.
+    const state = this.activeProviderState(key);
+    if (state) return { status: 'Daily Quota Exhausted', retryAt: state.retryAt };
+
     const runtimeRetryAt = this.activeRuntimeRateLimitRetryAt();
     if (runtimeRetryAt > 0) return { status: 'Cooling Down', retryAt: runtimeRetryAt };
-    const state = this.providers.get(key);
-    if (!state) return { status: 'Active', retryAt: null };
-    if (this.now() >= state.retryAt) {
-      this.providers.delete(key);
-      return { status: 'Active', retryAt: null };
-    }
-    return { status: 'Daily Quota Exhausted', retryAt: state.retryAt };
+    return { status: 'Active', retryAt: null };
   }
 
   earliestRetryAtIfAllCooling(keys: string[]): number | null {
     if (!keys.length) return null;
     const runtimeRetryAt = this.activeRuntimeRateLimitRetryAt();
-    if (runtimeRetryAt > 0) return runtimeRetryAt;
-    if (keys.some(key => this.eligible(key))) return null;
-    const retryTimes = keys.map(key => this.providers.get(key)?.retryAt ?? 0).filter(retryAt => retryAt > 0);
-    return retryTimes.length ? Math.min(...retryTimes) : null;
+    const now = this.now();
+    const effectiveRetryTimes = keys.map(key => {
+      const providerRetryAt = this.activeProviderState(key)?.retryAt ?? 0;
+      return Math.max(runtimeRetryAt, providerRetryAt);
+    });
+
+    // If at least one provider is usable now, the pool is not fully cooling.
+    if (effectiveRetryTimes.some(retryAt => retryAt <= now)) return null;
+    return Math.min(...effectiveRetryTimes);
   }
 }
 
