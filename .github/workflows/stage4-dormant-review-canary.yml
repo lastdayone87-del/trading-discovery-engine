@@ -16,46 +16,29 @@ on:
       - '.github/workflows/stage4-dormant-review-canary.yml'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          ref: fix/review-state-semantics-phase1
-          fetch-depth: 0
-      - name: Apply final Codex P2 fixes
-        env:
-          STORE_B64: aW1wb3J0IHtnZXRBcHBTZXR0aW5nLGdldERifSBmcm9tICcuLi9kYic7CmltcG9ydCB7bWF0ZXJpYWxpemVFbGlnaWJsZVJldmlld0luVHJhbnNhY3Rpb259IGZyb20gJy4uL3JlbGVhc2U1L3Jldmlld01hdGVyaWFsaXplcic7CmltcG9ydCB7YWRtaXNzaW9uQ2hlY2tzdW19IGZyb20gJy4uL2NhbmRpZGF0ZUFkbWlzc2lvbi92ZXJzaW9uaW5nJzsKaW1wb3J0IHthc3NpZ25BZG1pc3Npb25DYW5hcnl9IGZyb20gJy4uL2NhbmRpZGF0ZUFkbWlzc2lvbi9wb2xpY3knOwppbXBvcnQge2V2YWx1YXRlUmV2aWV3RWxpZ2liaWxpdHlWMixSRVZJRVdfRUxJR0lCSUxJVFlfUE9MSUNZX1ZFUlNJT04sdHlwZSBSZXZpZXdFbGlnaWJpbGl0eUlucHV0fSBmcm9tICcuL3BvbGljeSc7Cgphc3luYyBmdW5jdGlvbiByZWNvbmNpbGVNYWNoaW5lT3duZWRSZXZpZXcoY2xpZW50OmFueSxjaGFubmVsSWQ6c3RyaW5nKXsKICBhd2FpdCBjbGllbnQucXVlcnkoYFVQREFURSBjaGFubmVsX3Jldmlld3MgU0VUIHN0YXRlPSdTVVBFUlNFREVEJyxwZW5kaW5nX3NpbmNlPU5VTEwsdXBkYXRlZF9hdD1ub3coKSBXSEVSRSBjaGFubmVsX2lkPSQxIEFORCBzdGF0ZT0nUEVORElORydgLFtjaGFubmVsSWRdKTsKICBhd2FpdCBjbGllbnQucXVlcnkoYFVQREFURSBjaGFubmVscyBTRVQgdHJhZGluZ19zdGF0dXM9Q0FTRSBXSEVOIHRyYWRpbmdfc3RhdHVzPSdORUVEU19SRVZJRVcnIFRIRU4gJ1VOQ0VSVEFJTicgRUxTRSB0cmFkaW5nX3N0YXR1cyBFTkQsc2Nhbl9zdGF0dXM9Q0FTRSBXSEVOIHNjYW5fc3RhdHVzPSdORUVEU19SRVZJRVcnIFRIRU4gJ0NPTVBMRVRFRCcgRUxTRSBzY2FuX3N0YXR1cyBFTkQsbGFzdF9jaGVja2VkPW5vdygpIFdIRVJFIGNoYW5uZWxfaWQ9JDFgLFtjaGFubmVsSWRdKTsKfQoKZXhwb3J0IGFzeW5jIGZ1bmN0aW9uIHJlY29yZFJldmlld0VsaWdpYmlsaXR5U2hhZG93KGlucHV0OlJldmlld0VsaWdpYmlsaXR5SW5wdXQme2NoYW5uZWxJZDpzdHJpbmc7Y2xhc3NpZmljYXRpb25EaWFnbm9zdGljSWQ/OnN0cmluZztpbnZlc3RpZ2F0aW9uSWQ/OnN0cmluZztjcmVhdG9yRm9jdXNTbmFwc2hvdElkPzpzdHJpbmd9KXsKICBjb25zdCBldmFsdWF0aW9uPWV2YWx1YXRlUmV2aWV3RWxpZ2liaWxpdHlWMihpbnB1dCksY29uZmlndXJlZD1TdHJpbmcoYXdhaXQgZ2V0QXBwU2V0dGluZygncmV2aWV3X2VsaWdpYmlsaXR5X3YyX21vZGUnLCdPRkYnKSkudG9VcHBlckNhc2UoKSxtb2RlOidTSEFET1cnfCdDQU5BUlknPWNvbmZpZ3VyZWQ9PT0nQ0FOQVJZJz8nQ0FOQVJZJzonU0hBRE9XJyxiYXNpcz1NYXRoLm1pbigxMDAwMCxNYXRoLm1heCgwLE51bWJlcihhd2FpdCBnZXRBcHBTZXR0aW5nKCdyZXZpZXdfZWxpZ2liaWxpdHlfdjJfY2FuYXJ5X2Jhc2lzX3BvaW50cycsJzAnKSl8fDApKSxhc3NpZ25tZW50PWFzc2lnbkFkbWlzc2lvbkNhbmFyeShgJHtpbnB1dC5jaGFubmVsSWR9fCR7aW5wdXQuY2xhc3NpZmljYXRpb25EaWFnbm9zdGljSWR8fGlucHV0LmludmVzdGlnYXRpb25JZHx8J25vbmUnfXwke1JFVklFV19FTElHSUJJTElUWV9QT0xJQ1lfVkVSU0lPTn1gLGJhc2lzKSxzbmFwc2hvdD17Li4uaW5wdXQsY29uZmlndXJlZE1vZGU6Y29uZmlndXJlZCxtb2RlLGJhc2lzLHJhbmRvbWl6YXRpb25WYWx1ZTphc3NpZ25tZW50LnJhbmRvbWl6YXRpb25WYWx1ZSxyZWFzb25GYW1pbHk6ZXZhbHVhdGlvbi5yZWFzb25GYW1pbHl9LGNoZWNrc3VtPWFkbWlzc2lvbkNoZWNrc3VtKHNuYXBzaG90KSxrZXk9YWRtaXNzaW9uQ2hlY2tzdW0oe2NoZWNrc3VtLGV2YWx1YXRpb259KSxkYj1hd2FpdCBnZXREYigpLGNsaWVudD1hd2FpdCBkYi5jb25uZWN0KCk7CiAgbGV0IGRlY2lzaW9uSWQ6c3RyaW5nfHVuZGVmaW5lZDsKICB0cnl7CiAgICBhd2FpdCBjbGllbnQucXVlcnkoJ0JFR0lOJyk7CiAgICBjb25zdCBwcmlvcj1hd2FpdCBjbGllbnQucXVlcnkoJ1NFTEVDVCB2ZXJzaW9uLGRlY2lzaW9uX2lkLHN0YXR1cyBGUk9NIHJldmlld19lbGlnaWJpbGl0eV9wcm9qZWN0aW9uIFdIRVJFIGNoYW5uZWxfaWQ9JDEgRk9SIFVQREFURScsW2lucHV0LmNoYW5uZWxJZF0pLHZlcnNpb249TnVtYmVyKHByaW9yLnJvd3NbMF0/LnZlcnNpb258fDApOwogICAgY29uc3QgZGVjaXNpb249YXdhaXQgY2xpZW50LnF1ZXJ5KGBJTlNFUlQgSU5UTyByZXZpZXdfZWxpZ2liaWxpdHlfZGVjaXNpb25zKGRlY2lzaW9uX2tleSxjaGFubmVsX2lkLGNsYXNzaWZpY2F0aW9uX2RpYWdub3N0aWNfaWQsaW52ZXN0aWdhdGlvbl9pZCxjcmVhdG9yX2ZvY3VzX3NuYXBzaG90X2lkLHN0YXR1cyxyZWFzb25fY29kZXMsaW5wdXRfc25hcHNob3QsaW5wdXRfY2hlY2tzdW0scG9saWN5X3ZlcnNpb24sbW9kZSxhc3NpZ25tZW50X2Jhc2lzX3BvaW50cyxyYW5kb21pemF0aW9uX3ZhbHVlLGFzc2lnbmVkLHNlcnZpbmdfYXV0aG9yaXR5KSBWQUxVRVMoJDEsJDIsJDMsJDQsJDUsJDYsJDcsJDgsJDksJDEwLCQxMSwkMTIsJDEzLCQxNCx0cnVlKSBPTiBDT05GTElDVChkZWNpc2lvbl9rZXkpIERPIE5PVEhJTkcgUkVUVVJOSU5HIGlkLGRlY2lkZWRfYXRgLFtrZXksaW5wdXQuY2hhbm5lbElkLGlucHV0LmNsYXNzaWZpY2F0aW9uRGlhZ25vc3RpY0lkfHxudWxsLGlucHV0LmludmVzdGlnYXRpb25JZHx8bnVsbCxpbnB1dC5jcmVhdG9yRm9jdXNTbmFwc2hvdElkfHxudWxsLGV2YWx1YXRpb24uc3RhdHVzLEpTT04uc3RyaW5naWZ5KGV2YWx1YXRpb24ucmVhc29uQ29kZXMpLEpTT04uc3RyaW5naWZ5KHNuYXBzaG90KSxjaGVja3N1bSxSRVZJRVdfRUxJR0lCSUxJVFlfUE9MSUNZX1ZFUlNJT04sbW9kZSxiYXNpcyxhc3NpZ25tZW50LnJhbmRvbWl6YXRpb25WYWx1ZSxjb25maWd1cmVkPT09J0NBTkFSWScmJmFzc2lnbm1lbnQuYXNzaWduZWRdKTsKICAgIGlmKCFkZWNpc2lvbi5yb3dDb3VudCl7CiAgICAgIGNvbnN0IGV4aXN0aW5nPWF3YWl0IGNsaWVudC5xdWVyeSgnU0VMRUNUIGlkIEZST00gcmV2aWV3X2VsaWdpYmlsaXR5X2RlY2lzaW9ucyBXSEVSRSBkZWNpc2lvbl9rZXk9JDEnLFtrZXldKTsKICAgICAgZGVjaXNpb25JZD1leGlzdGluZy5yb3dzWzBdPy5pZDsKICAgICAgY29uc3QgaXNDdXJyZW50PSEhZGVjaXNpb25JZCYmcHJpb3Iucm93c1swXT8uZGVjaXNpb25faWQ9PT1kZWNpc2lvbklkOwogICAgICBpZihpc0N1cnJlbnQmJmV2YWx1YXRpb24uc3RhdHVzPT09J0VMSUdJQkxFJylhd2FpdCBtYXRlcmlhbGl6ZUVsaWdpYmxlUmV2aWV3SW5UcmFuc2FjdGlvbihjbGllbnQse2NoYW5uZWxJZDppbnB1dC5jaGFubmVsSWQsZWxpZ2liaWxpdHlEZWNpc2lvbklkOmRlY2lzaW9uSWQhfSk7CiAgICAgIGVsc2UgaWYoaXNDdXJyZW50KWF3YWl0IHJlY29uY2lsZU1hY2hpbmVPd25lZFJldmlldyhjbGllbnQsaW5wdXQuY2hhbm5lbElkKTsKICAgICAgYXdhaXQgY2xpZW50LnF1ZXJ5KCdDT01NSVQnKTsKICAgICAgcmV0dXJuIHsuLi5ldmFsdWF0aW9uLG1vZGUsY29uZmlndXJlZE1vZGU6Y29uZmlndXJlZCxyZWNvcmRlZDpmYWxzZSxpZGVtcG90ZW50OnRydWUsZGVjaXNpb25JZH07CiAgICB9CiAgICBkZWNpc2lvbklkPWRlY2lzaW9uLnJvd3NbMF0uaWQ7CiAgICBhd2FpdCBjbGllbnQucXVlcnkoYElOU0VSVCBJTlRPIHJldmlld19lbGlnaWJpbGl0eV9ldmVudHMoZXZlbnRfa2V5LGNoYW5uZWxfaWQsZGVjaXNpb25faWQsZXhwZWN0ZWRfcHJvamVjdGlvbl92ZXJzaW9uLHBheWxvYWQscG9saWN5X3ZlcnNpb24pIFZBTFVFUygkMSwkMiwkMywkNCwkNSwkNilgLFthZG1pc3Npb25DaGVja3N1bSh7a2V5LGV2ZW50OidFTElHSUJJTElUWV9FVkFMVUFURUQnfSksaW5wdXQuY2hhbm5lbElkLGRlY2lzaW9uSWQsdmVyc2lvbixKU09OLnN0cmluZ2lmeSh7c3RhdHVzOmV2YWx1YXRpb24uc3RhdHVzLHJlYXNvbkNvZGVzOmV2YWx1YXRpb24ucmVhc29uQ29kZXMscmVhc29uRmFtaWx5OmV2YWx1YXRpb24ucmVhc29uRmFtaWx5LGV2aWRlbmNlQ2hlY2tzdW06Y2hlY2tzdW19KSxSRVZJRVdfRUxJR0lCSUxJVFlfUE9MSUNZX1ZFUlNJT05dKTsKICAgIGF3YWl0IGNsaWVudC5xdWVyeShgSU5TRVJUIElOVE8gcmV2aWV3X2VsaWdpYmlsaXR5X3Byb2plY3Rpb24oY2hhbm5lbF9pZCxzdGF0dXMsdmVyc2lvbixkZWNpc2lvbl9pZCxyZWFzb25fY29kZXMsZXZpZGVuY2VfY2hlY2tzdW0scG9saWN5X3ZlcnNpb24sZGVjaWRlZF9hdCkgVkFMVUVTKCQxLCQyLDEsJDMsJDQsJDUsJDYsJDcpIE9OIENPTkZMSUNUKGNoYW5uZWxfaWQpIERPIFVQREFURSBTRVQgc3RhdHVzPWV4Y2x1ZGVkLnN0YXR1cyx2ZXJzaW9uPXJldmlld19lbGlnaWJpbGl0eV9wcm9qZWN0aW9uLnZlcnNpb24rMSxkZWNpc2lvbl9pZD1leGNsdWRlZC5kZWNpc2lvbl9pZCxyZWFzb25fY29kZXM9ZXhjbHVkZWQucmVhc29uX2NvZGVzLGV2aWRlbmNlX2NoZWNrc3VtPWV4Y2x1ZGVkLmV2aWRlbmNlX2NoZWNrc3VtLHBvbGljeV92ZXJzaW9uPWV4Y2x1ZGVkLnBvbGljeV92ZXJzaW9uLGRlY2lkZWRfYXQ9ZXhjbHVkZWQuZGVjaWRlZF9hdCx1cGRhdGVkX2F0PW5vdygpYCxbaW5wdXQuY2hhbm5lbElkLGV2YWx1YXRpb24uc3RhdHVzLGRlY2lzaW9uSWQsSlNPTi5zdHJpbmdpZnkoZXZhbHVhdGlvbi5yZWFzb25Db2RlcyksY2hlY2tzdW0sUkVWSUVXX0VMSUdJQklMSVRZX1BPTElDWV9WRVJTSU9OLGRlY2lzaW9uLnJvd3NbMF0uZGVjaWRlZF9hdF0pOwogICAgaWYoZXZhbHVhdGlvbi5zdGF0dXM9PT0nRUxJR0lCTEUnKWF3YWl0IG1hdGVyaWFsaXplRWxpZ2libGVSZXZpZXdJblRyYW5zYWN0aW9uKGNsaWVudCx7Y2hhbm5lbElkOmlucHV0LmNoYW5uZWxJZCxlbGlnaWJpbGl0eURlY2lzaW9uSWQ6ZGVjaXNpb25JZCF9KTsKICAgIGVsc2UgYXdhaXQgcmVjb25jaWxlTWFjaGluZU93bmVkUmV2aWV3KGNsaWVudCxpbnB1dC5jaGFubmVsSWQpOwogICAgYXdhaXQgY2xpZW50LnF1ZXJ5KCdDT01NSVQnKTsKICAgIHJldHVybiB7Li4uZXZhbHVhdGlvbixtb2RlLGNvbmZpZ3VyZWRNb2RlOmNvbmZpZ3VyZWQscmVjb3JkZWQ6dHJ1ZSxkZWNpc2lvbklkfTsKICB9Y2F0Y2goZXJyb3Ipe2F3YWl0IGNsaWVudC5xdWVyeSgnUk9MTEJBQ0snKTt0aHJvdyBlcnJvcjt9ZmluYWxseXtjbGllbnQucmVsZWFzZSgpO30KfQoKZXhwb3J0IGFzeW5jIGZ1bmN0aW9uIGluc3BlY3RSZXZpZXdFbGlnaWJpbGl0eShsaW1pdD0xMDApe2NvbnN0IGRiPWF3YWl0IGdldERiKCk7Y29uc3Qgcm93cz1hd2FpdCBkYi5xdWVyeShgU0VMRUNUIHAuKixjLmNoYW5uZWxfbmFtZSxjLmNvdW50cnksYy50cmFkaW5nX3N0YXR1cyxjLnNjYW5fc3RhdHVzIEZST00gcmV2aWV3X2VsaWdpYmlsaXR5X3Byb2plY3Rpb24gcCBKT0lOIGNoYW5uZWxzIGMgVVNJTkcoY2hhbm5lbF9pZCkgT1JERVIgQlkgcC51cGRhdGVkX2F0IERFU0MgTElNSVQgJDFgLFtNYXRoLm1pbig1MDAsTWF0aC5tYXgoMSxsaW1pdCkpXSk7cmV0dXJuIHttb2RlOmF3YWl0IGdldEFwcFNldHRpbmcoJ3Jldmlld19lbGlnaWJpbGl0eV92Ml9tb2RlJywnT0ZGJyksc2VydmluZ0F1dGhvcml0eTp0cnVlLGNyZWF0ZXNSZXZpZXdSb3dzOnRydWUsaXRlbXM6cm93cy5yb3dzfTt9Cg==
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Review serving contracts
+        run: node --import tsx --test server/reviewEligibility/policy.test.ts server/enrichmentLifecycle.test.ts server/enrichmentOperationalFailure.test.ts server/reviewEligibility/servingIntegration.test.ts server/release5/stage4ReviewCanaryContract.test.ts server/investigationWorkflow.test.ts
+      - name: Build
+        run: npm run build
+      - name: Verify authoritative review boundary
         run: |
-          python - <<'PY'
-          import base64, os
-          from pathlib import Path
-          def replace_once(path, old, new):
-              p=Path(path); s=p.read_text()
-              if s.count(old)!=1: raise SystemExit(f'{path}: expected one target, got {s.count(old)}')
-              p.write_text(s.replace(old,new,1))
-          replace_once('server/ingestionPipeline.ts', "    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput})\n      .catch(error=>console.warn(`[ReviewEligibility] authoritative write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));", "    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput});")
-          replace_once('server/queueManager.ts', "resultingStatus:channel?.trading_status||'NEEDS_REVIEW',output:{reason:'CASE_NO_LONGER_ELIGIBLE'}", "resultingStatus:channel?.trading_status||'POLICY_REJECTED',output:{reason:channel?'CASE_NO_LONGER_ELIGIBLE':'CHANNEL_MISSING'}")
-          Path('server/reviewEligibility/store.ts').write_bytes(base64.b64decode(os.environ['STORE_B64']))
-          p=Path('server/enrichmentOperationalFailure.test.ts'); s=p.read_text(); imp="import { resolveUncertainLifecycle } from './enrichmentLifecycle';\n"
-          if 'evaluateReviewEligibilityV2' not in s: s=s.replace(imp,imp+"import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';\n",1)
-          old="assert.deepEqual(resolveUncertainLifecycle(true),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});"
-          new="const eligibility=evaluateReviewEligibilityV2({classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false});\n  assert.deepEqual(resolveUncertainLifecycle(true,eligibility),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});"
-          if s.count(old)!=1: raise SystemExit('enrichment test target mismatch')
-          p.write_text(s.replace(old,new,1))
-          p=Path('server/reviewEligibility/servingIntegration.test.ts'); s=p.read_text()
-          if 'machine-owned authoritative projections supersede stale pending review debt' not in s:
-              s += "\n\ntest('machine-owned authoritative projections supersede stale pending review debt',()=>{const source=read('server/reviewEligibility/store.ts');assert.match(source,/reconcileMachineOwnedReview/);assert.match(source,/state='SUPERSEDED'/);});\n"
-              s += "test('production persistence failures propagate and missing channels never synthesize review',()=>{const ingestion=read('server/ingestionPipeline.ts'),queue=read('server/queueManager.ts');assert.doesNotMatch(ingestion,/authoritative write failed/);assert.doesNotMatch(queue,/channel\\?\\.trading_status\\|\\|'NEEDS_REVIEW'/);assert.match(queue,/channel\\?\\.trading_status\\|\\|'POLICY_REJECTED'/);});\n"
-              p.write_text(s)
-          PY
-          git config user.name "phase1-final-fix"
-          git config user.email "phase1-final-fix@users.noreply.github.com"
-          git add server/ingestionPipeline.ts server/queueManager.ts server/reviewEligibility/store.ts server/reviewEligibility/servingIntegration.test.ts server/enrichmentOperationalFailure.test.ts
-          git commit -m "fix: close final Phase 1 review gaps"
-          git push origin HEAD:fix/review-state-semantics-phase1
-          exit 0
+          set -euo pipefail
+          grep -q "servingAuthority:true" server/reviewEligibility/policy.ts
+          grep -q "review-eligibility-v2-serving-1" server/db/migrations/094_authoritative_review_projection.sql
+          grep -q "serving_authority!==true" server/release5/reviewMaterializer.ts
+          grep -q "evaluateReviewEligibilityV2(reviewEligibilityInput)" server/ingestionPipeline.ts
+          ! grep -q "authoritative write failed" server/ingestionPipeline.ts
+          grep -q "channel.scan_status = 'FAILED'" server/queueManager.ts
+          ! grep -q "channel?.trading_status||'NEEDS_REVIEW'" server/queueManager.ts
+          grep -q "state='OPERATIONALLY_BLOCKED'" server/investigationWorkflow.ts
+          ! git diff origin/main...HEAD -- server/youtube.ts server/youtubeProviderScheduler.ts | grep -E '^\+|^-'
