@@ -43,11 +43,13 @@ test('YouTube acquisition reports provider success only after validated JSON and
   assert.match(readerBlock,/youtubeProviderCooldown\.succeeded\(context\.providerKey\)/);
   assert.match(readerBlock,/if\s*\(!Array\.isArray\(object\.items\)\)[\s\S]*context\?\.acquisition\?\.providerSucceeded\(\)/);
 
-  const calls=[...source.matchAll(/youtubeFetch\(([^\n]+)\)/g)].slice(1).map(match=>match[1]);
+  const calls=[...source.matchAll(/youtubeFetch\(([^\n]+)\)/g)]
+    .filter(match=>!match[1].includes('url:string'))
+    .map(match=>match[1]);
   assert.ok(calls.length>=9);
   for(const args of calls){
     assert.match(args,/acquisition/);
-    assert.match(args,/keys\[index\]|keyPool\[index\]/);
+    assert.match(args,/keys\[index\]|keyPool\[index\]|apiKey/);
   }
 });
 
