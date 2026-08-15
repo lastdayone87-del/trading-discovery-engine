@@ -180,11 +180,12 @@ export async function processChannelThroughPipeline(
     },
     targetCountry
   );
-  // Country uncertainty is independent of trading uncertainty. Hydrate the
-  // authoritative channel resource with a one-unit call before spending on AI
-  // or community crawling. Failure remains observable and conservatively does
-  // not turn absence of metadata into an exclusion.
-  if (countryVal.status === 'UNCERTAIN' && candidate.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED') {
+  // Country uncertainty and subscriber availability are both cheap official
+  // channel-metadata concerns. If either is unresolved, hydrate them together
+  // with one channels.list request before semantic AI, enrichment, or Discord.
+  const subscriberEvidenceMissing = evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
+  const needsCountryHydration = countryVal.status === 'UNCERTAIN' && candidate.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED';
+  if (needsCountryHydration || subscriberEvidenceMissing) {
     const hydrated = await fetchYouTubeChannelCountryMetadata(candidate.channelId, candidate);
     Object.assign(candidate, hydrated);
     countryVal = await validateChannelCountry({ channelName:candidate.channelName, description:candidate.description,
