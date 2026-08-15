@@ -17,7 +17,39 @@ export async function recordAutonomousPage(p:AutonomousPageObservation):Promise<
 }
 
 export async function autonomousPageExists(runId:string,pageNumber:number):Promise<boolean>{const db=await getDb();const r=await db.query('SELECT 1 FROM autonomous_query_page_observations WHERE query_run_id=$1 AND page_number=$2',[runId,pageNumber]);return !!r.rowCount;}
-export async function getAutonomousContinuationState(runId:string):Promise<{consecutiveLowYieldPages:number;cumulativeDistinctCreators:number}>{const db=await getDb();const r=await db.query(`SELECT distinct_creator_count,marginal_utility,decision_reason_codes FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number DESC`,[runId]);let consecutive=0;for(const row of r.rows){const codes=typeof row.decision_reason_codes==='string'?JSON.parse(row.decision_reason_codes):row.decision_reason_codes;const low=Number(row.marginal_utility)<.2||codes?.some((x:string)=>['ZERO_CONFIRMED_VALUE','DUPLICATE_HEAVY','WRONG_COUNTRY'].includes(x));if(!low)break;consecutive++;}return {consecutiveLowYieldPages:consecutive,cumulativeDistinctCreators:r.rows.reduce((n,row)=>n+Number(row.distinct_creator_count||0),0)};}
+export async function getAutonomousContinuationState(runId:string):Promise<{
+  consecutiveLowYieldPages:number;
+  cumulativeDistinctCreators:number;
+  delayedConfirmedCreators:number;
+  delayedNonTradingCreators:number;
+  delayedQualityCreators:number;
+}>{
+  const db=await getDb();
+  const [pagesRes, delayedRes] = await Promise.all([
+    db.query(`SELECT distinct_creator_count,marginal_utility,decision_reason_codes FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number DESC`,[runId]),
+    db.query(`SELECT
+      COUNT(*) FILTER(WHERE c.trading_status='TRADING_CONFIRMED')::int AS delayed_confirmed,
+      COUNT(*) FILTER(WHERE c.trading_status IN ('NON_TRADING','HUMAN_REJECTED'))::int AS delayed_non_trading,
+      COUNT(*) FILTER(WHERE c.trading_status='TRADING_CONFIRMED' AND COALESCE(c.quality_score,0)>=55)::int AS delayed_quality
+      FROM channel_sightings s JOIN channels c ON c.channel_id=s.channel_id WHERE s.query_run_id=$1`,[runId])
+  ]);
+
+  const delayed = delayedRes.rows[0] || { delayed_confirmed: 0, delayed_non_trading: 0, delayed_quality: 0 };
+  let consecutive=0;
+  for(const row of pagesRes.rows){
+    const codes=typeof row.decision_reason_codes==='string'?JSON.parse(row.decision_reason_codes):row.decision_reason_codes;
+    const low=Number(row.marginal_utility)<.2||codes?.some((x:string)=>['ZERO_CONFIRMED_VALUE','DUPLICATE_HEAVY','WRONG_COUNTRY'].includes(x));
+    if(!low)break;
+    consecutive++;
+  }
+  return {
+    consecutiveLowYieldPages:consecutive,
+    cumulativeDistinctCreators:pagesRes.rows.reduce((n,row)=>n+Number(row.distinct_creator_count||0),0),
+    delayedConfirmedCreators: Number(delayed.delayed_confirmed || 0),
+    delayedNonTradingCreators: Number(delayed.delayed_non_trading || 0),
+    delayedQualityCreators: Number(delayed.delayed_quality || 0)
+  };
+}
 export async function getAutonomousRunMetrics(runId:string):Promise<QueryFunnelMetrics>{const db=await getDb();const r=await db.query('SELECT page_metrics FROM autonomous_query_page_observations WHERE query_run_id=$1 ORDER BY page_number',[runId]);return aggregatePageMetrics(r.rows.map(x=>typeof x.page_metrics==='string'?JSON.parse(x.page_metrics):x.page_metrics));}
 
 export function aggregatePageMetrics(pages:QueryFunnelMetrics[]):QueryFunnelMetrics {

@@ -14,8 +14,8 @@ import {
   getAppSetting
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
-import { limitRepeatedPrimaryTerms, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent } from './queryPlanner';
-import { selectQueryCollection, type QueryFunnelMetrics } from './queryPerformance';
+import { limitRepeatedPrimaryTerms, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
+import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
 import { executeProviderCall } from './providerResilience';
 import { appendProviderCallEvent } from './db';
@@ -452,6 +452,31 @@ export async function evaluateQueryPerformance(
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
   const performanceScore = metrics.performanceScore;
   const newCollection = selectQueryCollection(queryRecord.collection, queryRecord.times_executed, metrics);
+
+  if (isSeverelyContaminatedQuery(metrics)) {
+    const vocabs = await getCountryVocabularies();
+    const countryVocab = vocabs.find(v => v.country.toLowerCase() === queryRecord.country.toLowerCase());
+    const reformulated = reformulatePollutedQuery({
+      pollutedQuery: queryRecord.query,
+      country: queryRecord.country,
+      intent: queryRecord.intent,
+      countryVocabulary: countryVocab
+    });
+    if (reformulated) {
+      await upsertQueryRecord({
+        query: reformulated.query,
+        country: queryRecord.country,
+        collection: 'EXPERIMENTAL',
+        intent: reformulated.intent,
+        knowledgeTiers: reformulated.knowledgeTiers,
+        generationMode: reformulated.generationMode,
+        generationReason: reformulated.generationReason,
+        discoveryObjective: reformulated.discoveryObjective,
+        primaryTerm: reformulated.primaryTerm,
+        generationMetadata: reformulated.metadata
+      }).catch(error => console.warn(`[QueryIntelligence] Reformulation failed for ${queryRecord.query}:`, error));
+    }
+  }
 
   await updateQueryExecutionStats(queryRecord.id, {
     totalChannelsFound: metrics.distinctResults,

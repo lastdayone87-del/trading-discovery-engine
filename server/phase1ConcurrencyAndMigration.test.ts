@@ -14,8 +14,9 @@ test('rolling deployment trigger converts unbacked NEEDS_REVIEW to ENRICHMENT_PE
 
 test('store enforces monotonic evidence timestamp ordering for projections', () => {
   const storeSource = read('server/reviewEligibility/store.ts');
+  const pipeSource = read('server/ingestionPipeline.ts');
   assert.match(storeSource, /WHERE excluded\.decided_at>=review_eligibility_projection\.decided_at/);
-  assert.match(storeSource, /decidedAt/);
+  assert.match(pipeSource, /decidedAt:productionClassification\.decision\.timestamp/);
 });
 
 test('review materializer prevents older machine eligibility from reopening human-resolved reviews', () => {

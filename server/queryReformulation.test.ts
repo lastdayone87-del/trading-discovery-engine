@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { reformulatePollutedQuery } from './queryPlanner';
 import { isSeverelyContaminatedQuery, selectQueryCollection } from './queryPerformance';
+
+const root = process.cwd();
+const read = (p: string) => fs.readFileSync(path.join(root, p), 'utf8');
 
 test('reformulatePollutedQuery generates governed trading-specific reformulation', () => {
   const result = reformulatePollutedQuery({
@@ -39,4 +44,10 @@ test('isSeverelyContaminatedQuery quarantines heavily contaminated query cohorts
 
   assert.equal(isSeverelyContaminatedQuery(metrics), true);
   assert.equal(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
+});
+
+test('evaluateQueryPerformance triggers reformulatePollutedQuery on contaminated query runs', () => {
+  const intelSource = read('server/queryIntelligence.ts');
+  assert.match(intelSource, /isSeverelyContaminatedQuery\(metrics\)/);
+  assert.match(intelSource, /reformulatePollutedQuery/);
 });

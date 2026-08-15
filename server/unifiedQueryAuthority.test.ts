@@ -37,10 +37,11 @@ test('evaluateAutonomousQueryAuthority requires valid retrieval specificity prov
   assert.ok(decision.reasonCodes.includes('CURRENT_RETRIEVAL_PROVENANCE_MISSING'));
 });
 
-test('queueManager enforces execution-time query authority revalidation', () => {
+test('queueManager enforces execution-time query authority revalidation and handles missing provenance', () => {
   const queueSource = read('server/queueManager.ts');
   assert.match(queueSource, /evaluateAutonomousQueryAuthority/);
   assert.match(queueSource, /withheld before queuing/);
   assert.match(queueSource, /Withheld automated search job/);
-  assert.match(queueSource, /evaluateAutonomousQueryAuthority\(qRecord\)/);
+  assert.match(queueSource, /QUERY_PROVENANCE_RECORD_MISSING/);
+  assert.match(queueSource, /source !== 'manual_search'/);
 });

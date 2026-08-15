@@ -22,3 +22,11 @@ test('evaluateLowAudienceGate skips deep crawl for 1-29 subscribers and proceeds
   assert.equal(evaluateLowAudienceGate('500').shouldSkipDeepEnrichment, false);
   assert.equal(evaluateLowAudienceGate('hidden').shouldSkipDeepEnrichment, false);
 });
+
+test('evaluateLowAudienceGate allows reactivation when subscriber count grows from 18 to 35', () => {
+  const initial = evaluateLowAudienceGate('18');
+  assert.equal(initial.shouldSkipDeepEnrichment, true);
+
+  const grown = evaluateLowAudienceGate('35');
+  assert.equal(grown.shouldSkipDeepEnrichment, false);
+});

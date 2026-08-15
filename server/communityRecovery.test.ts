@@ -18,6 +18,14 @@ const mockChannel = (scan_status = 'FAILED_PERMANENT', last_checked = '2026-01-0
   last_checked
 });
 
+test('FAILED_PERMANENT without triggers remains dormant', () => {
+  const channel = mockChannel('FAILED_PERMANENT', '2026-08-15T00:00:00Z');
+  const check = shouldReactivateCommunityRecovery(channel, undefined, false, Date.parse('2026-08-15T12:00:00Z'));
+
+  assert.equal(check.reactivate, false);
+  assert.ok(check.reasonCodes.includes('NO_REACTIVATION_TRIGGER_MATCHED'));
+});
+
 test('shouldReactivateCommunityRecovery reactivates FAILED_PERMANENT on newly observed links', () => {
   const channel = mockChannel();
   const check = shouldReactivateCommunityRecovery(channel, {
@@ -43,9 +51,13 @@ test('shouldReactivateCommunityRecovery reactivates FAILED_PERMANENT after fresh
 
 test('reactivateCommunityRecovery resets scan_status to ENRICHMENT_PENDING while preserving history', () => {
   const channel = mockChannel();
+  channel.inspection_trail = [{ step: 'BIO', title: 'Prior Failed Attempt', status: 'NOT_FOUND', timestamp: '2026-01-01T00:00:00Z' }];
+
   const reactivated = reactivateCommunityRecovery(channel, ['OPERATOR_NOMINATED_RECHECK']);
 
   assert.equal(reactivated.scan_status, 'ENRICHMENT_PENDING');
   assert.equal(reactivated.discord_status, 'UNCERTAIN');
-  assert.ok(reactivated.inspection_trail?.some(step => step.title.includes('Reactivated')));
+  assert.equal(reactivated.inspection_trail.length, 2);
+  assert.equal(reactivated.inspection_trail[0].title, 'Prior Failed Attempt');
+  assert.ok(reactivated.inspection_trail[1].title.includes('Reactivated'));
 });

@@ -74,3 +74,35 @@ export function reactivateCommunityRecovery(
     ]
   };
 }
+
+let lastCommunityRecoveryReconciliationAt = 0;
+
+export async function reconcileCommunityAcquisitionRecovery(
+  getDb: () => Promise<any>,
+  getChannelById: (id: string) => Promise<ChannelRecord | null>,
+  upsertChannel: (channel: ChannelRecord) => Promise<void>,
+  limit = 20,
+  now = Date.now()
+): Promise<number> {
+  if (now - lastCommunityRecoveryReconciliationAt < 60_000) return 0;
+  lastCommunityRecoveryReconciliationAt = now;
+
+  const db = await getDb();
+  const rows = await db.query(
+    `SELECT c.channel_id FROM channels c WHERE c.scan_status='FAILED_PERMANENT' AND (c.last_checked IS NULL OR c.last_checked < now() - interval '30 days') ORDER BY c.last_checked ASC LIMIT $1`,
+    [Math.min(100, Math.max(1, limit))]
+  );
+
+  let reactivatedCount = 0;
+  for (const row of rows.rows) {
+    const channelRecord = await getChannelById(row.channel_id);
+    if (!channelRecord) continue;
+    const triggerCheck = shouldReactivateCommunityRecovery(channelRecord, undefined, false, now);
+    if (triggerCheck.reactivate) {
+      const updated = reactivateCommunityRecovery(channelRecord, triggerCheck.reasonCodes, new Date(now).toISOString());
+      await upsertChannel(updated);
+      reactivatedCount++;
+    }
+  }
+  return reactivatedCount;
+}

@@ -7,6 +7,7 @@ import {
   recoverStaleJobs,
   getAllChannels,
   getChannelById,
+  getQueriesByCountry,
   upsertChannel,
   getCountryVocabularies,
   getQueueStatus,
@@ -43,6 +44,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
+import { reconcileCommunityAcquisitionRecovery } from './communityRecovery';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
@@ -66,13 +68,13 @@ const WORKER_ID = `worker_${process.pid}`;
  * Pushes a new search query job to the Search Jobs Queue.
  */
 export interface JobProvenance { actorId: string; requestId?: string }
-export async function addSearchJob(query: string, country: string, source: DiscoverySource, provenance: JobProvenance = {actorId:'system:scheduler'}): Promise<SearchJob> {
+export async function addSearchJob(query: string, country: string, source: DiscoverySource, provenance: JobProvenance = {actorId:'system:scheduler'}, queryId?: number): Promise<SearchJob> {
   await assertCountryAllowed(country, `queue:${source}`);
   const catalogPin=await getActiveCatalogPin(country);
   await recordExecutionStage('JOB_CREATION','REACHED',{type:'SEARCH_YOUTUBE',source},provenance.requestId);
   const job = await enqueueJob(
     'SEARCH_YOUTUBE',
-    { query, country, source, provenance, catalogPin, traceId:provenance.requestId },
+    { query, country, source, provenance, catalogPin, traceId:provenance.requestId, queryId },
     {
       idempotencyKey: `search:${source}:${country.toLowerCase()}:${query.toLowerCase()}`,
       priority: source === 'manual_search' ? 100 : 20
@@ -153,6 +155,7 @@ export async function processNextSearchJob(
   await recoverStaleJobs();
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
+  await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel);
   triggerPhaseBObservationReconciliation();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
@@ -322,7 +325,9 @@ export async function processNextSearchJob(
     // Execution-time query authority revalidation: every non-manual search job
     // must satisfy the current retrieval-policy before YouTube quota is spent.
     if (source !== 'manual_search') {
-      const qRecord = queryId ? await getQueryById(queryId) : null;
+      const qRecord = queryId
+        ? await getQueryById(queryId)
+        : (await getQueriesByCountry(country)).find(q => q.query.toLowerCase() === query.toLowerCase());
       if (qRecord) {
         const queryAuthority = evaluateAutonomousQueryAuthority(qRecord);
         if (!queryAuthority.eligible) {
@@ -331,6 +336,11 @@ export async function processNextSearchJob(
           await completeJob(job.id);
           return true;
         }
+      } else {
+        console.log(`[Unified Query Authority] Withheld automated search job ${job.id} for "${query}" (${country}) before spending YouTube quota: QUERY_PROVENANCE_RECORD_MISSING.`);
+        if (queryRunId) await failQueryRun(queryRunId, new Error('Query authority missing: QUERY_PROVENANCE_RECORD_MISSING'), true);
+        await completeJob(job.id);
+        return true;
       }
     }
     const vocabs = await getCountryVocabularies();
@@ -395,7 +405,7 @@ export async function processNextSearchJob(
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const maxPages=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_pages','3')));const maxLow=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_low_yield_pages','2')));
       const prior=await getAutonomousContinuationState(queryRunId);
-      const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
+      const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,delayedConfirmedCreators:prior.delayedConfirmedCreators,delayedNonTradingCreators:prior.delayedNonTradingCreators,delayedQualityCreators:prior.delayedQualityCreators,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
       const enabled=await getAppSetting('autonomous_pagination_enabled','true')==='true';
       const stoppingReason=decision.shouldContinue?null:decision.primaryReason;
       const pageObservation={queryRunId,pageNumber,inputPageToken:pageToken,nextPageToken:searchPage?.nextPageToken||null,retrievalLane,searchOrdering,rawResultCount:metrics.rawResults,distinctCreatorCount:metrics.distinctResults,knownCreators:metrics.knownChannels,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,averageQualityScore:metrics.averageQualityScore,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,noveltyRatio:metrics.noveltyRatio,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,quotaUnits:providerQuotaUnits,decision,stoppingReason,pageMetrics:metrics};
