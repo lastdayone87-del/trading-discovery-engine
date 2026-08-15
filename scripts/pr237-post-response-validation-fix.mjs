@@ -25,11 +25,22 @@ fs.writeFileSync(youtubePath, source);
 
 const testPath = 'server/youtubeRequestScheduler.test.ts';
 let tests = fs.readFileSync(testPath, 'utf8');
+const oldSchedulerExpectation = `  assert.match(youtubeFetch, /youtubeProviderCooldown\\.succeeded\\(dispatchedProviderKey\\)/);`;
+const newSchedulerExpectation = `  assert.match(youtubeFetch, /youtubeResponseProviderContext\\.set\\(response,\\{providerKey:dispatchedProviderKey,acquisition\\}\\)/);`;
+if (tests.includes(oldSchedulerExpectation)) tests = tests.replace(oldSchedulerExpectation, newSchedulerExpectation);
+
 const testName = "post-response validation failures preserve the actual dispatched provider identity";
 if (!tests.includes(testName)) {
   const anchor = `test('provider-loop requests carry the selected API key into scheduler dispatch', () => {`;
   const addition = `test('${testName}', () => {\n  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');\n  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));\n  const reader = source.slice(source.indexOf('export async function readYouTubeJsonObject'), source.indexOf('/** A request-rate limit'));\n  assert.match(source, /youtubeResponseProviderContext = new WeakMap<Response/);\n  assert.match(youtubeFetch, /youtubeResponseProviderContext\\.set\\(response,\\{providerKey:dispatchedProviderKey,acquisition\\}\\)/);\n  assert.doesNotMatch(youtubeFetch, /youtubeProviderCooldown\\.succeeded\\(dispatchedProviderKey\\)/);\n  assert.match(reader, /const context = youtubeResponseProviderContext\\.get\\(response\\)/);\n  assert.match(reader, /failedDispatchProviders\\(context\\.acquisition\\)\\?\\.add\\(context\\.providerKey\\)/);\n  assert.match(reader, /Object\\.assign\\(error,\\{providerKey:context\\.providerKey\\}\\)/);\n  assert.match(reader, /youtubeProviderCooldown\\.succeeded\\(context\\.providerKey\\)/);\n  assert.match(reader, /context\\?\\.acquisition\\?\\.providerSucceeded\\(\\)/);\n});\n\n`;
   if (!tests.includes(anchor)) throw new Error('test insertion anchor not found');
   tests = tests.replace(anchor, addition + anchor);
-  fs.writeFileSync(testPath, tests);
 }
+fs.writeFileSync(testPath, tests);
+
+const liveTestPath = 'server/youtubeLiveProviderDispatch.test.ts';
+let liveTests = fs.readFileSync(liveTestPath, 'utf8');
+const oldLiveExpectation = `  assert.match(source,/youtubeProviderCooldown\\.succeeded\\(dispatchedProviderKey\\)/);`;
+const newLiveExpectation = `  assert.match(source,/youtubeResponseProviderContext\\.set\\(response,\\{providerKey:dispatchedProviderKey,acquisition\\}\\)/);`;
+if (liveTests.includes(oldLiveExpectation)) liveTests = liveTests.replace(oldLiveExpectation, newLiveExpectation);
+fs.writeFileSync(liveTestPath, liveTests);
