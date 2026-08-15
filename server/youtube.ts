@@ -671,7 +671,7 @@ export async function fetchYouTubeChannelEnrichment(
 }
 
 
-/** One-unit metadata hydration used only when country evidence remains uncertain. */
+/** One-unit basic metadata hydration used when country or subscriber evidence is missing. */
 export async function fetchYouTubeChannelCountryMetadata(channelId: string, fallback: DiscoveredChannelRaw): Promise<DiscoveredChannelRaw> {
   const keys = getYouTubeKeyPool();
   const checkedAt = new Date().toISOString();
@@ -682,15 +682,17 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
   try { const providerIndexes=availableKeyIndexes(keys); for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
     const index = providerIndexes[attempt];
     try {
-      const url = buildYouTubeApiUrl('channels',keys[index],{part:'snippet,brandingSettings',id:channelId});
+      const url = buildYouTubeApiUrl('channels',keys[index],{part:'snippet,brandingSettings,statistics',id:channelId});
       const response = await youtubeFetch(url, 'channel-country-metadata', 1, attempt + 1, acquisition, 'enrichment', keys[index]);
       const data = await readYouTubeJsonObject(response, 'channel-country-metadata');
       const channel = data.items?.[0];
       if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
       await incrementQuota(1);
       const officialCountry = channel.brandingSettings?.channel?.country;
+      const subscriberCount = channel.statistics?.hiddenSubscriberCount === true ? fallback.subscriberCount : (channel.statistics?.subscriberCount || fallback.subscriberCount);
       return { ...fallback, description: channel.snippet?.description || fallback.description,
         locationTag: officialCountry || fallback.locationTag,
+        subscriberCount,
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
     } catch (error) { recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++; }
   }
