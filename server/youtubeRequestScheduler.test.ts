@@ -104,6 +104,18 @@ test('youtubeFetch reselects from the live provider pool at dispatch and clears 
   assert.match(youtubeFetch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey\}\)/);
 });
 
+test('youtubeFetch records the actual provider failure before scheduler release and prevents duplicate outer accounting', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  const failureBranch = youtubeFetch.slice(youtubeFetch.indexOf('if(!response.ok)'), youtubeFetch.indexOf('if(dispatchedProviderKey)youtubeProviderCooldown.succeeded'));
+  assert.match(failureBranch, /youtubeProviderCooldown\.failed\(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED'\)/);
+  assert.match(failureBranch, /youtubeProviderCooldown\.failed\(dispatchedProviderKey,'RATE_LIMITED'\)/);
+  assert.match(failureBranch, /providerFailureRecorded:true/);
+  assert.ok(failureBranch.indexOf('youtubeProviderCooldown.failed') < failureBranch.indexOf('throw error'));
+  const recorder = source.slice(source.indexOf('function recordProviderFailure'), source.indexOf('export function selectYouTubeDispatchProviderIndex'));
+  assert.match(recorder, /providerFailureRecorded === true\) return/);
+});
+
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey\)/);

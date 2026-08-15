@@ -160,6 +160,7 @@ function throwIfAllProvidersCoolingDown(keys: string[]): void {
 }
 
 function recordProviderFailure(key: string, error: unknown): void {
+  if ((error as any)?.providerFailureRecorded === true) return;
   const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;
   if (isQuotaExceeded(error)) youtubeProviderCooldown.failed(dispatchedKey, 'DAILY_QUOTA_EXHAUSTED');
   else if (isYouTubeRateLimited(error)) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');
@@ -240,6 +241,11 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           trace('before HTTP-error-body-read at server/youtube.ts:135');
           const error=await youtubeHttpError(response,trace);
           trace('after HTTP-error-body-read at server/youtube.ts:135');
+          if(dispatchedProviderKey){
+            if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');
+            else if(isYouTubeRateLimited(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');
+            if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
+          }
           throw error;
         }
         if(dispatchedProviderKey)youtubeProviderCooldown.succeeded(dispatchedProviderKey);
