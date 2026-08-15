@@ -17,7 +17,7 @@ export type DiscordLivenessStatus='NOT_CHECKED'|'ACTIVE'|'INVALID_OBSERVED'|'DEA
 export type DiscordRelevanceStatus='NOT_CHECKED'|'TRADING_RELEVANT'|'NON_TRADING'|'UNCERTAIN';
 export type DiscordValidationStatus='NOT_STARTED'|'RETRY_PENDING'|'SUCCEEDED'|'FAILED_OPERATIONAL'|'COMPLETED';
 
-export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED';
+export type ScanStatus = 'PENDING' | 'LOCKED' | 'ENRICHMENT_PENDING' | 'ENRICHING' | 'NEEDS_REVIEW' | 'COMPLETED' | 'FAILED' | 'FAILED_PERMANENT' | 'SKIPPED_NON_TRADING' | 'SKIPPED_EXCLUDED' | 'SKIPPED_LOW_AUDIENCE';
 
 export type DiscoverySource = 'manual_search' | 'automated_query' | 'recheck';
 

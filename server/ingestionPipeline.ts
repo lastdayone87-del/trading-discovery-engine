@@ -24,8 +24,11 @@ import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceF
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders } from './enrichmentOperationalFailure';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
+import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
+import { evaluateLowAudienceGate } from './lowAudienceGate';
+import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -101,6 +104,15 @@ export async function processChannelThroughPipeline(
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);
   if (existing) {
+    if (existing.scan_status === 'FAILED_PERMANENT') {
+      const trigger = shouldReactivateCommunityRecovery(existing, candidate, isManualScan);
+      if (trigger.reactivate) {
+        const reactivated = reactivateCommunityRecovery(existing, trigger.reasonCodes);
+        await upsertChannel(reactivated);
+        existing.scan_status = reactivated.scan_status;
+        existing.discord_status = reactivated.discord_status;
+      }
+    }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
     if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
@@ -215,6 +227,57 @@ export async function processChannelThroughPipeline(
       discordStatus: 'NOT_FOUND',
       discordInvite: null,
       channelRecord: undefined
+    };
+  }
+
+  // Phase 7: Low-Audience Budget Gate
+  const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
+  if (lowAudienceGate.shouldSkipDeepEnrichment) {
+    console.log(`[Unified Ingestion Pipeline - Phase 7] Channel '${candidate.channelName}' (${candidate.channelId}) has ${candidate.subscriberCount} subscribers (< 30 threshold). Storing and marking low-audience skip.`);
+    const lowAudienceChannel: ChannelRecord = existing || {
+      channel_id: candidate.channelId,
+      channel_name: candidate.channelName,
+      youtube_url: candidate.youtubeUrl,
+      country: resolvedCountry,
+      country_status: countryVal.status,
+      confidence_score: countryVal.score,
+      discord_status: 'NOT_FOUND',
+      discord_invite: null,
+      scan_status: 'SKIPPED_LOW_AUDIENCE',
+      scan_attempts: 0,
+      discovery_source: source,
+      first_seen: now,
+      last_checked: now,
+      inspection_trail: [countryValidationStep, {
+        step: 'BIO',
+        title: 'Low-Audience Budget Gate',
+        status: 'SKIPPED',
+        details: `Subscribers: ${candidate.subscriberCount} (< 30). Stored and skipped deep enrichment.`,
+        timestamp: now
+      }],
+      subscriber_count: candidate.subscriberCount,
+      channel_thumbnail_url: candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
+      trading_status: 'UNCERTAIN'
+    };
+
+    lowAudienceChannel.subscriber_count = candidate.subscriberCount;
+    lowAudienceChannel.scan_status = 'SKIPPED_LOW_AUDIENCE';
+    lowAudienceChannel.trading_status = existing?.trading_status || 'UNCERTAIN';
+    lowAudienceChannel.last_checked = now;
+    applyCandidateObservability(lowAudienceChannel, candidate);
+    await upsertChannel(lowAudienceChannel);
+
+    return {
+      channelId: candidate.channelId,
+      channelName: candidate.channelName,
+      isNew: !existing,
+      wasKnown: !!existing,
+      persisted: true,
+      countryStatus: countryVal.status,
+      tradingStatus: lowAudienceChannel.trading_status || 'UNCERTAIN',
+      discordStatus: 'NOT_FOUND',
+      discordInvite: null,
+      channelRecord: lowAudienceChannel
     };
   }
 
@@ -365,7 +428,7 @@ export async function processChannelThroughPipeline(
         candidateHypothesis:{plausibleTradingHypothesis:false,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION},
         evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent,enrichmentStage:currentStage,reasonCodes:['NO_INDEPENDENT_TRADING_HYPOTHESIS_AFTER_ENRICHMENT']}})
         .catch(error=>console.warn(`[CandidateAdmission] post-enrichment withholding write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false})
+      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false,decidedAt:productionClassification.decision.timestamp})
         .catch(error=>console.warn(`[ReviewEligibility] withholding shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
       return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'UNCERTAIN',discordStatus:'UNCERTAIN',discordInvite:null,channelRecord:withheldChannel};
     }
@@ -374,11 +437,12 @@ export async function processChannelThroughPipeline(
     let evidencePlan:EvidenceActionPlan|undefined;
     try {const quota=await getQuota();evidencePlan=await planAndRecordEvidenceAction({channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,decision:productionClassification.decision,rawInput:productionClassification.input,legacyAction,providerQuotaRemaining:Math.max(0,quota.dailyLimit-quota.unitsUsed)});} catch(error){console.warn(`[VOI Evidence] Planning failed for ${candidate.channelId}; preserving legacy enrichment.`,error instanceof Error?error.message:error);}
     const appliedAction=evidencePlan?.appliedAction||legacyAction,shouldReview=appliedAction==='HUMAN_REVIEW';
-    const lifecycle = resolveUncertainLifecycle(shouldReview);
-    const finalUncertainStatus = lifecycle.tradingStatus;
-    const finalScanStatus = lifecycle.scanStatus;
     const corroboration=productionClassification.decision.stagedClassification?.stages.find(stage=>stage.stage==='CORROBORATION');
-    void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false}).catch(error=>console.warn(`[ReviewEligibility] shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+    const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
+    const reviewEligibility=evaluateReviewEligibilityV2(reviewEligibilityInput);
+    const lifecycle = resolveUncertainLifecycle(shouldReview,reviewEligibility);
+    const finalUncertainStatus = lifecycle.tradingStatus==='NEEDS_REVIEW'?'UNCERTAIN':lifecycle.tradingStatus;
+    const finalScanStatus = lifecycle.scanStatus==='NEEDS_REVIEW'?'COMPLETED':lifecycle.scanStatus;
 
     const uncertainChannel: ChannelRecord = existing || {
       channel_id: candidate.channelId,
@@ -416,6 +480,8 @@ export async function processChannelThroughPipeline(
     applyCandidateObservability(uncertainChannel, candidate);
 
     await upsertChannel(uncertainChannel);
+    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput,decidedAt:productionClassification.decision.timestamp});
+    const authoritativeChannel=(await getChannelById(candidate.channelId))||uncertainChannel;
 
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
@@ -434,10 +500,10 @@ export async function processChannelThroughPipeline(
       wasKnown: !!existing,
       persisted: true,
       countryStatus: countryVal.status,
-      tradingStatus: finalUncertainStatus,
+      tradingStatus: authoritativeChannel.trading_status || finalUncertainStatus,
       discordStatus: 'UNCERTAIN',
       discordInvite: null,
-      channelRecord: uncertainChannel
+      channelRecord: authoritativeChannel
     };
   }
 

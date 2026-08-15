@@ -22,6 +22,13 @@ const STRONG_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['JAPANESE_TRADING', /(トレード|デイトレード|先物|テクニカル分析|板読み|オーダーフロー)/u]
 ];
 
+const STRONG_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
+  ['GAMING', /\b(gameplay|walkthrough|playthrough|minecraft|roblox|fortnite|valorant|league\s*of\s*legends|gta\s*v|gta\s*5|call\s*of\s*duty|pokemon|pokémon|genshin|esports?|gaming\s*channel)\b/iu],
+  ['COOKING_RECIPES', /\b(recipe|recipes|cooking|kitchen|bake|baking|chef|cuisine|mukbang|delicious\s*food|street\s*food)\b/iu],
+  ['ENTERTAINMENT_GOSSIP', /\b(celebrity|gossip|vlog|vlogging|prank|pranks|unboxing|toy\s*review|makeup\s*tutorial|beauty\s*vlog|reaction\s*video|music\s*video|official\s*music\s*video|mv\b)\b/iu],
+  ['GENERIC_PERSONAL_FINANCE', /\b(personal\s*finance|budgeting|credit\s*card\s*points|save\s*money|paying\s*off\s*debt|mortgage\s*calculator)\b/iu]
+];
+
 function staleMatchedVideo(candidate: DiscoveredChannelRaw, now = Date.now()): boolean {
   if (candidate.matchedDocument?.type !== 'VIDEO' || !candidate.matchedDocument.publishedAt) return false;
   const publishedAt = Date.parse(candidate.matchedDocument.publishedAt);
@@ -71,6 +78,15 @@ export function triageAutonomousSearchCandidate(
       disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
       reasonCodes: ['RETRIEVAL_DOCUMENT_HAS_EXPLICIT_TRADING_SIGNAL'],
       matchedSignals
+    };
+  }
+
+  const negativeSignals = STRONG_NON_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
+  if (negativeSignals.length) {
+    return {
+      disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
+      reasonCodes: ['EXPLICIT_NON_TRADING_SIGNAL_DETECTED', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
+      matchedSignals: negativeSignals
     };
   }
 
