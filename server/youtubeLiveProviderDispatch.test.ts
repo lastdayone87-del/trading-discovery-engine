@@ -30,7 +30,8 @@ test('youtubeFetch performs live reselection inside scheduler dispatch and rebui
   const youtubeFetch=source.slice(source.indexOf('async function youtubeFetch'),source.indexOf('export type YouTubeAdditionalQuotaCallback'));
   assert.doesNotMatch(youtubeFetch,/activeKeyIndex=dispatchIndex/);
   assert.doesNotMatch(youtubeFetch,/youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
-  assert.match(reader,/youtubeProviderCooldown\.succeeded\(context\.providerKey\)/);
+  assert.match(reader,/youtubeProviderCooldown\.succeeded\(context\.providerKey,context\.providerFailureGeneration\)/);
+  assert.match(youtubeFetch,/providerFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined/);
   assert.match(reader,/validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
   assert.match(reader,/if\(validatedIndex>=0\)activeKeyIndex=validatedIndex/);
 });

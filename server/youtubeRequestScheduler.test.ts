@@ -100,14 +100,14 @@ test('youtubeFetch reselects from the live provider pool at dispatch and clears 
   assert.match(youtubeFetch, /selectYouTubeDispatchProviderIndex\(livePool,providerKey\)/);
   assert.match(youtubeFetch, /rebuiltUrl\.searchParams\.set\('key',dispatchedProviderKey\)/);
   assert.match(youtubeFetch, /fetch\(dispatchedUrl,\{signal\}\)/);
-  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition\}\)/);
+  assert.match(youtubeFetch, /providerFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined[\s\S]*youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration\}\)/);
   assert.match(youtubeFetch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey/);
 });
 
 test('youtubeFetch records the actual provider failure before scheduler release and prevents duplicate outer accounting', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
-  const failureBranch = youtubeFetch.slice(youtubeFetch.indexOf('if(!response.ok)'), youtubeFetch.indexOf('if(dispatchedProviderKey)youtubeProviderCooldown.succeeded'));
+  const failureBranch = youtubeFetch.slice(youtubeFetch.indexOf('if(!response.ok)'), youtubeFetch.indexOf('youtubeResponseProviderContext.set'));
   assert.match(failureBranch, /youtubeProviderCooldown\.failed\(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED'\)/);
   assert.match(failureBranch, /youtubeProviderCooldown\.failed\(dispatchedProviderKey,'RATE_LIMITED'\)/);
   assert.match(failureBranch, /providerFailureRecorded:true/);
@@ -148,12 +148,12 @@ test('post-response validation failures preserve the actual dispatched provider 
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
   const reader = source.slice(source.indexOf('export async function readYouTubeJsonObject'), source.indexOf('/** A request-rate limit'));
   assert.match(source, /youtubeResponseProviderContext = new WeakMap<Response/);
-  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition\}\)/);
+  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration\}\)/);
   assert.doesNotMatch(youtubeFetch, /youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
   assert.match(reader, /const context = youtubeResponseProviderContext\.get\(response\)/);
   assert.match(reader, /failedDispatchProviders\(context\.acquisition\)\?\.add\(context\.providerKey\)/);
   assert.match(reader, /Object\.assign\(error,\{providerKey:context\.providerKey\}\)/);
-  assert.match(reader, /youtubeProviderCooldown\.succeeded\(context\.providerKey\)/);
+  assert.match(reader, /youtubeProviderCooldown\.succeeded\(context\.providerKey,context\.providerFailureGeneration\)/);
   assert.match(reader, /context\?\.acquisition\?\.providerSucceeded\(\)/);
 });
 
@@ -170,6 +170,8 @@ test('preferred YouTube provider advances only after validated response success'
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
   const reader = source.slice(source.indexOf('export async function readYouTubeJsonObject'), source.indexOf('/** A request-rate limit'));
   assert.doesNotMatch(youtubeFetch, /activeKeyIndex=dispatchIndex/);
+  assert.match(reader, /providerSuccessIsCurrent=youtubeProviderCooldown\.succeeded\(context\.providerKey,context\.providerFailureGeneration\)/);
+  assert.match(reader, /if\(providerSuccessIsCurrent\)/);
   assert.match(reader, /const validatedPool=getYouTubeKeyPool\(\)/);
   assert.match(reader, /const validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
   assert.match(reader, /if\(validatedIndex>=0\)activeKeyIndex=validatedIndex/);

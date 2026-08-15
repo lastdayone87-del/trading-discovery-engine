@@ -40,7 +40,7 @@ test('YouTube acquisition reports provider success only after validated JSON and
 
   assert.doesNotMatch(fetchBlock,/providerSucceeded\(\)/);
   assert.match(readerBlock,/context\?\.acquisition\?\.providerSucceeded\(\)/);
-  assert.match(readerBlock,/youtubeProviderCooldown\.succeeded\(context\.providerKey\)/);
+  assert.match(readerBlock,/youtubeProviderCooldown\.succeeded\(context\.providerKey,context\.providerFailureGeneration\)/);
   assert.match(readerBlock,/if\s*\(!Array\.isArray\(object\.items\)\)[\s\S]*context\?\.acquisition\?\.providerSucceeded\(\)/);
 
   const calls=[...source.matchAll(/youtubeFetch\(([^\n]+)\)/g)]

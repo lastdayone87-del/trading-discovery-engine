@@ -146,7 +146,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
 let activeKeyIndex = 0;
 let outboundTraceSequence = 0;
 const failedDispatchProvidersByAcquisition = new WeakMap<object, Set<string>>();
-const youtubeResponseProviderContext = new WeakMap<Response, { providerKey?: string; acquisition?: YouTubePoolAcquisition }>();
+const youtubeResponseProviderContext = new WeakMap<Response, { providerKey?: string; acquisition?: YouTubePoolAcquisition; providerFailureGeneration?: number }>();
 
 function failedDispatchProviders(acquisition?: YouTubePoolAcquisition): Set<string> | undefined {
   if (!acquisition || (typeof acquisition !== 'object' && typeof acquisition !== 'function')) return undefined;
@@ -269,7 +269,8 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           }
           throw error;
         }
-        youtubeResponseProviderContext.set(response,{providerKey:dispatchedProviderKey,acquisition});
+        const providerFailureGeneration=dispatchedProviderKey?youtubeProviderCooldown.failureGeneration(dispatchedProviderKey):undefined;
+        youtubeResponseProviderContext.set(response,{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration});
         return response;
       }});
     }, trace, priority);
@@ -330,10 +331,12 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
       throw new ProviderCallError(`YouTube ${operation} returned a JSON body without an items array (HTTP ${status}).`, 'TRANSIENT', true, { status });
     }
     if(context?.providerKey){
-      youtubeProviderCooldown.succeeded(context.providerKey);
-      const validatedPool=getYouTubeKeyPool();
-      const validatedIndex=validatedPool.indexOf(context.providerKey);
-      if(validatedIndex>=0)activeKeyIndex=validatedIndex;
+      const providerSuccessIsCurrent=youtubeProviderCooldown.succeeded(context.providerKey,context.providerFailureGeneration);
+      if(providerSuccessIsCurrent){
+        const validatedPool=getYouTubeKeyPool();
+        const validatedIndex=validatedPool.indexOf(context.providerKey);
+        if(validatedIndex>=0)activeKeyIndex=validatedIndex;
+      }
     }
     context?.acquisition?.providerSucceeded();
     return object as T;
