@@ -28,6 +28,7 @@ import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate } from './lowAudienceGate';
+import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
   // Option for additional candidate details if provided
@@ -103,6 +104,15 @@ export async function processChannelThroughPipeline(
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);
   if (existing) {
+    if (existing.scan_status === 'FAILED_PERMANENT') {
+      const trigger = shouldReactivateCommunityRecovery(existing, candidate, isManualScan);
+      if (trigger.reactivate) {
+        const reactivated = reactivateCommunityRecovery(existing, trigger.reasonCodes);
+        await upsertChannel(reactivated);
+        existing.scan_status = reactivated.scan_status;
+        existing.discord_status = reactivated.discord_status;
+      }
+    }
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
     if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
@@ -190,6 +200,36 @@ export async function processChannelThroughPipeline(
     timestamp: now
   };
 
+  if (countryVal.status === 'REJECTED') {
+    console.log(
+      `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`
+    );
+    console.warn(JSON.stringify({
+      event: 'excluded_channel_blocked',
+      channelId: candidate.channelId,
+      targetCountry: resolvedCountry,
+      reason: countryVal.rejectionReason,
+      context: 'ingestion_gate',
+      timestamp: now
+    }));
+
+    void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:'COUNTRY_REJECTED',
+      investigationState:'POLICY_REJECTED',terminalCountryPolicy:true,candidateHypothesis:{},evidenceCoverage:{countryDecision:countryVal.status}})
+      .catch(error=>console.warn(`[CandidateAdmission] country-policy shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+    return {
+      channelId: candidate.channelId,
+      channelName: candidate.channelName,
+      isNew: false,
+      wasKnown: !!existing,
+      persisted: false,
+      countryStatus: 'REJECTED',
+      tradingStatus: 'UNCERTAIN',
+      discordStatus: 'NOT_FOUND',
+      discordInvite: null,
+      channelRecord: undefined
+    };
+  }
+
   // Phase 7: Low-Audience Budget Gate
   const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
   if (lowAudienceGate.shouldSkipDeepEnrichment) {
@@ -238,36 +278,6 @@ export async function processChannelThroughPipeline(
       discordStatus: 'NOT_FOUND',
       discordInvite: null,
       channelRecord: lowAudienceChannel
-    };
-  }
-
-  if (countryVal.status === 'REJECTED') {
-    console.log(
-      `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`
-    );
-    console.warn(JSON.stringify({
-      event: 'excluded_channel_blocked',
-      channelId: candidate.channelId,
-      targetCountry: resolvedCountry,
-      reason: countryVal.rejectionReason,
-      context: 'ingestion_gate',
-      timestamp: now
-    }));
-
-    void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:'COUNTRY_REJECTED',
-      investigationState:'POLICY_REJECTED',terminalCountryPolicy:true,candidateHypothesis:{},evidenceCoverage:{countryDecision:countryVal.status}})
-      .catch(error=>console.warn(`[CandidateAdmission] country-policy shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-    return {
-      channelId: candidate.channelId,
-      channelName: candidate.channelName,
-      isNew: false,
-      wasKnown: !!existing,
-      persisted: false,
-      countryStatus: 'REJECTED',
-      tradingStatus: 'UNCERTAIN',
-      discordStatus: 'NOT_FOUND',
-      discordInvite: null,
-      channelRecord: undefined
     };
   }
 

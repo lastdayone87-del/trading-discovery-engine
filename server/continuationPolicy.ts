@@ -21,13 +21,16 @@ const clamp = (n: number) => Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0)
 
 /** Pure, deterministic policy shared by human-directed and autonomous discovery. */
 export function evaluateContinuation(input: ContinuationPolicyInput): ContinuationDecision {
+  const cumulativeDistinct = Math.max(1, input.cumulativeDistinctCreators || input.distinctCreators);
   const effectiveConfirmed = Math.max(input.confirmedCreators, input.delayedConfirmedCreators || 0);
   const effectiveQuality = Math.max(input.qualityConfirmedCreators, input.delayedQualityCreators || 0);
   const distinct = Math.max(0, input.distinctCreators);
   const novelty = distinct ? clamp(input.newCreators / distinct) : 0;
-  const confirmedYield = distinct ? clamp(effectiveConfirmed / distinct) : 0;
-  const qualityYield = distinct ? clamp(effectiveQuality / distinct) : 0;
-  const nonTradingPenalty = distinct ? clamp((input.delayedNonTradingCreators || 0) / distinct) : 0;
+
+  // Cohort-attributed yield: cumulative confirmed creators against cumulative distinct creator cohort
+  const confirmedYield = clamp(effectiveConfirmed / cumulativeDistinct);
+  const qualityYield = clamp(effectiveQuality / cumulativeDistinct);
+  const nonTradingPenalty = clamp((input.delayedNonTradingCreators || 0) / cumulativeDistinct);
 
   const marginalUtility = Number(clamp(
     0.30 * qualityYield + 0.25 * confirmedYield + 0.20 * novelty +

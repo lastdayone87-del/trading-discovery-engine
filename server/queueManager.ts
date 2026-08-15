@@ -44,7 +44,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { reconcileCommunityAcquisitionRecovery } from './communityRecovery';
+import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
@@ -404,7 +404,7 @@ export async function processNextSearchJob(
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const maxPages=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_pages','3')));const maxLow=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_low_yield_pages','2')));
-      const prior=await getAutonomousContinuationState(queryRunId);
+      const prior=await getAutonomousContinuationState(queryRunId, pageNumber);
       const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,delayedConfirmedCreators:prior.delayedConfirmedCreators,delayedNonTradingCreators:prior.delayedNonTradingCreators,delayedQualityCreators:prior.delayedQualityCreators,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
       const enabled=await getAppSetting('autonomous_pagination_enabled','true')==='true';
       const stoppingReason=decision.shouldContinue?null:decision.primaryReason;
@@ -856,6 +856,15 @@ export async function triggerManualRecheck(
   const channel = await getChannelById(channelId);
   if (!channel) {
     return { success: false, message: 'Channel not found in database.', code: 'MANUAL_RESCAN_CHANNEL_NOT_FOUND', retryable: false, errorClass: 'PERMANENT_INPUT' };
+  }
+
+  if (channel.scan_status === 'FAILED_PERMANENT') {
+    const trigger = shouldReactivateCommunityRecovery(channel, undefined, true);
+    if (trigger.reactivate) {
+      const reactivated = reactivateCommunityRecovery(channel, trigger.reasonCodes);
+      await upsertChannel(reactivated);
+      Object.assign(channel, reactivated);
+    }
   }
 
   if (channel.trading_status === 'HUMAN_REJECTED') {

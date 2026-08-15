@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import type { ChannelRecord } from '../src/types';
+
+const root = process.cwd();
+const read = (p: string) => fs.readFileSync(path.join(root, p), 'utf8');
 
 const mockChannel = (scan_status = 'FAILED_PERMANENT', last_checked = '2026-01-01T00:00:00Z'): ChannelRecord => ({
   channel_id: 'UC_test_1',
@@ -60,4 +65,12 @@ test('reactivateCommunityRecovery resets scan_status to ENRICHMENT_PENDING while
   assert.equal(reactivated.inspection_trail.length, 2);
   assert.equal(reactivated.inspection_trail[0].title, 'Prior Failed Attempt');
   assert.ok(reactivated.inspection_trail[1].title.includes('Reactivated'));
+});
+
+test('production ingestion and manual recheck entry points invoke community recovery reactivation', () => {
+  const pipeSource = read('server/ingestionPipeline.ts');
+  const queueSource = read('server/queueManager.ts');
+
+  assert.match(pipeSource, /shouldReactivateCommunityRecovery\(existing, candidate, isManualScan\)/);
+  assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
 });
