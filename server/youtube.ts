@@ -146,6 +146,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
 let activeKeyIndex = 0;
 let outboundTraceSequence = 0;
 const failedDispatchProvidersByAcquisition = new WeakMap<object, Set<string>>();
+const youtubeResponseProviderContext = new WeakMap<Response, { providerKey?: string; acquisition?: YouTubePoolAcquisition }>();
 
 function failedDispatchProviders(acquisition?: YouTubePoolAcquisition): Set<string> | undefined {
   if (!acquisition || (typeof acquisition !== 'object' && typeof acquisition !== 'function')) return undefined;
@@ -269,8 +270,8 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           }
           throw error;
         }
-        if(dispatchedProviderKey)youtubeProviderCooldown.succeeded(dispatchedProviderKey);
-        acquisition?.providerSucceeded();return response;
+        youtubeResponseProviderContext.set(response,{providerKey:dispatchedProviderKey,acquisition});
+        return response;
       }});
     }, trace, priority);
   } catch(error) {
@@ -305,29 +306,40 @@ export async function youtubeHttpError(response:Response,trace?:(stage:string)=>
  * transport status; those responses are operationally retryable, not data.
  */
 export async function readYouTubeJsonObject<T extends Record<string, any> = Record<string, any>>(response: Response, operation: string): Promise<T> {
-  if (!response.ok) throw await youtubeHttpError(response);
-  const status = response.status;
-  const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  const body = (await response.text()).trim();
-  if (!body) throw new ProviderCallError(`YouTube ${operation} returned an empty response (HTTP ${status}).`, 'TRANSIENT', true, { status });
-  if (!contentType.includes('json')) throw new ProviderCallError(`YouTube ${operation} returned a non-JSON response (HTTP ${status}).`, 'TRANSIENT', true, { status });
-  let parsed: unknown;
+  const context = youtubeResponseProviderContext.get(response);
   try {
-    parsed = JSON.parse(body);
-  } catch (cause) {
-    throw new ProviderCallError(`YouTube ${operation} returned invalid JSON (HTTP ${status}).`, 'TRANSIENT', true, { status, cause });
+    if (!response.ok) throw await youtubeHttpError(response);
+    const status = response.status;
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    const body = (await response.text()).trim();
+    if (!body) throw new ProviderCallError(`YouTube ${operation} returned an empty response (HTTP ${status}).`, 'TRANSIENT', true, { status });
+    if (!contentType.includes('json')) throw new ProviderCallError(`YouTube ${operation} returned a non-JSON response (HTTP ${status}).`, 'TRANSIENT', true, { status });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch (cause) {
+      throw new ProviderCallError(`YouTube ${operation} returned invalid JSON (HTTP ${status}).`, 'TRANSIENT', true, { status, cause });
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new ProviderCallError(`YouTube ${operation} returned an invalid JSON object (HTTP ${status}).`, 'TRANSIENT', true, { status });
+    }
+    const object = parsed as Record<string, any>;
+    if (object.error) {
+      throw new ProviderCallError(`YouTube ${operation} returned a provider error payload (HTTP ${status}).`, 'TRANSIENT', true, { status });
+    }
+    if (!Array.isArray(object.items)) {
+      throw new ProviderCallError(`YouTube ${operation} returned a JSON body without an items array (HTTP ${status}).`, 'TRANSIENT', true, { status });
+    }
+    if(context?.providerKey)youtubeProviderCooldown.succeeded(context.providerKey);
+    context?.acquisition?.providerSucceeded();
+    return object as T;
+  } catch (error) {
+    if(context?.providerKey){
+      failedDispatchProviders(context.acquisition)?.add(context.providerKey);
+      if(error&&typeof error==='object')Object.assign(error,{providerKey:context.providerKey});
+    }
+    throw error;
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new ProviderCallError(`YouTube ${operation} returned an invalid JSON object (HTTP ${status}).`, 'TRANSIENT', true, { status });
-  }
-  const object = parsed as Record<string, any>;
-  if (object.error) {
-    throw new ProviderCallError(`YouTube ${operation} returned a provider error payload (HTTP ${status}).`, 'TRANSIENT', true, { status });
-  }
-  if (!Array.isArray(object.items)) {
-    throw new ProviderCallError(`YouTube ${operation} returned a JSON body without an items array (HTTP ${status}).`, 'TRANSIENT', true, { status });
-  }
-  return object as T;
 }
 
 /** A request-rate limit is common to this runtime; changing project keys cannot clear it. */

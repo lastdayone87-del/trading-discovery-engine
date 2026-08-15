@@ -100,7 +100,7 @@ test('youtubeFetch reselects from the live provider pool at dispatch and clears 
   assert.match(youtubeFetch, /selectYouTubeDispatchProviderIndex\(livePool,providerKey\)/);
   assert.match(youtubeFetch, /rebuiltUrl\.searchParams\.set\('key',dispatchedProviderKey\)/);
   assert.match(youtubeFetch, /fetch\(dispatchedUrl,\{signal\}\)/);
-  assert.match(youtubeFetch, /youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
+  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition\}\)/);
   assert.match(youtubeFetch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey/);
 });
 
@@ -141,6 +141,20 @@ test('transport failures record the actual dispatched provider before leaving yo
   assert.match(transportBranch, /failedDispatchProviders\(acquisition\)\?\.add\(dispatchedProviderKey\)/);
   assert.match(transportBranch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey\}\)/);
   assert.ok(transportBranch.indexOf('failedDispatchProviders') < transportBranch.indexOf('throw error'));
+});
+
+test('post-response validation failures preserve the actual dispatched provider identity', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  const reader = source.slice(source.indexOf('export async function readYouTubeJsonObject'), source.indexOf('/** A request-rate limit'));
+  assert.match(source, /youtubeResponseProviderContext = new WeakMap<Response/);
+  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition\}\)/);
+  assert.doesNotMatch(youtubeFetch, /youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
+  assert.match(reader, /const context = youtubeResponseProviderContext\.get\(response\)/);
+  assert.match(reader, /failedDispatchProviders\(context\.acquisition\)\?\.add\(context\.providerKey\)/);
+  assert.match(reader, /Object\.assign\(error,\{providerKey:context\.providerKey\}\)/);
+  assert.match(reader, /youtubeProviderCooldown\.succeeded\(context\.providerKey\)/);
+  assert.match(reader, /context\?\.acquisition\?\.providerSucceeded\(\)/);
 });
 
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
