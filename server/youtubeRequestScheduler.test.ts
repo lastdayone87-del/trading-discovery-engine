@@ -157,6 +157,14 @@ test('post-response validation failures preserve the actual dispatched provider 
   assert.match(reader, /context\?\.acquisition\?\.providerSucceeded\(\)/);
 });
 
+test('country metadata does not overwrite validated dispatched provider pin', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('export async function fetchYouTubeChannelCountryMetadata');
+  const end = source.indexOf('}', start);
+  const block = source.slice(start, source.indexOf('\n}', start)+2);
+  assert.doesNotMatch(block, /activeKeyIndex\s*=\s*index/);
+});
+
 test('preferred YouTube provider advances only after validated response success', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));

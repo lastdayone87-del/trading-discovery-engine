@@ -684,7 +684,7 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
       const data = await readYouTubeJsonObject(response, 'channel-country-metadata');
       const channel = data.items?.[0];
       if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
-      await incrementQuota(1); activeKeyIndex = index;
+      await incrementQuota(1);
       const officialCountry = channel.brandingSettings?.channel?.country;
       return { ...fallback, description: channel.snippet?.description || fallback.description,
         locationTag: officialCountry || fallback.locationTag,
