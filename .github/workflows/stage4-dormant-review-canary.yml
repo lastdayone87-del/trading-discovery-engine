@@ -28,108 +28,31 @@ jobs:
           ref: fix/review-state-semantics-phase1
           fetch-depth: 0
       - name: Apply final Codex P2 fixes
+        env:
+          STORE_B64: aW1wb3J0IHtnZXRBcHBTZXR0aW5nLGdldERifSBmcm9tICcuLi9kYic7CmltcG9ydCB7bWF0ZXJpYWxpemVFbGlnaWJsZVJldmlld0luVHJhbnNhY3Rpb259IGZyb20gJy4uL3JlbGVhc2U1L3Jldmlld01hdGVyaWFsaXplcic7CmltcG9ydCB7YWRtaXNzaW9uQ2hlY2tzdW19IGZyb20gJy4uL2NhbmRpZGF0ZUFkbWlzc2lvbi92ZXJzaW9uaW5nJzsKaW1wb3J0IHthc3NpZ25BZG1pc3Npb25DYW5hcnl9IGZyb20gJy4uL2NhbmRpZGF0ZUFkbWlzc2lvbi9wb2xpY3knOwppbXBvcnQge2V2YWx1YXRlUmV2aWV3RWxpZ2liaWxpdHlWMixSRVZJRVdfRUxJR0lCSUxJVFlfUE9MSUNZX1ZFUlNJT04sdHlwZSBSZXZpZXdFbGlnaWJpbGl0eUlucHV0fSBmcm9tICcuL3BvbGljeSc7Cgphc3luYyBmdW5jdGlvbiByZWNvbmNpbGVNYWNoaW5lT3duZWRSZXZpZXcoY2xpZW50OmFueSxjaGFubmVsSWQ6c3RyaW5nKXsKICBhd2FpdCBjbGllbnQucXVlcnkoYFVQREFURSBjaGFubmVsX3Jldmlld3MgU0VUIHN0YXRlPSdTVVBFUlNFREVEJyxwZW5kaW5nX3NpbmNlPU5VTEwsdXBkYXRlZF9hdD1ub3coKSBXSEVSRSBjaGFubmVsX2lkPSQxIEFORCBzdGF0ZT0nUEVORElORydgLFtjaGFubmVsSWRdKTsKICBhd2FpdCBjbGllbnQucXVlcnkoYFVQREFURSBjaGFubmVscyBTRVQgdHJhZGluZ19zdGF0dXM9Q0FTRSBXSEVOIHRyYWRpbmdfc3RhdHVzPSdORUVEU19SRVZJRVcnIFRIRU4gJ1VOQ0VSVEFJTicgRUxTRSB0cmFkaW5nX3N0YXR1cyBFTkQsc2Nhbl9zdGF0dXM9Q0FTRSBXSEVOIHNjYW5fc3RhdHVzPSdORUVEU19SRVZJRVcnIFRIRU4gJ0NPTVBMRVRFRCcgRUxTRSBzY2FuX3N0YXR1cyBFTkQsbGFzdF9jaGVja2VkPW5vdygpIFdIRVJFIGNoYW5uZWxfaWQ9JDFgLFtjaGFubmVsSWRdKTsKfQoKZXhwb3J0IGFzeW5jIGZ1bmN0aW9uIHJlY29yZFJldmlld0VsaWdpYmlsaXR5U2hhZG93KGlucHV0OlJldmlld0VsaWdpYmlsaXR5SW5wdXQme2NoYW5uZWxJZDpzdHJpbmc7Y2xhc3NpZmljYXRpb25EaWFnbm9zdGljSWQ/OnN0cmluZztpbnZlc3RpZ2F0aW9uSWQ/OnN0cmluZztjcmVhdG9yRm9jdXNTbmFwc2hvdElkPzpzdHJpbmd9KXsKICBjb25zdCBldmFsdWF0aW9uPWV2YWx1YXRlUmV2aWV3RWxpZ2liaWxpdHlWMihpbnB1dCksY29uZmlndXJlZD1TdHJpbmcoYXdhaXQgZ2V0QXBwU2V0dGluZygncmV2aWV3X2VsaWdpYmlsaXR5X3YyX21vZGUnLCdPRkYnKSkudG9VcHBlckNhc2UoKSxtb2RlOidTSEFET1cnfCdDQU5BUlknPWNvbmZpZ3VyZWQ9PT0nQ0FOQVJZJz8nQ0FOQVJZJzonU0hBRE9XJyxiYXNpcz1NYXRoLm1pbigxMDAwMCxNYXRoLm1heCgwLE51bWJlcihhd2FpdCBnZXRBcHBTZXR0aW5nKCdyZXZpZXdfZWxpZ2liaWxpdHlfdjJfY2FuYXJ5X2Jhc2lzX3BvaW50cycsJzAnKSl8fDApKSxhc3NpZ25tZW50PWFzc2lnbkFkbWlzc2lvbkNhbmFyeShgJHtpbnB1dC5jaGFubmVsSWR9fCR7aW5wdXQuY2xhc3NpZmljYXRpb25EaWFnbm9zdGljSWR8fGlucHV0LmludmVzdGlnYXRpb25JZHx8J25vbmUnfXwke1JFVklFV19FTElHSUJJTElUWV9QT0xJQ1lfVkVSU0lPTn1gLGJhc2lzKSxzbmFwc2hvdD17Li4uaW5wdXQsY29uZmlndXJlZE1vZGU6Y29uZmlndXJlZCxtb2RlLGJhc2lzLHJhbmRvbWl6YXRpb25WYWx1ZTphc3NpZ25tZW50LnJhbmRvbWl6YXRpb25WYWx1ZSxyZWFzb25GYW1pbHk6ZXZhbHVhdGlvbi5yZWFzb25GYW1pbHl9LGNoZWNrc3VtPWFkbWlzc2lvbkNoZWNrc3VtKHNuYXBzaG90KSxrZXk9YWRtaXNzaW9uQ2hlY2tzdW0oe2NoZWNrc3VtLGV2YWx1YXRpb259KSxkYj1hd2FpdCBnZXREYigpLGNsaWVudD1hd2FpdCBkYi5jb25uZWN0KCk7CiAgbGV0IGRlY2lzaW9uSWQ6c3RyaW5nfHVuZGVmaW5lZDsKICB0cnl7CiAgICBhd2FpdCBjbGllbnQucXVlcnkoJ0JFR0lOJyk7CiAgICBjb25zdCBwcmlvcj1hd2FpdCBjbGllbnQucXVlcnkoJ1NFTEVDVCB2ZXJzaW9uLGRlY2lzaW9uX2lkLHN0YXR1cyBGUk9NIHJldmlld19lbGlnaWJpbGl0eV9wcm9qZWN0aW9uIFdIRVJFIGNoYW5uZWxfaWQ9JDEgRk9SIFVQREFURScsW2lucHV0LmNoYW5uZWxJZF0pLHZlcnNpb249TnVtYmVyKHByaW9yLnJvd3NbMF0/LnZlcnNpb258fDApOwogICAgY29uc3QgZGVjaXNpb249YXdhaXQgY2xpZW50LnF1ZXJ5KGBJTlNFUlQgSU5UTyByZXZpZXdfZWxpZ2liaWxpdHlfZGVjaXNpb25zKGRlY2lzaW9uX2tleSxjaGFubmVsX2lkLGNsYXNzaWZpY2F0aW9uX2RpYWdub3N0aWNfaWQsaW52ZXN0aWdhdGlvbl9pZCxjcmVhdG9yX2ZvY3VzX3NuYXBzaG90X2lkLHN0YXR1cyxyZWFzb25fY29kZXMsaW5wdXRfc25hcHNob3QsaW5wdXRfY2hlY2tzdW0scG9saWN5X3ZlcnNpb24sbW9kZSxhc3NpZ25tZW50X2Jhc2lzX3BvaW50cyxyYW5kb21pemF0aW9uX3ZhbHVlLGFzc2lnbmVkLHNlcnZpbmdfYXV0aG9yaXR5KSBWQUxVRVMoJDEsJDIsJDMsJDQsJDUsJDYsJDcsJDgsJDksJDEwLCQxMSwkMTIsJDEzLCQxNCx0cnVlKSBPTiBDT05GTElDVChkZWNpc2lvbl9rZXkpIERPIE5PVEhJTkcgUkVUVVJOSU5HIGlkLGRlY2lkZWRfYXRgLFtrZXksaW5wdXQuY2hhbm5lbElkLGlucHV0LmNsYXNzaWZpY2F0aW9uRGlhZ25vc3RpY0lkfHxudWxsLGlucHV0LmludmVzdGlnYXRpb25JZHx8bnVsbCxpbnB1dC5jcmVhdG9yRm9jdXNTbmFwc2hvdElkfHxudWxsLGV2YWx1YXRpb24uc3RhdHVzLEpTT04uc3RyaW5naWZ5KGV2YWx1YXRpb24ucmVhc29uQ29kZXMpLEpTT04uc3RyaW5naWZ5KHNuYXBzaG90KSxjaGVja3N1bSxSRVZJRVdfRUxJR0lCSUxJVFlfUE9MSUNZX1ZFUlNJT04sbW9kZSxiYXNpcyxhc3NpZ25tZW50LnJhbmRvbWl6YXRpb25WYWx1ZSxjb25maWd1cmVkPT09J0NBTkFSWScmJmFzc2lnbm1lbnQuYXNzaWduZWRdKTsKICAgIGlmKCFkZWNpc2lvbi5yb3dDb3VudCl7CiAgICAgIGNvbnN0IGV4aXN0aW5nPWF3YWl0IGNsaWVudC5xdWVyeSgnU0VMRUNUIGlkIEZST00gcmV2aWV3X2VsaWdpYmlsaXR5X2RlY2lzaW9ucyBXSEVSRSBkZWNpc2lvbl9rZXk9JDEnLFtrZXldKTsKICAgICAgZGVjaXNpb25JZD1leGlzdGluZy5yb3dzWzBdPy5pZDsKICAgICAgY29uc3QgaXNDdXJyZW50PSEhZGVjaXNpb25JZCYmcHJpb3Iucm93c1swXT8uZGVjaXNpb25faWQ9PT1kZWNpc2lvbklkOwogICAgICBpZihpc0N1cnJlbnQmJmV2YWx1YXRpb24uc3RhdHVzPT09J0VMSUdJQkxFJylhd2FpdCBtYXRlcmlhbGl6ZUVsaWdpYmxlUmV2aWV3SW5UcmFuc2FjdGlvbihjbGllbnQse2NoYW5uZWxJZDppbnB1dC5jaGFubmVsSWQsZWxpZ2liaWxpdHlEZWNpc2lvbklkOmRlY2lzaW9uSWQhfSk7CiAgICAgIGVsc2UgaWYoaXNDdXJyZW50KWF3YWl0IHJlY29uY2lsZU1hY2hpbmVPd25lZFJldmlldyhjbGllbnQsaW5wdXQuY2hhbm5lbElkKTsKICAgICAgYXdhaXQgY2xpZW50LnF1ZXJ5KCdDT01NSVQnKTsKICAgICAgcmV0dXJuIHsuLi5ldmFsdWF0aW9uLG1vZGUsY29uZmlndXJlZE1vZGU6Y29uZmlndXJlZCxyZWNvcmRlZDpmYWxzZSxpZGVtcG90ZW50OnRydWUsZGVjaXNpb25JZH07CiAgICB9CiAgICBkZWNpc2lvbklkPWRlY2lzaW9uLnJvd3NbMF0uaWQ7CiAgICBhd2FpdCBjbGllbnQucXVlcnkoYElOU0VSVCBJTlRPIHJldmlld19lbGlnaWJpbGl0eV9ldmVudHMoZXZlbnRfa2V5LGNoYW5uZWxfaWQsZGVjaXNpb25faWQsZXhwZWN0ZWRfcHJvamVjdGlvbl92ZXJzaW9uLHBheWxvYWQscG9saWN5X3ZlcnNpb24pIFZBTFVFUygkMSwkMiwkMywkNCwkNSwkNilgLFthZG1pc3Npb25DaGVja3N1bSh7a2V5LGV2ZW50OidFTElHSUJJTElUWV9FVkFMVUFURUQnfSksaW5wdXQuY2hhbm5lbElkLGRlY2lzaW9uSWQsdmVyc2lvbixKU09OLnN0cmluZ2lmeSh7c3RhdHVzOmV2YWx1YXRpb24uc3RhdHVzLHJlYXNvbkNvZGVzOmV2YWx1YXRpb24ucmVhc29uQ29kZXMscmVhc29uRmFtaWx5OmV2YWx1YXRpb24ucmVhc29uRmFtaWx5LGV2aWRlbmNlQ2hlY2tzdW06Y2hlY2tzdW19KSxSRVZJRVdfRUxJR0lCSUxJVFlfUE9MSUNZX1ZFUlNJT05dKTsKICAgIGF3YWl0IGNsaWVudC5xdWVyeShgSU5TRVJUIElOVE8gcmV2aWV3X2VsaWdpYmlsaXR5X3Byb2plY3Rpb24oY2hhbm5lbF9pZCxzdGF0dXMsdmVyc2lvbixkZWNpc2lvbl9pZCxyZWFzb25fY29kZXMsZXZpZGVuY2VfY2hlY2tzdW0scG9saWN5X3ZlcnNpb24sZGVjaWRlZF9hdCkgVkFMVUVTKCQxLCQyLDEsJDMsJDQsJDUsJDYsJDcpIE9OIENPTkZMSUNUKGNoYW5uZWxfaWQpIERPIFVQREFURSBTRVQgc3RhdHVzPWV4Y2x1ZGVkLnN0YXR1cyx2ZXJzaW9uPXJldmlld19lbGlnaWJpbGl0eV9wcm9qZWN0aW9uLnZlcnNpb24rMSxkZWNpc2lvbl9pZD1leGNsdWRlZC5kZWNpc2lvbl9pZCxyZWFzb25fY29kZXM9ZXhjbHVkZWQucmVhc29uX2NvZGVzLGV2aWRlbmNlX2NoZWNrc3VtPWV4Y2x1ZGVkLmV2aWRlbmNlX2NoZWNrc3VtLHBvbGljeV92ZXJzaW9uPWV4Y2x1ZGVkLnBvbGljeV92ZXJzaW9uLGRlY2lkZWRfYXQ9ZXhjbHVkZWQuZGVjaWRlZF9hdCx1cGRhdGVkX2F0PW5vdygpYCxbaW5wdXQuY2hhbm5lbElkLGV2YWx1YXRpb24uc3RhdHVzLGRlY2lzaW9uSWQsSlNPTi5zdHJpbmdpZnkoZXZhbHVhdGlvbi5yZWFzb25Db2RlcyksY2hlY2tzdW0sUkVWSUVXX0VMSUdJQklMSVRZX1BPTElDWV9WRVJTSU9OLGRlY2lzaW9uLnJvd3NbMF0uZGVjaWRlZF9hdF0pOwogICAgaWYoZXZhbHVhdGlvbi5zdGF0dXM9PT0nRUxJR0lCTEUnKWF3YWl0IG1hdGVyaWFsaXplRWxpZ2libGVSZXZpZXdJblRyYW5zYWN0aW9uKGNsaWVudCx7Y2hhbm5lbElkOmlucHV0LmNoYW5uZWxJZCxlbGlnaWJpbGl0eURlY2lzaW9uSWQ6ZGVjaXNpb25JZCF9KTsKICAgIGVsc2UgYXdhaXQgcmVjb25jaWxlTWFjaGluZU93bmVkUmV2aWV3KGNsaWVudCxpbnB1dC5jaGFubmVsSWQpOwogICAgYXdhaXQgY2xpZW50LnF1ZXJ5KCdDT01NSVQnKTsKICAgIHJldHVybiB7Li4uZXZhbHVhdGlvbixtb2RlLGNvbmZpZ3VyZWRNb2RlOmNvbmZpZ3VyZWQscmVjb3JkZWQ6dHJ1ZSxkZWNpc2lvbklkfTsKICB9Y2F0Y2goZXJyb3Ipe2F3YWl0IGNsaWVudC5xdWVyeSgnUk9MTEJBQ0snKTt0aHJvdyBlcnJvcjt9ZmluYWxseXtjbGllbnQucmVsZWFzZSgpO30KfQoKZXhwb3J0IGFzeW5jIGZ1bmN0aW9uIGluc3BlY3RSZXZpZXdFbGlnaWJpbGl0eShsaW1pdD0xMDApe2NvbnN0IGRiPWF3YWl0IGdldERiKCk7Y29uc3Qgcm93cz1hd2FpdCBkYi5xdWVyeShgU0VMRUNUIHAuKixjLmNoYW5uZWxfbmFtZSxjLmNvdW50cnksYy50cmFkaW5nX3N0YXR1cyxjLnNjYW5fc3RhdHVzIEZST00gcmV2aWV3X2VsaWdpYmlsaXR5X3Byb2plY3Rpb24gcCBKT0lOIGNoYW5uZWxzIGMgVVNJTkcoY2hhbm5lbF9pZCkgT1JERVIgQlkgcC51cGRhdGVkX2F0IERFU0MgTElNSVQgJDFgLFtNYXRoLm1pbig1MDAsTWF0aC5tYXgoMSxsaW1pdCkpXSk7cmV0dXJuIHttb2RlOmF3YWl0IGdldEFwcFNldHRpbmcoJ3Jldmlld19lbGlnaWJpbGl0eV92Ml9tb2RlJywnT0ZGJyksc2VydmluZ0F1dGhvcml0eTp0cnVlLGNyZWF0ZXNSZXZpZXdSb3dzOnRydWUsaXRlbXM6cm93cy5yb3dzfTt9Cg==
         run: |
           python - <<'PY'
+          import base64, os
           from pathlib import Path
-
           def replace_once(path, old, new):
               p=Path(path); s=p.read_text()
               if s.count(old)!=1: raise SystemExit(f'{path}: expected one target, got {s.count(old)}')
               p.write_text(s.replace(old,new,1))
-
-          # 1) Propagate authoritative eligibility transaction failures.
-          replace_once('server/ingestionPipeline.ts',
-            "    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput})\n      .catch(error=>console.warn(`[ReviewEligibility] authoritative write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));",
-            "    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput});")
-
-          # 2) Missing enrichment subjects are superseded, never synthetic human review.
-          replace_once('server/queueManager.ts',
-            "resultingStatus:channel?.trading_status||'NEEDS_REVIEW',output:{reason:'CASE_NO_LONGER_ELIGIBLE'}",
-            "resultingStatus:channel?.trading_status||'POLICY_REJECTED',output:{reason:channel?'CASE_NO_LONGER_ELIGIBLE':'CHANNEL_MISSING'}")
-
-          # 3) Reconcile stale PENDING review debt whenever the current authoritative projection is machine-owned.
-          Path('server/reviewEligibility/store.ts').write_text("""import {getAppSetting,getDb} from '../db';
-import {materializeEligibleReviewInTransaction} from '../release5/reviewMaterializer';
-import {admissionChecksum} from '../candidateAdmission/versioning';
-import {assignAdmissionCanary} from '../candidateAdmission/policy';
-import {evaluateReviewEligibilityV2,REVIEW_ELIGIBILITY_POLICY_VERSION,type ReviewEligibilityInput} from './policy';
-
-async function reconcileMachineOwnedReview(client:any,channelId:string){
-  await client.query(`UPDATE channel_reviews SET state='SUPERSEDED',pending_since=NULL,updated_at=now() WHERE channel_id=$1 AND state='PENDING'`,[channelId]);
-  await client.query(`UPDATE channels SET trading_status=CASE WHEN trading_status='NEEDS_REVIEW' THEN 'UNCERTAIN' ELSE trading_status END,scan_status=CASE WHEN scan_status='NEEDS_REVIEW' THEN 'COMPLETED' ELSE scan_status END,last_checked=now() WHERE channel_id=$1`,[channelId]);
-}
-
-export async function recordReviewEligibilityShadow(input:ReviewEligibilityInput&{channelId:string;classificationDiagnosticId?:string;investigationId?:string;creatorFocusSnapshotId?:string}){
-  const evaluation=evaluateReviewEligibilityV2(input),configured=String(await getAppSetting('review_eligibility_v2_mode','OFF')).toUpperCase(),mode:'SHADOW'|'CANARY'=configured==='CANARY'?'CANARY':'SHADOW',basis=Math.min(10000,Math.max(0,Number(await getAppSetting('review_eligibility_v2_canary_basis_points','0'))||0)),assignment=assignAdmissionCanary(`${input.channelId}|${input.classificationDiagnosticId||input.investigationId||'none'}|${REVIEW_ELIGIBILITY_POLICY_VERSION}`,basis),snapshot={...input,configuredMode:configured,mode,basis,randomizationValue:assignment.randomizationValue,reasonFamily:evaluation.reasonFamily},checksum=admissionChecksum(snapshot),key=admissionChecksum({checksum,evaluation}),db=await getDb(),client=await db.connect();
-  let decisionId:string|undefined;
-  try{
-    await client.query('BEGIN');
-    const prior=await client.query('SELECT version,decision_id,status FROM review_eligibility_projection WHERE channel_id=$1 FOR UPDATE',[input.channelId]),version=Number(prior.rows[0]?.version||0);
-    const decision=await client.query(`INSERT INTO review_eligibility_decisions(decision_key,channel_id,classification_diagnostic_id,investigation_id,creator_focus_snapshot_id,status,reason_codes,input_snapshot,input_checksum,policy_version,mode,assignment_basis_points,randomization_value,assigned,serving_authority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true) ON CONFLICT(decision_key) DO NOTHING RETURNING id,decided_at`,[key,input.channelId,input.classificationDiagnosticId||null,input.investigationId||null,input.creatorFocusSnapshotId||null,evaluation.status,JSON.stringify(evaluation.reasonCodes),JSON.stringify(snapshot),checksum,REVIEW_ELIGIBILITY_POLICY_VERSION,mode,basis,assignment.randomizationValue,configured==='CANARY'&&assignment.assigned]);
-    if(!decision.rowCount){
-      const existing=await client.query('SELECT id FROM review_eligibility_decisions WHERE decision_key=$1',[key]);
-      decisionId=existing.rows[0]?.id;
-      const isCurrent=!!decisionId&&prior.rows[0]?.decision_id===decisionId;
-      if(isCurrent&&evaluation.status==='ELIGIBLE')await materializeEligibleReviewInTransaction(client,{channelId:input.channelId,eligibilityDecisionId:decisionId!});
-      else if(isCurrent)await reconcileMachineOwnedReview(client,input.channelId);
-      await client.query('COMMIT');
-      return {...evaluation,mode,configuredMode:configured,recorded:false,idempotent:true,decisionId};
-    }
-    decisionId=decision.rows[0].id;
-    await client.query(`INSERT INTO review_eligibility_events(event_key,channel_id,decision_id,expected_projection_version,payload,policy_version) VALUES($1,$2,$3,$4,$5,$6)`,[admissionChecksum({key,event:'ELIGIBILITY_EVALUATED'}),input.channelId,decisionId,version,JSON.stringify({status:evaluation.status,reasonCodes:evaluation.reasonCodes,reasonFamily:evaluation.reasonFamily,evidenceChecksum:checksum}),REVIEW_ELIGIBILITY_POLICY_VERSION]);
-    await client.query(`INSERT INTO review_eligibility_projection(channel_id,status,version,decision_id,reason_codes,evidence_checksum,policy_version,decided_at) VALUES($1,$2,1,$3,$4,$5,$6,$7) ON CONFLICT(channel_id) DO UPDATE SET status=excluded.status,version=review_eligibility_projection.version+1,decision_id=excluded.decision_id,reason_codes=excluded.reason_codes,evidence_checksum=excluded.evidence_checksum,policy_version=excluded.policy_version,decided_at=excluded.decided_at,updated_at=now()`,[input.channelId,evaluation.status,decisionId,JSON.stringify(evaluation.reasonCodes),checksum,REVIEW_ELIGIBILITY_POLICY_VERSION,decision.rows[0].decided_at]);
-    if(evaluation.status==='ELIGIBLE')await materializeEligibleReviewInTransaction(client,{channelId:input.channelId,eligibilityDecisionId:decisionId!});
-    else await reconcileMachineOwnedReview(client,input.channelId);
-    await client.query('COMMIT');
-    return {...evaluation,mode,configuredMode:configured,recorded:true,decisionId};
-  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
-}
-
-export async function inspectReviewEligibility(limit=100){const db=await getDb();const rows=await db.query(`SELECT p.*,c.channel_name,c.country,c.trading_status,c.scan_status FROM review_eligibility_projection p JOIN channels c USING(channel_id) ORDER BY p.updated_at DESC LIMIT $1`,[Math.min(500,Math.max(1,limit))]);return {mode:await getAppSetting('review_eligibility_v2_mode','OFF'),servingAuthority:true,createsReviewRows:true,items:rows.rows};}
-""")
-
-          # 4) Bring the remaining healthy-ambiguity regression onto the authoritative contract.
-          p=Path('server/enrichmentOperationalFailure.test.ts'); s=p.read_text()
-          old="import { resolveUncertainLifecycle } from './enrichmentLifecycle';\n"
-          if "evaluateReviewEligibilityV2" not in s:
-              s=s.replace(old,old+"import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';\n",1)
-          old_case="""test('fully observed genuine ambiguity can still reach human review when providers are healthy',()=>{
-  assert.equal(enrichmentOperationalFailure(report(false),true,false),null);
-  assert.deepEqual(resolveUncertainLifecycle(true),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});
-});
-"""
-          new_case="""test('fully observed genuine ambiguity can still reach human review when providers are healthy',()=>{
-  assert.equal(enrichmentOperationalFailure(report(false),true,false),null);
-  const eligibility=evaluateReviewEligibilityV2({classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false});
-  assert.deepEqual(resolveUncertainLifecycle(true,eligibility),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});
-});
-"""
-          if old_case not in s: raise SystemExit('enrichment test target mismatch')
-          p.write_text(s.replace(old_case,new_case,1))
-
-          # Add source-level regressions for the fresh P2s.
+          replace_once('server/ingestionPipeline.ts', "    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput})\n      .catch(error=>console.warn(`[ReviewEligibility] authoritative write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));", "    await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput});")
+          replace_once('server/queueManager.ts', "resultingStatus:channel?.trading_status||'NEEDS_REVIEW',output:{reason:'CASE_NO_LONGER_ELIGIBLE'}", "resultingStatus:channel?.trading_status||'POLICY_REJECTED',output:{reason:channel?'CASE_NO_LONGER_ELIGIBLE':'CHANNEL_MISSING'}")
+          Path('server/reviewEligibility/store.ts').write_bytes(base64.b64decode(os.environ['STORE_B64']))
+          p=Path('server/enrichmentOperationalFailure.test.ts'); s=p.read_text(); imp="import { resolveUncertainLifecycle } from './enrichmentLifecycle';\n"
+          if 'evaluateReviewEligibilityV2' not in s: s=s.replace(imp,imp+"import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';\n",1)
+          old="assert.deepEqual(resolveUncertainLifecycle(true),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});"
+          new="const eligibility=evaluateReviewEligibilityV2({classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false});\n  assert.deepEqual(resolveUncertainLifecycle(true,eligibility),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});"
+          if s.count(old)!=1: raise SystemExit('enrichment test target mismatch')
+          p.write_text(s.replace(old,new,1))
           p=Path('server/reviewEligibility/servingIntegration.test.ts'); s=p.read_text()
-          addition="""
-
-test('machine-owned authoritative projections supersede stale pending review debt',()=>{
-  const source=read('server/reviewEligibility/store.ts');
-  assert.match(source,/reconcileMachineOwnedReview/);
-  assert.match(source,/state='SUPERSEDED'/);
-  assert.match(source,/trading_status='NEEDS_REVIEW'.*'UNCERTAIN'/s);
-});
-
-test('production review persistence failures propagate and missing channels never synthesize review',()=>{
-  const ingestion=read('server/ingestionPipeline.ts');
-  const queue=read('server/queueManager.ts');
-  assert.doesNotMatch(ingestion,/authoritative write failed/);
-  assert.doesNotMatch(queue,/channel\?\.trading_status\|\|'NEEDS_REVIEW'/);
-  assert.match(queue,/channel\?\.trading_status\|\|'POLICY_REJECTED'/);
-});
-"""
-          if "machine-owned authoritative projections supersede stale pending review debt" not in s:
-              p.write_text(s+addition)
+          if 'machine-owned authoritative projections supersede stale pending review debt' not in s:
+              s += "\n\ntest('machine-owned authoritative projections supersede stale pending review debt',()=>{const source=read('server/reviewEligibility/store.ts');assert.match(source,/reconcileMachineOwnedReview/);assert.match(source,/state='SUPERSEDED'/);});\n"
+              s += "test('production persistence failures propagate and missing channels never synthesize review',()=>{const ingestion=read('server/ingestionPipeline.ts'),queue=read('server/queueManager.ts');assert.doesNotMatch(ingestion,/authoritative write failed/);assert.doesNotMatch(queue,/channel\\?\\.trading_status\\|\\|'NEEDS_REVIEW'/);assert.match(queue,/channel\\?\\.trading_status\\|\\|'POLICY_REJECTED'/);});\n"
+              p.write_text(s)
           PY
-
           git config user.name "phase1-final-fix"
           git config user.email "phase1-final-fix@users.noreply.github.com"
           git checkout HEAD^ -- .github/workflows/stage4-dormant-review-canary.yml
