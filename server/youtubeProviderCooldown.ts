@@ -4,6 +4,7 @@ export type YouTubeProviderOperationalStatus = 'Active' | 'Cooling Down' | 'Dail
 export interface YouTubeProviderCooldownOptions {
   initialRateLimitCooldownMs: number;
   maxRateLimitCooldownMs: number;
+  runtimeRateLimitPauseMs?: number;
   now?: () => number;
 }
 
@@ -42,45 +43,69 @@ export function nextYouTubeDailyQuotaResetAt(now: number): number {
   return candidate;
 }
 
-/** Process-local availability state for each configured API key/project. */
+/**
+ * Process-local provider availability.
+ *
+ * Daily quota exhaustion is project-specific and removes only that provider
+ * until the next YouTube quota day. A generic request-rate limit is different:
+ * it is shared by this runtime/egress identity, so rotating through every API
+ * project cannot clear it. RATE_LIMITED therefore creates one short, fixed
+ * runtime pause instead of poisoning each otherwise-healthy key with an
+ * exponential provider-local cooldown.
+ */
 export class YouTubeProviderCooldown {
-  private readonly providers = new Map<string, { retryAt: number; rateLimitCooldownMs: number; kind: YouTubeProviderFailureKind }>();
+  private readonly providers = new Map<string, { retryAt: number; kind: 'DAILY_QUOTA_EXHAUSTED' }>();
   private readonly failureGenerations = new Map<string, number>();
+  private runtimeRateLimitRetryAt = 0;
 
   constructor(private readonly options: YouTubeProviderCooldownOptions) {}
 
+  private now(): number { return (this.options.now ?? Date.now)(); }
+
+  private activeRuntimeRateLimitRetryAt(): number {
+    const now = this.now();
+    if (this.runtimeRateLimitRetryAt <= now) {
+      this.runtimeRateLimitRetryAt = 0;
+      return 0;
+    }
+    return this.runtimeRateLimitRetryAt;
+  }
+
   eligible(key: string): boolean {
+    if (this.activeRuntimeRateLimitRetryAt() > 0) return false;
     const state = this.providers.get(key);
     if (!state) return true;
-    if ((this.options.now ?? Date.now)() < state.retryAt) return false;
-    if (state.kind === 'DAILY_QUOTA_EXHAUSTED') this.providers.delete(key);
+    if (this.now() < state.retryAt) return false;
+    this.providers.delete(key);
     return true;
   }
 
   failed(key: string, kind: YouTubeProviderFailureKind): number {
-    const now = (this.options.now ?? Date.now)();
-    const previous = this.providers.get(key);
+    const now = this.now();
     this.failureGenerations.set(key, this.failureGeneration(key) + 1);
     if (kind === 'DAILY_QUOTA_EXHAUSTED') {
       const retryAt = nextYouTubeDailyQuotaResetAt(now);
-      this.providers.set(key, { retryAt, rateLimitCooldownMs: 0, kind });
+      this.providers.set(key, { retryAt, kind });
       return retryAt;
     }
-    const initial = Math.max(1, this.options.initialRateLimitCooldownMs);
-    const cooldown = previous?.kind === 'RATE_LIMITED' && previous.rateLimitCooldownMs
-      ? Math.min(Math.max(initial, this.options.maxRateLimitCooldownMs), previous.rateLimitCooldownMs * 2)
-      : initial;
-    const retryAt = now + cooldown;
-    this.providers.set(key, { retryAt, rateLimitCooldownMs: cooldown, kind });
-    return retryAt;
+
+    // A runtime/egress 429 is not project-local. Pause all outbound YouTube
+    // starts briefly, then retry with the healthy pool intact. This pause is
+    // deliberately fixed rather than exponential so #237's long global-backoff
+    // regression cannot return.
+    const configuredPause = this.options.runtimeRateLimitPauseMs ?? this.options.initialRateLimitCooldownMs;
+    const pauseMs = Math.max(1, Math.min(configuredPause, Math.max(1, this.options.maxRateLimitCooldownMs)));
+    this.runtimeRateLimitRetryAt = Math.max(this.runtimeRateLimitRetryAt, now + pauseMs);
+    return this.runtimeRateLimitRetryAt;
   }
 
   /** Monotonic per-provider failure generation for stale-success protection. */
   failureGeneration(key: string): number { return this.failureGenerations.get(key) ?? 0; }
 
   /**
-   * Clears provider cooldown/history only when no newer failure has occurred since
-   * the caller observed the supplied generation. Returns false for a stale success.
+   * A successful response may clear only project-specific state owned by the
+   * same generation. It must not clear a runtime pause raised by another
+   * concurrent request.
    */
   succeeded(key: string, expectedFailureGeneration?: number): boolean {
     if (expectedFailureGeneration !== undefined && this.failureGeneration(key) !== expectedFailureGeneration) return false;
@@ -88,20 +113,29 @@ export class YouTubeProviderCooldown {
     return true;
   }
 
-  retryAt(key: string): number { return this.providers.get(key)?.retryAt ?? 0; }
+  retryAt(key: string): number {
+    return Math.max(this.activeRuntimeRateLimitRetryAt(), this.providers.get(key)?.retryAt ?? 0);
+  }
 
   status(key: string): { status: YouTubeProviderOperationalStatus; retryAt: number | null } {
-    if (this.eligible(key)) return { status: 'Active', retryAt: null };
-    const state = this.providers.get(key)!;
-    return {
-      status: state.kind === 'DAILY_QUOTA_EXHAUSTED' ? 'Daily Quota Exhausted' : 'Cooling Down',
-      retryAt: state.retryAt
-    };
+    const runtimeRetryAt = this.activeRuntimeRateLimitRetryAt();
+    if (runtimeRetryAt > 0) return { status: 'Cooling Down', retryAt: runtimeRetryAt };
+    const state = this.providers.get(key);
+    if (!state) return { status: 'Active', retryAt: null };
+    if (this.now() >= state.retryAt) {
+      this.providers.delete(key);
+      return { status: 'Active', retryAt: null };
+    }
+    return { status: 'Daily Quota Exhausted', retryAt: state.retryAt };
   }
 
   earliestRetryAtIfAllCooling(keys: string[]): number | null {
-    if (!keys.length || keys.some(key => this.eligible(key))) return null;
-    return Math.min(...keys.map(key => this.retryAt(key)).filter(retryAt => retryAt > 0));
+    if (!keys.length) return null;
+    const runtimeRetryAt = this.activeRuntimeRateLimitRetryAt();
+    if (runtimeRetryAt > 0) return runtimeRetryAt;
+    if (keys.some(key => this.eligible(key))) return null;
+    const retryTimes = keys.map(key => this.providers.get(key)?.retryAt ?? 0).filter(retryAt => retryAt > 0);
+    return retryTimes.length ? Math.min(...retryTimes) : null;
   }
 }
 
@@ -123,6 +157,9 @@ const nonNegativeNumber = (value: string | undefined, fallback: number): number 
 };
 
 export const youtubeProviderCooldown = new YouTubeProviderCooldown({
+  // Legacy constructor fields remain for compatibility. Runtime 429 handling is
+  // governed by the short fixed pause below; daily quota remains per-provider.
   initialRateLimitCooldownMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_BACKOFF_MS, 5_000),
-  maxRateLimitCooldownMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS, 5 * 60_000)
+  maxRateLimitCooldownMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS, 5 * 60_000),
+  runtimeRateLimitPauseMs: nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_PAUSE_MS, 1_000)
 });
