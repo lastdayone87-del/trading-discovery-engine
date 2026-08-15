@@ -133,6 +133,16 @@ test('dispatch-time fallback failure is excluded when another healthy provider b
   assert.match(youtubeFetch, /failedDispatchProviders\(acquisition\)\?\.add\(dispatchedProviderKey\)/);
 });
 
+test('transport failures record the actual dispatched provider before leaving youtubeFetch', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  const transportBranch = youtubeFetch.slice(youtubeFetch.indexOf('response=await fetch(dispatchedUrl,{signal})'), youtubeFetch.indexOf('trace(`after HTTP fetch'));
+  assert.match(transportBranch, /catch \(error\)/);
+  assert.match(transportBranch, /failedDispatchProviders\(acquisition\)\?\.add\(dispatchedProviderKey\)/);
+  assert.match(transportBranch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey\}\)/);
+  assert.ok(transportBranch.indexOf('failedDispatchProviders') < transportBranch.indexOf('throw error'));
+});
+
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey\)/);
