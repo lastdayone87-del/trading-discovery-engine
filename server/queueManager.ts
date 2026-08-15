@@ -420,8 +420,8 @@ export async function processNextSearchJob(
       const channelId = String(job.payload?.channelId || '');
       const channel = channelId ? await getChannelById(channelId) : null;
       if (channel && channel.trading_status === 'UNCERTAIN') {
-        channel.scan_status = 'NEEDS_REVIEW';
-        channel.trading_status = 'NEEDS_REVIEW';
+        channel.scan_status = 'FAILED';
+        channel.trading_status = 'UNCERTAIN';
         channel.scan_attempts = job.attempts;
         channel.last_checked = new Date().toISOString();
         await upsertChannel(channel);
