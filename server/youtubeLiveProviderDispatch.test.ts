@@ -25,5 +25,12 @@ test('youtubeFetch performs live reselection inside scheduler dispatch and rebui
   const outbound=source.indexOf('fetch(dispatchedUrl,{signal})',rewrite);
   assert.ok(schedulerStart>=0&&selection>schedulerStart&&rewrite>selection&&outbound>rewrite);
   assert.match(source,/recordProviderFailure\(key: string, error: unknown\)[\s\S]*providerKey/);
-  assert.match(source,/youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
+  const readerStart=source.indexOf('export async function readYouTubeJsonObject');
+  const reader=source.slice(readerStart,source.indexOf('/** A request-rate limit',readerStart));
+  const youtubeFetch=source.slice(source.indexOf('async function youtubeFetch'),source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  assert.doesNotMatch(youtubeFetch,/activeKeyIndex=dispatchIndex/);
+  assert.doesNotMatch(youtubeFetch,/youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
+  assert.match(reader,/youtubeProviderCooldown\.succeeded\(context\.providerKey\)/);
+  assert.match(reader,/validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
+  assert.match(reader,/if\(validatedIndex>=0\)activeKeyIndex=validatedIndex/);
 });

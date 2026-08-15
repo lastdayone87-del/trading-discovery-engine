@@ -240,7 +240,6 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           dispatchedUrl=rebuiltUrl.toString();
           trace(`reselected provider at dispatch (key #${dispatchIndex+1})`);
         }
-        activeKeyIndex=dispatchIndex;
       }
       return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
         trace('before first-request-record at server/youtube.ts:128');
@@ -330,7 +329,12 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
     if (!Array.isArray(object.items)) {
       throw new ProviderCallError(`YouTube ${operation} returned a JSON body without an items array (HTTP ${status}).`, 'TRANSIENT', true, { status });
     }
-    if(context?.providerKey)youtubeProviderCooldown.succeeded(context.providerKey);
+    if(context?.providerKey){
+      youtubeProviderCooldown.succeeded(context.providerKey);
+      const validatedPool=getYouTubeKeyPool();
+      const validatedIndex=validatedPool.indexOf(context.providerKey);
+      if(validatedIndex>=0)activeKeyIndex=validatedIndex;
+    }
     context?.acquisition?.providerSucceeded();
     return object as T;
   } catch (error) {

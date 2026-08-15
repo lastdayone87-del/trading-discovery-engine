@@ -157,6 +157,16 @@ test('post-response validation failures preserve the actual dispatched provider 
   assert.match(reader, /context\?\.acquisition\?\.providerSucceeded\(\)/);
 });
 
+test('preferred YouTube provider advances only after validated response success', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  const reader = source.slice(source.indexOf('export async function readYouTubeJsonObject'), source.indexOf('/** A request-rate limit'));
+  assert.doesNotMatch(youtubeFetch, /activeKeyIndex=dispatchIndex/);
+  assert.match(reader, /const validatedPool=getYouTubeKeyPool\(\)/);
+  assert.match(reader, /const validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
+  assert.match(reader, /if\(validatedIndex>=0\)activeKeyIndex=validatedIndex/);
+});
+
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey\)/);
