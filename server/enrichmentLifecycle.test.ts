@@ -9,6 +9,10 @@ test('first uncertain classification schedules enrichment instead of completing'
   assert.deepEqual(resolveUncertainLifecycle(false), {scanStatus:'ENRICHMENT_PENDING',tradingStatus:'UNCERTAIN',shouldEnqueue:true});
 });
 
+test('legacy human-review intent without authoritative eligibility remains machine-owned',()=>{
+  assert.deepEqual(resolveUncertainLifecycle(true),{scanStatus:'COMPLETED',tradingStatus:'UNCERTAIN',shouldEnqueue:false});
+});
+
 test('evidence-complete human ambiguity is the only authoritative review projection', () => {
   const eligibility=evaluateReviewEligibilityV2(base);
   assert.deepEqual(resolveUncertainLifecycle(true,eligibility), {scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});
