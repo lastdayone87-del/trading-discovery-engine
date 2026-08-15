@@ -28,6 +28,31 @@ test('repeated 429 after cooldown preserves provider-local exponential history u
   assert.equal(providers.failed('project-a', 'RATE_LIMITED'), 1_800);
 });
 
+test('stale success cannot clear a newer provider cooldown', () => {
+  let now = 1_000;
+  const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,now:()=>now});
+  const responseGeneration = providers.failureGeneration('project-a');
+  assert.equal(responseGeneration, 0);
+  assert.equal(providers.failed('project-a', 'RATE_LIMITED'), 1_100);
+  assert.equal(providers.failureGeneration('project-a'), 1);
+  assert.equal(providers.succeeded('project-a', responseGeneration), false);
+  assert.equal(providers.eligible('project-a'), false);
+  assert.equal(providers.retryAt('project-a'), 1_100);
+  now = 1_100;
+  assert.equal(providers.eligible('project-a'), true);
+});
+
+test('success at the current failure generation clears cooldown history', () => {
+  let now = 1_000;
+  const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,now:()=>now});
+  providers.failed('project-a', 'RATE_LIMITED');
+  now = 1_100;
+  const generation = providers.failureGeneration('project-a');
+  assert.equal(providers.succeeded('project-a', generation), true);
+  assert.equal(providers.retryAt('project-a'), 0);
+  assert.equal(providers.failed('project-a', 'RATE_LIMITED'), 1_200);
+});
+
 test('daily quota exhaustion cools only that provider until the next Pacific quota day', () => {
   let now = Date.parse('2026-07-30T12:00:00Z');
   const providers = new YouTubeProviderCooldown({initialRateLimitCooldownMs:100,maxRateLimitCooldownMs:400,now:()=>now});
