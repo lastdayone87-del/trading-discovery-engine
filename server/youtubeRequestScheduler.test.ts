@@ -124,6 +124,15 @@ test('youtubeFetch preserves the already-recorded provider failure marker throug
   assert.match(youtubeFetch, /providerFailureRecorded:true/);
 });
 
+test('dispatch-time fallback failure is excluded when another healthy provider becomes available', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  assert.match(source, /failedDispatchProvidersByAcquisition = new WeakMap<object, Set<string>>/);
+  assert.match(youtubeFetch, /!failedProviders\?\.has\(key\)/);
+  assert.match(youtubeFetch, /if\(dispatchIndex<0\) dispatchIndex=selectYouTubeDispatchProviderIndex\(livePool,providerKey\)/);
+  assert.match(youtubeFetch, /failedDispatchProviders\(acquisition\)\?\.add\(dispatchedProviderKey\)/);
+});
+
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey\)/);

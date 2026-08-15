@@ -145,6 +145,15 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
  */
 let activeKeyIndex = 0;
 let outboundTraceSequence = 0;
+const failedDispatchProvidersByAcquisition = new WeakMap<object, Set<string>>();
+
+function failedDispatchProviders(acquisition?: YouTubePoolAcquisition): Set<string> | undefined {
+  if (!acquisition || (typeof acquisition !== 'object' && typeof acquisition !== 'function')) return undefined;
+  const key = acquisition as unknown as object;
+  let failed = failedDispatchProvidersByAcquisition.get(key);
+  if (!failed) { failed = new Set<string>(); failedDispatchProvidersByAcquisition.set(key, failed); }
+  return failed;
+}
 
 function availableKeyIndexes(keys: string[]): number[] {
   const indexes = keys.map((_key, index) => (activeKeyIndex + index) % keys.length)
@@ -216,7 +225,9 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
       if(providerKey){
         const livePool=getYouTubeKeyPool();
         if(!livePool.length)throw new Error('YouTube provider pool became unavailable before request dispatch.');
-        const dispatchIndex=selectYouTubeDispatchProviderIndex(livePool,providerKey);
+        const failedProviders=failedDispatchProviders(acquisition);
+        let dispatchIndex=selectYouTubeDispatchProviderIndex(livePool,providerKey,key=>youtubeProviderCooldown.eligible(key)&&!failedProviders?.has(key));
+        if(dispatchIndex<0) dispatchIndex=selectYouTubeDispatchProviderIndex(livePool,providerKey);
         if(dispatchIndex<0){
           throwIfAllProvidersCoolingDown(livePool);
           throw new Error('No eligible YouTube provider is available at request dispatch.');
@@ -242,6 +253,7 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           const error=await youtubeHttpError(response,trace);
           trace('after HTTP-error-body-read at server/youtube.ts:135');
           if(dispatchedProviderKey){
+            failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
             if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');
             else if(isYouTubeRateLimited(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');
             if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
