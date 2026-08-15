@@ -253,7 +253,11 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
       }});
     }, trace, priority);
   } catch(error) {
-    if(dispatchedProviderKey&&error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey});
+    if(dispatchedProviderKey&&error&&typeof error==='object'){
+      const wrappedCause=(error as any).cause;
+      const providerFailureRecorded=(error as any).providerFailureRecorded===true||(wrappedCause&&typeof wrappedCause==='object'&&(wrappedCause as any).providerFailureRecorded===true);
+      Object.assign(error,{providerKey:dispatchedProviderKey,...(providerFailureRecorded?{providerFailureRecorded:true}:{})});
+    }
     throw error;
   }
 }
