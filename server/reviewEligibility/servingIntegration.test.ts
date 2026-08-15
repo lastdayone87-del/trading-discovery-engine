@@ -15,7 +15,18 @@ test('authoritative review migration blocks unbacked NEEDS_REVIEW projections an
   assert.match(sql,/eligibilityDecisionId/);
   assert.match(sql,/NEW\.trading_status := 'UNCERTAIN'/);
   assert.match(sql,/NEW\.scan_status := 'ENRICHMENT_PENDING'/);
+  assert.match(sql,/scan_status=CASE WHEN c\.scan_status='NEEDS_REVIEW' THEN 'ENRICHMENT_PENDING'/);
+  assert.doesNotMatch(sql,/scan_status=CASE WHEN c\.scan_status='NEEDS_REVIEW' THEN 'COMPLETED'/);
   assert.match(sql,/BEFORE INSERT OR UPDATE ON channels/);
+});
+
+test('post-094 repair requeues only stranded legacy review rows while preserving authoritative NOT_ELIGIBLE completion',()=>{
+  const sql=read('server/db/migrations/095_requeue_legacy_review_cleanup.sql');
+  assert.match(sql,/c\.trading_status='UNCERTAIN'/);
+  assert.match(sql,/c\.scan_status='COMPLETED'/);
+  assert.match(sql,/r\.state='SUPERSEDED'/);
+  assert.match(sql,/SET scan_status='ENRICHMENT_PENDING'/);
+  assert.match(sql,/p\.status='NOT_ELIGIBLE'/);
 });
 
 test('eligible review materializer serializes against current projection, checks human resolution timestamp, and reopens eligible reviews',()=>{

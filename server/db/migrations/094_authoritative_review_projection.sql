@@ -65,9 +65,11 @@ BEFORE INSERT OR UPDATE ON channels
 FOR EACH ROW EXECUTE FUNCTION enforce_authoritative_needs_review();
 
 -- Clear legacy review projections that no longer have authoritative lineage.
+-- These rows remain machine-owned and must return to enrichment rather than
+-- being marked COMPLETED, otherwise genuine unresolved channels can be stranded.
 UPDATE channels c
 SET trading_status='UNCERTAIN',
-    scan_status=CASE WHEN c.scan_status='NEEDS_REVIEW' THEN 'COMPLETED' ELSE c.scan_status END,
+    scan_status=CASE WHEN c.scan_status='NEEDS_REVIEW' THEN 'ENRICHMENT_PENDING' ELSE c.scan_status END,
     last_checked=now()
 WHERE (c.trading_status='NEEDS_REVIEW' OR c.scan_status='NEEDS_REVIEW')
   AND NOT EXISTS (
