@@ -35,10 +35,13 @@ test('transient retries are provider-aware and bounded by wall-clock age', () =>
   assert.doesNotMatch(db, /scheduled=.*now\+5\*60_000/);
 });
 
-test('incident recovery is explicitly background-only behind production work', () => {
+test('incident recovery is explicitly background-only behind production work and provider-pool health', () => {
   assert.match(maintenance, /isRecoveryAdmissionOpen/);
   assert.match(maintenance, /productionBacklog\s*<=\s*RECOVERY_MAX_PRODUCTION_BACKLOG/);
-  assert.match(maintenance, /youtubeRequestScheduler\.isRateLimited\(\)/);
+  assert.match(maintenance, /const providerKeys = getYouTubeKeyPool\(\)/);
+  assert.match(maintenance, /youtubeProviderCooldown\.earliestRetryAtIfAllCooling\(providerKeys\) !== null/);
+  assert.match(maintenance, /&& !providerPoolCooling/);
+  assert.doesNotMatch(maintenance, /youtubeRequestScheduler\.isRateLimited\(\)/);
 });
 
 test('manual and autonomous official searches use the same per-attempt quota contract', () => {
