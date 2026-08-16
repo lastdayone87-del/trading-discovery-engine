@@ -3,6 +3,11 @@ name: YouTube quota rotation stability
 on:
   pull_request:
     paths:
+      - 'package.json'
+      - 'server/secretSafeLogging.cjs'
+      - 'server/secretSafeLogging.test.ts'
+      - 'server/youtubeKeyPool.ts'
+      - 'server/youtubeKeyPool.test.ts'
       - 'server/youtubeProviderCooldown.ts'
       - 'server/youtubeProviderCooldown.test.ts'
       - 'server/youtubePoolBackoff.ts'
@@ -25,6 +30,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
+      - name: Provider secret redaction and quota-group configuration tests
+        run: node --import tsx --test server/secretSafeLogging.test.ts server/youtubeKeyPool.test.ts
       - name: Provider cooldown and failover regression tests
         run: node --import tsx --test server/youtubeProviderCooldown.test.ts
       - name: Scheduler cooldown regression tests
