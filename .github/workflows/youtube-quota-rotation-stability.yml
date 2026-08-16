@@ -9,6 +9,7 @@ on:
       - 'server/youtubeRequestScheduler.test.ts'
       - 'server/youtubeAdaptivePacing.test.ts'
       - 'server/youtubeRatePressureDiagnostics.test.ts'
+      - 'server/youtubeRatePressureDiagnostics.contract.test.ts'
       - 'scripts/youtube-quota-rotation-stability-test.ts'
       - '.github/workflows/youtube-quota-rotation-stability.yml'
 
@@ -28,7 +29,7 @@ jobs:
       - name: Adaptive request-pressure regression tests
         run: node --import tsx --test server/youtubeAdaptivePacing.test.ts
       - name: Rate-pressure attribution diagnostics tests
-        run: node --import tsx --test server/youtubeRatePressureDiagnostics.test.ts
+        run: node --import tsx --test server/youtubeRatePressureDiagnostics.test.ts server/youtubeRatePressureDiagnostics.contract.test.ts
       - name: Quota reset and failover regression tests
         run: node --import tsx --test scripts/youtube-quota-rotation-stability-test.ts
       - name: TypeScript validation
