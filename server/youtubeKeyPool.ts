@@ -22,10 +22,36 @@ export function getYouTubeApiKeyEnvNames(environment: NodeJS.ProcessEnv = proces
   return ['YOUTUBE_API_KEY', ...Array.from({ length: getYouTubeApiKeyPoolSize(environment) - 1 }, (_, index) => `YOUTUBE_API_KEY_${index + 1}`)];
 }
 
+export interface ConfiguredYouTubeProvider {
+  key: string;
+  envName: string;
+  /** Optional non-secret label identifying the Google Cloud project/quota domain for this key. */
+  quotaGroup?: string;
+}
+
+/**
+ * Optional quota-domain labels use the API-key environment-variable name plus
+ * `_QUOTA_GROUP`, for example YOUTUBE_API_KEY_QUOTA_GROUP=project-a and
+ * YOUTUBE_API_KEY_1_QUOTA_GROUP=project-b. Labels are never sent to Google.
+ */
+export function getConfiguredYouTubeProviders(environment: NodeJS.ProcessEnv = process.env): ConfiguredYouTubeProvider[] {
+  const providers: ConfiguredYouTubeProvider[] = [];
+  const seen = new Set<string>();
+  for (const envName of getYouTubeApiKeyEnvNames(environment)) {
+    const key = environment[envName]?.trim();
+    if (!key || key.startsWith('MY_') || seen.has(key)) continue;
+    seen.add(key);
+    const quotaGroup = environment[`${envName}_QUOTA_GROUP`]?.trim();
+    providers.push({ key, envName, ...(quotaGroup ? { quotaGroup } : {}) });
+  }
+  return providers;
+}
+
 /** Return the configured, non-placeholder projects in stable rotation order. */
 export function getConfiguredYouTubeKeys(environment: NodeJS.ProcessEnv = process.env): string[] {
-  return getYouTubeApiKeyEnvNames(environment)
-    .map(name => environment[name]?.trim())
-    .filter((key): key is string => Boolean(key) && !key.startsWith('MY_'))
-    .filter((key, index, keys) => keys.indexOf(key) === index);
+  return getConfiguredYouTubeProviders(environment).map(provider => provider.key);
+}
+
+export function getYouTubeQuotaGroupForKey(key: string, environment: NodeJS.ProcessEnv = process.env): string | undefined {
+  return getConfiguredYouTubeProviders(environment).find(provider => provider.key === key)?.quotaGroup;
 }
