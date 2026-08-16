@@ -194,10 +194,9 @@ test('mixed website acquisition success and failure is projected as PARTIAL rath
   assert.equal(inspection.acquisitionOutcomes?.some(item => item.outcome === 'INSPECTED_NO_MATCH'), true);
 });
 
-test('Discord candidate selection contract does not stop on the first merely operational success', () => {
+test('Discord candidate selection validates the retained set and ranks creator ownership before health', () => {
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(source, /const validationRank=/);
-  assert.match(source, /TRADING_RELEVANT[^\n]*ACTIVE[^\n]*ACTIVE_LOW_VOLUME[^\n]*return 100/);
-  assert.match(source, /if\(rank>=100\)break;/);
+  assert.match(source, /discordCandidateCompositeRank\(candidate,validation\)/);
+  assert.doesNotMatch(source, /if\(rank>=100\)break;/);
   assert.doesNotMatch(source, /if\(validation\.operationalOutcome==='SUCCEEDED'\)\{selected=validation;selectedCandidate=candidate;break;\}/);
 });
