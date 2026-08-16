@@ -43,3 +43,22 @@ test('creator ownership outranks a healthier third-party Discord during final se
   const partnerActive={operationalOutcome:'SUCCEEDED',relevanceStatus:'TRADING_RELEVANT',status:'ACTIVE'};
   assert.ok(discordCandidateCompositeRank(creator,creatorAmbiguous)>discordCandidateCompositeRank(partner,partnerActive));
 });
+
+test('explicit trading context still permits rendered fallback when creator DB lookup is unavailable',async()=>{
+  let renderedCalls=0;
+  const result=await runChannelInspection({
+    channelId:'rendered-context',
+    channelBio:'Trading creator with enough metadata to avoid sparse About assumptions.',
+    channelLinks:['https://creator.example/'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:true,
+    recentVideoDescriptionsLoader:async()=>[],
+    externalFetchImpl:async input=>html('<html><body><p>No Discord in static HTML.</p></body></html>',String(input)),
+    renderedFallback:async seedUrl=>{
+      renderedCalls++;
+      return {foundInvite:'rendered-room',foundLocation:seedUrl,inspectedPages:1,scrolls:0,clicks:0,complete:true,retryable:false,detail:'Rendered candidate exposed by test fallback'};
+    }
+  });
+  assert.equal(renderedCalls,1);
+  assert.ok(result.discordCandidates?.some(candidate=>candidate.nativeInviteCode==='rendered-room'));
+});
