@@ -6,6 +6,8 @@ on:
       - 'server/evidenceEngine/providers/VideoMetadataProvider.ts'
       - 'server/evidenceEngine/multilingualTerminology.ts'
       - 'server/evidenceEngine/stagedClassification.ts'
+      - 'server/evidenceEngine/creatorFocusAggregation.ts'
+      - 'server/evidenceEngine/creatorFocusAggregation.test.ts'
       - 'server/repeatedTradingFocusDetection.test.ts'
       - '.github/workflows/repeated-trading-focus-detection.yml'
 
@@ -21,7 +23,7 @@ jobs:
           cache: npm
       - run: npm install
       - name: Repeated trading focus regression tests
-        run: node --import tsx --test server/repeatedTradingFocusDetection.test.ts server/enrichmentOutcomeLifecycle.test.ts
+        run: node --import tsx --test server/repeatedTradingFocusDetection.test.ts server/enrichmentOutcomeLifecycle.test.ts server/evidenceEngine/creatorFocusAggregation.test.ts
       - name: TypeScript validation
         run: npm run lint
       - name: Production build
