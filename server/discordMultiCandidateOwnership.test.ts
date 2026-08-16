@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {crawlExternalLinks,runChannelInspection} from './inspector';
 import {extractDiscordCandidates,mergeDiscordCandidates} from './discordCandidates';
+import {discordCandidateCompositeRank} from './discordOwnershipSelection';
 
 const html=(body:string,url:string)=>{const response=new Response(body,{status:200,headers:{'content-type':'text/html'}});Object.defineProperty(response,'url',{value:url});return response;};
 
@@ -33,4 +34,12 @@ test('ownership sorting keeps direct creator evidence ahead of affiliate-only ev
   ];
   const merged=mergeDiscordCandidates(items,{creatorName:'Creator'});
   assert.equal(merged[0].nativeInviteCode,'creator');assert.equal(merged[0].ownershipStatus,'CREATOR_OWNED');assert.equal(merged.find(candidate=>candidate.nativeInviteCode==='partner')?.ownershipStatus,'THIRD_PARTY');
+});
+
+test('creator ownership outranks a healthier third-party Discord during final selection',()=>{
+  const creator=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel'))[0];
+  const partner=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/partner','CREATOR_WEBSITES','https://broker.test/referral/creator'))[0];
+  const creatorAmbiguous={operationalOutcome:'SUCCEEDED',relevanceStatus:'UNCERTAIN',status:'UNCERTAIN'};
+  const partnerActive={operationalOutcome:'SUCCEEDED',relevanceStatus:'TRADING_RELEVANT',status:'ACTIVE'};
+  assert.ok(discordCandidateCompositeRank(creator,creatorAmbiguous)>discordCandidateCompositeRank(partner,partnerActive));
 });
