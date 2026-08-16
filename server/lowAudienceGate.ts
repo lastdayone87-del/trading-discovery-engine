@@ -18,7 +18,7 @@ export function parseSubscriberCountNumber(raw?: string): number | undefined {
 /**
  * Low-Audience Budget Gate (Phase 7):
  * Configurable subscriber threshold gate (default: 30 subscribers).
- * 1-29 subscribers: stored, visible/auditable, marked low-audience skip, deep crawl/enrichment skipped.
+ * 0-29 known subscribers: stored and marked low-audience skip; deep crawl/enrichment is skipped.
  * 30+ subscribers or hidden/unavailable: proceeds normally.
  */
 export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold = 30): LowAudienceGateResult {
@@ -26,7 +26,7 @@ export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold =
   if (count === undefined) {
     return { shouldSkipDeepEnrichment: false, reasonCode: 'SUBSCRIBER_COUNT_UNAVAILABLE' };
   }
-  if (count >= 1 && count < threshold) {
+  if (count < threshold) {
     return { shouldSkipDeepEnrichment: true, subscriberCountNumber: count, reasonCode: 'LOW_AUDIENCE_SKIP' };
   }
   return { shouldSkipDeepEnrichment: false, subscriberCountNumber: count, reasonCode: 'SUFFICIENT_AUDIENCE_PROCEED' };
