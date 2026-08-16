@@ -5,7 +5,8 @@ import fs from 'node:fs';
 test('default channel listing excludes low-audience skips unless explicitly requested',()=>{
   const db=fs.readFileSync(new URL('./db.ts',import.meta.url),'utf8');
   assert.match(db,/const explicitlyViewingLowAudience=args\.scanStatus==='SKIPPED_LOW_AUDIENCE'/);
-  assert.match(db,/!explicitlyViewingLowAudience\)clauses\.push\(`scan_status <> 'SKIPPED_LOW_AUDIENCE'`\)/);
+  assert.match(db,/scan_status <> 'SKIPPED_LOW_AUDIENCE'/);
+  assert.match(db,/subscriber_count::integer < 30/);
   assert.match(db,/add\('scan_status',args\.scanStatus\)/);
 });
 

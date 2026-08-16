@@ -18,7 +18,8 @@ test('parseSubscriberCountNumber correctly parses numeric and compact formats', 
   assert.equal(parseSubscriberCountNumber(undefined), undefined);
 });
 
-test('evaluateLowAudienceGate skips deep crawl for 1-29 subscribers and proceeds for 30+ or hidden', () => {
+test('evaluateLowAudienceGate skips deep crawl for known 0-29 subscribers and proceeds for 30+ or hidden', () => {
+  assert.equal(evaluateLowAudienceGate('0').shouldSkipDeepEnrichment, true);
   assert.equal(evaluateLowAudienceGate('2').shouldSkipDeepEnrichment, true);
   assert.equal(evaluateLowAudienceGate('18').shouldSkipDeepEnrichment, true);
   assert.equal(evaluateLowAudienceGate('29').shouldSkipDeepEnrichment, true);
@@ -39,7 +40,7 @@ test('evaluateLowAudienceGate allows reactivation when subscriber count grows fr
 test('ingestionPipeline enforces country hard-rejection before low-audience budget gate', () => {
   const source = read('server/ingestionPipeline.ts');
   const countryRejectedIndex = source.indexOf("countryVal.status === 'REJECTED'");
-  const lowAudienceGateIndex = source.indexOf('evaluateLowAudienceGate(candidate.subscriberCount)');
+  const lowAudienceGateIndex = source.indexOf('const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);');
   assert.ok(countryRejectedIndex >= 0 && lowAudienceGateIndex >= 0);
   assert.ok(countryRejectedIndex < lowAudienceGateIndex, 'Country hard-rejection must precede low-audience budget gate in ingestion pipeline');
 });
