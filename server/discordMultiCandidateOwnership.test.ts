@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {crawlExternalLinks,runChannelInspection} from './inspector';
-import {mergeDiscordCandidates} from './discordCandidates';
+import {extractDiscordCandidates,mergeDiscordCandidates} from './discordCandidates';
 
 const html=(body:string,url:string)=>{const response=new Response(body,{status:200,headers:{'content-type':'text/html'}});Object.defineProperty(response,'url',{value:url});return response;};
 
@@ -28,8 +28,8 @@ test('same invite across About and video becomes one canonical candidate with mu
 
 test('ownership sorting keeps direct creator evidence ahead of affiliate-only evidence',()=>{
   const items=[
-    ...require('./discordCandidates').extractDiscordCandidates('https://discord.gg/partner','CREATOR_WEBSITES','https://broker.test/referral/creator'),
-    ...require('./discordCandidates').extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel')
+    ...extractDiscordCandidates('https://discord.gg/partner','CREATOR_WEBSITES','https://broker.test/referral/creator'),
+    ...extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel')
   ];
   const merged=mergeDiscordCandidates(items,{creatorName:'Creator'});
   assert.equal(merged[0].nativeInviteCode,'creator');assert.equal(merged[0].ownershipStatus,'CREATOR_OWNED');assert.equal(merged.find(candidate=>candidate.nativeInviteCode==='partner')?.ownershipStatus,'THIRD_PARTY');
