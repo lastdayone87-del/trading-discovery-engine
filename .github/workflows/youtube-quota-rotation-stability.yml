@@ -5,6 +5,8 @@ on:
     paths:
       - 'server/youtubeProviderCooldown.ts'
       - 'server/youtubePoolBackoff.ts'
+      - 'server/youtubeRequestScheduler.ts'
+      - 'server/youtubeRequestScheduler.test.ts'
       - 'scripts/youtube-quota-rotation-stability-test.ts'
       - '.github/workflows/youtube-quota-rotation-stability.yml'
 
@@ -19,6 +21,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
+      - name: Scheduler cooldown regression tests
+        run: node --import tsx --test server/youtubeRequestScheduler.test.ts
       - name: Quota reset and failover regression tests
         run: node --import tsx --test scripts/youtube-quota-rotation-stability-test.ts
       - name: TypeScript validation
