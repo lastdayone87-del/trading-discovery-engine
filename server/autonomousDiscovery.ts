@@ -1,7 +1,6 @@
 import {
   acquireSchedulerLock,
   getAppSetting,
-  getAutonomousSchedulingSnapshot,
   getCountryVocabularies,
   getExcludedCountries,
   getSchedulerState,
@@ -22,6 +21,7 @@ import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
+import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -151,9 +151,11 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       .catch(error => console.warn('[PersistentResearch] Planning cycle failed; legacy query scheduling continues:', error));
 
     const config = await getDiscoveryConfig();
-    const snapshot = await getAutonomousSchedulingSnapshot();
     const now = new Date();
-    const minutesSinceUtcMidnight = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const snapshot = await reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot(now);
+    if (snapshot.awakenedQuotaDeferredJobs > 0) {
+      log(`Pacific quota-day rollover reactivated ${snapshot.awakenedQuotaDeferredJobs} quota-deferred job(s).`);
+    }
     const capacity = calculateDiscoveryCapacity({
       batchSize: config.batchSize,
       targetQueueDepth: config.targetQueueDepth,
@@ -162,7 +164,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       allocationPercent: config.autonomousQuotaPercent,
       unitsUsed: snapshot.autonomousUnitsUsed,
       unitsReserved: snapshot.autonomousUnitsReserved,
-      minutesSinceUtcMidnight
+      minutesSinceUtcMidnight: snapshot.minutesSinceQuotaDayStart
     });
 
     if (capacity === 0) {
