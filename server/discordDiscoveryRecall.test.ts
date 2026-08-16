@@ -14,7 +14,7 @@ const emptyRendered = async (seedUrl: string): Promise<BrowserFallbackResult> =>
   detail: 'test rendered surface inspected without invite',
 });
 
-const staticHtml = async (url: string | URL | Request): Promise<Response> => new Response('<html><body>no invite</body></html>', {
+const staticHtml = async (_url: string | URL | Request): Promise<Response> => new Response('<html><body>no invite</body></html>', {
   status: 200,
   headers: { 'content-type': 'text/html' },
 });
@@ -25,6 +25,7 @@ test('confirmed trading creator refreshes live About even when preloaded bio and
     channelId: 'UCaaaaaaaaaaaaaaaaaaaaaa',
     channelBio: 'This is a sufficiently long preloaded trading creator biography.',
     channelLinks: ['https://example.com'],
+    videoDescriptions: Array.from({ length: 5 }, (_, i) => `preloaded description ${i + 1}`),
     youtubeUrl: 'https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa',
     creatorLikelyTrading: true,
     liveChannelDataLoader: async () => {
