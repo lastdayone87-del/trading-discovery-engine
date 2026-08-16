@@ -12,6 +12,7 @@ export interface YouTubeRequestSchedulerOptions {
   runtimeRateLimitFloorMs?: number;
   maxAdaptiveIntervalMs?: number;
   adaptiveRecoverySuccesses?: number;
+  ratePressureWindowMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -33,6 +34,11 @@ interface QueuedRequest<T> {
   reject: (reason?: unknown) => void;
 }
 
+interface RuntimeRateLimitObservation {
+  at: number;
+  providerFingerprint: string;
+}
+
 const sleepFor = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 function sharedRuntimeCoolingDelayMs(error: unknown): number | null {
@@ -44,35 +50,56 @@ function sharedRuntimeCoolingDelayMs(error: unknown): number | null {
   return retryAfterMs;
 }
 
-function isRuntimeRateLimit(error: unknown, depth = 0): boolean {
-  if (!error || typeof error !== 'object' || depth > 4) return false;
+interface RuntimeRateLimitDetails {
+  providerKey?: string;
+  providerReasons: string[];
+  status?: number;
+}
+
+function runtimeRateLimitDetails(error: unknown, depth = 0): RuntimeRateLimitDetails | null {
+  if (!error || typeof error !== 'object' || depth > 4) return null;
   const candidate = error as {
     status?: unknown;
     quotaExceeded?: unknown;
     errorClass?: unknown;
     providerReasons?: unknown;
+    providerKey?: unknown;
     cause?: unknown;
   };
   const reasons = Array.isArray(candidate.providerReasons)
-    ? candidate.providerReasons.map(reason => String(reason).toLowerCase())
+    ? candidate.providerReasons.map(reason => String(reason))
     : [];
+  const normalizedReasons = reasons.map(reason => reason.toLowerCase());
   const rateLimited = candidate.errorClass === 'RATE_LIMIT'
     || Number(candidate.status) === 429
-    || reasons.some(reason => reason.includes('ratelimit'));
-  if (rateLimited && candidate.quotaExceeded !== true) return true;
-  return isRuntimeRateLimit(candidate.cause, depth + 1);
+    || normalizedReasons.some(reason => reason.includes('ratelimit'));
+  if (rateLimited && candidate.quotaExceeded !== true) {
+    return {
+      providerKey: typeof candidate.providerKey === 'string' ? candidate.providerKey : undefined,
+      providerReasons: reasons,
+      status: Number.isFinite(Number(candidate.status)) ? Number(candidate.status) : undefined
+    };
+  }
+  return runtimeRateLimitDetails(candidate.cause, depth + 1);
 }
 
-/**
- * Runtime-wide YouTube request serializer and pressure controller.
- *
- * Daily quota remains provider-specific. Short shared cooling signals are
- * absorbed and retried inside the same logical request. Production also opts
- * into bounded adaptive pacing: repeated real runtime 429s increase spacing
- * between outbound starts, while sustained successes gradually restore the
- * baseline. This keeps work moving without walking the API-key pool at a rate
- * the shared Railway egress identity cannot sustain.
- */
+function providerFingerprint(providerKey: string | undefined): string {
+  if (!providerKey) return 'unknown';
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < providerKey.length; index += 1) {
+    hash ^= providerKey.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `ytp-${hash.toString(16).padStart(8, '0')}`;
+}
+
+function sanitizeProviderReasons(reasons: string[]): string {
+  if (!reasons.length) return 'unknown';
+  return [...new Set(reasons.map(reason => reason.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)).filter(Boolean))]
+    .slice(0, 4)
+    .join(',') || 'unknown';
+}
+
 export class YouTubeRequestScheduler {
   private readonly queue: QueuedRequest<unknown>[] = [];
   private processing = false;
@@ -80,20 +107,15 @@ export class YouTubeRequestScheduler {
   private nextStartAt = 0;
   private adaptiveIntervalMs = 0;
   private successfulCallsUnderPressure = 0;
+  private lastDispatchAt: number | null = null;
+  private lastSuccessfulCallAt: number | null = null;
+  private readonly recentRuntimeRateLimits: RuntimeRateLimitObservation[] = [];
 
   constructor(private readonly options: YouTubeRequestSchedulerOptions) {}
 
   run<T>(call: () => Promise<T>, trace?: (stage: string) => void, priority: YouTubeRequestPriority = 'enrichment'): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      this.queue.push({
-        call,
-        trace,
-        priority,
-        sequence: this.sequence++,
-        enqueuedAt: (this.options.now ?? Date.now)(),
-        resolve,
-        reject
-      });
+      this.queue.push({ call, trace, priority, sequence: this.sequence++, enqueuedAt: (this.options.now ?? Date.now)(), resolve, reject });
       void this.processQueue();
     });
   }
@@ -101,45 +123,81 @@ export class YouTubeRequestScheduler {
   isRateLimited(): boolean { return false; }
   getCooldownUntil(): number | null { return null; }
 
-  private baseIntervalMs(): number {
-    return Math.max(0, this.options.minIntervalMs);
+  getRatePressureSnapshot(): {
+    adaptiveIntervalMs: number;
+    recent429s: number;
+    affectedProviders: number;
+    lastSuccessfulCallAt: number | null;
+    lastDispatchAt: number | null;
+  } {
+    const now = (this.options.now ?? Date.now)();
+    this.trimRuntimeRateLimits(now);
+    return {
+      adaptiveIntervalMs: this.currentIntervalMs(),
+      recent429s: this.recentRuntimeRateLimits.length,
+      affectedProviders: new Set(this.recentRuntimeRateLimits.map(item => item.providerFingerprint)).size,
+      lastSuccessfulCallAt: this.lastSuccessfulCallAt,
+      lastDispatchAt: this.lastDispatchAt
+    };
   }
 
-  private currentIntervalMs(): number {
-    return Math.max(this.baseIntervalMs(), this.adaptiveIntervalMs);
+  private baseIntervalMs(): number { return Math.max(0, this.options.minIntervalMs); }
+  private currentIntervalMs(): number { return Math.max(this.baseIntervalMs(), this.adaptiveIntervalMs); }
+  private pressureWindowMs(): number { return Math.max(1_000, this.options.ratePressureWindowMs ?? 60_000); }
+
+  private trimRuntimeRateLimits(now: number): void {
+    const cutoff = now - this.pressureWindowMs();
+    while (this.recentRuntimeRateLimits.length && this.recentRuntimeRateLimits[0].at < cutoff) this.recentRuntimeRateLimits.shift();
   }
 
-  private noteRuntimeRateLimit(trace?: (stage: string) => void): void {
-    // Keep adaptive pressure control explicit for constructed schedulers. The
-    // production singleton opts in below; legacy/unit construction sites that
-    // do not provide a floor retain their historical fixed-spacing semantics.
-    if (this.options.runtimeRateLimitFloorMs === undefined) return;
-
+  private noteRuntimeRateLimit(details: RuntimeRateLimitDetails, actualSpacingMs: number | null, priority: YouTubeRequestPriority, trace?: (stage: string) => void): void {
     const base = this.baseIntervalMs();
-    const floor = Math.max(base, this.options.runtimeRateLimitFloorMs);
-    const max = Math.max(floor, this.options.maxAdaptiveIntervalMs ?? 5_000);
-    this.adaptiveIntervalMs = this.adaptiveIntervalMs > 0
-      ? Math.min(max, Math.max(floor, this.adaptiveIntervalMs * 2))
-      : floor;
-    this.successfulCallsUnderPressure = 0;
+
+    // Preserve #244's explicit opt-in contract: constructed schedulers that do
+    // not provide a runtime floor keep their historical fixed-spacing behavior.
+    // Diagnostics still record the 429 below, so observability is independent
+    // from whether adaptive pacing is enabled for this scheduler instance.
+    if (this.options.runtimeRateLimitFloorMs !== undefined) {
+      const floor = Math.max(base, this.options.runtimeRateLimitFloorMs);
+      const max = Math.max(floor, this.options.maxAdaptiveIntervalMs ?? 5_000);
+      this.adaptiveIntervalMs = this.adaptiveIntervalMs > 0
+        ? Math.min(max, Math.max(floor, this.adaptiveIntervalMs * 2))
+        : floor;
+      this.successfulCallsUnderPressure = 0;
+
+      const pressureNow = (this.options.now ?? Date.now)();
+      this.nextStartAt = Math.max(this.nextStartAt, pressureNow + this.adaptiveIntervalMs);
+      trace?.(`adaptive-rate-pressure ${this.adaptiveIntervalMs}ms`);
+    }
 
     const now = (this.options.now ?? Date.now)();
-    this.nextStartAt = Math.max(this.nextStartAt, now + this.adaptiveIntervalMs);
-    trace?.(`adaptive-rate-pressure ${this.adaptiveIntervalMs}ms`);
+    const fingerprint = providerFingerprint(details.providerKey);
+    this.recentRuntimeRateLimits.push({ at: now, providerFingerprint: fingerprint });
+    this.trimRuntimeRateLimits(now);
+    const affectedProviders = new Set(this.recentRuntimeRateLimits.map(item => item.providerFingerprint)).size;
+    trace?.(
+      `runtime-rate-pressure-diagnostic status=${details.status ?? 429} quota=false provider=${fingerprint}`
+      + ` reasons=${sanitizeProviderReasons(details.providerReasons)}`
+      + ` actual-spacing-ms=${actualSpacingMs ?? 'first'}`
+      + ` target-spacing-ms=${this.currentIntervalMs()}`
+      + ` recent-429s-${Math.round(this.pressureWindowMs() / 1000)}s=${this.recentRuntimeRateLimits.length}`
+      + ` affected-providers=${affectedProviders}`
+      + ` priority=${priority}`
+    );
   }
 
   private noteSuccessfulCall(trace?: (stage: string) => void): void {
+    const now = (this.options.now ?? Date.now)();
+    this.lastSuccessfulCallAt = now;
     const base = this.baseIntervalMs();
     if (this.adaptiveIntervalMs <= base) {
       this.adaptiveIntervalMs = 0;
       this.successfulCallsUnderPressure = 0;
       return;
     }
-
     this.successfulCallsUnderPressure += 1;
     const requiredSuccesses = Math.max(1, Math.floor(this.options.adaptiveRecoverySuccesses ?? 4));
     if (this.successfulCallsUnderPressure < requiredSuccesses) return;
-
     this.successfulCallsUnderPressure = 0;
     const reduced = Math.floor(this.adaptiveIntervalMs / 2);
     this.adaptiveIntervalMs = reduced <= base ? 0 : Math.max(base, reduced);
@@ -150,24 +208,11 @@ export class YouTubeRequestScheduler {
     if (!this.queue.length) return undefined;
     const now = (this.options.now ?? Date.now)();
     const starvationMs = Math.max(0, this.options.starvationMs ?? 2_000);
-
-    const manual = this.queue.filter(request => request.priority === 'manual')
-      .sort((left, right) => left.sequence - right.sequence)[0];
-    if (manual) {
-      this.queue.splice(this.queue.indexOf(manual), 1);
-      return manual;
-    }
-
-    const starved = this.queue.filter(request => now - request.enqueuedAt >= starvationMs)
-      .sort((left, right) => left.sequence - right.sequence)[0];
-    if (starved) {
-      this.queue.splice(this.queue.indexOf(starved), 1);
-      return starved;
-    }
-
-    const prioritized = [...this.queue].sort(
-      (left, right) => PRIORITY[left.priority] - PRIORITY[right.priority] || left.sequence - right.sequence
-    )[0];
+    const manual = this.queue.filter(request => request.priority === 'manual').sort((left, right) => left.sequence - right.sequence)[0];
+    if (manual) { this.queue.splice(this.queue.indexOf(manual), 1); return manual; }
+    const starved = this.queue.filter(request => now - request.enqueuedAt >= starvationMs).sort((left, right) => left.sequence - right.sequence)[0];
+    if (starved) { this.queue.splice(this.queue.indexOf(starved), 1); return starved; }
+    const prioritized = [...this.queue].sort((left, right) => PRIORITY[left.priority] - PRIORITY[right.priority] || left.sequence - right.sequence)[0];
     this.queue.splice(this.queue.indexOf(prioritized), 1);
     return prioritized;
   }
@@ -180,6 +225,9 @@ export class YouTubeRequestScheduler {
   private async runSelectedRequest(request: QueuedRequest<unknown>): Promise<void> {
     for (;;) {
       request.trace?.('before scheduled-call at server/youtubeRequestScheduler.ts:166');
+      const dispatchAt = (this.options.now ?? Date.now)();
+      const actualSpacingMs = this.lastDispatchAt === null ? null : Math.max(0, dispatchAt - this.lastDispatchAt);
+      this.lastDispatchAt = dispatchAt;
       try {
         const value = await request.call();
         this.noteSuccessfulCall(request.trace);
@@ -189,11 +237,11 @@ export class YouTubeRequestScheduler {
       } catch (error) {
         const coolingDelayMs = sharedRuntimeCoolingDelayMs(error);
         if (coolingDelayMs === null) {
-          if (isRuntimeRateLimit(error)) this.noteRuntimeRateLimit(request.trace);
+          const details = runtimeRateLimitDetails(error);
+          if (details) this.noteRuntimeRateLimit(details, actualSpacingMs, request.priority, request.trace);
           request.reject(error);
           return;
         }
-
         const now = (this.options.now ?? Date.now)();
         const pacingDelayMs = Math.max(0, this.nextStartAt - now);
         const waitMs = Math.max(coolingDelayMs, pacingDelayMs);
@@ -208,19 +256,13 @@ export class YouTubeRequestScheduler {
   private async processQueue(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
-
     try {
       while (this.queue.length) {
         const now = (this.options.now ?? Date.now)();
         const waitMs = Math.max(0, this.nextStartAt - now);
         let request: QueuedRequest<unknown> | undefined;
-        if (waitMs > 0) {
-          await this.wait(waitMs);
-          request = this.takeNextRequest();
-        } else {
-          request = this.takeNextRequest();
-        }
-
+        if (waitMs > 0) { await this.wait(waitMs); request = this.takeNextRequest(); }
+        else request = this.takeNextRequest();
         if (!request) break;
         request.trace?.('scheduler-tail-released');
         this.nextStartAt = (this.options.now ?? Date.now)() + this.currentIntervalMs();
@@ -245,5 +287,6 @@ export const youtubeRequestScheduler = new YouTubeRequestScheduler({
   runtimeRateLimitFloorMs: nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_FLOOR_MS, 1_000),
   maxAdaptiveIntervalMs: nonNegativeNumber(process.env.YOUTUBE_MAX_ADAPTIVE_REQUEST_INTERVAL_MS, 5_000),
   adaptiveRecoverySuccesses: nonNegativeNumber(process.env.YOUTUBE_ADAPTIVE_RECOVERY_SUCCESSES, 4),
+  ratePressureWindowMs: nonNegativeNumber(process.env.YOUTUBE_RATE_PRESSURE_WINDOW_MS, 60_000),
   starvationMs: nonNegativeNumber(process.env.YOUTUBE_SCHEDULER_STARVATION_MS, 2_000)
 });
