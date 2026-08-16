@@ -1,0 +1,27 @@
+name: Low-audience dashboard visibility
+
+on:
+  pull_request:
+    paths:
+      - 'server/db.ts'
+      - 'src/components/ResultsTable.tsx'
+      - 'server/lowAudienceDashboardVisibility.test.ts'
+      - '.github/workflows/low-audience-dashboard-visibility.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Low-audience serving contract
+        run: node --import tsx --test server/lowAudienceDashboardVisibility.test.ts
+      - name: TypeScript validation
+        run: npm run lint
+      - name: Production build
+        run: npm run build
