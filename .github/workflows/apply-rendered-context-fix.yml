@@ -1,0 +1,34 @@
+name: Apply rendered context fix
+on:
+  push:
+    branches:
+      - fix/discord-multi-candidate-ownership
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/discord-multi-candidate-ownership
+          fetch-depth: 0
+      - name: Preserve explicit trading context when creator lookup is unavailable
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('server/inspector.ts')
+          s=p.read_text()
+          old="""  if((creatorLikelyTrading===undefined||!creatorName)&&channelData.channelId){try{const stored=await getChannelById(channelData.channelId);if(creatorLikelyTrading===undefined)creatorLikelyTrading=stored?.trading_status==='TRADING_CONFIRMED';if(!creatorName)creatorName=stored?.channel_name||'';}catch{creatorLikelyTrading=false;}}creatorLikelyTrading=creatorLikelyTrading===true;"""
+          new="""  if((creatorLikelyTrading===undefined||!creatorName)&&channelData.channelId){try{const stored=await getChannelById(channelData.channelId);if(creatorLikelyTrading===undefined)creatorLikelyTrading=stored?.trading_status==='TRADING_CONFIRMED';if(!creatorName)creatorName=stored?.channel_name||'';}catch{if(creatorLikelyTrading===undefined)creatorLikelyTrading=false;}}creatorLikelyTrading=creatorLikelyTrading===true;"""
+          if old not in s: raise SystemExit('expected creator context block missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          rm .github/workflows/apply-rendered-context-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add server/inspector.ts .github/workflows/apply-rendered-context-fix.yml
+          git diff --cached --check
+          git commit -m "Preserve explicit trading context for rendered fallback"
+          git push origin HEAD:fix/discord-multi-candidate-ownership
