@@ -46,6 +46,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   if(candidate.sourceSurface==='YOUTUBE_ABOUT'){score+=90;reasons.push('DIRECT_YOUTUBE_ABOUT');}
   if(candidate.sourceSurface==='RECENT_VIDEO_DESCRIPTIONS'){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
   if(candidate.sourceSurface==='CHANNEL_EXTERNAL_LINKS'){score+=70;reasons.push('DIRECT_CHANNEL_LINK');}
+  if(candidate.sourceSurface==='CREATOR_WEBSITES'){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
   if(candidate.sourceSurface==='SOCIAL_PROFILES'){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
   const source=String(candidate.sourceUrl||'').toLowerCase();
   const raw=String(candidate.rawLocator||'').toLowerCase();
