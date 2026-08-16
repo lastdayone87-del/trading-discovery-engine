@@ -73,14 +73,15 @@ function runtimeRateLimitDetails(error: unknown, depth = 0): RuntimeRateLimitDet
   const rateLimited = candidate.errorClass === 'RATE_LIMIT'
     || Number(candidate.status) === 429
     || normalizedReasons.some(reason => reason.includes('ratelimit'));
+  const nested = runtimeRateLimitDetails(candidate.cause, depth + 1);
   if (rateLimited && candidate.quotaExceeded !== true) {
     return {
-      providerKey: typeof candidate.providerKey === 'string' ? candidate.providerKey : undefined,
-      providerReasons: reasons,
-      status: Number.isFinite(Number(candidate.status)) ? Number(candidate.status) : undefined
+      providerKey: typeof candidate.providerKey === 'string' ? candidate.providerKey : nested?.providerKey,
+      providerReasons: reasons.length ? reasons : (nested?.providerReasons ?? []),
+      status: Number.isFinite(Number(candidate.status)) ? Number(candidate.status) : nested?.status
     };
   }
-  return runtimeRateLimitDetails(candidate.cause, depth + 1);
+  return nested;
 }
 
 function providerFingerprint(providerKey: string | undefined): string {
