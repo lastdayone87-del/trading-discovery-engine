@@ -37,7 +37,7 @@ test('daily exhausted provider remains unavailable until Pacific reset while hea
   assert.equal(cooldown.eligible(exhausted), true);
 });
 
-test('runtime rate limit briefly pauses healthy providers without creating provider-local cooldown debt', () => {
+test('runtime rate limit quarantines only the failing provider while healthy providers stay eligible', () => {
   let now = 1_000_000;
   const cooldown = new YouTubeProviderCooldown({
     initialRateLimitCooldownMs: 5_000,
@@ -46,18 +46,18 @@ test('runtime rate limit briefly pauses healthy providers without creating provi
     now: () => now
   });
   const retryAt = cooldown.failed('key-a', 'RATE_LIMITED');
-  assert.equal(retryAt, 1_001_000);
+  assert.equal(retryAt, 1_005_000);
   assert.equal(cooldown.eligible('key-a'), false);
-  assert.equal(cooldown.eligible('key-b'), false);
-  assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b']), retryAt);
+  assert.equal(cooldown.eligible('key-b'), true);
+  assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b']), null);
 
-  now += 1_000;
+  now += 5_000;
   assert.equal(cooldown.eligible('key-a'), true);
   assert.equal(cooldown.eligible('key-b'), true);
   assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b']), null);
 });
 
-test('daily exhausted provider retains its daily status during a shared runtime pause', () => {
+test('daily exhausted provider retains daily status while another provider is rate-limited', () => {
   let now = Date.parse('2026-08-12T06:30:00.000Z');
   const cooldown = new YouTubeProviderCooldown({
     initialRateLimitCooldownMs: 5_000,
@@ -66,10 +66,10 @@ test('daily exhausted provider retains its daily status during a shared runtime 
     now: () => now
   });
   const dailyReset = cooldown.failed('key-a', 'DAILY_QUOTA_EXHAUSTED');
-  const runtimeRetryAt = cooldown.failed('key-b', 'RATE_LIMITED');
+  const rateLimitRetryAt = cooldown.failed('key-b', 'RATE_LIMITED');
 
   assert.deepEqual(cooldown.status('key-a'), { status: 'Daily Quota Exhausted', retryAt: dailyReset });
-  assert.deepEqual(cooldown.status('key-b'), { status: 'Cooling Down', retryAt: runtimeRetryAt });
+  assert.deepEqual(cooldown.status('key-b'), { status: 'Cooling Down', retryAt: rateLimitRetryAt });
   assert.equal(cooldown.retryAt('key-a'), dailyReset);
 });
 
