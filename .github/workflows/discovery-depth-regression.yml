@@ -9,6 +9,8 @@ on:
       - 'server/queueManager.ts'
       - 'server/searchOrdering.ts'
       - 'server/continuationPolicy.ts'
+      - 'server/continuationPolicy.test.ts'
+      - 'server/db/migrations/096_autonomous_pagination_depth.sql'
       - 'server/discoveryDepthRegression.test.ts'
       - 'src/types/index.ts'
       - '.github/workflows/discovery-depth-regression.yml'
@@ -24,7 +26,20 @@ jobs:
           cache: npm
       - run: npm install
       - name: Discovery depth regression tests
-        run: node --import tsx --test server/discoveryDepthRegression.test.ts
+        run: node --import tsx --test server/discoveryDepthRegression.test.ts server/continuationPolicy.test.ts
+      - name: Validate autonomous pagination migration contract
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const sql = fs.readFileSync('server/db/migrations/096_autonomous_pagination_depth.sql', 'utf8');
+          const normalized = sql.replace(/\s+/g, ' ');
+          const migratesLegacyThree = /UPDATE app_settings SET setting_value\s*=\s*'10' WHERE setting_key\s*=\s*'autonomous_pagination_max_pages' AND setting_value\s*=\s*'3'\s*;/.test(normalized);
+          const seedsMissingTen = /INSERT INTO app_settings\s*\(setting_key,\s*setting_value\) VALUES\s*\('autonomous_pagination_max_pages',\s*'10'\) ON CONFLICT\s*\(setting_key\) DO NOTHING\s*;/.test(normalized);
+          if (!migratesLegacyThree || !seedsMissingTen) {
+            console.error({ migratesLegacyThree, seedsMissingTen });
+            process.exit(1);
+          }
+          NODE
       - name: TypeScript validation
         run: npm run lint
       - name: Production build
