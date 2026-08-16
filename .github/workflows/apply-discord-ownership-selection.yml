@@ -1,0 +1,45 @@
+name: Apply Discord ownership selection
+on:
+  push:
+    branches:
+      - fix/discord-multi-candidate-ownership
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/discord-multi-candidate-ownership
+          fetch-depth: 0
+      - name: Integrate ownership-aware queue selection
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('server/queueManager.ts')
+          s=p.read_text()
+          anchor="import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';\n"
+          imp="import { discordCandidateCompositeRank } from './discordOwnershipSelection';\n"
+          if imp not in s:
+              if anchor not in s: raise SystemExit('queue import anchor missing')
+              s=s.replace(anchor,anchor+imp,1)
+          old="""      const validationRank=(validation:Awaited<ReturnType<typeof validateDiscordInvite>>):number=>{\n        if(validation.operationalOutcome==='SUCCEEDED'){\n          if(validation.relevanceStatus==='TRADING_RELEVANT'&&(validation.status==='ACTIVE'||validation.status==='ACTIVE_LOW_VOLUME'))return 100;\n          if(validation.relevanceStatus==='TRADING_RELEVANT')return 90;\n          if(validation.relevanceStatus==='UNCERTAIN'||validation.status==='UNCERTAIN')return 60;\n          if(validation.status==='NON_TRADING'||validation.relevanceStatus==='NON_TRADING')return 40;\n          if(validation.status==='DEAD')return 30;\n          return 50;\n        }\n        if(validation.operationalOutcome==='INVALID_OBSERVED')return 20;\n        if(validation.operationalOutcome==='CONFIRMED_INVALID')return 10;\n        return 0;\n      };\n"""
+          if old in s:
+              s=s.replace(old,'',1)
+          elif 'const validationRank=' in s:
+              raise SystemExit('unexpected validationRank shape')
+          s=s.replace('        const rank=validationRank(validation);','        const rank=discordCandidateCompositeRank(candidate,validation);',1)
+          s=s.replace('        if(rank>=100)break;\n','',1)
+          if 'validationRank(validation)' in s or 'if(rank>=100)break' in s:
+              raise SystemExit('old first-success selection still present')
+          p.write_text(s)
+          PY
+          rm .github/workflows/apply-discord-ownership-selection.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add server/queueManager.ts .github/workflows/apply-discord-ownership-selection.yml
+          git diff --cached --check
+          git commit -m "Rank Discord candidates by creator ownership before health"
+          git push origin HEAD:fix/discord-multi-candidate-ownership
