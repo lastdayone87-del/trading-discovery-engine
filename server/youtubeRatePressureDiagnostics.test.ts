@@ -39,6 +39,37 @@ test('runtime 429 trace attributes pressure without exposing provider credential
   assert.doesNotMatch(diagnostic!,/SUPER_SECRET/);
 });
 
+test('wrapped runtime 429 inherits provider identity from its cause before diagnostics are counted', async () => {
+  let now=0;
+  const traces:string[]=[];
+  const scheduler=new YouTubeRequestScheduler({
+    minIntervalMs:0,
+    initialRateLimitBackoffMs:500,
+    maxRateLimitBackoffMs:5_000,
+    runtimeRateLimitFloorMs:0,
+    maxAdaptiveIntervalMs:0,
+    ratePressureWindowMs:60_000,
+    now:()=>now,
+    sleep:async ms=>{now+=ms;}
+  });
+  const secret='AIzaSyWRAPPED_PROVIDER_KEY';
+  const cause=runtime429(secret,['rateLimitExceeded','RATE_LIMIT_EXCEEDED']);
+  const wrapped=Object.assign(new Error('Provider rate limit reached.'),{
+    status:429,
+    quotaExceeded:false,
+    errorClass:'RATE_LIMIT',
+    providerReasons:['rateLimitExceeded','RATE_LIMIT_EXCEEDED'],
+    cause
+  });
+  await assert.rejects(scheduler.run(async()=>{throw wrapped;},stage=>traces.push(stage),'autonomous'));
+  const diagnostic=traces.find(stage=>stage.startsWith('runtime-rate-pressure-diagnostic'));
+  assert.ok(diagnostic);
+  assert.match(diagnostic!,/provider=ytp-[0-9a-f]{8}/);
+  assert.doesNotMatch(diagnostic!,/provider=unknown/);
+  assert.doesNotMatch(diagnostic!,/AIza/);
+  assert.equal(scheduler.getRatePressureSnapshot().affectedProviders,1);
+});
+
 test('recent pressure snapshot distinguishes multiple provider fingerprints', async () => {
   let now=0;
   const scheduler=new YouTubeRequestScheduler({
