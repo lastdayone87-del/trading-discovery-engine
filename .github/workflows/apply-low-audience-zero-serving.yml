@@ -50,6 +50,11 @@ jobs:
           if needle not in text:
               raise SystemExit('lowAudienceGate assertion anchor not found')
           text = text.replace(needle, "  assert.equal(evaluateLowAudienceGate('0').shouldSkipDeepEnrichment, true);\n" + needle, 1)
+          old_gate_probe = "  const lowAudienceGateIndex = source.indexOf('evaluateLowAudienceGate(candidate.subscriberCount)');"
+          new_gate_probe = "  const lowAudienceGateIndex = source.indexOf('const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);');"
+          if old_gate_probe not in text:
+              raise SystemExit('lowAudienceGate ordering probe not found')
+          text = text.replace(old_gate_probe, new_gate_probe, 1)
           test.write_text(text)
 
           db = Path('server/db.ts')
