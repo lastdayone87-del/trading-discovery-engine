@@ -32,5 +32,5 @@ test('quota-day identifier resolves to the next Pacific midnight instant', () =>
 test('dashboard reset display is explicitly the next reset rather than the quota-day date', () => {
   const payload = normalizeQueueStatusForDashboard({ quota: { lastReset: '2026-08-15', keyUsage: [] } });
   assert.match(payload.quota.lastReset, /^next /);
-  assert.doesNotEqual(payload.quota.lastReset, '2026-08-15');
+  assert.notEqual(payload.quota.lastReset, '2026-08-15');
 });
