@@ -1,3 +1,5 @@
+import { getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
+
 export type YouTubeRequestPriority =
   | 'manual'
   | 'autonomous'
@@ -13,6 +15,7 @@ export interface YouTubeRequestSchedulerOptions {
   maxAdaptiveIntervalMs?: number;
   adaptiveRecoverySuccesses?: number;
   ratePressureWindowMs?: number;
+  quotaGroupForProvider?: (providerKey: string) => string | undefined;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -37,6 +40,7 @@ interface QueuedRequest<T> {
 interface RuntimeRateLimitObservation {
   at: number;
   providerFingerprint: string;
+  quotaGroupFingerprint?: string;
 }
 
 const sleepFor = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -84,14 +88,17 @@ function runtimeRateLimitDetails(error: unknown, depth = 0): RuntimeRateLimitDet
   return nested;
 }
 
-function providerFingerprint(providerKey: string | undefined): string {
-  if (!providerKey) return 'unknown';
+function stableFingerprint(value: string, prefix: 'ytp' | 'ytq'): string {
   let hash = 0x811c9dc5;
-  for (let index = 0; index < providerKey.length; index += 1) {
-    hash ^= providerKey.charCodeAt(index);
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
-  return `ytp-${hash.toString(16).padStart(8, '0')}`;
+  return `${prefix}-${hash.toString(16).padStart(8, '0')}`;
+}
+
+function providerFingerprint(providerKey: string | undefined): string {
+  return providerKey ? stableFingerprint(providerKey, 'ytp') : 'unknown';
 }
 
 function sanitizeProviderReasons(reasons: string[]): string {
@@ -128,6 +135,8 @@ export class YouTubeRequestScheduler {
     adaptiveIntervalMs: number;
     recent429s: number;
     affectedProviders: number;
+    affectedQuotaGroups: number;
+    unattributedProviderObservations: number;
     lastSuccessfulCallAt: number | null;
     lastDispatchAt: number | null;
   } {
@@ -137,6 +146,8 @@ export class YouTubeRequestScheduler {
       adaptiveIntervalMs: this.currentIntervalMs(),
       recent429s: this.recentRuntimeRateLimits.length,
       affectedProviders: new Set(this.recentRuntimeRateLimits.map(item => item.providerFingerprint)).size,
+      affectedQuotaGroups: new Set(this.recentRuntimeRateLimits.map(item => item.quotaGroupFingerprint).filter((value): value is string => Boolean(value))).size,
+      unattributedProviderObservations: this.recentRuntimeRateLimits.filter(item => !item.quotaGroupFingerprint).length,
       lastSuccessfulCallAt: this.lastSuccessfulCallAt,
       lastDispatchAt: this.lastDispatchAt
     };
@@ -173,16 +184,23 @@ export class YouTubeRequestScheduler {
 
     const now = (this.options.now ?? Date.now)();
     const fingerprint = providerFingerprint(details.providerKey);
-    this.recentRuntimeRateLimits.push({ at: now, providerFingerprint: fingerprint });
+    const quotaGroup = details.providerKey
+      ? (this.options.quotaGroupForProvider ?? getYouTubeQuotaGroupForKey)(details.providerKey)
+      : undefined;
+    const quotaGroupFingerprint = quotaGroup ? stableFingerprint(quotaGroup, 'ytq') : undefined;
+    this.recentRuntimeRateLimits.push({ at: now, providerFingerprint: fingerprint, quotaGroupFingerprint });
     this.trimRuntimeRateLimits(now);
-    const affectedProviders = new Set(this.recentRuntimeRateLimits.map(item => item.providerFingerprint)).size;
+    const snapshot = this.getRatePressureSnapshot();
     trace?.(
       `runtime-rate-pressure-diagnostic status=${details.status ?? 429} quota=false provider=${fingerprint}`
+      + ` quota-group=${quotaGroupFingerprint ?? 'unconfigured'}`
       + ` reasons=${sanitizeProviderReasons(details.providerReasons)}`
       + ` actual-spacing-ms=${actualSpacingMs ?? 'first'}`
       + ` target-spacing-ms=${this.currentIntervalMs()}`
-      + ` recent-429s-${Math.round(this.pressureWindowMs() / 1000)}s=${this.recentRuntimeRateLimits.length}`
-      + ` affected-providers=${affectedProviders}`
+      + ` recent-429s-${Math.round(this.pressureWindowMs() / 1000)}s=${snapshot.recent429s}`
+      + ` affected-providers=${snapshot.affectedProviders}`
+      + ` affected-quota-groups=${snapshot.affectedQuotaGroups}`
+      + ` unattributed-provider-observations=${snapshot.unattributedProviderObservations}`
       + ` priority=${priority}`
     );
   }
