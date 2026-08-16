@@ -1,0 +1,23 @@
+name: Discord public evidence ladder
+on:
+  pull_request:
+    paths:
+      - 'server/discordValidator.ts'
+      - 'server/discordProjection.ts'
+      - 'server/discordPublicEvidenceLadder.test.ts'
+      - 'server/discordRelevanceContext.test.ts'
+      - '.github/workflows/discord-public-evidence-ladder.yml'
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Public evidence ladder regressions
+        run: node --import tsx --test server/discordPublicEvidenceLadder.test.ts server/discordRelevanceContext.test.ts
+      - name: Build
+        run: npm run build
