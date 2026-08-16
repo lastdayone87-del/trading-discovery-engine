@@ -9,6 +9,8 @@ on:
       - 'server/queueManager.ts'
       - 'server/searchOrdering.ts'
       - 'server/continuationPolicy.ts'
+      - 'server/continuationPolicy.test.ts'
+      - 'server/db/migrations/096_autonomous_pagination_depth.sql'
       - 'server/discoveryDepthRegression.test.ts'
       - 'src/types/index.ts'
       - '.github/workflows/discovery-depth-regression.yml'
@@ -24,7 +26,12 @@ jobs:
           cache: npm
       - run: npm install
       - name: Discovery depth regression tests
-        run: node --import tsx --test server/discoveryDepthRegression.test.ts
+        run: node --import tsx --test server/discoveryDepthRegression.test.ts server/continuationPolicy.test.ts
+      - name: Validate autonomous pagination migration contract
+        run: |
+          set -euo pipefail
+          grep -q "autonomous_pagination_max_pages','10'" server/db/migrations/096_autonomous_pagination_depth.sql
+          grep -q "setting_value='3'" server/db/migrations/096_autonomous_pagination_depth.sql
       - name: TypeScript validation
         run: npm run lint
       - name: Production build
