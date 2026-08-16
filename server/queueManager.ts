@@ -62,6 +62,7 @@ import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
+import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -614,19 +615,6 @@ export async function inspectAndValidateChannel(
       const candidates=structuredCandidates.length?structuredCandidates:[{candidateId:`legacy:${discoveredInvite}`,locatorType:'NATIVE_INVITE' as const,sourceSurface:'CHANNEL_EXTERNAL_LINKS' as const,rawLocator:discoveredInvite,nativeInviteCode:discoveredInvite,normalizedLocator:`https://discord.gg/${discoveredInvite}`,extractionConfidence:'EXPLICIT' as const}];
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
-      const validationRank=(validation:Awaited<ReturnType<typeof validateDiscordInvite>>):number=>{
-        if(validation.operationalOutcome==='SUCCEEDED'){
-          if(validation.relevanceStatus==='TRADING_RELEVANT'&&(validation.status==='ACTIVE'||validation.status==='ACTIVE_LOW_VOLUME'))return 100;
-          if(validation.relevanceStatus==='TRADING_RELEVANT')return 90;
-          if(validation.relevanceStatus==='UNCERTAIN'||validation.status==='UNCERTAIN')return 60;
-          if(validation.status==='NON_TRADING'||validation.relevanceStatus==='NON_TRADING')return 40;
-          if(validation.status==='DEAD')return 30;
-          return 50;
-        }
-        if(validation.operationalOutcome==='INVALID_OBSERVED')return 20;
-        if(validation.operationalOutcome==='CONFIRMED_INVALID')return 10;
-        return 0;
-      };
       for(const candidate of candidates){
         if(!candidate.nativeInviteCode)continue;
         const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
@@ -634,9 +622,8 @@ export async function inspectAndValidateChannel(
         const validation=await validateDiscordInvite(candidate.nativeInviteCode,{parentChannelIsTrading:channel.trading_status==='TRADING_CONFIRMED',channelName:channel.channel_name,priorInvalidObservations});
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
         if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}
-        const rank=validationRank(validation);
+        const rank=discordCandidateCompositeRank(candidate,validation);
         if(rank>selectedRank){selected=validation;selectedCandidate=candidate;selectedRank=rank;}
-        if(rank>=100)break;
       }
       if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0];selectedCandidate=candidates[0];}
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');

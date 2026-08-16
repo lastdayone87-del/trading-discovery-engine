@@ -1,0 +1,25 @@
+name: Discord multi-candidate ownership
+on:
+  pull_request:
+    paths:
+      - 'server/inspector.ts'
+      - 'server/discordCandidates.ts'
+      - 'server/browserCommunityFallback.ts'
+      - 'server/discordMultiCandidateOwnership.test.ts'
+      - '.github/workflows/discord-multi-candidate-ownership.yml'
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Multi-candidate ownership regressions
+        run: node --import tsx --test server/discordMultiCandidateOwnership.test.ts server/communityAcquisitionSemantics.test.ts
+      - name: Browser fallback regressions
+        run: node --import tsx --test server/browserCommunityFallback.test.ts server/browserCommunityFallback.integration.test.ts
+      - name: Build
+        run: npm run build
