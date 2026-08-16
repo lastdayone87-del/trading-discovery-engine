@@ -79,6 +79,62 @@ test('provider rate limiting does not impose shared exponential cooldown', async
   assert.equal(scheduler.isRateLimited(), false);
 });
 
+test('pre-dispatch shared cooling is absorbed and retries the same logical request', async () => {
+  let now = 0;
+  let attempts = 0;
+  const sleeps: number[] = [];
+  const traces: string[] = [];
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 100,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    now: () => now,
+    sleep: async ms => { sleeps.push(ms); now += ms; }
+  });
+
+  const result = await scheduler.run(async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw Object.assign(new Error('Every configured YouTube provider is cooling down'), {
+        code: 'YOUTUBE_PROVIDERS_COOLING_DOWN',
+        retryable: true,
+        errorClass: 'RATE_LIMIT',
+        retryAfterMs: 750
+      });
+    }
+    return 'ok';
+  }, stage => traces.push(stage));
+
+  assert.equal(result, 'ok');
+  assert.equal(attempts, 2);
+  assert.deepEqual(sleeps, [750]);
+  assert.ok(traces.includes('shared-runtime-cooling-wait 750ms'));
+  assert.ok(traces.includes('shared-runtime-cooling-retry'));
+});
+
+test('raw provider 429 still escapes to provider failover instead of being scheduler-retried', async () => {
+  let attempts = 0;
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 0,
+    initialRateLimitBackoffMs: 500,
+    maxRateLimitBackoffMs: 2_000,
+    sleep: async () => undefined
+  });
+  const rateLimit = Object.assign(new Error('Provider rate limit reached.'), {
+    errorClass: 'RATE_LIMIT',
+    retryable: true,
+    status: 429,
+    providerReasons: ['rateLimitExceeded'],
+    quotaExceeded: false
+  });
+
+  await assert.rejects(scheduler.run(async () => {
+    attempts += 1;
+    throw rateLimit;
+  }), rateLimit);
+  assert.equal(attempts, 1);
+});
+
 test('distinguishes runtime rate limiting from project quota exhaustion through wrapped errors', () => {
   const rateLimit = Object.assign(new Error('YouTube HTTP 429 RESOURCE_EXHAUSTED (rateLimitExceeded)'), { status: 429, providerReasons: ['rateLimitExceeded'], quotaExceeded: false });
   assert.equal(isYouTubeRateLimited(Object.assign(new Error('Provider rate limit reached.'), { cause: rateLimit })), true);
