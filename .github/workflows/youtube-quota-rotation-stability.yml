@@ -13,9 +13,11 @@ on:
       - 'server/youtubePoolBackoff.ts'
       - 'server/youtubeRequestScheduler.ts'
       - 'server/youtubeRequestScheduler.test.ts'
+      - 'server/youtubeRuntimePressureBoundary.test.ts'
       - 'server/youtubeAdaptivePacing.test.ts'
       - 'server/youtubeRatePressureDiagnostics.test.ts'
       - 'server/youtubeRatePressureDiagnostics.contract.test.ts'
+      - 'server/youtube.ts'
       - 'scripts/youtube-quota-rotation-stability-test.ts'
       - '.github/workflows/youtube-quota-rotation-stability.yml'
 
@@ -36,6 +38,8 @@ jobs:
         run: node --import tsx --test server/youtubeProviderCooldown.test.ts
       - name: Scheduler cooldown regression tests
         run: node --import tsx --test server/youtubeRequestScheduler.test.ts
+      - name: Runtime pressure boundary regression tests
+        run: node --import tsx --test server/youtubeRuntimePressureBoundary.test.ts
       - name: Adaptive request-pressure regression tests
         run: node --import tsx --test server/youtubeAdaptivePacing.test.ts
       - name: Rate-pressure attribution diagnostics tests
