@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 
-export const STAGED_CLASSIFICATION_VERSION = '3.2.0';
+export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
   if (item.provenance?.fields?.length) return item.provenance.fields;
@@ -37,15 +37,25 @@ function isPromotionalOrAdjacentNegative(item: EvidenceItem): boolean {
   return item.category === 'HYPE_SPECULATION' || item.category === 'NON_TRADING_ADJACENT';
 }
 
-/** Terminal rejection is intentionally asymmetric: promotional/adjacent evidence
- * may lower confidence, but it cannot prove that a creator is not a trader. A
- * terminal contradiction must be creator-level irrelevant-domain evidence and
- * must materially dominate substantive positive trading evidence. */
 function terminalContradictionWeights(negative: EvidenceItem[], positiveWeight: number) {
   const terminalNegative = negative.filter(item => item.category === 'IRRELEVANT_DOMAIN' && !isPromotionalOrAdjacentNegative(item));
   const terminalNegativeWeight = terminalNegative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const materiallyDominant = terminalNegativeWeight >= 25 && (positiveWeight === 0 || terminalNegativeWeight > positiveWeight * 1.5);
   return { terminalNegative, terminalNegativeWeight, materiallyDominant };
+}
+
+/** The staged layer only decides whether governed semantic UNRELATED evidence is
+ * eligible to reach the decision policy. Confidence threshold and substantive
+ * positive blockers remain the responsibility of decisionPolicy.ts. */
+function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], collection: EvidenceCollectionReport): boolean {
+  if (collection.terminalNegativeSufficiency?.status !== 'SUFFICIENT' || !collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
+  return negative.some(item => {
+    if (item.source !== 'gemini_semantic' || item.category !== 'IRRELEVANT_DOMAIN' || item.provenance?.semantic?.taxonomyLabel !== 'UNRELATED') return false;
+    const fields=item.provenance?.fields||[];
+    if(fields.some(field=>field.field==='channel_bio')) return true;
+    const videoFamilies=new Set(fields.filter(field=>field.field==='video_title'||field.field==='video_description').map(field=>field.sourceFamilyId||field.sourceId).filter(Boolean));
+    return videoFamilies.size>=2;
+  });
 }
 
 export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport): StagedClassificationReport {
@@ -70,8 +80,9 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const {terminalNegative,terminalNegativeWeight,materiallyDominant}=terminalContradictionWeights(negative,positiveWeight);
   const terminalNegativeSufficient=collection.terminalNegativeSufficiency?.status==='SUFFICIENT';
+  const semanticUnrelatedCandidate=hasCreatorLevelSemanticUnrelatedCandidate(negative,collection);
   const dominantContradiction = materiallyDominant && terminalNegativeSufficient;
-  const mixedNegativeConflict = negative.length > 0 && negativeWeight >= 25 && !dominantContradiction;
+  const mixedNegativeConflict = negative.length > 0 && negativeWeight >= 25 && !dominantContradiction && !semanticUnrelatedCandidate;
 
   const availability = collection.sufficiency === 'SUFFICIENT'
     ? result('AVAILABILITY', 'PASS', [collection.degraded ? 'STAGE_EVIDENCE_SUFFICIENT_WITH_PROVIDER_DEGRADATION' : 'STAGE_EVIDENCE_SUFFICIENT'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded })
@@ -86,11 +97,13 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const corroboration = corroborated
     ? result('CORROBORATION', 'PASS', [repeatedCreatorIndependent ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED' : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
     : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
-  const contradiction = dominantContradiction
-    ? result('CONTRADICTION', 'FAIL', ['DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION'], terminalNegative, { negativeWeight, positiveWeight, terminalNegativeWeight })
-    : mixedNegativeConflict
-      ? result('CONTRADICTION','ABSTAIN',['MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
-      : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_TERMINAL_OR_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight, terminalNegativeWeight });
+  const contradiction = semanticUnrelatedCandidate
+    ? result('CONTRADICTION','FAIL',['CREATOR_LEVEL_SEMANTIC_UNRELATED_CANDIDATE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
+    : dominantContradiction
+      ? result('CONTRADICTION', 'FAIL', ['DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION'], terminalNegative, { negativeWeight, positiveWeight, terminalNegativeWeight })
+      : mixedNegativeConflict
+        ? result('CONTRADICTION','ABSTAIN',['MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
+        : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_TERMINAL_OR_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight, terminalNegativeWeight });
 
   let lifecycleAction: LifecycleAction = 'REVIEW';
   if (availability.disposition !== 'PASS') lifecycleAction = collection.sufficiency === 'MISSING' || collection.sufficiency === 'INSUFFICIENT' ? 'ENRICH' : 'REVIEW';
