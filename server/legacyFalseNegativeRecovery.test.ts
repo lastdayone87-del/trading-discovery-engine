@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { getOperationalMaintenanceJobTypesForTests } from './operationalMaintenanceWorkers';
 
 const migration=fs.readFileSync(new URL('./db/migrations/098_recover_conflict_policy_false_negatives.sql',import.meta.url),'utf8');
+const discordSchema=fs.readFileSync(new URL('./db/migrations/069_discord_candidate_reliability.sql',import.meta.url),'utf8');
 const maintenance=fs.readFileSync(new URL('./operationalMaintenanceWorkers.ts',import.meta.url),'utf8');
 
 test('legacy machine false-negative recovery uses the governed dedicated worker',()=>{
@@ -37,7 +38,18 @@ test('upstream classifier skips persist Discord as not checked rather than Disco
   assert.match(migration,/discord_resolution_status='NOT_ATTEMPTED'/);
   assert.match(migration,/discord_liveness_status='NOT_CHECKED'/);
   assert.match(migration,/discord_relevance_status='NOT_CHECKED'/);
-  assert.match(migration,/discord_validation_status='NOT_ATTEMPTED'/);
+  assert.match(migration,/discord_validation_status='NOT_STARTED'/);
+  assert.match(migration,/NEW\.discord_validation_status := 'NOT_STARTED'/);
+  assert.doesNotMatch(migration,/discord_validation_status\s*(?:=|:=)\s*'NOT_ATTEMPTED'/);
   assert.match(migration,/CREATE TRIGGER channels_normalize_upstream_skipped_discord_state/);
   assert.match(migration,/BEFORE INSERT OR UPDATE/);
+});
+
+test('migration 098 only writes a validation status allowed by migration 069 schema',()=>{
+  const validationConstraint=discordSchema.match(/discord_validation_status IN\(([^)]+)\)/)?.[1] ?? '';
+  const allowed=new Set([...validationConstraint.matchAll(/'([^']+)'/g)].map(match=>match[1]));
+  assert.ok(allowed.size>0,'expected migration 069 to define allowed validation statuses');
+  const assigned=[...migration.matchAll(/discord_validation_status\s*(?::=|=)\s*'([^']+)'/g)].map(match=>match[1]);
+  assert.ok(assigned.length>=2,'expected UPDATE and trigger assignments in migration 098');
+  for(const status of assigned) assert.ok(allowed.has(status),`migration 098 writes unsupported discord_validation_status ${status}`);
 });
