@@ -1,11 +1,12 @@
-import { DiscordStatus } from '../src/types';
+import { DiscordStatus, type TradingStatus } from '../src/types';
 import { executeProviderCall, type ProviderCallError } from './providerResilience';
 import { appendProviderCallEvent } from './db';
+import type {DiscordOwnershipStatus} from './discordCandidates';
 
 export interface DiscordValidationResult {
   status: DiscordStatus;
-  confidence: number; // 0 to 100
-  inviteUrl: string | null; // ONLY non-null if status is ACTIVE or ACTIVE_LOW_VOLUME
+  confidence: number;
+  inviteUrl: string | null;
   guildName?: string;
   approximateMemberCount?: number;
   approximatePresenceCount?: number;
@@ -23,9 +24,25 @@ export interface DiscordValidationResult {
 export type DiscordOperationalOutcome = 'SUCCEEDED'|'INVALID_OBSERVED'|'CONFIRMED_INVALID'|'RATE_LIMITED'|'TIMEOUT'|'NETWORK_FAILURE'|'AUTHENTICATION_FAILURE'|'PROVIDER_FAILURE'|'MALFORMED_RESPONSE'|'INVALID_LOCATOR';
 export interface DiscordCheckAttempt {attemptNumber:number;operationalOutcome:DiscordOperationalOutcome;retryable:boolean;httpStatus?:number;providerErrorClass?:string;providerErrorCode?:number;responseContentType?:string;reason:string;checkedAt:string}
 
+/** Structured creator context is intentionally separate from Discord-native
+ * metadata. It may support association/relevance, but is never injected into
+ * the guild text as if Discord itself said it. */
+export interface DiscordParentContext {
+  tradingStatus?: TradingStatus;
+  tradingConfidence?: number;
+  tradingCategory?: string;
+  creatorName?: string;
+  country?: string;
+  sourceSurface?: string;
+  ownershipStatus?: DiscordOwnershipStatus;
+  ownershipConfidence?: number;
+}
+
 export interface DiscordValidationOptions {
+  /** Backward-compatible prior. New callers should send parentContext. */
   parentChannelIsTrading?: boolean;
   channelName?: string;
+  parentContext?: DiscordParentContext;
   maxAttempts?: number;
   retryDelayMs?: number;
   fetchImpl?: typeof fetch;
@@ -33,7 +50,6 @@ export interface DiscordValidationOptions {
   priorInvalidObservations?: number;
 }
 
-// Keywords required to confirm a Discord community is relevant to trading / finance
 const TRADING_RELEVANCE_KEYWORDS = [
   'trading', 'trader', 'trade', 'trades', 'forex', 'futures', 'stock', 'stocks',
   'orderflow', 'order flow', 'crypto', 'bitcoin', 'btc', 'eth', 'solana',
@@ -43,10 +59,12 @@ const TRADING_RELEVANCE_KEYWORDS = [
   'dax', 'sp500', 'nasdaq', 'ftse', 'cac', 'aex', 'bourse', 'bolsa', 'börse',
   'scalp', 'scalping', 'daytrade', 'daytrader', 'swing', 'liquidity',
   'volume', 'footprint', 'macro', 'finance', 'financial', 'börsenanalyse',
-  'technical analysis', 'pnl', 'lot size', 'pip', 'pips'
+  'technical analysis', 'pnl', 'lot size', 'pip', 'pips', 'market structure',
+  'risk management', 'trade review', 'live execution', 'vwap', 'dom',
+  'market profile', 'tpo', 'wyckoff', 'imbalance', 'fvg', 'fair value gap',
+  'liquidity sweep', 'liquidity grab', 'funded account', 'funded trader'
 ];
 
-// Explicit negative keywords that signal a non-trading community
 const EXPLICIT_NON_TRADING_KEYWORDS = [
   'gaming', 'minecraft', 'roblox', 'fortnite', 'valorant', 'csgo', 'counter strike',
   'league of legends', 'gta', 'anime', 'manga', 'roleplay', 'rp server', 'music',
@@ -54,16 +72,24 @@ const EXPLICIT_NON_TRADING_KEYWORDS = [
   'chill lounge', 'hangout spot', 'airdrop bot', 'free nitro', 'giveaway bot'
 ];
 
-/**
- * Validates a Discord invite link for active status AND verifies server trading relevance.
- * Confidence-aware classification supporting context inheritance from YouTube creator parent.
- */
-export async function validateDiscordInvite(
-  inviteCode: string,
-  options?: DiscordValidationOptions
-): Promise<DiscordValidationResult> {
+const matchedTerms=(text:string,terms:string[])=>terms.filter(term=>text.includes(term));
+
+function creatorAssociationContext(options?:DiscordValidationOptions){
+  const ctx=options?.parentContext;
+  const parentConfirmed=ctx?.tradingStatus==='TRADING_CONFIRMED'||options?.parentChannelIsTrading===true;
+  const tradingConfidence=Number(ctx?.tradingConfidence ?? (parentConfirmed ? 80 : 0));
+  const ownershipStatus=ctx?.ownershipStatus;
+  const ownershipConfidence=Number(ctx?.ownershipConfidence||0);
+  const creatorOwned=ownershipStatus==='CREATOR_OWNED'&&ownershipConfidence>=70;
+  const creatorText=[ctx?.creatorName||options?.channelName||'',ctx?.tradingCategory||''].filter(Boolean).join(' ').toLowerCase();
+  const parentTerms=matchedTerms(creatorText,TRADING_RELEVANCE_KEYWORDS);
+  const strongParent=parentConfirmed&&tradingConfidence>=80;
+  return {ctx,parentConfirmed,tradingConfidence,ownershipStatus,ownershipConfidence,creatorOwned,parentTerms,strongParent};
+}
+
+export async function validateDiscordInvite(inviteCode:string, options?:DiscordValidationOptions):Promise<DiscordValidationResult> {
   let cleanCode = inviteCode
-    .replace(/^[\/]+/, '')
+    .replace(/^[\\/]+/, '')
     .replace(/.*(?:discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite)\//i, '')
     .split(/[\?\#\/]/)[0]
     .trim();
@@ -86,11 +112,7 @@ export async function validateDiscordInvite(
   const maxAttempts=Math.min(5,Math.max(1,options?.maxAttempts||3)),fetchImpl=options?.fetchImpl||fetch,emit=options?.emitProviderEvent||appendProviderCallEvent;
   for(let attemptNumber=1;attemptNumber<=maxAttempts;attemptNumber++) try {
     const apiUrl = `https://discord.com/api/v9/invites/${encodeURIComponent(cleanCode)}?with_counts=true`;
-    const res = await executeProviderCall({context:{provider:'discord',operation:'invite-lookup',attempt:attemptNumber},timeoutMs:Number(process.env.DISCORD_PROVIDER_TIMEOUT_MS||'15000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit,call:signal=>fetchImpl(apiUrl, {
-      signal, headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    })});
+    const res = await executeProviderCall({context:{provider:'discord',operation:'invite-lookup',attempt:attemptNumber},timeoutMs:Number(process.env.DISCORD_PROVIDER_TIMEOUT_MS||'15000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit,call:signal=>fetchImpl(apiUrl, {signal,headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}})});
 
     if (!res.ok) {
       let discordErrorCode:number|undefined;try{const body=await res.clone().json();discordErrorCode=Number(body?.code)||undefined;}catch{}
@@ -108,115 +130,64 @@ export async function validateDiscordInvite(
     }
 
     const data = await res.json();
-
     if (data && (data.guild || data.code)) {
       attempts.push({attemptNumber,operationalOutcome:'SUCCEEDED',retryable:false,httpStatus:res.status,responseContentType:res.headers.get('content-type')||undefined,reason:'Discord invite metadata retrieved',checkedAt:new Date().toISOString()});
       const memberCount = data.approximate_member_count || 0;
       const presenceCount = data.approximate_presence_count || 0;
       const guildName = data.guild?.name || '';
       const guildDescription = data.guild?.description || '';
-      const channelName = data.channel?.name || '';
+      const inviteChannelName = data.channel?.name || '';
       const welcomeDesc = data.guild?.welcome_screen?.description || '';
       const actualCode = data.code || cleanCode;
       const canonicalInviteUrl = `https://discord.gg/${actualCode}`;
 
-      // Combine all available server metadata into lowercased text string
-      const fullText = [guildName, guildDescription, channelName, welcomeDesc, cleanCode]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase();
+      // Only Discord-native metadata is semantic server evidence. Invite codes
+      // and creator names are identifiers/context and must never masquerade as
+      // statements made by the Discord community itself.
+      const discordNativeText = [guildName, guildDescription, inviteChannelName, welcomeDesc].filter(Boolean).join(' ').toLowerCase();
+      const matchedTrading = matchedTerms(discordNativeText,TRADING_RELEVANCE_KEYWORDS);
+      const matchedNegative = matchedTerms(discordNativeText,EXPLICIT_NON_TRADING_KEYWORDS);
+      const association=creatorAssociationContext(options);
 
-      // Check positive trading keyword presence
-      const matchedTrading = TRADING_RELEVANCE_KEYWORDS.filter(kw => fullText.includes(kw));
-
-      // Check explicit negative non-trading keyword presence
-      const matchedNegative = EXPLICIT_NON_TRADING_KEYWORDS.filter(kw => fullText.includes(kw));
-
-      // Confidence Score Calculation (0 - 100%)
       let confidence = 20;
-
-      // Prior 1: Context inheritance from parent YouTube creator
-      if (options?.parentChannelIsTrading) {
-        confidence += 35;
-      }
-
-      // Prior 2: Positive trading keywords
-      if (matchedTrading.length >= 2) {
-        confidence += 50;
-      } else if (matchedTrading.length === 1) {
-        confidence += 35;
-      }
-
-      // Prior 3: Active community size signal
-      if (memberCount >= 50) {
-        confidence += 10;
-      }
-
-      // Penalty 1: Explicit non-trading negative signals
-      if (matchedNegative.length > 0) {
-        confidence -= (matchedNegative.length * 35);
-      }
-
-      // Clamp confidence between 0 and 99
+      if (association.parentConfirmed) confidence += 20;
+      if (association.tradingConfidence >= 90) confidence += 10;
+      else if (association.tradingConfidence >= 80) confidence += 5;
+      if (matchedTrading.length >= 2) confidence += 50;
+      else if (matchedTrading.length === 1) confidence += 35;
+      // Size is only a weak evidence-quality signal, never proof of trading.
+      if (memberCount >= 50) confidence += 5;
+      if (association.creatorOwned) confidence += 20;
+      if (association.creatorOwned && association.parentTerms.length > 0) confidence += 10;
+      if (matchedNegative.length > 0) confidence -= (matchedNegative.length * 35);
       confidence = Math.max(0, Math.min(99, confidence));
 
-      // Status Decision Logic
       if (matchedNegative.length > 0 && matchedTrading.length === 0) {
-        console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) REJECTED as NON_TRADING due to negative signals [${matchedNegative.join(', ')}]. Confidence: ${confidence}%.`);
-        return result({
-          status: 'NON_TRADING',
-          confidence,
-          inviteUrl: null, // DO NOT store invite URL for non-trading servers!
-          guildName: guildName || 'Discord Server',
-          approximateMemberCount: memberCount,
-          approximatePresenceCount: presenceCount,
-          relevanceReason: `Non-trading server detected (matched non-finance signals: ${matchedNegative.join(', ')})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'NON_TRADING',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
-        });
+        console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) REJECTED as NON_TRADING due to native negative signals [${matchedNegative.join(', ')}]. Confidence: ${confidence}%.`);
+        return result({status:'NON_TRADING',confidence,inviteUrl:null,guildName:guildName||'Discord Server',approximateMemberCount:memberCount,approximatePresenceCount:presenceCount,relevanceReason:`Non-trading server detected from Discord-native metadata (matched: ${matchedNegative.join(', ')})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'NON_TRADING',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'});
       }
 
-      if (confidence >= 70) {
+      const strongCreatorAssociation = association.strongParent && association.creatorOwned && matchedNegative.length===0;
+      const discordNativeConfirmation = matchedTrading.length>0 && confidence>=70;
+      if (discordNativeConfirmation || strongCreatorAssociation) {
         const status: DiscordStatus = memberCount >= 50 ? 'ACTIVE' : 'ACTIVE_LOW_VOLUME';
-        console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) APPROVED as ${status} (Confidence: ${confidence}%). Matched: [${matchedTrading.join(', ') || 'Parent Creator Link'}].`);
-        return result({
-          status,
-          confidence,
-          inviteUrl: canonicalInviteUrl, // Store invite URL ONLY for active trading communities!
-          guildName: guildName || 'Trading Discord',
-          approximateMemberCount: memberCount,
-          approximatePresenceCount: presenceCount,
-          relevanceReason: `Confirmed trading community (Confidence: ${confidence}%, Matched: ${matchedTrading.slice(0, 3).join(', ') || 'Parent Creator Link'})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'TRADING_RELEVANT',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
-        });
+        const reason=discordNativeConfirmation
+          ? `Confirmed trading community from Discord-native evidence (Confidence: ${confidence}%, Matched: ${matchedTrading.slice(0,3).join(', ')})`
+          : `Live community is strongly associated with a ${association.tradingConfidence}% trading-confirmed creator via creator-owned source; Discord metadata is sparse and contains no contradictory signal`;
+        console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) APPROVED as ${status} (Confidence: ${confidence}%). Native=[${matchedTrading.join(', ')||'none'}], ownership=${association.ownershipStatus||'unknown'}.`);
+        return result({status,confidence:Math.max(70,confidence),inviteUrl:canonicalInviteUrl,guildName:guildName||'Trading Discord',approximateMemberCount:memberCount,approximatePresenceCount:presenceCount,relevanceReason:reason,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'TRADING_RELEVANT',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'});
       }
 
       if (confidence >= 35) {
-        console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) CLASSIFIED as UNCERTAIN (Confidence: ${confidence}%). Withholding invite URL.`);
-        return result({
-          status: 'UNCERTAIN',
-          confidence,
-          inviteUrl: null, // DO NOT store invite URL for uncertain communities!
-          guildName: guildName || 'Discord Server',
-          approximateMemberCount: memberCount,
-          approximatePresenceCount: presenceCount,
-          relevanceReason: `Ambiguous community (Confidence: ${confidence}% - Insufficient explicit trading evidence)`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'UNCERTAIN',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
-        });
+        return result({status:'UNCERTAIN',confidence,inviteUrl:null,guildName:guildName||'Discord Server',approximateMemberCount:memberCount,approximatePresenceCount:presenceCount,relevanceReason:`Active community; relevance evidence remains insufficient (Confidence: ${confidence}%, ownership=${association.ownershipStatus||'unknown'}, Discord-native trading matches=${matchedTrading.length})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'UNCERTAIN',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'});
       }
 
-      console.log(`[Discord Relevance] Server '${guildName}' (${cleanCode}) CLASSIFIED as UNCERTAIN (Confidence: ${confidence}%).`);
-      return result({
-        status: 'UNCERTAIN',
-        confidence,
-        inviteUrl: null, // DO NOT store invite URL!
-        guildName: guildName || 'Discord Server',
-        approximateMemberCount: memberCount,
-        approximatePresenceCount: presenceCount,
-        relevanceReason: `Ambiguous community (${confidence}% - no explicit negative evidence)`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'UNCERTAIN',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'
-      });
-
-    } else {
-      const reason='Discord returned malformed guild data';attempts.push({attemptNumber,operationalOutcome:'MALFORMED_RESPONSE',retryable:true,reason,checkedAt:new Date().toISOString()});
-      if(attemptNumber<maxAttempts){await new Promise(resolve=>setTimeout(resolve,(options?.retryDelayMs??250)*2**(attemptNumber-1)));continue;}
-      return result({ status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:'MALFORMED_RESPONSE',retryable:true,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'RETRY_PENDING' });
+      return result({status:'UNCERTAIN',confidence,inviteUrl:null,guildName:guildName||'Discord Server',approximateMemberCount:memberCount,approximatePresenceCount:presenceCount,relevanceReason:`Active community with insufficient trading relevance evidence (${confidence}% - no explicit negative evidence)`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'UNCERTAIN',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'});
     }
+
+    const reason='Discord returned malformed guild data';attempts.push({attemptNumber,operationalOutcome:'MALFORMED_RESPONSE',retryable:true,reason,checkedAt:new Date().toISOString()});
+    if(attemptNumber<maxAttempts){await new Promise(resolve=>setTimeout(resolve,(options?.retryDelayMs??250)*2**(attemptNumber-1)));continue;}
+    return result({ status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:reason,operationalOutcome:'MALFORMED_RESPONSE',retryable:true,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'RESOLVED',validationStatus:'RETRY_PENDING' });
   } catch (err: any) {
     const typed=err as ProviderCallError,outcome:DiscordOperationalOutcome=typed.errorClass==='TIMEOUT'?'TIMEOUT':typed.errorClass==='RATE_LIMIT'?'RATE_LIMITED':typed.errorClass==='PERMANENT_INPUT'?'PROVIDER_FAILURE':'NETWORK_FAILURE',retryable=typed.retryable!==false;
     const reason=`Discord check failed: ${typed.message||String(err)}`;attempts.push({attemptNumber,operationalOutcome:outcome,retryable,httpStatus:typed.status,providerErrorClass:typed.errorClass,reason,checkedAt:new Date().toISOString()});
