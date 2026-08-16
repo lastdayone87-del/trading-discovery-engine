@@ -2,7 +2,7 @@ import type { DiscoverySource } from '../src/types';
 import type { VerificationDecision } from './evidenceEngine';
 import type { DiscoveredChannelRaw } from './youtube';
 
-export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v3-freshness';
+export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v4-contextual-admission';
 
 export type SearchCandidateTriageDisposition = 'PLAUSIBLE_TRADING_HYPOTHESIS' | 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS' | 'NOT_APPLICABLE';
 
@@ -12,21 +12,45 @@ export interface SearchCandidateTriageDecision {
   matchedSignals: string[];
 }
 
-const STRONG_TRADING_SIGNALS: Array<[string, RegExp]> = [
+/**
+ * High-specificity trading signals are strong enough to establish a cheap
+ * retrieval hypothesis by themselves. They describe trading activity/methods,
+ * rather than merely naming a financial product that can occur in unrelated
+ * content.
+ */
+const HIGH_SPECIFICITY_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['TRADING_LITERAL', /\b(trading|trader|day\s*trading|swing\s*trading|intraday|scalping|scalper)\b/iu],
-  ['FOREX_FUTURES_OPTIONS', /\b(forex|fx\s*trading|futures?|options?|0dte|cfd|spread\s*betting|prop\s*firm|funded\s*trader)\b/iu],
   ['TECHNICAL_METHOD', /\b(technical\s*analysis|price\s*action|order\s*flow|footprint|market\s*structure|volume\s*profile|liquidity\s*sweep|fair\s*value\s*gap|smart\s*money|ict\b|smc\b)\b/iu],
-  ['EQUITY_CRYPTO_MARKETS', /\b(stocks?|equities|shares?|crypto|bitcoin|ethereum|btc|eth|nasdaq|s&p\s*500|sp500)\b/iu],
-  ['LOCAL_TECHNICAL_ANALYSIS', /\b(analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse|beursanalyse|bourse|bolsa|borsa|aktiehandel|daghandel|futuros|opciones)\b/iu],
-  ['KNOWN_MARKET_INSTRUMENT', /\b(dax(?:\s*40)?|cac\s*40|ftse\s*100|ibex\s*35|aex|bel\s*20|smi|omx(?:c25|s30)?|tsx(?:\s*60)?|asx(?:\s*200)?|nq\s*futures?|es\s*futures?|eurusd|gbpusd|usdcad|audusd|nzdusd|usdchf|usdjpy)\b/iu],
-  ['JAPANESE_TRADING', /(トレード|デイトレード|先物|テクニカル分析|板読み|オーダーフロー)/u]
+  ['TRADING_VENUE_OR_PROGRAM', /\b(fx\s*trading|futures?\s*trading|options?\s*trading|cfd\s*trading|spread\s*betting|prop\s*firm|funded\s*trader)\b/iu],
+  ['LOCAL_TECHNICAL_ANALYSIS', /\b(analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse|beursanalyse|aktiehandel|daghandel|futuros\s*trading|opciones\s*trading)\b/iu],
+  ['JAPANESE_TRADING', /(トレード|デイトレード|先物取引|テクニカル分析|板読み|オーダーフロー)/u]
 ];
 
-const STRONG_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
+/**
+ * Market/product names are useful corroboration but are deliberately weaker.
+ * Words such as "options", "shares", "futures" and "crypto" are polysemous
+ * and must not independently turn an unrelated creator into a trading candidate.
+ */
+const MARKET_CONTEXT_SIGNALS: Array<[string, RegExp]> = [
+  ['FOREX_MARKET', /\b(forex|eurusd|gbpusd|usdcad|audusd|nzdusd|usdchf|usdjpy)\b/iu],
+  ['DERIVATIVES_MARKET', /\b(futures?|options?|0dte|cfd)\b/iu],
+  ['EQUITY_MARKET', /\b(stocks?|equities|shares?|nasdaq|s&p\s*500|sp500|dax(?:\s*40)?|cac\s*40|ftse\s*100|ibex\s*35|aex|bel\s*20|smi|omx(?:c25|s30)?|tsx(?:\s*60)?|asx(?:\s*200)?)\b/iu],
+  ['CRYPTO_MARKET', /\b(crypto|bitcoin|ethereum|btc|eth)\b/iu],
+  ['FUTURES_CONTRACT', /\b(nq\s*futures?|es\s*futures?)\b/iu]
+];
+
+/** Strong domain contradictions. These beat accidental market-word matches. */
+const HARD_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
   ['GAMING', /\b(gameplay|walkthrough|playthrough|minecraft|roblox|fortnite|valorant|league\s*of\s*legends|gta\s*v|gta\s*5|call\s*of\s*duty|pokemon|pokémon|genshin|esports?|gaming\s*channel)\b/iu],
   ['COOKING_RECIPES', /\b(recipe|recipes|cooking|kitchen|bake|baking|chef|cuisine|mukbang|delicious\s*food|street\s*food)\b/iu],
-  ['ENTERTAINMENT_GOSSIP', /\b(celebrity|gossip|vlog|vlogging|prank|pranks|unboxing|toy\s*review|makeup\s*tutorial|beauty\s*vlog|reaction\s*video|music\s*video|official\s*music\s*video|mv\b)\b/iu],
+  ['MUSIC_ARTIST', /\b(official\s*music\s*video|music\s*video|official\s*audio|lyrics?|lyric\s*video|album|single|singer|song|musician|record\s*label|clip\s*officiel|chanson|artiste|zouk)\b/iu],
+  ['BEAUTY_ENTERTAINMENT', /\b(celebrity\s*gossip|makeup\s*tutorial|beauty\s*vlog|toy\s*review)\b/iu],
   ['GENERIC_PERSONAL_FINANCE', /\b(personal\s*finance|budgeting|credit\s*card\s*points|save\s*money|paying\s*off\s*debt|mortgage\s*calculator)\b/iu]
+];
+
+/** Softer format cues are only contradictions when no real trading signal exists. */
+const SOFT_NON_TRADING_SIGNALS: Array<[string, RegExp]> = [
+  ['GENERAL_VLOG', /\b(vlog|vlogging|prank|pranks|unboxing|reaction\s*video)\b/iu]
 ];
 
 function staleMatchedVideo(candidate: DiscoveredChannelRaw, now = Date.now()): boolean {
@@ -56,8 +80,6 @@ export function triageAutonomousSearchCandidate(
   // A search hit from many years ago is weak evidence for the user's actual
   // target: active traders publishing now. Withhold stale VIDEO matches before
   // country hydration, semantic classification, enrichment, or Discord crawling.
-  // CHANNEL-lane results are not rejected here because they have no trustworthy
-  // publication timestamp and can still receive creator-level evidence later.
   if (staleMatchedVideo(candidate)) {
     return {
       disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
@@ -72,21 +94,50 @@ export function triageAutonomousSearchCandidate(
     candidate.matchedDocument?.description
   ].filter(Boolean).join(' ').normalize('NFKC');
 
-  const matchedSignals = STRONG_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
-  if (matchedSignals.length) {
+  const highSpecificity = HIGH_SPECIFICITY_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
+  const marketContext = MARKET_CONTEXT_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
+  const hardNegative = HARD_NON_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
+  const softNegative = SOFT_NON_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
+
+  // Dominant unrelated-domain evidence wins over accidental finance vocabulary.
+  // This is the key admission boundary that prevents artist/gaming/recipe hits
+  // containing words such as "options" or "shares" from entering the canonical
+  // creator pipeline and consuming enrichment/Discord quota.
+  if (hardNegative.length) {
     return {
-      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
-      reasonCodes: ['RETRIEVAL_DOCUMENT_HAS_EXPLICIT_TRADING_SIGNAL'],
-      matchedSignals
+      disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
+      reasonCodes: [
+        highSpecificity.length ? 'CONFLICTING_RETRIEVAL_DOMAINS' : 'EXPLICIT_NON_TRADING_DOMAIN_DETECTED',
+        'DO_NOT_SPEND_ENRICHMENT_QUOTA'
+      ],
+      matchedSignals: [...hardNegative, ...highSpecificity, ...marketContext]
     };
   }
 
-  const negativeSignals = STRONG_NON_TRADING_SIGNALS.filter(([, pattern]) => pattern.test(retrievalText)).map(([name]) => name);
-  if (negativeSignals.length) {
+  if (highSpecificity.length) {
+    return {
+      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
+      reasonCodes: ['RETRIEVAL_DOCUMENT_HAS_HIGH_SPECIFICITY_TRADING_SIGNAL'],
+      matchedSignals: [...highSpecificity, ...marketContext]
+    };
+  }
+
+  // Multiple independent market-context families can establish a bounded
+  // hypothesis (for example NQ futures + options), but one broad product word
+  // alone is intentionally insufficient for canonical admission.
+  if (new Set(marketContext).size >= 2 && !softNegative.length) {
+    return {
+      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
+      reasonCodes: ['MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'],
+      matchedSignals: marketContext
+    };
+  }
+
+  if (marketContext.length || softNegative.length) {
     return {
       disposition: 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS',
-      reasonCodes: ['EXPLICIT_NON_TRADING_SIGNAL_DETECTED', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
-      matchedSignals: negativeSignals
+      reasonCodes: ['AMBIGUOUS_RETRIEVAL_CONTEXT', 'DO_NOT_SPEND_ENRICHMENT_QUOTA'],
+      matchedSignals: [...marketContext, ...softNegative]
     };
   }
 
