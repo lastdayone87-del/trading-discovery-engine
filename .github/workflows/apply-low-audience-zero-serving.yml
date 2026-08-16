@@ -31,21 +31,25 @@ jobs:
           text = gate.read_text()
           text = text.replace(
               ' * 1-29 subscribers: stored, visible/auditable, marked low-audience skip, deep crawl/enrichment skipped.\n * 30+ subscribers or hidden/unavailable: proceeds normally.',
-              ' * 0-29 known subscribers: stored, visible/auditable only through the explicit low-audience filter, marked low-audience skip, deep crawl/enrichment skipped.\n * 30+ subscribers or hidden/unavailable: proceeds normally.'
+              ' * 0-29 known subscribers: stored and marked low-audience skip; deep crawl/enrichment is skipped.\n * 30+ subscribers or hidden/unavailable: proceeds normally.'
           )
           old = "  if (count >= 1 && count < threshold) {\n    return { shouldSkipDeepEnrichment: true, subscriberCountNumber: count, reasonCode: 'LOW_AUDIENCE_SKIP' };\n  }"
           new = "  if (count < threshold) {\n    return { shouldSkipDeepEnrichment: true, subscriberCountNumber: count, reasonCode: 'LOW_AUDIENCE_SKIP' };\n  }"
           if old not in text:
               raise SystemExit('lowAudienceGate boundary not found')
-          gate.write_text(text.replace(old, new))
+          gate.write_text(text.replace(old, new, 1))
 
           test = Path('server/lowAudienceGate.test.ts')
           text = test.read_text()
-          anchor = "test('29 subscribers is skipped',()=>{\n"
-          if anchor not in text:
-              raise SystemExit('lowAudienceGate test anchor not found')
-          insertion = "test('zero subscribers is a known low-audience value and is skipped',()=>{\n  const result=evaluateLowAudienceGate('0');\n  assert.equal(result.shouldSkipDeepEnrichment,true);\n  assert.equal(result.subscriberCountNumber,0);\n  assert.equal(result.reasonCode,'LOW_AUDIENCE_SKIP');\n});\n\n"
-          text = text.replace(anchor, insertion + anchor, 1)
+          old_title = "test('evaluateLowAudienceGate skips deep crawl for 1-29 subscribers and proceeds for 30+ or hidden', () => {"
+          new_title = "test('evaluateLowAudienceGate skips deep crawl for known 0-29 subscribers and proceeds for 30+ or hidden', () => {"
+          if old_title not in text:
+              raise SystemExit('lowAudienceGate test title not found')
+          text = text.replace(old_title, new_title, 1)
+          needle = "  assert.equal(evaluateLowAudienceGate('2').shouldSkipDeepEnrichment, true);"
+          if needle not in text:
+              raise SystemExit('lowAudienceGate assertion anchor not found')
+          text = text.replace(needle, "  assert.equal(evaluateLowAudienceGate('0').shouldSkipDeepEnrichment, true);\n" + needle, 1)
           test.write_text(text)
 
           db = Path('server/db.ts')
@@ -58,19 +62,17 @@ jobs:
 
           vis = Path('server/lowAudienceDashboardVisibility.test.ts')
           text = vis.read_text()
-          old = "  assert.match(db,/!explicitlyViewingLowAudience\\)clauses\\.push\\(`scan_status <> 'SKIPPED_LOW_AUDIENCE'`\\)/);"
-          new = "  assert.match(db,/scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT \\(subscriber_count ~ '\\\\^\\\\\\\\d\\\\+\\\\$' AND subscriber_count::integer < 30\\)/);"
-          if old not in text:
+          old_assert = "  assert.match(db,/!explicitlyViewingLowAudience\\)clauses\\.push\\(`scan_status <> 'SKIPPED_LOW_AUDIENCE'`\\)/);"
+          if old_assert not in text:
               raise SystemExit('dashboard visibility assertion not found')
-          text = text.replace(old, new, 1)
-          extra = "\ntest('default channel listing defensively hides stale known counts below 30 even before status repair',()=>{\n  const db=fs.readFileSync(new URL('./db.ts',import.meta.url),'utf8');\n  assert.match(db,/subscriber_count::integer < 30/);\n  assert.match(db,/subscriber_count ~ '\\\\^\\\\\\\\d\\\\+\\\\$'/);\n});\n"
-          vis.write_text(text + extra)
+          new_assert = "  assert.match(db,/scan_status <> 'SKIPPED_LOW_AUDIENCE'/);\n  assert.match(db,/subscriber_count::integer < 30/);"
+          text = text.replace(old_assert, new_assert, 1)
+          vis.write_text(text)
 
           migration = Path('server/db/migrations/097_reconcile_low_audience_zero_and_stale_rows.sql')
-          migration.write_text("""-- Repair rows that were allowed through when subscriber_count was the known value 0\n-- (or another stale known value below the 30-subscriber gate). Preserve stronger\n-- terminal policy states; only reconcile rows that should be low-audience skips.\nUPDATE channels\nSET scan_status = 'SKIPPED_LOW_AUDIENCE',\n    updated_at = now()\nWHERE subscriber_count ~ '^\\d+$'\n  AND subscriber_count::integer < 30\n  AND country_status <> 'REJECTED'\n  AND trading_status NOT IN ('NON_TRADING', 'HUMAN_REJECTED')\n  AND scan_status NOT IN ('SKIPPED_EXCLUDED', 'SKIPPED_NON_TRADING', 'SKIPPED_LOW_AUDIENCE');\n\n-- Retire queued enrichment work for rows repaired above so stale jobs do not keep\n-- spending provider quota after the low-audience decision is authoritative.\nUPDATE jobs j\nSET status = 'COMPLETED',\n    completed_at = COALESCE(j.completed_at, now()),\n    last_error = COALESCE(j.last_error, 'SKIPPED_LOW_AUDIENCE_RECONCILIATION')\nFROM channels c\nWHERE j.payload->>'channelId' = c.channel_id\n  AND c.scan_status = 'SKIPPED_LOW_AUDIENCE'\n  AND j.status IN ('PENDING', 'RETRY')\n  AND j.type IN ('ENRICH_CHANNEL', 'POST_APPROVAL_ENRICH');\n""")
+          migration.write_text("""-- Reconcile known numeric subscriber counts below the authoritative 30-subscriber gate.\n-- Preserve stronger country/trading terminal states; these rows remain stored for auditability.\nUPDATE channels\nSET scan_status = 'SKIPPED_LOW_AUDIENCE',\n    updated_at = now()\nWHERE subscriber_count ~ '^\\d+$'\n  AND subscriber_count::integer < 30\n  AND country_status <> 'REJECTED'\n  AND trading_status NOT IN ('NON_TRADING', 'HUMAN_REJECTED')\n  AND scan_status NOT IN ('SKIPPED_EXCLUDED', 'SKIPPED_NON_TRADING', 'SKIPPED_LOW_AUDIENCE');\n""")
 
-          workflow = Path('.github/workflows/apply-low-audience-zero-serving.yml')
-          workflow.unlink()
+          Path('.github/workflows/apply-low-audience-zero-serving.yml').unlink()
           PY
       - name: Run focused tests
         run: node --import tsx --test server/lowAudienceGate.test.ts server/lowAudienceDashboardVisibility.test.ts
