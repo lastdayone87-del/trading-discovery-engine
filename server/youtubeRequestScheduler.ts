@@ -152,20 +152,29 @@ export class YouTubeRequestScheduler {
 
   private noteRuntimeRateLimit(details: RuntimeRateLimitDetails, actualSpacingMs: number | null, priority: YouTubeRequestPriority, trace?: (stage: string) => void): void {
     const base = this.baseIntervalMs();
-    const floor = Math.max(base, this.options.runtimeRateLimitFloorMs ?? 1_000);
-    const max = Math.max(floor, this.options.maxAdaptiveIntervalMs ?? 5_000);
-    this.adaptiveIntervalMs = this.adaptiveIntervalMs > 0
-      ? Math.min(max, Math.max(floor, this.adaptiveIntervalMs * 2))
-      : floor;
-    this.successfulCallsUnderPressure = 0;
+
+    // Preserve #244's explicit opt-in contract: constructed schedulers that do
+    // not provide a runtime floor keep their historical fixed-spacing behavior.
+    // Diagnostics still record the 429 below, so observability is independent
+    // from whether adaptive pacing is enabled for this scheduler instance.
+    if (this.options.runtimeRateLimitFloorMs !== undefined) {
+      const floor = Math.max(base, this.options.runtimeRateLimitFloorMs);
+      const max = Math.max(floor, this.options.maxAdaptiveIntervalMs ?? 5_000);
+      this.adaptiveIntervalMs = this.adaptiveIntervalMs > 0
+        ? Math.min(max, Math.max(floor, this.adaptiveIntervalMs * 2))
+        : floor;
+      this.successfulCallsUnderPressure = 0;
+
+      const pressureNow = (this.options.now ?? Date.now)();
+      this.nextStartAt = Math.max(this.nextStartAt, pressureNow + this.adaptiveIntervalMs);
+      trace?.(`adaptive-rate-pressure ${this.adaptiveIntervalMs}ms`);
+    }
 
     const now = (this.options.now ?? Date.now)();
-    this.nextStartAt = Math.max(this.nextStartAt, now + this.adaptiveIntervalMs);
     const fingerprint = providerFingerprint(details.providerKey);
     this.recentRuntimeRateLimits.push({ at: now, providerFingerprint: fingerprint });
     this.trimRuntimeRateLimits(now);
     const affectedProviders = new Set(this.recentRuntimeRateLimits.map(item => item.providerFingerprint)).size;
-    trace?.(`adaptive-rate-pressure ${this.adaptiveIntervalMs}ms`);
     trace?.(
       `runtime-rate-pressure-diagnostic status=${details.status ?? 429} quota=false provider=${fingerprint}`
       + ` reasons=${sanitizeProviderReasons(details.providerReasons)}`
