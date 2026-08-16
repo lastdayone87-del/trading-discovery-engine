@@ -1,14 +1,40 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_BROWSER_FALLBACK_BUDGET, RenderedFallbackGate, renderedFallbackGate, shouldEscalateToRenderedFallback } from './browserCommunityFallback';
+import { classifyRenderedCrawlerFailure, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
-test('browser fallback is bounded', () => {
-  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxPages <= 4);
-  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxScrollsPerPage <= 4);
-  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxClicksPerPage <= 3);
-  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.totalTimeoutMs <= 35_000);
+test('browser fallback remains bounded while allowing useful retries', () => {
+  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxPages <= 6);
+  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxScrollsPerPage <= 5);
+  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxClicksPerPage <= 4);
+  assert.equal(DEFAULT_BROWSER_FALLBACK_BUDGET.maxRequestRetries, 3);
+  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxSessionRotations <= 4);
+  assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.totalTimeoutMs <= 60_000);
 });
 
+test('rendered retry policy rotates sessions for blocked responses', () => {
+  assert.equal(classifyRenderedCrawlerFailure(new Error('Request blocked - received 403 status code.')), 'BLOCKED');
+  const policy = renderedCrawlerRetryPolicy(new Error('Request blocked - received 403 status code.'), 0);
+  assert.equal(policy.retryable, true);
+  assert.equal(policy.retireSession, true);
+  assert.ok(policy.delayMs >= 500);
+});
+
+test('rendered retry policy backs off harder for 429 rate limits', () => {
+  const first = renderedCrawlerRetryPolicy(new Error('received 429 Too Many Requests'), 0);
+  const second = renderedCrawlerRetryPolicy(new Error('received 429 Too Many Requests'), 1);
+  assert.equal(first.failureClass, 'RATE_LIMITED');
+  assert.equal(first.retireSession, true);
+  assert.ok(second.delayMs > first.delayMs);
+  assert.ok(second.delayMs <= 8_000);
+});
+
+test('rendered retry policy keeps transient network retries without forced session churn', () => {
+  const policy = renderedCrawlerRetryPolicy(new Error('Navigation timed out after 15000 ms'), 1);
+  assert.equal(policy.failureClass, 'TRANSIENT');
+  assert.equal(policy.retryable, true);
+  assert.equal(policy.retireSession, false);
+});
 
 test('rendered browser launches are process-wide bounded', async () => {
   assert.ok(renderedFallbackGate.snapshot().concurrency <= 2);
@@ -69,10 +95,9 @@ test('can escalate a fully static no-match because Discord may be JS-hidden', ()
 });
 
 test('browser acquisition failure remains retryable rather than proving NOT_FOUND', async () => {
-  // Contract is enforced by the implementation: dynamic import/launch/navigation
-  // errors return complete=false and retryable=true. This test intentionally does
-  // not launch Chromium in the ordinary unit-test suite.
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
   assert.match(source, /complete:\s*false/);
   assert.match(source, /retryable:\s*true/);
+  assert.match(source, /retryOnBlocked:\s*true/);
+  assert.match(source, /maxSessionRotations:\s*limits\.maxSessionRotations/);
 });
