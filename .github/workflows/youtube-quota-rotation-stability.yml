@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'server/youtubeProviderCooldown.ts'
+      - 'server/youtubeProviderCooldown.test.ts'
       - 'server/youtubePoolBackoff.ts'
       - 'server/youtubeRequestScheduler.ts'
       - 'server/youtubeRequestScheduler.test.ts'
@@ -24,6 +25,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
+      - name: Provider cooldown and failover regression tests
+        run: node --import tsx --test server/youtubeProviderCooldown.test.ts
       - name: Scheduler cooldown regression tests
         run: node --import tsx --test server/youtubeRequestScheduler.test.ts
       - name: Adaptive request-pressure regression tests
