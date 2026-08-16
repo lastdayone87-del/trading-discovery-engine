@@ -9,6 +9,10 @@ on:
       - 'server/ingestionPipeline.ts'
       - 'server/evidenceEngine/providers/GeminiSemanticProvider.ts'
       - 'server/autonomousRootFirewall.test.ts'
+      - 'server/quotaCapacity.ts'
+      - 'server/youtubeQuotaDay.ts'
+      - 'server/quotaRolloverReconciliation.ts'
+      - 'server/quotaRolloverReconciliation.test.ts'
       - '.github/workflows/autonomous-root-firewall.yml'
 
 jobs:
@@ -21,8 +25,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
-      - name: Root firewall tests
-        run: node --import tsx --test server/autonomousRootFirewall.test.ts server/autonomousRetrievalSafety.test.ts server/queryPlanner.test.ts server/queryEvidenceIndependence.test.ts server/countryAwareRetrieval.test.ts
+      - name: Root firewall and quota rollover tests
+        run: node --import tsx --test server/autonomousRootFirewall.test.ts server/autonomousRetrievalSafety.test.ts server/queryPlanner.test.ts server/queryEvidenceIndependence.test.ts server/countryAwareRetrieval.test.ts server/quotaRolloverReconciliation.test.ts
       - name: TypeScript validation
         run: npm run lint
       - name: Production build
