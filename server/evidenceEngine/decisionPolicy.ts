@@ -52,8 +52,7 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
     status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {
-    if(input.lifecycleAction==='REJECT'&&negative.length)reasons.push('TERMINAL_REJECTION_WITHHELD_DUE_EVIDENCE_CONFLICT');
-    else reasons.push(input.lifecycleAction==='ENRICH'?'EVIDENCE_COVERAGE_INCOMPLETE':input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED':'SCORE_BOUNDARY_NOT_SATISFIED');
+    reasons.push(input.lifecycleAction==='ENRICH'?'EVIDENCE_COVERAGE_INCOMPLETE':input.lifecycleAction==='REVIEW'?'SELECTIVE_POLICY_ABSTAINED':'SCORE_BOUNDARY_NOT_SATISFIED');
   }
   const confidenceScore=status==='TRADING_CONFIRMED'?Math.max(82,tradingProbability):status==='NON_TRADING'?Math.min(22,100-nonTradingProbability):Math.min(79,Math.max(23,tradingProbability));
   return {status,confidenceScore,tradingProbability,nonTradingProbability,coverageConfidence,reasonCodes:reasons};
