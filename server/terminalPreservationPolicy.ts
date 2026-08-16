@@ -42,25 +42,30 @@ export function shouldPreserveExistingChannel(
   isManualScan: boolean,
   now = Date.now()
 ): boolean {
-  if (source === 'recheck') return false;
+  // Keep the explicit Stage-1 serving/evaluation separation visible: ordinary
+  // discovery follows preservation policy; the recheck lane is the deliberate
+  // operator override.
+  if (source !== 'recheck') {
+    const hardTerminal =
+      existing.country_status === 'REJECTED' ||
+      existing.trading_status === 'HUMAN_REJECTED' ||
+      existing.scan_status === 'SKIPPED_EXCLUDED';
+    if (hardTerminal) return true;
 
-  const hardTerminal =
-    existing.country_status === 'REJECTED' ||
-    existing.trading_status === 'HUMAN_REJECTED' ||
-    existing.scan_status === 'SKIPPED_EXCLUDED';
-  if (hardTerminal) return true;
-
-  const machineNonTrading = existing.trading_status === 'NON_TRADING' || existing.scan_status === 'SKIPPED_NON_TRADING';
-  if (machineNonTrading) {
-    const autonomousRediscovery = source === 'automated_query' || String(source) === 'autonomous';
-    if (autonomousRediscovery && !isManualScan && machineNonTradingRediscoveryEligible(existing, now)) {
-      return false;
+    const machineNonTrading = existing.trading_status === 'NON_TRADING' || existing.scan_status === 'SKIPPED_NON_TRADING';
+    if (machineNonTrading) {
+      const autonomousRediscovery = source === 'automated_query' || String(source) === 'autonomous';
+      if (autonomousRediscovery && !isManualScan && machineNonTradingRediscoveryEligible(existing, now)) {
+        return false;
+      }
+      return true;
     }
-    return true;
+
+    return !isManualScan && (
+      existing.trading_status === 'TRADING_CONFIRMED' ||
+      existing.scan_status === 'COMPLETED'
+    );
   }
 
-  return !isManualScan && (
-    existing.trading_status === 'TRADING_CONFIRMED' ||
-    existing.scan_status === 'COMPLETED'
-  );
+  return false;
 }
