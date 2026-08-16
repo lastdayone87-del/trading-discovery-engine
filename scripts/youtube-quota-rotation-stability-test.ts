@@ -37,7 +37,7 @@ test('daily exhausted provider remains unavailable until Pacific reset while hea
   assert.equal(cooldown.eligible(exhausted), true);
 });
 
-test('runtime rate limit quarantines only the failing provider while healthy providers stay eligible', () => {
+test('runtime rate limit creates one shared short pause across otherwise healthy providers', () => {
   let now = 1_000_000;
   const cooldown = new YouTubeProviderCooldown({
     initialRateLimitCooldownMs: 5_000,
@@ -46,12 +46,13 @@ test('runtime rate limit quarantines only the failing provider while healthy pro
     now: () => now
   });
   const retryAt = cooldown.failed('key-a', 'RATE_LIMITED');
-  assert.equal(retryAt, 1_005_000);
-  assert.equal(cooldown.eligible('key-a'), false);
-  assert.equal(cooldown.eligible('key-b'), true);
-  assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b']), null);
 
-  now += 5_000;
+  assert.equal(retryAt, 1_001_000);
+  assert.equal(cooldown.eligible('key-a'), false);
+  assert.equal(cooldown.eligible('key-b'), false);
+  assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b']), 1_001_000);
+
+  now += 1_000;
   assert.equal(cooldown.eligible('key-a'), true);
   assert.equal(cooldown.eligible('key-b'), true);
   assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b']), null);
