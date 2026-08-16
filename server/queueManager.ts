@@ -61,6 +61,7 @@ import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
+import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -947,6 +948,46 @@ export async function triggerManualRecheck(
       const rawErrorClass = String(error?.errorClass || '').toUpperCase() as ManualRecheckErrorClass;
       const typedTransient = MANUAL_RECHECK_TRANSIENT_CLASSES.has(rawErrorClass) && error?.retryable === true;
       console.warn(`[Manual Recheck] Reclassification failed operationally for ${channelId}; preserving prior decision where no complete classification was produced: ${detail}`);
+
+      if (canContinueCommunityInspectionAfterDegradedManualClassification({
+        existingTradingStatus: preserved.trading_status,
+        errorCode: code
+      })) {
+        console.warn(`[Manual Recheck] Gemini classification coverage is degraded for already-confirmed trading creator ${channelId}; preserving TRADING_CONFIRMED and continuing fresh community inspection.`);
+        try {
+          preserved.trading_status = 'TRADING_CONFIRMED';
+          await inspectAndValidateChannel(preserved, freshCandidate, true, enableDebug, false);
+          const communityRefreshed = await getChannelById(channelId) || preserved;
+          const communityIncomplete = communityRefreshed.scan_status === 'FAILED' || communityRefreshed.scan_status === 'FAILED_PERMANENT';
+          if (communityIncomplete) {
+            return {
+              success: false,
+              message: `Manual re-scan preserved the existing trading classification because semantic provider coverage was degraded, but the fresh Discord/community inspection did not complete reliably.`,
+              code: 'MANUAL_RESCAN_COMMUNITY_INCOMPLETE',
+              retryable: true,
+              errorClass: 'TRANSIENT',
+              channel: communityRefreshed
+            };
+          }
+          return {
+            success: true,
+            message: `Manual re-scan preserved the existing TRADING_CONFIRMED classification while semantic provider coverage was degraded, and refreshed Discord/community inspection from current evidence.`,
+            channel: communityRefreshed
+          };
+        } catch (communityError: any) {
+          const communityDetail = communityError instanceof Error ? communityError.message : String(communityError);
+          console.warn(`[Manual Recheck] Community-only continuation failed for ${channelId}: ${communityDetail}`);
+          return {
+            success: false,
+            message: `Manual re-scan preserved the existing trading classification because semantic provider coverage was degraded, but fresh Discord/community inspection failed operationally. ${communityDetail}`,
+            code: 'MANUAL_RESCAN_COMMUNITY_INCOMPLETE',
+            retryable: true,
+            errorClass: 'TRANSIENT',
+            channel: await getChannelById(channelId) || preserved
+          };
+        }
+      }
+
       return {
         success: false,
         message: `Manual re-scan could not complete a reliable trading reclassification. Existing classification was preserved where the classifier had incomplete provider coverage. ${detail}`,
