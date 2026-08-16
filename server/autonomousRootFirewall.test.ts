@@ -67,10 +67,59 @@ test('autonomous candidate with no trading signal is withheld before expensive p
 
 test('autonomous candidate with explicit trading content receives one bounded chance', () => {
   const decision = triageAutonomousSearchCandidate({
-    channelId: 'UCexample0000000000000001', channelName: 'Market Desk', youtubeUrl: 'https://youtube.com/channel/y',
+    channelId: 'UCexample0000000000000001', channelName: 'OC-Trades', youtubeUrl: 'https://youtube.com/channel/y',
     description: '', videoTitles: ['BEL20 futures trading review'], videoDescriptions: ['Order flow and risk management'],
     matchedDocument: { type: 'VIDEO', title: 'BEL20 futures trading review', description: 'Order flow and risk management' }
   }, 'automated_query', false);
   assert.equal(decision.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
-  assert.ok(decision.matchedSignals.length > 0);
+  assert.ok(decision.reasonCodes.includes('RETRIEVAL_DOCUMENT_HAS_HIGH_SPECIFICITY_TRADING_SIGNAL'));
+});
+
+test('music creator is withheld even when retrieval text contains an accidental finance word', () => {
+  const decision = triageAutonomousSearchCandidate({
+    channelId: 'UCmusic00000000000000001', channelName: 'Jessye Belleval', youtubeUrl: 'https://youtube.com/channel/music',
+    description: '', videoTitles: ['Palolé Palolé'], videoDescriptions: [''],
+    matchedDocument: {
+      type: 'VIDEO',
+      title: 'Jessye Belleval - Palolé Palolé (Clip Officiel 4K)',
+      description: 'Zouk love official music video. Streaming options available now.'
+    }
+  }, 'automated_query', false);
+  assert.equal(decision.disposition, 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS');
+  assert.ok(decision.reasonCodes.includes('EXPLICIT_NON_TRADING_DOMAIN_DETECTED'));
+  assert.ok(decision.matchedSignals.includes('MUSIC_ARTIST'));
+});
+
+test('dominant unrelated domain beats a stray high-specificity trading phrase', () => {
+  const decision = triageAutonomousSearchCandidate({
+    channelId: 'UCmusic00000000000000002', channelName: 'Artist Channel', youtubeUrl: 'https://youtube.com/channel/music2',
+    description: '', videoTitles: ['New single'], videoDescriptions: [''],
+    matchedDocument: {
+      type: 'VIDEO',
+      title: 'Official Music Video - New Single',
+      description: 'Singer talks about trading stories in the studio.'
+    }
+  }, 'automated_query', false);
+  assert.equal(decision.disposition, 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS');
+  assert.ok(decision.reasonCodes.includes('CONFLICTING_RETRIEVAL_DOMAINS'));
+});
+
+test('one broad financial product word is not enough for canonical autonomous admission', () => {
+  const decision = triageAutonomousSearchCandidate({
+    channelId: 'UCambiguous00000000000001', channelName: 'Career Desk', youtubeUrl: 'https://youtube.com/channel/ambiguous',
+    description: '', videoTitles: ['Understanding your options'], videoDescriptions: [''],
+    matchedDocument: { type: 'VIDEO', title: 'Understanding your options', description: 'A general explainer.' }
+  }, 'automated_query', false);
+  assert.equal(decision.disposition, 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS');
+  assert.ok(decision.reasonCodes.includes('AMBIGUOUS_RETRIEVAL_CONTEXT'));
+});
+
+test('multiple concrete market contexts can corroborate a retrieval hypothesis without generic prose', () => {
+  const decision = triageAutonomousSearchCandidate({
+    channelId: 'UCmarket0000000000000001', channelName: 'NQ Desk', youtubeUrl: 'https://youtube.com/channel/nq',
+    description: '', videoTitles: ['NQ futures 0DTE recap'], videoDescriptions: [''],
+    matchedDocument: { type: 'VIDEO', title: 'NQ futures 0DTE recap', description: 'Nasdaq session recap.' }
+  }, 'automated_query', false);
+  assert.equal(decision.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.ok(decision.reasonCodes.includes('MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'));
 });
