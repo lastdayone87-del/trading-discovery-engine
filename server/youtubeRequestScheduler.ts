@@ -9,6 +9,9 @@ export interface YouTubeRequestSchedulerOptions {
   initialRateLimitBackoffMs: number;
   maxRateLimitBackoffMs: number;
   starvationMs?: number;
+  runtimeRateLimitFloorMs?: number;
+  maxAdaptiveIntervalMs?: number;
+  adaptiveRecoverySuccesses?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -54,6 +57,27 @@ function sharedRuntimeCoolingDelayMs(error: unknown): number | null {
   return retryAfterMs;
 }
 
+/** True only for request-rate pressure, never daily project quota exhaustion. */
+function isRuntimeRateLimit(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== 'object' || depth > 4) return false;
+  const candidate = error as {
+    status?: unknown;
+    quotaExceeded?: unknown;
+    errorClass?: unknown;
+    providerReasons?: unknown;
+    cause?: unknown;
+  };
+  const reasons = Array.isArray(candidate.providerReasons)
+    ? candidate.providerReasons.map(reason => String(reason).toLowerCase())
+    : [];
+  const rateLimited =
+    candidate.errorClass === 'RATE_LIMIT'
+    || Number(candidate.status) === 429
+    || reasons.some(reason => reason.includes('ratelimit'));
+  if (rateLimited && candidate.quotaExceeded !== true) return true;
+  return isRuntimeRateLimit(candidate.cause, depth + 1);
+}
+
 /**
  * Serialize YouTube requests from this runtime so concurrent workers and paired
  * metadata lookups cannot present one shared egress identity as a bursty client.
@@ -65,6 +89,13 @@ function sharedRuntimeCoolingDelayMs(error: unknown): number | null {
  * the pre-dispatch cooling error to a provider loop and walking every API key.
  * Raw provider 429s still escape normally so youtube.ts can record the failure
  * and apply its ordinary failover/retry policy.
+ *
+ * Repeated real runtime 429s also raise the minimum spacing between outbound
+ * starts. This is pacing rather than a global lockout: work continues, but at a
+ * lower request rate until a sustained run of successful calls gradually brings
+ * spacing back toward the configured baseline. This prevents a shared Railway
+ * egress limit from being hammered once per API key while preserving healthy
+ * daily quota and the #237 rule against long all-provider cooldowns.
  *
  * Manual requests keep their explicit fast-path priority, but all other lanes
  * become FIFO once they have waited beyond the starvation ceiling. When a
@@ -78,6 +109,8 @@ export class YouTubeRequestScheduler {
   private processing = false;
   private sequence = 0;
   private nextStartAt = 0;
+  private adaptiveIntervalMs = 0;
+  private successfulCallsUnderPressure = 0;
 
   constructor(private readonly options: YouTubeRequestSchedulerOptions) {}
 
@@ -101,10 +134,50 @@ export class YouTubeRequestScheduler {
   }
 
   // Kept for incident-recovery callers that use scheduler health as an input.
-  // Provider cooldown remains authoritative; short shared runtime pauses are
-  // consumed internally and are not exposed as a long-lived scheduler state.
+  // Provider cooldown remains authoritative; adaptive pacing deliberately does
+  // not expose itself as a binary "rate limited" state.
   isRateLimited(): boolean { return false; }
   getCooldownUntil(): number | null { return null; }
+
+  private baseIntervalMs(): number {
+    return Math.max(0, this.options.minIntervalMs);
+  }
+
+  private currentIntervalMs(): number {
+    return Math.max(this.baseIntervalMs(), this.adaptiveIntervalMs);
+  }
+
+  private noteRuntimeRateLimit(trace?: (stage: string) => void): void {
+    const base = this.baseIntervalMs();
+    const floor = Math.max(base, this.options.runtimeRateLimitFloorMs ?? 1_000);
+    const max = Math.max(floor, this.options.maxAdaptiveIntervalMs ?? 5_000);
+    this.adaptiveIntervalMs = this.adaptiveIntervalMs > 0
+      ? Math.min(max, Math.max(floor, this.adaptiveIntervalMs * 2))
+      : floor;
+    this.successfulCallsUnderPressure = 0;
+
+    const now = (this.options.now ?? Date.now)();
+    this.nextStartAt = Math.max(this.nextStartAt, now + this.adaptiveIntervalMs);
+    trace?.(`adaptive-rate-pressure ${this.adaptiveIntervalMs}ms`);
+  }
+
+  private noteSuccessfulCall(trace?: (stage: string) => void): void {
+    const base = this.baseIntervalMs();
+    if (this.adaptiveIntervalMs <= base) {
+      this.adaptiveIntervalMs = 0;
+      this.successfulCallsUnderPressure = 0;
+      return;
+    }
+
+    this.successfulCallsUnderPressure += 1;
+    const requiredSuccesses = Math.max(1, Math.floor(this.options.adaptiveRecoverySuccesses ?? 4));
+    if (this.successfulCallsUnderPressure < requiredSuccesses) return;
+
+    this.successfulCallsUnderPressure = 0;
+    const reduced = Math.floor(this.adaptiveIntervalMs / 2);
+    this.adaptiveIntervalMs = reduced <= base ? 0 : Math.max(base, reduced);
+    trace?.(`adaptive-rate-recovery ${this.currentIntervalMs()}ms`);
+  }
 
   private takeNextRequest(): QueuedRequest<unknown> | undefined {
     if (!this.queue.length) return undefined;
@@ -148,6 +221,7 @@ export class YouTubeRequestScheduler {
       );
       try {
         const value = await request.call();
+        this.noteSuccessfulCall(request.trace);
         request.trace?.(
           'after scheduled-call at server/youtubeRequestScheduler.ts:166'
         );
@@ -156,6 +230,7 @@ export class YouTubeRequestScheduler {
       } catch (error) {
         const coolingDelayMs = sharedRuntimeCoolingDelayMs(error);
         if (coolingDelayMs === null) {
+          if (isRuntimeRateLimit(error)) this.noteRuntimeRateLimit(request.trace);
           request.reject(error);
           return;
         }
@@ -171,7 +246,7 @@ export class YouTubeRequestScheduler {
 
         this.nextStartAt =
           (this.options.now ?? Date.now)()
-          + Math.max(0, this.options.minIntervalMs);
+          + this.currentIntervalMs();
         request.trace?.('shared-runtime-cooling-retry');
       }
     }
@@ -204,7 +279,7 @@ export class YouTubeRequestScheduler {
 
         this.nextStartAt =
           (this.options.now ?? Date.now)()
-          + Math.max(0, this.options.minIntervalMs);
+          + this.currentIntervalMs();
 
         await this.runSelectedRequest(request);
       }
@@ -229,7 +304,7 @@ export const youtubeRequestScheduler = new YouTubeRequestScheduler({
     250
   ),
   // Retained in the options contract for compatibility with existing tests and
-  // construction sites; provider cooldown owns actual rate-limit state.
+  // construction sites; provider cooldown owns binary availability state.
   initialRateLimitBackoffMs: nonNegativeNumber(
     process.env.YOUTUBE_RATE_LIMIT_BACKOFF_MS,
     5_000
@@ -237,6 +312,18 @@ export const youtubeRequestScheduler = new YouTubeRequestScheduler({
   maxRateLimitBackoffMs: nonNegativeNumber(
     process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS,
     5 * 60_000
+  ),
+  runtimeRateLimitFloorMs: nonNegativeNumber(
+    process.env.YOUTUBE_RUNTIME_RATE_LIMIT_FLOOR_MS,
+    1_000
+  ),
+  maxAdaptiveIntervalMs: nonNegativeNumber(
+    process.env.YOUTUBE_MAX_ADAPTIVE_REQUEST_INTERVAL_MS,
+    5_000
+  ),
+  adaptiveRecoverySuccesses: nonNegativeNumber(
+    process.env.YOUTUBE_ADAPTIVE_RECOVERY_SUCCESSES,
+    4
   ),
   starvationMs: nonNegativeNumber(
     process.env.YOUTUBE_SCHEDULER_STARVATION_MS,
