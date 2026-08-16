@@ -118,7 +118,7 @@ ON CONFLICT(idempotency_key) DO NOTHING;
 -- The Discord crawler did not run, so the persisted Discord state must not imply
 -- that Discord itself was inspected and classified NON_TRADING. Existing enum
 -- values already support the truthful compatibility projection: UNCERTAIN at the
--- legacy top level, with every independent Discord dimension NOT_CHECKED.
+-- legacy top level, with every independent Discord dimension not yet checked.
 UPDATE channels
 SET discord_status='UNCERTAIN',
     discord_invite=NULL,
@@ -126,7 +126,7 @@ SET discord_status='UNCERTAIN',
     discord_resolution_status='NOT_ATTEMPTED',
     discord_liveness_status='NOT_CHECKED',
     discord_relevance_status='NOT_CHECKED',
-    discord_validation_status='NOT_ATTEMPTED'
+    discord_validation_status='NOT_STARTED'
 WHERE scan_status='SKIPPED_NON_TRADING'
   AND trading_status='NON_TRADING'
   AND discord_invite IS NULL;
@@ -146,7 +146,7 @@ BEGIN
     NEW.discord_resolution_status := 'NOT_ATTEMPTED';
     NEW.discord_liveness_status := 'NOT_CHECKED';
     NEW.discord_relevance_status := 'NOT_CHECKED';
-    NEW.discord_validation_status := 'NOT_ATTEMPTED';
+    NEW.discord_validation_status := 'NOT_STARTED';
   END IF;
   RETURN NEW;
 END;
