@@ -67,9 +67,11 @@ function sharedRuntimeCoolingDelayMs(error: unknown): number | null {
  * and apply its ordinary failover/retry policy.
  *
  * Manual requests keep their explicit fast-path priority, but all other lanes
- * become FIFO once they have waited beyond the starvation ceiling. Selection is
- * performed after the shared pacing delay so starvation is reconsidered before
- * every outbound call.
+ * become FIFO once they have waited beyond the starvation ceiling. When a
+ * pacing delay is actually required, selection is performed after that delay so
+ * starvation is reconsidered immediately before the next outbound call. When
+ * the scheduler is idle and no pacing delay is due, the first request is claimed
+ * synchronously so later arrivals cannot overtake work that is already active.
  */
 export class YouTubeRequestScheduler {
   private readonly queue: QueuedRequest<unknown>[] = [];
@@ -183,9 +185,20 @@ export class YouTubeRequestScheduler {
       while (this.queue.length) {
         const now = (this.options.now ?? Date.now)();
         const waitMs = Math.max(0, this.nextStartAt - now);
-        await this.wait(waitMs);
 
-        const request = this.takeNextRequest();
+        // Do not yield before claiming work that can start immediately. An
+        // unconditional `await wait(0)` lets later, higher-priority arrivals
+        // overtake the request that made the scheduler active. If pacing is
+        // required, however, deliberately wait first and then select so aging
+        // and starvation are evaluated against the post-delay clock.
+        let request: QueuedRequest<unknown> | undefined;
+        if (waitMs > 0) {
+          await this.wait(waitMs);
+          request = this.takeNextRequest();
+        } else {
+          request = this.takeNextRequest();
+        }
+
         if (!request) break;
         request.trace?.('scheduler-tail-released');
 
