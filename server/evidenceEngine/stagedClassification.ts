@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 
-export const STAGED_CLASSIFICATION_VERSION = '3.1.0';
+export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
   if (item.provenance?.fields?.length) return item.provenance.fields;
@@ -33,11 +33,31 @@ function result(stage: ClassificationStageResult['stage'], disposition: Classifi
   return { stage, disposition, reasonCodes, evidenceIds: items.map(item => item.id), fields: uniqueFields(items), metrics };
 }
 
-/**
- * Builds the diagnostic and policy gates for the staged classifier. Arithmetic is
- * deliberately left to the scoring policy; stages decide whether that score is
- * allowed to become a workflow outcome.
- */
+function isPromotionalOrAdjacentNegative(item: EvidenceItem): boolean {
+  return item.category === 'HYPE_SPECULATION' || item.category === 'NON_TRADING_ADJACENT';
+}
+
+function terminalContradictionWeights(negative: EvidenceItem[], positiveWeight: number) {
+  const terminalNegative = negative.filter(item => item.category === 'IRRELEVANT_DOMAIN' && !isPromotionalOrAdjacentNegative(item));
+  const terminalNegativeWeight = terminalNegative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
+  const materiallyDominant = terminalNegativeWeight >= 25 && (positiveWeight === 0 || terminalNegativeWeight > positiveWeight * 1.5);
+  return { terminalNegative, terminalNegativeWeight, materiallyDominant };
+}
+
+/** The staged layer only decides whether governed semantic UNRELATED evidence is
+ * eligible to reach the decision policy. Confidence threshold and substantive
+ * positive blockers remain the responsibility of decisionPolicy.ts. */
+function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], collection: EvidenceCollectionReport): boolean {
+  if (collection.terminalNegativeSufficiency?.status !== 'SUFFICIENT' || !collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
+  return negative.some(item => {
+    if (item.source !== 'gemini_semantic' || item.category !== 'IRRELEVANT_DOMAIN' || item.provenance?.semantic?.taxonomyLabel !== 'UNRELATED') return false;
+    const fields=item.provenance?.fields||[];
+    if(fields.some(field=>field.field==='channel_bio')) return true;
+    const videoFamilies=new Set(fields.filter(field=>field.field==='video_title'||field.field==='video_description').map(field=>field.sourceFamilyId||field.sourceId).filter(Boolean));
+    return videoFamilies.size>=2;
+  });
+}
+
 export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport): StagedClassificationReport {
   const positive = evidence.filter(item => item.polarity === 'POSITIVE' && item.rawMatches.length > 0);
   const negative = evidence.filter(item => item.polarity === 'NEGATIVE');
@@ -45,7 +65,6 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const strongPositive = positive.filter(item => item.reliability !== 'LOWER' && Math.abs(item.finalWeight) >= 6);
   const corroborating = strongPositive.filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY');
   const sources = new Set(corroborating.map(item => item.source));
-  const fields = uniqueFields(corroborating);
   const attributableFields=corroborating.flatMap(item=>item.provenance?.fields||[]);
   const observations=new Set(attributableFields.map(ref=>`${ref.field}:${ref.sourceId || ref.index || ''}`));
   const observationFamilies=new Set(attributableFields.map(ref=>ref.field==='video_title'||ref.field==='video_description'?'video':ref.field==='playlist_name'||ref.field==='playlist_description'?'playlist':ref.field));
@@ -54,26 +73,17 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const repeatedFields=repeatedItems.flatMap(item=>item.provenance?.fields||[]);
   const repeatedIndependence=collapseSourceIndependentObservations(repeatedFields.map((ref,index)=>({observationId:`${ref.field}:${ref.sourceId||ref.index||index}`,sourceFamilyId:ref.sourceFamilyId,sourceEntityId:ref.sourceEntityId})));
   const repeated = repeatedItems.length>0&&(repeatedFields.length===0||repeatedIndependence.independentFamilyCount>=2);
-  // Repeated creator-owned uploads are qualitatively different from a single
-  // retrieval-title keyword hit. When at least 70% of the sampled recent videos
-  // are trading-focused and those observations span at least three independent
-  // video source families, the repeated behavior itself is a creator-level
-  // trading hypothesis. This prevents obvious real traders with generic titles
-  // such as "Live Trading" or "Morning Session" from being forced to review
-  // merely because no instrument/methodology token happened to be present.
   const repeatedCreatorHypothesis = repeatedItems.filter(item => item.confidence >= 70 && Math.abs(item.finalWeight) >= 18);
   const repeatedCreatorIndependent = repeatedCreatorHypothesis.length > 0 && repeatedIndependence.independentFamilyCount >= 3;
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
-  const negativeWouldDominate = negative.length > 0 && (negativeWeight >= 25 || negativeWeight > positiveWeight * 1.5);
+  const {terminalNegative,terminalNegativeWeight,materiallyDominant}=terminalContradictionWeights(negative,positiveWeight);
   const terminalNegativeSufficient=collection.terminalNegativeSufficiency?.status==='SUFFICIENT';
-  const dominantContradiction = negativeWouldDominate && terminalNegativeSufficient;
+  const semanticUnrelatedCandidate=hasCreatorLevelSemanticUnrelatedCandidate(negative,collection);
+  const dominantContradiction = materiallyDominant && terminalNegativeSufficient;
+  const mixedNegativeConflict = negative.length > 0 && negativeWeight >= 25 && !dominantContradiction && !semanticUnrelatedCandidate;
 
-  // Availability describes whether the evidence in hand is sufficient to make a
-  // governed decision. An optional provider failing must remain observable, but
-  // must not veto an otherwise complete, independently corroborated evidence
-  // bundle. Candidate/corroboration/contradiction remain the safety gates.
   const availability = collection.sufficiency === 'SUFFICIENT'
     ? result('AVAILABILITY', 'PASS', [collection.degraded ? 'STAGE_EVIDENCE_SUFFICIENT_WITH_PROVIDER_DEGRADATION' : 'STAGE_EVIDENCE_SUFFICIENT'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded })
     : result('AVAILABILITY', 'ABSTAIN', collection.reasonCodes.length ? collection.reasonCodes : ['STAGE_EVIDENCE_NOT_READY'], evidence, { sufficiency: collection.sufficiency, degraded: collection.degraded });
@@ -81,25 +91,24 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const candidate = candidateEvidence.length > 0
     ? result('CANDIDATE_DETECTION', 'PASS', [semantic.length > 0 ? 'SEMANTIC_CANDIDATE_FOUND' : 'REPEATED_INDEPENDENT_TRADING_UPLOADS'], candidateEvidence, { candidateSignals: candidateEvidence.length, repeatedIndependentFamilies: repeatedIndependence.independentFamilyCount })
     : result('CANDIDATE_DETECTION', 'ABSTAIN', ['NO_SEMANTIC_OR_REPEATED_CREATOR_CANDIDATE'], [], { candidateSignals: 0, repeatedIndependentFamilies: repeatedIndependence.independentFamilyCount });
-  // Independence is established by separately attributable observations, not by
-  // duplicate provider emissions of the same lexical match. Multiple videos,
-  // an About page plus a video, or another distinct document family qualify.
   const independentObservations=independence.independentFamilyCount>=2 && observations.size>=2 && (observationFamilies.size>=2 || attributableFields.filter(f=>f.field==='video_title'||f.field==='video_description').length>=2);
   const corroborated = repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2)));
   const corroborationEvidence = repeatedCreatorIndependent ? [...corroborating, ...repeatedCreatorHypothesis] : corroborating;
   const corroboration = corroborated
     ? result('CORROBORATION', 'PASS', [repeatedCreatorIndependent ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED' : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
     : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
-  const contradiction = dominantContradiction
-    ? result('CONTRADICTION', 'FAIL', ['DOMINANT_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight })
-    : negativeWouldDominate
-      ? result('CONTRADICTION','ABSTAIN',['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT'],negative,{negativeWeight,positiveWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
-      : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight });
+  const contradiction = semanticUnrelatedCandidate
+    ? result('CONTRADICTION','FAIL',['CREATOR_LEVEL_SEMANTIC_UNRELATED_CANDIDATE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
+    : dominantContradiction
+      ? result('CONTRADICTION', 'FAIL', ['DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION'], terminalNegative, { negativeWeight, positiveWeight, terminalNegativeWeight })
+      : mixedNegativeConflict
+        ? result('CONTRADICTION','ABSTAIN',['MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
+        : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_TERMINAL_OR_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight, terminalNegativeWeight });
 
   let lifecycleAction: LifecycleAction = 'REVIEW';
   if (availability.disposition !== 'PASS') lifecycleAction = collection.sufficiency === 'MISSING' || collection.sufficiency === 'INSUFFICIENT' ? 'ENRICH' : 'REVIEW';
   else if (contradiction.disposition === 'FAIL') lifecycleAction = 'REJECT';
-  else if (contradiction.disposition === 'ABSTAIN') lifecycleAction = 'ENRICH';
+  else if (contradiction.disposition === 'ABSTAIN') lifecycleAction = candidate.disposition==='PASS'&&corroboration.disposition==='PASS'?'REVIEW':'ENRICH';
   else if (candidate.disposition === 'PASS' && corroboration.disposition === 'PASS') lifecycleAction = 'CONFIRM';
   const lifecycle = result('LIFECYCLE', 'PASS', [`ROUTE_${lifecycleAction}`], [], { action: lifecycleAction });
   return { pipelineVersion: STAGED_CLASSIFICATION_VERSION, stages: [availability, candidate, corroboration, contradiction, lifecycle], lifecycleAction };
