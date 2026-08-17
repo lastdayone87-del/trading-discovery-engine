@@ -8,6 +8,7 @@ export interface DiscordEvidenceCoverage {
   inviteWelcomeScreen:'PRESENT'|'ABSENT';
   publicWelcomeScreen:'NOT_ATTEMPTED'|'COMPLETED'|'UNAVAILABLE'|'FAILED';
   publicWidget:'NOT_ATTEMPTED'|'COMPLETED'|'UNAVAILABLE'|'FAILED';
+  publicInvitePage:'NOT_ATTEMPTED'|'COMPLETED'|'UNAVAILABLE'|'FAILED';
   publicEvidenceRequests:number;
 }
 
@@ -72,7 +73,7 @@ const EXPLICIT_NON_TRADING_KEYWORDS = [
 ];
 
 const matchedTerms=(text:string,terms:string[])=>terms.filter(term=>text.includes(term));
-const coverageSummary=(coverage:DiscordEvidenceCoverage)=>`coverage(invite=${coverage.inviteMetadata}, welcome=${coverage.inviteWelcomeScreen}/${coverage.publicWelcomeScreen}, widget=${coverage.publicWidget})`;
+const coverageSummary=(coverage:DiscordEvidenceCoverage)=>`coverage(invite=${coverage.inviteMetadata}, welcome=${coverage.inviteWelcomeScreen}/${coverage.publicWelcomeScreen}, widget=${coverage.publicWidget}, page=${coverage.publicInvitePage})`;
 
 function creatorAssociationContext(options?:DiscordValidationOptions){
   const ctx=options?.parentContext;
@@ -93,25 +94,42 @@ function welcomeScreenText(welcome:any):string{
   return [welcome.description||'',...channelDescriptions].filter(Boolean).join(' ');
 }
 
+function publicInvitePageText(html:string):string{
+  if(!html)return '';
+  const pieces:string[]=[];
+  for(const pattern of [
+    /<meta[^>]+(?:property|name)=["'](?:og:title|og:description|twitter:title|twitter:description|description)["'][^>]+content=["']([^"']+)["']/gi,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:title|og:description|twitter:title|twitter:description|description)["']/gi,
+    /<title[^>]*>([^<]+)<\/title>/gi
+  ]){
+    for(let match;(match=pattern.exec(html))!==null;)if(match[1])pieces.push(match[1]);
+  }
+  const decoded=pieces.join(' ')
+    .replace(/&amp;/gi,'&').replace(/&quot;/gi,'"').replace(/&#39;|&apos;/gi,"'").replace(/&lt;/gi,'<').replace(/&gt;/gi,'>')
+    .replace(/\s+/g,' ').trim();
+  return decoded.slice(0,4000);
+}
+
 async function fetchPublicEvidence(input:{
   guildId?:string;
+  inviteCode:string;
   existingWelcome:any;
   fetchImpl:typeof fetch;
   emit:typeof appendProviderCallEvent;
   maxRequests:number;
-}):Promise<{text:string;coverage:Pick<DiscordEvidenceCoverage,'publicWelcomeScreen'|'publicWidget'|'publicEvidenceRequests'>}>{
-  const coverage:{publicWelcomeScreen:DiscordEvidenceCoverage['publicWelcomeScreen'];publicWidget:DiscordEvidenceCoverage['publicWidget'];publicEvidenceRequests:number}={publicWelcomeScreen:'NOT_ATTEMPTED',publicWidget:'NOT_ATTEMPTED',publicEvidenceRequests:0};
-  if(!input.guildId||input.maxRequests<=0)return {text:'',coverage};
+}):Promise<{text:string;coverage:Pick<DiscordEvidenceCoverage,'publicWelcomeScreen'|'publicWidget'|'publicInvitePage'|'publicEvidenceRequests'>}>{
+  const coverage:{publicWelcomeScreen:DiscordEvidenceCoverage['publicWelcomeScreen'];publicWidget:DiscordEvidenceCoverage['publicWidget'];publicInvitePage:DiscordEvidenceCoverage['publicInvitePage'];publicEvidenceRequests:number}={publicWelcomeScreen:'NOT_ATTEMPTED',publicWidget:'NOT_ATTEMPTED',publicInvitePage:'NOT_ATTEMPTED',publicEvidenceRequests:0};
+  if(input.maxRequests<=0)return {text:'',coverage};
   const pieces:string[]=[];
-  const call=async(operation:string,url:string)=>executeProviderCall({
+  const call=async(operation:string,url:string,accept='application/json,text/plain,*/*')=>executeProviderCall({
     context:{provider:'discord',operation,attempt:1},
     timeoutMs:Number(process.env.DISCORD_PROVIDER_TIMEOUT_MS||'15000'),
     enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',
     emit:input.emit,
-    call:signal=>input.fetchImpl(url,{signal,headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}})
+    call:signal=>input.fetchImpl(url,{signal,headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':accept}})
   });
 
-  if(!input.existingWelcome&&coverage.publicEvidenceRequests<input.maxRequests){
+  if(input.guildId&&!input.existingWelcome&&coverage.publicEvidenceRequests<input.maxRequests){
     coverage.publicEvidenceRequests++;
     try{
       const res=await call('welcome-screen',`https://discord.com/api/v10/guilds/${encodeURIComponent(input.guildId)}/welcome-screen`);
@@ -120,7 +138,7 @@ async function fetchPublicEvidence(input:{
     }catch{coverage.publicWelcomeScreen='FAILED';}
   }
 
-  if(coverage.publicEvidenceRequests<input.maxRequests){
+  if(input.guildId&&coverage.publicEvidenceRequests<input.maxRequests){
     coverage.publicEvidenceRequests++;
     try{
       const res=await call('public-widget',`https://discord.com/api/v10/guilds/${encodeURIComponent(input.guildId)}/widget.json`);
@@ -132,6 +150,20 @@ async function fetchPublicEvidence(input:{
       }else coverage.publicWidget=[401,403,404].includes(res.status)?'UNAVAILABLE':'FAILED';
     }catch{coverage.publicWidget='FAILED';}
   }
+
+  // Final public-only semantic fallback. This does not log in, join the server,
+  // or use a user token. It inspects only metadata Discord exposes on the normal
+  // invite landing page, which can contain the server's public title/description
+  // even when the welcome-screen and widget APIs are disabled.
+  if(input.inviteCode&&coverage.publicEvidenceRequests<input.maxRequests){
+    coverage.publicEvidenceRequests++;
+    try{
+      const res=await call('public-invite-page',`https://discord.com/invite/${encodeURIComponent(input.inviteCode)}`,'text/html,application/xhtml+xml');
+      if(res.ok){const html=await res.text();pieces.push(publicInvitePageText(html));coverage.publicInvitePage='COMPLETED';}
+      else coverage.publicInvitePage=[401,403,404].includes(res.status)?'UNAVAILABLE':'FAILED';
+    }catch{coverage.publicInvitePage='FAILED';}
+  }
+
   return {text:pieces.filter(Boolean).join(' '),coverage};
 }
 
@@ -179,7 +211,7 @@ export async function validateDiscordInvite(inviteCode:string, options?:DiscordV
       const inviteWelcomeText=welcomeScreenText(inviteWelcome);
       const actualCode=data.code||cleanCode;
       const canonicalInviteUrl=`https://discord.gg/${actualCode}`;
-      const coverage:DiscordEvidenceCoverage={inviteMetadata:'COMPLETED',inviteWelcomeScreen:inviteWelcomeText?'PRESENT':'ABSENT',publicWelcomeScreen:'NOT_ATTEMPTED',publicWidget:'NOT_ATTEMPTED',publicEvidenceRequests:0};
+      const coverage:DiscordEvidenceCoverage={inviteMetadata:'COMPLETED',inviteWelcomeScreen:inviteWelcomeText?'PRESENT':'ABSENT',publicWelcomeScreen:'NOT_ATTEMPTED',publicWidget:'NOT_ATTEMPTED',publicInvitePage:'NOT_ATTEMPTED',publicEvidenceRequests:0};
       const association=creatorAssociationContext(options);
 
       let discordNativeText=[guildName,guildDescription,inviteChannelName,inviteWelcomeText].filter(Boolean).join(' ').toLowerCase();
@@ -189,9 +221,10 @@ export async function validateDiscordInvite(inviteCode:string, options?:DiscordV
       // Explicit unrelated Discord-native evidence is authoritative. Do not spend
       // more public requests trying to overturn a clear unrelated server.
       if(!(matchedNegative.length>0&&matchedTrading.length===0)&&matchedTrading.length===0){
-        const enrichment=await fetchPublicEvidence({guildId:String(data.guild?.id||''),existingWelcome:inviteWelcome,fetchImpl,emit,maxRequests:Math.min(2,Math.max(0,options?.publicEvidenceMaxRequests??2))});
+        const enrichment=await fetchPublicEvidence({guildId:String(data.guild?.id||''),inviteCode:actualCode,existingWelcome:inviteWelcome,fetchImpl,emit,maxRequests:Math.min(3,Math.max(0,options?.publicEvidenceMaxRequests??3))});
         coverage.publicWelcomeScreen=enrichment.coverage.publicWelcomeScreen;
         coverage.publicWidget=enrichment.coverage.publicWidget;
+        coverage.publicInvitePage=enrichment.coverage.publicInvitePage;
         coverage.publicEvidenceRequests=enrichment.coverage.publicEvidenceRequests;
         if(enrichment.text){
           discordNativeText=`${discordNativeText} ${enrichment.text}`.toLowerCase();
