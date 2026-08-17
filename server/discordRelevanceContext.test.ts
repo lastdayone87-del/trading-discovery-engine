@@ -53,6 +53,19 @@ test('validator does not promote generic active Discord when ownership context i
   assert.equal(result.inviteUrl,null);
 });
 
+test('validator keeps explicit Discord-native non-trading evidence authoritative even with strong creator context',async()=>{
+  const result=await validateDiscordInvite('gaming',{
+    parentContext:{
+      tradingStatus:'TRADING_CONFIRMED',tradingConfidence:93,tradingCategory:'Order Flow',creatorName:'Lunar - Trading Academy',country:'United States',
+      sourceSurface:'YOUTUBE_ABOUT',ownershipStatus:'CREATOR_OWNED',ownershipConfidence:95
+    },
+    fetchImpl:async()=>liveResponse({code:'gaming',guildName:'Minecraft Gaming Community'}),emitProviderEvent:noopEmit as any
+  });
+  assert.equal(result.livenessStatus,'ACTIVE');
+  assert.equal(result.relevanceStatus,'NON_TRADING');
+  assert.equal(result.inviteUrl,null);
+});
+
 test('production queue supplies complete candidate-specific parentContext to validator',()=>{
   const queue=readFileSync('server/queueManager.ts','utf8');
   assert.match(queue,/validateDiscordInvite\(candidate\.nativeInviteCode,\{\s*parentContext:\{/);
