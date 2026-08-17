@@ -1,0 +1,42 @@
+name: Temporary Discord parent-context rewrite
+on:
+  push:
+    branches:
+      - fix/discord-validator-parent-context
+permissions:
+  contents: write
+jobs:
+  rewrite:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restore queue from main and apply exact parent-context wiring
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout origin/main -- server/queueManager.ts
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('server/queueManager.ts')
+          text = path.read_text()
+          old = "const validation=await validateDiscordInvite(candidate.nativeInviteCode,{parentChannelIsTrading:channel.trading_status==='TRADING_CONFIRMED',channelName:channel.channel_name,priorInvalidObservations});"
+          new = """const validation=await validateDiscordInvite(candidate.nativeInviteCode,{\n          parentContext:{\n            tradingStatus:channel.trading_status,\n            tradingConfidence:Number(channel.trading_confidence_score||0),\n            tradingCategory:channel.trading_category,\n            creatorName:channel.channel_name,\n            country:channel.country,\n            sourceSurface:candidate.sourceSurface,\n            ownershipStatus:candidate.ownershipStatus,\n            ownershipConfidence:candidate.ownershipConfidence\n          },\n          priorInvalidObservations\n        });"""
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one production validator call, found {count}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff -- server/queueManager.ts
+      - name: Commit exact rewrite and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/_temporary-discord-parent-context-rewrite.yml
+          git add server/queueManager.ts
+          git commit -m "fix: wire production Discord validator parent context"
+          git push origin HEAD:fix/discord-validator-parent-context
