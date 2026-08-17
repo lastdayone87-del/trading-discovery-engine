@@ -170,10 +170,16 @@ function throwIfAllProvidersCoolingDown(keys: string[]): void {
 }
 
 function recordProviderFailure(key: string, error: unknown): void {
-  if ((error as any)?.providerFailureRecorded === true) return;
   const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;
+  // Runtime rate pressure is shared by the outbound runtime. Once the scheduler
+  // has exhausted its bounded same-operation retries, do not continue walking
+  // the API-key pool: propagate the retryable pressure result to the durable job.
+  if (isYouTubeRateLimited(error)) {
+    if ((error as any)?.providerFailureRecorded !== true) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');
+    throw error;
+  }
+  if ((error as any)?.providerFailureRecorded === true) return;
   if (isQuotaExceeded(error)) youtubeProviderCooldown.failed(dispatchedKey, 'DAILY_QUOTA_EXHAUSTED');
-  else if (isYouTubeRateLimited(error)) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');
 }
 
 export function selectYouTubeDispatchProviderIndex(
@@ -262,9 +268,10 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           const error=await youtubeHttpError(response,trace);
           trace('after HTTP-error-body-read at server/youtube.ts:135');
           if(dispatchedProviderKey){
-            failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
+            const runtimeRateLimited=isYouTubeRateLimited(error);
+            if(!runtimeRateLimited)failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
             if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');
-            else if(isYouTubeRateLimited(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');
+            else if(runtimeRateLimited)youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');
             if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
           }
           throw error;

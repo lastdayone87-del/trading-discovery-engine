@@ -13,6 +13,7 @@ export interface YouTubeRequestSchedulerOptions {
   starvationMs?: number;
   runtimeRateLimitFloorMs?: number;
   maxAdaptiveIntervalMs?: number;
+  maxRuntimeRateLimitRetries?: number;
   adaptiveRecoverySuccesses?: number;
   ratePressureWindowMs?: number;
   quotaGroupForProvider?: (providerKey: string) => string | undefined;
@@ -156,6 +157,7 @@ export class YouTubeRequestScheduler {
   private baseIntervalMs(): number { return Math.max(0, this.options.minIntervalMs); }
   private currentIntervalMs(): number { return Math.max(this.baseIntervalMs(), this.adaptiveIntervalMs); }
   private pressureWindowMs(): number { return Math.max(1_000, this.options.ratePressureWindowMs ?? 60_000); }
+  private runtimeRetryLimit(): number { return Math.max(0, Math.floor(this.options.maxRuntimeRateLimitRetries ?? 0)); }
 
   private trimRuntimeRateLimits(now: number): void {
     const cutoff = now - this.pressureWindowMs();
@@ -242,6 +244,7 @@ export class YouTubeRequestScheduler {
   }
 
   private async runSelectedRequest(request: QueuedRequest<unknown>): Promise<void> {
+    let runtimeRateLimitRetries = 0;
     for (;;) {
       request.trace?.('before scheduled-call at server/youtubeRequestScheduler.ts:166');
       const dispatchAt = (this.options.now ?? Date.now)();
@@ -255,19 +258,38 @@ export class YouTubeRequestScheduler {
         return;
       } catch (error) {
         const coolingDelayMs = sharedRuntimeCoolingDelayMs(error);
-        if (coolingDelayMs === null) {
-          const details = runtimeRateLimitDetails(error);
-          if (details) this.noteRuntimeRateLimit(details, actualSpacingMs, request.priority, request.trace);
+        if (coolingDelayMs !== null) {
+          const now = (this.options.now ?? Date.now)();
+          const pacingDelayMs = Math.max(0, this.nextStartAt - now);
+          const waitMs = Math.max(coolingDelayMs, pacingDelayMs);
+          request.trace?.(`shared-runtime-cooling-wait ${waitMs}ms`);
+          await this.wait(waitMs);
+          this.nextStartAt = (this.options.now ?? Date.now)() + this.currentIntervalMs();
+          request.trace?.('shared-runtime-cooling-retry');
+          continue;
+        }
+
+        const details = runtimeRateLimitDetails(error);
+        if (!details) {
           request.reject(error);
           return;
         }
+
+        this.noteRuntimeRateLimit(details, actualSpacingMs, request.priority, request.trace);
+        const maxRetries = this.runtimeRetryLimit();
+        if (this.options.runtimeRateLimitFloorMs === undefined || runtimeRateLimitRetries >= maxRetries) {
+          if (error && typeof error === 'object') Object.assign(error, { code: 'YOUTUBE_RUNTIME_RATE_PRESSURE', retryable: true });
+          request.trace?.(`runtime-rate-limit-retry-exhausted ${runtimeRateLimitRetries}/${maxRetries}`);
+          request.reject(error);
+          return;
+        }
+
+        runtimeRateLimitRetries += 1;
         const now = (this.options.now ?? Date.now)();
-        const pacingDelayMs = Math.max(0, this.nextStartAt - now);
-        const waitMs = Math.max(coolingDelayMs, pacingDelayMs);
-        request.trace?.(`shared-runtime-cooling-wait ${waitMs}ms`);
+        const waitMs = Math.max(1, this.nextStartAt - now);
+        request.trace?.(`runtime-rate-limit-retry ${runtimeRateLimitRetries}/${maxRetries} wait ${waitMs}ms`);
         await this.wait(waitMs);
         this.nextStartAt = (this.options.now ?? Date.now)() + this.currentIntervalMs();
-        request.trace?.('shared-runtime-cooling-retry');
       }
     }
   }
@@ -304,7 +326,8 @@ export const youtubeRequestScheduler = new YouTubeRequestScheduler({
   initialRateLimitBackoffMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_BACKOFF_MS, 5_000),
   maxRateLimitBackoffMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS, 5 * 60_000),
   runtimeRateLimitFloorMs: nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_FLOOR_MS, 1_000),
-  maxAdaptiveIntervalMs: nonNegativeNumber(process.env.YOUTUBE_MAX_ADAPTIVE_REQUEST_INTERVAL_MS, 5_000),
+  maxAdaptiveIntervalMs: nonNegativeNumber(process.env.YOUTUBE_MAX_ADAPTIVE_REQUEST_INTERVAL_MS, 30_000),
+  maxRuntimeRateLimitRetries: nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_RETRIES, 4),
   adaptiveRecoverySuccesses: nonNegativeNumber(process.env.YOUTUBE_ADAPTIVE_RECOVERY_SUCCESSES, 4),
   ratePressureWindowMs: nonNegativeNumber(process.env.YOUTUBE_RATE_PRESSURE_WINDOW_MS, 60_000),
   starvationMs: nonNegativeNumber(process.env.YOUTUBE_SCHEDULER_STARVATION_MS, 2_000)
