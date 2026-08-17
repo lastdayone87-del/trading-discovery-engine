@@ -40,26 +40,69 @@ const candidate=(value:Omit<DiscordCandidate,'candidateId'>):DiscordCandidate=>{
 };
 export const makeDiscordCandidate=candidate;
 
+const observationKey=(observation:DiscordCandidateObservation)=>JSON.stringify([
+  observation.sourceSurface,
+  observation.sourceUrl||'',
+  observation.rawLocator,
+  observation.sourcePageUrl||'',
+  observation.sourceAnchorText||'',
+  observation.sourcePageTitle||''
+]);
+
 export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorName?:string;creatorWebsiteHosts?:string[]}={}):Pick<DiscordCandidate,'ownershipStatus'|'ownershipConfidence'|'ownershipReasons'>{
   const reasons:string[]=[];
   let score=0;
-  if(candidate.sourceSurface==='YOUTUBE_ABOUT'){score+=90;reasons.push('DIRECT_YOUTUBE_ABOUT');}
-  if(candidate.sourceSurface==='RECENT_VIDEO_DESCRIPTIONS'){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
-  if(candidate.sourceSurface==='CHANNEL_EXTERNAL_LINKS'){score+=70;reasons.push('DIRECT_CHANNEL_LINK');}
-  if(candidate.sourceSurface==='CREATOR_WEBSITES'){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
-  if(candidate.sourceSurface==='SOCIAL_PROFILES'){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
-  const source=String(candidate.sourceUrl||'').toLowerCase();
-  const raw=String(candidate.rawLocator||'').toLowerCase();
+  const observations=candidate.observations?.length?candidate.observations:[{sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,rawLocator:candidate.rawLocator,sourcePageUrl:candidate.sourceUrl,extractionConfidence:candidate.extractionConfidence}];
+  const surfaces=new Set(observations.map(observation=>observation.sourceSurface));
+
+  if(surfaces.has('YOUTUBE_ABOUT')){score+=90;reasons.push('DIRECT_YOUTUBE_ABOUT');}
+  else if(surfaces.has('CHANNEL_EXTERNAL_LINKS')){score+=70;reasons.push('DIRECT_CHANNEL_LINK');}
+  else if(surfaces.has('RECENT_VIDEO_DESCRIPTIONS')){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
+  else if(surfaces.has('SOCIAL_PROFILES')){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
+  else if(surfaces.has('CREATOR_WEBSITES')){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
+
+  // A channel external link is a creator-controlled surface. Explicit extraction
+  // is enough corroboration to cross the creator-owned gate unless contradictory
+  // partner/referral evidence is present below.
+  if(surfaces.has('CHANNEL_EXTERNAL_LINKS')&&observations.some(observation=>observation.sourceSurface==='CHANNEL_EXTERNAL_LINKS'&&observation.extractionConfidence==='EXPLICIT')){
+    score+=10;reasons.push('EXPLICIT_CHANNEL_CONTROLLED_LINK');
+  }
+
+  // A Discord appearing in one video description can be a sponsor/partner link.
+  // Repetition across distinct creator video pages is materially stronger evidence
+  // that the community belongs to the creator, without globally lowering the gate.
+  const creatorVideoPages=new Set(observations
+    .filter(observation=>observation.sourceSurface==='RECENT_VIDEO_DESCRIPTIONS')
+    .map(observation=>observation.sourcePageUrl||observation.sourceUrl||'')
+    .filter(Boolean));
+  if(creatorVideoPages.size>=2){score+=15;reasons.push('REPEATED_CREATOR_VIDEO_OBSERVATION');}
+
+  if(surfaces.size>=2&&[...surfaces].some(surface=>surface==='YOUTUBE_ABOUT'||surface==='CHANNEL_EXTERNAL_LINKS'||surface==='RECENT_VIDEO_DESCRIPTIONS')){
+    score+=15;reasons.push('CROSS_CREATOR_SURFACE_CORROBORATION');
+  }
+
   const creatorName=String(input.creatorName||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
-  const partnerSignals=/affiliate|referral|sponsor|partner|broker|course|product|parrain|refer\b|promo|discount/;
-  if(partnerSignals.test(`${source} ${raw}`)){score-=80;reasons.push('PARTNER_OR_AFFILIATE_SURFACE');}
-  try{
-    const host=new URL(source).hostname.toLowerCase();
-    if(input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))){score+=55;reasons.push('CREATOR_CANONICAL_DOMAIN');}
-    if(creatorName){const compact=creatorName.replace(/\s+/g,'');const hostCompact=host.replace(/[^a-z0-9]/g,'');if(compact.length>=4&&hostCompact.includes(compact)){score+=30;reasons.push('CREATOR_BRAND_DOMAIN_MATCH');}}
-  }catch{}
+  const partnerSignals=/affiliate|referral|sponsor|sponsored|partner|broker|course|product|parrain|refer\b|promo|discount/;
+  const provenanceText=observations.map(observation=>[
+    observation.sourceUrl,
+    observation.sourcePageUrl,
+    observation.sourceAnchorText,
+    observation.sourcePageTitle,
+    observation.rawLocator
+  ].filter(Boolean).join(' ')).join(' ').toLowerCase();
+  if(partnerSignals.test(provenanceText)){score-=80;reasons.push('PARTNER_OR_AFFILIATE_SURFACE');}
+
+  const candidateHosts=new Set(observations.map(observation=>observation.sourcePageUrl||observation.sourceUrl||'').filter(Boolean));
+  for(const candidateUrl of candidateHosts){
+    try{
+      const host=new URL(candidateUrl).hostname.toLowerCase();
+      if(input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))){score+=55;reasons.push('CREATOR_CANONICAL_DOMAIN');break;}
+      if(creatorName){const compact=creatorName.replace(/\s+/g,'');const hostCompact=host.replace(/[^a-z0-9]/g,'');if(compact.length>=4&&hostCompact.includes(compact)){score+=30;reasons.push('CREATOR_BRAND_DOMAIN_MATCH');break;}}
+    }catch{}
+  }
+
   const ownershipStatus:DiscordOwnershipStatus=score>=75?'CREATOR_OWNED':score<=0?'THIRD_PARTY':'UNCERTAIN';
-  return {ownershipStatus,ownershipConfidence:Math.min(100,Math.max(10,Math.abs(score))),ownershipReasons:reasons.length?reasons:['OWNERSHIP_EVIDENCE_INSUFFICIENT']};
+  return {ownershipStatus,ownershipConfidence:Math.min(100,Math.max(10,Math.abs(score))),ownershipReasons:reasons.length?Array.from(new Set(reasons)):['OWNERSHIP_EVIDENCE_INSUFFICIENT']};
 }
 
 export function mergeDiscordCandidates(items:DiscordCandidate[],input:{creatorName?:string;creatorWebsiteHosts?:string[]}={}):DiscordCandidate[]{
@@ -67,13 +110,11 @@ export function mergeDiscordCandidates(items:DiscordCandidate[],input:{creatorNa
   for(const item of items){
     if(!item.nativeInviteCode)continue;
     const key=item.canonicalInviteId||canonicalDiscordInviteId(item.nativeInviteCode);
-    const ownership=inferDiscordOwnership(item,input);
-    const enriched={...item,...ownership,canonicalInviteId:key};
     const existing=byCanonical.get(key);
-    if(!existing){byCanonical.set(key,enriched);continue;}
-    const observations=[...(existing.observations||[]),...(enriched.observations||[])];
-    const stronger=(enriched.ownershipConfidence||0)>(existing.ownershipConfidence||0)?enriched:existing;
-    byCanonical.set(key,{...stronger,observations:Array.from(new Map(observations.map(obs=>[JSON.stringify([obs.sourceSurface,obs.sourceUrl,obs.rawLocator,obs.sourcePageUrl]),obs])).values())});
+    const observations=Array.from(new Map([...(existing?.observations||[]),...(item.observations||[])].map(observation=>[observationKey(observation),observation])).values());
+    const mergedBase:DiscordCandidate={...(existing||item),...item,canonicalInviteId:key,observations};
+    const ownership=inferDiscordOwnership(mergedBase,input);
+    byCanonical.set(key,{...mergedBase,...ownership});
   }
   const ownershipRank=(candidate:DiscordCandidate)=>candidate.ownershipStatus==='CREATOR_OWNED'?3:candidate.ownershipStatus==='UNCERTAIN'?2:1;
   return Array.from(byCanonical.values()).sort((a,b)=>ownershipRank(b)-ownershipRank(a)||(b.ownershipConfidence||0)-(a.ownershipConfidence||0));
