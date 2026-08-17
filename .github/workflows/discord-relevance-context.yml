@@ -5,7 +5,9 @@ on:
       - 'server/discordValidator.ts'
       - 'server/discordProjection.ts'
       - 'server/discordCandidates.ts'
+      - 'server/queueManager.ts'
       - 'server/discordRelevanceContext.test.ts'
+      - 'server/discordMultiCandidateOwnership.test.ts'
       - '.github/workflows/discord-relevance-context.yml'
 jobs:
   verify:
