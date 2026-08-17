@@ -39,6 +39,33 @@ export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
 
 const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about/i;
 
+/**
+ * Telegram channel pages contain a link for virtually every message. Those
+ * message permalinks are content pages, not additional creator/community
+ * surfaces, so recursively crawling them spends the rendered acquisition
+ * budget without increasing Discord coverage. A post permalink can still be
+ * used as the initial seed when explicitly supplied; this only filters links
+ * discovered while traversing a rendered page.
+ */
+export function isTelegramPostPermalink(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    if (hostname !== 't.me' && hostname !== 'telegram.me') return false;
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (parts.length === 2) return /^\d+$/.test(parts[1]);
+    if (parts.length === 3 && parts[0].toLowerCase() === 's') return /^\d+$/.test(parts[2]);
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
+  if (isTelegramPostPermalink(rawUrl)) return false;
+  return COMMUNITY_HINTS.test(rawUrl);
+}
+
 function boundedEnvInt(value: string | undefined, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -158,7 +185,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
-              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>COMMUNITY_HINTS.test(req.url)?req:false});
+              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>shouldEnqueueRenderedCommunityLink(req.url)?req:false});
             }
           },
         });
