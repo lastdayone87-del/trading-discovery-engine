@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, RenderedFallbackGate, renderedFallbackGate, shouldEscalateToRenderedFallback } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback } from './browserCommunityFallback';
 import { classifyRenderedCrawlerFailure, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
 test('browser fallback remains bounded while allowing useful retries', () => {
@@ -10,6 +10,20 @@ test('browser fallback remains bounded while allowing useful retries', () => {
   assert.equal(DEFAULT_BROWSER_FALLBACK_BUDGET.maxRequestRetries, 3);
   assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxSessionRotations <= 4);
   assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.totalTimeoutMs <= 60_000);
+});
+
+test('Telegram message permalinks are not recursively crawled as community surfaces', () => {
+  assert.equal(isTelegramPostPermalink('https://t.me/vipintraders/4013'), true);
+  assert.equal(isTelegramPostPermalink('https://t.me/s/vipintraders/4014?single'), true);
+  assert.equal(isTelegramPostPermalink('https://telegram.me/vipintraders/4015'), true);
+  assert.equal(shouldEnqueueRenderedCommunityLink('https://t.me/vipintraders/4013'), false);
+  assert.equal(shouldEnqueueRenderedCommunityLink('https://t.me/s/vipintraders/4014'), false);
+});
+
+test('Telegram community roots and non-Telegram community links remain eligible', () => {
+  assert.equal(isTelegramPostPermalink('https://t.me/vipintraders'), false);
+  assert.equal(shouldEnqueueRenderedCommunityLink('https://t.me/vipintraders'), true);
+  assert.equal(shouldEnqueueRenderedCommunityLink('https://example.com/vip-community'), true);
 });
 
 test('rendered retry policy rotates sessions for blocked responses', () => {
