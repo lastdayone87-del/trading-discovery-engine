@@ -86,6 +86,7 @@ export interface InspectionStep {
   status: 'FOUND' | 'NOT_FOUND' | 'SKIPPED' | 'PARTIAL' | 'ERROR' | 'REJECTED';
   details?: string;
   detectedInvite?: string;
+  detectedInvites?: string[];
   inviteLocation?: string;
   timestamp: string;
 }
