@@ -49,6 +49,11 @@ const observationKey=(observation:DiscordCandidateObservation)=>JSON.stringify([
   observation.sourcePageTitle||''
 ]);
 
+function creatorIdentityParts(name:string):string[]{
+  const stop=new Set(['the','and','official','channel','trading','trader','trades','trade','finance','financial','markets','market','academy','capital','investing','investor','investments']);
+  return name.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().split(/\s+/).filter(part=>part.length>=4&&!stop.has(part));
+}
+
 export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorName?:string;creatorWebsiteHosts?:string[]}={}):Pick<DiscordCandidate,'ownershipStatus'|'ownershipConfidence'|'ownershipReasons'>{
   const reasons:string[]=[];
   let score=0;
@@ -82,6 +87,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   }
 
   const creatorName=String(input.creatorName||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const creatorParts=creatorIdentityParts(creatorName);
   const partnerSignals=/affiliate|referral|sponsor|sponsored|partner|broker|course|product|parrain|refer\b|promo|discount/;
   const provenanceText=observations.map(observation=>[
     observation.sourceUrl,
@@ -95,9 +101,26 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   const candidateHosts=new Set(observations.map(observation=>observation.sourcePageUrl||observation.sourceUrl||'').filter(Boolean));
   for(const candidateUrl of candidateHosts){
     try{
-      const host=new URL(candidateUrl).hostname.toLowerCase();
+      const parsed=new URL(candidateUrl),host=parsed.hostname.toLowerCase();
       if(input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))){score+=55;reasons.push('CREATOR_CANONICAL_DOMAIN');break;}
-      if(creatorName){const compact=creatorName.replace(/\s+/g,'');const hostCompact=host.replace(/[^a-z0-9]/g,'');if(compact.length>=4&&hostCompact.includes(compact)){score+=30;reasons.push('CREATOR_BRAND_DOMAIN_MATCH');break;}}
+      if(creatorName){
+        const compact=creatorName.replace(/\s+/g,''),hostCompact=host.replace(/[^a-z0-9]/g,'');
+        // A brand-matching creator website was already intended as strong
+        // provenance, but the old +30 left a linked creator website at 70/75.
+        // Make that corroboration actually cross the existing gate without
+        // lowering the global CREATOR_OWNED threshold.
+        if(compact.length>=4&&hostCompact.includes(compact)){score+=35;reasons.push('CREATOR_BRAND_DOMAIN_MATCH');break;}
+
+        // Social profiles are creator-controlled only when the profile identity
+        // itself corroborates the creator. Require at least two meaningful name
+        // parts (or the complete compact creator name) in the URL path so a
+        // generic platform URL cannot promote a partner community.
+        if(surfaces.has('SOCIAL_PROFILES')){
+          const pathCompact=decodeURIComponent(parsed.pathname).toLowerCase().replace(/[^a-z0-9]/g,'');
+          const matchedParts=creatorParts.filter(part=>pathCompact.includes(part));
+          if((compact.length>=5&&pathCompact.includes(compact))||matchedParts.length>=2){score+=20;reasons.push('CREATOR_SOCIAL_IDENTITY_MATCH');break;}
+        }
+      }
     }catch{}
   }
 
