@@ -172,7 +172,7 @@ export async function processNextSearchJob(
   if(!claimableOverride||claimableOverride.includes('INSPECT_FEATURED_CHANNELS')){const db=await getDb();const c=await db.query(`SELECT 1 FROM acquisition_adapter_controls adapter JOIN creator_search_canary_control authority ON authority.singleton=true WHERE adapter.adapter_type='INSPECT_FEATURED_CHANNELS' AND adapter.mode='CANARY' AND NOT adapter.paused AND NOT adapter.kill_switch AND authority.enabled AND NOT authority.kill_switch AND authority.serving_authority_enabled AND authority.featured_channel_authority_enabled AND authority.featured_channel_rollout_basis_points>0`);if(c.rowCount)claimableTypes.push('INSPECT_FEATURED_CHANNELS');}
   if (!claimableOverride || claimableOverride.includes('TERM_HARVEST')) {
     const db=await getDb();const control=await db.query(`SELECT paused FROM corpus_controls WHERE singleton=true`);
-    if(control.rowCount&&!control.rows[0].paused)claimableTypes.push('TERM_HARVEST');
+    if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES')))claimableTypes.push('SCORE_CANDIDATES');
   }
   if(!claimableOverride||claimableOverride.includes('PROPOSE_CONCEPT_RESOLUTION')){const db=await getDb();const control=await db.query('SELECT resolution_paused FROM concept_graph_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].resolution_paused)claimableTypes.push('PROPOSE_CONCEPT_RESOLUTION');}
   if(!claimableOverride||claimableOverride.includes('OFFLINE_CANDIDATE_EVALUATION')){const db=await getDb();const control=await db.query('SELECT evaluation_paused,provider_access_allowed FROM offline_evaluation_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].evaluation_paused&&!control.rows[0].provider_access_allowed)claimableTypes.push('OFFLINE_CANDIDATE_EVALUATION');}
@@ -221,8 +221,6 @@ export async function processNextSearchJob(
       if(!result.success) throw new Error(result.message);
       const refreshed=await getChannelById(channelId);
       if(refreshed && job.type==='POST_APPROVAL_ENRICH') {
-        // Human approval remains authoritative; learning is delayed until this
-        // post-approval metadata/Discord inspection has completed successfully.
         refreshed.trading_status='TRADING_CONFIRMED';
         const text=refreshed.inspection_trail?.map(step=>step.details||'').join(' ')||'';
         const quality=calculateCreatorQualityScore(refreshed,[refreshed.channel_name],text);
@@ -302,8 +300,6 @@ export async function processNextSearchJob(
           await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
           quotaReserved=false;
         } else {
-          // Idempotently reconcile a reservation left RESERVED if a prior worker
-          // crashed after persisting the paid enrichment payload.
           await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         }
         const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true);
@@ -321,11 +317,8 @@ export async function processNextSearchJob(
     const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null } = job.payload as {
       query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null;
     };
-    // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
 
-    // Execution-time query authority revalidation: every non-manual search job
-    // must satisfy the current retrieval-policy before YouTube quota is spent.
     if (source !== 'manual_search') {
       const qRecord = queryId
         ? await getQueryById(queryId)
@@ -379,8 +372,6 @@ export async function processNextSearchJob(
     const observations: QueryObservation[] = [];
     const sightings = [];
     for (const [index, raw] of distinctExtracted.entries()) {
-      // A durable nomination is written before channel processing. When the
-      // ledger is OFF, legacy channel_sightings remain the compatibility path.
       const nomination=await recordNomination({channelId:raw.channelId,sourceType:source,queryId,queryRunId,jobId:job.id,
         queryCatalogVersion:typeof job.payload.catalogPin?.checksum==='string'?job.payload.catalogPin.checksum:undefined,
         query,querySemanticClasses:queryRecord?.intent?[queryRecord.intent]:[],queryGenerationMode:queryRecord?.generation_mode,
@@ -436,8 +427,6 @@ export async function processNextSearchJob(
     return true;
   } catch (err: any) {
     if (err instanceof ExcludedCountryError) {
-      // A policy change can make an already-persisted job ineligible. Consume it
-      // without retrying so it can never spend external API quota.
       const runId = String(job.payload?.queryRunId || '');
       if (runId) await failQueryRun(runId, err, true);
       if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
@@ -487,9 +476,6 @@ export interface ProcessDiscoveredChannelOutcome {
   channelRecord?: ChannelRecord;
 }
 
-/**
- * Handles newly discovered YouTube channel via the unified ingestion pipeline.
- */
 export async function processDiscoveredChannel(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
@@ -498,9 +484,6 @@ export async function processDiscoveredChannel(
   return processChannelThroughPipeline(raw, targetCountry, source, false);
 }
 
-/**
- * Executes the inspection and Discord quality validation for a locked channel.
- */
 export async function inspectAndValidateChannel(
   channel: ChannelRecord,
   rawDetails?: DiscoveredChannelRaw,
@@ -525,7 +508,6 @@ export async function inspectAndValidateChannel(
   let finalDebugLog: any = null;
   let inspection: Awaited<ReturnType<typeof runChannelInspection>> | null = null;
   try {
-    // 1. Re-check Country Validation before Discord scanning
     const valRes = await validateChannelCountry(
       {
         channelName: channel.channel_name,
@@ -547,7 +529,6 @@ export async function inspectAndValidateChannel(
     };
 
     if (valRes.status === 'REJECTED') {
-      // Excluded country matched — Halt execution immediately! Never reach Discord crawler.
       channel.country_status = 'REJECTED';
       channel.confidence_score = valRes.score;
       channel.scan_status = 'COMPLETED';
@@ -558,12 +539,10 @@ export async function inspectAndValidateChannel(
       return;
     }
 
-    // Update country status & decision trail
     channel.country_status = valRes.status;
     channel.confidence_score = valRes.score;
     if (valRes.detectedCountry) channel.country = valRes.detectedCountry;
 
-    // 2. Step-by-step Channel Inspection Engine for Discord Invites (force live YouTube scrape on manual scan)
     inspection = await runChannelInspection({
       enableDebug,
       channelId: channel.channel_id,
@@ -578,8 +557,6 @@ export async function inspectAndValidateChannel(
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
-    // Live About-page hydration can reveal stronger country evidence than the
-    // search snippet. Re-evaluate before persisting any discovered community.
     const liveCountry = await validateChannelCountry({channelName:channel.channel_name,
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
@@ -593,7 +570,6 @@ export async function inspectAndValidateChannel(
     }
     if (liveCountry.detectedCountry) { channel.country=liveCountry.detectedCountry; channel.country_status=liveCountry.status; channel.confidence_score=liveCountry.score; }
 
-    // Combine Country Validation step as Step 1 with Discord Inspection steps
     channel.inspection_trail = [countryStep, ...inspection.steps];
     finalDebugLog = inspection.debugLog;
 
@@ -603,15 +579,9 @@ export async function inspectAndValidateChannel(
       channel.channel_thumbnail_url = rawDetails.channelThumbnailUrl;
     }
 
-    // Structured candidates are authoritative for discovery; foundInvite is a
-    // compatibility fallback for older inspection results without the
-    // structured collection.
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
     const discoveredInvite=structuredCandidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||inspection.foundInvite||null;
     if (discoveredInvite) {
-      // Validate bounded native candidates until a high-confidence trading
-      // community is found. A live-but-ambiguous or live-but-non-trading first
-      // invite is a fallback, not a reason to suppress a stronger later invite.
       const candidates=structuredCandidates.length?structuredCandidates:[{candidateId:`legacy:${discoveredInvite}`,locatorType:'NATIVE_INVITE' as const,sourceSurface:'CHANNEL_EXTERNAL_LINKS' as const,rawLocator:discoveredInvite,nativeInviteCode:discoveredInvite,normalizedLocator:`https://discord.gg/${discoveredInvite}`,extractionConfidence:'EXPLICIT' as const}];
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
@@ -619,7 +589,19 @@ export async function inspectAndValidateChannel(
         if(!candidate.nativeInviteCode)continue;
         const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
         const priorInvalidObservations=await countDiscordInvalidObservations(channel.channel_id,candidate.candidateId,locator);
-        const validation=await validateDiscordInvite(candidate.nativeInviteCode,{parentChannelIsTrading:channel.trading_status==='TRADING_CONFIRMED',channelName:channel.channel_name,priorInvalidObservations});
+        const validation=await validateDiscordInvite(candidate.nativeInviteCode,{
+          parentContext:{
+            tradingStatus:channel.trading_status,
+            tradingConfidence:Number(channel.trading_confidence_score||0),
+            tradingCategory:channel.trading_category,
+            creatorName:channel.channel_name,
+            country:channel.country,
+            sourceSurface:candidate.sourceSurface,
+            ownershipStatus:candidate.ownershipStatus,
+            ownershipConfidence:candidate.ownershipConfidence
+          },
+          priorInvalidObservations
+        });
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
         if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}
         const rank=discordCandidateCompositeRank(candidate,validation);
@@ -637,7 +619,6 @@ export async function inspectAndValidateChannel(
       reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:true});
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
-      // A failed or partial crawl is operational uncertainty, not confirmed absence.
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
       if(!alreadyValidatedSuccess){
         channel.discord_status='UNCERTAIN';
@@ -648,13 +629,9 @@ export async function inspectAndValidateChannel(
       reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
       channel.scan_status='FAILED';
       channel.scan_attempts++;
-      // An incomplete rescan cannot erase an earlier discovered locator. The
-      // append-only checks remain authoritative until a new validation replaces
-      // this compatibility projection.
       channel.last_checked=now;
       if(inspection.acquisitionOutcomes?.some(item=>item.retryable)&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
     } else {
-      // Nothing Found After All Steps
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
       if(!alreadyValidatedSuccess){
         channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
@@ -662,7 +639,6 @@ export async function inspectAndValidateChannel(
       }
       channel.scan_status = 'COMPLETED';
       channel.scan_attempts = 0;
-      // Only a complete inspection with no prior discovery may project absence.
       if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
       else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
       reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
@@ -670,13 +646,8 @@ export async function inspectAndValidateChannel(
     }
 
   } catch (err) {
-    // Preserve any structured discovery even when validation or later
-    // processing throws. This must run before catch persistence and retry.
     reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
     channel.scan_attempts++;
-    // Durable RETRY_COMMUNITY_ACQUISITION owns the retry budget. Keep channel
-    // state retryable here so an internal scan counter cannot prematurely stop
-    // a job that still has durable attempts remaining.
     channel.scan_status = 'FAILED';
     if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
   } finally {
@@ -690,10 +661,6 @@ async function enqueueCommunityAcquisitionRetry(channelId:string):Promise<void>{
   await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5});
 }
 
-/**
- * Re-tests all existing channels in the database against the updated Hard Exclusion Engine.
- * Removes / marks previously accepted excluded-country channels as REJECTED.
- */
 export async function auditExistingChannelsWithExclusionEngine(): Promise<{ total: number; rejected: number }> {
   try {
     const allChannels = await getAllChannels();
@@ -730,7 +697,6 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
 
         await upsertChannel(channel);
       } else if (channel.discord_status === 'DEAD' || channel.discord_status === 'NON_TRADING' || channel.discord_status === 'UNCERTAIN') {
-        // Enforce persistence rule: never store invite URLs for DEAD, NON_TRADING, or UNCERTAIN channels
         if (channel.discord_invite !== null) {
           channel.discord_invite = null;
           await upsertChannel(channel);
@@ -768,7 +734,6 @@ const MANUAL_RECHECK_TRANSIENT_CLASSES = new Set<ManualRecheckErrorClass>([
   'TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'
 ]);
 
-
 export async function reserveOfficialRecheckQuota(operationType: string, operationId: string): Promise<boolean> {
   const dailyBudget = getDailyYouTubeQuotaBudget();
   const allocationPercent = Math.max(1, Math.min(100, Number(await getAppSetting('discovery_enrichment_quota_percent', '10')) || 10));
@@ -798,11 +763,6 @@ function classifyManualRecheckAcquisitionFailure(error: any): {
   const retryAt = Number(error?.retryAt);
   const retryAfterMs = Number(error?.retryAfterMs);
 
-  // Attempt-free infrastructure retries are deliberately opt-in. The
-  // upstream error itself must already carry a recognized transient
-  // class and explicitly say it is retryable. Status codes, messages,
-  // cooldown codes, and network-looking strings must never manufacture
-  // transient semantics for migration-091 recovery.
   if (MANUAL_RECHECK_ERROR_CLASSES.has(rawErrorClass)) {
     return {
       errorClass: rawErrorClass,
@@ -813,8 +773,6 @@ function classifyManualRecheckAcquisitionFailure(error: any): {
     };
   }
 
-  // Untyped permanent/not-found outcomes may still be identified for
-  // diagnostics, but they never receive attempt-free retry semantics.
   if (status === 404 || /channel ['"][^'"]+['"] was not found|channel not found|does not exist|deleted channel/i.test(message)) {
     return { errorClass: 'PERMANENT_INPUT', retryable: false, code };
   }
@@ -822,7 +780,6 @@ function classifyManualRecheckAcquisitionFailure(error: any): {
     return { errorClass: 'PERMANENT_INPUT', retryable: false, code };
   }
 
-  // Every other untyped failure consumes the bounded normal attempt.
   return {
     retryable: false,
     code,
@@ -831,11 +788,6 @@ function classifyManualRecheckAcquisitionFailure(error: any): {
   };
 }
 
-/**
- * Triggers a manual re-scan for a specific channel.
- * Runs 4-step inspection synchronously with force live YouTube scraping.
- * Does NOT schedule any automatic future rechecks.
- */
 export async function triggerManualRecheck(
   channelId: string,
   enableDebug?: boolean,
@@ -1011,11 +963,6 @@ export interface SearchExecutionResult {
   channels: ChannelRecord[];
 }
 
-/**
- * Synchronous Full Manual Search Execution Engine.
- * Traces and logs full execution status flow:
- * QUEUED -> SEARCHING -> PROCESSING CHANNELS -> VALIDATING COUNTRY -> INSPECTING -> COMPLETED
- */
 function manualVariants(query: string, vocab?: Awaited<ReturnType<typeof getCountryVocabularies>>[number]): string[] {
   return [...new Set([query, vocab?.native_trading_terminology?.[0] ? `${query} ${vocab.native_trading_terminology[0]}` : '', vocab?.common_content_format_names?.[0] ? `${query} ${vocab.common_content_format_names[0]}` : ''].filter(Boolean))];
 }
@@ -1023,7 +970,6 @@ function manualVariants(query: string, vocab?: Awaited<ReturnType<typeof getCoun
 async function executeManualSearchPage(sessionId: string, pageNumber: number, pageToken: string | null, variantIndex = 0): Promise<any> {
   const session = await getManualSearchSession(sessionId);
   if (!session || session.status !== 'RUNNING') return session;
-  // A completed observation is the idempotency boundary for retried queue jobs.
   if (session.pagesProcessed >= pageNumber) return session;
   const maxPages = Math.max(1, Number(await getAppSetting('manual_search_max_pages', '8')));
   const maxCreators = Math.max(1, Number(await getAppSetting('manual_search_max_unique_creators', '150')));
@@ -1091,7 +1037,6 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
   } catch (error) { await finishQuotaReservation('MANUAL_SEARCH_PAGE', operationId, false); throw error; }
 }
 
-/** Starts a durable session and atomically queues its first page. */
 export async function executeFullManualSearch(userQuery: string, countryName: string, traceId?:string): Promise<any> {
   await assertCountryAllowed(countryName, 'manual_search_session');
   const vocabs = await getCountryVocabularies();
@@ -1122,11 +1067,6 @@ function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEA
 
 let workersStarted = false;
 
-/**
- * Start the durable queue consumers explicitly, after HTTP readiness. Keeping
- * this idempotent prevents duplicate consumers if startup orchestration is
- * retried; individual ticks already preserve the existing claim/retry rules.
- */
 export function startSearchWorkers(): void {
   if (workersStarted) return;
   workersStarted = true;
