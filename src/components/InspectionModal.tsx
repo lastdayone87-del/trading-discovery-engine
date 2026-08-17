@@ -237,10 +237,12 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                       </div>
                     )}
 
-                    {step.detectedInvite && (
+                    {(step.detectedInvites?.length || step.detectedInvite) && (
                       <div className="mt-2 font-mono text-[11px] bg-emerald-100/70 dark:bg-emerald-950/60 text-emerald-900 dark:text-emerald-200 p-2 rounded border border-emerald-200 dark:border-emerald-800 flex items-center justify-between">
                         <div className="flex flex-col gap-0.5">
-                          <span>Invite Code: <strong>{step.detectedInvite}</strong></span>
+                          {(step.detectedInvites?.length ? step.detectedInvites : [step.detectedInvite!]).map((inviteCode, inviteIndex) => (
+                            <span key={`${inviteCode}-${inviteIndex}`}>Invite Code{(step.detectedInvites?.length || 1) > 1 ? ` ${inviteIndex + 1}` : ''}: <strong>{inviteCode}</strong></span>
+                          ))}
                           {step.inviteLocation && (
                             <span className="text-[10px] text-emerald-800 dark:text-emerald-300">Found in: <strong className="uppercase bg-emerald-200/50 dark:bg-emerald-800/50 px-1 rounded">{step.inviteLocation}</strong></span>
                           )}

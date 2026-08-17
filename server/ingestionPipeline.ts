@@ -402,36 +402,35 @@ export async function processChannelThroughPipeline(
     const independentHypothesis=hasIndependentTradingHypothesis(productionClassification.decision);
 
     // Once creator-level enrichment has run, absence of any independent trading
-    // hypothesis is a routing stop, not a reason to buy more evidence. Preserve
-    // the auditable channel/nominations internally, withhold it from further
-    // enrichment, and do not call Discord. This is deliberately not a terminal
-    // NON_TRADING label: later independent evidence or an operator recheck may
-    // reopen it.
+    // hypothesis means machine evidence is exhausted without a safe terminal
+    // classification. Do not silently present that state as COMPLETED: route it
+    // to operator review so the channel can be explicitly approved or rejected,
+    // and never run Discord inspection unless a trading decision is approved.
     if (currentStage > 0 && !independentHypothesis) {
-      console.log(`[Unified Ingestion Pipeline - Gate 2] Withholding '${candidate.channelName}' after enrichment: no independent trading hypothesis; no further provider quota will be spent.`);
+      console.log(`[Unified Ingestion Pipeline - Gate 2] Routing '${candidate.channelName}' to human review after enrichment: no independent trading hypothesis and no safe terminal classifier decision.`);
       const withheldChannel: ChannelRecord = existing || {
         channel_id:candidate.channelId, channel_name:candidate.channelName, youtube_url:candidate.youtubeUrl,
         country:resolvedCountry, country_status:countryVal.status, confidence_score:countryVal.score,
-        discord_status:'UNCERTAIN', discord_invite:null, scan_status:'COMPLETED', scan_attempts:0,
+        discord_status:'UNCERTAIN', discord_invite:null, scan_status:'NEEDS_REVIEW', scan_attempts:0,
         discovery_source:source, first_seen:now, last_checked:now, inspection_trail:[countryValidationStep],
         subscriber_count:candidate.subscriberCount,
         channel_thumbnail_url:candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
-        trading_status:'UNCERTAIN', trading_confidence_score:tradingVal.confidenceScore,
+        trading_status:'NEEDS_REVIEW', trading_confidence_score:tradingVal.confidenceScore,
         trading_category:tradingVal.category, trading_relevance_breakdown:tradingVal.breakdown
       };
       withheldChannel.country=resolvedCountry; withheldChannel.country_status=countryVal.status; withheldChannel.confidence_score=countryVal.score;
-      withheldChannel.trading_status='UNCERTAIN'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
+      withheldChannel.trading_status='NEEDS_REVIEW'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
       withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
-      withheldChannel.scan_status='COMPLETED'; withheldChannel.discord_status='UNCERTAIN'; withheldChannel.discord_invite=null; withheldChannel.last_checked=now;
+      withheldChannel.scan_status='NEEDS_REVIEW'; withheldChannel.discord_status='UNCERTAIN'; withheldChannel.discord_invite=null; withheldChannel.last_checked=now;
       applyCandidateObservability(withheldChannel,candidate);
       await upsertChannel(withheldChannel);
-      void recordAdmissionShadow({channelId:candidate.channelId,priorState:'WITHHELD_INVESTIGATING',classificationStatus:'UNCERTAIN',investigationState:'COMPLETED',classificationDiagnosticId,
+      void recordAdmissionShadow({channelId:candidate.channelId,priorState:'WITHHELD_INVESTIGATING',classificationStatus:'NEEDS_REVIEW',investigationState:'REVIEW_ELIGIBLE',classificationDiagnosticId,
         candidateHypothesis:{plausibleTradingHypothesis:false,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION},
         evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent,enrichmentStage:currentStage,reasonCodes:['NO_INDEPENDENT_TRADING_HYPOTHESIS_AFTER_ENRICHMENT']}})
         .catch(error=>console.warn(`[CandidateAdmission] post-enrichment withholding write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false,decidedAt:productionClassification.decision.timestamp})
+      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'NEEDS_REVIEW',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false,decidedAt:productionClassification.decision.timestamp})
         .catch(error=>console.warn(`[ReviewEligibility] withholding shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'UNCERTAIN',discordStatus:'UNCERTAIN',discordInvite:null,channelRecord:withheldChannel};
+      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'NEEDS_REVIEW',discordStatus:'UNCERTAIN',discordInvite:null,channelRecord:withheldChannel};
     }
 
     const legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
