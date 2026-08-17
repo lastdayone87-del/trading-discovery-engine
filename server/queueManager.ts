@@ -619,7 +619,19 @@ export async function inspectAndValidateChannel(
         if(!candidate.nativeInviteCode)continue;
         const locator=candidate.normalizedLocator||`https://discord.gg/${candidate.nativeInviteCode}`;
         const priorInvalidObservations=await countDiscordInvalidObservations(channel.channel_id,candidate.candidateId,locator);
-        const validation=await validateDiscordInvite(candidate.nativeInviteCode,{parentChannelIsTrading:channel.trading_status==='TRADING_CONFIRMED',channelName:channel.channel_name,priorInvalidObservations});
+        const validation=await validateDiscordInvite(candidate.nativeInviteCode,{
+          parentContext:{
+            tradingStatus:channel.trading_status,
+            tradingConfidence:Number(channel.trading_confidence_score||0),
+            tradingCategory:channel.trading_category,
+            creatorName:channel.channel_name,
+            country:channel.country,
+            sourceSurface:candidate.sourceSurface,
+            ownershipStatus:candidate.ownershipStatus,
+            ownershipConfidence:candidate.ownershipConfidence
+          },
+          priorInvalidObservations
+        });
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
         if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push(validation);continue;}
         const rank=discordCandidateCompositeRank(candidate,validation);

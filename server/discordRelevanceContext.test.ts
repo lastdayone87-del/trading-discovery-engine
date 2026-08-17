@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {readFileSync} from 'node:fs';
 import {validateDiscordInvite} from './discordValidator';
 import {applyCreatorAssociationToDiscordValidation,projectDiscordValidation} from './discordProjection';
 import {candidateFromNativeInvite} from './discordCandidates';
@@ -23,6 +24,60 @@ function channel(overrides:Partial<ChannelRecord>={}):ChannelRecord{
 }
 
 const creatorCandidate=()=>candidateFromNativeInvite({nativeInviteCode:'atas',sourceSurface:'YOUTUBE_ABOUT',sourceUrl:'https://youtube.com/@lunar'})!;
+
+test('validator directly promotes generic active Discord from complete strong creator context',async()=>{
+  const result=await validateDiscordInvite('atas',{
+    parentContext:{
+      tradingStatus:'TRADING_CONFIRMED',tradingConfidence:93,tradingCategory:'Order Flow',creatorName:'Lunar - Trading Academy',country:'United States',
+      sourceSurface:'YOUTUBE_ABOUT',ownershipStatus:'CREATOR_OWNED',ownershipConfidence:95
+    },
+    fetchImpl:async()=>liveResponse({code:'atas'}),emitProviderEvent:noopEmit as any
+  });
+  assert.equal(result.livenessStatus,'ACTIVE');
+  assert.equal(result.relevanceStatus,'TRADING_RELEVANT');
+  assert.equal(result.status,'ACTIVE');
+  assert.equal(result.inviteUrl,'https://discord.gg/atas');
+  assert.match(result.relevanceReason||'',/creator-owned source/i);
+});
+
+test('validator does not promote generic active Discord when ownership context is ambiguous',async()=>{
+  const result=await validateDiscordInvite('partner',{
+    parentContext:{
+      tradingStatus:'TRADING_CONFIRMED',tradingConfidence:93,tradingCategory:'Order Flow',creatorName:'Lunar - Trading Academy',country:'United States',
+      sourceSurface:'RECENT_VIDEO_DESCRIPTIONS',ownershipStatus:'UNCERTAIN',ownershipConfidence:65
+    },
+    fetchImpl:async()=>liveResponse({code:'partner'}),emitProviderEvent:noopEmit as any
+  });
+  assert.equal(result.livenessStatus,'ACTIVE');
+  assert.equal(result.relevanceStatus,'UNCERTAIN');
+  assert.equal(result.inviteUrl,null);
+});
+
+test('validator keeps explicit Discord-native non-trading evidence authoritative even with strong creator context',async()=>{
+  const result=await validateDiscordInvite('gaming',{
+    parentContext:{
+      tradingStatus:'TRADING_CONFIRMED',tradingConfidence:93,tradingCategory:'Order Flow',creatorName:'Lunar - Trading Academy',country:'United States',
+      sourceSurface:'YOUTUBE_ABOUT',ownershipStatus:'CREATOR_OWNED',ownershipConfidence:95
+    },
+    fetchImpl:async()=>liveResponse({code:'gaming',guildName:'Minecraft Gaming Community'}),emitProviderEvent:noopEmit as any
+  });
+  assert.equal(result.livenessStatus,'ACTIVE');
+  assert.equal(result.relevanceStatus,'NON_TRADING');
+  assert.equal(result.inviteUrl,null);
+});
+
+test('production queue supplies complete candidate-specific parentContext to validator',()=>{
+  const queue=readFileSync('server/queueManager.ts','utf8');
+  assert.match(queue,/validateDiscordInvite\(candidate\.nativeInviteCode,\{\s*parentContext:\{/);
+  assert.match(queue,/tradingStatus:channel\.trading_status/);
+  assert.match(queue,/tradingConfidence:Number\(channel\.trading_confidence_score\|\|0\)/);
+  assert.match(queue,/tradingCategory:channel\.trading_category/);
+  assert.match(queue,/creatorName:channel\.channel_name/);
+  assert.match(queue,/country:channel\.country/);
+  assert.match(queue,/sourceSurface:candidate\.sourceSurface/);
+  assert.match(queue,/ownershipStatus:candidate\.ownershipStatus/);
+  assert.match(queue,/ownershipConfidence:candidate\.ownershipConfidence/);
+});
 
 test('generic active Discord from strong creator-owned trading source is promoted by association',async()=>{
   const base=await validateDiscordInvite('atas',{parentChannelIsTrading:true,channelName:'Lunar - Trading Academy',fetchImpl:async()=>liveResponse({code:'atas'}),emitProviderEvent:noopEmit as any});
