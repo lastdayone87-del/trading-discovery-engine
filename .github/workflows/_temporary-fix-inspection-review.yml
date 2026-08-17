@@ -1,0 +1,122 @@
+name: Temporary inspection/review fix
+on: push
+jobs:
+  rewrite:
+    if: github.ref == 'refs/heads/fix/inspection-retention-and-review-routing'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/inspection-retention-and-review-routing
+      - name: Apply exact fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p=Path('server/inspector.ts')
+          s=p.read_text()
+          old="""  function addStep(stepName:InspectionStep['step'],title:string,status:InspectionStep['status'],detailsArr:string[],foundInvite:string|null=null,inviteLocation:string|undefined=undefined){steps.push({step:stepName,title,status,details:detailsArr.join('\\n'),detectedInvite:foundInvite||undefined,inviteLocation,timestamp:now});if(debugLog&&status==='NOT_FOUND'&&!debugLog.failureStep)debugLog.failureStep=stepName;}"""
+          new="""  function addStep(stepName:InspectionStep['step'],title:string,status:InspectionStep['status'],detailsArr:string[],foundInvite:string|null=null,inviteLocation:string|undefined=undefined,foundInvites:string[]=[]){steps.push({step:stepName,title,status,details:detailsArr.join('\\n'),detectedInvite:foundInvite||undefined,detectedInvites:foundInvites.length?foundInvites:foundInvite?[foundInvite]:undefined,inviteLocation,timestamp:now});if(debugLog&&status==='NOT_FOUND'&&!debugLog.failureStep)debugLog.failureStep=stepName;}"""
+          assert old in s
+          s=s.replace(old,new)
+          old2="""  const step2Logs:string[]=[];const linkCandidates=links.flatMap(link=>extractDiscordCandidates(link,'CHANNEL_EXTERNAL_LINKS',link)).filter(c=>c.nativeInviteCode);retainCandidates(linkCandidates);if(links.length){step2Logs.push(`Scanning ${links.length} channel links.`);if(linkCandidates.length){step2Logs.push(`${linkCandidates.length} direct Discord candidate(s) retained from channel links.`);for(const candidate of linkCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','FOUND',step2Logs,linkCandidates[0].nativeInviteCode||null,'CHANNEL_LINKS');}else{step2Logs.push('No direct Discord invite found in channel links.');addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','NOT_FOUND',step2Logs);}}else addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','SKIPPED',['No channel links found.']);"""
+          new2="""  const step2Logs:string[]=[];const rawLinkCandidates=links.flatMap(link=>extractDiscordCandidates(link,'CHANNEL_EXTERNAL_LINKS',link)).filter(c=>c.nativeInviteCode);const linkCandidates=mergeDiscordCandidates(rawLinkCandidates,{creatorName});retainCandidates(linkCandidates);if(links.length){step2Logs.push(`Scanning ${links.length} channel links.`);if(linkCandidates.length){const inviteCodes=linkCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step2Logs.push(`${linkCandidates.length} distinct direct Discord candidate(s) retained from channel links.`);step2Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);for(const candidate of linkCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','FOUND',step2Logs,linkCandidates[0].nativeInviteCode||null,'CHANNEL_LINKS',inviteCodes);}else{step2Logs.push('No direct Discord invite found in channel links.');addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','NOT_FOUND',step2Logs);}}else addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','SKIPPED',['No channel links found.']);"""
+          assert old2 in s
+          s=s.replace(old2,new2)
+          p.write_text(s)
+
+          p=Path('src/types/index.ts'); s=p.read_text(); old="""  detectedInvite?: string;
+  inviteLocation?: string;"""; new="""  detectedInvite?: string;
+  detectedInvites?: string[];
+  inviteLocation?: string;"""; assert old in s; p.write_text(s.replace(old,new))
+
+          p=Path('src/components/InspectionModal.tsx'); s=p.read_text();
+          old="""                    {step.detectedInvite && (
+                      <div className=\"mt-2 font-mono text-[11px] bg-emerald-100/70 dark:bg-emerald-950/60 text-emerald-900 dark:text-emerald-200 p-2 rounded border border-emerald-200 dark:border-emerald-800 flex items-center justify-between\">
+                        <div className=\"flex flex-col gap-0.5\">
+                          <span>Invite Code: <strong>{step.detectedInvite}</strong></span>"""
+          new="""                    {(step.detectedInvites?.length || step.detectedInvite) && (
+                      <div className=\"mt-2 font-mono text-[11px] bg-emerald-100/70 dark:bg-emerald-950/60 text-emerald-900 dark:text-emerald-200 p-2 rounded border border-emerald-200 dark:border-emerald-800 flex items-center justify-between\">
+                        <div className=\"flex flex-col gap-0.5\">
+                          {(step.detectedInvites?.length ? step.detectedInvites : [step.detectedInvite!]).map((inviteCode, inviteIndex) => (
+                            <span key={`${inviteCode}-${inviteIndex}`}>Invite Code{(step.detectedInvites?.length || 1) > 1 ? ` ${inviteIndex + 1}` : ''}: <strong>{inviteCode}</strong></span>
+                          ))}"""
+          assert old in s
+          p.write_text(s.replace(old,new))
+
+          p=Path('server/ingestionPipeline.ts'); s=p.read_text()
+          old="""    // Once creator-level enrichment has run, absence of any independent trading
+    // hypothesis is a routing stop, not a reason to buy more evidence. Preserve
+    // the auditable channel/nominations internally, withhold it from further
+    // enrichment, and do not call Discord. This is deliberately not a terminal
+    // NON_TRADING label: later independent evidence or an operator recheck may
+    // reopen it.
+    if (currentStage > 0 && !independentHypothesis) {
+      console.log(`[Unified Ingestion Pipeline - Gate 2] Withholding '${candidate.channelName}' after enrichment: no independent trading hypothesis; no further provider quota will be spent.`);"""
+          new="""    // Once creator-level enrichment has run, absence of any independent trading
+    // hypothesis means machine evidence is exhausted without a safe terminal
+    // classification. Do not silently present that state as COMPLETED: route it
+    // to operator review so the channel can be explicitly approved or rejected,
+    // and never run Discord inspection unless a trading decision is approved.
+    if (currentStage > 0 && !independentHypothesis) {
+      console.log(`[Unified Ingestion Pipeline - Gate 2] Routing '${candidate.channelName}' to human review after enrichment: no independent trading hypothesis and no safe terminal classifier decision.`);"""
+          assert old in s
+          s=s.replace(old,new)
+          s=s.replace("discord_status:'UNCERTAIN', discord_invite:null, scan_status:'COMPLETED', scan_attempts:0,", "discord_status:'UNCERTAIN', discord_invite:null, scan_status:'NEEDS_REVIEW', scan_attempts:0,",1)
+          s=s.replace("trading_status:'UNCERTAIN', trading_confidence_score:tradingVal.confidenceScore,", "trading_status:'NEEDS_REVIEW', trading_confidence_score:tradingVal.confidenceScore,",1)
+          old3="""      withheldChannel.trading_status='UNCERTAIN'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
+      withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
+      withheldChannel.scan_status='COMPLETED'; withheldChannel.discord_status='UNCERTAIN'; withheldChannel.discord_invite=null; withheldChannel.last_checked=now;"""
+          new3="""      withheldChannel.trading_status='NEEDS_REVIEW'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
+      withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
+      withheldChannel.scan_status='NEEDS_REVIEW'; withheldChannel.discord_status='UNCERTAIN'; withheldChannel.discord_invite=null; withheldChannel.last_checked=now;"""
+          assert old3 in s
+          s=s.replace(old3,new3)
+          s=s.replace("priorState:'WITHHELD_INVESTIGATING',classificationStatus:'UNCERTAIN',investigationState:'COMPLETED'", "priorState:'WITHHELD_INVESTIGATING',classificationStatus:'NEEDS_REVIEW',investigationState:'REVIEW_ELIGIBLE'",1)
+          old4="""      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false,decidedAt:productionClassification.decision.timestamp})"""
+          new4="""      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'NEEDS_REVIEW',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false,decidedAt:productionClassification.decision.timestamp})"""
+          assert old4 in s
+          s=s.replace(old4,new4)
+          old5="""      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'UNCERTAIN',discordStatus:'UNCERTAIN',discordInvite:null,channelRecord:withheldChannel};"""
+          new5="""      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'NEEDS_REVIEW',discordStatus:'UNCERTAIN',discordInvite:null,channelRecord:withheldChannel};"""
+          assert old5 in s
+          p.write_text(s.replace(old5,new5))
+      - name: Add focused regressions
+        shell: bash
+        run: |
+          cat > server/inspectionRetentionReviewRouting.test.ts <<'EOF'
+          import assert from 'node:assert/strict';
+          import test from 'node:test';
+          import {readFileSync} from 'node:fs';
+          import {runChannelInspection} from './inspector';
+
+          test('channel-link trail counts distinct Discord invites and exposes all retained codes',async()=>{
+            const result=await runChannelInspection({channelId:'c1',channelName:'Creator',channelBio:'bio',channelLinks:['https://discord.gg/same','https://discord.com/invite/same','https://discord.gg/other'],videoDescriptions:[]});
+            const step=result.steps.find(item=>item.step==='EXTERNAL_LINKS');
+            assert.equal(step?.status,'FOUND');
+            assert.match(step?.details||'',/2 distinct direct Discord candidate\(s\) retained/);
+            assert.deepEqual(step?.detectedInvites?.sort(),['other','same']);
+          });
+
+          test('post-enrichment no-independent-hypothesis path is reviewable, never silently completed',()=>{
+            const source=readFileSync('server/ingestionPipeline.ts','utf8');
+            const start=source.indexOf("if (currentStage > 0 && !independentHypothesis)");
+            const end=source.indexOf('const legacyAction',start);
+            const block=source.slice(start,end);
+            assert.match(block,/trading_status='NEEDS_REVIEW'/);
+            assert.match(block,/scan_status='NEEDS_REVIEW'/);
+            assert.match(block,/tradingStatus:'NEEDS_REVIEW'/);
+            assert.doesNotMatch(block,/tradingStatus:'UNCERTAIN'.*channelRecord:withheldChannel/);
+          });
+          EOF
+      - name: Commit fixes and remove temporary workflow
+        shell: bash
+        run: |
+          rm .github/workflows/_temporary-fix-inspection-review.yml
+          git config user.name 'lastdayone87-del'
+          git config user.email 'lastdayone87@gmail.com'
+          git add server/inspector.ts server/ingestionPipeline.ts server/inspectionRetentionReviewRouting.test.ts src/types/index.ts src/components/InspectionModal.tsx .github/workflows/_temporary-fix-inspection-review.yml
+          git commit -m 'Fix Discord retention trail and exhausted review routing'
+          git push origin HEAD:fix/inspection-retention-and-review-routing
