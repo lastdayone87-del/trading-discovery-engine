@@ -1,0 +1,21 @@
+name: Discord creator provenance final
+on:
+  pull_request:
+    paths:
+      - 'server/discordCandidates.ts'
+      - 'server/discordValidator.ts'
+      - 'server/discordCreatorProvenanceFinal.test.ts'
+      - '.github/workflows/discord-creator-provenance-final.yml'
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - run: node --import tsx --test server/discordCreatorProvenanceFinal.test.ts server/discordCandidates.ownership.test.ts server/discordPublicEvidenceLadder.test.ts server/discordRelevanceContext.test.ts
+      - run: npm run lint
+      - run: npm run build
