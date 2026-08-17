@@ -31,7 +31,7 @@ test('ACTIVE + UNCERTAIN creator Discord is promoted when parent is strongly tra
     relevanceStatus:'UNCERTAIN',
     resolutionStatus:'RESOLVED',
     validationStatus:'SUCCEEDED'
-  });
+  },candidate);
 
   assert.equal(projected.relevanceStatus,'TRADING_RELEVANT');
   assert.equal(projected.status,'ACTIVE_LOW_VOLUME');
