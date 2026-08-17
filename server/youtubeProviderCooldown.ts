@@ -4,7 +4,7 @@ export type YouTubeProviderOperationalStatus = 'Active' | 'Cooling Down' | 'Dail
 export interface YouTubeProviderCooldownOptions {
   initialRateLimitCooldownMs: number;
   maxRateLimitCooldownMs: number;
-  /** Short fixed pause for runtime/egress request-rate pressure. */
+  /** Short fixed pause once runtime pressure is confirmed across independent providers. */
   runtimeRateLimitPauseMs?: number;
   now?: () => number;
 }
@@ -47,25 +47,31 @@ export function nextYouTubeDailyQuotaResetAt(now: number): number {
 /**
  * Process-local provider availability.
  *
- * Daily quota exhaustion is project-specific and removes only that provider
- * until the next YouTube quota day. A generic request-rate limit is different:
- * it is shared by this runtime/egress identity, so rotating through every API
- * project cannot clear it. RATE_LIMITED therefore creates one short, fixed
- * runtime pause instead of poisoning each otherwise-healthy key with an
- * exponential provider-local cooldown.
+ * Daily quota exhaustion is always provider-specific and removes only that
+ * provider until the next YouTube quota day.
  *
- * The request scheduler absorbs the resulting all-provider cooling signal and
- * retries the same logical work after the pause. This restores the historical
- * anti-churn behavior while keeping daily quota isolation per project.
+ * A non-quota 429 is ambiguous on the first provider: it can be provider-local
+ * pressure or shared runtime/egress pressure. The first provider is therefore
+ * quarantined briefly so the scheduler can retry the same logical request on
+ * exactly one different eligible provider. Only a second distinct provider
+ * returning RATE_LIMITED inside the confirmation window promotes the condition
+ * to one shared short runtime pause. This avoids both blind twelve-key sweeps
+ * and the previous mistake of assuming one provider's 429 is automatically
+ * global.
  */
 export class YouTubeProviderCooldown {
-  private readonly providers = new Map<string, { retryAt: number; kind: 'DAILY_QUOTA_EXHAUSTED' }>();
+  private readonly dailyProviders = new Map<string, { retryAt: number }>();
+  private readonly localRateLimitedProviders = new Map<string, { retryAt: number; observedAt: number }>();
   private readonly failureGenerations = new Map<string, number>();
   private runtimeRateLimitRetryAt = 0;
 
   constructor(private readonly options: YouTubeProviderCooldownOptions) {}
 
   private now(): number { return (this.options.now ?? Date.now)(); }
+
+  private localConfirmationWindowMs(): number {
+    return Math.max(1, Math.min(this.options.initialRateLimitCooldownMs, Math.max(1, this.options.maxRateLimitCooldownMs)));
+  }
 
   private activeRuntimeRateLimitRetryAt(): number {
     const now = this.now();
@@ -76,77 +82,115 @@ export class YouTubeProviderCooldown {
     return this.runtimeRateLimitRetryAt;
   }
 
-  private activeProviderState(key: string): { retryAt: number; kind: 'DAILY_QUOTA_EXHAUSTED' } | undefined {
-    const state = this.providers.get(key);
+  private activeDailyState(key: string): { retryAt: number } | undefined {
+    const state = this.dailyProviders.get(key);
     if (!state) return undefined;
     if (this.now() >= state.retryAt) {
-      this.providers.delete(key);
+      this.dailyProviders.delete(key);
       return undefined;
     }
     return state;
   }
 
+  private activeLocalRateLimitState(key: string): { retryAt: number; observedAt: number } | undefined {
+    const state = this.localRateLimitedProviders.get(key);
+    if (!state) return undefined;
+    if (this.now() >= state.retryAt) {
+      this.localRateLimitedProviders.delete(key);
+      return undefined;
+    }
+    return state;
+  }
+
+  private recentDistinctLocalRateLimitProvider(excludeKey: string): string | undefined {
+    const now = this.now();
+    const cutoff = now - this.localConfirmationWindowMs();
+    for (const [providerKey, state] of this.localRateLimitedProviders) {
+      if (providerKey !== excludeKey && state.observedAt >= cutoff) return providerKey;
+    }
+    return undefined;
+  }
+
   eligible(key: string): boolean {
     if (this.activeRuntimeRateLimitRetryAt() > 0) return false;
-    return !this.activeProviderState(key);
+    return !this.activeDailyState(key) && !this.activeLocalRateLimitState(key);
   }
 
   failed(key: string, kind: YouTubeProviderFailureKind): number {
     const now = this.now();
     this.failureGenerations.set(key, this.failureGeneration(key) + 1);
+
     if (kind === 'DAILY_QUOTA_EXHAUSTED') {
       const retryAt = nextYouTubeDailyQuotaResetAt(now);
-      this.providers.set(key, { retryAt, kind });
+      this.dailyProviders.set(key, { retryAt });
+      this.localRateLimitedProviders.delete(key);
       return retryAt;
     }
 
-    // A runtime/egress 429 is not project-local. Pause all outbound YouTube
-    // starts briefly, then retry with the healthy pool intact. This pause is
-    // deliberately fixed rather than exponential so long global backoff cannot
-    // return while still preventing rapid key-by-key churn.
-    const configuredPause = this.options.runtimeRateLimitPauseMs ?? this.options.initialRateLimitCooldownMs;
-    const pauseMs = Math.max(1, Math.min(configuredPause, Math.max(1, this.options.maxRateLimitCooldownMs)));
-    this.runtimeRateLimitRetryAt = Math.max(this.runtimeRateLimitRetryAt, now + pauseMs);
-    return this.runtimeRateLimitRetryAt;
+    const corroboratingProvider = this.recentDistinctLocalRateLimitProvider(key);
+    if (corroboratingProvider) {
+      // Two distinct providers independently returned the same non-quota 429 in
+      // one short confirmation window. That is enough evidence to treat the
+      // pressure as shared without walking the rest of the pool.
+      this.localRateLimitedProviders.clear();
+      const configuredPause = this.options.runtimeRateLimitPauseMs ?? this.options.initialRateLimitCooldownMs;
+      const pauseMs = Math.max(1, Math.min(configuredPause, Math.max(1, this.options.maxRateLimitCooldownMs)));
+      this.runtimeRateLimitRetryAt = Math.max(this.runtimeRateLimitRetryAt, now + pauseMs);
+      return this.runtimeRateLimitRetryAt;
+    }
+
+    // First non-quota 429: quarantine only this provider long enough for the
+    // scheduler's next bounded retry to exercise one different provider.
+    const retryAt = now + this.localConfirmationWindowMs();
+    this.localRateLimitedProviders.set(key, { retryAt, observedAt: now });
+    return retryAt;
   }
 
   /** Monotonic per-provider failure generation for stale-success protection. */
   failureGeneration(key: string): number { return this.failureGenerations.get(key) ?? 0; }
 
   /**
-   * A successful response may clear only project-specific state owned by the
-   * same generation. It must not clear a runtime pause raised by another
-   * concurrent request.
+   * A successful response may clear only provider-local state owned by the same
+   * generation. It must not clear a shared runtime pause raised by another
+   * provider's corroborating failure.
    */
   succeeded(key: string, expectedFailureGeneration?: number): boolean {
     if (expectedFailureGeneration !== undefined && this.failureGeneration(key) !== expectedFailureGeneration) return false;
-    this.providers.delete(key);
+    this.dailyProviders.delete(key);
+    this.localRateLimitedProviders.delete(key);
     return true;
   }
 
   retryAt(key: string): number {
-    return Math.max(this.activeRuntimeRateLimitRetryAt(), this.activeProviderState(key)?.retryAt ?? 0);
+    return Math.max(
+      this.activeRuntimeRateLimitRetryAt(),
+      this.activeDailyState(key)?.retryAt ?? 0,
+      this.activeLocalRateLimitState(key)?.retryAt ?? 0
+    );
   }
 
   status(key: string): { status: YouTubeProviderOperationalStatus; retryAt: number | null } {
-    // Provider-specific daily exhaustion is more authoritative than a shorter
-    // runtime-wide pause. Keep the real daily reset visible in Queue Monitor.
-    const state = this.activeProviderState(key);
-    if (state) return { status: 'Daily Quota Exhausted', retryAt: state.retryAt };
+    const dailyState = this.activeDailyState(key);
+    if (dailyState) return { status: 'Daily Quota Exhausted', retryAt: dailyState.retryAt };
 
     const runtimeRetryAt = this.activeRuntimeRateLimitRetryAt();
     if (runtimeRetryAt > 0) return { status: 'Cooling Down', retryAt: runtimeRetryAt };
+
+    const localRateLimitState = this.activeLocalRateLimitState(key);
+    if (localRateLimitState) return { status: 'Cooling Down', retryAt: localRateLimitState.retryAt };
+
     return { status: 'Active', retryAt: null };
   }
 
   earliestRetryAtIfAllCooling(keys: string[]): number | null {
     if (!keys.length) return null;
-    const runtimeRetryAt = this.activeRuntimeRateLimitRetryAt();
     const now = this.now();
-    const effectiveRetryTimes = keys.map(key => {
-      const providerRetryAt = this.activeProviderState(key)?.retryAt ?? 0;
-      return Math.max(runtimeRetryAt, providerRetryAt);
-    });
+    const runtimeRetryAt = this.activeRuntimeRateLimitRetryAt();
+    const effectiveRetryTimes = keys.map(key => Math.max(
+      runtimeRetryAt,
+      this.activeDailyState(key)?.retryAt ?? 0,
+      this.activeLocalRateLimitState(key)?.retryAt ?? 0
+    ));
 
     if (effectiveRetryTimes.some(retryAt => retryAt <= now)) return null;
     return Math.min(...effectiveRetryTimes);
