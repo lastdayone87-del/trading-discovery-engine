@@ -17,6 +17,7 @@ import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
+import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
 import { calculateQueryFunnel } from './queryPerformance';
 
 const { Pool } = pg;
@@ -1048,6 +1049,11 @@ export async function recordNeighborhoodAnalyticsAfterRun(
       ]
     );
   }
+
+  // Phase 5: Shadow update of neighborhood frontier state
+  await updateNeighborhoodFrontierStatePostRun(neighborhoodKey).catch(error =>
+    console.warn('[Neighborhood Analytics] Failed to update frontier state:', error instanceof Error ? error.message : error)
+  );
   } catch (error) {
     console.warn('[Neighborhood Analytics] Failed to record observation analytics:', error instanceof Error ? error.message : error);
   }
