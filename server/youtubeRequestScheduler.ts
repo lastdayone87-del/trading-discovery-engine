@@ -158,6 +158,9 @@ export class YouTubeRequestScheduler {
   private currentIntervalMs(): number { return Math.max(this.baseIntervalMs(), this.adaptiveIntervalMs); }
   private pressureWindowMs(): number { return Math.max(1_000, this.options.ratePressureWindowMs ?? 60_000); }
   private runtimeRetryLimit(): number { return Math.max(0, Math.floor(this.options.maxRuntimeRateLimitRetries ?? 0)); }
+  private sharedCoolingAbsorbLimitMs(): number {
+    return Math.max(1_000, this.options.runtimeRateLimitFloorMs ?? 1_000, this.options.initialRateLimitBackoffMs);
+  }
 
   private trimRuntimeRateLimits(now: number): void {
     const cutoff = now - this.pressureWindowMs();
@@ -245,6 +248,15 @@ export class YouTubeRequestScheduler {
       } catch (error) {
         const coolingDelayMs = sharedRuntimeCoolingDelayMs(error);
         if (coolingDelayMs !== null) {
+          // Only absorb the short corroborated shared-runtime pause. If every
+          // distinct provider is now under its longer provider-local quarantine,
+          // surface that state immediately to the durable job instead of sleeping
+          // the scheduler for tens of seconds or minutes.
+          if (coolingDelayMs > this.sharedCoolingAbsorbLimitMs()) {
+            request.trace?.(`provider-cooling-surfaced ${coolingDelayMs}ms`);
+            request.reject(error);
+            return;
+          }
           const now = (this.options.now ?? Date.now)();
           const pacingDelayMs = Math.max(0, this.nextStartAt - now);
           const waitMs = Math.max(coolingDelayMs, pacingDelayMs);
@@ -274,8 +286,8 @@ export class YouTubeRequestScheduler {
         // Do not sleep or increase global pacing for a raw provider-local 429.
         // The retried closure re-runs dispatch selection, so a cooled provider
         // is skipped immediately in favor of a distinct eligible provider. If
-        // that second provider corroborates the 429, provider cooldown promotes
-        // the condition to the bounded shared-cooling signal handled above.
+        // a second provider corroborates the 429, the short shared pause is
+        // absorbed above and the acquisition then continues to the next key.
         request.trace?.(`runtime-rate-limit-provider-failover ${runtimeRateLimitRetries}/${maxRetries}`);
       }
     }
@@ -314,7 +326,7 @@ export const youtubeRequestScheduler = new YouTubeRequestScheduler({
   maxRateLimitBackoffMs: nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS, 5 * 60_000),
   runtimeRateLimitFloorMs: nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_FLOOR_MS, 1_000),
   maxAdaptiveIntervalMs: nonNegativeNumber(process.env.YOUTUBE_MAX_ADAPTIVE_REQUEST_INTERVAL_MS, 30_000),
-  maxRuntimeRateLimitRetries: nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_RETRIES, 4),
+  maxRuntimeRateLimitRetries: nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_RETRIES, 30),
   adaptiveRecoverySuccesses: nonNegativeNumber(process.env.YOUTUBE_ADAPTIVE_RECOVERY_SUCCESSES, 4),
   ratePressureWindowMs: nonNegativeNumber(process.env.YOUTUBE_RATE_PRESSURE_WINDOW_MS, 60_000),
   starvationMs: nonNegativeNumber(process.env.YOUTUBE_SCHEDULER_STARVATION_MS, 2_000)

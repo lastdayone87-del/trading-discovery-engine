@@ -81,12 +81,42 @@ test('bounded provider failovers surface retryable runtime pressure without minu
   assert.equal(traces.some(stage => stage.includes('wait 30000ms')), false);
 });
 
+test('long all-provider cooldown is surfaced instead of sleeping the scheduler', async () => {
+  let now = 0;
+  const sleeps: number[] = [];
+  const traces: string[] = [];
+  const scheduler = new YouTubeRequestScheduler({
+    minIntervalMs: 250,
+    initialRateLimitBackoffMs: 5_000,
+    maxRateLimitBackoffMs: 300_000,
+    runtimeRateLimitFloorMs: 1_000,
+    maxRuntimeRateLimitRetries: 30,
+    now: () => now,
+    sleep: async ms => { sleeps.push(ms); now += ms; }
+  });
+  const cooling = Object.assign(new Error('Every provider is cooling down'), {
+    code: 'YOUTUBE_PROVIDERS_COOLING_DOWN',
+    retryable: true,
+    errorClass: 'RATE_LIMIT',
+    retryAfterMs: 120_000
+  });
+
+  await assert.rejects(scheduler.run(async () => { throw cooling; }, stage => traces.push(stage), 'autonomous'), cooling);
+  assert.deepEqual(sleeps, []);
+  assert.ok(traces.includes('provider-cooling-surfaced 120000ms'));
+});
+
 test('runtime 429 is provider-cooled inside youtubeFetch so scheduler re-dispatch can select a healthy key', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
   assert.match(youtubeFetch, /const runtimeRateLimited=isYouTubeRateLimited\(error\)/);
   assert.match(youtubeFetch, /else if\(runtimeRateLimited\)youtubeProviderCooldown\.failed\(dispatchedProviderKey,'RATE_LIMITED'\)/);
   assert.match(youtubeFetch, /selectYouTubeDispatchProviderIndex\(livePool,providerKey,key=>youtubeProviderCooldown\.eligible\(key\)/);
+});
+
+test('production runtime retry budget covers the configured thirty-key pool', () => {
+  const source = fs.readFileSync(new URL('./youtubeRequestScheduler.ts', import.meta.url), 'utf8');
+  assert.match(source, /YOUTUBE_RUNTIME_RATE_LIMIT_RETRIES, 30\)/);
 });
 
 test('production raw 429 path no longer contains adaptive 30-second retry waits', () => {
@@ -99,4 +129,5 @@ test('production raw 429 path no longer contains adaptive 30-second retry waits'
   assert.doesNotMatch(rawRateLimitBranch, /await this\.wait\(/);
   assert.match(rawRateLimitBranch, /runtime-rate-limit-provider-failover/);
   assert.match(selectedRequest, /shared-runtime-cooling-wait/);
+  assert.match(selectedRequest, /provider-cooling-surfaced/);
 });

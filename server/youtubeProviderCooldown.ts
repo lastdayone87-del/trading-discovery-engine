@@ -51,13 +51,12 @@ export function nextYouTubeDailyQuotaResetAt(now: number): number {
  * provider until the next YouTube quota day.
  *
  * A non-quota 429 is ambiguous on the first provider: it can be provider-local
- * pressure or shared runtime/egress pressure. The first provider is therefore
- * quarantined briefly so the scheduler can retry the same logical request on
- * exactly one different eligible provider. Only a second distinct provider
- * returning RATE_LIMITED inside the confirmation window promotes the condition
- * to one shared short runtime pause. This avoids both blind twelve-key sweeps
- * and the previous mistake of assuming one provider's 429 is automatically
- * global.
+ * pressure or shared runtime/egress pressure. The first provider is quarantined
+ * while another eligible provider is exercised. A second distinct provider 429
+ * still promotes one short shared pause, but already-failed providers remain
+ * quarantined after that pause. This lets one logical acquisition continue
+ * forward through distinct healthy candidates instead of bouncing back to the
+ * same first providers after every shared pause.
  */
 export class YouTubeProviderCooldown {
   private readonly dailyProviders = new Map<string, { retryAt: number }>();
@@ -71,6 +70,10 @@ export class YouTubeProviderCooldown {
 
   private localConfirmationWindowMs(): number {
     return Math.max(1, Math.min(this.options.initialRateLimitCooldownMs, Math.max(1, this.options.maxRateLimitCooldownMs)));
+  }
+
+  private providerQuarantineMs(): number {
+    return Math.max(this.localConfirmationWindowMs(), Math.max(1, this.options.maxRateLimitCooldownMs));
   }
 
   private activeRuntimeRateLimitRetryAt(): number {
@@ -128,22 +131,23 @@ export class YouTubeProviderCooldown {
     }
 
     const corroboratingProvider = this.recentDistinctLocalRateLimitProvider(key);
+    const providerRetryAt = now + this.providerQuarantineMs();
+    this.localRateLimitedProviders.set(key, { retryAt: providerRetryAt, observedAt: now });
+
     if (corroboratingProvider) {
       // Two distinct providers independently returned the same non-quota 429 in
-      // one short confirmation window. That is enough evidence to treat the
-      // pressure as shared without walking the rest of the pool.
-      this.localRateLimitedProviders.clear();
+      // one short confirmation window. Pause the runtime briefly, but preserve
+      // both provider quarantines so the next dispatch advances to a new key.
       const configuredPause = this.options.runtimeRateLimitPauseMs ?? this.options.initialRateLimitCooldownMs;
       const pauseMs = Math.max(1, Math.min(configuredPause, Math.max(1, this.options.maxRateLimitCooldownMs)));
       this.runtimeRateLimitRetryAt = Math.max(this.runtimeRateLimitRetryAt, now + pauseMs);
       return this.runtimeRateLimitRetryAt;
     }
 
-    // First non-quota 429: quarantine only this provider long enough for the
-    // scheduler's next bounded retry to exercise one different provider.
-    const retryAt = now + this.localConfirmationWindowMs();
-    this.localRateLimitedProviders.set(key, { retryAt, observedAt: now });
-    return retryAt;
+    // First non-quota 429: quarantine this provider while the acquisition walks
+    // forward through other eligible providers. The longer provider quarantine
+    // prevents a short shared pause from immediately reintroducing the same key.
+    return providerRetryAt;
   }
 
   /** Monotonic per-provider failure generation for stale-success protection. */
