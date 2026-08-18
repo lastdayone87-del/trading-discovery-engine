@@ -1,4 +1,4 @@
-import { getDb, getAppSetting } from './db';
+import { getDb } from './db';
 import { getNeighborhoodFrontierState } from './discoveryFrontierState';
 import type { DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 
@@ -84,7 +84,8 @@ export async function evaluateTrialGate(
     const settingRes = await db.query(
       `SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_trials_enabled'`
     );
-    killSwitch = settingRes.rows[0]?.setting_value ?? 'true';
+    // Missing configuration is not authorization. Canary trials must be explicitly enabled.
+    killSwitch = settingRes.rows[0]?.setting_value ?? 'false';
   } catch (error) {
     return {
       eligible: false,
@@ -196,8 +197,9 @@ export async function initiateCanaryTrial(
   try {
     await client.query('BEGIN');
 
-    // Acquire transaction-scoped advisory lock to serialize daily canary capacity checks across all concurrent workers & proposals
-    await client.query('SELECT pg_advisory_xact_lock(741963285)').catch(() => undefined);
+    // Acquire transaction-scoped advisory lock to serialize daily canary capacity checks across all concurrent workers & proposals.
+    // This is a hard safety boundary: failure to acquire/verify the lock aborts the transaction.
+    await client.query('SELECT pg_advisory_xact_lock(741963285)');
 
     // Fetch proposal details inside transaction with FOR UPDATE
     const propRes = await client.query(
