@@ -78,15 +78,21 @@ export async function evaluateTrialGate(
 ): Promise<TrialGateResult> {
   const db = client || await getDb();
 
-  // 1. Explicit Kill Switch Check
-  let killSwitch = 'true';
+  // 1. Explicit Kill Switch Check (Fail Closed)
+  let killSwitch = 'false';
   try {
-    killSwitch = await getAppSetting('frontier_trials_enabled', 'true');
-  } catch {
-    killSwitch = 'true';
+    const settingRes = await db.query(
+      `SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_trials_enabled'`
+    );
+    killSwitch = settingRes.rows[0]?.setting_value ?? 'true';
+  } catch (error) {
+    return {
+      eligible: false,
+      reason: `Failed to verify operator kill switch setting: ${error instanceof Error ? error.message : String(error)}`
+    };
   }
-  if (killSwitch === 'false') {
-    return { eligible: false, reason: 'Frontier trials are globally disabled by operator kill switch.' };
+  if (killSwitch !== 'true') {
+    return { eligible: false, reason: 'Frontier trials are globally disabled or kill switch check unverified.' };
   }
 
   // 2. Proposal Fetch & Validation
@@ -112,15 +118,18 @@ export async function evaluateTrialGate(
     return { eligible: false, reason: 'Proposal has expired.' };
   }
 
-  // 3. Neighborhood Eligibility Check
+  // 3. Neighborhood Eligibility Check (Fail Closed)
   if (row.target_neighborhood_key) {
     try {
       const stateRecord = await getNeighborhoodFrontierState(row.target_neighborhood_key);
       if (stateRecord && stateRecord.state === 'HARMFUL') {
         return { eligible: false, reason: 'Target neighborhood is classified as HARMFUL.' };
       }
-    } catch {
-      // Non-blocking if DB state store unavailable
+    } catch (error) {
+      return {
+        eligible: false,
+        reason: `Failed to verify target neighborhood frontier state: ${error instanceof Error ? error.message : String(error)}`
+      };
     }
   }
 
@@ -232,7 +241,20 @@ export async function initiateCanaryTrial(
       };
     }
 
-    const quotaReserved = Math.min(100, options.maxQuota ?? 100);
+    const rawQuota = options.maxQuota ?? 100;
+    if (
+      typeof rawQuota !== 'number' ||
+      !Number.isFinite(rawQuota) ||
+      !Number.isInteger(rawQuota) ||
+      rawQuota < 1 ||
+      rawQuota > 100
+    ) {
+      await client.query('ROLLBACK');
+      throw new Error(
+        `Invalid canary quota reservation: ${rawQuota}. Quota reservation must be an integer between 1 and 100.`
+      );
+    }
+    const quotaReserved = rawQuota;
 
     // Evaluate gate inside transaction for concurrency safety
     const gate = await evaluateTrialGate(proposalId, quotaReserved, client);

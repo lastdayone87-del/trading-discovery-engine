@@ -107,7 +107,7 @@ test('Checkpoint 3 Blocker 1 & 2 Fix:evaluateTrialGate & initiateCanaryTrial han
             country: 'US',
             language: null,
             concept: 'options trading',
-            target_neighborhood_key: 'us|none|strategy|options|organic|relevance|none|automated_query',
+            target_neighborhood_key: null,
             target_dimensions: {},
             source_provenance: 'query_library:active',
             supporting_evidence: {},
