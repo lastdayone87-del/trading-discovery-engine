@@ -37,7 +37,7 @@ test('daily exhausted provider remains unavailable until Pacific reset while hea
   assert.equal(cooldown.eligible(exhausted), true);
 });
 
-test('first runtime rate limit quarantines only the failing provider for one independent confirmation attempt', () => {
+test('first runtime rate limit quarantines only the failing provider while later providers remain eligible', () => {
   let now = 1_000_000;
   const cooldown = new YouTubeProviderCooldown({
     initialRateLimitCooldownMs: 5_000,
@@ -47,13 +47,13 @@ test('first runtime rate limit quarantines only the failing provider for one ind
   });
   const retryAt = cooldown.failed('key-a', 'RATE_LIMITED');
 
-  assert.equal(retryAt, 1_005_000);
+  assert.equal(retryAt, 1_300_000);
   assert.equal(cooldown.eligible('key-a'), false);
   assert.equal(cooldown.eligible('key-b'), true);
   assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b']), null);
 });
 
-test('second distinct runtime rate limit confirms shared pressure without sweeping the full pool', () => {
+test('second distinct runtime rate limit pauses briefly then advances to an untried provider', () => {
   let now = 1_000_000;
   const cooldown = new YouTubeProviderCooldown({
     initialRateLimitCooldownMs: 5_000,
@@ -72,9 +72,10 @@ test('second distinct runtime rate limit confirms shared pressure without sweepi
   assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b', 'key-c']), sharedRetryAt);
 
   now = sharedRetryAt;
-  assert.equal(cooldown.eligible('key-a'), true);
-  assert.equal(cooldown.eligible('key-b'), true);
+  assert.equal(cooldown.eligible('key-a'), false);
+  assert.equal(cooldown.eligible('key-b'), false);
   assert.equal(cooldown.eligible('key-c'), true);
+  assert.equal(cooldown.earliestRetryAtIfAllCooling(['key-a', 'key-b', 'key-c']), null);
 });
 
 test('daily exhausted provider retains daily status while another provider is locally rate-limited', () => {
