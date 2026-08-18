@@ -2,7 +2,7 @@
 CREATE TABLE IF NOT EXISTS neighborhood_observations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   neighborhood_key TEXT NOT NULL REFERENCES discovery_neighborhoods(neighborhood_key) ON DELETE CASCADE,
-  query_run_id UUID REFERENCES query_runs(id) ON DELETE CASCADE,
+  query_run_id UUID UNIQUE REFERENCES query_runs(id) ON DELETE CASCADE,
   total_results INTEGER NOT NULL DEFAULT 0,
   duplicate_ratio REAL NOT NULL DEFAULT 0,
   known_creator_ratio REAL NOT NULL DEFAULT 0,
@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_neighborhood_obs_time ON neighborhood_observation
 CREATE TABLE IF NOT EXISTS neighborhood_marginal_values (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   neighborhood_key TEXT NOT NULL REFERENCES discovery_neighborhoods(neighborhood_key) ON DELETE CASCADE,
-  query_run_id UUID REFERENCES query_runs(id) ON DELETE CASCADE,
+  query_run_id UUID UNIQUE REFERENCES query_runs(id) ON DELETE CASCADE,
   expected_marginal_value REAL NOT NULL DEFAULT 0,
   observed_marginal_value REAL NOT NULL DEFAULT 0,
   coverage_gain REAL NOT NULL DEFAULT 0,

@@ -1,14 +1,20 @@
-export interface NeighborhoodValueInputs {
+export interface ObservedValueInputs {
   relevantNewCreators: number;
   qualityNewCreators: number;
-  knownCreators: number;
-  coverageGain?: number;          // 0.0 to 1.0
-  informationGain?: number;       // 0.0 to 1.0
-  frontierExpansionGain?: number; // 0.0 to 1.0
-  uncertaintyReduction?: number;  // 0.0 to 1.0
-  providerQuotaCost?: number;     // e.g. 100 units
-  reviewUnitsCost?: number;       // e.g. 0 or 1
-  redundancyRatio?: number;       // 0.0 to 1.0 (overlap / Jaccard)
+  coverageGain?: number;          // 0.0 to 1.0, defaults to 0 if unobserved
+  informationGain?: number;       // 0.0 to 1.0, defaults to 0 if unobserved
+  frontierExpansionGain?: number; // 0.0 to 1.0, defaults to 0 if unobserved
+  uncertaintyReduction?: number;  // 0.0 to 1.0, defaults to 0 if unobserved
+  providerQuotaCost?: number;     // e.g. 100
+  reviewUnitsCost?: number;       // e.g. 0
+  redundancyRatio?: number;       // 0.0 to 1.0
+}
+
+export interface PriorNeighborhoodContext {
+  priorRelevantNewRatio: number;
+  priorQualityNewRatio: number;
+  priorAverageOverlap: number;
+  priorExecutionsCount: number;
 }
 
 export interface ShadowMarginalValueResult {
@@ -28,17 +34,17 @@ export interface ShadowMarginalValueResult {
 }
 
 /**
- * Calculates shadow observed marginal value for a neighborhood search execution.
- * Raw new-channel count alone is NOT rewarded; value requires relevant, high-quality
- * creators, coverage/information gain, and low redundancy.
+ * Calculates shadow observed marginal value for a completed query run.
+ * Unobserved evidence fields default to 0; no optimistic bonus defaults are awarded.
  */
-export function calculateObservedMarginalValue(inputs: NeighborhoodValueInputs): ShadowMarginalValueResult['components'] & { totalValue: number } {
+export function calculateObservedMarginalValue(inputs: ObservedValueInputs): ShadowMarginalValueResult['components'] & { totalValue: number } {
   const relGain = Math.min(100, (inputs.relevantNewCreators || 0) * 25);
   const qualGain = Math.min(100, (inputs.qualityNewCreators || 0) * 35);
-  const covGain = Math.min(100, (inputs.coverageGain ?? 0.2) * 20);
-  const infoGain = Math.min(100, (inputs.informationGain ?? 0.2) * 15);
-  const frontierGain = Math.min(100, (inputs.frontierExpansionGain ?? 0.1) * 20);
-  const uncReduction = Math.min(100, (inputs.uncertaintyReduction ?? 0.1) * 10);
+  // Zero defaults for unobserved gains — unknown evidence earns zero gain credit
+  const covGain = Math.min(100, (inputs.coverageGain ?? 0.0) * 20);
+  const infoGain = Math.min(100, (inputs.informationGain ?? 0.0) * 15);
+  const frontierGain = Math.min(100, (inputs.frontierExpansionGain ?? 0.0) * 20);
+  const uncReduction = Math.min(100, (inputs.uncertaintyReduction ?? 0.0) * 10);
 
   const quotaPenalty = ((inputs.providerQuotaCost ?? 100) / 100) * 5;
   const reviewPenalty = (inputs.reviewUnitsCost ?? 0) * 8;
@@ -63,26 +69,41 @@ export function calculateObservedMarginalValue(inputs: NeighborhoodValueInputs):
 }
 
 /**
- * Calculates shadow expected marginal value prior to retrieval based on neighborhood history.
+ * Calculates genuinely predictive expected marginal value BEFORE current run execution.
+ * Uses only bounded historical neighborhood context available prior to the run.
  */
 export function calculateExpectedMarginalValue(
-  historicalAverageYield: { relevantNewRatio: number; qualityNewRatio: number; averageOverlap: number },
+  priorContext: PriorNeighborhoodContext,
   estimatedQuota = 100
 ): number {
-  const expectedRel = historicalAverageYield.relevantNewRatio * 2; // expected count per 10 results
-  const expectedQual = historicalAverageYield.qualityNewRatio * 1.5;
+  // If no prior executions exist in neighborhood, use unobserved cold-start baseline
+  if (priorContext.priorExecutionsCount === 0) {
+    return calculateObservedMarginalValue({
+      relevantNewCreators: 0,
+      qualityNewCreators: 0,
+      coverageGain: 0,
+      informationGain: 0,
+      frontierExpansionGain: 0,
+      uncertaintyReduction: 0,
+      providerQuotaCost: estimatedQuota,
+      reviewUnitsCost: 0,
+      redundancyRatio: 0
+    }).totalValue;
+  }
+
+  const expectedRel = priorContext.priorRelevantNewRatio * 2.0; // expected count per batch
+  const expectedQual = priorContext.priorQualityNewRatio * 1.5;
 
   const components = calculateObservedMarginalValue({
     relevantNewCreators: expectedRel,
     qualityNewCreators: expectedQual,
-    knownCreators: 5,
-    coverageGain: 0.25,
-    informationGain: 0.25,
-    frontierExpansionGain: 0.2,
-    uncertaintyReduction: 0.2,
+    coverageGain: priorContext.priorRelevantNewRatio,
+    informationGain: priorContext.priorQualityNewRatio,
+    frontierExpansionGain: Math.max(0, 1.0 - priorContext.priorAverageOverlap),
+    uncertaintyReduction: 0,
     providerQuotaCost: estimatedQuota,
-    reviewUnitsCost: 0.5,
-    redundancyRatio: historicalAverageYield.averageOverlap
+    reviewUnitsCost: 0,
+    redundancyRatio: priorContext.priorAverageOverlap
   });
 
   return components.totalValue;

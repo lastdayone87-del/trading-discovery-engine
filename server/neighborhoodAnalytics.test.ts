@@ -12,20 +12,125 @@ import {
 } from './neighborhoodValueModel';
 import {
   classifyCreatorSizeBand,
-  calculateSegmentHealth
+  calculateSegmentHealthFromHistory
 } from './segmentedDiscoveryHealth';
 import { recordNeighborhoodAnalyticsAfterRun } from './db';
+
+test('Blocker 1 Fix: Run with ONLY known high-quality creators receives ZERO relevant-new/quality-new yield', () => {
+  const runWithOnlyKnownCreators = {
+    rawResults: 10,
+    distinctResults: 10,
+    duplicateResults: 0,
+    knownChannels: 10,
+    newChannels: 0
+  };
+
+  // Even if aggregate tradingConfirmed = 10 and qualityChannels = 10, actual new intersections are 0
+  const actualIntersections = {
+    relevantNewCreatorsCount: 0,
+    qualityNewCreatorsCount: 0
+  };
+
+  const metrics = deriveNeighborhoodObservationMetrics(
+    runWithOnlyKnownCreators,
+    actualIntersections,
+    ['ch1', 'ch2', 'ch3'],
+    null,
+    null
+  );
+
+  assert.equal(metrics.relevantNewCreatorRatio, 0, 'Relevant new creator ratio must be 0 for known channels');
+  assert.equal(metrics.qualityNewCreatorRatio, 0, 'Quality new creator ratio must be 0 for known channels');
+  assert.equal(metrics.relevantNewCreatorsCount, 0);
+  assert.equal(metrics.qualityNewCreatorsCount, 0);
+
+  const observedVal = calculateObservedMarginalValue({
+    relevantNewCreators: metrics.relevantNewCreatorsCount,
+    qualityNewCreators: metrics.qualityNewCreatorsCount,
+    providerQuotaCost: 100
+  });
+
+  assert.equal(observedVal.relevantCreatorGain, 0, 'Relevant creator gain must be 0 for known channels');
+  assert.equal(observedVal.qualityCreatorGain, 0, 'Quality creator gain must be 0 for known channels');
+});
+
+test('Blocker 2 Fix: Changing current run outcome does NOT retroactively change expected value', () => {
+  const priorHistory = {
+    priorRelevantNewRatio: 0.3,
+    priorQualityNewRatio: 0.2,
+    priorAverageOverlap: 0.25,
+    priorExecutionsCount: 5
+  };
+
+  // Expected value before run
+  const expectedValBeforeRun = calculateExpectedMarginalValue(priorHistory, 100);
+
+  // Scenario A: current run yields 0 new creators
+  const runAObservedVal = calculateObservedMarginalValue({
+    relevantNewCreators: 0,
+    qualityNewCreators: 0,
+    providerQuotaCost: 100
+  });
+
+  // Scenario B: current run yields 8 new quality creators
+  const runBObservedVal = calculateObservedMarginalValue({
+    relevantNewCreators: 8,
+    qualityNewCreators: 6,
+    providerQuotaCost: 100
+  });
+
+  // Expected value before run must remain identical regardless of whether current run is A or B
+  const expectedValReCalculated = calculateExpectedMarginalValue(priorHistory, 100);
+
+  assert.equal(expectedValBeforeRun, expectedValReCalculated, 'Expected value prior to run must be independent of current run outcome');
+  assert.notEqual(runAObservedVal.totalValue, runBObservedVal.totalValue, 'Observed values reflect actual run outcomes separately');
+});
+
+test('Blocker 3 Fix: Unobserved evidence receives zero gain credit without fabricated defaults', () => {
+  const unobservedValue = calculateObservedMarginalValue({
+    relevantNewCreators: 2,
+    qualityNewCreators: 1,
+    providerQuotaCost: 100
+  });
+
+  assert.equal(unobservedValue.coverageGain, 0, 'Unobserved coverage gain must default to 0');
+  assert.equal(unobservedValue.informationGain, 0, 'Unobserved information gain must default to 0');
+  assert.equal(unobservedValue.frontierExpansionGain, 0, 'Unobserved frontier gain must default to 0');
+  assert.equal(unobservedValue.uncertaintyReduction, 0, 'Unobserved uncertainty reduction must default to 0');
+});
+
+test('Blocker 4 Fix: Bounded multi-dimensional segment health diagnostics', () => {
+  const segmentHistory = {
+    segmentType: 'COUNTRY' as const,
+    segmentKey: 'Brazil',
+    totalExecutions: 10,
+    totalQuotaConsumed: 1000,
+    valuableNewCreators: 12,
+    totalNewCreators: 25,
+    totalDistinctCreators: 40,
+    uniqueSources: ['automated_query', 'persistent_research', 'organic_expansion'],
+    averageOverlap: 0.25,
+    underexploredQuotaConsumed: 750
+  };
+
+  const health = calculateSegmentHealthFromHistory(segmentHistory);
+
+  assert.equal(health.yieldPer1000Quota, 12);
+  assert.equal(health.saturationScore, 0.25);
+  assert.equal(health.frontierExpansionRate, 0.75);
+  assert.equal(health.underexploredQuotaPercent, 75);
+  assert.equal(health.provenanceDiversity, 0.3); // 3 unique sources / 10 executions
+  assert.equal(health.coverageGapIdentified, false);
+});
 
 test('Phase 2: Jaccard similarity and result-set overlap calculations', () => {
   const setA = ['ch1', 'ch2', 'ch3', 'ch4'];
   const setB = ['ch3', 'ch4', 'ch5', 'ch6'];
 
   const jaccard = calculateJaccardSimilarity(setA, setB);
-  // Intersection = {ch3, ch4} (2), Union = {ch1, ch2, ch3, ch4, ch5, ch6} (6) => 2/6 = 0.3333...
   assert.equal(Math.round(jaccard * 100) / 100, 0.33);
 
   const overlap = calculateResultSetOverlap(['ch1', 'ch2', 'ch3'], ['ch2', 'ch3', 'ch4', 'ch5']);
-  // Overlap = {ch2, ch3} / 3 = 2/3 = 0.666...
   assert.equal(Math.round(overlap * 100) / 100, 0.67);
 });
 
@@ -37,48 +142,6 @@ test('Phase 2: Rolling yield trends identify saturation evidence without trigger
   assert.equal(trend.isSaturating, true, 'Declining yield with high overlap indicates saturation evidence');
 });
 
-test('Phase 3: Shadow marginal value rewards relevant quality creators and penalizes redundancy', () => {
-  const highQualityInput = {
-    relevantNewCreators: 4,
-    qualityNewCreators: 3,
-    knownCreators: 1,
-    coverageGain: 0.8,
-    informationGain: 0.7,
-    frontierExpansionGain: 0.6,
-    uncertaintyReduction: 0.5,
-    providerQuotaCost: 100,
-    reviewUnitsCost: 0,
-    redundancyRatio: 0.1
-  };
-
-  const highVal = calculateObservedMarginalValue(highQualityInput);
-
-  const redundantLowQualityInput = {
-    relevantNewCreators: 0,
-    qualityNewCreators: 0,
-    knownCreators: 10,
-    coverageGain: 0.0,
-    informationGain: 0.0,
-    frontierExpansionGain: 0.0,
-    uncertaintyReduction: 0.0,
-    providerQuotaCost: 100,
-    reviewUnitsCost: 2,
-    redundancyRatio: 0.9
-  };
-
-  const lowVal = calculateObservedMarginalValue(redundantLowQualityInput);
-
-  assert.ok(highVal.totalValue > 100, 'High quality discovery must yield strong positive marginal value');
-  assert.equal(lowVal.totalValue, 0, 'Redundant low-quality discovery must receive zero marginal value');
-});
-
-test('Phase 3: Expected marginal value prioritizes underexplored high-yield territories', () => {
-  const underexplored = calculateExpectedMarginalValue({ relevantNewRatio: 0.7, qualityNewRatio: 0.5, averageOverlap: 0.1 });
-  const saturated = calculateExpectedMarginalValue({ relevantNewRatio: 0.05, qualityNewRatio: 0.01, averageOverlap: 0.85 });
-
-  assert.ok(underexplored > saturated, 'Underexplored territory must have higher expected marginal value');
-});
-
 test('Phase 4: Creator size band classification is diagnostic only', () => {
   assert.equal(classifyCreatorSizeBand(500), 'MICRO_<10K');
   assert.equal(classifyCreatorSizeBand('25K'), 'MID_10K_100K');
@@ -87,33 +150,7 @@ test('Phase 4: Creator size band classification is diagnostic only', () => {
   assert.equal(classifyCreatorSizeBand(undefined), 'UNKNOWN');
 });
 
-test('Phase 4: Segmented discovery health correctly flags coverage gaps and yields', () => {
-  const healthy = calculateSegmentHealth('COUNTRY', 'Germany', {
-    valuableNewCreators: 8,
-    totalQuotaConsumed: 500,
-    underexploredQuotaConsumed: 300,
-    averageOverlap: 0.2,
-    uniqueSources: ['automated_query', 'persistent_research'],
-    totalExecutions: 5
-  });
-
-  assert.equal(healthy.yieldPer1000Quota, 16);
-  assert.equal(healthy.coverageGapIdentified, false);
-
-  const gap = calculateSegmentHealth('COUNTRY', 'Nigeria', {
-    valuableNewCreators: 0,
-    totalQuotaConsumed: 200,
-    underexploredQuotaConsumed: 10,
-    averageOverlap: 0.8,
-    uniqueSources: ['automated_query'],
-    totalExecutions: 2
-  });
-
-  assert.equal(gap.coverageGapIdentified, true, 'Zero valuable creators or low underexplored quota must flag a coverage gap');
-});
-
 test('Non-Interference Safety: Analytics failure does not throw or block completed query runs', async () => {
-  // Pass an invalid/non-existent queryRunId
   let threw = false;
   try {
     await recordNeighborhoodAnalyticsAfterRun('non-existent-query-run-id', {

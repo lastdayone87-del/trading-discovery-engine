@@ -15,6 +15,19 @@ export type CreatorSizeBand =
   | 'MAJOR_500K+'
   | 'UNKNOWN';
 
+export interface BoundedSegmentHistory {
+  segmentType: SegmentType;
+  segmentKey: string;
+  totalExecutions: number;
+  totalQuotaConsumed: number;
+  valuableNewCreators: number;
+  totalNewCreators: number;
+  totalDistinctCreators: number;
+  uniqueSources: string[];
+  averageOverlap: number;
+  underexploredQuotaConsumed: number;
+}
+
 export interface SegmentHealthMetrics {
   segmentType: SegmentType;
   segmentKey: string;
@@ -26,6 +39,7 @@ export interface SegmentHealthMetrics {
   underexploredQuotaPercent: number;
   provenanceDiversity: number;
   coverageGapIdentified: boolean;
+  totalExecutions: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -52,48 +66,34 @@ export function classifyCreatorSizeBand(subscriberCount: number | string | undef
 }
 
 /**
- * Calculates health diagnostics for a specific population segment.
+ * Calculates real health diagnostics from a bounded historical window across any supported segment.
  */
-export function calculateSegmentHealth(
-  segmentType: SegmentType,
-  segmentKey: string,
-  data: {
-    valuableNewCreators: number;
-    totalQuotaConsumed: number;
-    underexploredQuotaConsumed: number;
-    averageOverlap: number;
-    uniqueSources: string[];
-    totalExecutions: number;
-  }
+export function calculateSegmentHealthFromHistory(
+  history: BoundedSegmentHistory
 ): SegmentHealthMetrics {
-  const quota = Math.max(1, data.totalQuotaConsumed);
-  const yieldPer1000 = Math.round((data.valuableNewCreators / quota) * 1000 * 100) / 100;
+  const totalExecutions = Math.max(1, history.totalExecutions);
+  const totalQuota = Math.max(1, history.totalQuotaConsumed);
 
-  // Saturation score 0 to 1
-  const saturationScore = Math.min(1.0, Math.max(0.0, Math.round(data.averageOverlap * 100) / 100));
-
-  // Frontier expansion rate: inverse of saturation
+  const yieldPer1000 = Math.round((history.valuableNewCreators / totalQuota) * 1000 * 100) / 100;
+  const saturationScore = Math.min(1.0, Math.max(0.0, Math.round(history.averageOverlap * 100) / 100));
   const frontierExpansionRate = Math.round((1.0 - saturationScore) * 100) / 100;
+  const underexploredQuotaPercent = Math.min(100.0, Math.round((history.underexploredQuotaConsumed / totalQuota) * 100 * 10) / 10);
+  const provenanceDiversity = Math.min(1.0, Math.round((history.uniqueSources.length / totalExecutions) * 100) / 100);
 
-  // Underexplored quota %
-  const underexploredQuotaPercent = Math.round((data.underexploredQuotaConsumed / quota) * 100 * 10) / 10;
-
-  // Provenance diversity: ratio of unique discovery sources
-  const provenanceDiversity = Math.min(1.0, Math.round((data.uniqueSources.length / Math.max(1, data.totalExecutions)) * 100) / 100);
-
-  // Coverage gap identified if low yield or underexplored quota < 10%
-  const coverageGapIdentified = data.valuableNewCreators === 0 || underexploredQuotaPercent < 10.0;
+  // Coverage gap flagged if zero valuable creators found, low underexplored quota expenditure, or low execution history
+  const coverageGapIdentified = history.valuableNewCreators === 0 || underexploredQuotaPercent < 15.0 || totalExecutions < 3;
 
   return {
-    segmentType,
-    segmentKey,
-    valuableNewCreators: data.valuableNewCreators,
-    quotaConsumed: data.totalQuotaConsumed,
+    segmentType: history.segmentType,
+    segmentKey: history.segmentKey,
+    valuableNewCreators: history.valuableNewCreators,
+    quotaConsumed: history.totalQuotaConsumed,
     yieldPer1000Quota: yieldPer1000,
     saturationScore,
     frontierExpansionRate,
     underexploredQuotaPercent,
     provenanceDiversity,
-    coverageGapIdentified
+    coverageGapIdentified,
+    totalExecutions
   };
 }

@@ -1,5 +1,3 @@
-import type { QueryFunnelMetrics } from './queryPerformance';
-
 export interface NeighborhoodObservationMetrics {
   totalResults: number;
   duplicateRatio: number;
@@ -7,6 +5,8 @@ export interface NeighborhoodObservationMetrics {
   newCreatorRatio: number;
   relevantNewCreatorRatio: number;
   qualityNewCreatorRatio: number;
+  relevantNewCreatorsCount: number;
+  qualityNewCreatorsCount: number;
   jaccardSimilarity: number | null;
   resultSetOverlap: number | null;
   quotaConsumed: number;
@@ -56,10 +56,23 @@ export function calculateResultSetOverlap(currentChannels: Set<string> | string[
 }
 
 /**
- * Derives neighborhood observation metrics from QueryFunnelMetrics and result channel IDs.
+ * Derives neighborhood observation metrics.
+ * Note: relevantNewCreatorsCount and qualityNewCreatorsCount MUST be the actual intersection
+ * of NEW (previously unseen) creators that are trading-confirmed / quality-qualified.
+ * Aggregate counts including known creators must NEVER earn new creator yield credit.
  */
 export function deriveNeighborhoodObservationMetrics(
-  funnel: QueryFunnelMetrics,
+  funnel: {
+    rawResults: number;
+    distinctResults: number;
+    duplicateResults: number;
+    knownChannels: number;
+    newChannels: number;
+  },
+  counts: {
+    relevantNewCreatorsCount: number; // new ∩ tradingConfirmed
+    qualityNewCreatorsCount: number;  // new ∩ qualityQualified
+  },
   currentChannelIds: string[],
   previousChannelIds: string[] | null,
   recentNeighborhoodChannelIds: string[] | null,
@@ -75,13 +88,19 @@ export function deriveNeighborhoodObservationMetrics(
   const jaccard = previousChannelIds ? calculateJaccardSimilarity(currentChannelIds, previousChannelIds) : null;
   const overlap = recentNeighborhoodChannelIds ? calculateResultSetOverlap(currentChannelIds, recentNeighborhoodChannelIds) : null;
 
+  // Enforce boundary constraint: new creator intersections cannot exceed actual total new channels
+  const relevantNewCreatorsCount = Math.max(0, Math.min(funnel.newChannels, counts.relevantNewCreatorsCount));
+  const qualityNewCreatorsCount = Math.max(0, Math.min(funnel.newChannels, counts.qualityNewCreatorsCount));
+
   return {
     totalResults: funnel.distinctResults,
     duplicateRatio: funnel.duplicateResults / raw,
     knownCreatorRatio: funnel.knownChannels / distinct,
     newCreatorRatio: funnel.newChannels / distinct,
-    relevantNewCreatorRatio: Math.min(1.0, funnel.tradingConfirmed / distinct),
-    qualityNewCreatorRatio: Math.min(1.0, funnel.qualityChannels / distinct),
+    relevantNewCreatorRatio: relevantNewCreatorsCount / distinct,
+    qualityNewCreatorRatio: qualityNewCreatorsCount / distinct,
+    relevantNewCreatorsCount,
+    qualityNewCreatorsCount,
     jaccardSimilarity: jaccard !== null ? Math.round(jaccard * 1000) / 1000 : null,
     resultSetOverlap: overlap !== null ? Math.round(overlap * 1000) / 1000 : null,
     quotaConsumed: attribution.quotaConsumed ?? 100,
@@ -102,7 +121,6 @@ export function evaluateNeighborhoodTrend(
     return { recentYieldTrend: recentYields, recentOverlapTrend: recentOverlaps, isSaturating: false };
   }
 
-  // Declining yield pattern (e.g. 60% -> 30% -> 10%) combined with high overlap (>70%)
   const latestYield = recentYields[recentYields.length - 1];
   const earliestYield = recentYields[0];
   const latestOverlap = recentOverlaps.length > 0 ? recentOverlaps[recentOverlaps.length - 1] : 0;
