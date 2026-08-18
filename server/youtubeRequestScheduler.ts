@@ -165,25 +165,11 @@ export class YouTubeRequestScheduler {
   }
 
   private noteRuntimeRateLimit(details: RuntimeRateLimitDetails, actualSpacingMs: number | null, priority: YouTubeRequestPriority, trace?: (stage: string) => void): void {
-    const base = this.baseIntervalMs();
-
-    // Preserve #244's explicit opt-in contract: constructed schedulers that do
-    // not provide a runtime floor keep their historical fixed-spacing behavior.
-    // Diagnostics still record the 429 below, so observability is independent
-    // from whether adaptive pacing is enabled for this scheduler instance.
-    if (this.options.runtimeRateLimitFloorMs !== undefined) {
-      const floor = Math.max(base, this.options.runtimeRateLimitFloorMs);
-      const max = Math.max(floor, this.options.maxAdaptiveIntervalMs ?? 5_000);
-      this.adaptiveIntervalMs = this.adaptiveIntervalMs > 0
-        ? Math.min(max, Math.max(floor, this.adaptiveIntervalMs * 2))
-        : floor;
-      this.successfulCallsUnderPressure = 0;
-
-      const pressureNow = (this.options.now ?? Date.now)();
-      this.nextStartAt = Math.max(this.nextStartAt, pressureNow + this.adaptiveIntervalMs);
-      trace?.(`adaptive-rate-pressure ${this.adaptiveIntervalMs}ms`);
-    }
-
+    // A first raw provider 429 is not proof of shared runtime pressure. Keep the
+    // diagnostic observation, but do not raise global adaptive spacing here.
+    // Provider cooldown/reselection decides whether a distinct provider can
+    // serve the same logical request; only confirmed all-provider cooling uses
+    // the bounded sharedRuntimeCoolingDelayMs path below.
     const now = (this.options.now ?? Date.now)();
     const fingerprint = providerFingerprint(details.providerKey);
     const quotaGroup = details.providerKey
@@ -277,19 +263,20 @@ export class YouTubeRequestScheduler {
 
         this.noteRuntimeRateLimit(details, actualSpacingMs, request.priority, request.trace);
         const maxRetries = this.runtimeRetryLimit();
-        if (this.options.runtimeRateLimitFloorMs === undefined || runtimeRateLimitRetries >= maxRetries) {
+        if (runtimeRateLimitRetries >= maxRetries) {
           if (error && typeof error === 'object') Object.assign(error, { code: 'YOUTUBE_RUNTIME_RATE_PRESSURE', retryable: true });
-          request.trace?.(`runtime-rate-limit-retry-exhausted ${runtimeRateLimitRetries}/${maxRetries}`);
+          request.trace?.(`runtime-rate-limit-failover-exhausted ${runtimeRateLimitRetries}/${maxRetries}`);
           request.reject(error);
           return;
         }
 
         runtimeRateLimitRetries += 1;
-        const now = (this.options.now ?? Date.now)();
-        const waitMs = Math.max(1, this.nextStartAt - now);
-        request.trace?.(`runtime-rate-limit-retry ${runtimeRateLimitRetries}/${maxRetries} wait ${waitMs}ms`);
-        await this.wait(waitMs);
-        this.nextStartAt = (this.options.now ?? Date.now)() + this.currentIntervalMs();
+        // Do not sleep or increase global pacing for a raw provider-local 429.
+        // The retried closure re-runs dispatch selection, so a cooled provider
+        // is skipped immediately in favor of a distinct eligible provider. If
+        // that second provider corroborates the 429, provider cooldown promotes
+        // the condition to the bounded shared-cooling signal handled above.
+        request.trace?.(`runtime-rate-limit-provider-failover ${runtimeRateLimitRetries}/${maxRetries}`);
       }
     }
   }
