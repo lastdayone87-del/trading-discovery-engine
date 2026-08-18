@@ -232,17 +232,82 @@ const NATIVE_FINANCIAL_SEEDS: Record<string, string[]> = {
 
 export async function generateCountryNativeProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const normC = country.toUpperCase().trim();
-  const seeds = NATIVE_FINANCIAL_SEEDS[normC] || ['local exchange trading', 'stock market investing', 'crypto trading'];
 
+  const observedTerms: string[] = [];
+  try {
+    const db = await getDb().catch(() => null);
+    if (db) {
+      const vocabRes = await db.query(
+        `SELECT native_trading_terminology, popular_instruments, local_market_phrases
+         FROM country_vocabularies
+         WHERE UPPER(country) = $1`,
+        [normC]
+      ).catch(() => ({ rows: [] }));
+
+    if (vocabRes.rows.length > 0) {
+      const row = vocabRes.rows[0];
+      const parseList = (val: any): string[] => {
+        if (!val) return [];
+        if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
+        if (typeof val === 'string') {
+          try {
+            const parsed = JSON.parse(val);
+            if (Array.isArray(parsed)) return parsed.map(x => String(x).trim()).filter(Boolean);
+          } catch {
+            return val.split(',').map(x => x.trim()).filter(Boolean);
+          }
+        }
+        return [];
+      };
+
+      observedTerms.push(
+        ...parseList(row.native_trading_terminology),
+        ...parseList(row.popular_instruments),
+        ...parseList(row.local_market_phrases)
+      );
+    }
+    }
+  } catch {
+    // Database unavailable in unit test runtime; proceed to bootstrap vocabulary fallback
+  }
+
+  // 2. If observed repository evidence terms exist, use them with observed_native_evidence provenance
+  if (observedTerms.length > 0) {
+    const uniqueObserved = Array.from(new Set(observedTerms)).slice(0, limit);
+    return uniqueObserved.map(term =>
+      buildFrontierProposal({
+        proposalFamily: 'COUNTRY_NATIVE',
+        country: normC,
+        concept: term,
+        sourceProvenance: `observed_native_evidence:country_vocabularies:${term}`,
+        supportingEvidence: {
+          provenanceType: 'observed_native_evidence',
+          sourceTable: 'country_vocabularies',
+          nativeTerm: term,
+          market: normC
+        },
+        confidence: 0.85,
+        noveltyRationale: `Generated from observed repository native financial evidence for ${normC}.`
+      })
+    );
+  }
+
+  // 3. Fallback to static seed dictionary explicitly identified as bootstrap_vocabulary
+  const seeds = NATIVE_FINANCIAL_SEEDS[normC] || ['local exchange trading', 'stock market investing', 'crypto trading'];
   return seeds.slice(0, limit).map(seed =>
     buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
       country: normC,
       concept: seed,
-      sourceProvenance: `native_vocabulary:${normC}:${seed}`,
-      supportingEvidence: { nativeTerm: seed, market: normC },
-      confidence: 0.75,
-      noveltyRationale: `Generated from observed native market financial terminology for ${normC}.`
+      sourceProvenance: `bootstrap_vocabulary:static_seed:${seed}`,
+      supportingEvidence: {
+        provenanceType: 'bootstrap_vocabulary',
+        isBootstrapSeed: true,
+        nativeTerm: seed,
+        market: normC
+      },
+      confidence: 0.65,
+      noveltyRationale: `Generated from bootstrap seed dictionary for ${normC}.`
     })
   );
 }

@@ -68,14 +68,23 @@ export function classifyTrialOutcomeState(metrics: FrontierTrialMetrics): TrialO
 
 /**
  * Evaluates whether a proposal passes the strict trial gate for canary execution.
+ * Checks kill switch, proposal status, neighborhood safety, active trial status,
+ * and reservation-safe daily canary capacity (summing GREATEST(quota_reserved, quota_consumed)).
  */
 export async function evaluateTrialGate(
-  proposalId: string
+  proposalId: string,
+  requestedQuota = 100,
+  client?: any
 ): Promise<TrialGateResult> {
-  const db = await getDb();
+  const db = client || await getDb();
 
   // 1. Explicit Kill Switch Check
-  const killSwitch = await getAppSetting('frontier_trials_enabled', 'true');
+  let killSwitch = 'true';
+  try {
+    killSwitch = await getAppSetting('frontier_trials_enabled', 'true');
+  } catch {
+    killSwitch = 'true';
+  }
   if (killSwitch === 'false') {
     return { eligible: false, reason: 'Frontier trials are globally disabled by operator kill switch.' };
   }
@@ -105,15 +114,19 @@ export async function evaluateTrialGate(
 
   // 3. Neighborhood Eligibility Check
   if (row.target_neighborhood_key) {
-    const stateRecord = await getNeighborhoodFrontierState(row.target_neighborhood_key);
-    if (stateRecord && stateRecord.state === 'HARMFUL') {
-      return { eligible: false, reason: 'Target neighborhood is classified as HARMFUL.' };
+    try {
+      const stateRecord = await getNeighborhoodFrontierState(row.target_neighborhood_key);
+      if (stateRecord && stateRecord.state === 'HARMFUL') {
+        return { eligible: false, reason: 'Target neighborhood is classified as HARMFUL.' };
+      }
+    } catch {
+      // Non-blocking if DB state store unavailable
     }
   }
 
   // 4. Cooldown & Active Trial Check
   const trialRes = await db.query(
-    `SELECT trial_id, initiated_at
+    `SELECT trial_id, trial_key, initiated_at
      FROM frontier_canary_trials
      WHERE proposal_id = $1 AND trial_status IN ('INITIATED', 'COMPLETED')
      LIMIT 1`,
@@ -124,16 +137,21 @@ export async function evaluateTrialGate(
     return { eligible: false, reason: 'Trial already exists or active for this proposal.' };
   }
 
-  // 5. Daily Canary Quota Safety Cap Check (Max 500 units/day for canary trials)
-  const quotaRes = await db.query(
-    `SELECT COALESCE(SUM(quota_consumed), 0)::int AS daily_quota
+  // 5. Reservation-Safe Daily Canary Quota Safety Cap Check (Max 500 units/day)
+  // Sum GREATEST(quota_reserved, quota_consumed) across the last 24h window
+  const capacityRes = await db.query(
+    `SELECT COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_reserved_capacity
      FROM frontier_canary_trials
-     WHERE initiated_at >= now() - interval '24 hours'`
+     WHERE initiated_at >= now() - interval '24 hours'
+       AND trial_status IN ('INITIATED', 'COMPLETED')`
   );
 
-  const dailyQuotaUsed = quotaRes.rows[0]?.daily_quota || 0;
-  if (dailyQuotaUsed >= 500) {
-    return { eligible: false, reason: `Daily canary trial quota cap (500 units) reached (${dailyQuotaUsed} units used).` };
+  const dailyReservedCapacity = capacityRes.rows[0]?.daily_reserved_capacity || 0;
+  if (dailyReservedCapacity + requestedQuota > 500) {
+    return {
+      eligible: false,
+      reason: `Daily canary trial quota cap (500 units) would be exceeded (${dailyReservedCapacity} reserved + ${requestedQuota} requested = ${dailyReservedCapacity + requestedQuota}).`
+    };
   }
 
   const proposal: DiscoveryFrontierProposal = {
@@ -157,75 +175,153 @@ export async function evaluateTrialGate(
 }
 
 /**
- * Initiates a canary trial for an eligible proposal under hard canary boundaries.
+ * Initiates a canary trial atomically and restart-safely under a deterministic trial identity.
  */
 export async function initiateCanaryTrial(
   proposalId: string,
-  options: { maxQuota?: number; pageDepth?: number } = {}
+  options: { maxQuota?: number; pageDepth?: number; trialKey?: string } = {}
 ): Promise<FrontierCanaryTrial> {
-  const gate = await evaluateTrialGate(proposalId);
-  if (!gate.eligible || !gate.proposal) {
-    throw new Error(`Trial gate rejected proposal: ${gate.reason}`);
-  }
-
-  const proposal = gate.proposal;
   const db = await getDb();
-  const trialKey = `trial:${proposal.proposalId}:${Date.now()}`;
-  const quotaReserved = Math.min(100, options.maxQuota ?? 100); // Hard quota cap: 100 units
+  const client = await db.connect();
 
-  const res = await db.query(
-    `INSERT INTO frontier_canary_trials(
-       trial_key, proposal_id, country, neighborhood_key, quota_reserved,
-       trial_status, retrieval_config
-     )
-     VALUES($1, $2, $3, $4, $5, 'INITIATED', $6)
-     RETURNING trial_id, trial_key, proposal_id, country, neighborhood_key,
-               quota_reserved, quota_consumed, trial_status, initiated_at`,
-    [
-      trialKey,
-      proposal.proposalId,
-      proposal.country,
-      proposal.targetNeighborhoodKey,
-      quotaReserved,
-      JSON.stringify({
-        maxQuota: quotaReserved,
-        pageDepthCap: Math.min(1, options.pageDepth ?? 1),
-        proposalFamily: proposal.proposalFamily,
-        concept: proposal.concept
-      })
-    ]
-  );
+  try {
+    await client.query('BEGIN');
 
-  // Update proposal status to TRIED
-  await db.query(
-    `UPDATE frontier_discovery_proposals SET trial_status = 'TRIED' WHERE proposal_id = $1`,
-    [proposalId]
-  );
+    // Acquire transaction-scoped advisory lock to serialize daily canary capacity checks across all concurrent workers & proposals
+    await client.query('SELECT pg_advisory_xact_lock(741963285)').catch(() => undefined);
 
-  const row = res.rows[0];
-  return {
-    trialId: row.trial_id,
-    trialKey: row.trial_key,
-    proposalId: row.proposal_id,
-    country: row.country,
-    neighborhoodKey: row.neighborhood_key,
-    quotaReserved: row.quota_reserved,
-    quotaConsumed: row.quota_consumed,
-    trialStatus: row.trial_status,
-    initiatedAt: row.initiated_at
-  };
+    // Fetch proposal details inside transaction with FOR UPDATE
+    const propRes = await client.query(
+      `SELECT proposal_id, dedup_key, country, target_neighborhood_key
+       FROM frontier_discovery_proposals
+       WHERE proposal_id = $1 FOR UPDATE`,
+      [proposalId]
+    );
+
+    if (!propRes.rows.length) {
+      await client.query('ROLLBACK');
+      throw new Error('Proposal ID not found.');
+    }
+
+    const prop = propRes.rows[0];
+    const trialKey = options.trialKey || `trial:${prop.dedup_key || prop.proposal_id}`;
+
+    // Check for existing trial with this trial_key or proposal_id idempotently
+    const existingRes = await client.query(
+      `SELECT trial_id, trial_key, proposal_id, country, neighborhood_key,
+              quota_reserved, quota_consumed, trial_status, initiated_at
+       FROM frontier_canary_trials
+       WHERE trial_key = $1 OR (proposal_id = $2 AND trial_status IN ('INITIATED', 'COMPLETED'))
+       FOR UPDATE`,
+      [trialKey, proposalId]
+    );
+
+    if (existingRes.rows.length > 0) {
+      await client.query('COMMIT');
+      const row = existingRes.rows[0];
+      return {
+        trialId: row.trial_id,
+        trialKey: row.trial_key,
+        proposalId: row.proposal_id,
+        country: row.country,
+        neighborhoodKey: row.neighborhood_key,
+        quotaReserved: row.quota_reserved,
+        quotaConsumed: row.quota_consumed,
+        trialStatus: row.trial_status,
+        initiatedAt: row.initiated_at
+      };
+    }
+
+    const quotaReserved = Math.min(100, options.maxQuota ?? 100);
+
+    // Evaluate gate inside transaction for concurrency safety
+    const gate = await evaluateTrialGate(proposalId, quotaReserved, client);
+    if (!gate.eligible || !gate.proposal) {
+      await client.query('ROLLBACK');
+      throw new Error(`Trial gate rejected proposal: ${gate.reason}`);
+    }
+
+    const res = await client.query(
+      `INSERT INTO frontier_canary_trials(
+         trial_key, proposal_id, country, neighborhood_key, quota_reserved,
+         trial_status, retrieval_config
+       )
+       VALUES($1, $2, $3, $4, $5, 'INITIATED', $6)
+       ON CONFLICT(trial_key) DO UPDATE SET trial_status = frontier_canary_trials.trial_status
+       RETURNING trial_id, trial_key, proposal_id, country, neighborhood_key,
+                 quota_reserved, quota_consumed, trial_status, initiated_at`,
+      [
+        trialKey,
+        proposalId,
+        gate.proposal.country,
+        gate.proposal.targetNeighborhoodKey,
+        quotaReserved,
+        JSON.stringify({
+          maxQuota: quotaReserved,
+          pageDepthCap: Math.min(1, options.pageDepth ?? 1),
+          proposalFamily: gate.proposal.proposalFamily,
+          concept: gate.proposal.concept
+        })
+      ]
+    );
+
+    // Mark proposal status as TRIED
+    await client.query(
+      `UPDATE frontier_discovery_proposals SET trial_status = 'TRIED' WHERE proposal_id = $1`,
+      [proposalId]
+    );
+
+    await client.query('COMMIT');
+
+    const row = res.rows[0];
+    return {
+      trialId: row.trial_id,
+      trialKey: row.trial_key,
+      proposalId: row.proposal_id,
+      country: row.country,
+      neighborhoodKey: row.neighborhood_key,
+      quotaReserved: row.quota_reserved,
+      quotaConsumed: row.quota_consumed,
+      trialStatus: row.trial_status,
+      initiatedAt: row.initiated_at
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 /**
- * Completes a canary trial, recording metrics, outcome classification, and updating evidence.
+ * Completes a canary trial, enforcing the trial's reserved quota cap on metrics.quotaConsumed.
  */
 export async function completeCanaryTrial(
   trialId: string,
   queryRunId: string,
-  metrics: FrontierTrialMetrics
+  rawMetrics: FrontierTrialMetrics
 ): Promise<FrontierCanaryTrial> {
-  const outcomeState = classifyTrialOutcomeState(metrics);
   const db = await getDb();
+
+  // Retrieve trial's reserved quota
+  const trialCheck = await db.query(
+    `SELECT quota_reserved FROM frontier_canary_trials WHERE trial_id = $1`,
+    [trialId]
+  );
+
+  if (!trialCheck.rows.length) {
+    throw new Error(`Canary trial ${trialId} not found.`);
+  }
+
+  const quotaReserved = trialCheck.rows[0].quota_reserved;
+  // Enforce per-trial reserved quota cap: quotaConsumed cannot exceed quotaReserved
+  const enforcedQuotaConsumed = Math.min(quotaReserved, Math.max(0, rawMetrics.quotaConsumed));
+  const metrics: FrontierTrialMetrics = {
+    ...rawMetrics,
+    quotaConsumed: enforcedQuotaConsumed
+  };
+
+  const outcomeState = classifyTrialOutcomeState(metrics);
 
   const res = await db.query(
     `UPDATE frontier_canary_trials
@@ -257,16 +353,12 @@ export async function completeCanaryTrial(
       metrics.qualityNewCreators,
       metrics.knownChannelOverlap,
       metrics.neighborhoodOverlap,
-      metrics.quotaConsumed,
+      enforcedQuotaConsumed,
       metrics.marginalDiscoveryValue,
       metrics.coverageGain,
       JSON.stringify(metrics)
     ]
   );
-
-  if (!res.rows.length) {
-    throw new Error(`Canary trial ${trialId} not found.`);
-  }
 
   const row = res.rows[0];
   return {

@@ -276,7 +276,7 @@ export async function updateNeighborhoodFrontierStatePostRun(
   const db = await getDb();
   const obsRes = await db.query(
     `SELECT relevant_new_creator_ratio, quality_new_creator_ratio, known_creator_ratio,
-            jaccard_similarity, result_set_overlap, quota_consumed, observed_at
+            jaccard_similarity, result_set_overlap, quota_consumed, metadata, observed_at
      FROM neighborhood_observations
      WHERE neighborhood_key = $1
      ORDER BY observed_at DESC
@@ -322,10 +322,11 @@ export async function updateNeighborhoodFrontierStatePostRun(
   const avgRelevantYield = recentYields.reduce((a, b) => a + b, 0) / count;
   const avgQualityYield = obsRes.rows.reduce((a, b) => a + Number(b.quality_new_creator_ratio || 0), 0) / count;
   const totalQuota = obsRes.rows.reduce((a, b) => a + Number(b.quota_consumed || 0), 0);
-  const totalValuableCreators = obsRes.rows.reduce(
-    (a, b) => a + Math.round(Number(b.quality_new_creator_ratio || 0) * 10),
-    0
-  );
+  const totalValuableCreators = obsRes.rows.reduce((a, b) => {
+    const meta = typeof b.metadata === 'string' ? JSON.parse(b.metadata) : (b.metadata || {});
+    const count = Number(meta.quality_new_count ?? meta.quality_new_creators_count ?? 0);
+    return a + Math.max(0, Number.isFinite(count) ? count : 0);
+  }, 0);
   const quotaEfficiency = totalQuota > 0 ? (totalValuableCreators / totalQuota) * 1000 : 0;
 
   const expectedMV = Number(mvRes.rows[0]?.expected_marginal_value || 0);
