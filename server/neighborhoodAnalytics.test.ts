@@ -123,6 +123,63 @@ test('Blocker 4 Fix: Bounded multi-dimensional segment health diagnostics', () =
   assert.equal(health.coverageGapIdentified, false);
 });
 
+test('Exact valuable_new_creators uses exact quality-new intersection count without ratio approximations', () => {
+  const exactCount = 7; // Exact integer count of new quality creators
+  const history = {
+    segmentType: 'INTENT' as const,
+    segmentKey: 'futures',
+    totalExecutions: 5,
+    totalQuotaConsumed: 500,
+    valuableNewCreators: exactCount,
+    totalNewCreators: 10,
+    totalDistinctCreators: 20,
+    uniqueSources: ['automated_query'],
+    averageOverlap: 0.1,
+    underexploredQuotaConsumed: 450
+  };
+
+  const health = calculateSegmentHealthFromHistory(history);
+  assert.equal(health.valuableNewCreators, exactCount, 'Valuable new creators count must equal exact integer count');
+  assert.equal(health.yieldPer1000Quota, 14, 'Yield per 1000 quota = (7 / 500) * 1000 = 14');
+});
+
+test('CREATOR_SIZE historical health diagnostics remain distinct across different size bands', () => {
+  const microBandHistory = {
+    segmentType: 'CREATOR_SIZE' as const,
+    segmentKey: 'MICRO_<10K',
+    totalExecutions: 8,
+    totalQuotaConsumed: 800,
+    valuableNewCreators: 15,
+    totalNewCreators: 30,
+    totalDistinctCreators: 50,
+    uniqueSources: ['automated_query'],
+    averageOverlap: 0.15,
+    underexploredQuotaConsumed: 680
+  };
+
+  const majorBandHistory = {
+    segmentType: 'CREATOR_SIZE' as const,
+    segmentKey: 'MAJOR_500K+',
+    totalExecutions: 3,
+    totalQuotaConsumed: 300,
+    valuableNewCreators: 1,
+    totalNewCreators: 2,
+    totalDistinctCreators: 10,
+    uniqueSources: ['automated_query'],
+    averageOverlap: 0.85,
+    underexploredQuotaConsumed: 45
+  };
+
+  const microHealth = calculateSegmentHealthFromHistory(microBandHistory);
+  const majorHealth = calculateSegmentHealthFromHistory(majorBandHistory);
+
+  assert.notEqual(microHealth.yieldPer1000Quota, majorHealth.yieldPer1000Quota, 'Yield per 1k quota must differ between bands');
+  assert.notEqual(microHealth.saturationScore, majorHealth.saturationScore, 'Saturation scores must differ between bands');
+  assert.equal(microHealth.valuableNewCreators, 15);
+  assert.equal(majorHealth.valuableNewCreators, 1);
+  assert.equal(majorHealth.coverageGapIdentified, false);
+});
+
 test('Phase 2: Jaccard similarity and result-set overlap calculations', () => {
   const setA = ['ch1', 'ch2', 'ch3', 'ch4'];
   const setB = ['ch3', 'ch4', 'ch5', 'ch6'];

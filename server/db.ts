@@ -763,6 +763,35 @@ export async function recordNeighborhoodAnalyticsAfterRun(
   const relevantNewCreatorsCount = newIntersectionsRes.rows[0]?.relevant_new || 0;
   const qualityNewCreatorsCount = newIntersectionsRes.rows[0]?.quality_new || 0;
 
+  // Calculate per-size-band new creator and quality-new creator breakdown for this run
+  const sightingsDetailRes = await db.query(
+    `SELECT
+       c.subscriber_count,
+       (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= 55) AS is_quality_new,
+       (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED') AS is_relevant_new
+     FROM channel_sightings s
+     JOIN channels c ON c.channel_id = s.channel_id
+     WHERE s.query_run_id = $1`,
+    [queryRunId]
+  );
+
+  const sizeBandBreakdown: Record<string, { quality_new_count: number; relevant_new_count: number; total_count: number }> = {};
+  for (const row of sightingsDetailRes.rows) {
+    const band = classifyCreatorSizeBand(row.subscriber_count);
+    if (!sizeBandBreakdown[band]) {
+      sizeBandBreakdown[band] = { quality_new_count: 0, relevant_new_count: 0, total_count: 0 };
+    }
+    sizeBandBreakdown[band].total_count++;
+    if (row.is_quality_new) sizeBandBreakdown[band].quality_new_count++;
+    if (row.is_relevant_new) sizeBandBreakdown[band].relevant_new_count++;
+  }
+
+  const obsMetadata = {
+    relevant_new_count: relevantNewCreatorsCount,
+    quality_new_count: qualityNewCreatorsCount,
+    size_band_breakdown: sizeBandBreakdown
+  };
+
   // Derive observation metrics using exact new-creator intersections
   const obsMetrics = deriveNeighborhoodObservationMetrics(
     {
@@ -791,9 +820,9 @@ export async function recordNeighborhoodAnalyticsAfterRun(
     `INSERT INTO neighborhood_observations(
        neighborhood_key, query_run_id, total_results, duplicate_ratio, known_creator_ratio,
        new_creator_ratio, relevant_new_creator_ratio, quality_new_creator_ratio,
-       jaccard_similarity, result_set_overlap, quota_consumed, retrieval_depth, search_ordering
+       jaccard_similarity, result_set_overlap, quota_consumed, retrieval_depth, search_ordering, metadata
      )
-     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT(query_run_id) DO UPDATE
      SET total_results = EXCLUDED.total_results,
          duplicate_ratio = EXCLUDED.duplicate_ratio,
@@ -806,6 +835,7 @@ export async function recordNeighborhoodAnalyticsAfterRun(
          quota_consumed = EXCLUDED.quota_consumed,
          retrieval_depth = EXCLUDED.retrieval_depth,
          search_ordering = EXCLUDED.search_ordering,
+         metadata = neighborhood_observations.metadata || EXCLUDED.metadata,
          observed_at = now()`,
     [
       neighborhoodKey,
@@ -820,7 +850,8 @@ export async function recordNeighborhoodAnalyticsAfterRun(
       obsMetrics.resultSetOverlap,
       obsMetrics.quotaConsumed,
       obsMetrics.retrievalDepth,
-      obsMetrics.searchOrdering
+      obsMetrics.searchOrdering,
+      JSON.stringify(obsMetadata)
     ]
   );
 
@@ -918,28 +949,41 @@ export async function recordNeighborhoodAnalyticsAfterRun(
     if (!seg.key) continue;
 
     // Aggregate bounded historical window (past 30 days) for this segment
-    const windowRes = await db.query(
-      `SELECT
-         COUNT(DISTINCT no.query_run_id)::int AS total_executions,
-         COALESCE(SUM(no.quota_consumed), 0)::int AS total_quota,
-         COALESCE(SUM((no.metadata->>'quality_new_count')::int), COALESCE(SUM(no.quality_new_creator_ratio * no.total_results), 0))::int AS valuable_new,
-         COALESCE(AVG(no.result_set_overlap), 0)::float AS avg_overlap,
-         ARRAY_AGG(DISTINCT dn.source_family) AS sources
-       FROM neighborhood_observations no
-       JOIN discovery_neighborhoods dn ON dn.neighborhood_key = no.neighborhood_key
-       WHERE no.observed_at >= now() - interval '30 days'
-         AND (
-           ($1 = 'COUNTRY' AND dn.country = $2) OR
-           ($1 = 'LANGUAGE' AND dn.language = $2) OR
-           ($1 = 'INTENT' AND dn.query_intent = $2) OR
-           ($1 = 'INSTRUMENT' AND dn.instrument_or_theme = $2) OR
-           ($1 = 'SOURCE' AND dn.source_family = $2) OR
-           ($1 = 'ORDERING' AND dn.search_ordering = $2) OR
-           ($1 = 'NEIGHBORHOOD' AND dn.neighborhood_key = $2) OR
-           ($1 = 'CREATOR_SIZE')
-         )`,
-      [seg.type, seg.key]
-    );
+    const windowRes = seg.type === 'CREATOR_SIZE'
+      ? await db.query(
+          `SELECT
+             COUNT(DISTINCT no.query_run_id)::int AS total_executions,
+             COALESCE(SUM(no.quota_consumed), 0)::int AS total_quota,
+             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2->>'quality_new_count')::int), 0)::int AS valuable_new,
+             COALESCE(AVG(no.result_set_overlap), 0)::float AS avg_overlap,
+             ARRAY_AGG(DISTINCT dn.source_family) AS sources
+           FROM neighborhood_observations no
+           JOIN discovery_neighborhoods dn ON dn.neighborhood_key = no.neighborhood_key
+           WHERE no.observed_at >= now() - interval '30 days'
+             AND (no.metadata->'size_band_breakdown'->$2) IS NOT NULL`,
+          [seg.type, seg.key]
+        )
+      : await db.query(
+          `SELECT
+             COUNT(DISTINCT no.query_run_id)::int AS total_executions,
+             COALESCE(SUM(no.quota_consumed), 0)::int AS total_quota,
+             COALESCE(SUM((no.metadata->>'quality_new_count')::int), 0)::int AS valuable_new,
+             COALESCE(AVG(no.result_set_overlap), 0)::float AS avg_overlap,
+             ARRAY_AGG(DISTINCT dn.source_family) AS sources
+           FROM neighborhood_observations no
+           JOIN discovery_neighborhoods dn ON dn.neighborhood_key = no.neighborhood_key
+           WHERE no.observed_at >= now() - interval '30 days'
+             AND (
+               ($1 = 'COUNTRY' AND dn.country = $2) OR
+               ($1 = 'LANGUAGE' AND dn.language = $2) OR
+               ($1 = 'INTENT' AND dn.query_intent = $2) OR
+               ($1 = 'INSTRUMENT' AND dn.instrument_or_theme = $2) OR
+               ($1 = 'SOURCE' AND dn.source_family = $2) OR
+               ($1 = 'ORDERING' AND dn.search_ordering = $2) OR
+               ($1 = 'NEIGHBORHOOD' AND dn.neighborhood_key = $2)
+             )`,
+          [seg.type, seg.key]
+        );
 
     const historyRow = windowRes.rows[0];
     const totalExecutions = Math.max(1, historyRow?.total_executions || 1);
