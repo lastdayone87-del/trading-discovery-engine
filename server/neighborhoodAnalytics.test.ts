@@ -180,6 +180,55 @@ test('CREATOR_SIZE historical health diagnostics remain distinct across differen
   assert.equal(majorHealth.coverageGapIdentified, false);
 });
 
+test('CREATOR_SIZE proportional quota attribution across multiple bands in one run', () => {
+  const actualRunQuota = 100;
+  const sightings = [
+    { subscriber_count: '5K', is_quality_new: true, is_relevant_new: true },   // MICRO
+    { subscriber_count: '2K', is_quality_new: true, is_relevant_new: true },   // MICRO
+    { subscriber_count: '8K', is_quality_new: false, is_relevant_new: true },  // MICRO
+    { subscriber_count: '4K', is_quality_new: false, is_relevant_new: false }, // MICRO
+    { subscriber_count: '1K', is_quality_new: false, is_relevant_new: false }, // MICRO
+    { subscriber_count: '6K', is_quality_new: false, is_relevant_new: false }, // MICRO
+    { subscriber_count: '3K', is_quality_new: false, is_relevant_new: false }, // MICRO
+    { subscriber_count: '7K', is_quality_new: false, is_relevant_new: false }, // MICRO
+    { subscriber_count: '250K', is_quality_new: true, is_relevant_new: true }, // LARGE
+    { subscriber_count: '300K', is_quality_new: false, is_relevant_new: true } // LARGE
+  ];
+
+  const totalRunSightings = sightings.length; // 10
+  const sizeBandBreakdown: Record<string, { quality_new_count: number; relevant_new_count: number; total_count: number; attributed_quota: number }> = {};
+
+  for (const row of sightings) {
+    const band = classifyCreatorSizeBand(row.subscriber_count);
+    if (!sizeBandBreakdown[band]) {
+      sizeBandBreakdown[band] = { quality_new_count: 0, relevant_new_count: 0, total_count: 0, attributed_quota: 0 };
+    }
+    sizeBandBreakdown[band].total_count++;
+    if (row.is_quality_new) sizeBandBreakdown[band].quality_new_count++;
+    if (row.is_relevant_new) sizeBandBreakdown[band].relevant_new_count++;
+  }
+
+  for (const band of Object.keys(sizeBandBreakdown)) {
+    const share = sizeBandBreakdown[band].total_count / totalRunSightings;
+    sizeBandBreakdown[band].attributed_quota = Math.round(share * actualRunQuota);
+  }
+
+  // Verify MICRO band
+  assert.equal(sizeBandBreakdown['MICRO_<10K'].total_count, 8);
+  assert.equal(sizeBandBreakdown['MICRO_<10K'].quality_new_count, 2);
+  assert.equal(sizeBandBreakdown['MICRO_<10K'].attributed_quota, 80);
+
+  // Verify LARGE band
+  assert.equal(sizeBandBreakdown['LARGE_100K_500K'].total_count, 2);
+  assert.equal(sizeBandBreakdown['LARGE_100K_500K'].quality_new_count, 1);
+  assert.equal(sizeBandBreakdown['LARGE_100K_500K'].attributed_quota, 20);
+
+  // Sum of attributed quota across all bands = 80 + 20 = 100 <= actualRunQuota (100)
+  const totalAttributedQuota = Object.values(sizeBandBreakdown).reduce((sum, b) => sum + b.attributed_quota, 0);
+  assert.equal(totalAttributedQuota, actualRunQuota, 'Sum of attributed quota across all bands must equal actual run quota');
+  assert.ok(totalAttributedQuota <= actualRunQuota, 'Total attributed quota must not exceed actual run quota');
+});
+
 test('Phase 2: Jaccard similarity and result-set overlap calculations', () => {
   const setA = ['ch1', 'ch2', 'ch3', 'ch4'];
   const setB = ['ch3', 'ch4', 'ch5', 'ch6'];

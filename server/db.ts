@@ -775,15 +775,22 @@ export async function recordNeighborhoodAnalyticsAfterRun(
     [queryRunId]
   );
 
-  const sizeBandBreakdown: Record<string, { quality_new_count: number; relevant_new_count: number; total_count: number }> = {};
+  const totalRunSightings = sightingsDetailRes.rows.length;
+  const sizeBandBreakdown: Record<string, { quality_new_count: number; relevant_new_count: number; total_count: number; attributed_quota: number }> = {};
   for (const row of sightingsDetailRes.rows) {
     const band = classifyCreatorSizeBand(row.subscriber_count);
     if (!sizeBandBreakdown[band]) {
-      sizeBandBreakdown[band] = { quality_new_count: 0, relevant_new_count: 0, total_count: 0 };
+      sizeBandBreakdown[band] = { quality_new_count: 0, relevant_new_count: 0, total_count: 0, attributed_quota: 0 };
     }
     sizeBandBreakdown[band].total_count++;
     if (row.is_quality_new) sizeBandBreakdown[band].quality_new_count++;
     if (row.is_relevant_new) sizeBandBreakdown[band].relevant_new_count++;
+  }
+
+  // Attribute proportional share of actual run quota to each size band without duplicating cost
+  for (const band of Object.keys(sizeBandBreakdown)) {
+    const share = totalRunSightings > 0 ? sizeBandBreakdown[band].total_count / totalRunSightings : 1.0;
+    sizeBandBreakdown[band].attributed_quota = Math.round(share * metrics.quotaUsed);
   }
 
   const obsMetadata = {
@@ -953,7 +960,7 @@ export async function recordNeighborhoodAnalyticsAfterRun(
       ? await db.query(
           `SELECT
              COUNT(DISTINCT no.query_run_id)::int AS total_executions,
-             COALESCE(SUM(no.quota_consumed), 0)::int AS total_quota,
+             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2->>'attributed_quota')::int), 0)::int AS total_quota,
              COALESCE(SUM((no.metadata->'size_band_breakdown'->$2->>'quality_new_count')::int), 0)::int AS valuable_new,
              COALESCE(AVG(no.result_set_overlap), 0)::float AS avg_overlap,
              ARRAY_AGG(DISTINCT dn.source_family) AS sources
@@ -986,9 +993,15 @@ export async function recordNeighborhoodAnalyticsAfterRun(
         );
 
     const historyRow = windowRes.rows[0];
-    const totalExecutions = Math.max(1, historyRow?.total_executions || 1);
-    const totalQuota = Math.max(metrics.quotaUsed, historyRow?.total_quota || metrics.quotaUsed);
-    const valuableNew = historyRow?.valuable_new || qualityNewCreatorsCount;
+    const totalExecutions = Math.max(1, historyRow?.total_executions ?? 1);
+    const fallbackQuota = seg.type === 'CREATOR_SIZE' && sizeBandBreakdown[seg.key]
+      ? sizeBandBreakdown[seg.key].attributed_quota
+      : metrics.quotaUsed;
+    const totalQuota = Math.max(1, historyRow?.total_quota ?? fallbackQuota);
+    const fallbackValuableNew = seg.type === 'CREATOR_SIZE' && sizeBandBreakdown[seg.key]
+      ? sizeBandBreakdown[seg.key].quality_new_count
+      : qualityNewCreatorsCount;
+    const valuableNew = historyRow?.valuable_new ?? fallbackValuableNew;
     const sources = Array.isArray(historyRow?.sources) ? historyRow.sources.filter(Boolean) : [neighborhoodInfo.source_family || 'automated_query'];
 
     const health = calculateSegmentHealthFromHistory({
