@@ -23,10 +23,11 @@ CREATE TABLE IF NOT EXISTS retrieval_action_neighborhoods (
   query_run_id UUID NOT NULL REFERENCES query_runs(id) ON DELETE CASCADE,
   query_id INTEGER REFERENCES query_library(id) ON DELETE SET NULL,
   neighborhood_key TEXT NOT NULL REFERENCES discovery_neighborhoods(neighborhood_key) ON DELETE CASCADE,
-  retrieval_action_key TEXT NOT NULL,
+  retrieval_action_key TEXT UNIQUE NOT NULL,
   observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_action_neighborhoods_run ON retrieval_action_neighborhoods(query_run_id);
 CREATE INDEX IF NOT EXISTS idx_retrieval_action_neighborhoods_key ON retrieval_action_neighborhoods(neighborhood_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_retrieval_action_neighborhoods_action_key ON retrieval_action_neighborhoods(retrieval_action_key);

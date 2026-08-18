@@ -591,22 +591,31 @@ export async function scheduleAutonomousQueryRuns(
       const jobId = job.rows[0].id;
       await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
 
-      // Observation-only record of discovery neighborhood identity and lineage
-      const vocabRes = await client.query('SELECT languages FROM country_vocabularies WHERE country=$1', [candidate.query.country]);
-      const languageList = vocabRes.rows[0]?.languages ? (typeof vocabRes.rows[0].languages === 'string' ? JSON.parse(vocabRes.rows[0].languages) : vocabRes.rows[0].languages) : [];
-      const primaryLanguage = Array.isArray(languageList) && languageList.length > 0 ? String(languageList[0]) : null;
-
-      await recordNeighborhoodObservation(
-        client,
-        { runId, queryId: candidate.query.id, country: candidate.query.country, retrievalLane, searchOrdering, source: 'automated_query' },
-        candidate.query,
-        primaryLanguage
-      ).catch(error => console.warn('[Discovery Neighborhood] Observation persistence error:', error));
-
       await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     await client.query('COMMIT');
+
+    // Observation persistence runs AFTER scheduling transaction commit.
+    // Failures here cannot abort or roll back scheduled query runs or jobs.
+    for (const item of scheduled) {
+      try {
+        const candidate = candidates.find(c => c.query.id === item.query.id);
+        if (candidate) {
+          const genMeta = candidate.query.generation_metadata || {};
+          const observedLanguage = (genMeta.language || genMeta.locale || null) as string | null;
+          await recordNeighborhoodObservation(
+            null,
+            { runId: item.runId, queryId: item.query.id, country: item.query.country, retrievalLane: item.retrievalLane, searchOrdering: item.searchOrdering, source: 'automated_query' },
+            candidate.query,
+            observedLanguage
+          );
+        }
+      } catch (error) {
+        console.warn('[Discovery Neighborhood] Post-commit observation persistence error:', error);
+      }
+    }
+
     return scheduled;
   } catch (error) {
     await client.query('ROLLBACK');
@@ -622,9 +631,10 @@ export async function recordNeighborhoodObservation(
   queryRecord: Partial<QueryRecord> & { query: string; intent?: string; primary_term?: string; country: string },
   language?: string | null
 ): Promise<{ neighborhoodKey: string; retrievalActionKey: string }> {
+  const db = client || await getDb();
   const { neighborhood, lineage } = mapQueryRunToNeighborhood(queryRun, queryRecord, { language });
 
-  await client.query(
+  await db.query(
     `INSERT INTO discovery_neighborhoods(
        neighborhood_key, neighborhood_checksum, country, language, query_intent,
        primary_term_family, retrieval_lane, search_ordering, instrument_or_theme,
@@ -649,11 +659,14 @@ export async function recordNeighborhoodObservation(
     ]
   );
 
-  await client.query(
+  await db.query(
     `INSERT INTO retrieval_action_neighborhoods(
        query_run_id, query_id, neighborhood_key, retrieval_action_key, observed_at, metadata
      )
-     VALUES($1, $2, $3, $4, $5, $6)`,
+     VALUES($1, $2, $3, $4, $5, $6)
+     ON CONFLICT(retrieval_action_key) DO UPDATE
+     SET observed_at = EXCLUDED.observed_at,
+         metadata = retrieval_action_neighborhoods.metadata || EXCLUDED.metadata`,
     [
       lineage.queryRunId,
       lineage.queryId,
