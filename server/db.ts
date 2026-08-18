@@ -13,6 +13,7 @@ import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
+import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -589,10 +590,32 @@ export async function scheduleAutonomousQueryRuns(
       );
       const jobId = job.rows[0].id;
       await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
+
       await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     await client.query('COMMIT');
+
+    // Observation persistence runs AFTER scheduling transaction commit.
+    // Failures here cannot abort or roll back scheduled query runs or jobs.
+    for (const item of scheduled) {
+      try {
+        const candidate = candidates.find(c => c.query.id === item.query.id);
+        if (candidate) {
+          const genMeta = candidate.query.generation_metadata || {};
+          const observedLanguage = (genMeta.language || genMeta.locale || null) as string | null;
+          await recordNeighborhoodObservation(
+            null,
+            { runId: item.runId, queryId: item.query.id, country: item.query.country, retrievalLane: item.retrievalLane, searchOrdering: item.searchOrdering, source: 'automated_query' },
+            candidate.query,
+            observedLanguage
+          );
+        }
+      } catch (error) {
+        console.warn('[Discovery Neighborhood] Post-commit observation persistence error:', error);
+      }
+    }
+
     return scheduled;
   } catch (error) {
     await client.query('ROLLBACK');
@@ -600,6 +623,82 @@ export async function scheduleAutonomousQueryRuns(
   } finally {
     client.release();
   }
+}
+
+export async function recordNeighborhoodObservation(
+  client: any,
+  queryRun: { runId: string; queryId?: number; country: string; retrievalLane: string; searchOrdering: string; source?: string },
+  queryRecord: Partial<QueryRecord> & { query: string; intent?: string; primary_term?: string; country: string },
+  language?: string | null
+): Promise<{ neighborhoodKey: string; retrievalActionKey: string }> {
+  const db = client || await getDb();
+  const { neighborhood, lineage } = mapQueryRunToNeighborhood(queryRun, queryRecord, { language });
+
+  await db.query(
+    `INSERT INTO discovery_neighborhoods(
+       neighborhood_key, neighborhood_checksum, country, language, query_intent,
+       primary_term_family, retrieval_lane, search_ordering, instrument_or_theme,
+       source_family, metadata, last_observed_at
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+     ON CONFLICT(neighborhood_key) DO UPDATE
+     SET last_observed_at = now(),
+         metadata = discovery_neighborhoods.metadata || EXCLUDED.metadata`,
+    [
+      neighborhood.neighborhoodKey,
+      neighborhood.neighborhoodChecksum,
+      neighborhood.dimensions.country,
+      neighborhood.dimensions.language,
+      neighborhood.dimensions.queryIntent,
+      neighborhood.dimensions.primaryTermFamily,
+      neighborhood.dimensions.retrievalLane,
+      neighborhood.dimensions.searchOrdering,
+      neighborhood.dimensions.instrumentOrTheme,
+      neighborhood.dimensions.sourceFamily,
+      JSON.stringify(neighborhood.metadata || {})
+    ]
+  );
+
+  await db.query(
+    `INSERT INTO retrieval_action_neighborhoods(
+       query_run_id, query_id, neighborhood_key, retrieval_action_key, observed_at, metadata
+     )
+     VALUES($1, $2, $3, $4, $5, $6)
+     ON CONFLICT(retrieval_action_key) DO UPDATE
+     SET observed_at = EXCLUDED.observed_at,
+         metadata = retrieval_action_neighborhoods.metadata || EXCLUDED.metadata`,
+    [
+      lineage.queryRunId,
+      lineage.queryId,
+      lineage.neighborhoodKey,
+      lineage.retrievalActionKey,
+      lineage.observedAt,
+      JSON.stringify(lineage.metadata || {})
+    ]
+  );
+
+  return { neighborhoodKey: neighborhood.neighborhoodKey, retrievalActionKey: lineage.retrievalActionKey };
+}
+
+export async function getNeighborhoodForQueryRun(queryRunId: string): Promise<any | null> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT ran.query_run_id, ran.retrieval_action_key, ran.observed_at, dn.*
+     FROM retrieval_action_neighborhoods ran
+     JOIN discovery_neighborhoods dn ON ran.neighborhood_key = dn.neighborhood_key
+     WHERE ran.query_run_id = $1`,
+    [queryRunId]
+  );
+  return res.rows[0] || null;
+}
+
+export async function getNeighborhoodByKey(neighborhoodKey: string): Promise<any | null> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT * FROM discovery_neighborhoods WHERE neighborhood_key = $1`,
+    [neighborhoodKey]
+  );
+  return res.rows[0] || null;
 }
 
 export async function getQueryById(queryId: number): Promise<QueryRecord | null> {

@@ -9,12 +9,18 @@ test('RELEVANCE is the control and the fallback', () => {
 });
 
 test('DATE allocation converges within VIDEO runs', () => {
-  let dates = 0;
-  for (let total = 0; total < 20; total++) {
-    if (allocateSearchOrdering('VIDEO', dates, total, 25) === 'DATE') dates++;
+  const orig = process.env.DISCOVERY_RECENCY_FLOOR_PERCENT;
+  try {
+    process.env.DISCOVERY_RECENCY_FLOOR_PERCENT = '0';
+    let dates = 0;
+    for (let total = 0; total < 20; total++) {
+      if (allocateSearchOrdering('VIDEO', dates, total, 25) === 'DATE') dates++;
+    }
+    assert.equal(dates, 5);
+    assert.equal(youtubeOrder('DATE'), 'date');
+  } finally {
+    process.env.DISCOVERY_RECENCY_FLOOR_PERCENT = orig;
   }
-  assert.equal(dates, 5);
-  assert.equal(youtubeOrder('DATE'), 'date');
 });
 
 test('DATE is not assigned to the CHANNEL lane', () => {
