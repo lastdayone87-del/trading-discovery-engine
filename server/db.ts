@@ -14,6 +14,10 @@ import type { ProviderCallEvent } from './providerResilience';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
+import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
+import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
+import { calculateSegmentHealth } from './segmentedDiscoveryHealth';
+import { calculateQueryFunnel } from './queryPerformance';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -692,6 +696,196 @@ export async function getNeighborhoodForQueryRun(queryRunId: string): Promise<an
   return res.rows[0] || null;
 }
 
+export async function recordNeighborhoodAnalyticsAfterRun(
+  queryRunId: string,
+  metrics: {
+    rawResults: number;
+    distinctResults: number;
+    duplicateResults: number;
+    knownChannels: number;
+    newChannels: number;
+    countryRejected: number;
+    nonTrading: number;
+    uncertain: number;
+    needsReview: number;
+    tradingConfirmed: number;
+    qualityChannels: number;
+    quotaUsed: number;
+  }
+): Promise<void> {
+  try {
+    const db = await getDb();
+    const neighborhoodInfo = await getNeighborhoodForQueryRun(queryRunId);
+    if (!neighborhoodInfo) return;
+
+  const neighborhoodKey = neighborhoodInfo.neighborhood_key;
+
+  const channelSightingsRes = await db.query(
+    `SELECT channel_id FROM channel_sightings WHERE query_run_id = $1`,
+    [queryRunId]
+  );
+  const currentChannelIds = channelSightingsRes.rows.map(r => r.channel_id);
+
+  const recentRunsRes = await db.query(
+    `SELECT ran.query_run_id
+     FROM retrieval_action_neighborhoods ran
+     WHERE ran.neighborhood_key = $1 AND ran.query_run_id <> $2
+     ORDER BY ran.observed_at DESC LIMIT 5`,
+    [neighborhoodKey, queryRunId]
+  );
+  const priorRunIds = recentRunsRes.rows.map(r => r.query_run_id);
+
+  let previousChannelIds: string[] = [];
+  let recentNeighborhoodChannelIds: string[] = [];
+
+  if (priorRunIds.length > 0) {
+    const priorSightingsRes = await db.query(
+      `SELECT DISTINCT channel_id, query_run_id FROM channel_sightings WHERE query_run_id = ANY($1)`,
+      [priorRunIds]
+    );
+    recentNeighborhoodChannelIds = [...new Set(priorSightingsRes.rows.map(r => r.channel_id))];
+    previousChannelIds = priorSightingsRes.rows
+      .filter(r => r.query_run_id === priorRunIds[0])
+      .map(r => r.channel_id);
+  }
+
+  const funnel = calculateQueryFunnel(metrics.rawResults, currentChannelIds.map(channelId => ({
+    channelId,
+    wasKnown: false,
+    persisted: true,
+    funnelOutcome: 'TRADING_CONFIRMED',
+    qualityScore: 70,
+    hasCommunity: false
+  })));
+  funnel.rawResults = metrics.rawResults;
+  funnel.distinctResults = metrics.distinctResults;
+  funnel.duplicateResults = metrics.duplicateResults;
+  funnel.knownChannels = metrics.knownChannels;
+  funnel.newChannels = metrics.newChannels;
+  funnel.tradingConfirmed = metrics.tradingConfirmed;
+  funnel.qualityChannels = metrics.qualityChannels;
+
+  const obsMetrics = deriveNeighborhoodObservationMetrics(
+    funnel,
+    currentChannelIds,
+    previousChannelIds.length ? previousChannelIds : null,
+    recentNeighborhoodChannelIds.length ? recentNeighborhoodChannelIds : null,
+    {
+      quotaConsumed: metrics.quotaUsed,
+      retrievalDepth: 1,
+      searchOrdering: neighborhoodInfo.search_ordering || 'RELEVANCE'
+    }
+  );
+
+  await db.query(
+    `INSERT INTO neighborhood_observations(
+       neighborhood_key, query_run_id, total_results, duplicate_ratio, known_creator_ratio,
+       new_creator_ratio, relevant_new_creator_ratio, quality_new_creator_ratio,
+       jaccard_similarity, result_set_overlap, quota_consumed, retrieval_depth, search_ordering
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+    [
+      neighborhoodKey,
+      queryRunId,
+      obsMetrics.totalResults,
+      obsMetrics.duplicateRatio,
+      obsMetrics.knownCreatorRatio,
+      obsMetrics.newCreatorRatio,
+      obsMetrics.relevantNewCreatorRatio,
+      obsMetrics.qualityNewCreatorRatio,
+      obsMetrics.jaccardSimilarity,
+      obsMetrics.resultSetOverlap,
+      obsMetrics.quotaConsumed,
+      obsMetrics.retrievalDepth,
+      obsMetrics.searchOrdering
+    ]
+  );
+
+  const observedVal = calculateObservedMarginalValue({
+    relevantNewCreators: metrics.tradingConfirmed,
+    qualityNewCreators: metrics.qualityChannels,
+    knownCreators: metrics.knownChannels,
+    coverageGain: obsMetrics.newCreatorRatio,
+    informationGain: obsMetrics.qualityNewCreatorRatio,
+    frontierExpansionGain: 1.0 - (obsMetrics.resultSetOverlap || 0),
+    uncertaintyReduction: 0.1,
+    providerQuotaCost: metrics.quotaUsed,
+    reviewUnitsCost: 0,
+    redundancyRatio: obsMetrics.resultSetOverlap || 0
+  });
+
+  const expectedVal = calculateExpectedMarginalValue({
+    relevantNewRatio: obsMetrics.relevantNewCreatorRatio,
+    qualityNewRatio: obsMetrics.qualityNewCreatorRatio,
+    averageOverlap: obsMetrics.resultSetOverlap || 0
+  }, metrics.quotaUsed);
+
+  await db.query(
+    `INSERT INTO neighborhood_marginal_values(
+       neighborhood_key, query_run_id, expected_marginal_value, observed_marginal_value,
+       coverage_gain, information_gain, frontier_expansion_gain, uncertainty_reduction,
+       quota_cost, review_cost, redundancy_penalty
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      neighborhoodKey,
+      queryRunId,
+      expectedVal,
+      observedVal.totalValue,
+      observedVal.coverageGain,
+      observedVal.informationGain,
+      observedVal.frontierExpansionGain,
+      observedVal.uncertaintyReduction,
+      metrics.quotaUsed,
+      0,
+      observedVal.redundancyPenalty
+    ]
+  );
+
+  const health = calculateSegmentHealth('NEIGHBORHOOD', neighborhoodKey, {
+    valuableNewCreators: metrics.qualityChannels,
+    totalQuotaConsumed: metrics.quotaUsed,
+    underexploredQuotaConsumed: metrics.quotaUsed,
+    averageOverlap: obsMetrics.resultSetOverlap || 0,
+    uniqueSources: [neighborhoodInfo.source_family || 'automated_query'],
+    totalExecutions: 1
+  });
+
+  await db.query(
+    `INSERT INTO neighborhood_health_diagnostics(
+       segment_type, segment_key, valuable_new_creators, quota_consumed,
+       yield_per_1000_quota, saturation_score, frontier_expansion_rate,
+       underexplored_quota_percent, provenance_diversity, coverage_gap_identified
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT(segment_type, segment_key) DO UPDATE
+     SET valuable_new_creators = neighborhood_health_diagnostics.valuable_new_creators + EXCLUDED.valuable_new_creators,
+         quota_consumed = neighborhood_health_diagnostics.quota_consumed + EXCLUDED.quota_consumed,
+         yield_per_1000_quota = EXCLUDED.yield_per_1000_quota,
+         saturation_score = EXCLUDED.saturation_score,
+         frontier_expansion_rate = EXCLUDED.frontier_expansion_rate,
+         underexplored_quota_percent = EXCLUDED.underexplored_quota_percent,
+         provenance_diversity = EXCLUDED.provenance_diversity,
+         coverage_gap_identified = EXCLUDED.coverage_gap_identified,
+         calculated_at = now()`,
+    [
+      health.segmentType,
+      health.segmentKey,
+      health.valuableNewCreators,
+      health.quotaConsumed,
+      health.yieldPer1000Quota,
+      health.saturationScore,
+      health.frontierExpansionRate,
+      health.underexploredQuotaPercent,
+      health.provenanceDiversity,
+      health.coverageGapIdentified
+    ]
+  );
+  } catch (error) {
+    console.warn('[Neighborhood Analytics] Failed to record observation analytics:', error instanceof Error ? error.message : error);
+  }
+}
+
 export async function getNeighborhoodByKey(neighborhoodKey: string): Promise<any | null> {
   const db = await getDb();
   const res = await db.query(
@@ -757,6 +951,10 @@ export async function completeQueryRun(runId: string, metrics: {
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
     await client.query('COMMIT');
+
+    // Shadow observation analytics (Phases 2-4) run post-commit without blocking
+    recordNeighborhoodAnalyticsAfterRun(runId, metrics)
+      .catch(error => console.warn('[Neighborhood Analytics] Post-commit analytics error:', error));
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
