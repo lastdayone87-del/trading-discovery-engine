@@ -10,7 +10,7 @@ const runtime429 = () => Object.assign(new Error('Provider rate limit reached.')
   providerReasons: ['rateLimitExceeded']
 });
 
-test('repeated runtime 429s increase outbound spacing without exposing a binary scheduler cooldown', async () => {
+test('repeated provider-local runtime 429s keep normal scheduler spacing', async () => {
   let now = 0;
   const starts: number[] = [];
   const traces: string[] = [];
@@ -38,15 +38,14 @@ test('repeated runtime 429s increase outbound spacing without exposing a binary 
     throw runtime429();
   }, trace => traces.push(trace)));
 
-  assert.deepEqual(starts, [0, 1_000, 3_000]);
-  assert.ok(traces.includes('adaptive-rate-pressure 1000ms'));
-  assert.ok(traces.includes('adaptive-rate-pressure 2000ms'));
-  assert.ok(traces.includes('adaptive-rate-pressure 4000ms'));
+  assert.deepEqual(starts, [0, 100, 200]);
+  assert.equal(traces.some(trace => trace.startsWith('adaptive-rate-pressure ')), false);
+  assert.equal(scheduler.getRatePressureSnapshot().adaptiveIntervalMs, 100);
   assert.equal(scheduler.isRateLimited(), false);
   assert.equal(scheduler.getCooldownUntil(), null);
 });
 
-test('adaptive pacing is bounded and recovers gradually after sustained successes', async () => {
+test('provider-local runtime 429s do not create adaptive pacing that later needs recovery', async () => {
   let now = 0;
   const starts: number[] = [];
   const traces: string[] = [];
@@ -72,10 +71,10 @@ test('adaptive pacing is bounded and recovers gradually after sustained successe
     await scheduler.run(async () => { starts.push(now); }, trace => traces.push(trace));
   }
 
-  assert.deepEqual(starts, [0, 1_000, 3_000, 5_000, 7_000, 9_000, 10_000]);
-  assert.ok(traces.filter(trace => trace === 'adaptive-rate-pressure 2000ms').length >= 2);
-  assert.ok(traces.includes('adaptive-rate-recovery 1000ms'));
-  assert.ok(traces.includes('adaptive-rate-recovery 500ms'));
+  assert.deepEqual(starts, [0, 100, 200, 300, 400, 500, 600]);
+  assert.equal(traces.some(trace => trace.startsWith('adaptive-rate-pressure ')), false);
+  assert.equal(traces.some(trace => trace.startsWith('adaptive-rate-recovery ')), false);
+  assert.equal(scheduler.getRatePressureSnapshot().adaptiveIntervalMs, 100);
 });
 
 test('daily quota exhaustion does not activate adaptive runtime pacing', async () => {
