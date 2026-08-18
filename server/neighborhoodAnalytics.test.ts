@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import {
   calculateJaccardSimilarity,
@@ -16,6 +18,11 @@ import {
 } from './segmentedDiscoveryHealth';
 import { recordNeighborhoodAnalyticsAfterRun } from './db';
 
+const analyticsMigration = fs.readFileSync(
+  path.join(process.cwd(), 'server', 'db', 'migrations', '100_neighborhood_discovery_analytics.sql'),
+  'utf8'
+);
+
 test('Blocker 1 Fix: Run with ONLY known high-quality creators receives ZERO relevant-new/quality-new yield', () => {
   const runWithOnlyKnownCreators = {
     rawResults: 10,
@@ -25,7 +32,6 @@ test('Blocker 1 Fix: Run with ONLY known high-quality creators receives ZERO rel
     newChannels: 0
   };
 
-  // Even if aggregate tradingConfirmed = 10 and qualityChannels = 10, actual new intersections are 0
   const actualIntersections = {
     relevantNewCreatorsCount: 0,
     qualityNewCreatorsCount: 0
@@ -62,28 +68,51 @@ test('Blocker 2 Fix: Changing current run outcome does NOT retroactively change 
     priorExecutionsCount: 5
   };
 
-  // Expected value before run
   const expectedValBeforeRun = calculateExpectedMarginalValue(priorHistory, 100);
 
-  // Scenario A: current run yields 0 new creators
   const runAObservedVal = calculateObservedMarginalValue({
     relevantNewCreators: 0,
     qualityNewCreators: 0,
-    providerQuotaCost: 100
+    providerQuotaCost: 40
   });
 
-  // Scenario B: current run yields 8 new quality creators
   const runBObservedVal = calculateObservedMarginalValue({
     relevantNewCreators: 8,
     qualityNewCreators: 6,
-    providerQuotaCost: 100
+    providerQuotaCost: 280
   });
 
-  // Expected value before run must remain identical regardless of whether current run is A or B
-  const expectedValReCalculated = calculateExpectedMarginalValue(priorHistory, 100);
+  const expectedValReCalculatedFromSamePreRunEvidence = calculateExpectedMarginalValue(priorHistory, 100);
 
-  assert.equal(expectedValBeforeRun, expectedValReCalculated, 'Expected value prior to run must be independent of current run outcome');
+  assert.equal(
+    expectedValBeforeRun,
+    expectedValReCalculatedFromSamePreRunEvidence,
+    'Expected value must remain tied to the pre-run 100-unit reservation, not actual post-run quota/results'
+  );
   assert.notEqual(runAObservedVal.totalValue, runBObservedVal.totalValue, 'Observed values reflect actual run outcomes separately');
+});
+
+test('Pre-run prediction is frozen from bounded history at retrieval-action persistence', () => {
+  assert.match(analyticsMigration, /CREATE TRIGGER trg_freeze_neighborhood_expected_marginal_value/);
+  assert.match(analyticsMigration, /AFTER INSERT ON retrieval_action_neighborhoods/);
+  assert.match(analyticsMigration, /prediction_history_limit CONSTANT INTEGER := 20/);
+  assert.match(analyticsMigration, /ORDER BY no\.observed_at DESC\s+LIMIT prediction_history_limit/);
+  assert.match(analyticsMigration, /no\.observed_at < NEW\.observed_at/);
+  assert.match(analyticsMigration, /COALESCE\(qr\.quota_reserved, 100\)/);
+  assert.match(analyticsMigration, /'quota_basis', 'query_runs\.quota_reserved'/);
+});
+
+test('Completion-time analytics cannot overwrite a frozen expected prediction', () => {
+  assert.match(analyticsMigration, /CREATE TRIGGER trg_preserve_frozen_expected_marginal_value/);
+  assert.match(analyticsMigration, /BEFORE UPDATE ON neighborhood_marginal_values/);
+  assert.match(analyticsMigration, /NEW\.expected_marginal_value := OLD\.expected_marginal_value/);
+});
+
+test('Phase-3 prediction history has a supporting neighborhood/time index', () => {
+  assert.match(
+    analyticsMigration,
+    /CREATE INDEX IF NOT EXISTS idx_neighborhood_obs_key_time\s+ON neighborhood_observations\(neighborhood_key, observed_at DESC\)/
+  );
 });
 
 test('Blocker 3 Fix: Unobserved evidence receives zero gain credit without fabricated defaults', () => {
@@ -119,12 +148,12 @@ test('Blocker 4 Fix: Bounded multi-dimensional segment health diagnostics', () =
   assert.equal(health.saturationScore, 0.25);
   assert.equal(health.frontierExpansionRate, 0.75);
   assert.equal(health.underexploredQuotaPercent, 75);
-  assert.equal(health.provenanceDiversity, 0.3); // 3 unique sources / 10 executions
+  assert.equal(health.provenanceDiversity, 0.3);
   assert.equal(health.coverageGapIdentified, false);
 });
 
 test('Exact valuable_new_creators uses exact quality-new intersection count without ratio approximations', () => {
-  const exactCount = 7; // Exact integer count of new quality creators
+  const exactCount = 7;
   const history = {
     segmentType: 'INTENT' as const,
     segmentKey: 'futures',
@@ -180,53 +209,14 @@ test('CREATOR_SIZE historical health diagnostics remain distinct across differen
   assert.equal(majorHealth.coverageGapIdentified, false);
 });
 
-test('CREATOR_SIZE proportional quota attribution across multiple bands in one run', () => {
-  const actualRunQuota = 100;
-  const sightings = [
-    { subscriber_count: '5K', is_quality_new: true, is_relevant_new: true },   // MICRO
-    { subscriber_count: '2K', is_quality_new: true, is_relevant_new: true },   // MICRO
-    { subscriber_count: '8K', is_quality_new: false, is_relevant_new: true },  // MICRO
-    { subscriber_count: '4K', is_quality_new: false, is_relevant_new: false }, // MICRO
-    { subscriber_count: '1K', is_quality_new: false, is_relevant_new: false }, // MICRO
-    { subscriber_count: '6K', is_quality_new: false, is_relevant_new: false }, // MICRO
-    { subscriber_count: '3K', is_quality_new: false, is_relevant_new: false }, // MICRO
-    { subscriber_count: '7K', is_quality_new: false, is_relevant_new: false }, // MICRO
-    { subscriber_count: '250K', is_quality_new: true, is_relevant_new: true }, // LARGE
-    { subscriber_count: '300K', is_quality_new: false, is_relevant_new: true } // LARGE
-  ];
-
-  const totalRunSightings = sightings.length; // 10
-  const sizeBandBreakdown: Record<string, { quality_new_count: number; relevant_new_count: number; total_count: number; attributed_quota: number }> = {};
-
-  for (const row of sightings) {
-    const band = classifyCreatorSizeBand(row.subscriber_count);
-    if (!sizeBandBreakdown[band]) {
-      sizeBandBreakdown[band] = { quality_new_count: 0, relevant_new_count: 0, total_count: 0, attributed_quota: 0 };
-    }
-    sizeBandBreakdown[band].total_count++;
-    if (row.is_quality_new) sizeBandBreakdown[band].quality_new_count++;
-    if (row.is_relevant_new) sizeBandBreakdown[band].relevant_new_count++;
-  }
-
-  for (const band of Object.keys(sizeBandBreakdown)) {
-    const share = sizeBandBreakdown[band].total_count / totalRunSightings;
-    sizeBandBreakdown[band].attributed_quota = Math.round(share * actualRunQuota);
-  }
-
-  // Verify MICRO band
-  assert.equal(sizeBandBreakdown['MICRO_<10K'].total_count, 8);
-  assert.equal(sizeBandBreakdown['MICRO_<10K'].quality_new_count, 2);
-  assert.equal(sizeBandBreakdown['MICRO_<10K'].attributed_quota, 80);
-
-  // Verify LARGE band
-  assert.equal(sizeBandBreakdown['LARGE_100K_500K'].total_count, 2);
-  assert.equal(sizeBandBreakdown['LARGE_100K_500K'].quality_new_count, 1);
-  assert.equal(sizeBandBreakdown['LARGE_100K_500K'].attributed_quota, 20);
-
-  // Sum of attributed quota across all bands = 80 + 20 = 100 <= actualRunQuota (100)
-  const totalAttributedQuota = Object.values(sizeBandBreakdown).reduce((sum, b) => sum + b.attributed_quota, 0);
-  assert.equal(totalAttributedQuota, actualRunQuota, 'Sum of attributed quota across all bands must equal actual run quota');
-  assert.ok(totalAttributedQuota <= actualRunQuota, 'Total attributed quota must not exceed actual run quota');
+test('CREATOR_SIZE persistence uses conserved largest-remainder quota attribution', () => {
+  // Independent Math.round attribution fails this exact edge case: 2 units / 3 equal bands => 1+1+1=3.
+  // The persistence trigger must instead floor exact shares and distribute only the two real remainder units.
+  assert.match(analyticsMigration, /CREATE TRIGGER trg_conserve_creator_size_quota_attribution/);
+  assert.match(analyticsMigration, /FLOOR\(exact_share\)::integer AS base_quota/);
+  assert.match(analyticsMigration, /ROW_NUMBER\(\) OVER \(ORDER BY b\.fractional_remainder DESC, b\.key ASC\)/);
+  assert.match(analyticsMigration, /target_quota - COALESCE\(SUM\(base_quota\), 0\)/);
+  assert.match(analyticsMigration, /remainder_rank <= units_left/);
 });
 
 test('Phase 2: Jaccard similarity and result-set overlap calculations', () => {
