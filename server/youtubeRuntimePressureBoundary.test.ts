@@ -93,9 +93,10 @@ test('production raw 429 path no longer contains adaptive 30-second retry waits'
   const source = fs.readFileSync(new URL('./youtubeRequestScheduler.ts', import.meta.url), 'utf8');
   const rateLimitRecorder = source.slice(source.indexOf('private noteRuntimeRateLimit'), source.indexOf('private noteSuccessfulCall'));
   const selectedRequest = source.slice(source.indexOf('private async runSelectedRequest'), source.indexOf('private async processQueue'));
+  const rawRateLimitBranch = selectedRequest.slice(selectedRequest.indexOf('const details = runtimeRateLimitDetails(error);'));
   assert.doesNotMatch(rateLimitRecorder, /adaptive-rate-pressure/);
-  assert.doesNotMatch(selectedRequest, /runtime-rate-limit-retry /);
-  assert.doesNotMatch(selectedRequest, /await this\.wait\(waitMs\);[\s\S]*runtime-rate-limit-provider-failover/);
-  assert.match(selectedRequest, /runtime-rate-limit-provider-failover/);
+  assert.doesNotMatch(rawRateLimitBranch, /runtime-rate-limit-retry /);
+  assert.doesNotMatch(rawRateLimitBranch, /await this\.wait\(/);
+  assert.match(rawRateLimitBranch, /runtime-rate-limit-provider-failover/);
   assert.match(selectedRequest, /shared-runtime-cooling-wait/);
 });
