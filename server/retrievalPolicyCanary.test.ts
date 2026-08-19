@@ -2,8 +2,45 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   evaluateRetrievalPolicyEligibility,
-  selectLearnedRetrievalConfiguration
+  deterministicExplorationValue,
+  selectLearnedRetrievalConfiguration,
+  reserveRetrievalCanaryTreatment
 } from './retrievalPolicyCanary';
+
+test('deterministicExplorationValue is reproducible for the same seed and differs across seeds', () => {
+  const seed1 = 'opp1:neigh1:retrieval-policy-v1';
+  const seed2 = 'opp2:neigh1:retrieval-policy-v1';
+
+  const val1 = deterministicExplorationValue(seed1);
+  const val1Again = deterministicExplorationValue(seed1);
+  const val2 = deterministicExplorationValue(seed2);
+
+  assert.equal(val1, val1Again);
+  assert.notEqual(val1, val2);
+  assert.ok(val1 >= 0 && val1 < 1.0);
+});
+
+test('selectLearnedRetrievalConfiguration is 100% deterministic for identical opportunity inputs', async () => {
+  const result1 = await selectLearnedRetrievalConfiguration({
+    opportunityKey: 'opp_deterministic_1',
+    neighborhoodKey: 'neigh_active_1',
+    retrievalLane: 'VIDEO',
+    defaultOrdering: 'RELEVANCE',
+    frontierState: 'ACTIVE'
+  });
+
+  const result2 = await selectLearnedRetrievalConfiguration({
+    opportunityKey: 'opp_deterministic_1',
+    neighborhoodKey: 'neigh_active_1',
+    retrievalLane: 'VIDEO',
+    defaultOrdering: 'RELEVANCE',
+    frontierState: 'ACTIVE'
+  });
+
+  assert.equal(result1.config.configKey, result2.config.configKey);
+  assert.equal(result1.config.searchOrdering, result2.config.searchOrdering);
+  assert.equal(result1.config.requestedPageDepth, result2.config.requestedPageDepth);
+});
 
 test('evaluateRetrievalPolicyEligibility rejects HARMFUL and SATURATED neighborhoods from deep retrieval', () => {
   const harmful = evaluateRetrievalPolicyEligibility({
@@ -29,19 +66,4 @@ test('evaluateRetrievalPolicyEligibility rejects HARMFUL and SATURATED neighborh
   assert.equal(active.eligible, true);
   assert.equal(active.maxPageDepthCeiling, 3);
   assert.deepEqual(active.allowedOrderings, ['RELEVANCE', 'DATE']);
-});
-
-test('selectLearnedRetrievalConfiguration respects eligibility and produces bounded config', async () => {
-  const result = await selectLearnedRetrievalConfiguration({
-    neighborhoodKey: 'neigh_active_1',
-    retrievalLane: 'VIDEO',
-    defaultOrdering: 'RELEVANCE',
-    frontierState: 'ACTIVE'
-  });
-
-  assert.ok(result.config);
-  assert.ok(result.config.configKey);
-  assert.ok(result.config.requestedPageDepth >= 1 && result.config.requestedPageDepth <= 3);
-  assert.ok(['RELEVANCE', 'DATE'].includes(result.config.searchOrdering));
-  assert.equal(result.config.retrievalLane, 'VIDEO');
 });

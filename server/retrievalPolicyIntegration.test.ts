@@ -7,8 +7,10 @@ import {
 } from './retrievalConfiguration';
 import {
   evaluateRetrievalPolicyEligibility,
-  evaluateRetrievalCanaryAuthority,
-  selectLearnedRetrievalConfiguration
+  deterministicExplorationValue,
+  selectLearnedRetrievalConfiguration,
+  reserveRetrievalCanaryTreatment,
+  reserveIncrementalTreatmentPageQuota
 } from './retrievalPolicyCanary';
 import {
   evaluatePreferredRetrievalConfig,
@@ -26,18 +28,22 @@ test('deterministic retrieval-configuration identity and hashing', () => {
   assert.equal(config1.policyVersion, CURRENT_RETRIEVAL_POLICY_VERSION);
 });
 
-test('shadow recommendation has zero serving effect and records diff', async () => {
-  const actualConfig = buildRetrievalConfiguration({ searchOrdering: 'RELEVANCE', retrievalLane: 'VIDEO', requestedPageDepth: 1 });
+test('shadow recommendation explicitly distinguishes control, executed, and recommended configs', async () => {
+  const control = buildRetrievalConfiguration({ searchOrdering: 'RELEVANCE', retrievalLane: 'VIDEO', requestedPageDepth: 1 });
+  const executed = buildRetrievalConfiguration({ searchOrdering: 'DATE', retrievalLane: 'VIDEO', requestedPageDepth: 2 });
 
   const shadow = await evaluateShadowRetrievalRecommendation({
     opportunityKey: 'opp_shadow_test_1',
     neighborhoodKey: 'neigh_shadow_test_1',
-    actualConfig
+    controlConfig: control,
+    executedConfig: executed
   });
 
   assert.equal(shadow.opportunityKey, 'opp_shadow_test_1');
-  assert.equal(shadow.actualConfigKey, actualConfig.configKey);
-  assert.equal(typeof shadow.differsFromActual, 'boolean');
+  assert.equal(shadow.controlConfigKey, control.configKey);
+  assert.equal(shadow.executedConfigKey, executed.configKey);
+  assert.equal(typeof shadow.differsFromControl, 'boolean');
+  assert.equal(typeof shadow.differsFromExecuted, 'boolean');
 });
 
 test('DATE and RELEVANCE orderings are attributable separately', () => {
@@ -83,8 +89,21 @@ test('evaluateContinuation remains authoritative stopping boundary for deeper pa
   assert.ok(p2.reasonCodes.includes('ZERO_CONFIRMED_VALUE') || p2.reasonCodes.includes('DUPLICATE_HEAVY'));
 });
 
-test('missing feature setting or offline DB fails closed to disabled canary', async () => {
-  const canaryAuth = await evaluateRetrievalCanaryAuthority({});
-  assert.equal(canaryAuth.enabled, false);
-  assert.equal(canaryAuth.withinCaps, false);
+test('missing feature setting or offline DB fails closed to disabled canary treatment reservation', async () => {
+  const canaryRes = await reserveRetrievalCanaryTreatment({
+    opportunityKey: 'opp_disabled_test',
+    neighborhoodKey: 'neigh_1',
+    retrievalLane: 'VIDEO',
+    defaultOrdering: 'RELEVANCE'
+  });
+  assert.equal(canaryRes.authorized, false);
+  assert.ok(canaryRes.reason.includes('RETRIEVAL_STRATEGY_LEARNING_DISABLED') || canaryRes.reason.includes('DATABASE_UNAVAILABLE'));
+});
+
+test('incremental treatment page quota reservation fails closed when DB or caps unavailable', async () => {
+  const incRes = await reserveIncrementalTreatmentPageQuota({
+    queryRunId: 'run_123',
+    pageNumber: 2
+  });
+  assert.equal(incRes.authorized, false);
 });

@@ -30,6 +30,7 @@ import {
   getNeighborhoodForQueryRun
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
+import { reserveIncrementalTreatmentPageQuota } from './retrievalPolicyCanary';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
@@ -443,7 +444,29 @@ export async function processNextSearchJob(
       };
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
-      if(enabled&&decision.shouldContinue&&searchPage?.nextPageToken){await enqueueJob('SEARCH_YOUTUBE',{...job.payload,pageNumber:pageNumber+1,pageToken:searchPage.nextPageToken},{priority:20,maxAttempts:3,idempotencyKey:`search-run:${queryRunId}:page:${pageNumber+1}`});await completeJob(job.id);return true;}
+      if (enabled && decision.shouldContinue && searchPage?.nextPageToken) {
+        // Incremental Treatment Page Quota Reservation Boundary
+        if (retrievalTreatmentOrigin === 'CANARY_TREATMENT' && pageNumber >= 1) {
+          const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1 });
+          if (!incRes.authorized) {
+            console.log(`[Phase 9 Continuation] Incremental page continuation denied by treatment quota caps for run ${queryRunId}: ${incRes.reason}`);
+            await completeJob(job.id);
+            return true;
+          }
+        }
+
+        await enqueueJob('SEARCH_YOUTUBE', {
+          ...job.payload,
+          pageNumber: pageNumber + 1,
+          pageToken: searchPage.nextPageToken
+        }, {
+          priority: 20,
+          maxAttempts: 3,
+          idempotencyKey: `search-run:${queryRunId}:page:${pageNumber+1}`
+        });
+        await completeJob(job.id);
+        return true;
+      }
       const finalMetrics=await getAutonomousRunMetrics(queryRunId);
       const quotaConsumed=pageNumber*100;
       const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed });

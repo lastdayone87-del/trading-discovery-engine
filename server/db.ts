@@ -17,7 +17,7 @@ import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { buildRetrievalConfiguration } from './retrievalConfiguration';
 import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
-import { evaluateRetrievalCanaryAuthority, selectLearnedRetrievalConfiguration } from './retrievalPolicyCanary';
+import { reserveRetrievalCanaryTreatment, commitRetrievalCanaryReservation, releaseRetrievalCanaryReservation } from './retrievalPolicyCanary';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
@@ -584,28 +584,36 @@ export async function scheduleAutonomousQueryRuns(
       let retrievalConfigKey = controlConfig.configKey;
       let treatmentOrigin: 'CONTROL' | 'CANARY_TREATMENT' = 'CONTROL';
       let requestedPageDepth = 1;
+      let canaryReservationId: string | undefined;
 
-      // Phase 9 Canary Authority Check
-      const canaryAuthority = await evaluateRetrievalCanaryAuthority({ clientOverride: client });
-      if (canaryAuthority.enabled && canaryAuthority.withinCaps) {
-        const { neighborhood } = mapQueryRunToNeighborhood(
-          { runId: 'pending', queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
-          candidate.query
-        );
-        const learned = await selectLearnedRetrievalConfiguration({
-          neighborhoodKey: neighborhood.neighborhoodKey,
-          retrievalLane: controlRetrievalLane,
-          defaultOrdering: controlSearchOrdering,
-          clientOverride: client
-        });
-        if (learned.config) {
-          retrievalLane = learned.config.retrievalLane;
-          searchOrdering = learned.config.searchOrdering;
-          retrievalConfigKey = learned.config.configKey;
-          requestedPageDepth = learned.config.requestedPageDepth;
-          treatmentOrigin = 'CANARY_TREATMENT';
-        }
+      const { neighborhood } = mapQueryRunToNeighborhood(
+        { runId: 'pending', queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
+        candidate.query
+      );
+
+      // Phase 9 Canary Treatment Reservation under transaction advisory lock
+      const canaryTreatment = await reserveRetrievalCanaryTreatment({
+        opportunityKey: candidate.frontierDecisionId || `opp:${candidate.query.id}:${new Date().toISOString()}`,
+        neighborhoodKey: neighborhood.neighborhoodKey,
+        retrievalLane: controlRetrievalLane,
+        defaultOrdering: controlSearchOrdering,
+        clientOverride: client
+      });
+
+      if (canaryTreatment.authorized && canaryTreatment.config && canaryTreatment.reservation) {
+        retrievalLane = canaryTreatment.config.retrievalLane;
+        searchOrdering = canaryTreatment.config.searchOrdering;
+        retrievalConfigKey = canaryTreatment.config.configKey;
+        requestedPageDepth = canaryTreatment.config.requestedPageDepth;
+        treatmentOrigin = 'CANARY_TREATMENT';
+        canaryReservationId = canaryTreatment.reservation.reservationId;
       }
+
+      const executedConfig = buildRetrievalConfiguration({
+        searchOrdering,
+        retrievalLane,
+        requestedPageDepth
+      });
 
       const origin = candidate.allocationOrigin || 'LEGACY';
       const run = await client.query(
@@ -615,16 +623,17 @@ export async function scheduleAutonomousQueryRuns(
       );
       const runId = run.rows[0].id;
 
+      if (canaryReservationId) {
+        await commitRetrievalCanaryReservation(canaryReservationId, runId, client);
+      }
+
       // Shadow recommendation recording at scheduling boundary (zero serving authority)
-      const { neighborhood: shadowNeigh } = mapQueryRunToNeighborhood(
-        { runId, queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
-        candidate.query
-      );
       await evaluateShadowRetrievalRecommendation({
         opportunityKey: `opp:${runId}`,
         queryRunId: runId,
-        neighborhoodKey: shadowNeigh.neighborhoodKey,
-        actualConfig: controlConfig,
+        neighborhoodKey: neighborhood.neighborhoodKey,
+        controlConfig,
+        executedConfig,
         clientOverride: client
       }).catch(err => console.warn('[RetrievalPolicyShadow] Shadow recommendation recording error:', err));
 

@@ -10,7 +10,8 @@ export interface ShadowRetrievalRecommendationInput {
   opportunityKey: string;
   queryRunId?: string | null;
   neighborhoodKey: string;
-  actualConfig: RetrievalConfiguration;
+  controlConfig: RetrievalConfiguration;
+  executedConfig: RetrievalConfiguration;
   now?: Date;
   clientOverride?: any;
 }
@@ -20,12 +21,14 @@ export interface ShadowRetrievalRecommendationResult {
   opportunityKey: string;
   queryRunId?: string | null;
   neighborhoodKey: string;
-  actualConfigKey: string;
+  controlConfigKey: string;
+  executedConfigKey: string;
   recommendedConfigKey: string;
   expectedMarginalValue: number;
   uncertainty: number;
   expectedQuotaImpact: number;
-  differsFromActual: boolean;
+  differsFromControl: boolean;
+  differsFromExecuted: boolean;
   evidence: Record<string, unknown>;
   createdAt: string;
 }
@@ -35,22 +38,22 @@ export interface ShadowRetrievalRecommendationResult {
  */
 export async function evaluatePreferredRetrievalConfig(
   neighborhoodKey: string,
-  actualConfig: RetrievalConfiguration,
+  baseConfig: RetrievalConfiguration,
   clientOverride?: any
 ): Promise<{ recommendedConfig: RetrievalConfiguration; expectedMarginalValue: number; uncertainty: number; evidence: Record<string, unknown> }> {
   // Candidate configurations to evaluate for shadow recommendation
   const candidates: RetrievalConfiguration[] = [
-    actualConfig,
-    buildRetrievalConfiguration({ searchOrdering: 'RELEVANCE', retrievalLane: actualConfig.retrievalLane, requestedPageDepth: 1 }),
-    buildRetrievalConfiguration({ searchOrdering: 'RELEVANCE', retrievalLane: actualConfig.retrievalLane, requestedPageDepth: 2 }),
-    buildRetrievalConfiguration({ searchOrdering: 'DATE', retrievalLane: actualConfig.retrievalLane, requestedPageDepth: 1 }),
-    buildRetrievalConfiguration({ searchOrdering: 'DATE', retrievalLane: actualConfig.retrievalLane, requestedPageDepth: 2 })
+    baseConfig,
+    buildRetrievalConfiguration({ searchOrdering: 'RELEVANCE', retrievalLane: baseConfig.retrievalLane, requestedPageDepth: 1 }),
+    buildRetrievalConfiguration({ searchOrdering: 'RELEVANCE', retrievalLane: baseConfig.retrievalLane, requestedPageDepth: 2 }),
+    buildRetrievalConfiguration({ searchOrdering: 'DATE', retrievalLane: baseConfig.retrievalLane, requestedPageDepth: 1 }),
+    buildRetrievalConfiguration({ searchOrdering: 'DATE', retrievalLane: baseConfig.retrievalLane, requestedPageDepth: 2 })
   ];
 
   // Deduplicate candidates by configKey
   const uniqueCandidates = Array.from(new Map(candidates.map(c => [c.configKey, c])).values());
 
-  let bestCandidate = actualConfig;
+  let bestCandidate = baseConfig;
   let bestScore = -Infinity;
   let bestExpectedValue = 0;
   let bestUncertainty = 1.0;
@@ -108,31 +111,34 @@ export async function evaluateShadowRetrievalRecommendation(
   const now = input.now || new Date();
   const runner = input.clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
 
-  // Ensure both actual and recommended configurations are persisted in lookup table
   if (runner) {
-    await ensureRetrievalConfigurationPersisted(input.actualConfig, runner);
+    await ensureRetrievalConfigurationPersisted(input.controlConfig, runner);
+    await ensureRetrievalConfigurationPersisted(input.executedConfig, runner);
   }
 
   const { recommendedConfig, expectedMarginalValue, uncertainty, evidence } =
-    await evaluatePreferredRetrievalConfig(input.neighborhoodKey, input.actualConfig, runner);
+    await evaluatePreferredRetrievalConfig(input.neighborhoodKey, input.executedConfig, runner);
 
   if (runner) {
     await ensureRetrievalConfigurationPersisted(recommendedConfig, runner);
   }
 
-  const differsFromActual = recommendedConfig.configKey !== input.actualConfig.configKey;
-  const expectedQuotaImpact = (recommendedConfig.requestedPageDepth - input.actualConfig.requestedPageDepth) * 100;
+  const differsFromControl = recommendedConfig.configKey !== input.controlConfig.configKey;
+  const differsFromExecuted = recommendedConfig.configKey !== input.executedConfig.configKey;
+  const expectedQuotaImpact = (recommendedConfig.requestedPageDepth - input.executedConfig.requestedPageDepth) * 100;
 
   const result: ShadowRetrievalRecommendationResult = {
     opportunityKey: input.opportunityKey,
     queryRunId: input.queryRunId || null,
     neighborhoodKey: input.neighborhoodKey,
-    actualConfigKey: input.actualConfig.configKey,
+    controlConfigKey: input.controlConfig.configKey,
+    executedConfigKey: input.executedConfig.configKey,
     recommendedConfigKey: recommendedConfig.configKey,
     expectedMarginalValue,
     uncertainty,
     expectedQuotaImpact,
-    differsFromActual,
+    differsFromControl,
+    differsFromExecuted,
     evidence,
     createdAt: now.toISOString()
   };
@@ -140,21 +146,24 @@ export async function evaluateShadowRetrievalRecommendation(
   if (runner) {
     await runner.query(
       `INSERT INTO retrieval_policy_shadow_recommendations(
-         opportunity_key, query_run_id, neighborhood_key, actual_config_key,
-         recommended_config_key, expected_marginal_value, uncertainty,
-         expected_quota_impact, differs_from_actual, evidence, created_at
+         opportunity_key, query_run_id, neighborhood_key, control_config_key,
+         executed_config_key, recommended_config_key, expected_marginal_value,
+         uncertainty, expected_quota_impact, differs_from_control, differs_from_executed,
+         evidence, created_at
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         result.opportunityKey,
         result.queryRunId,
         result.neighborhoodKey,
-        result.actualConfigKey,
+        result.controlConfigKey,
+        result.executedConfigKey,
         result.recommendedConfigKey,
         result.expectedMarginalValue,
         result.uncertainty,
         result.expectedQuotaImpact,
-        result.differsFromActual,
+        result.differsFromControl,
+        result.differsFromExecuted,
         JSON.stringify(result.evidence),
         result.createdAt
       ]

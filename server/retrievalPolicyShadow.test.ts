@@ -8,7 +8,7 @@ import {
   evaluateShadowRetrievalRecommendation
 } from './retrievalPolicyShadow';
 
-test('evaluatePreferredRetrievalConfig returns actual config or best scoring candidate', async () => {
+test('evaluatePreferredRetrievalConfig returns base config or best scoring candidate', async () => {
   const actual = buildRetrievalConfiguration({
     searchOrdering: 'RELEVANCE',
     retrievalLane: 'VIDEO',
@@ -22,20 +22,29 @@ test('evaluatePreferredRetrievalConfig returns actual config or best scoring can
   assert.equal(typeof preferred.uncertainty, 'number');
 });
 
-test('evaluateShadowRetrievalRecommendation has zero serving authority and calculates diff', async () => {
-  const actual = buildRetrievalConfiguration({
+test('evaluateShadowRetrievalRecommendation explicitly distinguishes control, executed, and recommended configs', async () => {
+  const control = buildRetrievalConfiguration({
     searchOrdering: 'RELEVANCE',
     retrievalLane: 'VIDEO',
     requestedPageDepth: 1
   });
 
-  const recommendation = await evaluateShadowRetrievalRecommendation({
-    opportunityKey: 'opp_123',
-    neighborhoodKey: 'test_neighborhood_1',
-    actualConfig: actual
+  const executed = buildRetrievalConfiguration({
+    searchOrdering: 'DATE',
+    retrievalLane: 'VIDEO',
+    requestedPageDepth: 2
   });
 
-  assert.equal(recommendation.opportunityKey, 'opp_123');
-  assert.equal(recommendation.actualConfigKey, actual.configKey);
-  assert.equal(typeof recommendation.differsFromActual, 'boolean');
+  const recommendation = await evaluateShadowRetrievalRecommendation({
+    opportunityKey: 'opp_shadow_test_2',
+    neighborhoodKey: 'test_neighborhood_1',
+    controlConfig: control,
+    executedConfig: executed
+  });
+
+  assert.equal(recommendation.opportunityKey, 'opp_shadow_test_2');
+  assert.equal(recommendation.controlConfigKey, control.configKey);
+  assert.equal(recommendation.executedConfigKey, executed.configKey);
+  assert.equal(typeof recommendation.differsFromControl, 'boolean');
+  assert.equal(typeof recommendation.differsFromExecuted, 'boolean');
 });
