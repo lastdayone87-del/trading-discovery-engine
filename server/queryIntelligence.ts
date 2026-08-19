@@ -20,7 +20,7 @@ import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminol
 import { executeProviderCall } from './providerResilience';
 import { appendProviderCallEvent } from './db';
 import { getPublishedOrganicQueryCandidates } from './organicQueryExpansion';
-import type { DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
+import { type DiscoveryNeighborhoodDimensions, createNeighborhoodKey } from './discoveryNeighborhood';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -374,25 +374,47 @@ export async function selectNextQueryForCountry(
   // Targeted Frontier Neighborhood Selection (if provided)
   if (options.targetNeighborhoodDimensions) {
     const target = options.targetNeighborhoodDimensions;
-    const targetTerm = (target.primaryTermFamily || '').toLowerCase();
-    const targetIntent = (target.queryIntent || '').toLowerCase();
+    const targetKey = createNeighborhoodKey(target);
 
+    // Filter scoredQueries for candidates whose mapped canonical neighborhood key matches targetKey
     const matches = scoredQueries.filter(q => {
-      const pTerm = (q.primary_term || q.query || '').toLowerCase();
-      const qIntent = (q.intent || '').toLowerCase();
-      return (targetTerm && pTerm.includes(targetTerm)) || (targetIntent && qIntent === targetIntent);
+      const qDims: DiscoveryNeighborhoodDimensions = {
+        country: country || target.country,
+        language: target.language,
+        queryIntent: q.intent || target.queryIntent,
+        primaryTermFamily: q.primary_term || q.query,
+        retrievalLane: target.retrievalLane,
+        searchOrdering: target.searchOrdering,
+        instrumentOrTheme: target.instrumentOrTheme,
+        sourceFamily: target.sourceFamily
+      };
+      return createNeighborhoodKey(qDims) === targetKey;
     });
 
     if (matches.length > 0) {
       selected = matches[0];
       strategy = 'NEIGHBORHOOD_TARGETED';
-      reason = `Frontier neighborhood target selection for family "${target.primaryTermFamily}" and intent "${target.queryIntent}": ${selected.query} (UCB ${selected.ucb_score}).`;
+      reason = `Frontier neighborhood canonical selection for target key "${targetKey}": ${selected.query} (UCB ${selected.ucb_score}).`;
     } else {
       const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION');
-      if (generated.length > 0) {
-        selected = generated[0];
+      const matchingGenerated = generated.find(gen => {
+        const genDims: DiscoveryNeighborhoodDimensions = {
+          country: country || target.country,
+          language: target.language,
+          queryIntent: gen.intent || target.queryIntent,
+          primaryTermFamily: gen.primary_term || gen.query,
+          retrievalLane: target.retrievalLane,
+          searchOrdering: target.searchOrdering,
+          instrumentOrTheme: target.instrumentOrTheme,
+          sourceFamily: target.sourceFamily
+        };
+        return createNeighborhoodKey(genDims) === targetKey;
+      });
+
+      if (matchingGenerated) {
+        selected = matchingGenerated;
         strategy = 'NEIGHBORHOOD_TARGETED';
-        reason = `Generated new candidate query for targeted frontier neighborhood family "${target.primaryTermFamily}": ${selected.query}.`;
+        reason = `Generated candidate matching targeted frontier neighborhood key "${targetKey}": ${selected.query}.`;
       }
     }
   }

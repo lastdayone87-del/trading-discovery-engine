@@ -63,7 +63,7 @@ export async function allocateCreatorSearchAuthority(input: {
   availableAutonomousCapacity?: number;
 }): Promise<{
   country: string;
-  assignment: CreatorCanaryAssignment;
+  assignment?: CreatorCanaryAssignment;
   authorityDecisionKey?: string;
   legacyFallback: boolean;
   frontierAllocation?: {
@@ -90,35 +90,9 @@ export async function allocateCreatorSearchAuthority(input: {
 
   if (frontierResult.authorized && 'targetNeighborhoodDimensions' in frontierResult && frontierResult.targetNeighborhoodDimensions) {
     const decision = 'decision' in frontierResult ? frontierResult.decision : undefined;
-    const canaryAssignment: CreatorCanaryAssignment = {
-      assignmentId: decision?.id || undefined,
-      assignmentKey: `frontier_canary:${input.opportunityKey}`,
-      opportunityKey: input.opportunityKey,
-      country: frontierResult.country,
-      arm: 'TREATMENT',
-      assignmentStatus: 'CANARY_ALLOCATED',
-      programId: 'FRONTIER_NEIGHBORHOOD_CANARY',
-      objectiveKey: 'FRONTIER_CANARY',
-      objectiveVersion: 1,
-      hypothesisId: decision?.proposalId || 'FRONTIER_CANARY',
-      actionType: 'SEARCH_YOUTUBE',
-      rolloutBasisPoints: 1000,
-      behaviorPropensityBasisPoints: 5000,
-      treatmentPropensityBasisPoints: 5000,
-      randomizationValue: 0.5,
-      estimatedQuotaUnits: input.estimatedQuotaUnits ?? 100,
-      eligibilityChecksum: creatorIntelligenceChecksum({ key: input.opportunityKey, country: frontierResult.country }),
-      reasonCodes: ['FRONTIER_NEIGHBORHOOD_CANARY_AUTHORIZED'],
-      provenance: { decisionId: decision?.decisionId },
-      policyVersion: CREATOR_SEARCH_AUTHORITY_POLICY_VERSION,
-      configurationVersion: 1,
-      servingAuthority: true,
-      assignedAt: input.assignedAt
-    };
-
     return {
       country: frontierResult.country,
-      assignment: canaryAssignment,
+      assignment: undefined,
       legacyFallback: false,
       frontierAllocation: {
         authorized: true,

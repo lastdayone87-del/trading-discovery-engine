@@ -23,7 +23,8 @@ import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority'
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import {
   evaluateShadowFrontierAllocation,
-  bindAllocationQueryRun,
+  commitAllocationQueryRun,
+  releaseAllocationDecision,
   markAllocationDecisionDeferred
 } from './discoveryFrontierAllocator';
 import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
@@ -230,34 +231,39 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       }
 
-      const research = await getAllocatedResearchQuery(country);
-        let selected: { queryRecord: any; selectionStrategy: any; reason: string };
+      let research: { actionId: string; queryRecord: any } | null = null;
+      // Persistent Research runs ONLY on the control/legacy path when frontier allocation is NOT authorized
+      if (!frontierAllocationInfo?.authorized) {
+        research = await getAllocatedResearchQuery(country);
+      }
 
-        if (research) {
-          selected = {
-            queryRecord: research.queryRecord,
-            selectionStrategy: 'UCB1_EXPLORATION' as const,
-            reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
-          };
-        } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
-          const targeted = await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
-          if (targeted.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
-            selected = targeted;
-          } else {
-            // Query Intelligence could not construct/find a targeted action for this neighborhood; defer decision and revert to legacy control
-            if (frontierAllocationInfo.decision?.decisionId) {
-              await markAllocationDecisionDeferred(
-                frontierAllocationInfo.decision.decisionId,
-                'Query Intelligence could not construct or select a targeted action for neighborhood dimensions'
-              );
-            }
-            frontierAllocationInfo.authorized = false;
-            country = legacyCountry;
-            selected = await selectNextQueryForCountry(legacyCountry);
-          }
+      let selected: { queryRecord: any; selectionStrategy: any; reason: string };
+
+      if (research) {
+        selected = {
+          queryRecord: research.queryRecord,
+          selectionStrategy: 'UCB1_EXPLORATION' as const,
+          reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
+        };
+      } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
+        const targeted = await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
+        if (targeted.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
+          selected = targeted;
         } else {
-          selected = await selectNextQueryForCountry(country);
+          // Query Intelligence could not construct/find a targeted action for this neighborhood; defer decision and revert to legacy control
+          if (frontierAllocationInfo.decision?.decisionId) {
+            await releaseAllocationDecision(
+              frontierAllocationInfo.decision.decisionId,
+              'Query Intelligence could not construct or select a targeted action for neighborhood dimensions'
+            );
+          }
+          frontierAllocationInfo.authorized = false;
+          country = legacyCountry;
+          selected = await selectNextQueryForCountry(legacyCountry);
         }
+      } else {
+        selected = await selectNextQueryForCountry(country);
+      }
 
       // Every query source is revalidated immediately before scheduling. Stored
       // PROVEN/EXPERIMENTAL queries and research allocations are not grandfathered
@@ -265,9 +271,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord);
       if (!queryAuthority.eligible) {
         log(`Withheld autonomous query #${selected.queryRecord.id} "${selected.queryRecord.query}" (${selected.queryRecord.country}) before YouTube: ${queryAuthority.reasonCodes.join(', ')}.`);
-          if (frontierAllocationInfo?.decision?.decisionId) {
-            await markAllocationDecisionDeferred(frontierAllocationInfo.decision.decisionId, `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`);
-          }
+        if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+          await releaseAllocationDecision(
+            frontierAllocationInfo.decision.decisionId,
+            `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`
+          );
+          frontierAllocationInfo.authorized = false;
+        }
         await setQueryCollection(selected.queryRecord.id, 'REJECTED')
           .catch(error => console.warn('[Autonomous Producer] Failed to quarantine unsafe query:', error));
         continue;
@@ -296,14 +306,20 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       }], workerId, cooldownMinutes);
       if (created.length) {
         scheduled.push(...created);
-          if (frontierAllocationInfo?.decision?.decisionId) {
-            await bindAllocationQueryRun(frontierAllocationInfo.decision.decisionId, created[0].runId);
-          }
+        if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+          await commitAllocationQueryRun(frontierAllocationInfo.decision.decisionId, created[0].runId);
+        }
         if (creatorAllocation?.assignmentId) await bindCreatorCanaryQueryRun({ assignmentId: creatorAllocation.assignmentId, assignmentKey: creatorAllocation.assignmentKey, queryRunId: created[0].runId, queryId: created[0].query.id, selectionStrategy: selected.selectionStrategy, boundAt: now.toISOString() })
           .catch(error => console.warn('[CreatorIntelligence] Assignment binding failed without affecting scheduled query:', error instanceof Error ? error.message : error));
         if (research) await markResearchActionQueued(research.actionId, created[0].runId);
         usedIntents.add(intent);
         usedPrimaryTerms.add(primaryTerm);
+      } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+        await releaseAllocationDecision(
+          frontierAllocationInfo.decision.decisionId,
+          'Query scheduling returned zero created runs'
+        );
+        frontierAllocationInfo.authorized = false;
       }
     }
 

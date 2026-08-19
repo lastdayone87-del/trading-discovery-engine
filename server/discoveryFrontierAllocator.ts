@@ -10,6 +10,8 @@ import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
+export type DecisionStatus = 'RESERVED' | 'COMMITTED' | 'RELEASED' | 'DEFERRED';
+
 export interface NeighborhoodCandidate {
   neighborhoodKey: string;
   country: string;
@@ -47,6 +49,7 @@ export interface AllocationDecision {
   decisionId: string;
   opportunityKey: string;
   allocationOrigin: 'LEGACY' | 'FRONTIER_SHADOW' | 'FRONTIER_CANARY';
+  decisionStatus: DecisionStatus;
   legacyTargetCountry: string;
   legacyTargetNeighborhoodKey?: string | null;
   selectedNeighborhoodKey: string;
@@ -128,9 +131,7 @@ export function scoreNeighborhoodCandidate(
     explorationCeilingActive?: boolean;
   } = {}
 ): ScoringComponents {
-  // Base component normalization (0.0 to 1.0)
   const expectedValueScore = Math.min(1.0, Math.max(0, candidate.expectedMarginalValue / 100));
-
   const proposalBonus = candidate.proposalId ? 0.2 : 0.0;
   const rawExploration = (candidate.uncertainty * 0.4) + (candidate.coverageGain * 0.4) + proposalBonus;
   const explorationScore = Math.min(1.0, Math.max(0, rawExploration));
@@ -142,16 +143,13 @@ export function scoreNeighborhoodCandidate(
     ? Math.min(1.0, (candidate.expectedMarginalValue / candidate.expectedQuotaCost) * 10)
     : 0.5;
 
-  // Score weighting adjusted by protected exploration floor/ceiling
   let valueWeight = 0.40;
   let explorationWeight = 0.35;
 
   if (options.explorationFloorActive) {
-    // Under floor: boost exploration weight to protect underexplored territory
     explorationWeight = 0.55;
     valueWeight = 0.25;
   } else if (options.explorationCeilingActive) {
-    // Over ceiling: clamp exploration weight to prioritize proven exploitation
     explorationWeight = 0.15;
     valueWeight = 0.60;
   }
@@ -201,7 +199,7 @@ export async function getPacificQuotaDayExplorationStatus(
               OR uncertainty >= 0.5
          )::int AS exploration_allocations
        FROM frontier_allocation_decisions
-       WHERE quota_day = $1 AND allocation_origin = 'FRONTIER_CANARY'`,
+       WHERE quota_day = $1 AND allocation_origin = 'FRONTIER_CANARY' AND decision_status IN ('RESERVED', 'COMMITTED')`,
       [quotaDay]
     ).catch(() => ({ rows: [{ total_allocations: 0, exploration_allocations: 0 }] })),
     db.query(
@@ -281,6 +279,7 @@ export async function getNeighborhoodCandidates(
       FROM frontier_allocation_decisions
       WHERE selected_neighborhood_key = n.neighborhood_key
         AND quota_day = $2
+        AND decision_status IN ('RESERVED', 'COMMITTED')
     ) recent ON true
     ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3)' : ''}
     ORDER BY n.updated_at DESC
@@ -357,7 +356,6 @@ export async function evaluateShadowFrontierAllocation(input: {
     eligibleCandidates.push({ candidate: cand, score });
   }
 
-  // Sort eligible candidates by total score descending, breaking ties deterministically
   eligibleCandidates.sort((a, b) =>
     b.score.totalScore - a.score.totalScore ||
     a.candidate.neighborhoodKey.localeCompare(b.candidate.neighborhoodKey)
@@ -373,7 +371,6 @@ export async function evaluateShadowFrontierAllocation(input: {
     selectedCandidate = candidates[0];
     selectedScoreComponents = scoreNeighborhoodCandidate(selectedCandidate, expStatus);
   } else {
-    // Cold start synthetic fallback neighborhood
     const dimensions: DiscoveryNeighborhoodDimensions = {
       country: input.legacyCountry,
       language: null,
@@ -415,6 +412,7 @@ export async function evaluateShadowFrontierAllocation(input: {
     decisionId,
     opportunityKey: input.opportunityKey,
     allocationOrigin: 'FRONTIER_SHADOW',
+    decisionStatus: 'COMMITTED',
     legacyTargetCountry: input.legacyCountry,
     legacyTargetNeighborhoodKey: input.legacyNeighborhoodKey || null,
     selectedNeighborhoodKey: selectedCandidate.neighborhoodKey,
@@ -442,24 +440,24 @@ export async function evaluateShadowFrontierAllocation(input: {
     createdAt: now.toISOString()
   };
 
-  // Record shadow allocation decision post-commit / asynchronously if DB is configured
   if (input.client || process.env.DATABASE_URL) {
     const db = input.client || await getDb();
     await db.query(
       `INSERT INTO frontier_allocation_decisions(
-         decision_id, opportunity_key, allocation_origin, legacy_target_country,
+         decision_id, opportunity_key, allocation_origin, decision_status, legacy_target_country,
          legacy_target_neighborhood_key, selected_neighborhood_key, selected_country,
          frontier_state, expected_marginal_value, uncertainty, coverage_gain,
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
          deferred, quota_reserved, quota_consumed, quota_day, policy_version
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,
         decision.opportunityKey,
         decision.allocationOrigin,
+        decision.decisionStatus,
         decision.legacyTargetCountry,
         decision.legacyTargetNeighborhoodKey || null,
         decision.selectedNeighborhoodKey,
@@ -488,8 +486,8 @@ export async function evaluateShadowFrontierAllocation(input: {
 }
 
 /**
- * Evaluates production canary frontier authority.
- * Fails closed if settings missing/disabled, caps exceeded, lock fails, or no candidate eligible.
+ * Evaluates production canary frontier authority and reserves capacity.
+ * Status is set to 'RESERVED'. Must be committed via commitAllocationQueryRun or released via releaseAllocationDecision.
  */
 export async function evaluateFrontierCanaryAllocation(input: {
   opportunityKey: string;
@@ -575,13 +573,15 @@ export async function evaluateFrontierCanaryAllocation(input: {
     const assignmentCap = Number(assignCapRes.rows[0]?.setting_value ?? 10);
     const quotaCap = Number(quotaCapRes.rows[0]?.setting_value ?? 1000);
 
-    // Query usage in active Pacific quota day
+    // Query active reserved + committed usage in active Pacific quota day
     const usageRes = await runner.query(
       `SELECT
          COUNT(*)::int AS daily_assignments,
          COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
        FROM frontier_allocation_decisions
-       WHERE quota_day = $1 AND allocation_origin = 'FRONTIER_CANARY'`,
+       WHERE quota_day = $1
+         AND allocation_origin = 'FRONTIER_CANARY'
+         AND decision_status IN ('RESERVED', 'COMMITTED')`,
       [quotaDay]
     );
 
@@ -658,6 +658,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
       decisionId,
       opportunityKey: input.opportunityKey,
       allocationOrigin: 'FRONTIER_CANARY',
+      decisionStatus: 'RESERVED',
       legacyTargetCountry: input.legacyCountry,
       legacyTargetNeighborhoodKey: input.legacyNeighborhoodKey || null,
       selectedNeighborhoodKey: topCandidate.neighborhoodKey,
@@ -687,19 +688,20 @@ export async function evaluateFrontierCanaryAllocation(input: {
 
     await runner.query(
       `INSERT INTO frontier_allocation_decisions(
-         decision_id, opportunity_key, allocation_origin, legacy_target_country,
+         decision_id, opportunity_key, allocation_origin, decision_status, legacy_target_country,
          legacy_target_neighborhood_key, selected_neighborhood_key, selected_country,
          frontier_state, expected_marginal_value, uncertainty, coverage_gain,
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
          deferred, quota_reserved, quota_consumed, quota_day, policy_version
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,
         decision.opportunityKey,
         decision.allocationOrigin,
+        decision.decisionStatus,
         decision.legacyTargetCountry,
         decision.legacyTargetNeighborhoodKey || null,
         decision.selectedNeighborhoodKey,
@@ -747,31 +749,45 @@ export async function evaluateFrontierCanaryAllocation(input: {
 }
 
 /**
+ * Releases a reserved allocation decision, zeroing reserved quota and freeing canary capacity.
+ */
+export async function releaseAllocationDecision(
+  decisionId: string,
+  reason: string,
+  client?: any
+): Promise<void> {
+  const runner = client || (process.env.DATABASE_URL ? await getDb() : null);
+  if (!runner) return;
+
+  await runner.query(
+    `UPDATE frontier_allocation_decisions
+     SET decision_status = 'RELEASED',
+         deferred = true,
+         quota_reserved = 0,
+         rejection_reasons = jsonb_set(
+           COALESCE(rejection_reasons, '{}'::jsonb),
+           '{releaseReason}',
+           to_jsonb($2::text)
+         )
+     WHERE decision_id = $1`,
+    [decisionId, reason]
+  ).catch((error: unknown) => console.warn('[FrontierAllocator] Failed to release allocation decision:', error));
+}
+
+/**
  * Marks a frontier allocation decision as deferred when Query Intelligence cannot construct an action.
  */
 export async function markAllocationDecisionDeferred(
   decisionId: string,
   reason: string
 ): Promise<void> {
-  if (!process.env.DATABASE_URL) return;
-  const db = await getDb();
-  await db.query(
-    `UPDATE frontier_allocation_decisions
-     SET deferred = true,
-         rejection_reasons = jsonb_set(
-           COALESCE(rejection_reasons, '{}'::jsonb),
-           '{queryIntelligenceDeferral}',
-           to_jsonb($2::text)
-         )
-     WHERE decision_id = $1`,
-    [decisionId, reason]
-  ).catch(error => console.warn('[FrontierAllocator] Failed to mark decision deferred:', error));
+  await releaseAllocationDecision(decisionId, reason);
 }
 
 /**
- * Binds a query run ID to a frontier allocation decision AND updates query_runs.allocation_origin.
+ * Commits a reserved allocation decision, linking queryRunId and setting query_runs.allocation_origin = 'FRONTIER_CANARY'.
  */
-export async function bindAllocationQueryRun(
+export async function commitAllocationQueryRun(
   decisionId: string,
   queryRunId: string
 ): Promise<void> {
@@ -782,7 +798,8 @@ export async function bindAllocationQueryRun(
     await client.query('BEGIN');
     const res = await client.query(
       `UPDATE frontier_allocation_decisions
-       SET query_run_id = $2
+       SET decision_status = 'COMMITTED',
+           query_run_id = $2
        WHERE decision_id = $1
        RETURNING allocation_origin`,
       [decisionId, queryRunId]
@@ -797,10 +814,20 @@ export async function bindAllocationQueryRun(
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
-    console.warn('[FrontierAllocator] Failed to bind query run:', error);
+    console.warn('[FrontierAllocator] Failed to commit query run:', error);
   } finally {
     client.release();
   }
+}
+
+/**
+ * Binds a query run ID to a frontier allocation decision (alias for commit).
+ */
+export async function bindAllocationQueryRun(
+  decisionId: string,
+  queryRunId: string
+): Promise<void> {
+  await commitAllocationQueryRun(decisionId, queryRunId);
 }
 
 /**
@@ -821,11 +848,11 @@ export async function getFrontierAllocationDiagnostics(): Promise<Record<string,
   ] = await Promise.all([
     db.query(`SELECT allocation_origin, COUNT(*)::int AS count FROM frontier_allocation_decisions GROUP BY allocation_origin`),
     db.query(`SELECT allocation_origin, COALESCE(SUM(quota_reserved), 0)::int AS total_quota_reserved, COALESCE(SUM(quota_consumed), 0)::int AS total_quota_consumed FROM frontier_allocation_decisions GROUP BY allocation_origin`),
-    db.query(`SELECT selected_neighborhood_key, selected_country, COUNT(*)::int AS allocation_count FROM frontier_allocation_decisions WHERE allocation_origin = 'FRONTIER_CANARY' GROUP BY selected_neighborhood_key, selected_country ORDER BY allocation_count DESC LIMIT 20`),
-    db.query(`SELECT frontier_state, COUNT(*)::int AS count FROM frontier_allocation_decisions WHERE allocation_origin = 'FRONTIER_CANARY' GROUP BY frontier_state`),
+    db.query(`SELECT selected_neighborhood_key, selected_country, COUNT(*)::int AS allocation_count FROM frontier_allocation_decisions WHERE allocation_origin = 'FRONTIER_CANARY' AND decision_status = 'COMMITTED' GROUP BY selected_neighborhood_key, selected_country ORDER BY allocation_count DESC LIMIT 20`),
+    db.query(`SELECT frontier_state, COUNT(*)::int AS count FROM frontier_allocation_decisions WHERE allocation_origin = 'FRONTIER_CANARY' AND decision_status = 'COMMITTED' GROUP BY frontier_state`),
     db.query(`SELECT jsonb_object_keys(rejection_reasons) AS rejection_reason, COUNT(*)::int AS count FROM frontier_allocation_decisions GROUP BY jsonb_object_keys(rejection_reasons)`).catch(() => ({ rows: [] })),
-    db.query(`SELECT CASE WHEN frontier_state IN ('UNEXPLORED', 'PROBING', 'UNKNOWN') OR uncertainty >= 0.5 THEN 'EXPLORATION' ELSE 'EXPLOITATION' END AS allocation_type, COUNT(*)::int AS count FROM frontier_allocation_decisions WHERE allocation_origin = 'FRONTIER_CANARY' GROUP BY 1`),
-    db.query(`SELECT COUNT(*)::int AS count FROM frontier_allocation_decisions WHERE deferred = true`)
+    db.query(`SELECT CASE WHEN frontier_state IN ('UNEXPLORED', 'PROBING', 'UNKNOWN') OR uncertainty >= 0.5 THEN 'EXPLORATION' ELSE 'EXPLOITATION' END AS allocation_type, COUNT(*)::int AS count FROM frontier_allocation_decisions WHERE allocation_origin = 'FRONTIER_CANARY' AND decision_status = 'COMMITTED' GROUP BY 1`),
+    db.query(`SELECT COUNT(*)::int AS count FROM frontier_allocation_decisions WHERE deferred = true OR decision_status = 'RELEASED'`)
   ]);
 
   return {

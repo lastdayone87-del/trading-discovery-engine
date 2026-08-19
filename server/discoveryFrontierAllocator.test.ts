@@ -5,10 +5,14 @@ import {
   scoreNeighborhoodCandidate,
   evaluateShadowFrontierAllocation,
   evaluateFrontierCanaryAllocation,
+  releaseAllocationDecision,
+  commitAllocationQueryRun,
   getFrontierAllocationDiagnostics,
   getFrontierAllocationControlComparison,
   type NeighborhoodCandidate
 } from './discoveryFrontierAllocator';
+import { createNeighborhoodKey } from './discoveryNeighborhood';
+import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
 
 test('evaluateNeighborhoodEligibility rejects HARMFUL and SATURATED candidates', () => {
   const baseDims = {
@@ -115,9 +119,7 @@ test('exploration floor and ceiling adjust score weights', () => {
   const floorScore = scoreNeighborhoodCandidate(candidate, { explorationFloorActive: true });
   const ceilingScore = scoreNeighborhoodCandidate(candidate, { explorationCeilingActive: true });
 
-  // Under floor, exploration weight is higher (0.55 vs 0.35)
   assert.ok(floorScore.totalScore > normalScore.totalScore);
-  // Over ceiling, exploration weight is lower (0.15 vs 0.35)
   assert.ok(ceilingScore.totalScore < normalScore.totalScore);
 });
 
@@ -201,6 +203,80 @@ test('evaluateFrontierCanaryAllocation enforces daily assignment and quota caps 
   assert.equal(result.authorized, false);
   assert.equal(result.allocationOrigin, 'LEGACY');
   assert.ok(result.reason.includes('FRONTIER_CANARY_DAILY_CAP_EXCEEDED'));
+});
+
+test('subordination guard rejects frontier allocation when available autonomous capacity is 0', async () => {
+  const result = await evaluateFrontierCanaryAllocation({
+    opportunityKey: `opp_subord_test_${Date.now()}`,
+    legacyCountry: 'JP',
+    availableAutonomousCapacity: 0
+  });
+
+  assert.equal(result.authorized, false);
+  assert.equal(result.allocationOrigin, 'LEGACY');
+  assert.equal(result.reason, 'AUTONOMOUS_CAPACITY_EXHAUSTED');
+});
+
+test('truthful provenance: allocateCreatorSearchAuthority does not fabricate Creator Intelligence canary when frontier allocation is selected', async () => {
+  const mockClient = {
+    query: async (sql: string) => {
+      if (sql.includes('frontier_allocation_enabled')) {
+        return { rows: [{ setting_value: 'true' }] };
+      }
+      if (sql.includes('pg_advisory_xact_lock')) {
+        return { rows: [] };
+      }
+      if (sql.includes('frontier_allocation_daily_assignment_cap')) {
+        return { rows: [{ setting_value: '10' }] };
+      }
+      if (sql.includes('frontier_allocation_daily_quota_cap')) {
+        return { rows: [{ setting_value: '1000' }] };
+      }
+      if (sql.includes('daily_assignments')) {
+        return { rows: [{ daily_assignments: 0, daily_quota_used: 0 }] };
+      }
+      if (sql.includes('discovery_neighborhoods')) {
+        return {
+          rows: [{
+            neighborhood_key: 'AU|en|GENERAL|asx|KEYWORD_SEARCH|RELEVANCE|none|automated_query',
+            country: 'AU',
+            dimensions: JSON.stringify({
+              country: 'AU',
+              language: 'en',
+              queryIntent: 'GENERAL',
+              primaryTermFamily: 'asx',
+              retrievalLane: 'KEYWORD_SEARCH',
+              searchOrdering: 'RELEVANCE',
+              sourceFamily: 'automated_query'
+            }),
+            frontier_state: 'UNEXPLORED',
+            expected_marginal_value: 50,
+            uncertainty: 0.9,
+            coverage_gain: 0.8,
+            known_creator_ratio: 0,
+            result_set_overlap: 0,
+            is_saturating: false,
+            proposal_id: null,
+            last_allocated_at: null,
+            recent_allocation_count: 0
+          }]
+        };
+      }
+      return { rows: [] };
+    }
+  };
+
+  const auth = await evaluateFrontierCanaryAllocation({
+    opportunityKey: `opp_truthful_${Date.now()}`,
+    legacyCountry: 'AU',
+    client: mockClient
+  });
+
+  assert.equal(auth.authorized, true);
+  assert.equal(auth.allocationOrigin, 'FRONTIER_CANARY');
+  assert.equal(auth.country, 'AU');
+  assert.ok(auth.targetNeighborhoodDimensions);
+  assert.equal(createNeighborhoodKey(auth.targetNeighborhoodDimensions!), 'au|en|general|asx|keyword_search|relevance|none|automated_query');
 });
 
 test('getFrontierAllocationDiagnostics and getFrontierAllocationControlComparison return structured diagnostics', async () => {
