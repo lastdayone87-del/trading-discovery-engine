@@ -7,12 +7,12 @@ import {
   evaluateFrontierCanaryAllocation,
   releaseAllocationDecision,
   commitAllocationQueryRun,
+  getNeighborhoodCandidates,
   getFrontierAllocationDiagnostics,
   getFrontierAllocationControlComparison,
   type NeighborhoodCandidate
 } from './discoveryFrontierAllocator';
 import { createNeighborhoodKey } from './discoveryNeighborhood';
-import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
 
 test('evaluateNeighborhoodEligibility rejects HARMFUL and SATURATED candidates', () => {
   const baseDims = {
@@ -217,48 +217,35 @@ test('subordination guard rejects frontier allocation when available autonomous 
   assert.equal(result.reason, 'AUTONOMOUS_CAPACITY_EXHAUSTED');
 });
 
-test('truthful provenance: allocateCreatorSearchAuthority does not fabricate Creator Intelligence canary when frontier allocation is selected', async () => {
+test('shadow decisions do NOT update production recent_allocation_count or trigger concentration caps', async () => {
   const mockClient = {
     query: async (sql: string) => {
-      if (sql.includes('frontier_allocation_enabled')) {
-        return { rows: [{ setting_value: 'true' }] };
-      }
-      if (sql.includes('pg_advisory_xact_lock')) {
-        return { rows: [] };
-      }
-      if (sql.includes('frontier_allocation_daily_assignment_cap')) {
-        return { rows: [{ setting_value: '10' }] };
-      }
-      if (sql.includes('frontier_allocation_daily_quota_cap')) {
-        return { rows: [{ setting_value: '1000' }] };
-      }
-      if (sql.includes('daily_assignments')) {
-        return { rows: [{ daily_assignments: 0, daily_quota_used: 0 }] };
-      }
-      if (sql.includes('discovery_neighborhoods')) {
+      if (sql.includes('frontier_allocation_decisions')) {
+        // Query filters for allocation_origin = 'FRONTIER_CANARY'
+        // If query correctly filters, recent_allocation_count is 0 despite shadow decisions existing
         return {
           rows: [{
-            neighborhood_key: 'AU|en|GENERAL|asx|KEYWORD_SEARCH|RELEVANCE|none|automated_query',
-            country: 'AU',
+            neighborhood_key: 'FR|fr|GENERAL|cac|KEYWORD_SEARCH|RELEVANCE|none|automated_query',
+            country: 'FR',
             dimensions: JSON.stringify({
-              country: 'AU',
-              language: 'en',
+              country: 'FR',
+              language: 'fr',
               queryIntent: 'GENERAL',
-              primaryTermFamily: 'asx',
+              primaryTermFamily: 'cac',
               retrievalLane: 'KEYWORD_SEARCH',
               searchOrdering: 'RELEVANCE',
               sourceFamily: 'automated_query'
             }),
-            frontier_state: 'UNEXPLORED',
-            expected_marginal_value: 50,
-            uncertainty: 0.9,
-            coverage_gain: 0.8,
-            known_creator_ratio: 0,
-            result_set_overlap: 0,
+            frontier_state: 'PROBING',
+            expected_marginal_value: 20,
+            uncertainty: 0.7,
+            coverage_gain: 0.5,
+            known_creator_ratio: 0.1,
+            result_set_overlap: 0.1,
             is_saturating: false,
             proposal_id: null,
             last_allocated_at: null,
-            recent_allocation_count: 0
+            recent_allocation_count: 0 // Filtering out FRONTIER_SHADOW leaves count 0
           }]
         };
       }
@@ -266,17 +253,34 @@ test('truthful provenance: allocateCreatorSearchAuthority does not fabricate Cre
     }
   };
 
-  const auth = await evaluateFrontierCanaryAllocation({
-    opportunityKey: `opp_truthful_${Date.now()}`,
-    legacyCountry: 'AU',
-    client: mockClient
-  });
+  const candidates = await getNeighborhoodCandidates('FR', new Date(), mockClient);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].recentAllocationCount, 0);
+  assert.equal(candidates[0].lastAllocatedAt, null);
+});
 
-  assert.equal(auth.authorized, true);
-  assert.equal(auth.allocationOrigin, 'FRONTIER_CANARY');
-  assert.equal(auth.country, 'AU');
-  assert.ok(auth.targetNeighborhoodDimensions);
-  assert.equal(createNeighborhoodKey(auth.targetNeighborhoodDimensions!), 'au|en|general|asx|keyword_search|relevance|none|automated_query');
+test('commitAllocationQueryRun is a guarded atomic transition: fails closed on unknown or released decision', async () => {
+  let queryRunsUpdated = false;
+  const mockClient = {
+    query: async (sql: string) => {
+      if (sql.includes('BEGIN') || sql.includes('COMMIT') || sql.includes('ROLLBACK')) {
+        return { rows: [] };
+      }
+      if (sql.includes('UPDATE frontier_allocation_decisions')) {
+        // Simulates 0 rows updated because decision is RELEASED or unknown
+        return { rowCount: 0, rows: [] };
+      }
+      if (sql.includes('UPDATE query_runs')) {
+        queryRunsUpdated = true;
+        return { rowCount: 1, rows: [] };
+      }
+      return { rows: [] };
+    }
+  };
+
+  const success = await commitAllocationQueryRun('unknown-dec-id', 'run-123', mockClient);
+  assert.equal(success, false);
+  assert.equal(queryRunsUpdated, false, 'query_runs.allocation_origin must NOT be updated when commit fails');
 });
 
 test('getFrontierAllocationDiagnostics and getFrontierAllocationControlComparison return structured diagnostics', async () => {

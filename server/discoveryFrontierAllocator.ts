@@ -226,6 +226,8 @@ export async function getPacificQuotaDayExplorationStatus(
 
 /**
  * Fetches candidate neighborhoods from persistent store and proposals.
+ * Only FRONTIER_CANARY allocations update production concentration and cooldown state.
+ * FRONTIER_SHADOW recommendations have zero effect on production concentration.
  */
 export async function getNeighborhoodCandidates(
   targetCountry?: string,
@@ -279,6 +281,7 @@ export async function getNeighborhoodCandidates(
       FROM frontier_allocation_decisions
       WHERE selected_neighborhood_key = n.neighborhood_key
         AND quota_day = $2
+        AND allocation_origin = 'FRONTIER_CANARY'
         AND decision_status IN ('RESERVED', 'COMMITTED')
     ) recent ON true
     ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3)' : ''}
@@ -785,38 +788,57 @@ export async function markAllocationDecisionDeferred(
 }
 
 /**
- * Commits a reserved allocation decision, linking queryRunId and setting query_runs.allocation_origin = 'FRONTIER_CANARY'.
+ * Commits a reserved allocation decision via a guarded atomic state transition (RESERVED -> COMMITTED).
+ * Requires allocation_origin = 'FRONTIER_CANARY' and decision_status = 'RESERVED'.
+ * Fails closed and returns false if decision was RELEASED/DEFERRED/COMMITTED or unknown.
  */
 export async function commitAllocationQueryRun(
   decisionId: string,
-  queryRunId: string
-): Promise<void> {
-  if (!process.env.DATABASE_URL) return;
-  const db = await getDb();
-  const client = await db.connect();
+  queryRunId: string,
+  clientOverride?: any
+): Promise<boolean> {
+  const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+  if (!runner) return false;
+
+  const client = clientOverride ? null : await (await getDb()).connect();
+  const activeRunner = clientOverride || client;
+
   try {
-    await client.query('BEGIN');
-    const res = await client.query(
+    if (client) await activeRunner.query('BEGIN');
+
+    const res = await activeRunner.query(
       `UPDATE frontier_allocation_decisions
        SET decision_status = 'COMMITTED',
            query_run_id = $2
        WHERE decision_id = $1
-       RETURNING allocation_origin`,
+         AND allocation_origin = 'FRONTIER_CANARY'
+         AND decision_status = 'RESERVED'
+         AND (query_run_id IS NULL OR query_run_id = $2)
+       RETURNING id, allocation_origin`,
       [decisionId, queryRunId]
     );
-    const origin = res.rows[0]?.allocation_origin || 'FRONTIER_CANARY';
-    await client.query(
+
+    if (!res.rowCount) {
+      if (client) await activeRunner.query('ROLLBACK');
+      console.warn(`[FrontierAllocator] Commit rejected: decision ${decisionId} is not an active RESERVED canary decision.`);
+      return false;
+    }
+
+    await activeRunner.query(
       `UPDATE query_runs
-       SET allocation_origin = $2
+       SET allocation_origin = 'FRONTIER_CANARY'
        WHERE id = $1`,
-      [queryRunId, origin]
+      [queryRunId]
     );
-    await client.query('COMMIT');
+
+    if (client) await activeRunner.query('COMMIT');
+    return true;
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
+    if (client) await activeRunner.query('ROLLBACK').catch(() => undefined);
     console.warn('[FrontierAllocator] Failed to commit query run:', error);
+    return false;
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
 
@@ -826,8 +848,8 @@ export async function commitAllocationQueryRun(
 export async function bindAllocationQueryRun(
   decisionId: string,
   queryRunId: string
-): Promise<void> {
-  await commitAllocationQueryRun(decisionId, queryRunId);
+): Promise<boolean> {
+  return commitAllocationQueryRun(decisionId, queryRunId);
 }
 
 /**
