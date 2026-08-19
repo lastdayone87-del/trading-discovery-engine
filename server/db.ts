@@ -653,7 +653,10 @@ export async function scheduleAutonomousQueryRuns(
       const runId = run.rows[0].id;
 
       if (canaryReservationId) {
-        await commitRetrievalCanaryReservation(canaryReservationId, runId, client);
+        const committed = await commitRetrievalCanaryReservation(canaryReservationId, runId, client);
+        if (!committed) {
+          throw new Error(`RETRIEVAL_CANARY_COMMIT_FAILED: Reservation ${canaryReservationId} could not be committed for run ${runId}`);
+        }
       }
 
       // Shadow recommendation recording at scheduling boundary (zero serving authority)

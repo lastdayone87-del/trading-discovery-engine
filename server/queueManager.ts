@@ -30,7 +30,7 @@ import {
   getNeighborhoodForQueryRun
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
-import { reserveIncrementalTreatmentPageQuota } from './retrievalPolicyCanary';
+import { reserveIncrementalTreatmentPageQuota, commitIncrementalTreatmentPageReservation, releaseIncrementalTreatmentPageReservation } from './retrievalPolicyCanary';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
@@ -447,6 +447,8 @@ export async function processNextSearchJob(
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
       if (enabled && decision.shouldContinue && searchPage?.nextPageToken) {
+        let incPageReservationId: string | undefined;
+
         // Incremental Treatment Page Quota Reservation Boundary
         if (retrievalTreatmentOrigin === 'CANARY_TREATMENT' && pageNumber >= 1) {
           const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1 });
@@ -455,19 +457,32 @@ export async function processNextSearchJob(
             await completeJob(job.id);
             return true;
           }
+          incPageReservationId = incRes.pageReservationId;
         }
 
-        await enqueueJob('SEARCH_YOUTUBE', {
-          ...job.payload,
-          pageNumber: pageNumber + 1,
-          pageToken: searchPage.nextPageToken
-        }, {
-          priority: 20,
-          maxAttempts: 3,
-          idempotencyKey: `search-run:${queryRunId}:page:${pageNumber+1}`
-        });
-        await completeJob(job.id);
-        return true;
+        try {
+          await enqueueJob('SEARCH_YOUTUBE', {
+            ...job.payload,
+            pageNumber: pageNumber + 1,
+            pageToken: searchPage.nextPageToken
+          }, {
+            priority: 20,
+            maxAttempts: 3,
+            idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`
+          });
+
+          if (incPageReservationId) {
+            await commitIncrementalTreatmentPageReservation(incPageReservationId);
+          }
+
+          await completeJob(job.id);
+          return true;
+        } catch (enqueueError) {
+          if (incPageReservationId) {
+            await releaseIncrementalTreatmentPageReservation(incPageReservationId, queryRunId);
+          }
+          throw enqueueError;
+        }
       }
       const finalMetrics=await getAutonomousRunMetrics(queryRunId);
       const quotaConsumed=pageNumber*100;

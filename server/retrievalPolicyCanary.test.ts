@@ -4,7 +4,10 @@ import {
   evaluateRetrievalPolicyEligibility,
   deterministicExplorationValue,
   selectLearnedRetrievalConfiguration,
-  reserveRetrievalCanaryTreatment
+  reserveRetrievalCanaryTreatment,
+  reserveIncrementalTreatmentPageQuota,
+  commitIncrementalTreatmentPageReservation,
+  releaseIncrementalTreatmentPageReservation
 } from './retrievalPolicyCanary';
 
 test('deterministicExplorationValue is reproducible for the same seed and differs across seeds', () => {

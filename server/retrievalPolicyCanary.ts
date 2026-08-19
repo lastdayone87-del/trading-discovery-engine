@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { getDb, getDailyYouTubeQuotaBudget } from './db';
+import { getDb, getDailyYouTubeQuotaBudget, getAutonomousSchedulingSnapshot } from './db';
 import { getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
 import type { RetrievalLane } from './retrievalLanes';
 import type { SearchOrdering } from './searchOrdering';
@@ -100,7 +100,7 @@ export function evaluateRetrievalPolicyEligibility(input: {
 /**
  * Evaluates and reserves Phase 9 canary treatment authority under a transaction advisory lock.
  * Concurrency-safe: tracks reserved + committed treatment capacity in the active Pacific quota day.
- * State-aware: prevents state resurrection on retries/restarts.
+ * State-aware: COMMITTED reservations cannot be reused to authorize a second query run.
  */
 export async function reserveRetrievalCanaryTreatment(input: {
   opportunityKey: string;
@@ -168,7 +168,7 @@ export async function reserveRetrievalCanaryTreatment(input: {
 
     const reservationId = `retrieval-res:${input.opportunityKey}:${CURRENT_RETRIEVAL_POLICY_VERSION}`;
 
-    // State-Aware Idempotency Check: Prevent resurrecting COMMITTED, RELEASED, or DEFERRED states
+    // State-Aware Idempotency Check: A COMMITTED reservation belongs to its run and CANNOT authorize a second run!
     const existingRes = await activeRunner.query(
       `SELECT
          reservation_id, opportunity_key, neighborhood_key, query_run_id,
@@ -204,12 +204,30 @@ export async function reserveRetrievalCanaryTreatment(input: {
 
       if (client) await activeRunner.query('COMMIT');
 
-      const isAuthorized = row.reservation_status === 'RESERVED' || row.reservation_status === 'COMMITTED';
+      if (row.reservation_status === 'COMMITTED') {
+        return {
+          authorized: false,
+          reservation: existingReservation,
+          config,
+          reason: `RESERVATION_ALREADY_COMMITTED (queryRunId: ${row.query_run_id})`
+        };
+      }
+
+      if (row.reservation_status === 'RELEASED' || row.reservation_status === 'DEFERRED') {
+        return {
+          authorized: false,
+          reservation: existingReservation,
+          config,
+          reason: `RESERVATION_TERMINAL_STATE (${row.reservation_status})`
+        };
+      }
+
+      // Existing RESERVED status allows continuing the same uncommitted attempt
       return {
-        authorized: isAuthorized,
+        authorized: true,
         reservation: existingReservation,
         config,
-        reason: `RESERVATION_ALREADY_EXISTS (status: ${row.reservation_status})`
+        reason: 'EXISTING_UNCOMMITTED_RESERVATION_REUSED'
       };
     }
 
@@ -353,7 +371,7 @@ export async function releaseRetrievalCanaryReservation(
 /**
  * Atomically reserves incremental treatment page quota for multi-page continuation requests (page 2 / page 3).
  * Idempotent: tied to deterministic (query_run_id, page_number) identity.
- * Verifies global autonomous YouTube quota capacity before authorizing.
+ * Verifies global reservation-aware autonomous capacity before authorizing.
  */
 export async function reserveIncrementalTreatmentPageQuota(input: {
   queryRunId: string;
@@ -362,6 +380,7 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
   clientOverride?: any;
 }): Promise<{
   authorized: boolean;
+  pageReservationId?: string;
   reason: string;
 }> {
   const now = input.now || new Date();
@@ -393,23 +412,26 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
       if (client) await activeRunner.query('COMMIT');
       return {
         authorized: status === 'RESERVED' || status === 'COMMITTED',
+        pageReservationId,
         reason: `PAGE_RESERVATION_ALREADY_EXISTS (status: ${status})`
       };
     }
 
-    // 2. Recheck Global Autonomous Capacity
-    const globalQuotaTracker = await activeRunner.query(
-      `SELECT units_used, daily_limit FROM quota_tracker WHERE id = 'youtube'`
-    );
-    const globalUsed = Number(globalQuotaTracker.rows[0]?.units_used || 0);
-    const globalLimit = Number(globalQuotaTracker.rows[0]?.daily_limit || getDailyYouTubeQuotaBudget());
+    // 2. Recheck Reservation-Aware Global Autonomous Capacity
+    const schedulingSnapshot = await getAutonomousSchedulingSnapshot().catch(() => null);
+    const dailyBudget = getDailyYouTubeQuotaBudget();
+    const autonomousPercent = Number(process.env.DISCOVERY_AUTONOMOUS_QUOTA_PERCENT || '70');
+    const autonomousLimit = Math.floor((dailyBudget * autonomousPercent) / 100);
 
-    if (globalUsed + 100 > globalLimit) {
-      if (client) await activeRunner.query('COMMIT');
-      return {
-        authorized: false,
-        reason: `GLOBAL_AUTONOMOUS_QUOTA_EXHAUSTED (${globalUsed + 100}/${globalLimit})`
-      };
+    if (schedulingSnapshot) {
+      const totalAutonomousUsage = schedulingSnapshot.autonomousUnitsUsed + schedulingSnapshot.autonomousUnitsReserved;
+      if (totalAutonomousUsage + 100 > autonomousLimit) {
+        if (client) await activeRunner.query('COMMIT');
+        return {
+          authorized: false,
+          reason: `GLOBAL_AUTONOMOUS_QUOTA_EXHAUSTED (${totalAutonomousUsage + 100}/${autonomousLimit})`
+        };
+      }
     }
 
     // 3. Read Phase 9 Canary Caps
@@ -449,13 +471,13 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
       };
     }
 
-    // Insert Page Reservation
+    // Insert Page Reservation in RESERVED state first
     await activeRunner.query(
       `INSERT INTO retrieval_canary_page_reservations(
          page_reservation_id, query_run_id, page_number, reservation_status,
          quota_reserved, quota_consumed, quota_day, policy_version, created_at
        )
-       VALUES($1, $2, $3, 'COMMITTED', 100, 0, $4, $5, now())
+       VALUES($1, $2, $3, 'RESERVED', 100, 0, $4, $5, now())
        ON CONFLICT(page_reservation_id) DO NOTHING`,
       [
         pageReservationId,
@@ -475,7 +497,11 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
     );
 
     if (client) await activeRunner.query('COMMIT');
-    return { authorized: true, reason: 'INCREMENTAL_CANARY_QUOTA_AUTHORIZED' };
+    return {
+      authorized: true,
+      pageReservationId,
+      reason: 'INCREMENTAL_CANARY_QUOTA_RESERVED'
+    };
   } catch (err) {
     if (client) await activeRunner.query('ROLLBACK').catch(() => undefined);
     return {
@@ -488,31 +514,74 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
 }
 
 /**
- * Releases an incremental page reservation if continuation job enqueueing fails.
+ * Commits an incremental page reservation after job enqueue succeeds.
  */
-export async function releaseIncrementalTreatmentPageReservation(
-  queryRunId: string,
-  pageNumber: number,
+export async function commitIncrementalTreatmentPageReservation(
+  pageReservationId: string,
   clientOverride?: any
 ): Promise<boolean> {
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return false;
 
-  const pageReservationId = `inc-page-res:${queryRunId}:${pageNumber}:${CURRENT_RETRIEVAL_POLICY_VERSION}`;
-
   const res = await runner.query(
     `UPDATE retrieval_canary_page_reservations
-     SET reservation_status = 'RELEASED',
-         quota_reserved = 0
+     SET reservation_status = 'COMMITTED'
      WHERE page_reservation_id = $1
-       AND reservation_status IN ('RESERVED', 'COMMITTED')`,
+       AND reservation_status = 'RESERVED'`,
     [pageReservationId]
   ).catch((err: unknown) => {
-    console.warn('[RetrievalPolicyCanary] Failed to release page reservation:', err);
+    console.warn('[RetrievalPolicyCanary] Failed to commit page reservation:', err);
     return { rowCount: 0 };
   });
 
   return (res?.rowCount ?? 0) > 0;
+}
+
+/**
+ * Releases an incremental page reservation and reconciles parent reservation quota if continuation job enqueueing fails.
+ */
+export async function releaseIncrementalTreatmentPageReservation(
+  pageReservationId: string,
+  queryRunId: string,
+  clientOverride?: any
+): Promise<boolean> {
+  const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+  if (!runner) return false;
+
+  const client = clientOverride ? null : await (await getDb()).connect();
+  const activeRunner = clientOverride || client;
+
+  try {
+    if (client) await activeRunner.query('BEGIN');
+
+    const res = await activeRunner.query(
+      `UPDATE retrieval_canary_page_reservations
+       SET reservation_status = 'RELEASED',
+           quota_reserved = 0
+       WHERE page_reservation_id = $1
+         AND reservation_status IN ('RESERVED', 'COMMITTED')
+       RETURNING query_run_id`,
+      [pageReservationId]
+    );
+
+    if (res.rowCount > 0) {
+      await activeRunner.query(
+        `UPDATE retrieval_canary_reservations
+         SET quota_reserved = GREATEST(100, quota_reserved - 100)
+         WHERE query_run_id = $1 AND reservation_status IN ('RESERVED', 'COMMITTED')`,
+        [queryRunId]
+      );
+    }
+
+    if (client) await activeRunner.query('COMMIT');
+    return (res?.rowCount ?? 0) > 0;
+  } catch (err) {
+    if (client) await activeRunner.query('ROLLBACK').catch(() => undefined);
+    console.warn('[RetrievalPolicyCanary] Failed to release page reservation:', err);
+    return false;
+  } finally {
+    if (client) client.release();
+  }
 }
 
 /**
