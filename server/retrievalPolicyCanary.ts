@@ -417,21 +417,40 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
       };
     }
 
-    // 2. Recheck Reservation-Aware Global Autonomous Capacity
-    const schedulingSnapshot = await getAutonomousSchedulingSnapshot().catch(() => null);
+    // 2. Recheck Reservation-Aware Global Autonomous Capacity (Fail Closed on Error)
+    let schedulingSnapshot;
+    try {
+      schedulingSnapshot = await getAutonomousSchedulingSnapshot();
+    } catch (snapshotErr) {
+      if (client) await activeRunner.query('COMMIT');
+      return {
+        authorized: false,
+        reason: `GLOBAL_AUTONOMOUS_SNAPSHOT_UNAVAILABLE: ${snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr)}`
+      };
+    }
+
     const dailyBudget = getDailyYouTubeQuotaBudget();
     const autonomousPercent = Number(process.env.DISCOVERY_AUTONOMOUS_QUOTA_PERCENT || '70');
     const autonomousLimit = Math.floor((dailyBudget * autonomousPercent) / 100);
 
-    if (schedulingSnapshot) {
-      const totalAutonomousUsage = schedulingSnapshot.autonomousUnitsUsed + schedulingSnapshot.autonomousUnitsReserved;
-      if (totalAutonomousUsage + 100 > autonomousLimit) {
-        if (client) await activeRunner.query('COMMIT');
-        return {
-          authorized: false,
-          reason: `GLOBAL_AUTONOMOUS_QUOTA_EXHAUSTED (${totalAutonomousUsage + 100}/${autonomousLimit})`
-        };
-      }
+    // Account for live Phase 9 page reservations under advisory lock
+    const livePageRes = await activeRunner.query(
+      `SELECT COALESCE(SUM(quota_reserved), 0)::int AS live_inc_page_quota
+       FROM retrieval_canary_page_reservations
+       WHERE quota_day = $1
+         AND reservation_status IN ('RESERVED', 'COMMITTED')`,
+      [quotaDay]
+    );
+
+    const liveIncPageQuota = Number(livePageRes.rows[0]?.live_inc_page_quota || 0);
+    const totalAutonomousUsage = schedulingSnapshot.autonomousUnitsUsed + schedulingSnapshot.autonomousUnitsReserved + liveIncPageQuota;
+
+    if (totalAutonomousUsage + 100 > autonomousLimit) {
+      if (client) await activeRunner.query('COMMIT');
+      return {
+        authorized: false,
+        reason: `GLOBAL_AUTONOMOUS_QUOTA_EXHAUSTED (${totalAutonomousUsage + 100}/${autonomousLimit})`
+      };
     }
 
     // 3. Read Phase 9 Canary Caps
@@ -554,12 +573,13 @@ export async function releaseIncrementalTreatmentPageReservation(
   try {
     if (client) await activeRunner.query('BEGIN');
 
+    // Only RESERVED page reservations can be released on enqueue failure; COMMITTED reservations are preserved
     const res = await activeRunner.query(
       `UPDATE retrieval_canary_page_reservations
        SET reservation_status = 'RELEASED',
            quota_reserved = 0
        WHERE page_reservation_id = $1
-         AND reservation_status IN ('RESERVED', 'COMMITTED')
+         AND reservation_status = 'RESERVED'
        RETURNING query_run_id`,
       [pageReservationId]
     );

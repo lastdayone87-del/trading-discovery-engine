@@ -70,3 +70,9 @@ test('evaluateRetrievalPolicyEligibility rejects HARMFUL and SATURATED neighborh
   assert.equal(active.maxPageDepthCeiling, 3);
   assert.deepEqual(active.allowedOrderings, ['RELEVANCE', 'DATE']);
 });
+
+test('releaseIncrementalTreatmentPageReservation does NOT revert COMMITTED page reservations', async () => {
+  // Offline DB runner shim
+  const released = await releaseIncrementalTreatmentPageReservation('inc-page-res:run_1:2:v1', 'run_1');
+  assert.equal(released, false);
+});
