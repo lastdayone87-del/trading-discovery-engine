@@ -752,17 +752,19 @@ export async function evaluateFrontierCanaryAllocation(input: {
 }
 
 /**
- * Releases a reserved allocation decision, zeroing reserved quota and freeing canary capacity.
+ * Releases a reserved allocation decision via an atomic RESERVED -> RELEASED transition.
+ * Requires allocation_origin = 'FRONTIER_CANARY' and decision_status = 'RESERVED'.
+ * Fails closed and returns false if decision was COMMITTED, RELEASED, DEFERRED, or unknown.
  */
 export async function releaseAllocationDecision(
   decisionId: string,
   reason: string,
-  client?: any
-): Promise<void> {
-  const runner = client || (process.env.DATABASE_URL ? await getDb() : null);
-  if (!runner) return;
+  clientOverride?: any
+): Promise<boolean> {
+  const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+  if (!runner) return false;
 
-  await runner.query(
+  const res = await runner.query(
     `UPDATE frontier_allocation_decisions
      SET decision_status = 'RELEASED',
          deferred = true,
@@ -772,9 +774,16 @@ export async function releaseAllocationDecision(
            '{releaseReason}',
            to_jsonb($2::text)
          )
-     WHERE decision_id = $1`,
+     WHERE decision_id = $1
+       AND allocation_origin = 'FRONTIER_CANARY'
+       AND decision_status = 'RESERVED'`,
     [decisionId, reason]
-  ).catch((error: unknown) => console.warn('[FrontierAllocator] Failed to release allocation decision:', error));
+  ).catch((error: unknown) => {
+    console.warn('[FrontierAllocator] Failed to release allocation decision:', error);
+    return { rowCount: 0 };
+  });
+
+  return (res?.rowCount ?? 0) > 0;
 }
 
 /**
@@ -782,15 +791,16 @@ export async function releaseAllocationDecision(
  */
 export async function markAllocationDecisionDeferred(
   decisionId: string,
-  reason: string
-): Promise<void> {
-  await releaseAllocationDecision(decisionId, reason);
+  reason: string,
+  clientOverride?: any
+): Promise<boolean> {
+  return releaseAllocationDecision(decisionId, reason, clientOverride);
 }
 
 /**
  * Commits a reserved allocation decision via a guarded atomic state transition (RESERVED -> COMMITTED).
  * Requires allocation_origin = 'FRONTIER_CANARY' and decision_status = 'RESERVED'.
- * Fails closed and returns false if decision was RELEASED/DEFERRED/COMMITTED or unknown.
+ * Fails closed and returns false if decision was RELEASED, DEFERRED, COMMITTED, or unknown.
  */
 export async function commitAllocationQueryRun(
   decisionId: string,
@@ -847,9 +857,10 @@ export async function commitAllocationQueryRun(
  */
 export async function bindAllocationQueryRun(
   decisionId: string,
-  queryRunId: string
+  queryRunId: string,
+  clientOverride?: any
 ): Promise<boolean> {
-  return commitAllocationQueryRun(decisionId, queryRunId);
+  return commitAllocationQueryRun(decisionId, queryRunId, clientOverride);
 }
 
 /**

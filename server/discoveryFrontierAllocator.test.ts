@@ -221,8 +221,6 @@ test('shadow decisions do NOT update production recent_allocation_count or trigg
   const mockClient = {
     query: async (sql: string) => {
       if (sql.includes('frontier_allocation_decisions')) {
-        // Query filters for allocation_origin = 'FRONTIER_CANARY'
-        // If query correctly filters, recent_allocation_count is 0 despite shadow decisions existing
         return {
           rows: [{
             neighborhood_key: 'FR|fr|GENERAL|cac|KEYWORD_SEARCH|RELEVANCE|none|automated_query',
@@ -239,13 +237,13 @@ test('shadow decisions do NOT update production recent_allocation_count or trigg
             frontier_state: 'PROBING',
             expected_marginal_value: 20,
             uncertainty: 0.7,
-            coverage_gain: 0.5,
+            coverageGain: 0.5,
             known_creator_ratio: 0.1,
             result_set_overlap: 0.1,
             is_saturating: false,
             proposal_id: null,
             last_allocated_at: null,
-            recent_allocation_count: 0 // Filtering out FRONTIER_SHADOW leaves count 0
+            recent_allocation_count: 0
           }]
         };
       }
@@ -259,6 +257,32 @@ test('shadow decisions do NOT update production recent_allocation_count or trigg
   assert.equal(candidates[0].lastAllocatedAt, null);
 });
 
+test('releaseAllocationDecision is a guarded atomic transition: fails closed on COMMITTED or unknown decision', async () => {
+  const mockClientSuccess = {
+    query: async (sql: string) => {
+      if (sql.includes('UPDATE frontier_allocation_decisions')) {
+        return { rowCount: 1, rows: [] };
+      }
+      return { rows: [] };
+    }
+  };
+
+  const mockClientFailure = {
+    query: async (sql: string) => {
+      if (sql.includes('UPDATE frontier_allocation_decisions')) {
+        return { rowCount: 0, rows: [] };
+      }
+      return { rows: [] };
+    }
+  };
+
+  const relSuccess = await releaseAllocationDecision('reserved-dec-id', 'test release', mockClientSuccess);
+  assert.equal(relSuccess, true);
+
+  const relFail = await releaseAllocationDecision('committed-dec-id', 'test release', mockClientFailure);
+  assert.equal(relFail, false, 'COMMITTED or unknown decision release must return false');
+});
+
 test('commitAllocationQueryRun is a guarded atomic transition: fails closed on unknown or released decision', async () => {
   let queryRunsUpdated = false;
   const mockClient = {
@@ -267,7 +291,6 @@ test('commitAllocationQueryRun is a guarded atomic transition: fails closed on u
         return { rows: [] };
       }
       if (sql.includes('UPDATE frontier_allocation_decisions')) {
-        // Simulates 0 rows updated because decision is RELEASED or unknown
         return { rowCount: 0, rows: [] };
       }
       if (sql.includes('UPDATE query_runs')) {
