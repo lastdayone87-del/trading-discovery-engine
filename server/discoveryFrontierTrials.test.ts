@@ -61,6 +61,9 @@ test('Phase 7: Fail Closed Gate - Rejects trial when operator kill switch read f
 test('Phase 7: Fail Closed Gate - Rejects trial when target neighborhood frontier state verification errors', async () => {
   const mockClientError = {
     query: async (sql: string) => {
+      if (sql.includes('app_settings')) {
+        return { rows: [{ setting_value: 'true' }] };
+      }
       if (sql.includes('discovery_neighborhood_frontier_states')) {
         throw new Error('Database connection reset during state verification');
       }

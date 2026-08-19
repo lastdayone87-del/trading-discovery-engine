@@ -20,6 +20,7 @@ import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminol
 import { executeProviderCall } from './providerResilience';
 import { appendProviderCallEvent } from './db';
 import { getPublishedOrganicQueryCandidates } from './organicQueryExpansion';
+import type { DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -297,9 +298,14 @@ Return ONLY a valid JSON object with format:
  * Selects the next search query for a country using Multi-Armed Bandit (UCB1)
  * balancing exploitation (PROVEN) vs exploration (EXPERIMENTAL) with intent rotation.
  */
-export async function selectNextQueryForCountry(country: string): Promise<{
+export async function selectNextQueryForCountry(
+  country: string,
+  options: {
+    targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
+  } = {}
+): Promise<{
   queryRecord: QueryRecord;
-  selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION';
+  selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' | 'NEIGHBORHOOD_TARGETED';
   reason: string;
 }> {
   const now = new Date();
@@ -361,14 +367,40 @@ export async function selectNextQueryForCountry(country: string): Promise<{
   // Sort by UCB score descending
   scoredQueries.sort((a, b) => (b.ucb_score || 0) - (a.ucb_score || 0));
 
+  let selected: QueryRecord | null = null;
+  let strategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' | 'NEIGHBORHOOD_TARGETED' = 'UCB1_EXPLOITATION';
+  let reason = '';
+
+  // Targeted Frontier Neighborhood Selection (if provided)
+  if (options.targetNeighborhoodDimensions) {
+    const target = options.targetNeighborhoodDimensions;
+    const targetTerm = (target.primaryTermFamily || '').toLowerCase();
+    const targetIntent = (target.queryIntent || '').toLowerCase();
+
+    const matches = scoredQueries.filter(q => {
+      const pTerm = (q.primary_term || q.query || '').toLowerCase();
+      const qIntent = (q.intent || '').toLowerCase();
+      return (targetTerm && pTerm.includes(targetTerm)) || (targetIntent && qIntent === targetIntent);
+    });
+
+    if (matches.length > 0) {
+      selected = matches[0];
+      strategy = 'NEIGHBORHOOD_TARGETED';
+      reason = `Frontier neighborhood target selection for family "${target.primaryTermFamily}" and intent "${target.queryIntent}": ${selected.query} (UCB ${selected.ucb_score}).`;
+    } else {
+      const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION');
+      if (generated.length > 0) {
+        selected = generated[0];
+        strategy = 'NEIGHBORHOOD_TARGETED';
+        reason = `Generated new candidate query for targeted frontier neighborhood family "${target.primaryTermFamily}": ${selected.query}.`;
+      }
+    }
+  }
+
   // Explicitly configured exploration prevents permanent overfitting to winners.
   const isExploration = Math.random() < explorationRatio;
 
-  let selected: QueryRecord | null = null;
-  let strategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' = 'UCB1_EXPLOITATION';
-  let reason = '';
-
-  if (isExploration) {
+  if (!selected && isExploration) {
     // Pick an EXPERIMENTAL query with highest UCB or generate a new candidate
     const experimental = scoredQueries
       .filter(q => q.collection === 'EXPERIMENTAL')

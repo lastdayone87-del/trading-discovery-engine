@@ -122,8 +122,11 @@ export async function evaluateTrialGate(
   // 3. Neighborhood Eligibility Check (Fail Closed)
   if (row.target_neighborhood_key) {
     try {
-      const stateRecord = await getNeighborhoodFrontierState(row.target_neighborhood_key);
-      if (stateRecord && stateRecord.state === 'HARMFUL') {
+      const stateRes = await db.query(
+        `SELECT state FROM discovery_neighborhood_frontier_states WHERE neighborhood_key = $1`,
+        [row.target_neighborhood_key]
+      );
+      if (stateRes.rows.length > 0 && stateRes.rows[0].state === 'HARMFUL') {
         return { eligible: false, reason: 'Target neighborhood is classified as HARMFUL.' };
       }
     } catch (error) {
