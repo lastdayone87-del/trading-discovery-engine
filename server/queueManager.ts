@@ -409,7 +409,9 @@ export async function processNextSearchJob(
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const globalMaxPages = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')));
-      const maxPages = Math.min(requestedPageDepth ?? 1, globalMaxPages);
+      const maxPages = retrievalTreatmentOrigin === 'CANARY_TREATMENT'
+        ? Math.min(requestedPageDepth ?? 1, globalMaxPages)
+        : globalMaxPages;
       const maxLow = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_low_yield_pages', '2')));
       const prior = await getAutonomousContinuationState(queryRunId, pageNumber);
       const decision = evaluateContinuation({

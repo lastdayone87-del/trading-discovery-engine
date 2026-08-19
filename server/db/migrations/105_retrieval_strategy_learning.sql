@@ -36,7 +36,24 @@ CREATE INDEX IF NOT EXISTS idx_retrieval_res_status ON retrieval_canary_reservat
 CREATE INDEX IF NOT EXISTS idx_retrieval_res_run ON retrieval_canary_reservations(query_run_id);
 CREATE INDEX IF NOT EXISTS idx_retrieval_res_neigh ON retrieval_canary_reservations(neighborhood_key);
 
--- 3. Shadow retrieval policy recommendations (Zero serving authority)
+-- 3. Incremental treatment page reservations (idempotent per query run + page number)
+CREATE TABLE IF NOT EXISTS retrieval_canary_page_reservations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  page_reservation_id TEXT UNIQUE NOT NULL,
+  query_run_id UUID NOT NULL REFERENCES query_runs(id) ON DELETE CASCADE,
+  page_number INTEGER NOT NULL CHECK (page_number BETWEEN 2 AND 3),
+  reservation_status TEXT NOT NULL DEFAULT 'RESERVED' CHECK (reservation_status IN ('RESERVED', 'COMMITTED', 'RELEASED')),
+  quota_reserved INTEGER NOT NULL DEFAULT 100,
+  quota_consumed INTEGER NOT NULL DEFAULT 0,
+  quota_day TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_page_res_run ON retrieval_canary_page_reservations(query_run_id);
+CREATE INDEX IF NOT EXISTS idx_retrieval_page_res_day ON retrieval_canary_page_reservations(quota_day);
+
+-- 4. Shadow retrieval policy recommendations (Zero serving authority)
 CREATE TABLE IF NOT EXISTS retrieval_policy_shadow_recommendations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   opportunity_key TEXT NOT NULL,
@@ -58,7 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_shadow_retrieval_rec_run ON retrieval_policy_shad
 CREATE INDEX IF NOT EXISTS idx_shadow_retrieval_rec_neigh ON retrieval_policy_shadow_recommendations(neighborhood_key);
 CREATE INDEX IF NOT EXISTS idx_shadow_retrieval_rec_time ON retrieval_policy_shadow_recommendations(created_at);
 
--- 4. Derived, idempotent aggregate retrieval-policy neighborhood evidence table
+-- 5. Derived, idempotent aggregate retrieval-policy neighborhood evidence table
 CREATE TABLE IF NOT EXISTS retrieval_policy_neighborhood_evidence (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   neighborhood_key TEXT NOT NULL REFERENCES discovery_neighborhoods(neighborhood_key) ON DELETE CASCADE,
@@ -83,7 +100,7 @@ CREATE TABLE IF NOT EXISTS retrieval_policy_neighborhood_evidence (
 CREATE INDEX IF NOT EXISTS idx_retrieval_evidence_neigh ON retrieval_policy_neighborhood_evidence(neighborhood_key);
 CREATE INDEX IF NOT EXISTS idx_retrieval_evidence_config ON retrieval_policy_neighborhood_evidence(config_key);
 
--- 5. Extend query_runs and autonomous_query_page_observations with config identity and treatment origin
+-- 6. Extend query_runs and autonomous_query_page_observations with config identity and treatment origin
 ALTER TABLE query_runs
   ADD COLUMN IF NOT EXISTS retrieval_config_key TEXT,
   ADD COLUMN IF NOT EXISTS retrieval_treatment_origin TEXT DEFAULT 'CONTROL';

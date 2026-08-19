@@ -591,12 +591,41 @@ export async function scheduleAutonomousQueryRuns(
         candidate.query
       );
 
+      const oppKey = candidate.frontierDecisionId || (candidate.allocationProvenance?.assignmentKey ? String(candidate.allocationProvenance.assignmentKey) : `opp:q${candidate.query.id}:strat_${candidate.strategy}:n${candidate.query.times_executed || 0}`);
+
+      // Query actual Phase 8 neighborhood frontier state and saturation evidence
+      const fsRes = await client.query(
+        `SELECT
+           COALESCE(fs.state, 'UNEXPLORED') AS frontier_state,
+           COALESCE(obs.known_creator_ratio, 0)::float AS known_creator_ratio,
+           COALESCE(obs.result_set_overlap, 0)::float AS result_set_overlap,
+           COALESCE((fs.evidence->>'isSaturating')::boolean, false) AS is_saturating
+         FROM discovery_neighborhoods dn
+         LEFT JOIN discovery_neighborhood_frontier_states fs ON fs.neighborhood_key = dn.neighborhood_key
+         LEFT JOIN LATERAL (
+           SELECT known_creator_ratio, result_set_overlap
+           FROM neighborhood_observations
+           WHERE neighborhood_key = dn.neighborhood_key
+           ORDER BY observed_at DESC LIMIT 1
+         ) obs ON true
+         WHERE dn.neighborhood_key = $1`,
+        [neighborhood.neighborhoodKey]
+      );
+
+      const frontierState = fsRes.rows[0]?.frontier_state || 'UNEXPLORED';
+      const isSaturating = Boolean(fsRes.rows[0]?.is_saturating) || (
+        Number(fsRes.rows[0]?.result_set_overlap || 0) >= 0.85 &&
+        Number(fsRes.rows[0]?.known_creator_ratio || 0) >= 0.85
+      );
+
       // Phase 9 Canary Treatment Reservation under transaction advisory lock
       const canaryTreatment = await reserveRetrievalCanaryTreatment({
-        opportunityKey: candidate.frontierDecisionId || `opp:${candidate.query.id}:${new Date().toISOString()}`,
+        opportunityKey: oppKey,
         neighborhoodKey: neighborhood.neighborhoodKey,
         retrievalLane: controlRetrievalLane,
         defaultOrdering: controlSearchOrdering,
+        frontierState,
+        isSaturating,
         clientOverride: client
       });
 

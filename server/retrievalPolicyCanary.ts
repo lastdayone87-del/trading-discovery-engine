@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { getDb } from './db';
+import { getDb, getDailyYouTubeQuotaBudget } from './db';
 import { getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
 import type { RetrievalLane } from './retrievalLanes';
 import type { SearchOrdering } from './searchOrdering';
@@ -100,6 +100,7 @@ export function evaluateRetrievalPolicyEligibility(input: {
 /**
  * Evaluates and reserves Phase 9 canary treatment authority under a transaction advisory lock.
  * Concurrency-safe: tracks reserved + committed treatment capacity in the active Pacific quota day.
+ * State-aware: prevents state resurrection on retries/restarts.
  */
 export async function reserveRetrievalCanaryTreatment(input: {
   opportunityKey: string;
@@ -146,6 +147,72 @@ export async function reserveRetrievalCanaryTreatment(input: {
     // Concurrency advisory lock for Phase 9 canary authority
     await activeRunner.query('SELECT pg_advisory_xact_lock(741963287)');
 
+    // Select learned configuration deterministically first
+    const learned = await selectLearnedRetrievalConfiguration({
+      opportunityKey: input.opportunityKey,
+      neighborhoodKey: input.neighborhoodKey,
+      retrievalLane: input.retrievalLane,
+      defaultOrdering: input.defaultOrdering,
+      frontierState: input.frontierState,
+      isSaturating: input.isSaturating,
+      clientOverride: activeRunner
+    });
+
+    if (!learned.eligibility.eligible) {
+      if (client) await activeRunner.query('COMMIT');
+      return {
+        authorized: false,
+        reason: `INELIGIBLE_NEIGHBORHOOD: ${learned.eligibility.rejectionReasons.join(', ')}`
+      };
+    }
+
+    const reservationId = `retrieval-res:${input.opportunityKey}:${CURRENT_RETRIEVAL_POLICY_VERSION}`;
+
+    // State-Aware Idempotency Check: Prevent resurrecting COMMITTED, RELEASED, or DEFERRED states
+    const existingRes = await activeRunner.query(
+      `SELECT
+         reservation_id, opportunity_key, neighborhood_key, query_run_id,
+         reservation_status, quota_reserved, quota_consumed, quota_day,
+         policy_version, retrieval_config_key, created_at
+       FROM retrieval_canary_reservations
+       WHERE reservation_id = $1`,
+      [reservationId]
+    );
+
+    if (existingRes.rows.length > 0) {
+      const row = existingRes.rows[0];
+      const configKey = row.retrieval_config_key || learned.config.configKey;
+      const config = buildRetrievalConfiguration({
+        searchOrdering: learned.config.searchOrdering,
+        retrievalLane: learned.config.retrievalLane,
+        requestedPageDepth: learned.config.requestedPageDepth
+      });
+
+      const existingReservation: CanaryTreatmentReservation = {
+        reservationId: row.reservation_id,
+        opportunityKey: row.opportunity_key,
+        neighborhoodKey: row.neighborhood_key,
+        queryRunId: row.query_run_id,
+        reservationStatus: row.reservation_status,
+        quotaReserved: Number(row.quota_reserved || 100),
+        quotaConsumed: Number(row.quota_consumed || 0),
+        quotaDay: row.quota_day,
+        policyVersion: row.policy_version,
+        config,
+        createdAt: row.created_at
+      };
+
+      if (client) await activeRunner.query('COMMIT');
+
+      const isAuthorized = row.reservation_status === 'RESERVED' || row.reservation_status === 'COMMITTED';
+      return {
+        authorized: isAuthorized,
+        reservation: existingReservation,
+        config,
+        reason: `RESERVATION_ALREADY_EXISTS (status: ${row.reservation_status})`
+      };
+    }
+
     // Read Configurable Caps
     const [assignCapRes, quotaCapRes] = await Promise.all([
       activeRunner.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'retrieval_canary_daily_assignment_cap'`),
@@ -176,28 +243,7 @@ export async function reserveRetrievalCanaryTreatment(input: {
       };
     }
 
-    // Select learned configuration deterministically
-    const learned = await selectLearnedRetrievalConfiguration({
-      opportunityKey: input.opportunityKey,
-      neighborhoodKey: input.neighborhoodKey,
-      retrievalLane: input.retrievalLane,
-      defaultOrdering: input.defaultOrdering,
-      frontierState: input.frontierState,
-      isSaturating: input.isSaturating,
-      clientOverride: activeRunner
-    });
-
-    if (!learned.eligibility.eligible) {
-      if (client) await activeRunner.query('COMMIT');
-      return {
-        authorized: false,
-        reason: `INELIGIBLE_NEIGHBORHOOD: ${learned.eligibility.rejectionReasons.join(', ')}`
-      };
-    }
-
     await ensureRetrievalConfigurationPersisted(learned.config, activeRunner);
-
-    const reservationId = `retrieval-res:${input.opportunityKey}:${learned.config.configKey}:${CURRENT_RETRIEVAL_POLICY_VERSION}`;
 
     const reservation: CanaryTreatmentReservation = {
       reservationId,
@@ -218,8 +264,7 @@ export async function reserveRetrievalCanaryTreatment(input: {
          quota_reserved, quota_consumed, quota_day, policy_version, retrieval_config_key, created_at
        )
        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       ON CONFLICT(reservation_id) DO UPDATE SET
-         reservation_status = EXCLUDED.reservation_status`,
+       ON CONFLICT(reservation_id) DO NOTHING`,
       [
         reservation.reservationId,
         reservation.opportunityKey,
@@ -306,8 +351,9 @@ export async function releaseRetrievalCanaryReservation(
 }
 
 /**
- * Atomically reserves incremental treatment quota for multi-page continuation requests (page 2 / page 3).
- * Enforces treatment quota caps before the continuation job is created.
+ * Atomically reserves incremental treatment page quota for multi-page continuation requests (page 2 / page 3).
+ * Idempotent: tied to deterministic (query_run_id, page_number) identity.
+ * Verifies global autonomous YouTube quota capacity before authorizing.
  */
 export async function reserveIncrementalTreatmentPageQuota(input: {
   queryRunId: string;
@@ -320,6 +366,7 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
 }> {
   const now = input.now || new Date();
   const quotaDay = getYouTubeQuotaDay(now);
+  const pageReservationId = `inc-page-res:${input.queryRunId}:${input.pageNumber}:${CURRENT_RETRIEVAL_POLICY_VERSION}`;
 
   const runner = input.clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return { authorized: false, reason: 'DATABASE_UNAVAILABLE' };
@@ -333,6 +380,39 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
     // Concurrency advisory lock for Phase 9 canary authority
     await activeRunner.query('SELECT pg_advisory_xact_lock(741963287)');
 
+    // 1. Idempotency Check: Return authorized if page reservation already exists for this queryRunId + pageNumber
+    const existingPageRes = await activeRunner.query(
+      `SELECT reservation_status
+       FROM retrieval_canary_page_reservations
+       WHERE page_reservation_id = $1`,
+      [pageReservationId]
+    );
+
+    if (existingPageRes.rows.length > 0) {
+      const status = existingPageRes.rows[0].reservation_status;
+      if (client) await activeRunner.query('COMMIT');
+      return {
+        authorized: status === 'RESERVED' || status === 'COMMITTED',
+        reason: `PAGE_RESERVATION_ALREADY_EXISTS (status: ${status})`
+      };
+    }
+
+    // 2. Recheck Global Autonomous Capacity
+    const globalQuotaTracker = await activeRunner.query(
+      `SELECT units_used, daily_limit FROM quota_tracker WHERE id = 'youtube'`
+    );
+    const globalUsed = Number(globalQuotaTracker.rows[0]?.units_used || 0);
+    const globalLimit = Number(globalQuotaTracker.rows[0]?.daily_limit || getDailyYouTubeQuotaBudget());
+
+    if (globalUsed + 100 > globalLimit) {
+      if (client) await activeRunner.query('COMMIT');
+      return {
+        authorized: false,
+        reason: `GLOBAL_AUTONOMOUS_QUOTA_EXHAUSTED (${globalUsed + 100}/${globalLimit})`
+      };
+    }
+
+    // 3. Read Phase 9 Canary Caps
     const [quotaCapRes, pageCapRes] = await Promise.all([
       activeRunner.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'retrieval_canary_daily_quota_cap'`),
       activeRunner.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'retrieval_canary_max_additional_pages'`)
@@ -341,6 +421,7 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
     const quotaCap = Number(quotaCapRes.rows[0]?.setting_value ?? 1000);
     const maxAdditionalPages = Number(pageCapRes.rows[0]?.setting_value ?? 5);
 
+    // 4. Count Live Page Reservations + Committed Page Observations Without Double Counting
     const [usageRes, pageRes] = await Promise.all([
       activeRunner.query(
         `SELECT COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
@@ -349,31 +430,47 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
         [quotaDay]
       ),
       activeRunner.query(
-        `SELECT COUNT(*)::int AS extra_pages
-         FROM autonomous_query_page_observations
-         WHERE retrieval_treatment_origin = 'CANARY_TREATMENT'
-           AND page_number > 1
-           AND created_at >= $1`,
-        [getYouTubeQuotaDayStartAt(now)]
+        `SELECT COUNT(*)::int AS extra_pages_reserved
+         FROM retrieval_canary_page_reservations
+         WHERE quota_day = $1
+           AND reservation_status IN ('RESERVED', 'COMMITTED')`,
+        [quotaDay]
       )
     ]);
 
     const dailyQuotaUsed = Number(usageRes.rows[0]?.daily_quota_used || 0);
-    const extraPagesUsed = Number(pageRes.rows[0]?.extra_pages || 0);
+    const extraPagesReserved = Number(pageRes.rows[0]?.extra_pages_reserved || 0);
 
-    if (dailyQuotaUsed + 100 > quotaCap || extraPagesUsed >= maxAdditionalPages) {
+    if (dailyQuotaUsed + 100 > quotaCap || extraPagesReserved >= maxAdditionalPages) {
       if (client) await activeRunner.query('COMMIT');
       return {
         authorized: false,
-        reason: `INCREMENTAL_CANARY_QUOTA_CAP_EXCEEDED (quota: ${dailyQuotaUsed + 100}/${quotaCap}, extra pages: ${extraPagesUsed}/${maxAdditionalPages})`
+        reason: `INCREMENTAL_CANARY_QUOTA_CAP_EXCEEDED (quota: ${dailyQuotaUsed + 100}/${quotaCap}, extra pages: ${extraPagesReserved}/${maxAdditionalPages})`
       };
     }
 
-    // Top-up existing reservation for query run
+    // Insert Page Reservation
+    await activeRunner.query(
+      `INSERT INTO retrieval_canary_page_reservations(
+         page_reservation_id, query_run_id, page_number, reservation_status,
+         quota_reserved, quota_consumed, quota_day, policy_version, created_at
+       )
+       VALUES($1, $2, $3, 'COMMITTED', 100, 0, $4, $5, now())
+       ON CONFLICT(page_reservation_id) DO NOTHING`,
+      [
+        pageReservationId,
+        input.queryRunId,
+        input.pageNumber,
+        quotaDay,
+        CURRENT_RETRIEVAL_POLICY_VERSION
+      ]
+    );
+
+    // Update main reservation quota_reserved
     await activeRunner.query(
       `UPDATE retrieval_canary_reservations
        SET quota_reserved = quota_reserved + 100
-       WHERE query_run_id = $1 AND reservation_status = 'COMMITTED'`,
+       WHERE query_run_id = $1 AND reservation_status IN ('RESERVED', 'COMMITTED')`,
       [input.queryRunId]
     );
 
@@ -388,6 +485,34 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
   } finally {
     if (client) client.release();
   }
+}
+
+/**
+ * Releases an incremental page reservation if continuation job enqueueing fails.
+ */
+export async function releaseIncrementalTreatmentPageReservation(
+  queryRunId: string,
+  pageNumber: number,
+  clientOverride?: any
+): Promise<boolean> {
+  const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+  if (!runner) return false;
+
+  const pageReservationId = `inc-page-res:${queryRunId}:${pageNumber}:${CURRENT_RETRIEVAL_POLICY_VERSION}`;
+
+  const res = await runner.query(
+    `UPDATE retrieval_canary_page_reservations
+     SET reservation_status = 'RELEASED',
+         quota_reserved = 0
+     WHERE page_reservation_id = $1
+       AND reservation_status IN ('RESERVED', 'COMMITTED')`,
+    [pageReservationId]
+  ).catch((err: unknown) => {
+    console.warn('[RetrievalPolicyCanary] Failed to release page reservation:', err);
+    return { rowCount: 0 };
+  });
+
+  return (res?.rowCount ?? 0) > 0;
 }
 
 /**
