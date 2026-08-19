@@ -26,8 +26,10 @@ import {
   getYouTubeKeyPool,
   appendDiscordCheckAttempts,
   countDiscordInvalidObservations,
-  appendExternalAcquisitionObservations
+  appendExternalAcquisitionObservations,
+  getNeighborhoodForQueryRun
 } from './db';
+import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
@@ -318,8 +320,8 @@ export async function processNextSearchJob(
       return true;
     }
 
-    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null } = job.payload as {
-      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null;
+    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null, retrievalConfigKey = null, retrievalTreatmentOrigin = 'CONTROL', requestedPageDepth = 1 } = job.payload as {
+      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null; retrievalConfigKey?: string | null; retrievalTreatmentOrigin?: string; requestedPageDepth?: number;
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
@@ -405,12 +407,40 @@ export async function processNextSearchJob(
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations);
       await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
-      const maxPages=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_pages','3')));const maxLow=Math.max(1,Number(await getAppSetting('autonomous_pagination_max_low_yield_pages','2')));
-      const prior=await getAutonomousContinuationState(queryRunId, pageNumber);
-      const decision=evaluateContinuation({pageNumber,maxPages,hasNextPage:!!searchPage?.nextPageToken,distinctCreators:metrics.distinctResults,cumulativeDistinctCreators:prior.cumulativeDistinctCreators+metrics.distinctResults,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,delayedConfirmedCreators:prior.delayedConfirmedCreators,delayedNonTradingCreators:prior.delayedNonTradingCreators,delayedQualityCreators:prior.delayedQualityCreators,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,consecutiveLowYieldPages:prior.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLow});
-      const enabled=await getAppSetting('autonomous_pagination_enabled','true')==='true';
-      const stoppingReason=decision.shouldContinue?null:decision.primaryReason;
-      const pageObservation={queryRunId,pageNumber,inputPageToken:pageToken,nextPageToken:searchPage?.nextPageToken||null,retrievalLane,searchOrdering,rawResultCount:metrics.rawResults,distinctCreatorCount:metrics.distinctResults,knownCreators:metrics.knownChannels,newCreators:metrics.newChannels,confirmedCreators:metrics.tradingConfirmed,qualityConfirmedCreators:metrics.qualityChannels,averageQualityScore:metrics.averageQualityScore,countryPrecision:metrics.countryPrecision,communityDiversity:metrics.tradingConfirmed?metrics.communitiesDiscovered/metrics.tradingConfirmed:0,noveltyRatio:metrics.noveltyRatio,duplicateRatio:metrics.rawResults?metrics.duplicateResults/metrics.rawResults:1,quotaUnits:providerQuotaUnits,decision,stoppingReason,pageMetrics:metrics};
+      const globalMaxPages = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_pages', '3')));
+      const maxPages = Math.min(requestedPageDepth ?? 1, globalMaxPages);
+      const maxLow = Math.max(1, Number(await getAppSetting('autonomous_pagination_max_low_yield_pages', '2')));
+      const prior = await getAutonomousContinuationState(queryRunId, pageNumber);
+      const decision = evaluateContinuation({
+        pageNumber, maxPages, hasNextPage: !!searchPage?.nextPageToken,
+        distinctCreators: metrics.distinctResults,
+        cumulativeDistinctCreators: prior.cumulativeDistinctCreators + metrics.distinctResults,
+        newCreators: metrics.newChannels, confirmedCreators: metrics.tradingConfirmed,
+        qualityConfirmedCreators: metrics.qualityChannels,
+        delayedConfirmedCreators: prior.delayedConfirmedCreators,
+        delayedNonTradingCreators: prior.delayedNonTradingCreators,
+        delayedQualityCreators: prior.delayedQualityCreators,
+        countryPrecision: metrics.countryPrecision,
+        communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
+        duplicateRatio: metrics.rawResults ? metrics.duplicateResults / metrics.rawResults : 1,
+        consecutiveLowYieldPages: prior.consecutiveLowYieldPages,
+        maxConsecutiveLowYieldPages: maxLow
+      });
+      const enabled = await getAppSetting('autonomous_pagination_enabled', 'true') === 'true';
+      const stoppingReason = decision.shouldContinue ? null : decision.primaryReason;
+      const pageObservation = {
+        queryRunId, pageNumber, inputPageToken: pageToken, nextPageToken: searchPage?.nextPageToken || null,
+        retrievalLane, searchOrdering, rawResultCount: metrics.rawResults,
+        distinctCreatorCount: metrics.distinctResults, knownCreators: metrics.knownChannels,
+        newCreators: metrics.newChannels, confirmedCreators: metrics.tradingConfirmed,
+        qualityConfirmedCreators: metrics.qualityChannels, averageQualityScore: metrics.averageQualityScore,
+        countryPrecision: metrics.countryPrecision,
+        communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
+        noveltyRatio: metrics.noveltyRatio,
+        duplicateRatio: metrics.rawResults ? metrics.duplicateResults / metrics.rawResults : 1,
+        quotaUnits: providerQuotaUnits, decision, stoppingReason, pageMetrics: metrics,
+        retrievalConfigKey, retrievalTreatmentOrigin
+      };
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
       if(enabled&&decision.shouldContinue&&searchPage?.nextPageToken){await enqueueJob('SEARCH_YOUTUBE',{...job.payload,pageNumber:pageNumber+1,pageToken:searchPage.nextPageToken},{priority:20,maxAttempts:3,idempotencyKey:`search-run:${queryRunId}:page:${pageNumber+1}`});await completeJob(job.id);return true;}
@@ -431,6 +461,13 @@ export async function processNextSearchJob(
         cycle_quality_score: performance.performanceScore,
         logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via YOUTUBE_DATA_API.`, `Funnel: ${JSON.stringify(metrics)}`]
       });
+
+      // Post-run idempotent recomputation of derived evidence aggregate
+      const neighborhoodInfo = await getNeighborhoodForQueryRun(queryRunId);
+      if (neighborhoodInfo && retrievalConfigKey) {
+        await recomputeNeighborhoodRetrievalEvidence(neighborhoodInfo.neighborhood_key, retrievalConfigKey)
+          .catch(err => console.warn('[RetrievalPolicyEvidence] Post-run evidence recomputation error:', err));
+      }
     }
     await completeJob(job.id);
     return true;

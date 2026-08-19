@@ -15,6 +15,10 @@ import { validateLedgerInput, type ValidationKind, type ValidationStatus } from 
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
+import { buildRetrievalConfiguration } from './retrievalConfiguration';
+import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
+import { evaluateRetrievalCanaryAuthority, selectLearnedRetrievalConfiguration } from './retrievalPolicyCanary';
+import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
@@ -562,20 +566,67 @@ export async function scheduleAutonomousQueryRuns(
       );
       const video = laneCounts.rows[0]?.video || 0;
       const total = laneCounts.rows[0]?.total || 0;
-      const retrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
+      const controlRetrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
       const orderingCounts = await client.query(
         `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
          FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
       );
-      const searchOrdering = allocateSearchOrdering(retrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+      const controlSearchOrdering = allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+
+      const controlConfig = buildRetrievalConfiguration({
+        searchOrdering: controlSearchOrdering,
+        retrievalLane: controlRetrievalLane,
+        requestedPageDepth: 1
+      });
+
+      let retrievalLane = controlRetrievalLane;
+      let searchOrdering = controlSearchOrdering;
+      let retrievalConfigKey = controlConfig.configKey;
+      let treatmentOrigin: 'CONTROL' | 'CANARY_TREATMENT' = 'CONTROL';
+      let requestedPageDepth = 1;
+
+      // Phase 9 Canary Authority Check
+      const canaryAuthority = await evaluateRetrievalCanaryAuthority({ clientOverride: client });
+      if (canaryAuthority.enabled && canaryAuthority.withinCaps) {
+        const { neighborhood } = mapQueryRunToNeighborhood(
+          { runId: 'pending', queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
+          candidate.query
+        );
+        const learned = await selectLearnedRetrievalConfiguration({
+          neighborhoodKey: neighborhood.neighborhoodKey,
+          retrievalLane: controlRetrievalLane,
+          defaultOrdering: controlSearchOrdering,
+          clientOverride: client
+        });
+        if (learned.config) {
+          retrievalLane = learned.config.retrievalLane;
+          searchOrdering = learned.config.searchOrdering;
+          retrievalConfigKey = learned.config.configKey;
+          requestedPageDepth = learned.config.requestedPageDepth;
+          treatmentOrigin = 'CANARY_TREATMENT';
+        }
+      }
 
       const origin = candidate.allocationOrigin || 'LEGACY';
       const run = await client.query(
-        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin)
-         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8) RETURNING id`,
-        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) }), origin]
+        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin)
+         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10) RETURNING id`,
+        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) }), origin, retrievalConfigKey, treatmentOrigin]
       );
       const runId = run.rows[0].id;
+
+      // Shadow recommendation recording at scheduling boundary (zero serving authority)
+      const { neighborhood: shadowNeigh } = mapQueryRunToNeighborhood(
+        { runId, queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
+        candidate.query
+      );
+      await evaluateShadowRetrievalRecommendation({
+        opportunityKey: `opp:${runId}`,
+        queryRunId: runId,
+        neighborhoodKey: shadowNeigh.neighborhoodKey,
+        actualConfig: controlConfig,
+        clientOverride: client
+      }).catch(err => console.warn('[RetrievalPolicyShadow] Shadow recommendation recording error:', err));
 
       if (candidate.frontierDecisionId && origin === 'FRONTIER_CANARY') {
         const commitRes = await client.query(
@@ -610,7 +661,10 @@ export async function scheduleAutonomousQueryRuns(
           country: candidate.query.country,
           source: 'automated_query',
           retrievalLane,
-          searchOrdering
+          searchOrdering,
+          retrievalConfigKey,
+          retrievalTreatmentOrigin: treatmentOrigin,
+          requestedPageDepth
         }), `search-run:${runId}`]
       );
       const jobId = job.rows[0].id;
