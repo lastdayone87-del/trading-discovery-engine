@@ -1,6 +1,8 @@
 import { getDb } from '../db';
 import { creatorIntelligenceChecksum, type CreatorDiscoveryObjective, type CreatorProgramLifecycle } from './contracts';
 import { allocateCreatorSearchCanary, CREATOR_SEARCH_CANARY_POLICY_VERSION, type CreatorCanaryAssignment } from './canary';
+import { evaluateFrontierCanaryAllocation, type AllocationDecision } from '../discoveryFrontierAllocator';
+import type { DiscoveryNeighborhoodDimensions } from '../discoveryNeighborhood';
 
 export const CREATOR_SEARCH_AUTHORITY_POLICY_VERSION = 'creator-search-allocation-authority-v1';
 
@@ -52,7 +54,56 @@ export function prioritizeCreatorSearchPrograms(candidates: CreatorAuthorityCand
   }).sort((a, b) => Number(b.eligible) - Number(a.eligible) || b.priority - a.priority || a.candidate.programKey.localeCompare(b.candidate.programKey) || a.candidate.hypothesisId.localeCompare(b.candidate.hypothesisId));
 }
 
-export async function allocateCreatorSearchAuthority(input: { opportunityKey: string; legacyCountry: string; allowedCountries: string[]; assignedAt: string; estimatedQuotaUnits?: number }): Promise<{ country: string; assignment: CreatorCanaryAssignment; authorityDecisionKey?: string; legacyFallback: boolean }> {
+export async function allocateCreatorSearchAuthority(input: {
+  opportunityKey: string;
+  legacyCountry: string;
+  allowedCountries: string[];
+  assignedAt: string;
+  estimatedQuotaUnits?: number;
+  availableAutonomousCapacity?: number;
+}): Promise<{
+  country: string;
+  assignment?: CreatorCanaryAssignment;
+  authorityDecisionKey?: string;
+  legacyFallback: boolean;
+  frontierAllocation?: {
+    authorized: boolean;
+    allocationOrigin: 'FRONTIER_CANARY' | 'LEGACY';
+    targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
+    decision?: AllocationDecision;
+  };
+}> {
+  // 1. Evaluate Bounded Frontier Neighborhood Canary Authority
+  const frontierResult = await evaluateFrontierCanaryAllocation({
+    opportunityKey: input.opportunityKey,
+    legacyCountry: input.legacyCountry,
+    allowedCountries: input.allowedCountries,
+    estimatedQuotaUnits: input.estimatedQuotaUnits,
+    availableAutonomousCapacity: input.availableAutonomousCapacity,
+    now: input.assignedAt ? new Date(input.assignedAt) : new Date()
+  }).catch(error => ({
+    authorized: false,
+    allocationOrigin: 'LEGACY' as const,
+    country: input.legacyCountry,
+    reason: `FRONTIER_CANARY_EVALUATION_ERROR: ${error instanceof Error ? error.message : String(error)}`
+  }));
+
+  if (frontierResult.authorized && 'targetNeighborhoodDimensions' in frontierResult && frontierResult.targetNeighborhoodDimensions) {
+    const decision = 'decision' in frontierResult ? frontierResult.decision : undefined;
+    return {
+      country: frontierResult.country,
+      assignment: undefined,
+      legacyFallback: false,
+      frontierAllocation: {
+        authorized: true,
+        allocationOrigin: 'FRONTIER_CANARY',
+        targetNeighborhoodDimensions: frontierResult.targetNeighborhoodDimensions,
+        decision
+      }
+    };
+  }
+
+  // 2. Creator Intelligence Top-Level Search Authority Fallback / Control Path
   const db = await getDb();
   const controlResult = await db.query(`SELECT * FROM creator_search_canary_control WHERE singleton=true`);
   const control = controlResult.rows[0];

@@ -20,6 +20,7 @@ import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminol
 import { executeProviderCall } from './providerResilience';
 import { appendProviderCallEvent } from './db';
 import { getPublishedOrganicQueryCandidates } from './organicQueryExpansion';
+import { type DiscoveryNeighborhoodDimensions, createNeighborhoodKey } from './discoveryNeighborhood';
 
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
@@ -297,9 +298,14 @@ Return ONLY a valid JSON object with format:
  * Selects the next search query for a country using Multi-Armed Bandit (UCB1)
  * balancing exploitation (PROVEN) vs exploration (EXPERIMENTAL) with intent rotation.
  */
-export async function selectNextQueryForCountry(country: string): Promise<{
+export async function selectNextQueryForCountry(
+  country: string,
+  options: {
+    targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
+  } = {}
+): Promise<{
   queryRecord: QueryRecord;
-  selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION';
+  selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' | 'NEIGHBORHOOD_TARGETED';
   reason: string;
 }> {
   const now = new Date();
@@ -361,14 +367,62 @@ export async function selectNextQueryForCountry(country: string): Promise<{
   // Sort by UCB score descending
   scoredQueries.sort((a, b) => (b.ucb_score || 0) - (a.ucb_score || 0));
 
+  let selected: QueryRecord | null = null;
+  let strategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' | 'NEIGHBORHOOD_TARGETED' = 'UCB1_EXPLOITATION';
+  let reason = '';
+
+  // Targeted Frontier Neighborhood Selection (if provided)
+  if (options.targetNeighborhoodDimensions) {
+    const target = options.targetNeighborhoodDimensions;
+    const targetKey = createNeighborhoodKey(target);
+
+    // Filter scoredQueries for candidates whose mapped canonical neighborhood key matches targetKey
+    const matches = scoredQueries.filter(q => {
+      const qDims: DiscoveryNeighborhoodDimensions = {
+        country: country || target.country,
+        language: target.language,
+        queryIntent: q.intent || target.queryIntent,
+        primaryTermFamily: q.primary_term || q.query,
+        retrievalLane: target.retrievalLane,
+        searchOrdering: target.searchOrdering,
+        instrumentOrTheme: target.instrumentOrTheme,
+        sourceFamily: target.sourceFamily
+      };
+      return createNeighborhoodKey(qDims) === targetKey;
+    });
+
+    if (matches.length > 0) {
+      selected = matches[0];
+      strategy = 'NEIGHBORHOOD_TARGETED';
+      reason = `Frontier neighborhood canonical selection for target key "${targetKey}": ${selected.query} (UCB ${selected.ucb_score}).`;
+    } else {
+      const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION');
+      const matchingGenerated = generated.find(gen => {
+        const genDims: DiscoveryNeighborhoodDimensions = {
+          country: country || target.country,
+          language: target.language,
+          queryIntent: gen.intent || target.queryIntent,
+          primaryTermFamily: gen.primary_term || gen.query,
+          retrievalLane: target.retrievalLane,
+          searchOrdering: target.searchOrdering,
+          instrumentOrTheme: target.instrumentOrTheme,
+          sourceFamily: target.sourceFamily
+        };
+        return createNeighborhoodKey(genDims) === targetKey;
+      });
+
+      if (matchingGenerated) {
+        selected = matchingGenerated;
+        strategy = 'NEIGHBORHOOD_TARGETED';
+        reason = `Generated candidate matching targeted frontier neighborhood key "${targetKey}": ${selected.query}.`;
+      }
+    }
+  }
+
   // Explicitly configured exploration prevents permanent overfitting to winners.
   const isExploration = Math.random() < explorationRatio;
 
-  let selected: QueryRecord | null = null;
-  let strategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' = 'UCB1_EXPLOITATION';
-  let reason = '';
-
-  if (isExploration) {
+  if (!selected && isExploration) {
     // Pick an EXPERIMENTAL query with highest UCB or generate a new candidate
     const experimental = scoredQueries
       .filter(q => q.collection === 'EXPERIMENTAL')

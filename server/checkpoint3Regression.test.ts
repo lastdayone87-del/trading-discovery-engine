@@ -97,7 +97,10 @@ test('Checkpoint 3 Blocker 1 & 2 Fix:evaluateTrialGate & initiateCanaryTrial han
   // Mock client to test evaluateTrialGate logic without live DB
   const mockClient = {
     query: async (sql: string, params: any[]) => {
-      if (sql.includes('frontier_trials_enabled')) return { rows: [] };
+      if (sql.includes('frontier_trials_enabled')) return { rows: [{ setting_value: 'true' }] };
+      if (sql.includes('app_settings')) {
+        return { rows: [{ setting_value: 'true' }] };
+      }
       if (sql.includes('frontier_discovery_proposals')) {
         return {
           rows: [{

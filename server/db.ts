@@ -468,6 +468,8 @@ export interface AutonomousQueryCandidate {
   strategy: string;
   reason: string;
   allocationProvenance?: Record<string, unknown>;
+  allocationOrigin?: 'FRONTIER_CANARY' | 'LEGACY';
+  frontierDecisionId?: string;
 }
 
 export interface AutonomousSchedulingSnapshot {
@@ -567,12 +569,30 @@ export async function scheduleAutonomousQueryRuns(
       );
       const searchOrdering = allocateSearchOrdering(retrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
+      const origin = candidate.allocationOrigin || 'LEGACY';
       const run = await client.query(
-        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata)
-         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7) RETURNING id`,
-        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) })]
+        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin)
+         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8) RETURNING id`,
+        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) }), origin]
       );
       const runId = run.rows[0].id;
+
+      if (candidate.frontierDecisionId && origin === 'FRONTIER_CANARY') {
+        const commitRes = await client.query(
+          `UPDATE frontier_allocation_decisions
+           SET decision_status = 'COMMITTED',
+               query_run_id = $2
+           WHERE decision_id = $1
+             AND allocation_origin = 'FRONTIER_CANARY'
+             AND decision_status = 'RESERVED'
+             AND (query_run_id IS NULL OR query_run_id = $2)
+           RETURNING id`,
+          [candidate.frontierDecisionId, runId]
+        );
+        if (!commitRes.rowCount) {
+          throw new Error(`FRONTIER_ALLOCATION_COMMIT_FAILED: Decision ${candidate.frontierDecisionId} is not an active RESERVED canary decision.`);
+        }
+      }
       for (const component of queryComponents(candidate.query)) {
         await client.query(
           `INSERT INTO query_run_components(query_run_id,component_type,term,normalized_term,knowledge_tier,position)

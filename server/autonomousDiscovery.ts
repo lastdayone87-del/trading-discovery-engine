@@ -21,6 +21,12 @@ import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
 import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
+import {
+  evaluateShadowFrontierAllocation,
+  commitAllocationQueryRun,
+  releaseAllocationDecision,
+  markAllocationDecisionDeferred
+} from './discoveryFrontierAllocator';
 import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
@@ -201,21 +207,63 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       const legacyCountry = countries[(currentCountryIndex + attempts) % countries.length];
       attempts++;
       const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
+
+        // Shadow frontier evaluation (zero scheduling authority)
+        await evaluateShadowFrontierAllocation({ opportunityKey, legacyCountry, now })
+          .catch(err => console.warn('[FrontierAllocator] Shadow allocation evaluation warning:', err));
+
       let creatorAllocation: CreatorCanaryAssignment | undefined;
+        let frontierAllocationInfo: any;
       let country = legacyCountry;
       try {
-        const authority = await allocateCreatorSearchAuthority({ opportunityKey, legacyCountry, allowedCountries: countries, assignedAt: now.toISOString(), estimatedQuotaUnits: 100 });
+          const authority = await allocateCreatorSearchAuthority({
+            opportunityKey,
+            legacyCountry,
+            allowedCountries: countries,
+            assignedAt: now.toISOString(),
+            estimatedQuotaUnits: 100,
+            availableAutonomousCapacity: capacity - scheduled.length
+          });
         creatorAllocation = authority.assignment;
         country = authority.country;
+          frontierAllocationInfo = authority.frontierAllocation;
       } catch (error) {
         console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       }
-      const research = await getAllocatedResearchQuery(country);
-      const selected = research ? {
-        queryRecord: research.queryRecord,
-        selectionStrategy: 'UCB1_EXPLORATION' as const,
-        reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
-      } : await selectNextQueryForCountry(country);
+
+      let research: { actionId: string; queryRecord: any } | null = null;
+      // Persistent Research runs ONLY on the control/legacy path when frontier allocation is NOT authorized
+      if (!frontierAllocationInfo?.authorized) {
+        research = await getAllocatedResearchQuery(country);
+      }
+
+      let selected: { queryRecord: any; selectionStrategy: any; reason: string };
+
+      if (research) {
+        selected = {
+          queryRecord: research.queryRecord,
+          selectionStrategy: 'UCB1_EXPLORATION' as const,
+          reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
+        };
+      } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
+        const targeted = await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
+        if (targeted.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
+          selected = targeted;
+        } else {
+          // Query Intelligence could not construct/find a targeted action for this neighborhood; defer decision and revert to legacy control
+          if (frontierAllocationInfo.decision?.decisionId) {
+            await releaseAllocationDecision(
+              frontierAllocationInfo.decision.decisionId,
+              'Query Intelligence could not construct or select a targeted action for neighborhood dimensions'
+            );
+          }
+          frontierAllocationInfo.authorized = false;
+          country = legacyCountry;
+          selected = await selectNextQueryForCountry(legacyCountry);
+        }
+      } else {
+        selected = await selectNextQueryForCountry(country);
+      }
 
       // Every query source is revalidated immediately before scheduling. Stored
       // PROVEN/EXPERIMENTAL queries and research allocations are not grandfathered
@@ -223,6 +271,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord);
       if (!queryAuthority.eligible) {
         log(`Withheld autonomous query #${selected.queryRecord.id} "${selected.queryRecord.query}" (${selected.queryRecord.country}) before YouTube: ${queryAuthority.reasonCodes.join(', ')}.`);
+        if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+          await releaseAllocationDecision(
+            frontierAllocationInfo.decision.decisionId,
+            `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`
+          );
+          frontierAllocationInfo.authorized = false;
+        }
         await setQueryCollection(selected.queryRecord.id, 'REJECTED')
           .catch(error => console.warn('[Autonomous Producer] Failed to quarantine unsafe query:', error));
         continue;
@@ -235,6 +290,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         query: selected.queryRecord,
         strategy: selected.selectionStrategy,
         reason: `${selected.reason} Execution authority: ${queryAuthority.reasonCodes.join(', ')}.`,
+        allocationOrigin: frontierAllocationInfo?.authorized ? 'FRONTIER_CANARY' : 'LEGACY',
+        frontierDecisionId: frontierAllocationInfo?.authorized ? frontierAllocationInfo.decision?.decisionId : undefined,
         allocationProvenance: creatorAllocation ? {
           assignmentId: creatorAllocation.assignmentId,
           assignmentKey: creatorAllocation.assignmentKey,
@@ -248,7 +305,17 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
           policyVersion: creatorAllocation.policyVersion,
           queryAuthority: 'QUERY_INTELLIGENCE'
         } : { status: 'LEGACY_FALLBACK', reason: 'CANARY_ALLOCATION_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
-      }], workerId, cooldownMinutes);
+      }], workerId, cooldownMinutes).catch(async error => {
+        if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+          await releaseAllocationDecision(
+            frontierAllocationInfo.decision.decisionId,
+            `Scheduling transaction failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+          frontierAllocationInfo.authorized = false;
+        }
+        return [];
+      });
+
       if (created.length) {
         scheduled.push(...created);
         if (creatorAllocation?.assignmentId) await bindCreatorCanaryQueryRun({ assignmentId: creatorAllocation.assignmentId, assignmentKey: creatorAllocation.assignmentKey, queryRunId: created[0].runId, queryId: created[0].query.id, selectionStrategy: selected.selectionStrategy, boundAt: now.toISOString() })
@@ -256,6 +323,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         if (research) await markResearchActionQueued(research.actionId, created[0].runId);
         usedIntents.add(intent);
         usedPrimaryTerms.add(primaryTerm);
+      } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+        await releaseAllocationDecision(
+          frontierAllocationInfo.decision.decisionId,
+          'Query scheduling returned zero created runs'
+        );
+        frontierAllocationInfo.authorized = false;
       }
     }
 
