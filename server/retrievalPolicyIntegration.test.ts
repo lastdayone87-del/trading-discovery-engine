@@ -10,13 +10,15 @@ import {
   deterministicExplorationValue,
   selectLearnedRetrievalConfiguration,
   reserveRetrievalCanaryTreatment,
-  reserveIncrementalTreatmentPageQuota
+  reserveIncrementalTreatmentPageQuota,
+  enqueueChildAndCommitPageReservation
 } from './retrievalPolicyCanary';
 import {
   evaluatePreferredRetrievalConfig,
   evaluateShadowRetrievalRecommendation
 } from './retrievalPolicyShadow';
 import { evaluateContinuation } from './continuationPolicy';
+import { enqueueJob } from './db';
 
 test('deterministic retrieval-configuration identity and hashing', () => {
   const config1 = buildRetrievalConfiguration({ searchOrdering: 'RELEVANCE', retrievalLane: 'VIDEO', requestedPageDepth: 2 });
@@ -106,4 +108,95 @@ test('incremental treatment page quota reservation fails closed when DB or caps 
     pageNumber: 2
   });
   assert.equal(incRes.authorized, false);
+});
+
+test('enqueueJob with preventReopen=true preserves COMPLETED/FAILED status on idempotency conflict', async () => {
+  let storedJobStatus: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' = 'PENDING';
+  let storedAttempts = 1;
+
+  const mockDb = {
+    query: async (sql: string, params: any[]) => {
+      if (sql.includes('preventReopen')) {
+        // Mock returning the existing job without reopening
+      }
+      return {
+        rows: [{
+          id: 'job_mock_1',
+          type: params[0],
+          status: storedJobStatus,
+          attempts: storedAttempts,
+          max_attempts: 3,
+          run_after: new Date().toISOString(),
+          created_at: new Date().toISOString()
+        }],
+        rowCount: 1
+      };
+    }
+  };
+
+  // 1. Initial enqueue with preventReopen
+  const job1 = await enqueueJob('SEARCH_YOUTUBE', { queryRunId: 'run_1' }, {
+    idempotencyKey: 'idemp_key_1',
+    clientOverride: mockDb,
+    preventReopen: true
+  });
+  assert.equal(job1.status, 'PENDING');
+
+  // Simulate job completing
+  storedJobStatus = 'COMPLETED';
+
+  // 2. Retry with preventReopen: true returns COMPLETED status without reopening
+  const job2 = await enqueueJob('SEARCH_YOUTUBE', { queryRunId: 'run_1' }, {
+    idempotencyKey: 'idemp_key_1',
+    clientOverride: mockDb,
+    preventReopen: true
+  });
+  assert.equal(job2.status, 'COMPLETED');
+
+  // Simulate job processing
+  storedJobStatus = 'PROCESSING';
+  const job3 = await enqueueJob('SEARCH_YOUTUBE', { queryRunId: 'run_1' }, {
+    idempotencyKey: 'idemp_key_1',
+    clientOverride: mockDb,
+    preventReopen: true
+  });
+  assert.equal(job3.status, 'PROCESSING');
+
+  // Simulate job failed
+  storedJobStatus = 'FAILED';
+  const job4 = await enqueueJob('SEARCH_YOUTUBE', { queryRunId: 'run_1' }, {
+    idempotencyKey: 'idemp_key_1',
+    clientOverride: mockDb,
+    preventReopen: true
+  });
+  assert.equal(job4.status, 'FAILED');
+});
+
+test('ordinary callers of enqueueJob without preventReopen retain default reopen semantics', async () => {
+  let storedJobStatus: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' = 'COMPLETED';
+
+  const mockDb = {
+    query: async (sql: string, params: any[]) => {
+      // Default query uses CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING'
+      return {
+        rows: [{
+          id: 'job_mock_2',
+          type: params[0],
+          status: 'PENDING',
+          attempts: 0,
+          max_attempts: 3,
+          run_after: new Date().toISOString(),
+          created_at: new Date().toISOString()
+        }],
+        rowCount: 1
+      };
+    }
+  };
+
+  const recheckJob = await enqueueJob('FORCE_REVIEW_RESCAN', { channelId: 'ch_1' }, {
+    idempotencyKey: 'recheck:ch_1',
+    clientOverride: mockDb
+  });
+
+  assert.equal(recheckJob.status, 'PENDING');
 });
