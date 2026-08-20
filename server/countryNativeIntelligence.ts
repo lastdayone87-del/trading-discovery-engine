@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
+import { isQualityCreator } from './queryPerformance';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
 
@@ -312,8 +313,7 @@ export async function recomputeNativeEvidenceProjection(
 
     if (r.source_channel_id) {
       allCreators.add(r.source_channel_id);
-      // Explicit Quality Creator Criteria: TRADING_CONFIRMED and quality_score >= 50
-      if (r.trading_status === 'TRADING_CONFIRMED' && (r.quality_score || 0) >= 50) {
+      if (isQualityCreator(r.trading_status, Number(r.quality_score || 0))) {
         qualityCreators.add(r.source_channel_id);
         if (r.native_evidence_status === 'NATIVE_OBSERVED') nativeQualityCreators.add(r.source_channel_id);
       }

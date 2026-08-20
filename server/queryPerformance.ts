@@ -2,6 +2,13 @@ import type { QueryCollection } from '../src/types';
 
 export type FunnelOutcome = 'COUNTRY_REJECTED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'TRADING_CONFIRMED';
 
+/** Authoritative production threshold for a trading-confirmed creator to count as quality. */
+export const QUALITY_CREATOR_SCORE_THRESHOLD = 55;
+
+export function isQualityCreator(funnelOutcome: string, qualityScore: number): boolean {
+  return funnelOutcome === 'TRADING_CONFIRMED' && qualityScore >= QUALITY_CREATOR_SCORE_THRESHOLD;
+}
+
 export interface QueryObservation {
   channelId: string;
   wasKnown: boolean;
@@ -45,7 +52,7 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
   const tradingConfirmed = count('TRADING_CONFIRMED');
   const evaluated = nonTrading + uncertain + needsReview + tradingConfirmed;
   const persisted = values.filter(value => value.persisted);
-  const qualityChannels = values.filter(value => value.funnelOutcome === 'TRADING_CONFIRMED' && value.qualityScore >= 55).length;
+  const qualityChannels = values.filter(value => isQualityCreator(value.funnelOutcome, value.qualityScore)).length;
   const communitiesDiscovered = values.filter(value => value.funnelOutcome === 'TRADING_CONFIRMED' && value.hasCommunity).length;
   const averageQualityScore = persisted.length
     ? Math.round(persisted.reduce((sum, value) => sum + value.qualityScore, 0) / persisted.length)

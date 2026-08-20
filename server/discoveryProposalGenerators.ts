@@ -3,6 +3,7 @@ import { getDb } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry, countryIsoAlias } from './countryInference';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
+import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -183,7 +184,7 @@ export async function generateCreatorDerivedProposals(country: string, limit = 1
   const res = await db.query(
     `SELECT c.channel_id, c.title, c.description, c.primary_market
      FROM channels c
-     WHERE UPPER(c.country) = $1 AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= 55
+     WHERE UPPER(c.country) = $1 AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= ${QUALITY_CREATOR_SCORE_THRESHOLD}
      ORDER BY c.updated_at DESC
      LIMIT $2`,
     [country.toUpperCase(), limit]

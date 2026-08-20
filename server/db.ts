@@ -22,7 +22,7 @@ import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidenc
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
-import { calculateQueryFunnel } from './queryPerformance';
+import { calculateQueryFunnel, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 
 const { Pool } = pg;
@@ -870,7 +870,7 @@ export async function recordNeighborhoodAnalyticsAfterRun(
   const newIntersectionsRes = await db.query(
     `SELECT
        COUNT(*) FILTER (WHERE s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED')::int AS relevant_new,
-       COUNT(*) FILTER (WHERE s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= 55)::int AS quality_new
+       COUNT(*) FILTER (WHERE s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= ${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new
      FROM channel_sightings s
      JOIN channels c ON c.channel_id = s.channel_id
      WHERE s.query_run_id = $1`,
@@ -884,7 +884,7 @@ export async function recordNeighborhoodAnalyticsAfterRun(
   const sightingsDetailRes = await db.query(
     `SELECT
        c.subscriber_count,
-       (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= 55) AS is_quality_new,
+       (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= ${QUALITY_CREATOR_SCORE_THRESHOLD}) AS is_quality_new,
        (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED') AS is_relevant_new
      FROM channel_sightings s
      JOIN channels c ON c.channel_id = s.channel_id
@@ -1232,7 +1232,7 @@ async function attributeCompletedCountryNativeRun(client: EventClient, runId: st
        )::int AS relevant_new_creators,
        COUNT(DISTINCT s.channel_id) FILTER (
          WHERE s.persisted AND NOT s.was_known
-           AND s.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=55
+           AND s.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD}
        )::int AS quality_new_creators
      FROM channel_sightings s
      LEFT JOIN channels c ON c.channel_id=s.channel_id

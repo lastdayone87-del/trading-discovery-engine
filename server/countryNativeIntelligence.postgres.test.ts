@@ -70,7 +70,7 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     }, db);
 
     const projection = await db.query(
-      `SELECT native_evidence_status, native_observed_count, quality_creator_count,
+      `SELECT native_evidence_status, native_observed_count, quality_creator_count, native_quality_creator_count,
               native_proposal_eligible, last_observed_at
        FROM country_native_evidence_projections WHERE canonical_term_id=$1`,
       [firstId]
@@ -78,6 +78,7 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.equal(projection.rows[0].native_evidence_status, 'NATIVE_OBSERVED');
     assert.equal(projection.rows[0].native_observed_count, 2);
     assert.equal(projection.rows[0].quality_creator_count, 2);
+    assert.equal(projection.rows[0].native_quality_creator_count, 2);
     assert.equal(projection.rows[0].native_proposal_eligible, true);
 
     await attributeCountryNativePerformance({
@@ -117,6 +118,7 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     const persisted = proposals.find(proposal => proposal.supportingEvidence.canonicalTermId === firstId);
     assert.ok(persisted, 'persisted eligible native projection must feed the production proposal generator');
     assert.equal(persisted.supportingEvidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+    assert.equal(persisted.supportingEvidence.nativeQualityCreatorCount, 2, 'persisted proposal evidence uses the production quality definition');
 
     const revisionTerm = await db.query(
       `INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,term_type,first_observed_at,last_observed_at)

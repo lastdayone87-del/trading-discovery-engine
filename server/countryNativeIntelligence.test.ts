@@ -13,6 +13,7 @@ import { observeTerminology } from './terminologyIntelligence';
 import { getDb } from './db';
 import fs from 'node:fs';
 import { effectiveProjectionProposalEvidence, generateCountryNativeProposals, projectionProposalProvenance, selectFairCountryNativeProposals, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
+import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 
 test('Phase 10: normalizeNativeTerm preserves diacritics, ticker symbols, and multi-word phrases', () => {
   assert.equal(normalizeNativeTerm('  Ações Brasil  '), 'ações brasil');
@@ -703,6 +704,31 @@ test('Phase 10: non-native quality creators cannot satisfy the native multi-crea
   assert.equal(projection?.nativeQualityCreatorCount, 1);
   assert.equal(projection?.nativeEvidenceStatus, 'NATIVE_OBSERVED');
   assert.equal(projection?.structuredEntityMatched, false);
+});
+
+test('Phase 10: native gating reuses the authoritative production quality threshold', async () => {
+  const runner = createMockRunner();
+  for (const [channelId, score] of [['native-50', 50], ['native-54', 54], ['native-55', QUALITY_CREATOR_SCORE_THRESHOLD]] as const) {
+    runner.channels.set(channelId, { country: 'Germany', trading_status: 'TRADING_CONFIRMED', quality_score: score });
+    await observeTerminology({
+      term: 'authoritative quality threshold', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+      videoId: `video-${channelId}`, channelId, nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA'
+    }, runner);
+  }
+  const termId = runner.observations[0].canonical_term_id;
+  let projection = await recomputeNativeEvidenceProjection(termId, runner);
+  assert.equal(projection?.nativeQualityCreatorCount, 1, 'scores 50-54 must not count as production quality');
+  assert.equal(projection?.nativeProposalEligible, false, 'one qualifying native creator cannot satisfy the two-creator gate');
+
+  runner.channels.set('native-56', { country: 'Germany', trading_status: 'TRADING_CONFIRMED', quality_score: QUALITY_CREATOR_SCORE_THRESHOLD + 1 });
+  await observeTerminology({
+    term: 'authoritative quality threshold', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    videoId: 'video-native-56', channelId: 'native-56', nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+  projection = await recomputeNativeEvidenceProjection(termId, runner);
+  assert.equal(projection?.nativeQualityCreatorCount, 2);
+  assert.equal(projection?.qualityCreatorCount, 2);
+  assert.equal(projection?.nativeProposalEligible, true, 'two creators at or above the shared threshold satisfy the gate');
 });
 
 test('Phase 10: persisted structured native match survives dominant creator provenance and governed bootstrap', async () => {
