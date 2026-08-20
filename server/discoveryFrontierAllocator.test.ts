@@ -181,6 +181,7 @@ test('evaluateFrontierCanaryAllocation enforces daily assignment and quota caps 
       if (sql.includes('pg_advisory_xact_lock')) {
         return { rows: [] };
       }
+      if(sql.includes('discovery_provider_registry'))return {rows:[{provider_key:'youtube-search',provider_family:'youtube',capabilities:['SEARCH_YOUTUBE'],quota_domain:'YOUTUBE_DATA_API',mode:'ACTIVE',daily_cost_cap:0,configuration_version:1,updated_at:'2026-08-20T00:00:00Z'}]};
       if (sql.includes('frontier_allocation_daily_assignment_cap')) {
         return { rows: [{ setting_value: '5' }] };
       }
