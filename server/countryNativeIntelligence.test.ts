@@ -35,6 +35,66 @@ test('Phase 10: isNoiseOrBoilerplate rejects generic stopwords, URLs, affiliate 
   assert.equal(isNoiseOrBoilerplate('日経平均'), false);
 });
 
+test('Phase 10: computeEvidenceChecksum recursively canonicalizes nested evidence objects regardless of key order', () => {
+  const objA = {
+    metadata: { author: 'Trader1', score: 90 },
+    tags: ['dax', 'futures']
+  };
+
+  const objB = {
+    tags: ['dax', 'futures'],
+    metadata: { score: 90, author: 'Trader1' }
+  };
+
+  const checkA = computeEvidenceChecksum(objA);
+  const checkB = computeEvidenceChecksum(objB);
+
+  assert.ok(checkA.length > 0);
+  assert.equal(checkA, checkB, 'Semantically identical evidence objects with different key insertion order must produce identical checksums');
+});
+
+test('Phase 10: Non-video observations fail closed when stable source evidence identity is missing', async () => {
+  const runner = createMockRunner();
+
+  // Non-video observation without videoId, sourceEvidenceId, or evidence payload MUST fail closed (return null)
+  const rejected = await recordNativeTerminologyObservation({
+    term: 'mini indice acoes',
+    country: 'BR',
+    channelId: 'UC_TEST_01',
+    observationType: 'DESCRIPTION', // Non-video
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+
+  assert.equal(rejected, null, 'Non-video observation missing evidence identity must fail closed');
+
+  // Non-video observation WITH evidence payload succeeds
+  const accepted = await recordNativeTerminologyObservation({
+    term: 'mini indice acoes',
+    country: 'BR',
+    channelId: 'UC_TEST_01',
+    observationType: 'DESCRIPTION',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA',
+    evidence: { channelDescriptionSnippet: 'mini indice acoes no Brasil' }
+  }, runner);
+
+  assert.ok(accepted, 'Non-video observation with evidence payload must be accepted');
+
+  // Video-backed observation WITHOUT explicit evidence payload succeeds because videoId provides identity
+  const videoAccepted = await recordNativeTerminologyObservation({
+    term: 'mini indice acoes',
+    country: 'BR',
+    channelId: 'UC_TEST_01',
+    videoId: 'VID_9999',
+    observationType: 'VIDEO_TITLE',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+
+  assert.ok(videoAccepted, 'Video-backed observation must use videoId as identity');
+});
+
 test('Phase 10: detectCodeSwitching accurately identifies mixed-script and English financial vocabulary in native text', () => {
   const deGerman = detectCodeSwitching('DAX Opening Range Breakout Setup', 'de');
   assert.equal(deGerman.isCodeSwitched, true);
@@ -259,7 +319,7 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
     term: termStr,
     country: 'BR',
     observationType: 'ENRICHMENT',
-    nativeEvidenceStatus: 'STRUCTURED_LOCAL_ENTITY' as any,
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
     sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY',
     evidence: enrich1
   }, runner);
@@ -268,7 +328,7 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
     term: termStr,
     country: 'BR',
     observationType: 'ENRICHMENT',
-    nativeEvidenceStatus: 'STRUCTURED_LOCAL_ENTITY' as any,
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
     sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY',
     evidence: enrich2
   }, runner);
@@ -285,12 +345,13 @@ test('Phase 10: Phase 10 native observations route through authoritative termino
 
   const termStr = 'mini indice operacoes';
 
-  // Record observations across 3 distinct creators
+  // Record observations across 3 distinct creators with valid evidence payloads
   const termId1 = await recordNativeTerminologyObservation({
     term: termStr,
     country: 'BR',
     channelId: 'UC_AUTHORITATIVE_1',
     observationType: 'VIDEO_TITLE',
+    videoId: 'VID_1',
     nativeEvidenceStatus: 'NATIVE_OBSERVED'
   }, runner);
 
@@ -299,6 +360,7 @@ test('Phase 10: Phase 10 native observations route through authoritative termino
     country: 'BR',
     channelId: 'UC_AUTHORITATIVE_2',
     observationType: 'DESCRIPTION',
+    evidence: { snippet: 'desc 2' },
     nativeEvidenceStatus: 'NATIVE_OBSERVED'
   }, runner);
 
@@ -307,6 +369,7 @@ test('Phase 10: Phase 10 native observations route through authoritative termino
     country: 'BR',
     channelId: 'UC_AUTHORITATIVE_3',
     observationType: 'DESCRIPTION',
+    evidence: { snippet: 'desc 3' },
     nativeEvidenceStatus: 'NATIVE_OBSERVED'
   }, runner);
 
@@ -330,6 +393,7 @@ test('Phase 10: Mixed native evidence provenance preserves status and source fam
     country: 'DE',
     channelId: 'UC_NATIVE_01',
     observationType: 'VIDEO_TITLE',
+    videoId: 'V_NATIVE_1',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
     sourceProvenanceFamily: 'CREATOR_METADATA'
   }, runner);

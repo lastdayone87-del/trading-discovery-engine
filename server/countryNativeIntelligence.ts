@@ -70,16 +70,30 @@ const SPONSOR_OR_AFFILIATE_PATTERNS = [
 ];
 
 /**
- * Computes a deterministic checksum for an evidence payload.
+ * Recursively canonicalizes a JSON object or array by sorting all keys at every level.
+ */
+function canonicalizeJSON(obj: any): any {
+  if (obj === null || typeof obj !== 'object') {
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(canonicalizeJSON);
+  }
+  const sortedKeys = Object.keys(obj).sort();
+  const result: Record<string, any> = {};
+  for (const key of sortedKeys) {
+    result[key] = canonicalizeJSON(obj[key]);
+  }
+  return result;
+}
+
+/**
+ * Computes a deterministic checksum for an evidence payload using recursive canonical key sorting.
  */
 export function computeEvidenceChecksum(evidence?: Record<string, unknown> | null): string {
-  if (!evidence || Object.keys(evidence).length === 0) return 'none';
-  const sortedKeys = Object.keys(evidence).sort();
-  const sorted: Record<string, unknown> = {};
-  for (const k of sortedKeys) {
-    sorted[k] = evidence[k];
-  }
-  return createHash('sha256').update(JSON.stringify(sorted)).digest('hex').substring(0, 16);
+  if (!evidence || Object.keys(evidence).length === 0) return '';
+  const canonical = canonicalizeJSON(evidence);
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex').substring(0, 16);
 }
 
 /**
@@ -103,7 +117,8 @@ export function computeObservationKey(params: {
   const normStatus = params.nativeEvidenceStatus.trim().toUpperCase();
   const normFamily = params.sourceProvenanceFamily.trim().toUpperCase();
 
-  const evidenceId = (params.sourceEvidenceId || computeEvidenceChecksum(params.evidence)).trim().toLowerCase();
+  const checksum = computeEvidenceChecksum(params.evidence);
+  const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();
 
   const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}|${evidenceId}`;
   return createHash('sha256').update(raw).digest('hex');
@@ -476,6 +491,7 @@ export async function recomputeNativeEvidenceProjection(
 /**
  * Extracts and records native candidate market terms from channel/video metadata.
  * Uses deterministic observation keys binding stable evidence identity to ensure observation idempotency and retry safety.
+ * For non-video observations, fails closed (returns null) if no stable evidence identity is provided.
  * Invokes refreshTerminologyLifecycle and recomputeNativeEvidenceProjection only when a new observation is actually inserted.
  */
 export async function recordNativeTerminologyObservation(args: {
@@ -494,6 +510,15 @@ export async function recordNativeTerminologyObservation(args: {
 }, clientOverride?: Queryable): Promise<number | null> {
   const norm = normalizeNativeTerm(args.term);
   if (isNoiseOrBoilerplate(args.term)) return null;
+
+  const isVideoBacked = Boolean(args.videoId && args.videoId.trim() !== '');
+  const checksum = computeEvidenceChecksum(args.evidence);
+  const hasEvidenceId = Boolean((args.sourceEvidenceId && args.sourceEvidenceId.trim() !== '') || checksum !== '');
+
+  // For non-video observation types, fail closed if no stable source evidence identity is present
+  if (!isVideoBacked && !hasEvidenceId && args.observationType !== 'CHANNEL_NAME') {
+    return null;
+  }
 
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return null;
