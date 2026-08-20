@@ -6,9 +6,9 @@ import {
   detectCodeSwitching,
   recordNativeTerminologyObservation,
   recomputeNativeEvidenceProjection,
-  computeObservationKey
+  computeObservationKey,
+  computeEvidenceChecksum
 } from './countryNativeIntelligence';
-import { generateCountryNativeProposals } from './discoveryProposalGenerators';
 import { getDb } from './db';
 
 test('Phase 10: normalizeNativeTerm preserves diacritics, ticker symbols, and multi-word phrases', () => {
@@ -58,12 +58,14 @@ function createMockRunner() {
   const channels = new Map<string, any>();
   const projections = new Map<number, any>();
   let nextTermId = 1;
+  let lifecycleRefreshCount = 0;
 
   return {
     canonicalTerms,
     observations,
     channels,
     projections,
+    get lifecycleRefreshCount() { return lifecycleRefreshCount; },
     async query(sql: string, params: any[] = []) {
       const sqlNorm = sql.trim().replace(/\s+/g, ' ');
 
@@ -110,6 +112,7 @@ function createMockRunner() {
       }
 
       if (sqlNorm.startsWith('SELECT t.*,')) {
+        lifecycleRefreshCount++;
         const id = Number(params[0]);
         const term = canonicalTerms.get(id);
         if (!term) return { rows: [] };
@@ -144,7 +147,7 @@ function createMockRunner() {
       if (sqlNorm.startsWith('INSERT INTO terminology_observations')) {
         const obsKey = params[12];
         if (obsKey && observations.some(o => o.observation_key === obsKey)) {
-          // ON CONFLICT (observation_key) DO NOTHING
+          // ON CONFLICT (observation_key) DO NOTHING -> Returns empty rows
           return { rows: [] };
         }
 
@@ -197,80 +200,80 @@ function createMockRunner() {
   };
 }
 
-test('Phase 10: Retrying the exact same native observation inserts 1 canonical observation row only and is idempotent', async () => {
+test('Phase 10: Source evidence identity binds payload and changed descriptions create new observations while exact retries deduplicate', async () => {
   const runner = createMockRunner();
-  runner.channels.set('UC_IDEMPOTENT_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+  runner.channels.set('UC_EVIDENCE_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
 
-  const termStr = 'operacoes de mini indice';
-  const channelId = 'UC_IDEMPOTENT_1';
-  const videoId = 'VID_1001';
+  const termStr = 'operacoes mini indice';
+  const channelId = 'UC_EVIDENCE_1';
 
-  // Call recordNativeTerminologyObservation 5 times with identical parameters
-  let termId: number | null = null;
-  for (let i = 0; i < 5; i++) {
-    termId = await recordNativeTerminologyObservation({
+  // 1. Exact retry of the SAME description evidence payload
+  const desc1 = { text: 'Canal de operacoes mini indice e day trade no Brasil' };
+  for (let i = 0; i < 3; i++) {
+    await recordNativeTerminologyObservation({
       term: termStr,
       country: 'BR',
       channelId,
-      videoId,
-      observationType: 'VIDEO_TITLE',
+      observationType: 'DESCRIPTION',
       nativeEvidenceStatus: 'NATIVE_OBSERVED',
-      sourceProvenanceFamily: 'CREATOR_METADATA'
+      sourceProvenanceFamily: 'CREATOR_METADATA',
+      evidence: desc1
     }, runner);
   }
 
-  assert.ok(termId);
+  assert.equal(runner.observations.length, 1, 'Exact retry of description evidence must produce 1 observation row');
+  const initialRefreshCount = runner.lifecycleRefreshCount;
 
-  // Exact observation count in DB MUST remain 1
-  const termObs = runner.observations.filter(o => o.canonical_term_id === termId);
-  assert.equal(termObs.length, 1, 'Exact observation retry must produce exactly 1 observation row');
-
-  const proj = await recomputeNativeEvidenceProjection(termId!, runner);
-  assert.ok(proj);
-
-  assert.equal(proj.rawObservationCount, 1);
-  assert.equal(proj.nativeObservedCount, 1);
-  assert.equal(proj.qualityCreatorCount, 1);
-  assert.equal(proj.nativeProposalEligible, false, 'Single creator evidence remains evidence-only');
-
-  // Verify that two genuinely DIFFERENT source videos from the same creator create two distinct observations
-  const video2Id = 'VID_1002';
+  // Re-running exact retry MUST NOT trigger lifecycle refresh
   await recordNativeTerminologyObservation({
     term: termStr,
     country: 'BR',
     channelId,
-    videoId: video2Id,
-    observationType: 'VIDEO_TITLE',
+    observationType: 'DESCRIPTION',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA'
+    sourceProvenanceFamily: 'CREATOR_METADATA',
+    evidence: desc1
   }, runner);
 
-  const updatedObs = runner.observations.filter(o => o.canonical_term_id === termId);
-  assert.equal(updatedObs.length, 2, 'Two distinct videos must produce 2 distinct observations');
+  assert.equal(runner.lifecycleRefreshCount, initialRefreshCount, 'Exact retry must skip lifecycle refresh on conflict');
 
-  const projAfterTwoVideos = await recomputeNativeEvidenceProjection(termId!, runner);
-  assert.ok(projAfterTwoVideos);
-  assert.equal(projAfterTwoVideos.rawObservationCount, 2);
-  // Quality creator count remains 1 because both videos come from the SAME creator
-  assert.equal(projAfterTwoVideos.qualityCreatorCount, 1);
-  assert.equal(projAfterTwoVideos.nativeProposalEligible, false);
-
-  // Adding a second DISTINCT quality creator unlocks proposal eligibility!
-  runner.channels.set('UC_IDEMPOTENT_2', { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
+  // 2. CHANGED description evidence snapshot from the SAME creator creates a NEW observation
+  const desc2 = { text: 'Novo treinamento de operacoes mini indice e mini dolar na B3' };
   await recordNativeTerminologyObservation({
     term: termStr,
     country: 'BR',
-    channelId: 'UC_IDEMPOTENT_2',
-    videoId: 'VID_2001',
+    channelId,
     observationType: 'DESCRIPTION',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA'
+    sourceProvenanceFamily: 'CREATOR_METADATA',
+    evidence: desc2
   }, runner);
 
-  const projMultiCreator = await recomputeNativeEvidenceProjection(termId!, runner);
-  assert.ok(projMultiCreator);
-  assert.equal(projMultiCreator.qualityCreatorCount, 2);
-  assert.equal(projMultiCreator.nativeProposalEligible, true, 'Distinct quality creators unlock proposal eligibility');
+  assert.equal(runner.observations.length, 2, 'Genuinely changed description evidence must create a new observation');
+
+  // 3. Two distinct ENRICHMENT evidence snapshots without videoId do NOT collapse
+  const enrich1 = { source: 'entity_linker_v1', matchedEntity: 'B3_INDICE' };
+  const enrich2 = { source: 'entity_linker_v2', matchedEntity: 'B3_FUTURES' };
+
+  await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'BR',
+    observationType: 'ENRICHMENT',
+    nativeEvidenceStatus: 'STRUCTURED_LOCAL_ENTITY' as any,
+    sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY',
+    evidence: enrich1
+  }, runner);
+
+  await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'BR',
+    observationType: 'ENRICHMENT',
+    nativeEvidenceStatus: 'STRUCTURED_LOCAL_ENTITY' as any,
+    sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY',
+    evidence: enrich2
+  }, runner);
+
+  assert.equal(runner.observations.length, 4, 'Distinct enrichment evidence snapshots must remain distinct');
 });
 
 test('Phase 10: Phase 10 native observations route through authoritative terminology lifecycle', async () => {

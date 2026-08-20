@@ -70,7 +70,22 @@ const SPONSOR_OR_AFFILIATE_PATTERNS = [
 ];
 
 /**
+ * Computes a deterministic checksum for an evidence payload.
+ */
+export function computeEvidenceChecksum(evidence?: Record<string, unknown> | null): string {
+  if (!evidence || Object.keys(evidence).length === 0) return 'none';
+  const sortedKeys = Object.keys(evidence).sort();
+  const sorted: Record<string, unknown> = {};
+  for (const k of sortedKeys) {
+    sorted[k] = evidence[k];
+  }
+  return createHash('sha256').update(JSON.stringify(sorted)).digest('hex').substring(0, 16);
+}
+
+/**
  * Computes a deterministic SHA-256 key for a native terminology observation to guarantee observation idempotency.
+ * Binds canonical term ID, channel ID, video ID, observation type, native evidence status, provenance family,
+ * and stable source evidence checksum/identity.
  */
 export function computeObservationKey(params: {
   canonicalTermId: number;
@@ -79,13 +94,18 @@ export function computeObservationKey(params: {
   observationType: string;
   nativeEvidenceStatus: string;
   sourceProvenanceFamily: string;
+  sourceEvidenceId?: string | null;
+  evidence?: Record<string, unknown> | null;
 }): string {
   const normChannel = (params.channelId || 'none').trim().toLowerCase();
   const normVideo = (params.videoId || 'none').trim().toLowerCase();
   const normType = params.observationType.trim().toUpperCase();
   const normStatus = params.nativeEvidenceStatus.trim().toUpperCase();
   const normFamily = params.sourceProvenanceFamily.trim().toUpperCase();
-  const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}`;
+
+  const evidenceId = (params.sourceEvidenceId || computeEvidenceChecksum(params.evidence)).trim().toLowerCase();
+
+  const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}|${evidenceId}`;
   return createHash('sha256').update(raw).digest('hex');
 }
 
@@ -455,8 +475,8 @@ export async function recomputeNativeEvidenceProjection(
 
 /**
  * Extracts and records native candidate market terms from channel/video metadata.
- * Uses deterministic observation keys to ensure observation idempotency and retry safety.
- * Always invokes refreshTerminologyLifecycle to keep canonical terminology maturity in sync.
+ * Uses deterministic observation keys binding stable evidence identity to ensure observation idempotency and retry safety.
+ * Invokes refreshTerminologyLifecycle and recomputeNativeEvidenceProjection only when a new observation is actually inserted.
  */
 export async function recordNativeTerminologyObservation(args: {
   term: string;
@@ -466,6 +486,7 @@ export async function recordNativeTerminologyObservation(args: {
   locale?: string;
   channelId?: string;
   videoId?: string;
+  sourceEvidenceId?: string;
   observationType: 'CHANNEL_NAME' | 'VIDEO_TITLE' | 'DESCRIPTION' | 'ENRICHMENT' | 'HUMAN_APPROVED_CHANNEL';
   nativeEvidenceStatus?: NativeEvidenceStatus;
   sourceProvenanceFamily?: SourceProvenanceFamily;
@@ -502,7 +523,9 @@ export async function recordNativeTerminologyObservation(args: {
     videoId: args.videoId,
     observationType: args.observationType,
     nativeEvidenceStatus: evidenceStatus,
-    sourceProvenanceFamily: provenanceFamily
+    sourceProvenanceFamily: provenanceFamily,
+    sourceEvidenceId: args.sourceEvidenceId,
+    evidence: args.evidence
   });
 
   // Insert observation into terminology_observations idempotently using observation_key
@@ -534,12 +557,11 @@ export async function recordNativeTerminologyObservation(args: {
     ]
   );
 
-  // Invoke authoritative terminology lifecycle refresh ONLY if a new observation was actually inserted
-  // or re-run to ensure current state is fresh.
-  await refreshTerminologyLifecycle(termId, undefined, runner);
-
-  // Recompute native evidence projection idempotently
-  await recomputeNativeEvidenceProjection(termId, runner);
+  // Invoke authoritative terminology lifecycle refresh & projection recompute ONLY if a new observation was actually inserted!
+  if (obsInsert.rows && obsInsert.rows.length > 0) {
+    await refreshTerminologyLifecycle(termId, undefined, runner);
+    await recomputeNativeEvidenceProjection(termId, runner);
+  }
 
   return termId;
 }
