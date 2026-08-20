@@ -12,7 +12,7 @@ import {
 import { observeTerminology } from './terminologyIntelligence';
 import { getDb } from './db';
 import fs from 'node:fs';
-import { effectiveProjectionProposalEvidence, generateCountryNativeProposals, projectionProposalProvenance, selectFairCountryNativeProposals, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
+import { buildFrontierProposal, effectiveProjectionProposalEvidence, generateCountryNativeProposals, projectionProposalProvenance, selectFairCountryNativeProposals, settleBeforeDeadline, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import { planCountryNativeProposalQuery } from './queryPlanner';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
@@ -798,6 +798,34 @@ test('Phase 10: the existing autonomous producer materializes only bounded nativ
     source.indexOf('materializeBoundedCountryNativeProposals') < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
     'proposal materialization must precede the existing Phase 8 allocation boundary'
   );
+});
+
+test('Phase 10: a hung optional materializer is bounded and native neighborhoods are executable identities', async () => {
+  const started = Date.now();
+  const never = new Promise<string>(() => undefined);
+  assert.equal(await settleBeforeDeadline(never, 20, 'legacy-continues'), 'legacy-continues');
+  assert.ok(Date.now() - started < 500, 'deadline must release the producer promptly');
+  const proposal = buildFrontierProposal({
+    proposalFamily: 'COUNTRY_NATIVE', country: 'Japan', concept: '日経平均',
+    sourceProvenance: 'native:test', supportingEvidence: { nativeTerm: '日経平均' },
+    noveltyRationale: 'test'
+  });
+  assert.equal(proposal.targetDimensions.retrievalLane, 'VIDEO');
+  assert.equal(proposal.targetDimensions.searchOrdering, 'RELEVANCE');
+  assert.equal(proposal.targetDimensions.sourceFamily, 'automated_query');
+});
+
+test('Phase 10: every scheduler skip has an explicit reservation disposition and successful scheduling consumes once', () => {
+  const scheduler = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  const allocator = fs.readFileSync(new URL('./discoveryFrontierAllocator.ts', import.meta.url), 'utf8');
+  const db = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  assert.match(scheduler, /Batch diversity guard skipped reserved allocation/);
+  assert.match(scheduler, /quarantineUnexecutableAllocation/);
+  assert.match(allocator, /trial_status='EXPIRED'/);
+  assert.match(allocator, /STALE_RESERVATION_RECOVERED/);
+  assert.match(db, /SET trial_status='TRIED'/);
+  assert.match(db, /p\.trial_status='PENDING'/);
+  assert.match(db, /WHERE id=\$1 AND status<>'COMPLETED'/);
 });
 
 test('Phase 10: authoritative query completion attributes native outcomes through persisted allocation lineage', () => {

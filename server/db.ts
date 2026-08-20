@@ -13,7 +13,7 @@ import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
-import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
+import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { buildRetrievalConfiguration } from './retrievalConfiguration';
 import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
@@ -497,6 +497,7 @@ export interface AutonomousQueryCandidate {
   allocationProvenance?: Record<string, unknown>;
   allocationOrigin?: 'FRONTIER_CANARY' | 'LEGACY';
   frontierDecisionId?: string;
+  targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
 }
 
 export interface AutonomousSchedulingSnapshot {
@@ -566,6 +567,14 @@ export async function scheduleAutonomousQueryRuns(
   try {
     await client.query('BEGIN');
     for (const candidate of candidates) {
+      const nativeLineage = (candidate.query.generation_metadata?.countryNativeAllocation || {}) as Record<string, unknown>;
+      const allocatedDimensions = candidate.allocationOrigin === 'FRONTIER_CANARY' && nativeLineage.targetNeighborhoodKey
+        ? candidate.targetNeighborhoodDimensions
+        : undefined;
+      if (nativeLineage.targetNeighborhoodKey && (!allocatedDimensions ||
+          createNeighborhoodKey(allocatedDimensions) !== nativeLineage.targetNeighborhoodKey)) {
+        throw new Error('FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH');
+      }
       const reserved = await client.query(
         `UPDATE query_library
          SET reserved_at=now(), reserved_until=now()+interval '20 minutes', reserved_by=$2, last_queued_at=now()
@@ -589,12 +598,16 @@ export async function scheduleAutonomousQueryRuns(
       );
       const video = laneCounts.rows[0]?.video || 0;
       const total = laneCounts.rows[0]?.total || 0;
-      const controlRetrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
+      const controlRetrievalLane = allocatedDimensions
+        ? allocatedDimensions.retrievalLane as RetrievalLane
+        : allocateRetrievalLane(video, total, videoLanePercent);
       const orderingCounts = await client.query(
         `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
          FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
       );
-      const controlSearchOrdering = allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+      const controlSearchOrdering = allocatedDimensions
+        ? allocatedDimensions.searchOrdering as SearchOrdering
+        : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
       const controlConfig = buildRetrievalConfiguration({
         searchOrdering: controlSearchOrdering,
@@ -609,10 +622,13 @@ export async function scheduleAutonomousQueryRuns(
       let requestedPageDepth = 1;
       let canaryReservationId: string | undefined;
 
-      const { neighborhood } = mapQueryRunToNeighborhood(
+      const { neighborhood: mappedNeighborhood } = mapQueryRunToNeighborhood(
         { runId: 'pending', queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
         candidate.query
       );
+      const neighborhood = allocatedDimensions
+        ? { neighborhoodKey: createNeighborhoodKey(allocatedDimensions), dimensions: allocatedDimensions }
+        : mappedNeighborhood;
 
       const oppKey = candidate.frontierDecisionId || (candidate.allocationProvenance?.assignmentKey ? String(candidate.allocationProvenance.assignmentKey) : `opp:q${candidate.query.id}:strat_${candidate.strategy}:n${candidate.query.times_executed || 0}`);
 
@@ -661,6 +677,11 @@ export async function scheduleAutonomousQueryRuns(
         canaryReservationId = canaryTreatment.reservation.reservationId;
       }
 
+      if (allocatedDimensions && (retrievalLane !== allocatedDimensions.retrievalLane ||
+          searchOrdering !== allocatedDimensions.searchOrdering)) {
+        throw new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
+      }
+
       const executedConfig = buildRetrievalConfiguration({
         searchOrdering,
         retrievalLane,
@@ -707,6 +728,17 @@ export async function scheduleAutonomousQueryRuns(
         if (!commitRes.rowCount) {
           throw new Error(`FRONTIER_ALLOCATION_COMMIT_FAILED: Decision ${candidate.frontierDecisionId} is not an active RESERVED canary decision.`);
         }
+        if (nativeLineage.targetNeighborhoodKey) {
+          const consumed = await client.query(
+            `UPDATE frontier_discovery_proposals p SET trial_status='TRIED'
+             FROM frontier_allocation_decisions d
+             WHERE d.decision_id=$1 AND d.proposal_id=p.proposal_id
+               AND d.decision_status='COMMITTED' AND p.trial_status='PENDING'
+               AND p.proposal_family='COUNTRY_NATIVE'
+             RETURNING p.proposal_id`, [candidate.frontierDecisionId]
+          );
+          if (!consumed.rowCount) throw new Error(`FRONTIER_PROPOSAL_CONSUME_FAILED: ${candidate.frontierDecisionId}`);
+        }
       }
       for (const component of queryComponents(candidate.query)) {
         await client.query(
@@ -751,7 +783,10 @@ export async function scheduleAutonomousQueryRuns(
             null,
             { runId: item.runId, queryId: item.query.id, country: item.query.country, retrievalLane: item.retrievalLane, searchOrdering: item.searchOrdering, source: 'automated_query' },
             candidate.query,
-            observedLanguage
+            observedLanguage,
+            candidate.query.generation_metadata?.countryNativeAllocation
+              ? candidate.targetNeighborhoodDimensions
+              : undefined
           );
         }
       } catch (error) {
@@ -772,10 +807,16 @@ export async function recordNeighborhoodObservation(
   client: any,
   queryRun: { runId: string; queryId?: number; country: string; retrievalLane: string; searchOrdering: string; source?: string },
   queryRecord: Partial<QueryRecord> & { query: string; intent?: string; primary_term?: string; country: string },
-  language?: string | null
+  language?: string | null,
+  authoritativeDimensions?: DiscoveryNeighborhoodDimensions
 ): Promise<{ neighborhoodKey: string; retrievalActionKey: string }> {
   const db = client || await getDb();
-  const { neighborhood, lineage } = mapQueryRunToNeighborhood(queryRun, queryRecord, { language });
+  const mapped = mapQueryRunToNeighborhood(queryRun, queryRecord, { language });
+  const neighborhood = authoritativeDimensions
+    ? { ...mapped.neighborhood, neighborhoodKey: createNeighborhoodKey(authoritativeDimensions), dimensions: authoritativeDimensions }
+    : mapped.neighborhood;
+  const lineage = { ...mapped.lineage, neighborhoodKey: neighborhood.neighborhoodKey,
+    retrievalActionKey: `retrieval_action:${queryRun.runId}:${neighborhood.neighborhoodKey}` };
 
   await db.query(
     `INSERT INTO discovery_neighborhoods(
@@ -1311,13 +1352,13 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE query_runs SET status='COMPLETED',raw_results=$2,distinct_results=$3,duplicate_results=$4,
        known_channels=$5,new_channels=$6,country_rejected=$7,non_trading=$8,uncertain=$9,needs_review=$10,
        trading_confirmed=$11,unique_channels=$12,quality_channels=$13,communities_discovered=$14,quota_used=$15,
-       performance_details=$16,completed_at=now() WHERE id=$1 RETURNING query_id`,
+       performance_details=$16,completed_at=now() WHERE id=$1 AND status<>'COMPLETED' RETURNING query_id`,
       [runId, metrics.rawResults, metrics.distinctResults, metrics.duplicateResults, metrics.knownChannels,
        metrics.newChannels, metrics.countryRejected, metrics.nonTrading, metrics.uncertain, metrics.needsReview,
        metrics.tradingConfirmed, metrics.uniqueChannels, metrics.qualityChannels, metrics.communitiesDiscovered,
        metrics.quotaUsed, JSON.stringify(metrics)]
     );
-    await client.query(`UPDATE query_run_components SET performance_details=$2 WHERE query_run_id=$1`, [runId, JSON.stringify(metrics)]);
+    if (run.rowCount) await client.query(`UPDATE query_run_components SET performance_details=$2 WHERE query_run_id=$1`, [runId, JSON.stringify(metrics)]);
     if (run.rowCount) {
       await client.query(
         `UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL,
@@ -1326,7 +1367,7 @@ export async function completeQueryRun(runId: string, metrics: {
       );
     }
     if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});await attributeCompletedCountryNativeRun(client,runId,metrics);}
-    await client.query(
+    if (run.rowCount) await client.query(
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
@@ -1335,7 +1376,7 @@ export async function completeQueryRun(runId: string, metrics: {
     // Await post-commit best-effort observation analytics (Phases 2-4).
     // Any analytics error is caught inside recordNeighborhoodAnalyticsAfterRun,
     // ensuring analytics failures never roll back or abort completed runs.
-    await recordNeighborhoodAnalyticsAfterRun(runId, metrics);
+    if (run.rowCount) await recordNeighborhoodAnalyticsAfterRun(runId, metrics);
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

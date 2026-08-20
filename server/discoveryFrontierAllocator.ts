@@ -583,6 +583,16 @@ export async function evaluateFrontierCanaryAllocation(input: {
     // Acquire transaction advisory lock for allocation authority
     await runner.query('SELECT pg_advisory_xact_lock(741963286)');
 
+    // A process can die after Phase 8 reserves but before the scheduling transaction.
+    // Expire those orphaned reservations under the allocation authority lock.
+    await runner.query(
+      `UPDATE frontier_allocation_decisions
+       SET decision_status='RELEASED',deferred=true,quota_reserved=0,
+           rejection_reasons=jsonb_set(COALESCE(rejection_reasons,'{}'::jsonb),'{releaseReason}',to_jsonb('STALE_RESERVATION_RECOVERED'::text))
+       WHERE allocation_origin='FRONTIER_CANARY' AND decision_status='RESERVED'
+         AND created_at < now()-interval '20 minutes'`
+    );
+
     // Read Configurable Caps
     const [assignCapRes, quotaCapRes] = await Promise.all([
       runner.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_allocation_daily_assignment_cap'`),
@@ -688,7 +698,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
         }
       }
       const lockedProposal = await runner.query(
-        `SELECT proposal_family,source_provenance,supporting_evidence,confidence
+        `SELECT proposal_family,source_provenance,supporting_evidence,confidence,target_neighborhood_key,target_dimensions
          FROM frontier_discovery_proposals
          WHERE proposal_id=$1 AND trial_status='PENDING' AND (expires_at IS NULL OR expires_at>$2)
          FOR UPDATE`,
@@ -700,9 +710,12 @@ export async function evaluateFrontierCanaryAllocation(input: {
       }
       const locked = lockedProposal.rows[0];
       const lockedEvidence = typeof locked.supporting_evidence === 'string' ? JSON.parse(locked.supporting_evidence) : locked.supporting_evidence || {};
+      const lockedDimensions = typeof locked.target_dimensions === 'string' ? JSON.parse(locked.target_dimensions) : locked.target_dimensions;
       if (lockedEvidence.evidenceChecksum !== selectedEvidence.evidenceChecksum ||
           locked.source_provenance !== topCandidate.proposalEvidenceSnapshot?.sourceProvenance ||
-          Number(locked.confidence) !== Number(topCandidate.proposalEvidenceSnapshot?.confidence)) {
+          Number(locked.confidence) !== Number(topCandidate.proposalEvidenceSnapshot?.confidence) ||
+          locked.target_neighborhood_key !== topCandidate.neighborhoodKey ||
+          createNeighborhoodKey(lockedDimensions) !== topCandidate.neighborhoodKey) {
         if (client) await runner.query('COMMIT');
         return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_FRONTIER_PROPOSAL_SNAPSHOT' };
       }
@@ -710,6 +723,8 @@ export async function evaluateFrontierCanaryAllocation(input: {
         proposalFamily: locked.proposal_family,
         sourceProvenance: locked.source_provenance,
         confidence: Number(locked.confidence),
+        targetNeighborhoodKey: locked.target_neighborhood_key,
+        targetDimensions: lockedDimensions,
         supportingEvidence: lockedEvidence
       };
     }
@@ -865,6 +880,44 @@ export async function markAllocationDecisionDeferred(
   clientOverride?: any
 ): Promise<boolean> {
   return releaseAllocationDecision(decisionId, reason, clientOverride);
+}
+
+/**
+ * Atomically releases an unexecutable reservation and terminally quarantines only its
+ * still-pending proposal. Executability is part of proposal identity, so evidence refresh
+ * must never resurrect it; a materially different proposal receives a different dedup key.
+ */
+export async function quarantineUnexecutableAllocation(
+  decisionId: string,
+  reason: string,
+  clientOverride?: any
+): Promise<boolean> {
+  const db = clientOverride || await getDb();
+  const client = clientOverride ? null : await db.connect();
+  const runner = clientOverride || client;
+  try {
+    if (client) await runner.query('BEGIN');
+    const decision = await runner.query(
+      `UPDATE frontier_allocation_decisions
+       SET decision_status='DEFERRED', deferred=true, quota_reserved=0,
+           rejection_reasons=jsonb_set(COALESCE(rejection_reasons,'{}'::jsonb),'{releaseReason}',to_jsonb($2::text))
+       WHERE decision_id=$1 AND allocation_origin='FRONTIER_CANARY' AND decision_status='RESERVED'
+       RETURNING proposal_id`, [decisionId, reason]
+    );
+    if (decision.rowCount && decision.rows[0].proposal_id) {
+      await runner.query(
+        `UPDATE frontier_discovery_proposals SET trial_status='EXPIRED'
+         WHERE proposal_id=$1 AND trial_status='PENDING'`, [decision.rows[0].proposal_id]
+      );
+    }
+    if (client) await runner.query('COMMIT');
+    return Boolean(decision.rowCount);
+  } catch (error) {
+    if (client) await runner.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    if (client) client.release();
+  }
 }
 
 /**

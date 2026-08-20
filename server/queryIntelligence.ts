@@ -503,6 +503,8 @@ export async function constructCountryNativeAllocationQuery(args: {
   await assertCountryAllowed(args.country, 'query_generation');
   const snapshot = args.proposalEvidenceSnapshot;
   if (snapshot?.proposalFamily !== 'COUNTRY_NATIVE') return null;
+  if (snapshot.targetNeighborhoodKey !== createNeighborhoodKey(args.targetNeighborhoodDimensions) ||
+      createNeighborhoodKey(snapshot.targetDimensions as DiscoveryNeighborhoodDimensions) !== snapshot.targetNeighborhoodKey) return null;
   const evidence = snapshot.supportingEvidence || {};
   const nativeTerm = typeof evidence.nativeTerm === 'string' ? evidence.nativeTerm.trim() : '';
   if (!nativeTerm || !evidence.evidenceChecksum) return null;

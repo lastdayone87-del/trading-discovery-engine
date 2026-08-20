@@ -118,10 +118,10 @@ export function buildFrontierProposal(params: {
     language: params.language || null,
     queryIntent: params.intent || 'GENERAL',
     primaryTermFamily: params.primaryTermFamily || params.concept,
-    retrievalLane: params.retrievalLane || 'ORGANIC',
+    retrievalLane: params.retrievalLane || (params.proposalFamily === 'COUNTRY_NATIVE' ? 'VIDEO' : 'ORGANIC'),
     searchOrdering: params.searchOrdering || 'RELEVANCE',
     instrumentOrTheme: params.instrumentOrTheme || null,
-    sourceFamily: params.sourceFamily || 'frontier_proposal'
+    sourceFamily: params.sourceFamily || (params.proposalFamily === 'COUNTRY_NATIVE' ? 'automated_query' : 'frontier_proposal')
   };
 
   const neighborhood = buildDiscoveryNeighborhood(dimensions);
@@ -460,18 +460,34 @@ export async function generateCountryNativeProposals(country: string, limit = 10
 /** Bounded Phase 10 materialization for the existing autonomous producer cycle. */
 export async function materializeBoundedCountryNativeProposals(
   countries: string[],
-  config: { globalCap?: number; perCountryCap?: number; fairnessCursor?: number } = {}
+  config: { globalCap?: number; perCountryCap?: number; fairnessCursor?: number; deadlineMs?: number } = {}
 ): Promise<{ generated: number; persisted: number; proposals: DiscoveryFrontierProposal[] }> {
   const globalCap = Math.min(100, Math.max(1, Math.floor(config.globalCap ?? 25)));
   const perCountryCap = Math.min(globalCap, Math.max(1, Math.floor(config.perCountryCap ?? 5)));
   const normalizedCountries = [...new Set(countries.map(canonicalCountry).filter(Boolean))].sort();
+  const deadlineMs = Math.min(30_000, Math.max(100, Math.floor(config.deadlineMs ?? 2_500)));
   const groups = await Promise.all(normalizedCountries.map(async country => ({
     country,
-    proposals: await generateCountryNativeProposals(country, perCountryCap).catch(() => [])
+    proposals: await settleBeforeDeadline(
+      generateCountryNativeProposals(country, perCountryCap), deadlineMs, []
+    )
   })));
   const proposals = selectFairCountryNativeProposals(groups, globalCap, config.fairnessCursor ?? 0);
-  const persisted = await persistFrontierProposals(proposals);
+  const persisted = await settleBeforeDeadline(persistFrontierProposals(proposals), deadlineMs, 0);
   return { generated: proposals.length, persisted, proposals };
+}
+
+/** A best-effort materializer may never extend the scheduler critical path past its budget. */
+export async function settleBeforeDeadline<T>(work: Promise<T>, deadlineMs: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work.catch(() => fallback),
+      new Promise<T>(resolve => { timer = setTimeout(() => resolve(fallback), Math.max(0, deadlineMs)); })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Deterministic rotating round-robin selection prevents lexicographic country starvation. */

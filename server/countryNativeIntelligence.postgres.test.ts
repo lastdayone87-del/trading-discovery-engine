@@ -5,6 +5,7 @@ import { observeTerminology } from './terminologyIntelligence';
 import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
 import { recomputeNativeEvidenceProjection, refreshCountryNativeProjectionsForCreator } from './countryNativeIntelligence';
+import { quarantineUnexecutableAllocation } from './discoveryFrontierAllocator';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
 
@@ -498,6 +499,36 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.equal(productionAttribution.rows[0].provenance_family, 'CREATOR_METADATA');
     assert.equal(productionAttribution.rows[0].canonical_term_id, firstId);
     assert.equal(productionAttribution.rows[0].structured_entity_matched, true);
+    await completeQueryRun(run.rows[0].id, { ...completedMetrics, rawResults: 999, quotaUsed: 1 });
+    const completionReplayState = await db.query(
+      `SELECT r.raw_results,r.quota_used,count(a.id)::int attribution_count,max(a.raw_results)::int attributed_raw
+       FROM query_runs r LEFT JOIN country_native_performance_attribution a ON a.query_run_id=r.id
+       WHERE r.id=$1 GROUP BY r.id`, [run.rows[0].id]
+    );
+    assert.equal(completionReplayState.rows[0].raw_results, completedMetrics.rawResults, 'completion is first-terminal-write wins');
+    assert.equal(completionReplayState.rows[0].quota_used, completedMetrics.quotaUsed);
+    assert.equal(completionReplayState.rows[0].attribution_count, 1, 'attribution uses the same first-write replay policy');
+    assert.equal(completionReplayState.rows[0].attributed_raw, completedMetrics.rawResults);
+
+    const invalidProposal = await db.query(
+      `INSERT INTO frontier_discovery_proposals(dedup_key,proposal_family,country,concept,target_dimensions,source_provenance,supporting_evidence,novelty_rationale)
+       VALUES($1,'COUNTRY_NATIVE',$2,$3,'{}'::jsonb,'phase10-invalid','{}'::jsonb,'invalid construction regression') RETURNING proposal_id`,
+      [`invalid:${suffix}`, country, `too many tokens for native ${suffix}`]
+    );
+    await db.query(
+      `INSERT INTO frontier_allocation_decisions(decision_id,opportunity_key,allocation_origin,decision_status,selected_country,frontier_state,proposal_id,quota_day,policy_version)
+       VALUES($1,$2,'FRONTIER_CANARY','RESERVED',$3,'UNEXPLORED',$4,'2026-08-20','phase10-test')`,
+      [`invalid-decision:${suffix}`, `invalid-opportunity:${suffix}`, country, invalidProposal.rows[0].proposal_id]
+    );
+    assert.equal(await quarantineUnexecutableAllocation(`invalid-decision:${suffix}`, 'unconstructable regression'), true);
+    const quarantine = await db.query(
+      `SELECT d.decision_status,d.quota_reserved,p.trial_status
+       FROM frontier_allocation_decisions d JOIN frontier_discovery_proposals p ON p.proposal_id=d.proposal_id
+       WHERE d.decision_id=$1`, [`invalid-decision:${suffix}`]
+    );
+    assert.deepEqual(quarantine.rows[0], { decision_status: 'DEFERRED', quota_reserved: 0, trial_status: 'EXPIRED' });
+    assert.equal(await quarantineUnexecutableAllocation(`invalid-decision:${suffix}`, 'retry'), false,
+      'terminal quarantine is exact-replay idempotent');
 
     await assert.rejects(
       db.query(`UPDATE frontier_allocation_decisions SET proposal_evidence_snapshot='{}'::jsonb WHERE decision_id=$1`, [`decision:${suffix}`]),
