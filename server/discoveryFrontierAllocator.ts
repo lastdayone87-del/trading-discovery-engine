@@ -7,6 +7,7 @@ import {
   buildDiscoveryNeighborhood
 } from './discoveryNeighborhood';
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
+import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -662,6 +663,55 @@ export async function evaluateFrontierCanaryAllocation(input: {
 
     const topCandidate = eligibleCandidates[0].candidate;
     const topScore = eligibleCandidates[0].score;
+    let lockedProposalSnapshot = topCandidate.proposalEvidenceSnapshot || null;
+    if (topCandidate.proposalId) {
+      const selectedEvidence = (topCandidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
+      const canonicalTermId = Number(selectedEvidence.canonicalTermId);
+      if (Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+        const projection = await runner.query(
+          `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
+                  bootstrap_seed_count,native_quality_creator_count,structured_entity_matched,
+                  native_proposal_eligible,evidence_revision,updated_at
+           FROM country_native_evidence_projections WHERE canonical_term_id=$1 FOR SHARE`,
+          [canonicalTermId]
+        );
+        const row = projection.rows[0];
+        const effective = row ? effectiveProjectionProposalEvidence(row) : null;
+        if (!row?.native_proposal_eligible || !effective ||
+            String(row.evidence_revision || '0') !== String(selectedEvidence.evidenceRevision || '0') ||
+            new Date(row.updated_at).getTime() !== new Date(String(selectedEvidence.projectionRevision || 0)).getTime() ||
+            effective.nativeEvidenceStatus !== selectedEvidence.nativeEvidenceStatus ||
+            effective.sourceProvenanceFamily !== selectedEvidence.sourceProvenanceFamily) {
+          if (client) await runner.query('COMMIT');
+          return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_FRONTIER_PROPOSAL_EVIDENCE' };
+        }
+      }
+      const lockedProposal = await runner.query(
+        `SELECT proposal_family,source_provenance,supporting_evidence,confidence
+         FROM frontier_discovery_proposals
+         WHERE proposal_id=$1 AND trial_status='PENDING' AND (expires_at IS NULL OR expires_at>$2)
+         FOR UPDATE`,
+        [topCandidate.proposalId, now.toISOString()]
+      );
+      if (!lockedProposal.rowCount) {
+        if (client) await runner.query('COMMIT');
+        return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_FRONTIER_PROPOSAL_STATE' };
+      }
+      const locked = lockedProposal.rows[0];
+      const lockedEvidence = typeof locked.supporting_evidence === 'string' ? JSON.parse(locked.supporting_evidence) : locked.supporting_evidence || {};
+      if (lockedEvidence.evidenceChecksum !== selectedEvidence.evidenceChecksum ||
+          locked.source_provenance !== topCandidate.proposalEvidenceSnapshot?.sourceProvenance ||
+          Number(locked.confidence) !== Number(topCandidate.proposalEvidenceSnapshot?.confidence)) {
+        if (client) await runner.query('COMMIT');
+        return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_FRONTIER_PROPOSAL_SNAPSHOT' };
+      }
+      lockedProposalSnapshot = {
+        proposalFamily: locked.proposal_family,
+        sourceProvenance: locked.source_provenance,
+        confidence: Number(locked.confidence),
+        supportingEvidence: lockedEvidence
+      };
+    }
 
     const decisionId = createHash('sha256')
       .update(`${input.opportunityKey}:${topCandidate.neighborhoodKey}:canary:${PERSISTENT_RESEARCH_PHASE8_VERSION}`)
@@ -691,7 +741,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
         knownCreatorRatio: topCandidate.knownCreatorRatio
       },
       proposalId: topCandidate.proposalId || null,
-      proposalEvidenceSnapshot: topCandidate.proposalEvidenceSnapshot || null,
+      proposalEvidenceSnapshot: lockedProposalSnapshot,
       selectionScore: topScore.totalScore,
       scoreComponents: topScore,
       candidateNeighborhoodCount: candidates.length,

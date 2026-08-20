@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { completeQueryRun, getChannelById, getDb, upsertChannel } from './db';
 import { observeTerminology } from './terminologyIntelligence';
-import { buildFrontierProposal, countryNativeEvidenceChecksum, countryNativeEvidenceVersion, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
+import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
@@ -192,6 +192,8 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     await upsertChannel(reclassified!);
     let governedStored = await db.query('SELECT trial_status,supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey]);
     assert.equal(governedStored.rows[0].trial_status, 'DISABLED', 'stale native tier is immediately non-allocatable');
+    assert.equal(await persistFrontierProposals([governedNative!]), 0, 'stale materialization cannot resurrect a proposal disabled by newer projection state');
+    assert.equal((await db.query('SELECT trial_status FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey])).rows[0].trial_status, 'DISABLED');
     const governedBootstrap = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
     assert.equal(governedBootstrap?.supportingEvidence.nativeEvidenceStatus, 'BOOTSTRAP_SEED');
     assert.equal(governedBootstrap?.dedupKey, governedNative?.dedupKey);
@@ -206,6 +208,19 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     governedStored = await db.query('SELECT trial_status,supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey]);
     assert.equal(governedStored.rows[0].trial_status, 'PENDING');
     assert.equal(governedStored.rows[0].supporting_evidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+
+    const staleWithoutRow = governedRestored!;
+    await db.query('DELETE FROM frontier_discovery_proposals WHERE dedup_key=$1',[staleWithoutRow.dedupKey]);
+    reclassified!.quality_score = 50;
+    await upsertChannel(reclassified!);
+    assert.equal(await persistFrontierProposals([staleWithoutRow]), 0, 'stale projection cannot insert a new PENDING proposal after downgrade');
+    assert.equal((await db.query('SELECT count(*)::int count FROM frontier_discovery_proposals WHERE dedup_key=$1',[staleWithoutRow.dedupKey])).rows[0].count, 0);
+    const bootstrapAfterMissingRow = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
+    await persistFrontierProposals([bootstrapAfterMissingRow!]);
+    reclassified!.quality_score = 55;
+    await upsertChannel(reclassified!);
+    const nativeAfterMissingRow = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
+    await persistFrontierProposals([nativeAfterMissingRow!]);
 
     await db.query(`UPDATE frontier_discovery_proposals SET trial_status='TRIED' WHERE dedup_key=$1`,[governedNative!.dedupKey]);
     reclassified!.quality_score = 50;
@@ -277,8 +292,12 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
       },
       confidence: 0.4, noveltyRationale: 'bootstrap first'
     });
+    const currentPersisted = (await generateCountryNativeProposals(country, 30)).find(
+      proposal => proposal.supportingEvidence.canonicalTermId === firstId
+    );
+    assert.ok(currentPersisted);
     await persistFrontierProposals([bootstrap]);
-    await persistFrontierProposals([persisted!]);
+    await persistFrontierProposals([currentPersisted!]);
     await persistFrontierProposals([bootstrap]);
     const upgraded = await db.query(
       `SELECT count(*)::int count, max(source_provenance) source_provenance,
@@ -290,64 +309,8 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.equal(upgraded.rows[0].count, 1);
     assert.equal(upgraded.rows[0].native_status, 'NATIVE_OBSERVED');
     assert.match(upgraded.rows[0].source_provenance, /^observed_native_evidence:/);
-    assert.ok(Math.abs(upgraded.rows[0].confidence - persisted!.confidence) < 1e-6);
-
-    const versionEvidence = <T extends Record<string, unknown>>(evidence: T): T & { evidenceChecksum: string; evidenceVersion: string } => {
-      const evidenceChecksum = countryNativeEvidenceChecksum(evidence);
-      return { ...evidence, evidenceChecksum, evidenceVersion: countryNativeEvidenceVersion(evidence, evidenceChecksum) };
-    };
-    const creatorRefresh = {
-      ...persisted!,
-      supportingEvidence: versionEvidence({
-        ...persisted!.supportingEvidence,
-        evidenceRevision: String(BigInt(String(persisted!.supportingEvidence.evidenceRevision || '0')) + 1n),
-        qualityCreatorCount: Number(persisted!.supportingEvidence.qualityCreatorCount || 0) + 1,
-        distinctCreatorCount: Number(persisted!.supportingEvidence.distinctCreatorCount || 0) + 1
-      })
-    };
-    assert.equal(await persistFrontierProposals([creatorRefresh]), 1, 'higher same-tier creator evidence must refresh');
-    const confidenceRefresh = { ...creatorRefresh, confidence: creatorRefresh.confidence + 0.01,
-      supportingEvidence: versionEvidence({ ...creatorRefresh.supportingEvidence, evidenceRevision: String(BigInt(String(creatorRefresh.supportingEvidence.evidenceRevision)) + 1n) }) };
-    assert.equal(await persistFrontierProposals([confidenceRefresh]), 1, 'higher same-tier confidence must refresh');
-    const geographyRefresh = {
-      ...confidenceRefresh,
-      supportingEvidence: versionEvidence({
-        ...confidenceRefresh.supportingEvidence,
-        evidenceRevision: String(BigInt(String(confidenceRefresh.supportingEvidence.evidenceRevision)) + 1n),
-        lastObservedAt: '2099-01-01T00:00:00.000Z',
-        observedCreatorCountries: [...new Set([...((confidenceRefresh.supportingEvidence as Record<string, unknown>).observedCreatorCountries as string[] || []), 'Austria'])]
-      })
-    };
-    assert.equal(await persistFrontierProposals([geographyRefresh]), 1, 'newer same-tier expanded geography must refresh');
-    assert.equal(await persistFrontierProposals([persisted!]), 0, 'weaker same-tier replay must remain a no-op');
-    const refreshed = await db.query(
-      `SELECT confidence::float confidence, supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1`,
-      [persisted!.dedupKey]
-    );
-    assert.ok(Math.abs(refreshed.rows[0].confidence - confidenceRefresh.confidence) < 1e-6);
-    assert.ok(refreshed.rows[0].supporting_evidence.observedCreatorCountries.includes('Austria'));
-    assert.equal(Number(refreshed.rows[0].supporting_evidence.qualityCreatorCount), Number(creatorRefresh.supportingEvidence.qualityCreatorCount));
-
-    const codeSwitchRefresh = {
-      ...geographyRefresh,
-      supportingEvidence: versionEvidence({ ...geographyRefresh.supportingEvidence, evidenceRevision: String(BigInt(String(geographyRefresh.supportingEvidence.evidenceRevision)) + 1n), lastObservedAt: '2099-01-01T00:00:01.000Z', isCodeSwitched: true, codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' })
-    };
-    assert.equal(await persistFrontierProposals([codeSwitchRefresh]), 1, 'code-switch-only same-tier change must refresh');
-    const provenanceRefresh = {
-      ...codeSwitchRefresh,
-      sourceProvenance: `observed_native_evidence:structured_local_entity:${firstId}`,
-      supportingEvidence: versionEvidence({ ...codeSwitchRefresh.supportingEvidence, evidenceRevision: String(BigInt(String(codeSwitchRefresh.supportingEvidence.evidenceRevision)) + 1n), lastObservedAt: '2099-01-01T00:00:02.000Z', sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY' })
-    };
-    assert.equal(await persistFrontierProposals([provenanceRefresh]), 1, 'primary same-tier provenance-only change must refresh');
-    assert.equal(await persistFrontierProposals([provenanceRefresh]), 0, 'canonical evidence exact replay must remain a no-op');
-    assert.equal(await persistFrontierProposals([codeSwitchRefresh]), 0, 'stale evidence cannot overwrite newer same-tier evidence');
-
-    const revisionA = BigInt(String(provenanceRefresh.supportingEvidence.evidenceRevision)) + 1n;
-    const equalTimestampA = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, evidenceRevision: String(revisionA), lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' }) };
-    const equalTimestampB = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, evidenceRevision: String(revisionA + 1n), lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'ENGLISH_DOMINANT_NATIVE_MARKET' }) };
-    assert.equal(await persistFrontierProposals([equalTimestampA]), 1);
-    assert.equal(await persistFrontierProposals([equalTimestampB]), 1, 'equal timestamp must accept higher authoritative observation revision');
-    assert.equal(await persistFrontierProposals([equalTimestampA]), 0, 'lower equal-timestamp revision cannot overwrite authoritative winner');
+    assert.ok(Math.abs(upgraded.rows[0].confidence - currentPersisted!.confidence) < 1e-6);
+    assert.equal(await persistFrontierProposals([currentPersisted!]), 0, 'exact authoritative proposal replay remains a no-op');
 
     const query = await db.query(
       `INSERT INTO query_library(query,normalized_query,country,collection,intent)

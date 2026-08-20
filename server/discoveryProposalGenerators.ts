@@ -571,9 +571,40 @@ export async function persistFrontierProposals(
   let inserted = 0;
 
   for (const p of proposals) {
-    if (p.targetNeighborhoodKey) {
+    let client: any = null;
+    let runner: any = db;
+    try {
+      const canonicalTermId = Number(p.supportingEvidence.canonicalTermId);
+      if (p.proposalFamily === 'COUNTRY_NATIVE' && Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+        client = await db.connect();
+        runner = client;
+        await runner.query('BEGIN');
+        const authoritative = await runner.query(
+          `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
+                  bootstrap_seed_count,native_quality_creator_count,structured_entity_matched,
+                  native_proposal_eligible,evidence_revision,updated_at
+           FROM country_native_evidence_projections
+           WHERE canonical_term_id=$1 FOR SHARE`,
+          [canonicalTermId]
+        );
+        if (!authoritative.rowCount) {
+          await runner.query('ROLLBACK'); client.release(); client = null; continue;
+        }
+        const row = authoritative.rows[0];
+        const effective = effectiveProjectionProposalEvidence(row);
+        const incomingProjectionRevision = new Date(String(p.supportingEvidence.projectionRevision || 0)).getTime();
+        const currentProjectionRevision = new Date(row.updated_at).getTime();
+        const currentRevision = String(row.evidence_revision || '0');
+        if (!row.native_proposal_eligible || incomingProjectionRevision !== currentProjectionRevision ||
+            String(p.supportingEvidence.evidenceRevision || '0') !== currentRevision ||
+            p.supportingEvidence.nativeEvidenceStatus !== effective.nativeEvidenceStatus ||
+            p.supportingEvidence.sourceProvenanceFamily !== effective.sourceProvenanceFamily) {
+          await runner.query('ROLLBACK'); client.release(); client = null; continue;
+        }
+      }
+      if (p.targetNeighborhoodKey) {
       const d = p.targetDimensions;
-      await db.query(
+      await runner.query(
         `INSERT INTO discovery_neighborhoods(
            neighborhood_key,neighborhood_checksum,country,language,query_intent,
            primary_term_family,retrieval_lane,search_ordering,instrument_or_theme,source_family,metadata
@@ -582,8 +613,8 @@ export async function persistFrontierProposals(
         [p.targetNeighborhoodKey, createNeighborhoodChecksum(p.targetNeighborhoodKey), d.country, d.language,
           d.queryIntent, d.primaryTermFamily, d.retrievalLane, d.searchOrdering, d.instrumentOrTheme, d.sourceFamily]
       );
-    }
-    const res = await db.query(
+      }
+      const res = await runner.query(
       `INSERT INTO frontier_discovery_proposals(
          dedup_key, proposal_family, country, language, concept,
          target_neighborhood_key, target_dimensions, source_provenance,
@@ -674,7 +705,14 @@ export async function persistFrontierProposals(
         p.expiresAt
       ]
     );
-    if (res.rowCount) inserted++;
+      if (res.rowCount) inserted++;
+      if (client) await runner.query('COMMIT');
+    } catch (error) {
+      if (client) await runner.query('ROLLBACK');
+      throw error;
+    } finally {
+      if (client) client.release();
+    }
   }
 
   return inserted;
