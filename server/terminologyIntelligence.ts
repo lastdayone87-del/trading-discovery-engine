@@ -2,7 +2,17 @@ import type { Pool, PoolClient } from 'pg';
 import type { QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
-import { recordNativeTerminologyObservation } from './countryNativeIntelligence';
+import {
+  computeEvidenceChecksum,
+  computeObservationKey,
+  detectCodeSwitching,
+  inferScript,
+  recomputeNativeEvidenceProjection,
+  type NativeEvidenceStatus,
+  type SourceProvenanceFamily
+} from './countryNativeIntelligence';
+
+export { inferScript } from './countryNativeIntelligence';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
 
@@ -31,14 +41,6 @@ export function normalizeTerm(value: string): string {
   return value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
 }
 
-export function inferScript(value: string): string {
-  if (/\p{Script=Han}/u.test(value)) return 'Hani';
-  if (/\p{Script=Katakana}|\p{Script=Hiragana}/u.test(value)) return 'Jpan';
-  if (/\p{Script=Cyrillic}/u.test(value)) return 'Cyrl';
-  if (/\p{Script=Arabic}/u.test(value)) return 'Arab';
-  return /\p{Script=Latin}/u.test(value) ? 'Latn' : 'Zyyy';
-}
-
 export function decayWeight(observedAt: Date, now: Date, halfLifeDays: number): number {
   const ageDays = Math.max(0, now.getTime() - observedAt.getTime()) / 86_400_000;
   return Math.pow(0.5, ageDays / Math.max(1, halfLifeDays));
@@ -58,29 +60,146 @@ export function decideLifecycle(input: { current: TerminologyLifecycle; decayedE
   return { status: 'CANDIDATE', searchEligible: false, reason: 'Evidence remains below the observation threshold.' };
 }
 
-export async function observeTerminology(args: { term: string; country: string; language?: string; termType: TerminologyTermType; observationType: TerminologyObservationType; channelId?: string; videoId?: string; humanApproved?: boolean; humanApprovalId?: string; communityFingerprint?: string; evidence?: Record<string, unknown> }, clientOverride?: Queryable): Promise<number | null> {
+export async function observeTerminology(args: {
+  term: string;
+  country: string;
+  language?: string;
+  termType: TerminologyTermType;
+  observationType: TerminologyObservationType;
+  channelId?: string;
+  videoId?: string;
+  humanApproved?: boolean;
+  humanApprovalId?: string;
+  communityFingerprint?: string;
+  evidence?: Record<string, unknown>;
+  sourceCreatorCountry?: string | null;
+  targetMarketCountry?: string | null;
+  locale?: string;
+  nativeEvidenceStatus?: NativeEvidenceStatus | null;
+  sourceProvenanceFamily?: SourceProvenanceFamily | null;
+  sourceEvidenceId?: string;
+}, clientOverride?: Queryable): Promise<number | null> {
   const canonical = args.term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
   const normalized = normalizeTerm(canonical);
   if (normalized.length < 2 || normalized.length > 80) return null;
+
+  const isVideoBacked = Boolean(args.videoId && args.videoId.trim() !== '');
+  const checksum = computeEvidenceChecksum(args.evidence);
+  const hasEvidenceId = Boolean((args.sourceEvidenceId && args.sourceEvidenceId.trim() !== '') || checksum !== '');
+
+  // For non-video observation types, fail closed if no stable source evidence identity is present
+  if (!isVideoBacked && !hasEvidenceId && args.observationType !== 'CHANNEL_NAME') {
+    return null;
+  }
+
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return null;
-  const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
-  const saved = await runner.query(`INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,language,script,term_type,first_observed_at,last_observed_at)
-    VALUES($1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT(country,normalized_term) DO UPDATE SET last_observed_at=now() RETURNING id`, [canonical, normalized, args.country, args.language || 'und', inferScript(canonical), args.termType]);
-  const termId = Number(saved.rows[0].id);
-  await runner.query(`INSERT INTO terminology_observations(canonical_term_id,source_channel_id,source_video_id,observation_type,human_approval_id,human_approved,community_fingerprint,evidence_weight,evidence)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [termId, args.channelId || null, args.videoId || null, args.observationType, args.humanApprovalId || null, Boolean(args.humanApproved), args.communityFingerprint || null, weight, JSON.stringify(args.evidence || {})]);
-  await refreshTerminologyLifecycle(termId, DEFAULT_TERMINOLOGY_POLICY, runner);
 
-  // Extend native observation evidence into Phase 10 country_native_evidence_projections
-  await recordNativeTerminologyObservation({
-    term: args.term,
-    country: args.country,
+  const contextLang = args.locale ? args.locale.split('-')[0] : args.language || 'und';
+  const codeSwitching = detectCodeSwitching(canonical, contextLang);
+  const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
+
+  // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict
+  const saved = await runner.query(
+    `INSERT INTO canonical_trading_terms(canonical_term, normalized_term, country, language, script, term_type, first_observed_at, last_observed_at)
+     VALUES($1, $2, $3, $4, $5, $6, now(), now())
+     ON CONFLICT(country, normalized_term) DO NOTHING
+     RETURNING id`,
+    [canonical, normalized, args.country.toUpperCase(), contextLang, inferScript(canonical), args.termType]
+  );
+
+  let termId: number;
+  if (saved.rows && saved.rows[0]) {
+    termId = Number(saved.rows[0].id);
+  } else {
+    const existing = await runner.query(
+      `SELECT id FROM canonical_trading_terms WHERE country = $1 AND normalized_term = $2`,
+      [args.country.toUpperCase(), normalized]
+    );
+    if (!existing.rows || !existing.rows[0]) return null;
+    termId = Number(existing.rows[0].id);
+  }
+
+  // 2. Resolve native creator/locale evidence status
+  let resolvedCreatorCountry: string | null = args.sourceCreatorCountry ? args.sourceCreatorCountry.toUpperCase() : null;
+  let resolvedMarketCountry: string | null = args.targetMarketCountry ? args.targetMarketCountry.toUpperCase() : null;
+
+  if (!resolvedCreatorCountry && args.channelId) {
+    const channelRes = await runner.query(
+      `SELECT country FROM channels WHERE channel_id = $1`,
+      [args.channelId]
+    ).catch(() => ({ rows: [] }));
+
+    if (channelRes.rows && channelRes.rows[0] && channelRes.rows[0].country) {
+      resolvedCreatorCountry = String(channelRes.rows[0].country).toUpperCase();
+    }
+  }
+
+  let resolvedNativeStatus: NativeEvidenceStatus | null = args.nativeEvidenceStatus || null;
+  let resolvedProvenanceFamily: SourceProvenanceFamily | null = args.sourceProvenanceFamily || null;
+
+  if (!resolvedNativeStatus && resolvedCreatorCountry && resolvedCreatorCountry === args.country.toUpperCase()) {
+    resolvedNativeStatus = 'NATIVE_OBSERVED';
+    resolvedProvenanceFamily = 'CREATOR_METADATA';
+  }
+
+  // 3. Compute deterministic observation key for single-write idempotency
+  const obsKey = computeObservationKey({
+    canonicalTermId: termId,
     channelId: args.channelId,
     videoId: args.videoId,
     observationType: args.observationType,
+    nativeEvidenceStatus: resolvedNativeStatus,
+    sourceProvenanceFamily: resolvedProvenanceFamily,
+    sourceEvidenceId: args.sourceEvidenceId,
     evidence: args.evidence
-  }, runner).catch(() => null);
+  });
+
+  // 4. Perform single, authoritative observation write
+  const obsInsert = await runner.query(
+    `INSERT INTO terminology_observations(
+       canonical_term_id, source_channel_id, source_video_id, observation_type,
+       human_approval_id, human_approved, community_fingerprint, evidence_weight, evidence,
+       source_creator_country, target_market_country, locale, is_code_switched,
+       native_language, term_language, native_evidence_status, source_provenance_family, code_switch_type,
+       observation_key
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+     ON CONFLICT(observation_key) DO NOTHING
+     RETURNING id, observed_at`,
+    [
+      termId,
+      args.channelId || null,
+      args.videoId || null,
+      args.observationType,
+      args.humanApprovalId || null,
+      Boolean(args.humanApproved),
+      args.communityFingerprint || null,
+      weight,
+      JSON.stringify(args.evidence || {}),
+      resolvedCreatorCountry,
+      resolvedMarketCountry,
+      args.locale || args.language || 'und',
+      codeSwitching.isCodeSwitched,
+      codeSwitching.dominantLanguage, // Context / native language (e.g. de)
+      codeSwitching.termLanguage,     // Embedded term language (e.g. en)
+      resolvedNativeStatus,           // NATIVE_OBSERVED | BOOTSTRAP_SEED | TRANSLATED_SEED | NULL
+      resolvedProvenanceFamily,
+      codeSwitching.codeSwitchType,
+      obsKey
+    ]
+  );
+
+  // 5. Invoke authoritative terminology lifecycle refresh & projection recompute ONLY if a new observation row was actually inserted!
+  if (obsInsert.rows && obsInsert.rows.length > 0) {
+    const obsAt = obsInsert.rows[0].observed_at || new Date().toISOString();
+    await runner.query(
+      `UPDATE canonical_trading_terms SET last_observed_at = $2 WHERE id = $1`,
+      [termId, obsAt]
+    );
+    await refreshTerminologyLifecycle(termId, DEFAULT_TERMINOLOGY_POLICY, runner);
+    await recomputeNativeEvidenceProjection(termId, runner);
+  }
 
   return termId;
 }
@@ -145,6 +264,6 @@ export async function getTerminologyDashboard(country?: string, clientOverride?:
 export async function getPlannerTerminology(country: string, clientOverride?: Queryable): Promise<Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }>> {
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return [];
-  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC LIMIT 50`, [country]);
+  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [country]);
   return result.rows.map(row => ({ id: Number(row.id), term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }));
 }

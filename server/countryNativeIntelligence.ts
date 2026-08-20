@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
-import { normalizeTerm, inferScript, refreshTerminologyLifecycle } from './terminologyIntelligence';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
 
@@ -106,16 +105,16 @@ export function computeObservationKey(params: {
   channelId?: string | null;
   videoId?: string | null;
   observationType: string;
-  nativeEvidenceStatus: string;
-  sourceProvenanceFamily: string;
+  nativeEvidenceStatus?: string | null;
+  sourceProvenanceFamily?: string | null;
   sourceEvidenceId?: string | null;
   evidence?: Record<string, unknown> | null;
 }): string {
   const normChannel = (params.channelId || 'none').trim().toLowerCase();
   const normVideo = (params.videoId || 'none').trim().toLowerCase();
   const normType = params.observationType.trim().toUpperCase();
-  const normStatus = params.nativeEvidenceStatus.trim().toUpperCase();
-  const normFamily = params.sourceProvenanceFamily.trim().toUpperCase();
+  const normStatus = (params.nativeEvidenceStatus || 'none').trim().toUpperCase();
+  const normFamily = (params.sourceProvenanceFamily || 'none').trim().toUpperCase();
 
   const checksum = computeEvidenceChecksum(params.evidence);
   const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();
@@ -158,6 +157,17 @@ export function isNoiseOrBoilerplate(term: string): boolean {
   if (/^\d+$/.test(norm) && norm.length < 3) return true;
 
   return false;
+}
+
+/**
+ * Infers script for a term.
+ */
+export function inferScript(value: string): string {
+  if (/\p{Script=Han}/u.test(value)) return 'Hani';
+  if (/\p{Script=Katakana}|\p{Script=Hiragana}/u.test(value)) return 'Jpan';
+  if (/\p{Script=Cyrillic}/u.test(value)) return 'Cyrl';
+  if (/\p{Script=Arabic}/u.test(value)) return 'Arab';
+  return /\p{Script=Latin}/u.test(value) ? 'Latn' : 'Zyyy';
 }
 
 /**
@@ -211,7 +221,7 @@ export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
 /**
  * Recomputes native evidence projections deterministically from `terminology_observations` and `channels`.
  * Preserves distributions for provenance status, source family, and code-switching.
- * Derives lastObservedAt from maximum observation timestamp and applies deterministic tie-breaking.
+ * Does NOT treat legacy NULL provenance observations as native evidence.
  */
 export async function recomputeNativeEvidenceProjection(
   canonicalTermId: number,
@@ -306,12 +316,12 @@ export async function recomputeNativeEvidenceProjection(
     const csType = r.code_switch_type || 'NONE';
     codeSwitchTypeCounts[csType] = (codeSwitchTypeCounts[csType] || 0) + 1;
 
-    const status = r.native_evidence_status || 'NATIVE_OBSERVED';
-    if (status === 'NATIVE_OBSERVED') nativeObservedCount++;
-    else if (status === 'BOOTSTRAP_SEED') bootstrapSeedCount++;
-    else if (status === 'TRANSLATED_SEED') translatedSeedCount++;
+    // Do NOT default NULL to NATIVE_OBSERVED! Legacy observations remain NULL / UNCLASSIFIED
+    if (r.native_evidence_status === 'NATIVE_OBSERVED') nativeObservedCount++;
+    else if (r.native_evidence_status === 'BOOTSTRAP_SEED') bootstrapSeedCount++;
+    else if (r.native_evidence_status === 'TRANSLATED_SEED') translatedSeedCount++;
 
-    const family = r.source_provenance_family || 'CREATOR_METADATA';
+    const family = r.source_provenance_family || 'UNCLASSIFIED';
     provenanceCounts[family] = (provenanceCounts[family] || 0) + 1;
 
     if (family === 'STRUCTURED_LOCAL_ENTITY') {
@@ -340,7 +350,9 @@ export async function recomputeNativeEvidenceProjection(
     ? 'NATIVE_OBSERVED'
     : bootstrapSeedCount > 0
       ? 'BOOTSTRAP_SEED'
-      : 'TRANSLATED_SEED';
+      : translatedSeedCount > 0
+        ? 'TRANSLATED_SEED'
+        : 'NATIVE_OBSERVED';
 
   const nativeObservedRatio = rawObservationCount > 0 ? nativeObservedCount / rawObservationCount : 0.0;
   const codeSwitchRatio = rawObservationCount > 0 ? codeSwitchedCount / rawObservationCount : 0.0;
@@ -364,7 +376,7 @@ export async function recomputeNativeEvidenceProjection(
     if (b[1] !== a[1]) return b[1] - a[1];
     return a[0].localeCompare(b[0]);
   });
-  if (sortedFamilies.length > 0) {
+  if (sortedFamilies.length > 0 && sortedFamilies[0][0] !== 'UNCLASSIFIED') {
     primaryFamily = sortedFamilies[0][0] as SourceProvenanceFamily;
   }
 
@@ -509,10 +521,8 @@ export async function recomputeNativeEvidenceProjection(
 }
 
 /**
- * Extracts and records native candidate market terms from channel/video metadata.
- * Uses deterministic observation keys binding stable evidence identity to ensure observation idempotency and retry safety.
- * For non-video observations, fails closed (returns null) if no stable evidence identity is provided.
- * Updates canonical term last_observed_at, refreshes lifecycle, and recomputes projections ONLY when a new observation is actually inserted.
+ * @deprecated Use observeTerminology() in server/terminologyIntelligence.ts.
+ * Delegated write helper ensuring all observations write through observeTerminology().
  */
 export async function recordNativeTerminologyObservation(args: {
   term: string;
@@ -528,105 +538,22 @@ export async function recordNativeTerminologyObservation(args: {
   sourceProvenanceFamily?: SourceProvenanceFamily;
   evidence?: Record<string, unknown>;
 }, clientOverride?: Queryable): Promise<number | null> {
-  const norm = normalizeNativeTerm(args.term);
-  if (isNoiseOrBoilerplate(args.term)) return null;
-
-  const isVideoBacked = Boolean(args.videoId && args.videoId.trim() !== '');
-  const checksum = computeEvidenceChecksum(args.evidence);
-  const hasEvidenceId = Boolean((args.sourceEvidenceId && args.sourceEvidenceId.trim() !== '') || checksum !== '');
-
-  // For non-video observation types, fail closed if no stable source evidence identity is present
-  if (!isVideoBacked && !hasEvidenceId && args.observationType !== 'CHANNEL_NAME') {
-    return null;
-  }
-
-  const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
-  if (!runner) return null;
-
-  const canonical = args.term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
-  const codeSwitching = detectCodeSwitching(canonical, args.locale ? args.locale.split('-')[0] : 'und');
-
-  // Insert or fetch canonical trading term WITHOUT touching last_observed_at on conflict
-  const saved = await runner.query(
-    `INSERT INTO canonical_trading_terms(canonical_term, normalized_term, country, language, script, term_type, first_observed_at, last_observed_at)
-     VALUES($1, $2, $3, $4, $5, 'TERMINOLOGY', now(), now())
-     ON CONFLICT(country, normalized_term) DO NOTHING
-     RETURNING id`,
-    [canonical, norm, args.country.toUpperCase(), codeSwitching.dominantLanguage, inferScript(canonical)]
-  );
-
-  let termId: number;
-  if (saved.rows && saved.rows[0]) {
-    termId = Number(saved.rows[0].id);
-  } else {
-    const existing = await runner.query(
-      `SELECT id FROM canonical_trading_terms WHERE country = $1 AND normalized_term = $2`,
-      [args.country.toUpperCase(), norm]
-    );
-    if (!existing.rows || !existing.rows[0]) return null;
-    termId = Number(existing.rows[0].id);
-  }
-
-  // Do NOT default source_creator_country or target_market_country to args.country! Persist NULL if unknown.
-  const creatorCountry = args.sourceCreatorCountry ? args.sourceCreatorCountry.toUpperCase() : null;
-  const marketCountry = args.targetMarketCountry ? args.targetMarketCountry.toUpperCase() : null;
-  const evidenceStatus = args.nativeEvidenceStatus || 'NATIVE_OBSERVED';
-  const provenanceFamily = args.sourceProvenanceFamily || 'CREATOR_METADATA';
-
-  const obsKey = computeObservationKey({
-    canonicalTermId: termId,
+  const { observeTerminology } = await import('./terminologyIntelligence');
+  return observeTerminology({
+    term: args.term,
+    country: args.country,
+    termType: 'TERMINOLOGY',
+    observationType: args.observationType,
     channelId: args.channelId,
     videoId: args.videoId,
-    observationType: args.observationType,
-    nativeEvidenceStatus: evidenceStatus,
-    sourceProvenanceFamily: provenanceFamily,
+    sourceCreatorCountry: args.sourceCreatorCountry,
+    targetMarketCountry: args.targetMarketCountry,
+    locale: args.locale,
+    nativeEvidenceStatus: args.nativeEvidenceStatus,
+    sourceProvenanceFamily: args.sourceProvenanceFamily,
     sourceEvidenceId: args.sourceEvidenceId,
     evidence: args.evidence
-  });
-
-  // Insert observation into terminology_observations idempotently using observation_key
-  const obsInsert = await runner.query(
-    `INSERT INTO terminology_observations (
-       canonical_term_id, source_channel_id, source_video_id, observation_type,
-       source_creator_country, target_market_country, locale, is_code_switched,
-       native_language, term_language, native_evidence_status, source_provenance_family, code_switch_type,
-       observation_key, evidence
-     )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (observation_key) DO NOTHING
-     RETURNING id, observed_at`,
-    [
-      termId,
-      args.channelId || null,
-      args.videoId || null,
-      args.observationType,
-      creatorCountry,
-      marketCountry,
-      args.locale || 'und',
-      codeSwitching.isCodeSwitched,
-      codeSwitching.dominantLanguage, // Context / native language (e.g. de)
-      codeSwitching.termLanguage,     // Embedded term language (e.g. en)
-      evidenceStatus,
-      provenanceFamily,
-      codeSwitching.codeSwitchType,
-      obsKey,
-      JSON.stringify(args.evidence || {})
-    ]
-  );
-
-  // Invoke authoritative terminology lifecycle refresh, update canonical last_observed_at & recompute projection
-  // ONLY if a new observation row was actually inserted!
-  if (obsInsert.rows && obsInsert.rows.length > 0) {
-    const obsAt = obsInsert.rows[0].observed_at || new Date().toISOString();
-    await runner.query(
-      `UPDATE canonical_trading_terms SET last_observed_at = $2 WHERE id = $1`,
-      [termId, obsAt]
-    );
-    await refreshTerminologyLifecycle(termId, undefined, runner);
-    await recomputeNativeEvidenceProjection(termId, runner);
-  }
-
-  return termId;
+  }, clientOverride);
 }
 
 /**

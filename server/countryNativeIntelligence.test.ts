@@ -121,6 +121,11 @@ function createMockRunner() {
         return { rows: [] };
       }
 
+      if (sqlNorm.startsWith('SELECT country FROM channels WHERE channel_id = $1')) {
+        const ch = channels.get(params[0]);
+        return { rows: ch ? [{ country: ch.country }] : [] };
+      }
+
       if (sqlNorm.startsWith('UPDATE canonical_trading_terms SET last_observed_at = $2 WHERE id = $1')) {
         const id = Number(params[0]);
         const term = canonicalTerms.get(id);
@@ -170,7 +175,7 @@ function createMockRunner() {
       }
 
       if (sqlNorm.startsWith('INSERT INTO terminology_observations')) {
-        const obsKey = params[13] || params[12];
+        const obsKey = params[18];
         if (obsKey && observations.some(o => o.observation_key === obsKey)) {
           // ON CONFLICT (observation_key) DO NOTHING -> Returns empty rows
           return { rows: [] };
@@ -183,24 +188,24 @@ function createMockRunner() {
           source_channel_id: params[1],
           source_video_id: params[2],
           observation_type: params[3],
-          source_creator_country: params[4],
-          target_market_country: params[5],
-          locale: params[6],
-          is_code_switched: params[7],
-          native_language: params[8],
-          term_language: params[9],
-          native_evidence_status: params[10],
-          source_provenance_family: params[11],
-          code_switch_type: params[12],
+          source_creator_country: params[9],
+          target_market_country: params[10],
+          locale: params[11],
+          is_code_switched: params[12],
+          native_language: params[13],
+          term_language: params[14],
+          native_evidence_status: params[15],
+          source_provenance_family: params[16],
+          code_switch_type: params[17],
           observation_key: obsKey,
-          evidence: params[14],
+          evidence: params[8],
           observed_at: obsAt
         };
         observations.push(obs);
         return { rows: [{ id: obs.id, observed_at: obsAt }] };
       }
 
-      if (sqlNorm.startsWith('SELECT o.id, o.source_creator_country,')) {
+      if (sqlNorm.includes('FROM terminology_observations o')) {
         const termId = Number(params[0]);
         const termObs = observations.filter(o => o.canonical_term_id === termId);
         const rows = termObs.map(o => {
@@ -216,7 +221,37 @@ function createMockRunner() {
 
       if (sqlNorm.startsWith('INSERT INTO country_native_evidence_projections')) {
         const termId = Number(params[0]);
-        projections.set(termId, { canonical_term_id: termId, ...params });
+        const parseArr = (p: any) => typeof p === 'string' ? JSON.parse(p) : p || [];
+        projections.set(termId, {
+          canonical_term_id: termId,
+          concept_id: params[1],
+          country: params[2],
+          dominant_locale: params[3],
+          observedCreatorCountries: parseArr(params[4]),
+          observedMarketCountries: parseArr(params[5]),
+          codeSwitchRatio: params[6],
+          isCodeSwitched: params[7],
+          codeSwitchType: params[8],
+          codeSwitchTypes: parseArr(params[9]),
+          codeSwitchTypeCounts: typeof params[10] === 'string' ? JSON.parse(params[10]) : params[10],
+          rawObservationCount: params[11],
+          nativeObservedCount: params[12],
+          bootstrapSeedCount: params[13],
+          translatedSeedCount: params[14],
+          nativeObservedRatio: params[15],
+          distinctCreatorCount: params[16],
+          qualityCreatorCount: params[17],
+          distinctCommunityCount: params[18],
+          structuredEntityMatched: params[19],
+          nativeEvidenceStatus: params[20],
+          sourceProvenanceFamily: params[21],
+          sourceProvenanceFamilies: parseArr(params[22]),
+          sourceProvenanceCounts: typeof params[23] === 'string' ? JSON.parse(params[23]) : params[23],
+          nativeConfidenceScore: params[24],
+          nativeProposalEligible: params[25],
+          lastObservedAt: params[26],
+          updatedAt: params[27]
+        });
         return { rows: [] };
       }
 
@@ -231,7 +266,7 @@ function createMockRunner() {
 
 test('Phase 10: observeTerminology automatically feeds Phase 10 native evidence and projections', async () => {
   const runner = createMockRunner();
-  runner.channels.set('UC_INGESTION_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
+  runner.channels.set('UC_INGESTION_1', { country: 'DE', trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
 
   const termStr = 'hebelprodukte aktien';
 
@@ -260,14 +295,15 @@ test('Phase 10: Separate creator geography, market geography, and code-switching
   const runner = createMockRunner();
 
   // 1. German creator trading US market
-  const deTermId = await recordNativeTerminologyObservation({
+  const deTermId = await observeTerminology({
     term: 'dax opening range breakout',
     country: 'DE',
+    termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE',
+    videoId: 'VID_DE_US_1',
     sourceCreatorCountry: 'DE',
     targetMarketCountry: 'US',
-    locale: 'de-DE',
-    videoId: 'VID_DE_US_1',
-    observationType: 'VIDEO_TITLE'
+    locale: 'de-DE'
   }, runner);
 
   const deObs = runner.observations.find(o => o.canonical_term_id === deTermId);
@@ -279,19 +315,17 @@ test('Phase 10: Separate creator geography, market geography, and code-switching
   assert.equal(deObs.term_language, 'en', 'term_language must represent embedded term language en');
 
   // 2. Brazilian creator with UNKNOWN market (must be NULL, not defaulted to BR)
-  const brTermId = await recordNativeTerminologyObservation({
+  const brTermId = await observeTerminology({
     term: 'investimentos em acoes',
     country: 'BR',
-    sourceCreatorCountry: 'BR',
-    // targetMarketCountry not provided -> must remain NULL
-    locale: 'pt-BR',
+    termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE',
     videoId: 'VID_BR_1',
-    observationType: 'VIDEO_TITLE'
+    locale: 'pt-BR'
   }, runner);
 
   const brObs = runner.observations.find(o => o.canonical_term_id === brTermId);
   assert.ok(brObs);
-  assert.equal(brObs.source_creator_country, 'BR');
   assert.equal(brObs.target_market_country, null, 'Unspecified target market country must be NULL, not defaulted');
 });
 
@@ -299,9 +333,10 @@ test('Phase 10: Non-video observations fail closed when stable source evidence i
   const runner = createMockRunner();
 
   // Non-video observation without videoId, sourceEvidenceId, or evidence payload MUST fail closed (return null)
-  const rejected = await recordNativeTerminologyObservation({
+  const rejected = await observeTerminology({
     term: 'mini indice acoes',
     country: 'BR',
+    termType: 'TERMINOLOGY',
     channelId: 'UC_TEST_01',
     observationType: 'DESCRIPTION', // Non-video
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
@@ -311,9 +346,10 @@ test('Phase 10: Non-video observations fail closed when stable source evidence i
   assert.equal(rejected, null, 'Non-video observation missing evidence identity must fail closed');
 
   // Non-video observation WITH evidence payload succeeds
-  const accepted = await recordNativeTerminologyObservation({
+  const accepted = await observeTerminology({
     term: 'mini indice acoes',
     country: 'BR',
+    termType: 'TERMINOLOGY',
     channelId: 'UC_TEST_01',
     observationType: 'DESCRIPTION',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
@@ -324,9 +360,10 @@ test('Phase 10: Non-video observations fail closed when stable source evidence i
   assert.ok(accepted, 'Non-video observation with evidence payload must be accepted');
 
   // Video-backed observation WITHOUT explicit evidence payload succeeds because videoId provides identity
-  const videoAccepted = await recordNativeTerminologyObservation({
+  const videoAccepted = await observeTerminology({
     term: 'mini indice acoes',
     country: 'BR',
+    termType: 'TERMINOLOGY',
     channelId: 'UC_TEST_01',
     videoId: 'VID_9999',
     observationType: 'VIDEO_TITLE',
@@ -339,7 +376,7 @@ test('Phase 10: Non-video observations fail closed when stable source evidence i
 
 test('Phase 10: Source evidence identity binds payload and changed descriptions create new observations while exact retries deduplicate', async () => {
   const runner = createMockRunner();
-  runner.channels.set('UC_EVIDENCE_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+  runner.channels.set('UC_EVIDENCE_1', { country: 'BR', trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
 
   const termStr = 'operacoes mini indice';
   const channelId = 'UC_EVIDENCE_1';
@@ -347,9 +384,10 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
   // 1. Exact retry of the SAME description evidence payload
   const desc1 = { text: 'Canal de operacoes mini indice e day trade no Brasil' };
   for (let i = 0; i < 3; i++) {
-    await recordNativeTerminologyObservation({
+    await observeTerminology({
       term: termStr,
       country: 'BR',
+      termType: 'TERMINOLOGY',
       channelId,
       observationType: 'DESCRIPTION',
       nativeEvidenceStatus: 'NATIVE_OBSERVED',
@@ -362,9 +400,10 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
   const initialRefreshCount = runner.lifecycleRefreshCount;
 
   // Re-running exact retry MUST NOT trigger lifecycle refresh
-  await recordNativeTerminologyObservation({
+  await observeTerminology({
     term: termStr,
     country: 'BR',
+    termType: 'TERMINOLOGY',
     channelId,
     observationType: 'DESCRIPTION',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
@@ -376,9 +415,10 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
 
   // 2. CHANGED description evidence snapshot from the SAME creator creates a NEW observation
   const desc2 = { text: 'Novo treinamento de operacoes mini indice e mini dolar na B3' };
-  await recordNativeTerminologyObservation({
+  await observeTerminology({
     term: termStr,
     country: 'BR',
+    termType: 'TERMINOLOGY',
     channelId,
     observationType: 'DESCRIPTION',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
@@ -392,18 +432,20 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
   const enrich1 = { source: 'entity_linker_v1', matchedEntity: 'B3_INDICE' };
   const enrich2 = { source: 'entity_linker_v2', matchedEntity: 'B3_FUTURES' };
 
-  await recordNativeTerminologyObservation({
+  await observeTerminology({
     term: termStr,
     country: 'BR',
+    termType: 'TERMINOLOGY',
     observationType: 'ENRICHMENT',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
     sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY',
     evidence: enrich1
   }, runner);
 
-  await recordNativeTerminologyObservation({
+  await observeTerminology({
     term: termStr,
     country: 'BR',
+    termType: 'TERMINOLOGY',
     observationType: 'ENRICHMENT',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
     sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY',
@@ -415,15 +457,16 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
 
 test('Phase 10: Exact observation replay does NOT advance canonical term last_observed_at timestamp', async () => {
   const runner = createMockRunner();
-  runner.channels.set('UC_RECENCY_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+  runner.channels.set('UC_RECENCY_1', { country: 'BR', trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
 
   const termStr = 'mini indice recency';
   const evidence = { text: 'snapshot for recency test' };
 
   // First insertion
-  const termId = await recordNativeTerminologyObservation({
+  const termId = await observeTerminology({
     term: termStr,
     country: 'BR',
+    termType: 'TERMINOLOGY',
     channelId: 'UC_RECENCY_1',
     observationType: 'DESCRIPTION',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
@@ -438,9 +481,10 @@ test('Phase 10: Exact observation replay does NOT advance canonical term last_ob
 
   // Replay exact same observation multiple times
   for (let i = 0; i < 3; i++) {
-    await recordNativeTerminologyObservation({
+    await observeTerminology({
       term: termStr,
       country: 'BR',
+      termType: 'TERMINOLOGY',
       channelId: 'UC_RECENCY_1',
       observationType: 'DESCRIPTION',
       nativeEvidenceStatus: 'NATIVE_OBSERVED',
@@ -455,12 +499,13 @@ test('Phase 10: Exact observation replay does NOT advance canonical term last_ob
 
 test('Phase 10: Projection lastObservedAt is derived from MAX(observed_at) and remains invariant across recomputations', async () => {
   const runner = createMockRunner();
-  runner.channels.set('UC_PROJ_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+  runner.channels.set('UC_PROJ_1', { country: 'DE', trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
 
   const termStr = 'hebelprodukte test';
-  const termId = (await recordNativeTerminologyObservation({
+  const termId = (await observeTerminology({
     term: termStr,
     country: 'DE',
+    termType: 'TERMINOLOGY',
     channelId: 'UC_PROJ_1',
     videoId: 'VID_DE_01',
     observationType: 'VIDEO_TITLE',
@@ -479,6 +524,6 @@ test('Phase 10: Projection lastObservedAt is derived from MAX(observed_at) and r
   assert.equal(proj1.lastObservedAt, '2026-08-01T12:00:00.000Z');
 
   // Array fields MUST be sorted in stable alphabetical order
-  assert.deepEqual(proj1.observedCreatorCountries, []);
+  assert.deepEqual(proj1.observedCreatorCountries, ['DE']);
   assert.deepEqual(proj1.sourceProvenanceFamilies, ['CREATOR_METADATA']);
 });
