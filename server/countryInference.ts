@@ -107,6 +107,15 @@ export function canonicalCountry(value: string): string {
   return COUNTRY_ALIASES[normalized] || Object.keys(COUNTRY_SIGNALS).find(country => normalizeCountryName(country) === normalized) || value.trim();
 }
 
+/** Returns the authoritative two-letter alias for a canonical country identity, when configured. */
+export function countryIsoAlias(value: string): string | null {
+  const canonical = canonicalCountry(value);
+  const alias = Object.entries(COUNTRY_ALIASES).find(([key, country]) =>
+    key.length === 2 && canonicalCountry(country) === canonical
+  )?.[0];
+  return alias ? alias.toUpperCase() : null;
+}
+
 function includesSignal(text: string, signals: string[]): string | null {
   return signals.find(signal => text.includes(signal.toLocaleLowerCase('en'))) || null;
 }

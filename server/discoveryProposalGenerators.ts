@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import { getDb } from './db';
-import { buildDiscoveryNeighborhood, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
+import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
+import { canonicalCountry, countryIsoAlias } from './countryInference';
+import { computeEvidenceChecksum } from './countryNativeIntelligence';
+import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -54,6 +57,41 @@ export function createProposalDedupKey(
   return createHash('sha256').update(raw).digest('hex');
 }
 
+export function countryNativeEvidenceChecksum(evidence: Record<string, unknown>): string {
+  const { evidenceChecksum: _previousChecksum, evidenceVersion: _previousVersion, ...mutableEvidence } = evidence;
+  return computeEvidenceChecksum(mutableEvidence);
+}
+
+export function countryNativeEvidenceVersion(evidence: Record<string, unknown>, checksum: string): string {
+  const observedAt = typeof evidence.lastObservedAt === 'string' && !Number.isNaN(Date.parse(evidence.lastObservedAt))
+    ? new Date(evidence.lastObservedAt).toISOString()
+    : '1970-01-01T00:00:00.000Z';
+  const revision = String(evidence.evidenceRevision || '0').padStart(20, '0');
+  return `${observedAt}|${revision}|${checksum}`;
+}
+
+export function effectiveProjectionProposalEvidence(row: {
+  native_evidence_status: string;
+  source_provenance_family: string;
+  source_provenance_families?: string[];
+  bootstrap_seed_count?: number | string;
+  quality_creator_count?: number | string;
+  native_quality_creator_count?: number | string;
+  structured_entity_matched?: boolean;
+}): { nativeEvidenceStatus: string; sourceProvenanceFamily: string; nativeGateSatisfied: boolean } {
+  const nativeGateSatisfied = row.native_evidence_status === 'NATIVE_OBSERVED' &&
+    (Number(row.native_quality_creator_count) >= 2 || Boolean(row.structured_entity_matched));
+  const families = row.source_provenance_families || [];
+  return {
+    nativeGateSatisfied,
+    nativeEvidenceStatus: nativeGateSatisfied ? row.native_evidence_status
+      : Number(row.bootstrap_seed_count) > 0 ? 'BOOTSTRAP_SEED' : row.native_evidence_status,
+    sourceProvenanceFamily: nativeGateSatisfied ? row.source_provenance_family
+      : families.includes('COUNTRY_VOCABULARY') ? 'COUNTRY_VOCABULARY'
+        : Number(row.bootstrap_seed_count) > 0 ? 'STATIC_BOOTSTRAP' : row.source_provenance_family
+  };
+}
+
 /**
  * Constructs a candidate proposal object with deterministic dedup key and neighborhood.
  */
@@ -73,16 +111,17 @@ export function buildFrontierProposal(params: {
   confidence?: number;
   noveltyRationale: string;
   ttlDays?: number;
+  preserveCountryIdentity?: boolean;
 }): DiscoveryFrontierProposal {
   const dimensions: DiscoveryNeighborhoodDimensions = {
     country: params.country,
     language: params.language || null,
     queryIntent: params.intent || 'GENERAL',
     primaryTermFamily: params.primaryTermFamily || params.concept,
-    retrievalLane: params.retrievalLane || 'ORGANIC',
+    retrievalLane: params.retrievalLane || (params.proposalFamily === 'COUNTRY_NATIVE' ? 'VIDEO' : 'ORGANIC'),
     searchOrdering: params.searchOrdering || 'RELEVANCE',
     instrumentOrTheme: params.instrumentOrTheme || null,
-    sourceFamily: params.sourceFamily || 'frontier_proposal'
+    sourceFamily: params.sourceFamily || (params.proposalFamily === 'COUNTRY_NATIVE' ? 'automated_query' : 'frontier_proposal')
   };
 
   const neighborhood = buildDiscoveryNeighborhood(dimensions);
@@ -91,16 +130,21 @@ export function buildFrontierProposal(params: {
   const ttl = params.ttlDays ?? 14;
   const expiresAt = new Date(Date.now() + ttl * 86_400_000).toISOString();
 
+  const supportingEvidence = params.supportingEvidence || {};
+  const evidenceChecksum = countryNativeEvidenceChecksum(supportingEvidence);
+  const versionedEvidence = params.proposalFamily === 'COUNTRY_NATIVE'
+    ? { ...supportingEvidence, evidenceChecksum, evidenceVersion: countryNativeEvidenceVersion(supportingEvidence, evidenceChecksum) }
+    : supportingEvidence;
   return {
     dedupKey,
     proposalFamily: params.proposalFamily,
-    country: params.country.toUpperCase().trim(),
+    country: params.preserveCountryIdentity ? canonicalCountry(params.country) : params.country.toUpperCase().trim(),
     language: params.language ? params.language.trim() : null,
     concept: params.concept.trim(),
     targetNeighborhoodKey: neighborhood.neighborhoodKey,
     targetDimensions: neighborhood.dimensions,
     sourceProvenance: params.sourceProvenance,
-    supportingEvidence: params.supportingEvidence || {},
+    supportingEvidence: versionedEvidence,
     confidence: Math.max(0.0, Math.min(1.0, params.confidence ?? 0.5)),
     noveltyRationale: params.noveltyRationale,
     trialStatus: 'PENDING',
@@ -140,7 +184,7 @@ export async function generateCreatorDerivedProposals(country: string, limit = 1
   const res = await db.query(
     `SELECT c.channel_id, c.title, c.description, c.primary_market
      FROM channels c
-     WHERE UPPER(c.country) = $1 AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= 55
+     WHERE UPPER(c.country) = $1 AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= ${QUALITY_CREATOR_SCORE_THRESHOLD}
      ORDER BY c.updated_at DESC
      LIMIT $2`,
     [country.toUpperCase(), limit]
@@ -230,13 +274,107 @@ const NATIVE_FINANCIAL_SEEDS: Record<string, string[]> = {
   IN: ['Nifty 50 options', 'Bank Nifty daytrading', 'Indian stock market', 'Zerodha trading', 'crypto India']
 };
 
-export async function generateCountryNativeProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
-  const normC = country.toUpperCase().trim();
+export function projectionProposalProvenance(
+  nativeEvidenceStatus: string,
+  sourceProvenanceFamily: string,
+  canonicalTermId: number
+): { provenanceType: string; sourceProvenance: string } {
+  const identity = `canonical_projection:${canonicalTermId}`;
+  if (nativeEvidenceStatus === 'NATIVE_OBSERVED') {
+    return { provenanceType: 'observed_native_evidence', sourceProvenance: `observed_native_evidence:${sourceProvenanceFamily.toLowerCase()}:${identity}` };
+  }
+  if (nativeEvidenceStatus === 'TRANSLATED_SEED' || sourceProvenanceFamily === 'TRANSLATED_QUERY') {
+    return { provenanceType: 'translated_seed', sourceProvenance: `translated_seed:translated_query:${identity}` };
+  }
+  if (sourceProvenanceFamily === 'COUNTRY_VOCABULARY') {
+    return { provenanceType: 'bootstrap_vocabulary', sourceProvenance: `bootstrap_vocabulary:country_vocabulary:${identity}` };
+  }
+  return { provenanceType: 'bootstrap_vocabulary', sourceProvenance: `bootstrap_vocabulary:static_bootstrap:${identity}` };
+}
 
-  const observedTerms: string[] = [];
+export async function generateCountryNativeProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+  const canonicalC = canonicalCountry(country);
+  const normC = canonicalC.toUpperCase();
+  const seedKey = country.toUpperCase().trim();
+
   try {
     const db = await getDb().catch(() => null);
     if (db) {
+      // 1. First, check Phase 10 proposal-eligible native projections from canonical_trading_terms
+      const nativeProjRes = await db.query(
+        `SELECT
+           t.id AS canonical_term_id,
+           t.canonical_term,
+           t.concept_id,
+           p.native_confidence_score,
+           p.native_evidence_status,
+           p.source_provenance_family,
+           p.source_provenance_families,
+           p.bootstrap_seed_count,
+           p.quality_creator_count,
+           p.native_quality_creator_count,
+           p.distinct_creator_count,
+           p.structured_entity_matched,
+           p.evidence_revision,
+           p.is_code_switched,
+           p.code_switch_type,
+           p.observed_creator_countries,
+           p.observed_market_countries,
+           p.last_observed_at
+           ,p.updated_at AS projection_updated_at
+         FROM country_native_evidence_projections p
+         JOIN canonical_trading_terms t ON t.id = p.canonical_term_id
+         WHERE UPPER(p.country) = $1 AND p.native_proposal_eligible = true
+         ORDER BY p.native_confidence_score DESC, p.last_observed_at DESC, p.canonical_term_id ASC
+         LIMIT $2`,
+        [normC, limit]
+      ).catch(() => ({ rows: [] }));
+
+      if (nativeProjRes.rows.length > 0) {
+        return nativeProjRes.rows.map(row => {
+          const effective = effectiveProjectionProposalEvidence(row);
+          const provenance = projectionProposalProvenance(
+            effective.nativeEvidenceStatus,
+            effective.sourceProvenanceFamily,
+            Number(row.canonical_term_id)
+          );
+          return buildFrontierProposal({
+            proposalFamily: 'COUNTRY_NATIVE',
+            country: canonicalC,
+            preserveCountryIdentity: true,
+            concept: row.canonical_term,
+            sourceProvenance: provenance.sourceProvenance,
+            supportingEvidence: {
+              provenanceType: provenance.provenanceType,
+              nativeEvidenceStatus: effective.nativeEvidenceStatus,
+              sourceProvenanceFamily: effective.sourceProvenanceFamily,
+              canonicalTermId: Number(row.canonical_term_id),
+              conceptId: row.concept_id || null,
+              nativeConfidenceScore: Number(row.native_confidence_score),
+              qualityCreatorCount: Number(row.quality_creator_count),
+              nativeQualityCreatorCount: Number(row.native_quality_creator_count),
+              distinctCreatorCount: Number(row.distinct_creator_count),
+              isCodeSwitched: Boolean(row.is_code_switched),
+              structuredEntityMatched: Boolean(row.structured_entity_matched),
+              evidenceRevision: String(row.evidence_revision || '0'),
+              projectionRevision: row.projection_updated_at instanceof Date
+                ? row.projection_updated_at.toISOString() : row.projection_updated_at,
+              codeSwitchType: row.code_switch_type || 'NONE',
+              observedCreatorCountries: row.observed_creator_countries || [],
+              observedMarketCountries: row.observed_market_countries || [],
+              lastObservedAt: row.last_observed_at instanceof Date
+                ? row.last_observed_at.toISOString()
+                : row.last_observed_at,
+              nativeTerm: row.canonical_term,
+              market: canonicalC
+            },
+            confidence: Number(row.native_confidence_score),
+            noveltyRationale: `Generated from eligible country-native concept projection for ${normC}.`
+          });
+        });
+      }
+
+      // 2. Fallback to country_vocabularies if present
       const vocabRes = await db.query(
         `SELECT native_trading_terminology, popular_instruments, local_market_phrases
          FROM country_vocabularies
@@ -244,72 +382,141 @@ export async function generateCountryNativeProposals(country: string, limit = 10
         [normC]
       ).catch(() => ({ rows: [] }));
 
-    if (vocabRes.rows.length > 0) {
-      const row = vocabRes.rows[0];
-      const parseList = (val: any): string[] => {
-        if (!val) return [];
-        if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
-        if (typeof val === 'string') {
-          try {
-            const parsed = JSON.parse(val);
-            if (Array.isArray(parsed)) return parsed.map(x => String(x).trim()).filter(Boolean);
-          } catch {
-            return val.split(',').map(x => x.trim()).filter(Boolean);
+      if (vocabRes.rows.length > 0) {
+        const row = vocabRes.rows[0];
+        const parseList = (val: any): string[] => {
+          if (!val) return [];
+          if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
+          if (typeof val === 'string') {
+            try {
+              const parsed = JSON.parse(val);
+              if (Array.isArray(parsed)) return parsed.map(x => String(x).trim()).filter(Boolean);
+            } catch {
+              return val.split(',').map(x => x.trim()).filter(Boolean);
+            }
           }
-        }
-        return [];
-      };
+          return [];
+        };
 
-      observedTerms.push(
-        ...parseList(row.native_trading_terminology),
-        ...parseList(row.popular_instruments),
-        ...parseList(row.local_market_phrases)
-      );
-    }
+        const observedTerms = Array.from(new Set([
+          ...parseList(row.native_trading_terminology),
+          ...parseList(row.popular_instruments),
+          ...parseList(row.local_market_phrases)
+        ])).slice(0, limit);
+
+        if (observedTerms.length > 0) {
+          return observedTerms.map(term =>
+            buildFrontierProposal({
+              proposalFamily: 'COUNTRY_NATIVE',
+              country: canonicalC,
+              preserveCountryIdentity: true,
+              concept: term,
+              sourceProvenance: `bootstrap_vocabulary:country_vocabularies:${term}`,
+              supportingEvidence: {
+                provenanceType: 'bootstrap_vocabulary',
+                nativeEvidenceStatus: 'BOOTSTRAP_SEED',
+                sourceProvenanceFamily: 'COUNTRY_VOCABULARY',
+                sourceTable: 'country_vocabularies',
+                nativeTerm: term,
+                market: canonicalC
+              },
+              confidence: 0.85,
+              noveltyRationale: `Generated from governed country vocabulary bootstrap evidence for ${normC}.`
+            })
+          );
+        }
+      }
     }
   } catch {
     // Database unavailable in unit test runtime; proceed to bootstrap vocabulary fallback
   }
 
-  // 2. If observed repository evidence terms exist, use them with observed_native_evidence provenance
-  if (observedTerms.length > 0) {
-    const uniqueObserved = Array.from(new Set(observedTerms)).slice(0, limit);
-    return uniqueObserved.map(term =>
-      buildFrontierProposal({
-        proposalFamily: 'COUNTRY_NATIVE',
-        country: normC,
-        concept: term,
-        sourceProvenance: `observed_native_evidence:country_vocabularies:${term}`,
-        supportingEvidence: {
-          provenanceType: 'observed_native_evidence',
-          sourceTable: 'country_vocabularies',
-          nativeTerm: term,
-          market: normC
-        },
-        confidence: 0.85,
-        noveltyRationale: `Generated from observed repository native financial evidence for ${normC}.`
-      })
-    );
-  }
-
   // 3. Fallback to static seed dictionary explicitly identified as bootstrap_vocabulary
-  const seeds = NATIVE_FINANCIAL_SEEDS[normC] || ['local exchange trading', 'stock market investing', 'crypto trading'];
+  const isoSeedKey = countryIsoAlias(canonicalC);
+  const seeds = (isoSeedKey ? NATIVE_FINANCIAL_SEEDS[isoSeedKey] : undefined) ||
+    NATIVE_FINANCIAL_SEEDS[seedKey] || NATIVE_FINANCIAL_SEEDS[normC] ||
+    ['local exchange trading', 'stock market investing', 'crypto trading'];
   return seeds.slice(0, limit).map(seed =>
     buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
-      country: normC,
+      country: canonicalC,
+      preserveCountryIdentity: true,
       concept: seed,
       sourceProvenance: `bootstrap_vocabulary:static_seed:${seed}`,
       supportingEvidence: {
         provenanceType: 'bootstrap_vocabulary',
+        nativeEvidenceStatus: 'BOOTSTRAP_SEED',
+        sourceProvenanceFamily: 'STATIC_BOOTSTRAP',
         isBootstrapSeed: true,
         nativeTerm: seed,
-        market: normC
+        market: canonicalC
       },
       confidence: 0.65,
       noveltyRationale: `Generated from bootstrap seed dictionary for ${normC}.`
     })
   );
+}
+
+/** Bounded Phase 10 materialization for the existing autonomous producer cycle. */
+export async function materializeBoundedCountryNativeProposals(
+  countries: string[],
+  config: { globalCap?: number; perCountryCap?: number; fairnessCursor?: number; deadlineMs?: number } = {}
+): Promise<{ generated: number; persisted: number; proposals: DiscoveryFrontierProposal[] }> {
+  const globalCap = Math.min(100, Math.max(1, Math.floor(config.globalCap ?? 25)));
+  const perCountryCap = Math.min(globalCap, Math.max(1, Math.floor(config.perCountryCap ?? 5)));
+  const normalizedCountries = [...new Set(countries.map(canonicalCountry).filter(Boolean))].sort();
+  const deadlineMs = Math.min(30_000, Math.max(100, Math.floor(config.deadlineMs ?? 2_500)));
+  const groups = await Promise.all(normalizedCountries.map(async country => ({
+    country,
+    proposals: await settleBeforeDeadline(
+      generateCountryNativeProposals(country, perCountryCap), deadlineMs, []
+    )
+  })));
+  const proposals = selectFairCountryNativeProposals(groups, globalCap, config.fairnessCursor ?? 0);
+  const persisted = await settleBeforeDeadline(persistFrontierProposals(proposals), deadlineMs, 0);
+  return { generated: proposals.length, persisted, proposals };
+}
+
+/** A best-effort materializer may never extend the scheduler critical path past its budget. */
+export async function settleBeforeDeadline<T>(work: Promise<T>, deadlineMs: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work.catch(() => fallback),
+      new Promise<T>(resolve => { timer = setTimeout(() => resolve(fallback), Math.max(0, deadlineMs)); })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Deterministic rotating round-robin selection prevents lexicographic country starvation. */
+export function selectFairCountryNativeProposals(
+  groups: Array<{ country: string; proposals: DiscoveryFrontierProposal[] }>,
+  globalCap: number,
+  fairnessCursor: number
+): DiscoveryFrontierProposal[] {
+  const ordered = groups
+    .map(group => ({ ...group, proposals: [...group.proposals] }))
+    .filter(group => group.proposals.length > 0)
+    .sort((a, b) => a.country.localeCompare(b.country));
+  if (!ordered.length || globalCap <= 0) return [];
+  const offset = Math.max(0, Math.floor(fairnessCursor)) % ordered.length;
+  const rotated = [...ordered.slice(offset), ...ordered.slice(0, offset)];
+  const seen = new Set<string>();
+  const selected: DiscoveryFrontierProposal[] = [];
+  const maxDepth = Math.max(...rotated.map(group => group.proposals.length));
+  for (let depth = 0; depth < maxDepth && selected.length < globalCap; depth++) {
+    for (const group of rotated) {
+      const proposal = group.proposals[depth];
+      if (proposal && !seen.has(proposal.dedupKey)) {
+        seen.add(proposal.dedupKey);
+        selected.push(proposal);
+        if (selected.length >= globalCap) break;
+      }
+    }
+  }
+  return selected;
 }
 
 // 6. COVERAGE_GAP Generator
@@ -368,7 +575,9 @@ export async function generateTemporalProposals(country: string, limit = 10): Pr
 }
 
 /**
- * Persists proposals into database with deduplication (ON CONFLICT (dedup_key) DO NOTHING).
+ * Persists proposals with stable identity; COUNTRY_NATIVE evidence upgrades only
+ * when deterministic provenance precedence is stronger, or same-tier evidence
+ * improves monotonically without losing an already persisted signal.
  */
 export async function persistFrontierProposals(
   proposals: DiscoveryFrontierProposal[]
@@ -378,14 +587,125 @@ export async function persistFrontierProposals(
   let inserted = 0;
 
   for (const p of proposals) {
-    const res = await db.query(
+    let client: any = null;
+    let runner: any = db;
+    try {
+      const canonicalTermId = Number(p.supportingEvidence.canonicalTermId);
+      if (p.proposalFamily === 'COUNTRY_NATIVE' && Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+        client = await db.connect();
+        runner = client;
+        await runner.query('BEGIN');
+        await runner.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR SHARE', [canonicalTermId]);
+        const authoritative = await runner.query(
+          `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
+                  bootstrap_seed_count,native_quality_creator_count,structured_entity_matched,
+                  native_proposal_eligible,evidence_revision,updated_at
+           FROM country_native_evidence_projections
+           WHERE canonical_term_id=$1 FOR SHARE`,
+          [canonicalTermId]
+        );
+        if (!authoritative.rowCount) {
+          await runner.query('ROLLBACK'); client.release(); client = null; continue;
+        }
+        const row = authoritative.rows[0];
+        const effective = effectiveProjectionProposalEvidence(row);
+        const incomingProjectionRevision = new Date(String(p.supportingEvidence.projectionRevision || 0)).getTime();
+        const currentProjectionRevision = new Date(row.updated_at).getTime();
+        const currentRevision = String(row.evidence_revision || '0');
+        if (!row.native_proposal_eligible || incomingProjectionRevision !== currentProjectionRevision ||
+            String(p.supportingEvidence.evidenceRevision || '0') !== currentRevision ||
+            p.supportingEvidence.nativeEvidenceStatus !== effective.nativeEvidenceStatus ||
+            p.supportingEvidence.sourceProvenanceFamily !== effective.sourceProvenanceFamily) {
+          await runner.query('ROLLBACK'); client.release(); client = null; continue;
+        }
+      }
+      if (p.targetNeighborhoodKey) {
+      const d = p.targetDimensions;
+      await runner.query(
+        `INSERT INTO discovery_neighborhoods(
+           neighborhood_key,neighborhood_checksum,country,language,query_intent,
+           primary_term_family,retrieval_lane,search_ordering,instrument_or_theme,source_family,metadata
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'{}'::jsonb)
+         ON CONFLICT(neighborhood_key) DO NOTHING`,
+        [p.targetNeighborhoodKey, createNeighborhoodChecksum(p.targetNeighborhoodKey), d.country, d.language,
+          d.queryIntent, d.primaryTermFamily, d.retrievalLane, d.searchOrdering, d.instrumentOrTheme, d.sourceFamily]
+      );
+      }
+      const res = await runner.query(
       `INSERT INTO frontier_discovery_proposals(
          dedup_key, proposal_family, country, language, concept,
          target_neighborhood_key, target_dimensions, source_provenance,
          supporting_evidence, confidence, novelty_rationale, trial_status, expires_at
        )
        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-       ON CONFLICT(dedup_key) DO NOTHING`,
+       ON CONFLICT(dedup_key) DO UPDATE SET
+         country=excluded.country,
+         language=excluded.language,
+         target_neighborhood_key=excluded.target_neighborhood_key,
+         target_dimensions=excluded.target_dimensions,
+         source_provenance=excluded.source_provenance,
+         supporting_evidence=excluded.supporting_evidence,
+         confidence=excluded.confidence,
+         novelty_rationale=excluded.novelty_rationale,
+         trial_status=CASE
+           WHEN frontier_discovery_proposals.trial_status IN ('TRIED','EXPIRED') THEN frontier_discovery_proposals.trial_status
+           WHEN frontier_discovery_proposals.trial_status='DISABLED' THEN excluded.trial_status
+           ELSE frontier_discovery_proposals.trial_status
+         END,
+         expires_at=excluded.expires_at
+       WHERE frontier_discovery_proposals.proposal_family='COUNTRY_NATIVE'
+         AND excluded.proposal_family='COUNTRY_NATIVE'
+         AND ((CASE
+           WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+           WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+           WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+           WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+           ELSE 0 END)
+         > (CASE
+           WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+           WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+           WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+           WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+           ELSE 0 END)
+         OR (
+           (CASE
+             WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+             WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+             WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+             WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+             ELSE 0 END)
+           = (CASE
+             WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+             WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+             WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+             WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+             ELSE 0 END)
+           AND (
+             COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+               > COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+             OR (
+               COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+                 = COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+               AND (
+                 COALESCE((excluded.supporting_evidence->>'evidenceRevision')::numeric,0)
+                   > COALESCE((frontier_discovery_proposals.supporting_evidence->>'evidenceRevision')::numeric,0)
+                 OR (
+                   COALESCE((excluded.supporting_evidence->>'evidenceRevision')::numeric,0)
+                     = COALESCE((frontier_discovery_proposals.supporting_evidence->>'evidenceRevision')::numeric,0)
+                   AND COALESCE((excluded.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
+                     > COALESCE((frontier_discovery_proposals.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
+                 )
+               )
+             )
+           )
+         )
+         OR (
+           excluded.supporting_evidence ? 'projectionRevision'
+           AND excluded.supporting_evidence->>'canonicalTermId' = frontier_discovery_proposals.supporting_evidence->>'canonicalTermId'
+           AND excluded.supporting_evidence->>'nativeEvidenceStatus' IS DISTINCT FROM frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'
+           AND COALESCE((excluded.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
+             > COALESCE((frontier_discovery_proposals.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
+         ))`,
       [
         p.dedupKey,
         p.proposalFamily,
@@ -402,7 +722,14 @@ export async function persistFrontierProposals(
         p.expiresAt
       ]
     );
-    if (res.rowCount) inserted++;
+      if (res.rowCount) inserted++;
+      if (client) await runner.query('COMMIT');
+    } catch (error) {
+      if (client) await runner.query('ROLLBACK');
+      throw error;
+    } finally {
+      if (client) client.release();
+    }
   }
 
   return inserted;

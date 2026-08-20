@@ -7,6 +7,7 @@ import {
   buildDiscoveryNeighborhood
 } from './discoveryNeighborhood';
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
+import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -25,6 +26,7 @@ export interface NeighborhoodCandidate {
   isSaturating: boolean;
   proposalId?: string;
   proposalFamily?: string;
+  proposalEvidenceSnapshot?: Record<string, unknown> | null;
   lastAllocatedAt?: string | null;
   recentAllocationCount: number;
   expectedQuotaCost: number;
@@ -64,6 +66,7 @@ export interface AllocationDecision {
     knownCreatorRatio: number;
   };
   proposalId?: string | null;
+  proposalEvidenceSnapshot?: Record<string, unknown> | null;
   selectionScore: number;
   scoreComponents: ScoringComponents;
   candidateNeighborhoodCount: number;
@@ -252,6 +255,9 @@ export async function getNeighborhoodCandidates(
       COALESCE((fs.evidence->>'isSaturating')::boolean, false) AS is_saturating,
       p.proposal_id::text AS proposal_id,
       p.proposal_family,
+      p.supporting_evidence AS proposal_supporting_evidence,
+      p.source_provenance AS proposal_source_provenance,
+      p.confidence AS proposal_confidence,
       recent.last_allocated_at,
       COALESCE(recent.alloc_count, 0)::int AS recent_allocation_count
     FROM discovery_neighborhoods n
@@ -269,7 +275,7 @@ export async function getNeighborhoodCandidates(
       ORDER BY observed_at DESC LIMIT 1
     ) obs ON true
     LEFT JOIN LATERAL (
-      SELECT proposal_id, proposal_family
+      SELECT proposal_id, proposal_family, supporting_evidence, source_provenance, confidence
       FROM frontier_discovery_proposals
       WHERE target_neighborhood_key = n.neighborhood_key
         AND trial_status = 'PENDING'
@@ -318,6 +324,12 @@ export async function getNeighborhoodCandidates(
       isSaturating: Boolean(row.is_saturating),
       proposalId: row.proposal_id || undefined,
       proposalFamily: row.proposal_family || undefined,
+      proposalEvidenceSnapshot: row.proposal_id ? {
+        proposalFamily: row.proposal_family,
+        sourceProvenance: row.proposal_source_provenance,
+        confidence: Number(row.proposal_confidence),
+        supportingEvidence: typeof row.proposal_supporting_evidence === 'string' ? JSON.parse(row.proposal_supporting_evidence) : row.proposal_supporting_evidence
+      } : null,
       lastAllocatedAt: row.last_allocated_at || null,
       recentAllocationCount: Number(row.recent_allocation_count || 0),
       expectedQuotaCost: 100
@@ -430,6 +442,7 @@ export async function evaluateShadowFrontierAllocation(input: {
       knownCreatorRatio: selectedCandidate.knownCreatorRatio
     },
     proposalId: selectedCandidate.proposalId || null,
+    proposalEvidenceSnapshot: selectedCandidate.proposalEvidenceSnapshot || null,
     selectionScore: selectedScoreComponents.totalScore,
     scoreComponents: selectedScoreComponents,
     candidateNeighborhoodCount: candidates.length,
@@ -452,9 +465,10 @@ export async function evaluateShadowFrontierAllocation(input: {
          frontier_state, expected_marginal_value, uncertainty, coverage_gain,
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
-         deferred, quota_reserved, quota_consumed, quota_day, policy_version
+         deferred, quota_reserved, quota_consumed, quota_day, policy_version,
+         proposal_evidence_snapshot, proposal_evidence_checksum
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,
@@ -480,7 +494,9 @@ export async function evaluateShadowFrontierAllocation(input: {
         decision.quotaReserved,
         decision.quotaConsumed,
         decision.quotaDay,
-        decision.policyVersion
+        decision.policyVersion,
+        JSON.stringify(decision.proposalEvidenceSnapshot),
+        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null
       ]
     ).catch((error: unknown) => console.warn('[FrontierAllocator] Failed to persist shadow decision:', error));
   }
@@ -567,6 +583,16 @@ export async function evaluateFrontierCanaryAllocation(input: {
     // Acquire transaction advisory lock for allocation authority
     await runner.query('SELECT pg_advisory_xact_lock(741963286)');
 
+    // A process can die after Phase 8 reserves but before the scheduling transaction.
+    // Expire those orphaned reservations under the allocation authority lock.
+    await runner.query(
+      `UPDATE frontier_allocation_decisions
+       SET decision_status='RELEASED',deferred=true,quota_reserved=0,
+           rejection_reasons=jsonb_set(COALESCE(rejection_reasons,'{}'::jsonb),'{releaseReason}',to_jsonb('STALE_RESERVATION_RECOVERED'::text))
+       WHERE allocation_origin='FRONTIER_CANARY' AND decision_status='RESERVED'
+         AND created_at < now()-interval '20 minutes'`
+    );
+
     // Read Configurable Caps
     const [assignCapRes, quotaCapRes] = await Promise.all([
       runner.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_allocation_daily_assignment_cap'`),
@@ -647,6 +673,61 @@ export async function evaluateFrontierCanaryAllocation(input: {
 
     const topCandidate = eligibleCandidates[0].candidate;
     const topScore = eligibleCandidates[0].score;
+    let lockedProposalSnapshot = topCandidate.proposalEvidenceSnapshot || null;
+    if (topCandidate.proposalId) {
+      const selectedEvidence = (topCandidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
+      const canonicalTermId = Number(selectedEvidence.canonicalTermId);
+      if (Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+        await runner.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR SHARE', [canonicalTermId]);
+        const projection = await runner.query(
+          `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
+                  bootstrap_seed_count,native_quality_creator_count,structured_entity_matched,
+                  native_proposal_eligible,evidence_revision,updated_at
+           FROM country_native_evidence_projections WHERE canonical_term_id=$1 FOR SHARE`,
+          [canonicalTermId]
+        );
+        const row = projection.rows[0];
+        const effective = row ? effectiveProjectionProposalEvidence(row) : null;
+        if (!row?.native_proposal_eligible || !effective ||
+            String(row.evidence_revision || '0') !== String(selectedEvidence.evidenceRevision || '0') ||
+            new Date(row.updated_at).getTime() !== new Date(String(selectedEvidence.projectionRevision || 0)).getTime() ||
+            effective.nativeEvidenceStatus !== selectedEvidence.nativeEvidenceStatus ||
+            effective.sourceProvenanceFamily !== selectedEvidence.sourceProvenanceFamily) {
+          if (client) await runner.query('COMMIT');
+          return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_FRONTIER_PROPOSAL_EVIDENCE' };
+        }
+      }
+      const lockedProposal = await runner.query(
+        `SELECT proposal_family,source_provenance,supporting_evidence,confidence,target_neighborhood_key,target_dimensions
+         FROM frontier_discovery_proposals
+         WHERE proposal_id=$1 AND trial_status='PENDING' AND (expires_at IS NULL OR expires_at>$2)
+         FOR UPDATE`,
+        [topCandidate.proposalId, now.toISOString()]
+      );
+      if (!lockedProposal.rowCount) {
+        if (client) await runner.query('COMMIT');
+        return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_FRONTIER_PROPOSAL_STATE' };
+      }
+      const locked = lockedProposal.rows[0];
+      const lockedEvidence = typeof locked.supporting_evidence === 'string' ? JSON.parse(locked.supporting_evidence) : locked.supporting_evidence || {};
+      const lockedDimensions = typeof locked.target_dimensions === 'string' ? JSON.parse(locked.target_dimensions) : locked.target_dimensions;
+      if (lockedEvidence.evidenceChecksum !== selectedEvidence.evidenceChecksum ||
+          locked.source_provenance !== topCandidate.proposalEvidenceSnapshot?.sourceProvenance ||
+          Number(locked.confidence) !== Number(topCandidate.proposalEvidenceSnapshot?.confidence) ||
+          locked.target_neighborhood_key !== topCandidate.neighborhoodKey ||
+          createNeighborhoodKey(lockedDimensions) !== topCandidate.neighborhoodKey) {
+        if (client) await runner.query('COMMIT');
+        return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_FRONTIER_PROPOSAL_SNAPSHOT' };
+      }
+      lockedProposalSnapshot = {
+        proposalFamily: locked.proposal_family,
+        sourceProvenance: locked.source_provenance,
+        confidence: Number(locked.confidence),
+        targetNeighborhoodKey: locked.target_neighborhood_key,
+        targetDimensions: lockedDimensions,
+        supportingEvidence: lockedEvidence
+      };
+    }
 
     const decisionId = createHash('sha256')
       .update(`${input.opportunityKey}:${topCandidate.neighborhoodKey}:canary:${PERSISTENT_RESEARCH_PHASE8_VERSION}`)
@@ -676,6 +757,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
         knownCreatorRatio: topCandidate.knownCreatorRatio
       },
       proposalId: topCandidate.proposalId || null,
+      proposalEvidenceSnapshot: lockedProposalSnapshot,
       selectionScore: topScore.totalScore,
       scoreComponents: topScore,
       candidateNeighborhoodCount: candidates.length,
@@ -696,9 +778,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
          frontier_state, expected_marginal_value, uncertainty, coverage_gain,
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
-         deferred, quota_reserved, quota_consumed, quota_day, policy_version
+         deferred, quota_reserved, quota_consumed, quota_day, policy_version,
+         proposal_evidence_snapshot, proposal_evidence_checksum
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,
@@ -724,7 +807,9 @@ export async function evaluateFrontierCanaryAllocation(input: {
         decision.quotaReserved,
         decision.quotaConsumed,
         decision.quotaDay,
-        decision.policyVersion
+        decision.policyVersion,
+        JSON.stringify(decision.proposalEvidenceSnapshot),
+        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null
       ]
     );
 
@@ -795,6 +880,44 @@ export async function markAllocationDecisionDeferred(
   clientOverride?: any
 ): Promise<boolean> {
   return releaseAllocationDecision(decisionId, reason, clientOverride);
+}
+
+/**
+ * Atomically releases an unexecutable reservation and terminally quarantines only its
+ * still-pending proposal. Executability is part of proposal identity, so evidence refresh
+ * must never resurrect it; a materially different proposal receives a different dedup key.
+ */
+export async function quarantineUnexecutableAllocation(
+  decisionId: string,
+  reason: string,
+  clientOverride?: any
+): Promise<boolean> {
+  const db = clientOverride || await getDb();
+  const client = clientOverride ? null : await db.connect();
+  const runner = clientOverride || client;
+  try {
+    if (client) await runner.query('BEGIN');
+    const decision = await runner.query(
+      `UPDATE frontier_allocation_decisions
+       SET decision_status='DEFERRED', deferred=true, quota_reserved=0,
+           rejection_reasons=jsonb_set(COALESCE(rejection_reasons,'{}'::jsonb),'{releaseReason}',to_jsonb($2::text))
+       WHERE decision_id=$1 AND allocation_origin='FRONTIER_CANARY' AND decision_status='RESERVED'
+       RETURNING proposal_id`, [decisionId, reason]
+    );
+    if (decision.rowCount && decision.rows[0].proposal_id) {
+      await runner.query(
+        `UPDATE frontier_discovery_proposals SET trial_status='EXPIRED'
+         WHERE proposal_id=$1 AND trial_status='PENDING'`, [decision.rows[0].proposal_id]
+      );
+    }
+    if (client) await runner.query('COMMIT');
+    return Boolean(decision.rowCount);
+  } catch (error) {
+    if (client) await runner.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    if (client) client.release();
+  }
 }
 
 /**

@@ -13,7 +13,7 @@ import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
-import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
+import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { buildRetrievalConfiguration } from './retrievalConfiguration';
 import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
@@ -22,7 +22,8 @@ import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidenc
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
-import { calculateQueryFunnel } from './queryPerformance';
+import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
+import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -346,7 +347,14 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
 
 export async function upsertChannel(channel: ChannelRecord): Promise<void> {
   const db = await getDb();
-  await db.query(`INSERT INTO channels (
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const prior = await client.query(
+      'SELECT quality_score,trading_status FROM channels WHERE channel_id=$1 FOR UPDATE',
+      [channel.channel_id]
+    );
+    await client.query(`INSERT INTO channels (
     channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,updated_at
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,now())
   ON CONFLICT(channel_id) DO UPDATE SET
@@ -362,7 +370,22 @@ export async function upsertChannel(channel: ChannelRecord): Promise<void> {
     channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
     channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
     channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED'
-  ]);
+    ]);
+    if (prior.rowCount) {
+      const before = isQualityCreator(prior.rows[0].trading_status, Number(prior.rows[0].quality_score || 0));
+      const after = isQualityCreator(channel.trading_status || 'UNCERTAIN', Number(channel.quality_score || 0));
+      if (before !== after) {
+        const { refreshCountryNativeProjectionsForCreator } = await import('./countryNativeIntelligence');
+        await refreshCountryNativeProjectionsForCreator(channel.channel_id, client);
+      }
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getCountryVocabularies(): Promise<CountryVocabulary[]> {
@@ -474,6 +497,7 @@ export interface AutonomousQueryCandidate {
   allocationProvenance?: Record<string, unknown>;
   allocationOrigin?: 'FRONTIER_CANARY' | 'LEGACY';
   frontierDecisionId?: string;
+  targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
 }
 
 export interface AutonomousSchedulingSnapshot {
@@ -543,6 +567,14 @@ export async function scheduleAutonomousQueryRuns(
   try {
     await client.query('BEGIN');
     for (const candidate of candidates) {
+      const nativeLineage = (candidate.query.generation_metadata?.countryNativeAllocation || {}) as Record<string, unknown>;
+      const allocatedDimensions = candidate.allocationOrigin === 'FRONTIER_CANARY' && nativeLineage.targetNeighborhoodKey
+        ? candidate.targetNeighborhoodDimensions
+        : undefined;
+      if (nativeLineage.targetNeighborhoodKey && (!allocatedDimensions ||
+          createNeighborhoodKey(allocatedDimensions) !== nativeLineage.targetNeighborhoodKey)) {
+        throw new Error('FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH');
+      }
       const reserved = await client.query(
         `UPDATE query_library
          SET reserved_at=now(), reserved_until=now()+interval '20 minutes', reserved_by=$2, last_queued_at=now()
@@ -566,12 +598,16 @@ export async function scheduleAutonomousQueryRuns(
       );
       const video = laneCounts.rows[0]?.video || 0;
       const total = laneCounts.rows[0]?.total || 0;
-      const controlRetrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
+      const controlRetrievalLane = allocatedDimensions
+        ? allocatedDimensions.retrievalLane as RetrievalLane
+        : allocateRetrievalLane(video, total, videoLanePercent);
       const orderingCounts = await client.query(
         `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
          FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
       );
-      const controlSearchOrdering = allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+      const controlSearchOrdering = allocatedDimensions
+        ? allocatedDimensions.searchOrdering as SearchOrdering
+        : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
       const controlConfig = buildRetrievalConfiguration({
         searchOrdering: controlSearchOrdering,
@@ -586,10 +622,13 @@ export async function scheduleAutonomousQueryRuns(
       let requestedPageDepth = 1;
       let canaryReservationId: string | undefined;
 
-      const { neighborhood } = mapQueryRunToNeighborhood(
+      const { neighborhood: mappedNeighborhood } = mapQueryRunToNeighborhood(
         { runId: 'pending', queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
         candidate.query
       );
+      const neighborhood = allocatedDimensions
+        ? { neighborhoodKey: createNeighborhoodKey(allocatedDimensions), dimensions: allocatedDimensions }
+        : mappedNeighborhood;
 
       const oppKey = candidate.frontierDecisionId || (candidate.allocationProvenance?.assignmentKey ? String(candidate.allocationProvenance.assignmentKey) : `opp:q${candidate.query.id}:strat_${candidate.strategy}:n${candidate.query.times_executed || 0}`);
 
@@ -638,6 +677,11 @@ export async function scheduleAutonomousQueryRuns(
         canaryReservationId = canaryTreatment.reservation.reservationId;
       }
 
+      if (allocatedDimensions && (retrievalLane !== allocatedDimensions.retrievalLane ||
+          searchOrdering !== allocatedDimensions.searchOrdering)) {
+        throw new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
+      }
+
       const executedConfig = buildRetrievalConfiguration({
         searchOrdering,
         retrievalLane,
@@ -684,6 +728,17 @@ export async function scheduleAutonomousQueryRuns(
         if (!commitRes.rowCount) {
           throw new Error(`FRONTIER_ALLOCATION_COMMIT_FAILED: Decision ${candidate.frontierDecisionId} is not an active RESERVED canary decision.`);
         }
+        if (nativeLineage.targetNeighborhoodKey) {
+          const consumed = await client.query(
+            `UPDATE frontier_discovery_proposals p SET trial_status='TRIED'
+             FROM frontier_allocation_decisions d
+             WHERE d.decision_id=$1 AND d.proposal_id=p.proposal_id
+               AND d.decision_status='COMMITTED' AND p.trial_status='PENDING'
+               AND p.proposal_family='COUNTRY_NATIVE'
+             RETURNING p.proposal_id`, [candidate.frontierDecisionId]
+          );
+          if (!consumed.rowCount) throw new Error(`FRONTIER_PROPOSAL_CONSUME_FAILED: ${candidate.frontierDecisionId}`);
+        }
       }
       for (const component of queryComponents(candidate.query)) {
         await client.query(
@@ -728,7 +783,10 @@ export async function scheduleAutonomousQueryRuns(
             null,
             { runId: item.runId, queryId: item.query.id, country: item.query.country, retrievalLane: item.retrievalLane, searchOrdering: item.searchOrdering, source: 'automated_query' },
             candidate.query,
-            observedLanguage
+            observedLanguage,
+            candidate.query.generation_metadata?.countryNativeAllocation
+              ? candidate.targetNeighborhoodDimensions
+              : undefined
           );
         }
       } catch (error) {
@@ -749,10 +807,16 @@ export async function recordNeighborhoodObservation(
   client: any,
   queryRun: { runId: string; queryId?: number; country: string; retrievalLane: string; searchOrdering: string; source?: string },
   queryRecord: Partial<QueryRecord> & { query: string; intent?: string; primary_term?: string; country: string },
-  language?: string | null
+  language?: string | null,
+  authoritativeDimensions?: DiscoveryNeighborhoodDimensions
 ): Promise<{ neighborhoodKey: string; retrievalActionKey: string }> {
   const db = client || await getDb();
-  const { neighborhood, lineage } = mapQueryRunToNeighborhood(queryRun, queryRecord, { language });
+  const mapped = mapQueryRunToNeighborhood(queryRun, queryRecord, { language });
+  const neighborhood = authoritativeDimensions
+    ? { ...mapped.neighborhood, neighborhoodKey: createNeighborhoodKey(authoritativeDimensions), dimensions: authoritativeDimensions }
+    : mapped.neighborhood;
+  const lineage = { ...mapped.lineage, neighborhoodKey: neighborhood.neighborhoodKey,
+    retrievalActionKey: `retrieval_action:${queryRun.runId}:${neighborhood.neighborhoodKey}` };
 
   await db.query(
     `INSERT INTO discovery_neighborhoods(
@@ -869,7 +933,7 @@ export async function recordNeighborhoodAnalyticsAfterRun(
   const newIntersectionsRes = await db.query(
     `SELECT
        COUNT(*) FILTER (WHERE s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED')::int AS relevant_new,
-       COUNT(*) FILTER (WHERE s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= 55)::int AS quality_new
+       COUNT(*) FILTER (WHERE s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= ${QUALITY_CREATOR_SCORE_THRESHOLD})::int AS quality_new
      FROM channel_sightings s
      JOIN channels c ON c.channel_id = s.channel_id
      WHERE s.query_run_id = $1`,
@@ -883,7 +947,7 @@ export async function recordNeighborhoodAnalyticsAfterRun(
   const sightingsDetailRes = await db.query(
     `SELECT
        c.subscriber_count,
-       (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= 55) AS is_quality_new,
+       (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED' AND c.quality_score >= ${QUALITY_CREATOR_SCORE_THRESHOLD}) AS is_quality_new,
        (s.was_known = false AND c.trading_status = 'TRADING_CONFIRMED') AS is_relevant_new
      FROM channel_sightings s
      JOIN channels c ON c.channel_id = s.channel_id
@@ -1195,6 +1259,75 @@ export async function startQueryRun(runId: string): Promise<void> {
   await db.query(`UPDATE quota_reservations SET expires_at=now()+interval '20 minutes' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
 }
 
+async function attributeCompletedCountryNativeRun(client: EventClient, runId: string, metrics: {
+  rawResults: number; distinctResults: number; newChannels: number; tradingConfirmed: number;
+  qualityChannels: number; quotaUsed: number;
+}): Promise<void> {
+  const lineage = await client.query(
+    `SELECT d.decision_id, d.proposal_id, d.coverage_gain, r.query_id, r.country,
+            d.proposal_evidence_snapshot
+     FROM frontier_allocation_decisions d
+     JOIN query_runs r ON r.id=d.query_run_id
+     WHERE d.query_run_id=$1
+       AND d.allocation_origin='FRONTIER_CANARY'
+       AND d.decision_status='COMMITTED'
+       AND d.proposal_evidence_snapshot->>'proposalFamily'='COUNTRY_NATIVE'
+     ORDER BY d.created_at, d.decision_id
+     LIMIT 1`,
+    [runId]
+  );
+  if (!lineage.rowCount) return;
+  const row = lineage.rows[0];
+  const snapshot = typeof row.proposal_evidence_snapshot === 'string' ? JSON.parse(row.proposal_evidence_snapshot) : row.proposal_evidence_snapshot || {};
+  const evidence = snapshot.supportingEvidence || {};
+  const canonicalTermId = Number(evidence.canonicalTermId);
+  const nativeEvidenceStatus = String(evidence.nativeEvidenceStatus || '');
+  const sourceProvenanceFamily = String(evidence.sourceProvenanceFamily || '');
+  if ((nativeEvidenceStatus === 'NATIVE_OBSERVED' && (!Number.isSafeInteger(canonicalTermId) || canonicalTermId <= 0)) ||
+      !['NATIVE_OBSERVED', 'BOOTSTRAP_SEED', 'TRANSLATED_SEED'].includes(nativeEvidenceStatus) ||
+      !['CREATOR_METADATA', 'STRUCTURED_LOCAL_ENTITY', 'COUNTRY_VOCABULARY', 'STATIC_BOOTSTRAP', 'TRANSLATED_QUERY'].includes(sourceProvenanceFamily)) return;
+
+  const exact = await client.query(
+    `SELECT
+       COUNT(DISTINCT s.channel_id) FILTER (
+         WHERE s.persisted AND NOT s.was_known
+           AND s.funnel_outcome IN ('TRADING_CONFIRMED','NEEDS_REVIEW')
+       )::int AS relevant_new_creators,
+       COUNT(DISTINCT s.channel_id) FILTER (
+         WHERE s.persisted AND NOT s.was_known
+           AND s.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD}
+       )::int AS quality_new_creators
+     FROM channel_sightings s
+     LEFT JOIN channels c ON c.channel_id=s.channel_id
+     WHERE s.query_run_id=$1`,
+    [runId]
+  );
+  const observed = exact.rows[0] || {};
+  const { attributeCountryNativePerformance } = await import('./countryNativeIntelligence');
+  await attributeCountryNativePerformance({
+    attributionKey: `country-native:${runId}:${row.proposal_id}:v1`,
+    canonicalTermId: Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0 ? canonicalTermId : null,
+    proposalId: row.proposal_id,
+    allocationDecisionId: row.decision_id,
+    queryId: Number(row.query_id),
+    queryRunId: runId,
+    country: row.country,
+    nativeEvidenceStatus: nativeEvidenceStatus as NativeEvidenceStatus,
+    sourceProvenanceFamily: sourceProvenanceFamily as SourceProvenanceFamily,
+    isCodeSwitched: Boolean(evidence.isCodeSwitched),
+    structuredEntityMatched: Boolean(evidence.structuredEntityMatched),
+    rawResults: metrics.rawResults,
+    uniqueCreators: metrics.distinctResults,
+    newCreators: metrics.newChannels,
+    relevantNewCreators: Number(observed.relevant_new_creators || 0),
+    qualityCreators: Number(observed.quality_new_creators || 0),
+    confirmedTradingCreators: metrics.tradingConfirmed,
+    quotaConsumed: metrics.quotaUsed,
+    yieldScore: metrics.distinctResults > 0 ? metrics.newChannels / metrics.distinctResults : 0,
+    coverageExpansionGain: metrics.distinctResults > 0 ? metrics.newChannels / metrics.distinctResults : 0
+  }, client);
+}
+
 export async function completeQueryRun(runId: string, metrics: {
   rawResults: number;
   distinctResults: number;
@@ -1219,13 +1352,13 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE query_runs SET status='COMPLETED',raw_results=$2,distinct_results=$3,duplicate_results=$4,
        known_channels=$5,new_channels=$6,country_rejected=$7,non_trading=$8,uncertain=$9,needs_review=$10,
        trading_confirmed=$11,unique_channels=$12,quality_channels=$13,communities_discovered=$14,quota_used=$15,
-       performance_details=$16,completed_at=now() WHERE id=$1 RETURNING query_id`,
+       performance_details=$16,completed_at=now() WHERE id=$1 AND status<>'COMPLETED' RETURNING query_id`,
       [runId, metrics.rawResults, metrics.distinctResults, metrics.duplicateResults, metrics.knownChannels,
        metrics.newChannels, metrics.countryRejected, metrics.nonTrading, metrics.uncertain, metrics.needsReview,
        metrics.tradingConfirmed, metrics.uniqueChannels, metrics.qualityChannels, metrics.communitiesDiscovered,
        metrics.quotaUsed, JSON.stringify(metrics)]
     );
-    await client.query(`UPDATE query_run_components SET performance_details=$2 WHERE query_run_id=$1`, [runId, JSON.stringify(metrics)]);
+    if (run.rowCount) await client.query(`UPDATE query_run_components SET performance_details=$2 WHERE query_run_id=$1`, [runId, JSON.stringify(metrics)]);
     if (run.rowCount) {
       await client.query(
         `UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL,
@@ -1233,8 +1366,8 @@ export async function completeQueryRun(runId: string, metrics: {
          WHERE id=$1`, [run.rows[0].query_id]
       );
     }
-    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});}
-    await client.query(
+    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});await attributeCompletedCountryNativeRun(client,runId,metrics);}
+    if (run.rowCount) await client.query(
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
@@ -1243,7 +1376,7 @@ export async function completeQueryRun(runId: string, metrics: {
     // Await post-commit best-effort observation analytics (Phases 2-4).
     // Any analytics error is caught inside recordNeighborhoodAnalyticsAfterRun,
     // ensuring analytics failures never roll back or abort completed runs.
-    await recordNeighborhoodAnalyticsAfterRun(runId, metrics);
+    if (run.rowCount) await recordNeighborhoodAnalyticsAfterRun(runId, metrics);
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

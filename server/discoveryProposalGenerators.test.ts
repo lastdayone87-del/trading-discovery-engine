@@ -42,11 +42,11 @@ test('Phase 6: Country-native proposal generator uses native market terms withou
   const proposalsJP = await generateCountryNativeProposals('JP', 5);
   assert.ok(proposalsJP.length > 0);
   assert.equal(proposalsJP[0].proposalFamily, 'COUNTRY_NATIVE');
-  assert.equal(proposalsJP[0].country, 'JP');
+  assert.equal(proposalsJP[0].country, 'Japan');
   assert.ok(proposalsJP.some(p => p.concept.includes('日経平均') || p.concept.includes('FX')), 'Japanese native terms must be present');
 
   const proposalsBR = await generateCountryNativeProposals('BR', 5);
   assert.ok(proposalsBR.length > 0);
-  assert.equal(proposalsBR[0].country, 'BR');
+  assert.equal(proposalsBR[0].country, 'Brazil');
   assert.ok(proposalsBR.some(p => p.concept.includes('B3') || p.concept.includes('mini indice')), 'Brazilian native terms must be present');
 });

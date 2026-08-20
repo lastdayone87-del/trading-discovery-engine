@@ -117,6 +117,51 @@ export function rotateAwayFromMostRecentIntent(eligible: QueryRecord[], history:
   return eligible.filter(query => query.intent !== mostRecent.intent);
 }
 
+/**
+ * Constructs one governed query for an immutable COUNTRY_NATIVE allocation.
+ * The learned native surface remains a modifier; the existing curated/country
+ * vocabulary atom policy supplies the independently authorized retrieval anchor.
+ */
+export function planCountryNativeProposalQuery(args: {
+  country: string;
+  nativeTerm: string;
+  countryVocabulary?: CountryVocabulary;
+  targetIntent: string;
+  allocationLineage: Record<string, unknown>;
+}): PlannedQuery | null {
+  const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (!nativeTerm || queryTokenCount(nativeTerm) > 3) return null;
+  const learned = atom(nativeTerm, 'LEARNED', (args.targetIntent || 'strategy') as QueryIntent, 2, 'LEARNED');
+  const anchor = countryAtoms(args.country, args.countryVocabulary)
+    .filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility))
+    .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
+  if (!anchor) return null;
+  const query = `${anchor.term} ${nativeTerm}`;
+  return {
+    query,
+    intent: (args.targetIntent || anchor.intent) as QueryIntent,
+    // Preserve the allocated neighborhood identity even though the native term
+    // is safely executed as a governed modifier behind an authorized anchor.
+    primaryTerm: nativeTerm,
+    knowledgeTiers: [1, 2],
+    generationMode: 'EXPLORATION',
+    generationReason: 'Governed COUNTRY_NATIVE allocation combined with an authorized local retrieval anchor.',
+    discoveryObjective: 'Test the selected country-native terminology while discovering relevant trading creators.',
+    metadata: {
+      country: args.country,
+      queryTemplate: 'ANCHOR_LEARNED',
+      retrievalOptimized: true,
+      tokenCount: queryTokenCount(query),
+      scriptValidated: true,
+      retrievalSpecificity: { ...anchor.retrievalPolicy },
+      atoms: [anchor, learned].map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
+      localTier1Term: anchor.term,
+      learnedTerm: nativeTerm,
+      countryNativeAllocation: args.allocationLineage
+    }
+  };
+}
+
 function inferIntent(term: string, fallback: QueryIntent): QueryIntent {
   const value = normalizeQuery(term);
   if (/future|fdax|bund|先物/.test(value)) return 'futures';

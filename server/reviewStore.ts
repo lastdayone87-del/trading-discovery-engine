@@ -6,6 +6,7 @@ import { observeGroundTruthLabelReliably } from './phaseBObservationOutbox';
 import { recordFalseNegativeIncident } from './governedAdaptation';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import {resolveReviewReason, type ReviewReasonAction} from './reviewReasons';
+import {isQualityCreator} from './queryPerformance';
 
 export type ReviewState = 'NOT_REQUIRED'|'PENDING'|'APPROVED'|'REJECTED'|'SUPERSEDED';
 export type ReviewAction = 'APPROVE'|'REJECT'|'FORCE_RESCAN';
@@ -80,6 +81,11 @@ export async function decideReview(input:DecideInput) {
     const updatedReview=await client.query(`UPDATE channel_reviews SET state=$2::review_state,review_version=$3,evidence_snapshot=$4,decided_at=CASE WHEN $2::review_state='PENDING'::review_state THEN NULL ELSE now() END,pending_since=CASE WHEN $2::review_state='PENDING'::review_state THEN now() ELSE pending_since END,updated_at=now() WHERE channel_id=$1 RETURNING state,review_version`,[input.channelId,resulting,nextVersion,JSON.stringify(evidence)]);
     const updatedChannel=await client.query(`SELECT channel_id,trading_status,scan_status,discord_status FROM channels WHERE channel_id=$1`,[input.channelId]);
     if(updatedReview.rowCount!==1||updatedChannel.rowCount!==1)throw new Error('Review decision persistence verification failed.');
+    const qualityScore=Number(row.channel_snapshot?.quality_score||0);
+    if(isQualityCreator(row.channel_snapshot?.trading_status,qualityScore)!==isQualityCreator(updatedChannel.rows[0].trading_status,qualityScore)){
+      const {refreshCountryNativeProjectionsForCreator}=await import('./countryNativeIntelligence');
+      await refreshCountryNativeProjectionsForCreator(input.channelId,client);
+    }
     await client.query('COMMIT');
     // Labels are observational: schedule only after the authoritative review
     // commits, never await them, and contain all failures at this boundary.
