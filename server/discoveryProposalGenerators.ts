@@ -579,6 +579,7 @@ export async function persistFrontierProposals(
         client = await db.connect();
         runner = client;
         await runner.query('BEGIN');
+        await runner.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR SHARE', [canonicalTermId]);
         const authoritative = await runner.query(
           `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
                   bootstrap_seed_count,native_quality_creator_count,structured_entity_matched,

@@ -668,6 +668,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
       const selectedEvidence = (topCandidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
       const canonicalTermId = Number(selectedEvidence.canonicalTermId);
       if (Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+        await runner.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR SHARE', [canonicalTermId]);
         const projection = await runner.query(
           `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
                   bootstrap_seed_count,native_quality_creator_count,structured_entity_matched,

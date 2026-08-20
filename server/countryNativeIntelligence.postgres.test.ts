@@ -4,8 +4,85 @@ import { completeQueryRun, getChannelById, getDb, upsertChannel } from './db';
 import { observeTerminology } from './terminologyIntelligence';
 import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
+import { recomputeNativeEvidenceProjection, refreshCountryNativeProjectionsForCreator } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
+
+test('Phase 10 PostgreSQL concurrency: canonical-term serialization converges creator and observation races', {
+  skip: databaseUrl ? false : 'PHASE10_POSTGRES_URL is required for PostgreSQL concurrency coverage'
+}, async () => {
+  process.env.DATABASE_URL = databaseUrl!;
+  process.env.PGSSL = 'disable';
+  const db = await getDb();
+  const suffix = `race_${Date.now()}_${process.pid}`;
+  const country = `R${String(process.pid).slice(-2)}`;
+  const creatorA = `RACE_A_${suffix}`;
+  const creatorB = `RACE_B_${suffix}`;
+  let termId = 0;
+  try {
+    for (const channelId of [creatorA, creatorB]) {
+      await db.query(`INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+        VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','phase10-race',now(),90,'TRADING_CONFIRMED')`,
+      [channelId, `https://youtube.com/channel/${channelId}`, country]);
+    }
+    termId = Number(await observeTerminology({ term: `serialized ${suffix}`, country, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE', channelId: creatorA, videoId: `${suffix}-a` }, db));
+    await observeTerminology({ term: `serialized ${suffix}`, country, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE', channelId: creatorB, videoId: `${suffix}-b` }, db);
+
+    // Hold the canonical authority while committing a downgrade. A recompute
+    // already started on another connection must wait and then read the commit.
+    const mutator = await db.connect();
+    await mutator.query('BEGIN');
+    await mutator.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR UPDATE', [termId]);
+    await mutator.query("UPDATE channels SET quality_score=10 WHERE channel_id=$1", [creatorA]);
+    const waitingRecompute = recomputeNativeEvidenceProjection(termId, db);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await mutator.query('COMMIT');
+    mutator.release();
+    await waitingRecompute;
+    assert.equal((await db.query('SELECT native_quality_creator_count FROM country_native_evidence_projections WHERE canonical_term_id=$1', [termId])).rows[0].native_quality_creator_count, 1,
+      'an observation-side recompute cannot overwrite the committed downgrade with an old aggregate');
+
+    // Opposite creator classifications serialize on the same canonical term;
+    // the transaction that commits last is reflected by the final projection.
+    const down = await db.connect();
+    const up = await db.connect();
+    await down.query('BEGIN');
+    await down.query("UPDATE channels SET quality_score=10 WHERE channel_id=$1", [creatorB]);
+    await refreshCountryNativeProjectionsForCreator(creatorB, down);
+    const restore = (async () => {
+      await up.query('BEGIN');
+      await up.query("UPDATE channels SET quality_score=90 WHERE channel_id=$1", [creatorB]);
+      await refreshCountryNativeProjectionsForCreator(creatorB, up);
+      await up.query('COMMIT');
+    })();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await down.query('COMMIT');
+    await restore;
+    down.release(); up.release();
+    assert.equal((await db.query('SELECT native_quality_creator_count FROM country_native_evidence_projections WHERE canonical_term_id=$1', [termId])).rows[0].native_quality_creator_count, 1,
+      'the last authoritative creator classification is reflected (A down, B restored)');
+
+    // Concurrent append-only observations remain deterministic and the maximum
+    // observation id is the durable evidence revision.
+    await db.query("UPDATE channels SET quality_score=90 WHERE channel_id=ANY($1::text[])", [[creatorA, creatorB]]);
+    await Promise.all([
+      observeTerminology({ term: `concurrent ${suffix}`, country, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE', channelId: creatorA, videoId: `${suffix}-c` }, db),
+      observeTerminology({ term: `concurrent ${suffix}`, country, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE', channelId: creatorB, videoId: `${suffix}-d` }, db)
+    ]);
+    const concurrent = await db.query(`SELECT p.raw_observation_count,p.evidence_revision,max(o.id)::text max_revision,t.last_observed_at
+      FROM canonical_trading_terms t JOIN country_native_evidence_projections p ON p.canonical_term_id=t.id
+      JOIN terminology_observations o ON o.canonical_term_id=t.id WHERE t.normalized_term=$1 AND t.country=$2 GROUP BY p.raw_observation_count,p.evidence_revision,t.last_observed_at`,
+    [`concurrent ${suffix}`, country]);
+    assert.equal(concurrent.rows[0].raw_observation_count, 2);
+    assert.equal(String(concurrent.rows[0].evidence_revision), concurrent.rows[0].max_revision);
+    assert.ok(concurrent.rows[0].last_observed_at);
+  } finally {
+    await db.query('DELETE FROM terminology_observations WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE country=$1)', [country]).catch(() => undefined);
+    await db.query('DELETE FROM country_native_evidence_projections WHERE country=$1', [country]).catch(() => undefined);
+    await db.query('DELETE FROM canonical_trading_terms WHERE country=$1', [country]).catch(() => undefined);
+    await db.query('DELETE FROM channels WHERE channel_id=ANY($1::text[])', [[creatorA, creatorB]]).catch(() => undefined);
+  }
+});
 
 test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neutrality, and proposal eligibility', {
   skip: databaseUrl ? false : 'PHASE10_POSTGRES_URL is required for PostgreSQL integration coverage'

@@ -13,7 +13,7 @@ import {
   getDailyYouTubeQuotaBudget
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
-import { selectNextQueryForCountry } from './queryIntelligence';
+import { constructCountryNativeAllocationQuery, selectNextQueryForCountry } from './queryIntelligence';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
@@ -258,18 +258,41 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
           reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
         };
       } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
-        const targeted = await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
-        if (targeted.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
+        const nativeSnapshot = frontierAllocationInfo.decision?.proposalEvidenceSnapshot;
+        const nativeQuery = nativeSnapshot?.proposalFamily === 'COUNTRY_NATIVE'
+          ? await constructCountryNativeAllocationQuery({
+              country,
+              decisionId: frontierAllocationInfo.decision.decisionId,
+              proposalId: frontierAllocationInfo.decision.proposalId,
+              targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions,
+              proposalEvidenceSnapshot: nativeSnapshot
+            })
+          : null;
+        const targeted = nativeSnapshot?.proposalFamily === 'COUNTRY_NATIVE'
+          ? null
+          : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
+        if (nativeQuery) {
+          selected = {
+            queryRecord: nativeQuery,
+            selectionStrategy: 'NEIGHBORHOOD_TARGETED',
+            reason: 'Query Intelligence constructed the selected immutable COUNTRY_NATIVE proposal through governed retrieval policy.'
+          };
+        } else if (targeted?.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
           selected = targeted;
         } else {
           // Query Intelligence could not construct/find a targeted action for this neighborhood; defer decision and revert to legacy control
           if (frontierAllocationInfo.decision?.decisionId) {
             await releaseAllocationDecision(
               frontierAllocationInfo.decision.decisionId,
-              'Query Intelligence could not construct or select a targeted action for neighborhood dimensions'
+              'Query Intelligence could not authorize a query for the selected immutable proposal/neighborhood evidence'
             );
           }
           frontierAllocationInfo.authorized = false;
+          if (nativeSnapshot?.proposalFamily === 'COUNTRY_NATIVE') {
+            // Fail closed for the selected proposal. Do not spend this opportunity
+            // on an unrelated generic query after releasing its reservation.
+            continue;
+          }
           country = legacyCountry;
           selected = await selectNextQueryForCountry(legacyCountry);
         }

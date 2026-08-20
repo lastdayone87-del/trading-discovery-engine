@@ -14,6 +14,8 @@ import { getDb } from './db';
 import fs from 'node:fs';
 import { effectiveProjectionProposalEvidence, generateCountryNativeProposals, projectionProposalProvenance, selectFairCountryNativeProposals, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
+import { planCountryNativeProposalQuery } from './queryPlanner';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 
 test('Phase 10: normalizeNativeTerm preserves diacritics, ticker symbols, and multi-word phrases', () => {
   assert.equal(normalizeNativeTerm('  Ações Brasil  '), 'ações brasil');
@@ -804,4 +806,27 @@ test('Phase 10: authoritative query completion attributes native outcomes throug
   assert.match(source, /proposal_evidence_snapshot/);
   assert.doesNotMatch(source, /JOIN frontier_discovery_proposals p ON p\.proposal_id=d\.proposal_id/);
   assert.match(source, /attributeCountryNativePerformance/);
+});
+
+test('Phase 10: a novel native proposal is represented by the governed Query Intelligence plan', () => {
+  const planned = planCountryNativeProposalQuery({
+    country: 'United States',
+    nativeTerm: 'fluxograma',
+    targetIntent: 'strategy',
+    allocationLineage: { decisionId: 'decision-1', proposalId: 'proposal-1', evidenceChecksum: 'abc' }
+  });
+  assert.ok(planned);
+  assert.match(planned.query.toLowerCase(), /fluxograma/);
+  assert.equal(planned.primaryTerm, 'fluxograma');
+  assert.equal((planned.metadata.countryNativeAllocation as any).decisionId, 'decision-1');
+  const governed = evaluateAutonomousQueryAuthority({
+    id: 1, query: planned.query, country: 'United States', collection: 'EXPERIMENTAL',
+    intent: planned.intent, times_executed: 0, total_channels_found: 0,
+    unique_channels_found: 0, quality_channels_found: 0, community_channels_found: 0,
+    avg_quality_score: 0, performance_score: 0, created_at: new Date(0).toISOString(),
+    status: 'ACTIVE', primary_term: planned.primaryTerm, generation_metadata: planned.metadata
+  });
+  assert.equal(governed.eligible, true);
+  assert.equal(planCountryNativeProposalQuery({ country: 'Unknown', nativeTerm: 'novel', targetIntent: 'strategy', allocationLineage: {} }), null,
+    'an unconstructable native proposal fails closed without a generic query');
 });

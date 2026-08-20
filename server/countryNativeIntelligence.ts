@@ -234,11 +234,35 @@ export async function recomputeNativeEvidenceProjection(
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return null;
 
-  // Fetch canonical term
+  // A Pool cannot hold a row lock across separate query calls. Own a transaction
+  // when necessary; callers already inside an authoritative mutation transaction
+  // pass a PoolClient and retain that transaction's commit/rollback authority.
+  if ('connect' in runner && typeof (runner as Pool).connect === 'function' && !('release' in runner)) {
+    const client = await (runner as Pool).connect();
+    try {
+      await client.query('BEGIN');
+      const projection = await recomputeNativeEvidenceProjection(canonicalTermId, client);
+      await client.query('COMMIT');
+      return projection;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  // The canonical term is the smallest pre-existing PostgreSQL authority shared
+  // by observation insertion and creator reclassification. Lock it before the
+  // aggregate read and retain the lock through projection/proposal mutation.
+  // This prevents an aggregate computed from an older creator state from writing
+  // after a newer recomputation. Canonical-term locks are always taken before
+  // projection and proposal locks (see docs/phase-10-lock-order.md).
   const termRes = await runner.query(
     `SELECT id, canonical_term, normalized_term, country, language, concept_id
      FROM canonical_trading_terms
-     WHERE id = $1`,
+     WHERE id = $1
+     FOR UPDATE`,
     [canonicalTermId]
   );
   if (!termRes.rows[0]) return null;

@@ -14,7 +14,7 @@ import {
   getAppSetting
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
-import { limitRepeatedPrimaryTerms, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
+import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
 import { executeProviderCall } from './providerResilience';
@@ -490,6 +490,52 @@ export async function generateCandidateQueriesForCountry(
     newQueries.push(record);
   }
   return newQueries;
+}
+
+/** Governed Query Intelligence boundary for an immutable Phase 8 native allocation. */
+export async function constructCountryNativeAllocationQuery(args: {
+  country: string;
+  decisionId: string;
+  proposalId: string;
+  targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
+  proposalEvidenceSnapshot: Record<string, any>;
+}): Promise<QueryRecord | null> {
+  await assertCountryAllowed(args.country, 'query_generation');
+  const snapshot = args.proposalEvidenceSnapshot;
+  if (snapshot?.proposalFamily !== 'COUNTRY_NATIVE') return null;
+  const evidence = snapshot.supportingEvidence || {};
+  const nativeTerm = typeof evidence.nativeTerm === 'string' ? evidence.nativeTerm.trim() : '';
+  if (!nativeTerm || !evidence.evidenceChecksum) return null;
+  const vocabs = await getCountryVocabularies();
+  const countryVocabulary = vocabs.find(v => v.country.toLowerCase() === args.country.toLowerCase());
+  const planned = planCountryNativeProposalQuery({
+    country: args.country,
+    nativeTerm,
+    countryVocabulary,
+    targetIntent: args.targetNeighborhoodDimensions.queryIntent,
+    allocationLineage: {
+      decisionId: args.decisionId,
+      proposalId: args.proposalId,
+      targetNeighborhoodKey: createNeighborhoodKey(args.targetNeighborhoodDimensions),
+      targetNeighborhoodDimensions: args.targetNeighborhoodDimensions,
+      evidenceChecksum: evidence.evidenceChecksum,
+      canonicalTermId: evidence.canonicalTermId ?? null,
+      evidenceRevision: evidence.evidenceRevision ?? null
+    }
+  });
+  if (!planned || !planned.query.normalize('NFKC').toLocaleLowerCase('en').includes(nativeTerm.normalize('NFKC').toLocaleLowerCase('en'))) return null;
+  return upsertQueryRecord({
+    query: planned.query,
+    country: args.country,
+    collection: 'EXPERIMENTAL',
+    intent: planned.intent,
+    knowledgeTiers: planned.knowledgeTiers,
+    generationMode: planned.generationMode,
+    generationReason: planned.generationReason,
+    discoveryObjective: planned.discoveryObjective,
+    primaryTerm: planned.primaryTerm,
+    generationMetadata: planned.metadata
+  });
 }
 
 // ==========================================
