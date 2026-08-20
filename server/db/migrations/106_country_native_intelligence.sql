@@ -15,7 +15,7 @@ CREATE INDEX IF NOT EXISTS idx_term_obs_creator_country ON terminology_observati
 CREATE INDEX IF NOT EXISTS idx_term_obs_market_country ON terminology_observations(target_market_country);
 CREATE INDEX IF NOT EXISTS idx_term_obs_status ON terminology_observations(native_evidence_status);
 
--- 2. Derived, idempotent aggregated country-native evidence projection table
+-- 2. Derived, idempotent aggregate country-native evidence projection table
 CREATE TABLE IF NOT EXISTS country_native_evidence_projections (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   canonical_term_id BIGINT NOT NULL UNIQUE REFERENCES canonical_trading_terms(id) ON DELETE CASCADE,
@@ -27,13 +27,21 @@ CREATE TABLE IF NOT EXISTS country_native_evidence_projections (
   code_switch_ratio REAL NOT NULL DEFAULT 0.0,
   is_code_switched BOOLEAN NOT NULL DEFAULT false,
   code_switch_type TEXT,
+  code_switch_types JSONB NOT NULL DEFAULT '[]'::jsonb,
+  code_switch_type_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
   raw_observation_count INTEGER NOT NULL DEFAULT 0,
+  native_observed_count INTEGER NOT NULL DEFAULT 0,
+  bootstrap_seed_count INTEGER NOT NULL DEFAULT 0,
+  translated_seed_count INTEGER NOT NULL DEFAULT 0,
+  native_observed_ratio REAL NOT NULL DEFAULT 0.0,
   distinct_creator_count INTEGER NOT NULL DEFAULT 0,
   quality_creator_count INTEGER NOT NULL DEFAULT 0,
   distinct_community_count INTEGER NOT NULL DEFAULT 0,
   structured_entity_matched BOOLEAN NOT NULL DEFAULT false,
   native_evidence_status TEXT NOT NULL DEFAULT 'NATIVE_OBSERVED' CHECK (native_evidence_status IN ('NATIVE_OBSERVED', 'BOOTSTRAP_SEED', 'TRANSLATED_SEED')),
   source_provenance_family TEXT NOT NULL DEFAULT 'CREATOR_METADATA' CHECK (source_provenance_family IN ('CREATOR_METADATA', 'STRUCTURED_LOCAL_ENTITY', 'COUNTRY_VOCABULARY', 'STATIC_BOOTSTRAP', 'TRANSLATED_QUERY')),
+  source_provenance_families JSONB NOT NULL DEFAULT '[]'::jsonb,
+  source_provenance_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
   native_confidence_score REAL NOT NULL DEFAULT 0.0,
   native_proposal_eligible BOOLEAN NOT NULL DEFAULT false,
   last_observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),

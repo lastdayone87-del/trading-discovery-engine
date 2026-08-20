@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
-import { normalizeTerm, inferScript } from './terminologyIntelligence';
+import { normalizeTerm, inferScript, refreshTerminologyLifecycle } from './terminologyIntelligence';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
 
@@ -30,13 +30,21 @@ export interface CountryNativeEvidenceProjection {
   codeSwitchRatio: number;
   isCodeSwitched: boolean;
   codeSwitchType: CodeSwitchType | string | null;
+  codeSwitchTypes: string[];
+  codeSwitchTypeCounts: Record<string, number>;
   rawObservationCount: number;
+  nativeObservedCount: number;
+  bootstrapSeedCount: number;
+  translatedSeedCount: number;
+  nativeObservedRatio: number;
   distinctCreatorCount: number;
   qualityCreatorCount: number;
   distinctCommunityCount: number;
   structuredEntityMatched: boolean;
   nativeEvidenceStatus: NativeEvidenceStatus;
   sourceProvenanceFamily: SourceProvenanceFamily;
+  sourceProvenanceFamilies: string[];
+  sourceProvenanceCounts: Record<string, number>;
   nativeConfidenceScore: number;
   nativeProposalEligible: boolean;
   lastObservedAt: string;
@@ -146,6 +154,7 @@ export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
 
 /**
  * Recomputes native evidence projections deterministically from `terminology_observations` and `channels`.
+ * Preserves distributions for provenance status, source family, and code-switching.
  * Ensures full idempotency and idempotency retry safety.
  */
 export async function recomputeNativeEvidenceProjection(
@@ -172,6 +181,7 @@ export async function recomputeNativeEvidenceProjection(
        o.target_market_country,
        o.locale,
        o.is_code_switched,
+       o.code_switch_type,
        o.native_evidence_status,
        o.source_provenance_family,
        o.community_fingerprint,
@@ -191,7 +201,6 @@ export async function recomputeNativeEvidenceProjection(
     return null;
   }
 
-  // Calculate distinct creator count and quality creator count
   const allCreators = new Set<string>();
   const qualityCreators = new Set<string>();
   const creatorCountries = new Set<string>();
@@ -199,12 +208,14 @@ export async function recomputeNativeEvidenceProjection(
   const communities = new Set<string>();
   const locales = new Map<string, number>();
 
+  let nativeObservedCount = 0;
+  let bootstrapSeedCount = 0;
+  let translatedSeedCount = 0;
+
+  const provenanceCounts: Record<string, number> = {};
+  const codeSwitchTypeCounts: Record<string, number> = {};
   let codeSwitchedCount = 0;
   let structuredMatched = false;
-  let hasNativeObserved = false;
-  let hasBootstrap = false;
-  let hasTranslated = false;
-  let primaryFamily: SourceProvenanceFamily = 'CREATOR_METADATA';
 
   for (const r of rows) {
     if (r.source_channel_id) {
@@ -225,15 +236,19 @@ export async function recomputeNativeEvidenceProjection(
 
     if (r.is_code_switched) codeSwitchedCount++;
 
-    if (r.native_evidence_status === 'NATIVE_OBSERVED') hasNativeObserved = true;
-    if (r.native_evidence_status === 'BOOTSTRAP_SEED') hasBootstrap = true;
-    if (r.native_evidence_status === 'TRANSLATED_SEED') hasTranslated = true;
+    const csType = r.code_switch_type || 'NONE';
+    codeSwitchTypeCounts[csType] = (codeSwitchTypeCounts[csType] || 0) + 1;
 
-    if (r.source_provenance_family === 'STRUCTURED_LOCAL_ENTITY') {
+    const status = r.native_evidence_status || 'NATIVE_OBSERVED';
+    if (status === 'NATIVE_OBSERVED') nativeObservedCount++;
+    else if (status === 'BOOTSTRAP_SEED') bootstrapSeedCount++;
+    else if (status === 'TRANSLATED_SEED') translatedSeedCount++;
+
+    const family = r.source_provenance_family || 'CREATOR_METADATA';
+    provenanceCounts[family] = (provenanceCounts[family] || 0) + 1;
+
+    if (family === 'STRUCTURED_LOCAL_ENTITY') {
       structuredMatched = true;
-      primaryFamily = 'STRUCTURED_LOCAL_ENTITY';
-    } else if (r.source_provenance_family === 'COUNTRY_VOCABULARY') {
-      primaryFamily = 'COUNTRY_VOCABULARY';
     }
   }
 
@@ -247,35 +262,52 @@ export async function recomputeNativeEvidenceProjection(
     }
   }
 
-  // Primary native evidence status
-  const nativeEvidenceStatus: NativeEvidenceStatus = hasNativeObserved
+  // Primary native evidence status (summary field)
+  const nativeEvidenceStatus: NativeEvidenceStatus = nativeObservedCount > 0
     ? 'NATIVE_OBSERVED'
-    : hasBootstrap
+    : bootstrapSeedCount > 0
       ? 'BOOTSTRAP_SEED'
-      : hasTranslated
-        ? 'TRANSLATED_SEED'
-        : 'NATIVE_OBSERVED';
+      : 'TRANSLATED_SEED';
 
+  const nativeObservedRatio = rawObservationCount > 0 ? nativeObservedCount / rawObservationCount : 0.0;
   const codeSwitchRatio = rawObservationCount > 0 ? codeSwitchedCount / rawObservationCount : 0.0;
   const isCodeSwitched = codeSwitchRatio > 0.3;
-  const codeSwitchType: CodeSwitchType = isCodeSwitched ? 'NATIVE_DOMINANT_ENGLISH_FINANCE' : 'NONE';
+
+  // Determine dominant code-switch type from actual observation distributions
+  let dominantCodeSwitchType: CodeSwitchType = 'NONE';
+  let maxCsCount = 0;
+  for (const [csT, count] of Object.entries(codeSwitchTypeCounts)) {
+    if (csT !== 'NONE' && count > maxCsCount) {
+      maxCsCount = count;
+      dominantCodeSwitchType = csT as CodeSwitchType;
+    }
+  }
+
+  // Primary source provenance family (summary field)
+  let primaryFamily: SourceProvenanceFamily = 'CREATOR_METADATA';
+  let maxFamCount = 0;
+  for (const [fam, count] of Object.entries(provenanceCounts)) {
+    if (count > maxFamCount) {
+      maxFamCount = count;
+      primaryFamily = fam as SourceProvenanceFamily;
+    }
+  }
 
   const distinctCreatorCount = allCreators.size;
   const qualityCreatorCount = qualityCreators.size;
   const distinctCommunityCount = communities.size;
 
-  // Calculate Native Proposal Eligibility:
-  // Must have qualityCreatorCount >= 2 OR structuredEntityMatched = true OR originate from governed country_vocabularies / BOOTSTRAP_SEED
+  // Native Proposal Eligibility Rule:
+  // Requires native_observed_count >= 1 AND (qualityCreatorCount >= 2 OR structuredMatched) OR governed country_vocabularies / BOOTSTRAP_SEED
   const nativeProposalEligible =
-    qualityCreatorCount >= 2 ||
-    structuredMatched ||
+    (nativeObservedCount >= 1 && (qualityCreatorCount >= 2 || structuredMatched)) ||
     nativeEvidenceStatus === 'BOOTSTRAP_SEED' ||
     primaryFamily === 'COUNTRY_VOCABULARY';
 
   // Calculate Native Confidence Score (0.0 to 1.0)
   let confidence = 0.20; // Base
   if (structuredMatched) confidence += 0.30;
-  if (nativeEvidenceStatus === 'NATIVE_OBSERVED') confidence += 0.20;
+  if (nativeObservedCount >= 1) confidence += 0.20;
   confidence += Math.min(0.30, qualityCreatorCount * 0.10);
   confidence += Math.min(0.10, distinctCommunityCount * 0.05);
 
@@ -296,14 +328,22 @@ export async function recomputeNativeEvidenceProjection(
     observedMarketCountries: Array.from(marketCountries),
     codeSwitchRatio,
     isCodeSwitched,
-    codeSwitchType,
+    codeSwitchType: dominantCodeSwitchType,
+    codeSwitchTypes: Object.keys(codeSwitchTypeCounts),
+    codeSwitchTypeCounts,
     rawObservationCount,
+    nativeObservedCount,
+    bootstrapSeedCount,
+    translatedSeedCount,
+    nativeObservedRatio,
     distinctCreatorCount,
     qualityCreatorCount,
     distinctCommunityCount,
     structuredEntityMatched: structuredMatched,
     nativeEvidenceStatus,
     sourceProvenanceFamily: primaryFamily,
+    sourceProvenanceFamilies: Object.keys(provenanceCounts),
+    sourceProvenanceCounts: provenanceCounts,
     nativeConfidenceScore: finalConfidence,
     nativeProposalEligible,
     lastObservedAt: now,
@@ -316,13 +356,19 @@ export async function recomputeNativeEvidenceProjection(
        canonical_term_id, concept_id, country, dominant_locale,
        observed_creator_countries, observed_market_countries,
        code_switch_ratio, is_code_switched, code_switch_type,
-       raw_observation_count, distinct_creator_count, quality_creator_count,
-       distinct_community_count, structured_entity_matched,
-       native_evidence_status, source_provenance_family,
+       code_switch_types, code_switch_type_counts,
+       raw_observation_count, native_observed_count, bootstrap_seed_count,
+       translated_seed_count, native_observed_ratio,
+       distinct_creator_count, quality_creator_count, distinct_community_count,
+       structured_entity_matched, native_evidence_status, source_provenance_family,
+       source_provenance_families, source_provenance_counts,
        native_confidence_score, native_proposal_eligible,
        last_observed_at, updated_at
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+     VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+       $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+     )
      ON CONFLICT (canonical_term_id) DO UPDATE SET
        concept_id = EXCLUDED.concept_id,
        country = EXCLUDED.country,
@@ -332,13 +378,21 @@ export async function recomputeNativeEvidenceProjection(
        code_switch_ratio = EXCLUDED.code_switch_ratio,
        is_code_switched = EXCLUDED.is_code_switched,
        code_switch_type = EXCLUDED.code_switch_type,
+       code_switch_types = EXCLUDED.code_switch_types,
+       code_switch_type_counts = EXCLUDED.code_switch_type_counts,
        raw_observation_count = EXCLUDED.raw_observation_count,
+       native_observed_count = EXCLUDED.native_observed_count,
+       bootstrap_seed_count = EXCLUDED.bootstrap_seed_count,
+       translated_seed_count = EXCLUDED.translated_seed_count,
+       native_observed_ratio = EXCLUDED.native_observed_ratio,
        distinct_creator_count = EXCLUDED.distinct_creator_count,
        quality_creator_count = EXCLUDED.quality_creator_count,
        distinct_community_count = EXCLUDED.distinct_community_count,
        structured_entity_matched = EXCLUDED.structured_entity_matched,
        native_evidence_status = EXCLUDED.native_evidence_status,
        source_provenance_family = EXCLUDED.source_provenance_family,
+       source_provenance_families = EXCLUDED.source_provenance_families,
+       source_provenance_counts = EXCLUDED.source_provenance_counts,
        native_confidence_score = EXCLUDED.native_confidence_score,
        native_proposal_eligible = EXCLUDED.native_proposal_eligible,
        last_observed_at = EXCLUDED.last_observed_at,
@@ -353,13 +407,21 @@ export async function recomputeNativeEvidenceProjection(
       projection.codeSwitchRatio,
       projection.isCodeSwitched,
       projection.codeSwitchType,
+      JSON.stringify(projection.codeSwitchTypes),
+      JSON.stringify(projection.codeSwitchTypeCounts),
       projection.rawObservationCount,
+      projection.nativeObservedCount,
+      projection.bootstrapSeedCount,
+      projection.translatedSeedCount,
+      projection.nativeObservedRatio,
       projection.distinctCreatorCount,
       projection.qualityCreatorCount,
       projection.distinctCommunityCount,
       projection.structuredEntityMatched,
       projection.nativeEvidenceStatus,
       projection.sourceProvenanceFamily,
+      JSON.stringify(projection.sourceProvenanceFamilies),
+      JSON.stringify(projection.sourceProvenanceCounts),
       projection.nativeConfidenceScore,
       projection.nativeProposalEligible,
       projection.lastObservedAt,
@@ -372,6 +434,7 @@ export async function recomputeNativeEvidenceProjection(
 
 /**
  * Extracts and records native candidate market terms from channel/video metadata.
+ * Always invokes refreshTerminologyLifecycle to keep canonical terminology maturity in sync.
  */
 export async function recordNativeTerminologyObservation(args: {
   term: string;
@@ -436,6 +499,9 @@ export async function recordNativeTerminologyObservation(args: {
       JSON.stringify(args.evidence || {})
     ]
   );
+
+  // Invoke authoritative terminology lifecycle refresh
+  await refreshTerminologyLifecycle(termId, undefined, runner);
 
   // Recompute native evidence projection idempotently
   await recomputeNativeEvidenceProjection(termId, runner);

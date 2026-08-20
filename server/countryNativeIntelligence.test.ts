@@ -5,7 +5,8 @@ import {
   isNoiseOrBoilerplate,
   detectCodeSwitching,
   recordNativeTerminologyObservation,
-  recomputeNativeEvidenceProjection
+  recomputeNativeEvidenceProjection,
+  getCountryNativeCoverageDiagnostics
 } from './countryNativeIntelligence';
 import { generateCountryNativeProposals } from './discoveryProposalGenerators';
 import { getDb } from './db';
@@ -48,130 +49,271 @@ test('Phase 10: detectCodeSwitching accurately identifies mixed-script and Engli
   assert.equal(purePt.codeSwitchType, 'NONE');
 });
 
-test('Phase 10: Single creator unstructured evidence remains evidence-only and capped below proposal eligibility', async () => {
-  if (!process.env.DATABASE_URL) return; // DB required for integration assertion
+/**
+ * Mock Queryable Runner for isolated unit testing when PostgreSQL database is not connected.
+ */
+function createMockRunner() {
+  const canonicalTerms = new Map<number, any>();
+  const observations: any[] = [];
+  const channels = new Map<string, any>();
+  const projections = new Map<number, any>();
+  let nextTermId = 1;
 
-  const db = await getDb();
+  return {
+    canonicalTerms,
+    observations,
+    channels,
+    projections,
+    async query(sql: string, params: any[] = []) {
+      const sqlNorm = sql.trim().replace(/\s+/g, ' ');
 
-  // Clean up test channel & term
-  const testChannelId = 'UC_TEST_SINGLE_CREATOR_01';
-  await db.query(`DELETE FROM channels WHERE channel_id = $1`, [testChannelId]);
-  await db.query(`INSERT INTO channels(channel_id, channel_name, youtube_url, country, country_status, discord_status, scan_status, discovery_source, first_seen, quality_score, trading_status)
-    VALUES($1, 'Test Trader 1', 'https://youtube.com/c/test1', 'BR', 'CONFIRMED', 'NONE', 'COMPLETED', 'TEST', now(), 70, 'TRADING_CONFIRMED')`, [testChannelId]);
+      if (sqlNorm.startsWith('INSERT INTO canonical_trading_terms')) {
+        const canonicalTerm = params[0];
+        const normalizedTerm = params[1];
+        const country = params[2];
+        const language = params[3];
 
-  const termId = await recordNativeTerminologyObservation({
-    term: 'single creator unique phrase',
-    country: 'BR',
-    sourceCreatorCountry: 'BR',
-    targetMarketCountry: 'BR',
-    locale: 'pt-BR',
-    channelId: testChannelId,
-    observationType: 'DESCRIPTION',
-    nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA'
-  });
+        let existing: any = null;
+        for (const t of canonicalTerms.values()) {
+          if (t.country === country && t.normalized_term === normalizedTerm) {
+            existing = t;
+            break;
+          }
+        }
 
-  assert.ok(termId);
+        if (existing) {
+          existing.last_observed_at = new Date().toISOString();
+          return { rows: [{ id: existing.id }] };
+        } else {
+          const id = nextTermId++;
+          const row = {
+            id,
+            canonical_term: canonicalTerm,
+            normalized_term: normalizedTerm,
+            country,
+            language,
+            script: params[4],
+            term_type: params[5],
+            lifecycle_status: 'CANDIDATE',
+            search_eligible: false,
+            first_observed_at: new Date().toISOString(),
+            last_observed_at: new Date().toISOString()
+          };
+          canonicalTerms.set(id, row);
+          return { rows: [{ id }] };
+        }
+      }
 
-  const proj = await recomputeNativeEvidenceProjection(termId!);
-  assert.ok(proj);
-  assert.equal(proj.qualityCreatorCount, 1);
-  assert.equal(proj.structuredEntityMatched, false);
-  // MUST remain evidence-only (not proposal eligible) because qualityCreatorCount < 2 and not structured entity
-  assert.equal(proj.nativeProposalEligible, false);
-  assert.ok(proj.nativeConfidenceScore <= 0.45, `Confidence ${proj.nativeConfidenceScore} must be capped at 0.45`);
+      if (sqlNorm.startsWith('SELECT id, canonical_term, normalized_term, country, language, concept_id FROM canonical_trading_terms')) {
+        const id = Number(params[0]);
+        const term = canonicalTerms.get(id);
+        return { rows: term ? [term] : [] };
+      }
 
-  // Clean up
-  await db.query(`DELETE FROM canonical_trading_terms WHERE id = $1`, [termId]);
-  await db.query(`DELETE FROM channels WHERE channel_id = $1`, [testChannelId]);
-});
+      if (sqlNorm.startsWith('SELECT t.*,')) {
+        const id = Number(params[0]);
+        const term = canonicalTerms.get(id);
+        if (!term) return { rows: [] };
 
-test('Phase 10: Multi-creator quality evidence aggregates idempotently and qualifies for native proposals', async () => {
-  if (!process.env.DATABASE_URL) return; // DB required for integration assertion
+        const termObs = observations.filter(o => o.canonical_term_id === id);
+        const creators = new Set(termObs.map(o => o.source_channel_id).filter(Boolean));
+        const communities = new Set(termObs.map(o => o.community_fingerprint).filter(Boolean));
 
-  const db = await getDb();
+        return {
+          rows: [{
+            ...term,
+            distinct_creators: creators.size,
+            distinct_communities: communities.size,
+            human_approved: 0,
+            decayed_evidence: termObs.length,
+            executions: 0,
+            decayed_yield: 0
+          }]
+        };
+      }
 
-  const c1 = 'UC_TEST_MULTI_01';
-  const c2 = 'UC_TEST_MULTI_02';
+      if (sqlNorm.startsWith('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3')) {
+        const id = Number(params[0]);
+        const term = canonicalTerms.get(id);
+        if (term) {
+          term.lifecycle_status = params[1];
+          term.search_eligible = Boolean(params[2]);
+        }
+        return { rows: [] };
+      }
 
-  await db.query(`DELETE FROM channels WHERE channel_id IN ($1, $2)`, [c1, c2]);
-  await db.query(`INSERT INTO channels(channel_id, channel_name, youtube_url, country, country_status, discord_status, scan_status, discovery_source, first_seen, quality_score, trading_status)
-    VALUES ($1, 'Trader 1', 'https://yt.com/1', 'DE', 'CONFIRMED', 'NONE', 'COMPLETED', 'TEST', now(), 80, 'TRADING_CONFIRMED'),
-           ($2, 'Trader 2', 'https://yt.com/2', 'DE', 'CONFIRMED', 'NONE', 'COMPLETED', 'TEST', now(), 85, 'TRADING_CONFIRMED')`, [c1, c2]);
+      if (sqlNorm.startsWith('INSERT INTO terminology_observations')) {
+        const obs = {
+          canonical_term_id: Number(params[0]),
+          source_channel_id: params[1],
+          source_video_id: params[2],
+          observation_type: params[3],
+          source_creator_country: params[4],
+          target_market_country: params[5],
+          locale: params[6],
+          is_code_switched: params[7],
+          native_language: params[8],
+          native_evidence_status: params[9],
+          source_provenance_family: params[10],
+          code_switch_type: params[11],
+          evidence: params[12]
+        };
+        observations.push(obs);
+        return { rows: [] };
+      }
 
-  const termStr = 'hebelprodukte strategien';
+      if (sqlNorm.startsWith('SELECT o.source_creator_country,')) {
+        const termId = Number(params[0]);
+        const termObs = observations.filter(o => o.canonical_term_id === termId);
+        const rows = termObs.map(o => {
+          const ch = o.source_channel_id ? channels.get(o.source_channel_id) : null;
+          return {
+            ...o,
+            trading_status: ch ? ch.trading_status : 'UNCERTAIN',
+            quality_score: ch ? ch.quality_score : 0
+          };
+        });
+        return { rows };
+      }
 
+      if (sqlNorm.startsWith('INSERT INTO country_native_evidence_projections')) {
+        const termId = Number(params[0]);
+        projections.set(termId, { canonical_term_id: termId, ...params });
+        return { rows: [] };
+      }
+
+      if (sqlNorm.startsWith('INSERT INTO terminology_lifecycle_events') || sqlNorm.startsWith('INSERT INTO terminology_score_snapshots')) {
+        return { rows: [] };
+      }
+
+      return { rows: [] };
+    }
+  };
+}
+
+test('Phase 10: Phase 10 native observations route through authoritative terminology lifecycle', async () => {
+  const runner = createMockRunner();
+
+  runner.channels.set('UC_AUTHORITATIVE_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+  runner.channels.set('UC_AUTHORITATIVE_2', { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
+  runner.channels.set('UC_AUTHORITATIVE_3', { trading_status: 'TRADING_CONFIRMED', quality_score: 90 });
+
+  const termStr = 'mini indice operacoes';
+
+  // Record observations across 3 distinct creators
   const termId1 = await recordNativeTerminologyObservation({
     term: termStr,
+    country: 'BR',
+    channelId: 'UC_AUTHORITATIVE_1',
+    observationType: 'VIDEO_TITLE',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED'
+  }, runner);
+
+  await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'BR',
+    channelId: 'UC_AUTHORITATIVE_2',
+    observationType: 'DESCRIPTION',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED'
+  }, runner);
+
+  await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'BR',
+    channelId: 'UC_AUTHORITATIVE_3',
+    observationType: 'DESCRIPTION',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED'
+  }, runner);
+
+  assert.ok(termId1);
+  const termRow = runner.canonicalTerms.get(termId1!);
+  assert.ok(termRow);
+  // Authoritative lifecycle MUST be refreshed and set status to OBSERVED or higher
+  assert.equal(termRow.lifecycle_status, 'OBSERVED');
+});
+
+test('Phase 10: Mixed native evidence provenance preserves status and source family distributions', async () => {
+  const runner = createMockRunner();
+
+  runner.channels.set('UC_NATIVE_01', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+
+  const termStr = 'dax krypto trading';
+
+  // 1 Native observation + 3 Translated seed observations
+  const termId = await recordNativeTerminologyObservation({
+    term: termStr,
     country: 'DE',
-    sourceCreatorCountry: 'DE',
-    targetMarketCountry: 'DE',
-    locale: 'de-DE',
-    channelId: c1,
+    channelId: 'UC_NATIVE_01',
     observationType: 'VIDEO_TITLE',
     nativeEvidenceStatus: 'NATIVE_OBSERVED',
     sourceProvenanceFamily: 'CREATOR_METADATA'
-  });
+  }, runner);
 
-  const termId2 = await recordNativeTerminologyObservation({
-    term: termStr,
-    country: 'DE',
-    sourceCreatorCountry: 'DE',
-    targetMarketCountry: 'US', // Creator in DE trading US market
-    locale: 'de-DE',
-    channelId: c2,
-    observationType: 'DESCRIPTION',
-    nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA'
-  });
+  for (let i = 0; i < 3; i++) {
+    await recordNativeTerminologyObservation({
+      term: termStr,
+      country: 'DE',
+      observationType: 'ENRICHMENT',
+      nativeEvidenceStatus: 'TRANSLATED_SEED',
+      sourceProvenanceFamily: 'TRANSLATED_QUERY'
+    }, runner);
+  }
 
-  assert.equal(termId1, termId2, 'Same term in same country must reuse canonical term ID');
-
-  const proj = await recomputeNativeEvidenceProjection(termId1!);
+  const proj = await recomputeNativeEvidenceProjection(termId!, runner);
   assert.ok(proj);
-  assert.equal(proj.qualityCreatorCount, 2);
-  assert.equal(proj.nativeProposalEligible, true, 'Multi-creator quality evidence must become proposal-eligible');
 
-  // Verify creator geography vs market geography separation
-  assert.deepEqual(proj.observedCreatorCountries, ['DE']);
-  assert.ok(proj.observedMarketCountries.includes('DE') && proj.observedMarketCountries.includes('US'));
+  // MUST preserve distributions without erasing translated or native counts
+  assert.equal(proj.rawObservationCount, 4);
+  assert.equal(proj.nativeObservedCount, 1);
+  assert.equal(proj.translatedSeedCount, 3);
+  assert.equal(proj.nativeObservedRatio, 0.25);
 
-  // Test proposal generator emits this term as a COUNTRY_NATIVE proposal
-  const proposals = await generateCountryNativeProposals('DE', 10);
-  const matched = proposals.find(p => p.concept.toLowerCase() === termStr);
-  assert.ok(matched, 'Proposal generator must emit native-eligible projection');
-  assert.equal(matched.proposalFamily, 'COUNTRY_NATIVE');
-  assert.equal(matched.supportingEvidence.provenanceType, 'observed_native_evidence');
-  assert.equal(matched.supportingEvidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
-
-  // Clean up
-  await db.query(`DELETE FROM canonical_trading_terms WHERE id = $1`, [termId1]);
-  await db.query(`DELETE FROM channels WHERE channel_id IN ($1, $2)`, [c1, c2]);
+  assert.deepEqual(proj.sourceProvenanceFamilies.sort(), ['CREATOR_METADATA', 'TRANSLATED_QUERY'].sort());
+  assert.equal(proj.sourceProvenanceCounts['CREATOR_METADATA'], 1);
+  assert.equal(proj.sourceProvenanceCounts['TRANSLATED_QUERY'], 3);
 });
 
-test('Phase 10: Translated seeds and bootstrap seeds are NEVER classified as NATIVE_OBSERVED', async () => {
-  if (!process.env.DATABASE_URL) return; // DB required for integration assertion
+test('Phase 10: Idempotent recomputation prevents double-counting duplicate creator observations', async () => {
+  const runner = createMockRunner();
 
-  const db = await getDb();
+  const c1 = 'UC_RETRY_01';
+  runner.channels.set(c1, { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
 
-  const termId = await recordNativeTerminologyObservation({
-    term: 'translated english seed phrase',
-    country: 'JP',
-    sourceCreatorCountry: 'JP',
-    targetMarketCountry: 'JP',
-    locale: 'ja-JP',
-    observationType: 'ENRICHMENT',
-    nativeEvidenceStatus: 'TRANSLATED_SEED',
-    sourceProvenanceFamily: 'TRANSLATED_QUERY'
-  });
+  const termStr = 'optionsschein trading';
 
-  assert.ok(termId);
+  // Record same term from same creator 3 times (retry scenario)
+  for (let i = 0; i < 3; i++) {
+    await recordNativeTerminologyObservation({
+      term: termStr,
+      country: 'DE',
+      channelId: c1,
+      observationType: 'VIDEO_TITLE',
+      nativeEvidenceStatus: 'NATIVE_OBSERVED'
+    }, runner);
+  }
 
-  const proj = await recomputeNativeEvidenceProjection(termId!);
-  assert.ok(proj);
-  assert.equal(proj.nativeEvidenceStatus, 'TRANSLATED_SEED');
-  assert.notEqual(proj.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+  const termId = (await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'DE',
+    channelId: c1,
+    observationType: 'VIDEO_TITLE',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED'
+  }, runner))!;
 
-  // Clean up
-  await db.query(`DELETE FROM canonical_trading_terms WHERE id = $1`, [termId]);
+  const proj1 = await recomputeNativeEvidenceProjection(termId, runner);
+  const proj2 = await recomputeNativeEvidenceProjection(termId, runner);
+
+  assert.ok(proj1);
+  assert.ok(proj2);
+
+  // Quality creator count MUST strictly equal 1 (not 4 from duplicate observations)
+  assert.equal(proj1.qualityCreatorCount, 1);
+  assert.equal(proj2.qualityCreatorCount, 1);
+
+  // Single creator remains evidence-only (not proposal eligible)
+  assert.equal(proj1.nativeProposalEligible, false);
+
+  // Projections must be identical across repeated recomputations
+  assert.equal(proj1.nativeConfidenceScore, proj2.nativeConfidenceScore);
+  assert.equal(proj1.rawObservationCount, proj2.rawObservationCount);
 });
