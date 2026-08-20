@@ -1417,6 +1417,12 @@ export async function completeQueryRun(runId: string, metrics: {
     // Any analytics error is caught inside recordNeighborhoodAnalyticsAfterRun,
     // ensuring analytics failures never roll back or abort completed runs.
     if (run.rowCount) await recordNeighborhoodAnalyticsAfterRun(runId, metrics);
+    // Phase 12 is observation-only. Failure must never interrupt autonomous
+    // discovery or change the authoritative completion transaction.
+    if (run.rowCount) {
+      const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
+      await captureCompletedRunObservation(runId).catch(error => console.warn('[DiscoveryTrustEvaluation] Observation capture failed:', error));
+    }
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
