@@ -58,7 +58,10 @@ CREATE INDEX IF NOT EXISTS idx_country_native_proj_status ON country_native_evid
 -- 3. Performance attribution table tracking executions and net-new creators by native provenance
 CREATE TABLE IF NOT EXISTS country_native_performance_attribution (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  canonical_term_id BIGINT NOT NULL REFERENCES canonical_trading_terms(id) ON DELETE CASCADE,
+  attribution_key TEXT NOT NULL UNIQUE,
+  canonical_term_id BIGINT REFERENCES canonical_trading_terms(id) ON DELETE CASCADE,
+  proposal_id UUID REFERENCES frontier_discovery_proposals(proposal_id) ON DELETE SET NULL,
+  allocation_decision_id TEXT REFERENCES frontier_allocation_decisions(decision_id) ON DELETE SET NULL,
   query_id INTEGER REFERENCES query_library(id) ON DELETE SET NULL,
   query_run_id UUID REFERENCES query_runs(id) ON DELETE SET NULL,
   country TEXT NOT NULL,
@@ -69,6 +72,7 @@ CREATE TABLE IF NOT EXISTS country_native_performance_attribution (
   raw_results INTEGER NOT NULL DEFAULT 0,
   unique_creators INTEGER NOT NULL DEFAULT 0,
   new_creators INTEGER NOT NULL DEFAULT 0,
+  relevant_new_creators INTEGER NOT NULL DEFAULT 0,
   quality_creators INTEGER NOT NULL DEFAULT 0,
   confirmed_trading_creators INTEGER NOT NULL DEFAULT 0,
   quota_consumed INTEGER NOT NULL DEFAULT 0,
@@ -79,6 +83,7 @@ CREATE TABLE IF NOT EXISTS country_native_performance_attribution (
 CREATE INDEX IF NOT EXISTS idx_country_native_attr_term ON country_native_performance_attribution(canonical_term_id);
 CREATE INDEX IF NOT EXISTS idx_country_native_attr_country ON country_native_performance_attribution(country);
 CREATE INDEX IF NOT EXISTS idx_country_native_attr_status ON country_native_performance_attribution(native_evidence_status);
+CREATE INDEX IF NOT EXISTS idx_country_native_attr_run ON country_native_performance_attribution(query_run_id);
 
 -- 4. Diagnostics view summarizing concept coverage, provenance split, and code-switching rates
 CREATE OR REPLACE VIEW country_native_coverage_diagnostics AS

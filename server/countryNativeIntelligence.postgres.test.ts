@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getDb } from './db';
+import { completeQueryRun, getDb } from './db';
 import { observeTerminology } from './terminologyIntelligence';
 import { generateCountryNativeProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
@@ -81,14 +81,22 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.equal(projection.rows[0].native_proposal_eligible, true);
 
     await attributeCountryNativePerformance({
+      attributionKey: `native-attribution:${firstId}:run-1`,
+      canonicalTermId: firstId!, country,
+      nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA',
+      quotaConsumed: 100, rawResults: 5, uniqueCreators: 2, newCreators: 1
+    }, db);
+    await attributeCountryNativePerformance({
+      attributionKey: `native-attribution:${firstId}:run-1`,
       canonicalTermId: firstId!, country,
       nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA',
       quotaConsumed: 100, rawResults: 5, uniqueCreators: 2, newCreators: 1
     }, db);
     const attribution = await db.query(
-      'SELECT quota_consumed FROM country_native_performance_attribution WHERE canonical_term_id=$1',
+      'SELECT count(*)::int count, max(quota_consumed)::int quota_consumed FROM country_native_performance_attribution WHERE canonical_term_id=$1',
       [firstId]
     );
+    assert.equal(attribution.rows[0].count, 1, 'exact attribution replay must not double-count one query run');
     assert.equal(attribution.rows[0].quota_consumed, 100);
 
     const legacy = await db.query(
@@ -109,6 +117,64 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     const persisted = proposals.find(proposal => proposal.supportingEvidence.canonicalTermId === firstId);
     assert.ok(persisted, 'persisted eligible native projection must feed the production proposal generator');
     assert.equal(persisted.supportingEvidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+
+    const query = await db.query(
+      `INSERT INTO query_library(query,normalized_query,country,collection,intent)
+       VALUES($1,$1,$2,'EXPERIMENTAL','GENERAL') RETURNING id`,
+      [`native production ${suffix}`, country]
+    );
+    const run = await db.query(
+      `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,status)
+       VALUES($1,$2,'automated_query','UCB1_EXPLORATION','phase10 integration','RUNNING') RETURNING id`,
+      [query.rows[0].id, country]
+    );
+    const proposal = await db.query(
+      `INSERT INTO frontier_discovery_proposals(
+         dedup_key,proposal_family,country,concept,target_dimensions,source_provenance,
+         supporting_evidence,novelty_rationale
+       ) VALUES($1,'COUNTRY_NATIVE',$2,$3,'{}'::jsonb,$4,$5,$6) RETURNING proposal_id`,
+      [`phase10:${suffix}`, country, term, `native:${suffix}`, JSON.stringify({
+        canonicalTermId: firstId, nativeEvidenceStatus: 'NATIVE_OBSERVED',
+        sourceProvenanceFamily: 'CREATOR_METADATA', isCodeSwitched: true
+      }), 'phase10 integration']
+    );
+    await db.query(
+      `INSERT INTO frontier_allocation_decisions(
+         decision_id,opportunity_key,allocation_origin,decision_status,selected_country,
+         frontier_state,proposal_id,quota_day,policy_version,query_run_id
+       ) VALUES($1,$2,'FRONTIER_CANARY','COMMITTED',$3,'PRODUCTIVE',$4,'2026-08-20','phase10-test',$5)`,
+      [`decision:${suffix}`, `opportunity:${suffix}`, country, proposal.rows[0].proposal_id, run.rows[0].id]
+    );
+    await db.query(
+      `INSERT INTO channel_sightings(
+         query_run_id,query_id,channel_id,result_rank,search_lane,page_number,was_known,persisted,
+         country_outcome,trading_outcome,funnel_outcome,metadata
+       ) VALUES
+         ($1,$2,$3,1,'VIDEO',1,false,true,'CONFIRMED','TRADING_CONFIRMED','TRADING_CONFIRMED','{}'::jsonb),
+         ($1,$2,$4,2,'VIDEO',1,false,true,'CONFIRMED','NEEDS_REVIEW','NEEDS_REVIEW','{}'::jsonb)`,
+      [run.rows[0].id, query.rows[0].id, channels[0], channels[1]]
+    );
+    const completedMetrics = {
+      rawResults: 3, distinctResults: 2, duplicateResults: 1, knownChannels: 0,
+      newChannels: 2, countryRejected: 0, nonTrading: 0, uncertain: 0, needsReview: 1,
+      tradingConfirmed: 1, uniqueChannels: 2, qualityChannels: 1,
+      communitiesDiscovered: 0, quotaUsed: 100
+    };
+    await completeQueryRun(run.rows[0].id, completedMetrics);
+    const productionAttribution = await db.query(
+      `SELECT count(*)::int count, max(query_id)::int query_id, max(query_run_id::text) query_run_id,
+              max(proposal_id::text) proposal_id, max(relevant_new_creators)::int relevant,
+              max(quality_creators)::int quality, max(quota_consumed)::int quota
+       FROM country_native_performance_attribution WHERE query_run_id=$1`,
+      [run.rows[0].id]
+    );
+    assert.equal(productionAttribution.rows[0].count, 1);
+    assert.equal(productionAttribution.rows[0].query_id, query.rows[0].id);
+    assert.equal(productionAttribution.rows[0].query_run_id, run.rows[0].id);
+    assert.equal(productionAttribution.rows[0].proposal_id, proposal.rows[0].proposal_id);
+    assert.equal(productionAttribution.rows[0].relevant, 2);
+    assert.equal(productionAttribution.rows[0].quality, 1);
+    assert.equal(productionAttribution.rows[0].quota, 100);
   } finally {
     await db.end();
   }

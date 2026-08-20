@@ -23,6 +23,7 @@ import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from '
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
 import { calculateQueryFunnel } from './queryPerformance';
+import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -1195,6 +1196,76 @@ export async function startQueryRun(runId: string): Promise<void> {
   await db.query(`UPDATE quota_reservations SET expires_at=now()+interval '20 minutes' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
 }
 
+async function attributeCompletedCountryNativeRun(client: EventClient, runId: string, metrics: {
+  rawResults: number; distinctResults: number; newChannels: number; tradingConfirmed: number;
+  qualityChannels: number; quotaUsed: number;
+}): Promise<void> {
+  const lineage = await client.query(
+    `SELECT d.decision_id, d.proposal_id, d.coverage_gain, r.query_id, r.country,
+            p.supporting_evidence
+     FROM frontier_allocation_decisions d
+     JOIN frontier_discovery_proposals p ON p.proposal_id=d.proposal_id
+     JOIN query_runs r ON r.id=d.query_run_id
+     WHERE d.query_run_id=$1
+       AND d.allocation_origin='FRONTIER_CANARY'
+       AND d.decision_status='COMMITTED'
+       AND p.proposal_family='COUNTRY_NATIVE'
+     ORDER BY d.created_at, d.decision_id
+     LIMIT 1`,
+    [runId]
+  );
+  if (!lineage.rowCount) return;
+  const row = lineage.rows[0];
+  const evidence = typeof row.supporting_evidence === 'string'
+    ? JSON.parse(row.supporting_evidence)
+    : row.supporting_evidence || {};
+  const canonicalTermId = Number(evidence.canonicalTermId);
+  const nativeEvidenceStatus = String(evidence.nativeEvidenceStatus || '');
+  const sourceProvenanceFamily = String(evidence.sourceProvenanceFamily || '');
+  if ((nativeEvidenceStatus === 'NATIVE_OBSERVED' && (!Number.isSafeInteger(canonicalTermId) || canonicalTermId <= 0)) ||
+      !['NATIVE_OBSERVED', 'BOOTSTRAP_SEED', 'TRANSLATED_SEED'].includes(nativeEvidenceStatus) ||
+      !['CREATOR_METADATA', 'STRUCTURED_LOCAL_ENTITY', 'COUNTRY_VOCABULARY', 'STATIC_BOOTSTRAP', 'TRANSLATED_QUERY'].includes(sourceProvenanceFamily)) return;
+
+  const exact = await client.query(
+    `SELECT
+       COUNT(DISTINCT s.channel_id) FILTER (
+         WHERE s.persisted AND NOT s.was_known
+           AND s.funnel_outcome IN ('TRADING_CONFIRMED','NEEDS_REVIEW')
+       )::int AS relevant_new_creators,
+       COUNT(DISTINCT s.channel_id) FILTER (
+         WHERE s.persisted AND NOT s.was_known
+           AND s.funnel_outcome='TRADING_CONFIRMED' AND c.quality_score>=55
+       )::int AS quality_new_creators
+     FROM channel_sightings s
+     LEFT JOIN channels c ON c.channel_id=s.channel_id
+     WHERE s.query_run_id=$1`,
+    [runId]
+  );
+  const observed = exact.rows[0] || {};
+  const { attributeCountryNativePerformance } = await import('./countryNativeIntelligence');
+  await attributeCountryNativePerformance({
+    attributionKey: `country-native:${runId}:${row.proposal_id}:v1`,
+    canonicalTermId: Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0 ? canonicalTermId : null,
+    proposalId: row.proposal_id,
+    allocationDecisionId: row.decision_id,
+    queryId: Number(row.query_id),
+    queryRunId: runId,
+    country: row.country,
+    nativeEvidenceStatus: nativeEvidenceStatus as NativeEvidenceStatus,
+    sourceProvenanceFamily: sourceProvenanceFamily as SourceProvenanceFamily,
+    isCodeSwitched: Boolean(evidence.isCodeSwitched),
+    rawResults: metrics.rawResults,
+    uniqueCreators: metrics.distinctResults,
+    newCreators: metrics.newChannels,
+    relevantNewCreators: Number(observed.relevant_new_creators || 0),
+    qualityCreators: Number(observed.quality_new_creators || 0),
+    confirmedTradingCreators: metrics.tradingConfirmed,
+    quotaConsumed: metrics.quotaUsed,
+    yieldScore: metrics.distinctResults > 0 ? metrics.newChannels / metrics.distinctResults : 0,
+    coverageExpansionGain: metrics.distinctResults > 0 ? metrics.newChannels / metrics.distinctResults : 0
+  }, client);
+}
+
 export async function completeQueryRun(runId: string, metrics: {
   rawResults: number;
   distinctResults: number;
@@ -1233,7 +1304,7 @@ export async function completeQueryRun(runId: string, metrics: {
          WHERE id=$1`, [run.rows[0].query_id]
       );
     }
-    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});}
+    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});await attributeCompletedCountryNativeRun(client,runId,metrics);}
     await client.query(
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]

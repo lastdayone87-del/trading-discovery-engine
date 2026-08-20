@@ -551,11 +551,21 @@ test('Phase 10: legacy NULL evidence remains neutral and cannot manufacture a na
   assert.equal(runner.projections.has(termId!), false);
 });
 
-test('Phase 10: the existing autonomous producer materializes frontier proposals before Phase 8 allocation', () => {
+test('Phase 10: the existing autonomous producer materializes only bounded native proposals before Phase 8 allocation', () => {
   const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  assert.match(source, /generateFrontierProposalsForCountry/);
+  assert.match(source, /materializeBoundedCountryNativeProposals/);
+  assert.doesNotMatch(source, /generateFrontierProposalsForCountry/);
+  assert.match(source, /materializeBoundedCountryNativeProposals\(countries, \{ globalCap: 25, perCountryCap: 5 \}\)/);
   assert.ok(
-    source.indexOf('generateFrontierProposalsForCountry(country)') < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
+    source.indexOf('materializeBoundedCountryNativeProposals') < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
     'proposal materialization must precede the existing Phase 8 allocation boundary'
   );
+});
+
+test('Phase 10: authoritative query completion attributes native outcomes through persisted allocation lineage', () => {
+  const source = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  assert.match(source, /attributeCompletedCountryNativeRun\(client,runId,metrics\)/);
+  assert.match(source, /JOIN frontier_discovery_proposals p ON p\.proposal_id=d\.proposal_id/);
+  assert.match(source, /p\.proposal_family='COUNTRY_NATIVE'/);
+  assert.match(source, /attributeCountryNativePerformance/);
 });

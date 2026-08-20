@@ -567,7 +567,10 @@ export async function recordNativeTerminologyObservation(args: {
  * Tracks query execution yield and coverage expansion gains by native provenance type.
  */
 export async function attributeCountryNativePerformance(args: {
-  canonicalTermId: number;
+  attributionKey: string;
+  canonicalTermId?: number | null;
+  proposalId?: string | null;
+  allocationDecisionId?: string | null;
   queryId?: number | null;
   queryRunId?: string | null;
   country: string;
@@ -577,6 +580,7 @@ export async function attributeCountryNativePerformance(args: {
   rawResults?: number;
   uniqueCreators?: number;
   newCreators?: number;
+  relevantNewCreators?: number;
   qualityCreators?: number;
   confirmedTradingCreators?: number;
   quotaConsumed?: number;
@@ -588,15 +592,20 @@ export async function attributeCountryNativePerformance(args: {
 
   await runner.query(
     `INSERT INTO country_native_performance_attribution (
-       canonical_term_id, query_id, query_run_id, country,
+       attribution_key, canonical_term_id, proposal_id, allocation_decision_id,
+       query_id, query_run_id, country,
        native_evidence_status, source_provenance_family, is_code_switched,
-       executed_at, raw_results, unique_creators, new_creators,
+       executed_at, raw_results, unique_creators, new_creators, relevant_new_creators,
        quality_creators, confirmed_trading_creators, quota_consumed,
        yield_score, coverage_expansion_gain
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), $11, $12, $13, $14, $15, $16, $17, $18, $19)
+     ON CONFLICT (attribution_key) DO NOTHING`,
     [
-      args.canonicalTermId,
+      args.attributionKey,
+      args.canonicalTermId || null,
+      args.proposalId || null,
+      args.allocationDecisionId || null,
       args.queryId || null,
       args.queryRunId || null,
       args.country.toUpperCase(),
@@ -606,6 +615,7 @@ export async function attributeCountryNativePerformance(args: {
       args.rawResults || 0,
       args.uniqueCreators || 0,
       args.newCreators || 0,
+      args.relevantNewCreators || 0,
       args.qualityCreators || 0,
       args.confirmedTradingCreators || 0,
       args.quotaConsumed || 0,

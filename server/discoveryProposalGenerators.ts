@@ -370,6 +370,26 @@ export async function generateCountryNativeProposals(country: string, limit = 10
   );
 }
 
+/** Bounded Phase 10 materialization for the existing autonomous producer cycle. */
+export async function materializeBoundedCountryNativeProposals(
+  countries: string[],
+  config: { globalCap?: number; perCountryCap?: number } = {}
+): Promise<{ generated: number; persisted: number; proposals: DiscoveryFrontierProposal[] }> {
+  const globalCap = Math.min(100, Math.max(1, Math.floor(config.globalCap ?? 25)));
+  const perCountryCap = Math.min(globalCap, Math.max(1, Math.floor(config.perCountryCap ?? 5)));
+  const normalizedCountries = [...new Set(countries.map(country => country.toUpperCase().trim()).filter(Boolean))].sort();
+  const generated = (await Promise.all(normalizedCountries.map(country =>
+    generateCountryNativeProposals(country, perCountryCap).catch(() => [])
+  ))).flat();
+  const seen = new Set<string>();
+  const proposals = generated
+    .sort((a, b) => a.country.localeCompare(b.country) || a.dedupKey.localeCompare(b.dedupKey))
+    .filter(proposal => !seen.has(proposal.dedupKey) && Boolean(seen.add(proposal.dedupKey)))
+    .slice(0, globalCap);
+  const persisted = await persistFrontierProposals(proposals);
+  return { generated: proposals.length, persisted, proposals };
+}
+
 // 6. COVERAGE_GAP Generator
 export async function generateCoverageGapProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const db = await getDb();
