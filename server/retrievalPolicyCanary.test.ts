@@ -7,7 +7,8 @@ import {
   reserveRetrievalCanaryTreatment,
   reserveIncrementalTreatmentPageQuota,
   commitIncrementalTreatmentPageReservation,
-  releaseIncrementalTreatmentPageReservation
+  releaseIncrementalTreatmentPageReservation,
+  enqueueChildAndCommitPageReservation
 } from './retrievalPolicyCanary';
 
 test('deterministicExplorationValue is reproducible for the same seed and differs across seeds', () => {

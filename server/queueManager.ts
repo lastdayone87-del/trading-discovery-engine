@@ -30,7 +30,7 @@ import {
   getNeighborhoodForQueryRun
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
-import { reserveIncrementalTreatmentPageQuota, commitIncrementalTreatmentPageReservation, releaseIncrementalTreatmentPageReservation } from './retrievalPolicyCanary';
+import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
 import { validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
@@ -460,29 +460,23 @@ export async function processNextSearchJob(
           incPageReservationId = incRes.pageReservationId;
         }
 
-        try {
-          await enqueueJob('SEARCH_YOUTUBE', {
+        // Atomic child job enqueue + page reservation commit
+        await enqueueChildAndCommitPageReservation({
+          pageReservationId: incPageReservationId,
+          queryRunId,
+          jobType: 'SEARCH_YOUTUBE',
+          jobPayload: {
             ...job.payload,
             pageNumber: pageNumber + 1,
             pageToken: searchPage.nextPageToken
-          }, {
-            priority: 20,
-            maxAttempts: 3,
-            idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`
-          });
+          },
+          priority: 20,
+          maxAttempts: 3,
+          idempotencyKey: `search-run:${queryRunId}:page:${pageNumber + 1}`
+        });
 
-          if (incPageReservationId) {
-            await commitIncrementalTreatmentPageReservation(incPageReservationId);
-          }
-
-          await completeJob(job.id);
-          return true;
-        } catch (enqueueError) {
-          if (incPageReservationId) {
-            await releaseIncrementalTreatmentPageReservation(incPageReservationId, queryRunId);
-          }
-          throw enqueueError;
-        }
+        await completeJob(job.id);
+        return true;
       }
       const finalMetrics=await getAutonomousRunMetrics(queryRunId);
       const quotaConsumed=pageNumber*100;

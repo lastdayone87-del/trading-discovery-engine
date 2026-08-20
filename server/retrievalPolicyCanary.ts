@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { getDb, getDailyYouTubeQuotaBudget, getAutonomousSchedulingSnapshot } from './db';
+import { getDb, getDailyYouTubeQuotaBudget, getAutonomousSchedulingSnapshot, enqueueJob, type DurableJob } from './db';
 import { getYouTubeQuotaDay, getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
 import type { RetrievalLane } from './retrievalLanes';
 import type { SearchOrdering } from './searchOrdering';
@@ -599,6 +599,70 @@ export async function releaseIncrementalTreatmentPageReservation(
     if (client) await activeRunner.query('ROLLBACK').catch(() => undefined);
     console.warn('[RetrievalPolicyCanary] Failed to release page reservation:', err);
     return false;
+  } finally {
+    if (client) client.release();
+  }
+}
+
+/**
+ * Atomically enqueues a child continuation job and transitions the corresponding page reservation from RESERVED -> COMMITTED
+ * inside a single database transaction.
+ *
+ * Guarantees that a durable continuation job NEVER exists without durable COMMITTED page authority.
+ * If either child job creation or page-reservation commit fails, the transaction rolls back,
+ * ensuring no unreserved child job remains.
+ */
+export async function enqueueChildAndCommitPageReservation(input: {
+  pageReservationId?: string;
+  queryRunId: string;
+  jobType: string;
+  jobPayload: any;
+  priority?: number;
+  maxAttempts?: number;
+  idempotencyKey: string;
+  clientOverride?: any;
+}): Promise<DurableJob> {
+  const runner = input.clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+
+  const client = input.clientOverride ? null : await (await getDb()).connect();
+  const activeRunner = input.clientOverride || client;
+
+  try {
+    if (client) await activeRunner.query('BEGIN');
+
+    // 1. Enqueue child job inside transaction
+    const childJob = await enqueueJob(input.jobType, input.jobPayload, {
+      priority: input.priority ?? 20,
+      maxAttempts: input.maxAttempts ?? 3,
+      idempotencyKey: input.idempotencyKey,
+      clientOverride: activeRunner
+    });
+
+    // 2. Commit page reservation if pageReservationId was provided
+    if (input.pageReservationId) {
+      const commitRes = await activeRunner.query(
+        `UPDATE retrieval_canary_page_reservations
+         SET reservation_status = 'COMMITTED'
+         WHERE page_reservation_id = $1
+           AND reservation_status IN ('RESERVED', 'COMMITTED')
+         RETURNING id`,
+        [input.pageReservationId]
+      );
+
+      if (commitRes.rowCount === 0) {
+        throw new Error(`RETRIEVAL_CANARY_PAGE_COMMIT_FAILED: Page reservation ${input.pageReservationId} could not be committed.`);
+      }
+    }
+
+    if (client) await activeRunner.query('COMMIT');
+    return childJob;
+  } catch (err) {
+    if (client) await activeRunner.query('ROLLBACK').catch(() => undefined);
+    if (input.pageReservationId) {
+      // Safely release RESERVED page reservation if transaction failed before commitment
+      await releaseIncrementalTreatmentPageReservation(input.pageReservationId, input.queryRunId, runner).catch(() => undefined);
+    }
+    throw err;
   } finally {
     if (client) client.release();
   }
