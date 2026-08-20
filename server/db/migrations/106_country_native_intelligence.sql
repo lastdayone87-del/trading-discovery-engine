@@ -1,6 +1,6 @@
 -- Migration 106: Checkpoint 6 / Phase 10 — Country-Native Intelligence
 
--- 1. Additive observation-level geography, locale, and code-switching fields to terminology_observations
+-- 1. Additive observation-level geography, locale, code-switching, and deterministic observation_key fields to terminology_observations
 ALTER TABLE terminology_observations
   ADD COLUMN IF NOT EXISTS source_creator_country TEXT,
   ADD COLUMN IF NOT EXISTS target_market_country TEXT,
@@ -9,11 +9,13 @@ ALTER TABLE terminology_observations
   ADD COLUMN IF NOT EXISTS native_language TEXT,
   ADD COLUMN IF NOT EXISTS native_evidence_status TEXT CHECK (native_evidence_status IN ('NATIVE_OBSERVED', 'BOOTSTRAP_SEED', 'TRANSLATED_SEED')),
   ADD COLUMN IF NOT EXISTS source_provenance_family TEXT CHECK (source_provenance_family IN ('CREATOR_METADATA', 'STRUCTURED_LOCAL_ENTITY', 'COUNTRY_VOCABULARY', 'STATIC_BOOTSTRAP', 'TRANSLATED_QUERY')),
-  ADD COLUMN IF NOT EXISTS code_switch_type TEXT;
+  ADD COLUMN IF NOT EXISTS code_switch_type TEXT,
+  ADD COLUMN IF NOT EXISTS observation_key TEXT UNIQUE;
 
 CREATE INDEX IF NOT EXISTS idx_term_obs_creator_country ON terminology_observations(source_creator_country);
 CREATE INDEX IF NOT EXISTS idx_term_obs_market_country ON terminology_observations(target_market_country);
 CREATE INDEX IF NOT EXISTS idx_term_obs_status ON terminology_observations(native_evidence_status);
+CREATE INDEX IF NOT EXISTS idx_term_obs_key ON terminology_observations(observation_key);
 
 -- 2. Derived, idempotent aggregate country-native evidence projection table
 CREATE TABLE IF NOT EXISTS country_native_evidence_projections (

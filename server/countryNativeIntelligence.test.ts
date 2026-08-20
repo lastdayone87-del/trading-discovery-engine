@@ -6,7 +6,7 @@ import {
   detectCodeSwitching,
   recordNativeTerminologyObservation,
   recomputeNativeEvidenceProjection,
-  getCountryNativeCoverageDiagnostics
+  computeObservationKey
 } from './countryNativeIntelligence';
 import { generateCountryNativeProposals } from './discoveryProposalGenerators';
 import { getDb } from './db';
@@ -71,7 +71,6 @@ function createMockRunner() {
         const canonicalTerm = params[0];
         const normalizedTerm = params[1];
         const country = params[2];
-        const language = params[3];
 
         let existing: any = null;
         for (const t of canonicalTerms.values()) {
@@ -91,7 +90,7 @@ function createMockRunner() {
             canonical_term: canonicalTerm,
             normalized_term: normalizedTerm,
             country,
-            language,
+            language: params[3],
             script: params[4],
             term_type: params[5],
             lifecycle_status: 'CANDIDATE',
@@ -143,6 +142,12 @@ function createMockRunner() {
       }
 
       if (sqlNorm.startsWith('INSERT INTO terminology_observations')) {
+        const obsKey = params[12];
+        if (obsKey && observations.some(o => o.observation_key === obsKey)) {
+          // ON CONFLICT (observation_key) DO NOTHING
+          return { rows: [] };
+        }
+
         const obs = {
           canonical_term_id: Number(params[0]),
           source_channel_id: params[1],
@@ -156,10 +161,11 @@ function createMockRunner() {
           native_evidence_status: params[9],
           source_provenance_family: params[10],
           code_switch_type: params[11],
-          evidence: params[12]
+          observation_key: obsKey,
+          evidence: params[13]
         };
         observations.push(obs);
-        return { rows: [] };
+        return { rows: [{ id: observations.length }] };
       }
 
       if (sqlNorm.startsWith('SELECT o.source_creator_country,')) {
@@ -190,6 +196,82 @@ function createMockRunner() {
     }
   };
 }
+
+test('Phase 10: Retrying the exact same native observation inserts 1 canonical observation row only and is idempotent', async () => {
+  const runner = createMockRunner();
+  runner.channels.set('UC_IDEMPOTENT_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+
+  const termStr = 'operacoes de mini indice';
+  const channelId = 'UC_IDEMPOTENT_1';
+  const videoId = 'VID_1001';
+
+  // Call recordNativeTerminologyObservation 5 times with identical parameters
+  let termId: number | null = null;
+  for (let i = 0; i < 5; i++) {
+    termId = await recordNativeTerminologyObservation({
+      term: termStr,
+      country: 'BR',
+      channelId,
+      videoId,
+      observationType: 'VIDEO_TITLE',
+      nativeEvidenceStatus: 'NATIVE_OBSERVED',
+      sourceProvenanceFamily: 'CREATOR_METADATA'
+    }, runner);
+  }
+
+  assert.ok(termId);
+
+  // Exact observation count in DB MUST remain 1
+  const termObs = runner.observations.filter(o => o.canonical_term_id === termId);
+  assert.equal(termObs.length, 1, 'Exact observation retry must produce exactly 1 observation row');
+
+  const proj = await recomputeNativeEvidenceProjection(termId!, runner);
+  assert.ok(proj);
+
+  assert.equal(proj.rawObservationCount, 1);
+  assert.equal(proj.nativeObservedCount, 1);
+  assert.equal(proj.qualityCreatorCount, 1);
+  assert.equal(proj.nativeProposalEligible, false, 'Single creator evidence remains evidence-only');
+
+  // Verify that two genuinely DIFFERENT source videos from the same creator create two distinct observations
+  const video2Id = 'VID_1002';
+  await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'BR',
+    channelId,
+    videoId: video2Id,
+    observationType: 'VIDEO_TITLE',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+
+  const updatedObs = runner.observations.filter(o => o.canonical_term_id === termId);
+  assert.equal(updatedObs.length, 2, 'Two distinct videos must produce 2 distinct observations');
+
+  const projAfterTwoVideos = await recomputeNativeEvidenceProjection(termId!, runner);
+  assert.ok(projAfterTwoVideos);
+  assert.equal(projAfterTwoVideos.rawObservationCount, 2);
+  // Quality creator count remains 1 because both videos come from the SAME creator
+  assert.equal(projAfterTwoVideos.qualityCreatorCount, 1);
+  assert.equal(projAfterTwoVideos.nativeProposalEligible, false);
+
+  // Adding a second DISTINCT quality creator unlocks proposal eligibility!
+  runner.channels.set('UC_IDEMPOTENT_2', { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
+  await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'BR',
+    channelId: 'UC_IDEMPOTENT_2',
+    videoId: 'VID_2001',
+    observationType: 'DESCRIPTION',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+
+  const projMultiCreator = await recomputeNativeEvidenceProjection(termId!, runner);
+  assert.ok(projMultiCreator);
+  assert.equal(projMultiCreator.qualityCreatorCount, 2);
+  assert.equal(projMultiCreator.nativeProposalEligible, true, 'Distinct quality creators unlock proposal eligibility');
+});
 
 test('Phase 10: Phase 10 native observations route through authoritative terminology lifecycle', async () => {
   const runner = createMockRunner();
@@ -253,6 +335,7 @@ test('Phase 10: Mixed native evidence provenance preserves status and source fam
     await recordNativeTerminologyObservation({
       term: termStr,
       country: 'DE',
+      videoId: `TRANS_${i}`,
       observationType: 'ENRICHMENT',
       nativeEvidenceStatus: 'TRANSLATED_SEED',
       sourceProvenanceFamily: 'TRANSLATED_QUERY'
@@ -271,49 +354,4 @@ test('Phase 10: Mixed native evidence provenance preserves status and source fam
   assert.deepEqual(proj.sourceProvenanceFamilies.sort(), ['CREATOR_METADATA', 'TRANSLATED_QUERY'].sort());
   assert.equal(proj.sourceProvenanceCounts['CREATOR_METADATA'], 1);
   assert.equal(proj.sourceProvenanceCounts['TRANSLATED_QUERY'], 3);
-});
-
-test('Phase 10: Idempotent recomputation prevents double-counting duplicate creator observations', async () => {
-  const runner = createMockRunner();
-
-  const c1 = 'UC_RETRY_01';
-  runner.channels.set(c1, { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
-
-  const termStr = 'optionsschein trading';
-
-  // Record same term from same creator 3 times (retry scenario)
-  for (let i = 0; i < 3; i++) {
-    await recordNativeTerminologyObservation({
-      term: termStr,
-      country: 'DE',
-      channelId: c1,
-      observationType: 'VIDEO_TITLE',
-      nativeEvidenceStatus: 'NATIVE_OBSERVED'
-    }, runner);
-  }
-
-  const termId = (await recordNativeTerminologyObservation({
-    term: termStr,
-    country: 'DE',
-    channelId: c1,
-    observationType: 'VIDEO_TITLE',
-    nativeEvidenceStatus: 'NATIVE_OBSERVED'
-  }, runner))!;
-
-  const proj1 = await recomputeNativeEvidenceProjection(termId, runner);
-  const proj2 = await recomputeNativeEvidenceProjection(termId, runner);
-
-  assert.ok(proj1);
-  assert.ok(proj2);
-
-  // Quality creator count MUST strictly equal 1 (not 4 from duplicate observations)
-  assert.equal(proj1.qualityCreatorCount, 1);
-  assert.equal(proj2.qualityCreatorCount, 1);
-
-  // Single creator remains evidence-only (not proposal eligible)
-  assert.equal(proj1.nativeProposalEligible, false);
-
-  // Projections must be identical across repeated recomputations
-  assert.equal(proj1.nativeConfidenceScore, proj2.nativeConfidenceScore);
-  assert.equal(proj1.rawObservationCount, proj2.rawObservationCount);
 });

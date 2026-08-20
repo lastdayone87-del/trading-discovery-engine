@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { normalizeTerm, inferScript, refreshTerminologyLifecycle } from './terminologyIntelligence';
@@ -67,6 +68,26 @@ const SPONSOR_OR_AFFILIATE_PATTERNS = [
   /giveaway|sorteio|vlog|lifestyle|affiliate|patroc[ií]nio/i,
   /subscribe|channel|video|watch|like|follow|link|below|inscreva|canal|curta|abonnieren|abonnent/i
 ];
+
+/**
+ * Computes a deterministic SHA-256 key for a native terminology observation to guarantee observation idempotency.
+ */
+export function computeObservationKey(params: {
+  canonicalTermId: number;
+  channelId?: string | null;
+  videoId?: string | null;
+  observationType: string;
+  nativeEvidenceStatus: string;
+  sourceProvenanceFamily: string;
+}): string {
+  const normChannel = (params.channelId || 'none').trim().toLowerCase();
+  const normVideo = (params.videoId || 'none').trim().toLowerCase();
+  const normType = params.observationType.trim().toUpperCase();
+  const normStatus = params.nativeEvidenceStatus.trim().toUpperCase();
+  const normFamily = params.sourceProvenanceFamily.trim().toUpperCase();
+  const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}`;
+  return createHash('sha256').update(raw).digest('hex');
+}
 
 /**
  * Deterministically normalizes a candidate native term.
@@ -434,6 +455,7 @@ export async function recomputeNativeEvidenceProjection(
 
 /**
  * Extracts and records native candidate market terms from channel/video metadata.
+ * Uses deterministic observation keys to ensure observation idempotency and retry safety.
  * Always invokes refreshTerminologyLifecycle to keep canonical terminology maturity in sync.
  */
 export async function recordNativeTerminologyObservation(args: {
@@ -474,15 +496,26 @@ export async function recordNativeTerminologyObservation(args: {
   const evidenceStatus = args.nativeEvidenceStatus || 'NATIVE_OBSERVED';
   const provenanceFamily = args.sourceProvenanceFamily || 'CREATOR_METADATA';
 
-  // Insert observation into terminology_observations
-  await runner.query(
+  const obsKey = computeObservationKey({
+    canonicalTermId: termId,
+    channelId: args.channelId,
+    videoId: args.videoId,
+    observationType: args.observationType,
+    nativeEvidenceStatus: evidenceStatus,
+    sourceProvenanceFamily: provenanceFamily
+  });
+
+  // Insert observation into terminology_observations idempotently using observation_key
+  const obsInsert = await runner.query(
     `INSERT INTO terminology_observations (
        canonical_term_id, source_channel_id, source_video_id, observation_type,
        source_creator_country, target_market_country, locale, is_code_switched,
        native_language, native_evidence_status, source_provenance_family, code_switch_type,
-       evidence
+       observation_key, evidence
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     ON CONFLICT (observation_key) DO NOTHING
+     RETURNING id`,
     [
       termId,
       args.channelId || null,
@@ -496,11 +529,13 @@ export async function recordNativeTerminologyObservation(args: {
       evidenceStatus,
       provenanceFamily,
       codeSwitching.codeSwitchType,
+      obsKey,
       JSON.stringify(args.evidence || {})
     ]
   );
 
-  // Invoke authoritative terminology lifecycle refresh
+  // Invoke authoritative terminology lifecycle refresh ONLY if a new observation was actually inserted
+  // or re-run to ensure current state is fresh.
   await refreshTerminologyLifecycle(termId, undefined, runner);
 
   // Recompute native evidence projection idempotently
