@@ -233,10 +233,66 @@ const NATIVE_FINANCIAL_SEEDS: Record<string, string[]> = {
 export async function generateCountryNativeProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const normC = country.toUpperCase().trim();
 
-  const observedTerms: string[] = [];
   try {
     const db = await getDb().catch(() => null);
     if (db) {
+      // 1. First, check Phase 10 proposal-eligible native projections from canonical_trading_terms
+      const nativeProjRes = await db.query(
+        `SELECT
+           t.id AS canonical_term_id,
+           t.canonical_term,
+           t.concept_id,
+           p.native_confidence_score,
+           p.native_evidence_status,
+           p.source_provenance_family,
+           p.quality_creator_count,
+           p.distinct_creator_count,
+           p.is_code_switched,
+           p.code_switch_type,
+           p.observed_creator_countries,
+           p.observed_market_countries
+         FROM country_native_evidence_projections p
+         JOIN canonical_trading_terms t ON t.id = p.canonical_term_id
+         WHERE UPPER(p.country) = $1 AND p.native_proposal_eligible = true
+         ORDER BY p.native_confidence_score DESC, p.last_observed_at DESC
+         LIMIT $2`,
+        [normC, limit]
+      ).catch(() => ({ rows: [] }));
+
+      if (nativeProjRes.rows.length > 0) {
+        return nativeProjRes.rows.map(row => {
+          const isObserved = row.native_evidence_status === 'NATIVE_OBSERVED';
+          const provenanceType = isObserved ? 'observed_native_evidence' : 'bootstrap_vocabulary';
+          return buildFrontierProposal({
+            proposalFamily: 'COUNTRY_NATIVE',
+            country: normC,
+            concept: row.canonical_term,
+            sourceProvenance: isObserved
+              ? `observed_native_evidence:canonical_trading_terms:${row.canonical_term_id}:${row.canonical_term}`
+              : `bootstrap_vocabulary:static_seed:${row.canonical_term}`,
+            supportingEvidence: {
+              provenanceType,
+              nativeEvidenceStatus: row.native_evidence_status,
+              sourceProvenanceFamily: row.source_provenance_family,
+              canonicalTermId: Number(row.canonical_term_id),
+              conceptId: row.concept_id || null,
+              nativeConfidenceScore: Number(row.native_confidence_score),
+              qualityCreatorCount: Number(row.quality_creator_count),
+              distinctCreatorCount: Number(row.distinct_creator_count),
+              isCodeSwitched: Boolean(row.is_code_switched),
+              codeSwitchType: row.code_switch_type || 'NONE',
+              observedCreatorCountries: row.observed_creator_countries || [],
+              observedMarketCountries: row.observed_market_countries || [],
+              nativeTerm: row.canonical_term,
+              market: normC
+            },
+            confidence: Number(row.native_confidence_score),
+            noveltyRationale: `Generated from eligible country-native concept projection for ${normC}.`
+          });
+        });
+      }
+
+      // 2. Fallback to country_vocabularies if present
       const vocabRes = await db.query(
         `SELECT native_trading_terminology, popular_instruments, local_market_phrases
          FROM country_vocabularies
@@ -244,52 +300,52 @@ export async function generateCountryNativeProposals(country: string, limit = 10
         [normC]
       ).catch(() => ({ rows: [] }));
 
-    if (vocabRes.rows.length > 0) {
-      const row = vocabRes.rows[0];
-      const parseList = (val: any): string[] => {
-        if (!val) return [];
-        if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
-        if (typeof val === 'string') {
-          try {
-            const parsed = JSON.parse(val);
-            if (Array.isArray(parsed)) return parsed.map(x => String(x).trim()).filter(Boolean);
-          } catch {
-            return val.split(',').map(x => x.trim()).filter(Boolean);
+      if (vocabRes.rows.length > 0) {
+        const row = vocabRes.rows[0];
+        const parseList = (val: any): string[] => {
+          if (!val) return [];
+          if (Array.isArray(val)) return val.map(x => String(x).trim()).filter(Boolean);
+          if (typeof val === 'string') {
+            try {
+              const parsed = JSON.parse(val);
+              if (Array.isArray(parsed)) return parsed.map(x => String(x).trim()).filter(Boolean);
+            } catch {
+              return val.split(',').map(x => x.trim()).filter(Boolean);
+            }
           }
-        }
-        return [];
-      };
+          return [];
+        };
 
-      observedTerms.push(
-        ...parseList(row.native_trading_terminology),
-        ...parseList(row.popular_instruments),
-        ...parseList(row.local_market_phrases)
-      );
-    }
+        const observedTerms = Array.from(new Set([
+          ...parseList(row.native_trading_terminology),
+          ...parseList(row.popular_instruments),
+          ...parseList(row.local_market_phrases)
+        ])).slice(0, limit);
+
+        if (observedTerms.length > 0) {
+          return observedTerms.map(term =>
+            buildFrontierProposal({
+              proposalFamily: 'COUNTRY_NATIVE',
+              country: normC,
+              concept: term,
+              sourceProvenance: `observed_native_evidence:country_vocabularies:${term}`,
+              supportingEvidence: {
+                provenanceType: 'observed_native_evidence',
+                nativeEvidenceStatus: 'NATIVE_OBSERVED',
+                sourceProvenanceFamily: 'COUNTRY_VOCABULARY',
+                sourceTable: 'country_vocabularies',
+                nativeTerm: term,
+                market: normC
+              },
+              confidence: 0.85,
+              noveltyRationale: `Generated from observed repository native financial evidence for ${normC}.`
+            })
+          );
+        }
+      }
     }
   } catch {
     // Database unavailable in unit test runtime; proceed to bootstrap vocabulary fallback
-  }
-
-  // 2. If observed repository evidence terms exist, use them with observed_native_evidence provenance
-  if (observedTerms.length > 0) {
-    const uniqueObserved = Array.from(new Set(observedTerms)).slice(0, limit);
-    return uniqueObserved.map(term =>
-      buildFrontierProposal({
-        proposalFamily: 'COUNTRY_NATIVE',
-        country: normC,
-        concept: term,
-        sourceProvenance: `observed_native_evidence:country_vocabularies:${term}`,
-        supportingEvidence: {
-          provenanceType: 'observed_native_evidence',
-          sourceTable: 'country_vocabularies',
-          nativeTerm: term,
-          market: normC
-        },
-        confidence: 0.85,
-        noveltyRationale: `Generated from observed repository native financial evidence for ${normC}.`
-      })
-    );
   }
 
   // 3. Fallback to static seed dictionary explicitly identified as bootstrap_vocabulary
@@ -302,6 +358,8 @@ export async function generateCountryNativeProposals(country: string, limit = 10
       sourceProvenance: `bootstrap_vocabulary:static_seed:${seed}`,
       supportingEvidence: {
         provenanceType: 'bootstrap_vocabulary',
+        nativeEvidenceStatus: 'BOOTSTRAP_SEED',
+        sourceProvenanceFamily: 'STATIC_BOOTSTRAP',
         isBootstrapSeed: true,
         nativeTerm: seed,
         market: normC
