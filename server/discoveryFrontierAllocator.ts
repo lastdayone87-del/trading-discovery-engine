@@ -9,6 +9,7 @@ import {
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
+import { YOUTUBE_SEARCH_PROVIDER, type ProviderAllocation } from './providerAwareRetrieval';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -79,6 +80,9 @@ export interface AllocationDecision {
   quotaConsumed: number;
   quotaDay: string;
   policyVersion: string;
+  provider?: ProviderAllocation;
+  providerReservationId?: string;
+  providerEligibilitySnapshot?: Record<string,unknown>;
   createdAt?: string;
 }
 
@@ -586,11 +590,22 @@ export async function evaluateFrontierCanaryAllocation(input: {
     // Acquire transaction advisory lock for allocation authority
     await runner.query('SELECT pg_advisory_xact_lock(741963286)');
 
+    // Provider capability and production eligibility are locked and snapshotted
+    // by Phase 8; Phase 9 may not consult mutable registry state to switch provider.
+    const providerResult=await runner.query(`SELECT provider_key,provider_family,capabilities,quota_domain,mode,daily_cost_cap,configuration_version,updated_at
+      FROM discovery_provider_registry WHERE provider_key=$1 FOR SHARE`,[YOUTUBE_SEARCH_PROVIDER.providerKey]);
+    const providerRow=providerResult.rows[0];
+    if(!providerRow || providerRow.mode!=='ACTIVE' || providerRow.quota_domain!==YOUTUBE_SEARCH_PROVIDER.costDomain ||
+       !Array.isArray(providerRow.capabilities) || !providerRow.capabilities.includes(YOUTUBE_SEARCH_PROVIDER.capability)) {
+      if(client)await runner.query('COMMIT');
+      return {authorized:false,allocationOrigin:'LEGACY',country:input.legacyCountry,reason:'PROVIDER_INELIGIBLE_OR_CAPABILITY_MISMATCH'};
+    }
+
     // A process can die after Phase 8 reserves but before the scheduling transaction.
     // Expire those orphaned reservations under the allocation authority lock.
     await runner.query(
       `UPDATE frontier_allocation_decisions
-       SET decision_status='RELEASED',deferred=true,quota_reserved=0,
+       SET decision_status='RELEASED',deferred=true,quota_reserved=0,provider_reserved_amount=0,
            rejection_reasons=jsonb_set(COALESCE(rejection_reasons,'{}'::jsonb),'{releaseReason}',to_jsonb('STALE_RESERVATION_RECOVERED'::text))
        WHERE allocation_origin='FRONTIER_CANARY' AND decision_status='RESERVED'
          AND created_at < now()-interval '20 minutes'`
@@ -779,6 +794,9 @@ export async function evaluateFrontierCanaryAllocation(input: {
       quotaConsumed: 0,
       quotaDay,
       policyVersion: PERSISTENT_RESEARCH_PHASE8_VERSION,
+      provider: YOUTUBE_SEARCH_PROVIDER,
+      providerReservationId: `frontier:${decisionId}`,
+      providerEligibilitySnapshot:{providerKey:providerRow.provider_key,providerFamily:providerRow.provider_family,mode:providerRow.mode,capability:YOUTUBE_SEARCH_PROVIDER.capability,costDomain:providerRow.quota_domain,configurationVersion:providerRow.configuration_version,updatedAt:providerRow.updated_at},
       createdAt: now.toISOString()
     };
 
@@ -790,9 +808,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
          deferred, quota_reserved, quota_consumed, quota_day, policy_version,
-         proposal_evidence_snapshot, proposal_evidence_checksum
+         proposal_evidence_snapshot, proposal_evidence_checksum,provider_key,retrieval_surface,provider_capability,cost_domain,
+         provider_reservation_id,provider_reserved_amount,provider_consumed_amount,provider_eligibility_snapshot,continuation_owner
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,
@@ -820,7 +839,9 @@ export async function evaluateFrontierCanaryAllocation(input: {
         decision.quotaDay,
         decision.policyVersion,
         JSON.stringify(decision.proposalEvidenceSnapshot),
-        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null
+        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null,
+        decision.provider!.providerKey,decision.provider!.retrievalSurface,decision.provider!.capability,decision.provider!.costDomain,
+        decision.providerReservationId,decision.quotaReserved,decision.quotaConsumed,JSON.stringify(decision.providerEligibilitySnapshot),decision.provider.continuationOwner
       ]
     );
 
@@ -864,7 +885,7 @@ export async function releaseAllocationDecision(
     `UPDATE frontier_allocation_decisions
      SET decision_status = 'RELEASED',
          deferred = true,
-         quota_reserved = 0,
+         quota_reserved = 0, provider_reserved_amount = 0,
          rejection_reasons = jsonb_set(
            COALESCE(rejection_reasons, '{}'::jsonb),
            '{releaseReason}',
@@ -910,7 +931,7 @@ export async function quarantineUnexecutableAllocation(
     if (client) await runner.query('BEGIN');
     const decision = await runner.query(
       `UPDATE frontier_allocation_decisions
-       SET decision_status='DEFERRED', deferred=true, quota_reserved=0,
+       SET decision_status='DEFERRED', deferred=true, quota_reserved=0,provider_reserved_amount=0,
            rejection_reasons=jsonb_set(COALESCE(rejection_reasons,'{}'::jsonb),'{releaseReason}',to_jsonb($2::text))
        WHERE decision_id=$1 AND allocation_origin='FRONTIER_CANARY' AND decision_status='RESERVED'
        RETURNING proposal_id`, [decisionId, reason]

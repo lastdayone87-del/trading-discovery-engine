@@ -38,6 +38,7 @@ import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
+import {executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, selectNextQueryForCountry } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
@@ -324,7 +325,7 @@ export async function processNextSearchJob(
     }
 
     const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null, retrievalConfigKey = null, retrievalTreatmentOrigin = 'CONTROL', requestedPageDepth = 1 } = job.payload as {
-      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null; retrievalConfigKey?: string | null; retrievalTreatmentOrigin?: string; requestedPageDepth?: number;
+      query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null; retrievalConfigKey?: string | null; retrievalTreatmentOrigin?: string; requestedPageDepth?: number;provider?:ProviderAllocation;
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
@@ -365,13 +366,16 @@ export async function processNextSearchJob(
       const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
       if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerReservationUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
       try {
-        searchPage=await searchYouTubeChannelPage(query,country,vocab,retrievalLane,pageToken,searchOrdering,async additionalUnits=>{
+        const allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
+        const lineage=await (await getDb()).query(`SELECT provider_allocation_snapshot FROM query_runs WHERE id=$1`,[queryRunId]);
+        if(!lineage.rowCount||JSON.stringify(lineage.rows[0].provider_allocation_snapshot)!==JSON.stringify(allocatedProvider))throw new Error('PHASE9_PROVIDER_LINEAGE_MISMATCH');
+        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
           const toppedUp=await topUpQuotaReservation({
             operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',
             additionalUnits,dailyBudget:budget,allocationPercent:percent
           });
           if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
-        },'autonomous');
+        },priority:'autonomous'});
         await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
       } catch (error) {
         await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,false);
