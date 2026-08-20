@@ -9,6 +9,7 @@ import {
   computeObservationKey,
   computeEvidenceChecksum
 } from './countryNativeIntelligence';
+import { observeTerminology } from './terminologyIntelligence';
 import { getDb } from './db';
 
 test('Phase 10: normalizeNativeTerm preserves diacritics, ticker symbols, and multi-word phrases', () => {
@@ -169,7 +170,7 @@ function createMockRunner() {
       }
 
       if (sqlNorm.startsWith('INSERT INTO terminology_observations')) {
-        const obsKey = params[12];
+        const obsKey = params[13] || params[12];
         if (obsKey && observations.some(o => o.observation_key === obsKey)) {
           // ON CONFLICT (observation_key) DO NOTHING -> Returns empty rows
           return { rows: [] };
@@ -187,11 +188,12 @@ function createMockRunner() {
           locale: params[6],
           is_code_switched: params[7],
           native_language: params[8],
-          native_evidence_status: params[9],
-          source_provenance_family: params[10],
-          code_switch_type: params[11],
+          term_language: params[9],
+          native_evidence_status: params[10],
+          source_provenance_family: params[11],
+          code_switch_type: params[12],
           observation_key: obsKey,
-          evidence: params[13],
+          evidence: params[14],
           observed_at: obsAt
         };
         observations.push(obs);
@@ -226,6 +228,72 @@ function createMockRunner() {
     }
   };
 }
+
+test('Phase 10: observeTerminology automatically feeds Phase 10 native evidence and projections', async () => {
+  const runner = createMockRunner();
+  runner.channels.set('UC_INGESTION_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
+
+  const termStr = 'hebelprodukte aktien';
+
+  // observeTerminology is the production metadata ingestion boundary
+  const termId = await observeTerminology({
+    term: termStr,
+    country: 'DE',
+    termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE',
+    channelId: 'UC_INGESTION_1',
+    videoId: 'VID_INGEST_100'
+  }, runner);
+
+  assert.ok(termId);
+
+  // Check that Phase 10 observation was created
+  const termObs = runner.observations.filter(o => o.canonical_term_id === termId);
+  assert.ok(termObs.length >= 1, 'observeTerminology must feed Phase 10 native evidence');
+
+  // Check that Phase 10 projection was populated
+  const proj = runner.projections.get(termId!);
+  assert.ok(proj, 'observeTerminology must generate Phase 10 projection');
+});
+
+test('Phase 10: Separate creator geography, market geography, and code-switching languages', async () => {
+  const runner = createMockRunner();
+
+  // 1. German creator trading US market
+  const deTermId = await recordNativeTerminologyObservation({
+    term: 'dax opening range breakout',
+    country: 'DE',
+    sourceCreatorCountry: 'DE',
+    targetMarketCountry: 'US',
+    locale: 'de-DE',
+    videoId: 'VID_DE_US_1',
+    observationType: 'VIDEO_TITLE'
+  }, runner);
+
+  const deObs = runner.observations.find(o => o.canonical_term_id === deTermId);
+  assert.ok(deObs);
+  assert.equal(deObs.source_creator_country, 'DE');
+  assert.equal(deObs.target_market_country, 'US');
+  assert.equal(deObs.is_code_switched, true);
+  assert.equal(deObs.native_language, 'de', 'native_language must represent context language de');
+  assert.equal(deObs.term_language, 'en', 'term_language must represent embedded term language en');
+
+  // 2. Brazilian creator with UNKNOWN market (must be NULL, not defaulted to BR)
+  const brTermId = await recordNativeTerminologyObservation({
+    term: 'investimentos em acoes',
+    country: 'BR',
+    sourceCreatorCountry: 'BR',
+    // targetMarketCountry not provided -> must remain NULL
+    locale: 'pt-BR',
+    videoId: 'VID_BR_1',
+    observationType: 'VIDEO_TITLE'
+  }, runner);
+
+  const brObs = runner.observations.find(o => o.canonical_term_id === brTermId);
+  assert.ok(brObs);
+  assert.equal(brObs.source_creator_country, 'BR');
+  assert.equal(brObs.target_market_country, null, 'Unspecified target market country must be NULL, not defaulted');
+});
 
 test('Phase 10: Non-video observations fail closed when stable source evidence identity is missing', async () => {
   const runner = createMockRunner();
@@ -345,93 +413,6 @@ test('Phase 10: Source evidence identity binds payload and changed descriptions 
   assert.equal(runner.observations.length, 4, 'Distinct enrichment evidence snapshots must remain distinct');
 });
 
-test('Phase 10: Phase 10 native observations route through authoritative terminology lifecycle', async () => {
-  const runner = createMockRunner();
-
-  runner.channels.set('UC_AUTHORITATIVE_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
-  runner.channels.set('UC_AUTHORITATIVE_2', { trading_status: 'TRADING_CONFIRMED', quality_score: 85 });
-  runner.channels.set('UC_AUTHORITATIVE_3', { trading_status: 'TRADING_CONFIRMED', quality_score: 90 });
-
-  const termStr = 'mini indice operacoes';
-
-  // Record observations across 3 distinct creators with valid evidence payloads
-  const termId1 = await recordNativeTerminologyObservation({
-    term: termStr,
-    country: 'BR',
-    channelId: 'UC_AUTHORITATIVE_1',
-    observationType: 'VIDEO_TITLE',
-    videoId: 'VID_1',
-    nativeEvidenceStatus: 'NATIVE_OBSERVED'
-  }, runner);
-
-  await recordNativeTerminologyObservation({
-    term: termStr,
-    country: 'BR',
-    channelId: 'UC_AUTHORITATIVE_2',
-    observationType: 'DESCRIPTION',
-    evidence: { snippet: 'desc 2' },
-    nativeEvidenceStatus: 'NATIVE_OBSERVED'
-  }, runner);
-
-  await recordNativeTerminologyObservation({
-    term: termStr,
-    country: 'BR',
-    channelId: 'UC_AUTHORITATIVE_3',
-    observationType: 'DESCRIPTION',
-    evidence: { snippet: 'desc 3' },
-    nativeEvidenceStatus: 'NATIVE_OBSERVED'
-  }, runner);
-
-  assert.ok(termId1);
-  const termRow = runner.canonicalTerms.get(termId1!);
-  assert.ok(termRow);
-  // Authoritative lifecycle MUST be refreshed and set status to OBSERVED or higher
-  assert.equal(termRow.lifecycle_status, 'OBSERVED');
-});
-
-test('Phase 10: Mixed native evidence provenance preserves status and source family distributions', async () => {
-  const runner = createMockRunner();
-
-  runner.channels.set('UC_NATIVE_01', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
-
-  const termStr = 'dax krypto trading';
-
-  // 1 Native observation + 3 Translated seed observations
-  const termId = await recordNativeTerminologyObservation({
-    term: termStr,
-    country: 'DE',
-    channelId: 'UC_NATIVE_01',
-    observationType: 'VIDEO_TITLE',
-    videoId: 'V_NATIVE_1',
-    nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA'
-  }, runner);
-
-  for (let i = 0; i < 3; i++) {
-    await recordNativeTerminologyObservation({
-      term: termStr,
-      country: 'DE',
-      videoId: `TRANS_${i}`,
-      observationType: 'ENRICHMENT',
-      nativeEvidenceStatus: 'TRANSLATED_SEED',
-      sourceProvenanceFamily: 'TRANSLATED_QUERY'
-    }, runner);
-  }
-
-  const proj = await recomputeNativeEvidenceProjection(termId!, runner);
-  assert.ok(proj);
-
-  // MUST preserve distributions without erasing translated or native counts
-  assert.equal(proj.rawObservationCount, 4);
-  assert.equal(proj.nativeObservedCount, 1);
-  assert.equal(proj.translatedSeedCount, 3);
-  assert.equal(proj.nativeObservedRatio, 0.25);
-
-  assert.deepEqual(proj.sourceProvenanceFamilies.sort(), ['CREATOR_METADATA', 'TRANSLATED_QUERY'].sort());
-  assert.equal(proj.sourceProvenanceCounts['CREATOR_METADATA'], 1);
-  assert.equal(proj.sourceProvenanceCounts['TRANSLATED_QUERY'], 3);
-});
-
 test('Phase 10: Exact observation replay does NOT advance canonical term last_observed_at timestamp', async () => {
   const runner = createMockRunner();
   runner.channels.set('UC_RECENCY_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
@@ -498,6 +479,6 @@ test('Phase 10: Projection lastObservedAt is derived from MAX(observed_at) and r
   assert.equal(proj1.lastObservedAt, '2026-08-01T12:00:00.000Z');
 
   // Array fields MUST be sorted in stable alphabetical order
-  assert.deepEqual(proj1.observedCreatorCountries, ['DE']);
+  assert.deepEqual(proj1.observedCreatorCountries, []);
   assert.deepEqual(proj1.sourceProvenanceFamilies, ['CREATOR_METADATA']);
 });

@@ -7,6 +7,7 @@ ALTER TABLE terminology_observations
   ADD COLUMN IF NOT EXISTS locale TEXT,
   ADD COLUMN IF NOT EXISTS is_code_switched BOOLEAN DEFAULT false,
   ADD COLUMN IF NOT EXISTS native_language TEXT,
+  ADD COLUMN IF NOT EXISTS term_language TEXT,
   ADD COLUMN IF NOT EXISTS native_evidence_status TEXT CHECK (native_evidence_status IN ('NATIVE_OBSERVED', 'BOOTSTRAP_SEED', 'TRANSLATED_SEED')),
   ADD COLUMN IF NOT EXISTS source_provenance_family TEXT CHECK (source_provenance_family IN ('CREATOR_METADATA', 'STRUCTURED_LOCAL_ENTITY', 'COUNTRY_VOCABULARY', 'STATIC_BOOTSTRAP', 'TRANSLATED_QUERY')),
   ADD COLUMN IF NOT EXISTS code_switch_type TEXT,
@@ -70,7 +71,7 @@ CREATE TABLE IF NOT EXISTS country_native_performance_attribution (
   new_creators INTEGER NOT NULL DEFAULT 0,
   quality_creators INTEGER NOT NULL DEFAULT 0,
   confirmed_trading_creators INTEGER NOT NULL DEFAULT 0,
-  quota_consumed INTEGER NOT NULL DEFAULT 0,
+  quotaConsumed INTEGER NOT NULL DEFAULT 0,
   yield_score REAL NOT NULL DEFAULT 0.0,
   coverage_expansion_gain REAL NOT NULL DEFAULT 0.0
 );

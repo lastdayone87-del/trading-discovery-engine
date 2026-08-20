@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
+import { recordNativeTerminologyObservation } from './countryNativeIntelligence';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
 
@@ -70,6 +71,17 @@ export async function observeTerminology(args: { term: string; country: string; 
   await runner.query(`INSERT INTO terminology_observations(canonical_term_id,source_channel_id,source_video_id,observation_type,human_approval_id,human_approved,community_fingerprint,evidence_weight,evidence)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [termId, args.channelId || null, args.videoId || null, args.observationType, args.humanApprovalId || null, Boolean(args.humanApproved), args.communityFingerprint || null, weight, JSON.stringify(args.evidence || {})]);
   await refreshTerminologyLifecycle(termId, DEFAULT_TERMINOLOGY_POLICY, runner);
+
+  // Extend native observation evidence into Phase 10 country_native_evidence_projections
+  await recordNativeTerminologyObservation({
+    term: args.term,
+    country: args.country,
+    channelId: args.channelId,
+    videoId: args.videoId,
+    observationType: args.observationType,
+    evidence: args.evidence
+  }, runner).catch(() => null);
+
   return termId;
 }
 

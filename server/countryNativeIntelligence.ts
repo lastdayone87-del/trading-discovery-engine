@@ -517,8 +517,8 @@ export async function recomputeNativeEvidenceProjection(
 export async function recordNativeTerminologyObservation(args: {
   term: string;
   country: string;
-  sourceCreatorCountry?: string;
-  targetMarketCountry?: string;
+  sourceCreatorCountry?: string | null;
+  targetMarketCountry?: string | null;
   locale?: string;
   channelId?: string;
   videoId?: string;
@@ -567,8 +567,9 @@ export async function recordNativeTerminologyObservation(args: {
     termId = Number(existing.rows[0].id);
   }
 
-  const creatorCountry = (args.sourceCreatorCountry || args.country).toUpperCase();
-  const marketCountry = (args.targetMarketCountry || args.country).toUpperCase();
+  // Do NOT default source_creator_country or target_market_country to args.country! Persist NULL if unknown.
+  const creatorCountry = args.sourceCreatorCountry ? args.sourceCreatorCountry.toUpperCase() : null;
+  const marketCountry = args.targetMarketCountry ? args.targetMarketCountry.toUpperCase() : null;
   const evidenceStatus = args.nativeEvidenceStatus || 'NATIVE_OBSERVED';
   const provenanceFamily = args.sourceProvenanceFamily || 'CREATOR_METADATA';
 
@@ -588,10 +589,10 @@ export async function recordNativeTerminologyObservation(args: {
     `INSERT INTO terminology_observations (
        canonical_term_id, source_channel_id, source_video_id, observation_type,
        source_creator_country, target_market_country, locale, is_code_switched,
-       native_language, native_evidence_status, source_provenance_family, code_switch_type,
+       native_language, term_language, native_evidence_status, source_provenance_family, code_switch_type,
        observation_key, evidence
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (observation_key) DO NOTHING
      RETURNING id, observed_at`,
     [
@@ -603,7 +604,8 @@ export async function recordNativeTerminologyObservation(args: {
       marketCountry,
       args.locale || 'und',
       codeSwitching.isCodeSwitched,
-      codeSwitching.termLanguage,
+      codeSwitching.dominantLanguage, // Context / native language (e.g. de)
+      codeSwitching.termLanguage,     // Embedded term language (e.g. en)
       evidenceStatus,
       provenanceFamily,
       codeSwitching.codeSwitchType,
