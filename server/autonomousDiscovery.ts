@@ -28,6 +28,7 @@ import {
   markAllocationDecisionDeferred
 } from './discoveryFrontierAllocator';
 import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
+import { generateFrontierProposalsForCountry } from './discoveryProposalGenerators';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -195,6 +196,14 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     }
     if (targetCountry) countries = [targetCountry];
     if (countries.length === 0) throw new Error('No eligible countries are available for autonomous discovery.');
+
+    // Materialize proposal-only evidence inside the existing producer cycle.
+    // Phase 8 remains the sole allocation authority; generation failures cannot
+    // block the legacy Query Intelligence scheduler.
+    await Promise.all(countries.map(country =>
+      generateFrontierProposalsForCountry(country)
+        .catch(error => console.warn('[FrontierProposals] Generation warning:', error))
+    ));
 
     currentCountryIndex = Number(await getAppSetting('qi_current_country_index', '0')) || 0;
     const cooldownMinutes = await numericSetting('query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', 360, 1, 10080);
