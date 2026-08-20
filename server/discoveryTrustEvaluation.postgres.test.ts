@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { failQueryRun,getDb } from './db';
-import { captureCompletedRunObservation,getDiscoveryTrustDiagnostics,materializeEvaluationWindow } from './discoveryTrustEvaluation';
+import { captureCompletedRunObservation,checksum,getDiscoveryTrustDiagnostics,materializeEvaluationWindow } from './discoveryTrustEvaluation';
 
 const databaseUrl=process.env.PHASE12_POSTGRES_URL;
 test('Phase 12 PostgreSQL: persisted lineage, late outcomes, concurrency, windows and replay',{skip:databaseUrl?false:'PHASE12_POSTGRES_URL is required'},async()=>{
@@ -57,4 +57,29 @@ test('Phase 12 PostgreSQL: terminal provider and invalid-query failures are obse
     for(const error of [Object.assign(new Error('outage'),{code:'ETIMEDOUT'}),Object.assign(new Error('bad query'),{code:'INVALID_QUERY'})]){const run=await db.query(`INSERT INTO query_runs(query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering) VALUES($1,'BR','automated_query','RUNNING','BASELINE','test','VIDEO','RELEVANCE') RETURNING id`,[queryId]);ids.push(run.rows[0].id);await failQueryRun(run.rows[0].id,error,true);}
     const observed=await db.query('SELECT provider_failed,invalid_query FROM discovery_evaluation_run_observations WHERE query_run_id=ANY($1::uuid[]) ORDER BY query_run_id',[ids]);assert.equal(observed.rowCount,2);assert.deepEqual(observed.rows.map(x=>[x.provider_failed,x.invalid_query]).sort(),[[false,true],[true,false]].sort());
   }finally{await db.query(`SELECT set_config('app.phase12_maintenance','on',false)`);await db.query('DELETE FROM discovery_evaluation_run_observations WHERE query_run_id=ANY($1::uuid[])',[ids]).catch(()=>undefined);await db.query(`SELECT set_config('app.phase12_maintenance','off',false)`);await db.query('DELETE FROM query_runs WHERE id=ANY($1::uuid[])',[ids]).catch(()=>undefined);if(queryId)await db.query('DELETE FROM query_library WHERE id=$1',[queryId]).catch(()=>undefined);}
+});
+
+test('Phase 12 PostgreSQL: coverage lookbacks cannot cross the cohort source watermark',{skip:databaseUrl?false:'PHASE12_POSTGRES_URL is required'},async()=>{
+  process.env.DATABASE_URL=databaseUrl!;process.env.PGSSL='disable';const db=await getDb();
+  const suffix=`p12-watermark-${Date.now()}-${process.pid}`,currentId=`00000000-0000-4000-8000-${String(Date.now()).slice(-12)}`,futureId=`00000000-0000-4000-9000-${String(Date.now()+1).slice(-12)}`;
+  const start=new Date(Date.now()-120_000).toISOString(),end=new Date(Date.now()+120_000).toISOString(),future=new Date(Date.now()+1500).toISOString();
+  const values=[suffix,`${suffix}-language`,`${suffix}-concept`,`${suffix}-source`];
+  const insert=`INSERT INTO discovery_evaluation_run_observations(query_run_id,observation_revision,allocation_origin,proposal_family,source_families,country,language,canonical_concept,provider,rollout_cohort,allocation_snapshot,allocation_at,completed_at,classification_observed_at,quota_reserved,quota_consumed,provider_requests,raw_results,distinct_creators,known_creators,new_creators,relevant_new_creators,quality_new_creators,confirmed_new_creators,wrong_country_results,irrelevant_results,provider_failed,invalid_query,outcome_checksum) VALUES($1,$9,'FRONTIER_CANARY','COUNTRY_NATIVE',jsonb_build_array($5::text),$2,$3,$4,'youtube-search','CONTROL','{}',now(),$6,$7,0,0,0,0,0,0,0,0,0,0,0,0,false,false,$8)`;
+  try {
+    const library=(await db.query(`INSERT INTO query_library(query,country,collection,intent,normalized_query) VALUES($1,$2,'EXPERIMENTAL','GENERAL',$1) RETURNING id`,[suffix,values[0]])).rows[0].id;
+    await db.query(`INSERT INTO query_runs(id,query_id,country,source,status,selection_strategy,selection_reason,retrieval_lane,search_ordering) VALUES($1,$3,$2,'automated_query','COMPLETED','BASELINE','watermark test','VIDEO','RELEVANCE'),($4,$3,$2,'automated_query','COMPLETED','BASELINE','watermark test','VIDEO','RELEVANCE')`,[currentId,values[0],library,futureId]);
+    await db.query(insert,[currentId,...values,new Date(Date.now()-30_000).toISOString(),new Date(Date.now()-1000).toISOString(),`${suffix}-current`,1]);
+    // This earlier observation is revision N+1 from the materializer's point of view:
+    // it exists physically, but its immutable classification timestamp is beyond N.
+    await db.query(insert,[futureId,...values,new Date(Date.now()-60_000).toISOString(),future,`${suffix}-future`,2]);
+    const atN=await materializeEvaluationWindow({windowStart:start,windowEnd:end,dimension:'concept',value:values[2]});
+    assert.equal(atN.metrics.sampleCount,1);assert.deepEqual(atN.metrics.coverageExpansion,{countries:1,languages:1,concepts:1,sourceFamilies:1});
+    const expectedAtN=checksum([[currentId,1,`${suffix}-current`]]);assert.equal(atN.source_checksum,expectedAtN,'membership and checksum stay at N');
+    await new Promise(resolve=>setTimeout(resolve,1700));
+    const includingNext=await materializeEvaluationWindow({windowStart:start,windowEnd:end,dimension:'concept',value:values[2],revision:2});
+    assert.equal(includingNext.metrics.sampleCount,2);assert.deepEqual(includingNext.metrics.coverageExpansion,{countries:1,languages:1,concepts:1,sourceFamilies:1},'earlier N+1 evidence owns each first-coverage event only once it is visible');
+    assert.equal(includingNext.source_checksum,checksum([[futureId,2,`${suffix}-future`],[currentId,1,`${suffix}-current`]].sort((a,b)=>String(a[0]).localeCompare(String(b[0])))));
+  } finally {
+    await db.query(`SELECT set_config('app.phase12_maintenance','on',false)`);await db.query('DELETE FROM discovery_evaluation_snapshots WHERE window_start=$1',[start]).catch(()=>undefined);await db.query('DELETE FROM discovery_evaluation_run_observations WHERE query_run_id=ANY($1::uuid[])',[[currentId,futureId]]).catch(()=>undefined);await db.query(`SELECT set_config('app.phase12_maintenance','off',false)`);await db.query('DELETE FROM query_runs WHERE id=ANY($1::uuid[])',[[currentId,futureId]]).catch(()=>undefined);await db.query('DELETE FROM query_library WHERE query=$1',[suffix]).catch(()=>undefined);
+  }
 });
