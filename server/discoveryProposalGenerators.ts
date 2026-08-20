@@ -599,7 +599,11 @@ export async function persistFrontierProposals(
          supporting_evidence=excluded.supporting_evidence,
          confidence=excluded.confidence,
          novelty_rationale=excluded.novelty_rationale,
-         trial_status=excluded.trial_status,
+         trial_status=CASE
+           WHEN frontier_discovery_proposals.trial_status IN ('TRIED','EXPIRED') THEN frontier_discovery_proposals.trial_status
+           WHEN frontier_discovery_proposals.trial_status='DISABLED' THEN excluded.trial_status
+           ELSE frontier_discovery_proposals.trial_status
+         END,
          expires_at=excluded.expires_at
        WHERE frontier_discovery_proposals.proposal_family='COUNTRY_NATIVE'
          AND excluded.proposal_family='COUNTRY_NATIVE'
@@ -646,6 +650,13 @@ export async function persistFrontierProposals(
                )
              )
            )
+         )
+         OR (
+           excluded.supporting_evidence ? 'projectionRevision'
+           AND excluded.supporting_evidence->>'canonicalTermId' = frontier_discovery_proposals.supporting_evidence->>'canonicalTermId'
+           AND excluded.supporting_evidence->>'nativeEvidenceStatus' IS DISTINCT FROM frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'
+           AND COALESCE((excluded.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
+             > COALESCE((frontier_discovery_proposals.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
          ))`,
       [
         p.dedupKey,

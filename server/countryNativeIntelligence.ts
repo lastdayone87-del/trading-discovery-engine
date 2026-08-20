@@ -561,12 +561,15 @@ export async function refreshCountryNativeProjectionsForCreator(
   );
   for (const row of affected.rows) {
     const projection = await recomputeNativeEvidenceProjection(Number(row.canonical_term_id), runner);
-    if (!projection?.nativeProposalEligible) {
+    const nativeGateSatisfied = projection?.nativeEvidenceStatus === 'NATIVE_OBSERVED' &&
+      (projection.nativeQualityCreatorCount >= 2 || projection.structuredEntityMatched);
+    if (!projection?.nativeProposalEligible || !nativeGateSatisfied) {
       await runner.query(
         `UPDATE frontier_discovery_proposals
          SET trial_status='DISABLED'
          WHERE proposal_family='COUNTRY_NATIVE'
            AND supporting_evidence->>'canonicalTermId'=$1
+           AND supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED'
            AND trial_status='PENDING'`,
         [String(row.canonical_term_id)]
       );

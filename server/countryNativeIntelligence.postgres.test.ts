@@ -167,6 +167,67 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.equal(persisted.supportingEvidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
     assert.equal(persisted.supportingEvidence.nativeQualityCreatorCount, 2, 'persisted proposal evidence uses the production quality definition');
 
+    const governedTerm = await db.query(
+      `INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,term_type,first_observed_at,last_observed_at)
+       VALUES($1,$1,$2,'TERMINOLOGY',now(),now()) RETURNING id`,
+      [`governed downgrade ${suffix}`, country]
+    );
+    await db.query(
+      `INSERT INTO terminology_observations(canonical_term_id,observation_type,evidence,native_evidence_status,source_provenance_family)
+       VALUES($1,'ENRICHMENT','{}'::jsonb,'BOOTSTRAP_SEED','COUNTRY_VOCABULARY')`,
+      [governedTerm.rows[0].id]
+    );
+    for (const channelId of channels) {
+      await db.query(
+        `INSERT INTO terminology_observations(canonical_term_id,source_channel_id,observation_type,evidence,native_evidence_status,source_provenance_family)
+         VALUES($1,$2,'VIDEO_TITLE','{}'::jsonb,'NATIVE_OBSERVED','CREATOR_METADATA')`,
+        [governedTerm.rows[0].id, channelId]
+      );
+    }
+    await recomputeNativeEvidenceProjection(Number(governedTerm.rows[0].id), db);
+    const governedNative = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
+    assert.equal(governedNative?.supportingEvidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+    await persistFrontierProposals([governedNative!]);
+    reclassified!.quality_score = 50;
+    await upsertChannel(reclassified!);
+    let governedStored = await db.query('SELECT trial_status,supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey]);
+    assert.equal(governedStored.rows[0].trial_status, 'DISABLED', 'stale native tier is immediately non-allocatable');
+    const governedBootstrap = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
+    assert.equal(governedBootstrap?.supportingEvidence.nativeEvidenceStatus, 'BOOTSTRAP_SEED');
+    assert.equal(governedBootstrap?.dedupKey, governedNative?.dedupKey);
+    await persistFrontierProposals([governedBootstrap!]);
+    governedStored = await db.query('SELECT trial_status,supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey]);
+    assert.equal(governedStored.rows[0].trial_status, 'PENDING');
+    assert.equal(governedStored.rows[0].supporting_evidence.nativeEvidenceStatus, 'BOOTSTRAP_SEED');
+    reclassified!.quality_score = 55;
+    await upsertChannel(reclassified!);
+    const governedRestored = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
+    await persistFrontierProposals([governedRestored!]);
+    governedStored = await db.query('SELECT trial_status,supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey]);
+    assert.equal(governedStored.rows[0].trial_status, 'PENDING');
+    assert.equal(governedStored.rows[0].supporting_evidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+
+    await db.query(`UPDATE frontier_discovery_proposals SET trial_status='TRIED' WHERE dedup_key=$1`,[governedNative!.dedupKey]);
+    reclassified!.quality_score = 50;
+    await upsertChannel(reclassified!);
+    const triedBootstrap = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
+    await persistFrontierProposals([triedBootstrap!]);
+    assert.equal((await db.query('SELECT trial_status FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey])).rows[0].trial_status, 'TRIED');
+    reclassified!.quality_score = 55;
+    await upsertChannel(reclassified!);
+    const triedNative = (await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id));
+    await persistFrontierProposals([triedNative!]);
+    assert.equal((await db.query('SELECT trial_status FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey])).rows[0].trial_status, 'TRIED', 'native restoration cannot resurrect a consumed trial');
+
+    await db.query(`UPDATE frontier_discovery_proposals SET trial_status='EXPIRED' WHERE dedup_key=$1`,[governedNative!.dedupKey]);
+    reclassified!.quality_score = 50;
+    await upsertChannel(reclassified!);
+    await persistFrontierProposals([(await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id))!]);
+    reclassified!.quality_score = 55;
+    await upsertChannel(reclassified!);
+    await persistFrontierProposals([(await generateCountryNativeProposals(country, 30)).find(p => p.supportingEvidence.canonicalTermId === Number(governedTerm.rows[0].id))!]);
+    assert.equal((await db.query('SELECT trial_status FROM frontier_discovery_proposals WHERE dedup_key=$1',[governedNative!.dedupKey])).rows[0].trial_status, 'EXPIRED', 'expired proposal cannot be resurrected by evidence refresh');
+
     const revisionTerm = await db.query(
       `INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,term_type,first_observed_at,last_observed_at)
        VALUES($1,$1,$2,'TERMINOLOGY',$3,$3) RETURNING id`,
