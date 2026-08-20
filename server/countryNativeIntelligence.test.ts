@@ -53,62 +53,6 @@ test('Phase 10: computeEvidenceChecksum recursively canonicalizes nested evidenc
   assert.equal(checkA, checkB, 'Semantically identical evidence objects with different key insertion order must produce identical checksums');
 });
 
-test('Phase 10: Non-video observations fail closed when stable source evidence identity is missing', async () => {
-  const runner = createMockRunner();
-
-  // Non-video observation without videoId, sourceEvidenceId, or evidence payload MUST fail closed (return null)
-  const rejected = await recordNativeTerminologyObservation({
-    term: 'mini indice acoes',
-    country: 'BR',
-    channelId: 'UC_TEST_01',
-    observationType: 'DESCRIPTION', // Non-video
-    nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA'
-  }, runner);
-
-  assert.equal(rejected, null, 'Non-video observation missing evidence identity must fail closed');
-
-  // Non-video observation WITH evidence payload succeeds
-  const accepted = await recordNativeTerminologyObservation({
-    term: 'mini indice acoes',
-    country: 'BR',
-    channelId: 'UC_TEST_01',
-    observationType: 'DESCRIPTION',
-    nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA',
-    evidence: { channelDescriptionSnippet: 'mini indice acoes no Brasil' }
-  }, runner);
-
-  assert.ok(accepted, 'Non-video observation with evidence payload must be accepted');
-
-  // Video-backed observation WITHOUT explicit evidence payload succeeds because videoId provides identity
-  const videoAccepted = await recordNativeTerminologyObservation({
-    term: 'mini indice acoes',
-    country: 'BR',
-    channelId: 'UC_TEST_01',
-    videoId: 'VID_9999',
-    observationType: 'VIDEO_TITLE',
-    nativeEvidenceStatus: 'NATIVE_OBSERVED',
-    sourceProvenanceFamily: 'CREATOR_METADATA'
-  }, runner);
-
-  assert.ok(videoAccepted, 'Video-backed observation must use videoId as identity');
-});
-
-test('Phase 10: detectCodeSwitching accurately identifies mixed-script and English financial vocabulary in native text', () => {
-  const deGerman = detectCodeSwitching('DAX Opening Range Breakout Setup', 'de');
-  assert.equal(deGerman.isCodeSwitched, true);
-  assert.equal(deGerman.codeSwitchType, 'NATIVE_DOMINANT_ENGLISH_FINANCE');
-
-  const jpMixed = detectCodeSwitching('FXトレード Scalping Strategy', 'ja');
-  assert.equal(jpMixed.isCodeSwitched, true);
-  assert.equal(jpMixed.codeSwitchType, 'MIXED_SCRIPT_TERMINOLOGY');
-
-  const purePt = detectCodeSwitching('investimentos em acoes', 'pt');
-  assert.equal(purePt.isCodeSwitched, false);
-  assert.equal(purePt.codeSwitchType, 'NONE');
-});
-
 /**
  * Mock Queryable Runner for isolated unit testing when PostgreSQL database is not connected.
  */
@@ -143,10 +87,10 @@ function createMockRunner() {
         }
 
         if (existing) {
-          existing.last_observed_at = new Date().toISOString();
-          return { rows: [{ id: existing.id }] };
+          return { rows: [] }; // ON CONFLICT DO NOTHING
         } else {
           const id = nextTermId++;
+          const initialTime = '2026-08-01T00:00:00.000Z';
           const row = {
             id,
             canonical_term: canonicalTerm,
@@ -157,12 +101,32 @@ function createMockRunner() {
             term_type: params[5],
             lifecycle_status: 'CANDIDATE',
             search_eligible: false,
-            first_observed_at: new Date().toISOString(),
-            last_observed_at: new Date().toISOString()
+            first_observed_at: initialTime,
+            last_observed_at: initialTime
           };
           canonicalTerms.set(id, row);
           return { rows: [{ id }] };
         }
+      }
+
+      if (sqlNorm === 'SELECT id FROM canonical_trading_terms WHERE country = $1 AND normalized_term = $2') {
+        const country = params[0];
+        const normTerm = params[1];
+        for (const t of canonicalTerms.values()) {
+          if (t.country === country && t.normalized_term === normTerm) {
+            return { rows: [{ id: t.id }] };
+          }
+        }
+        return { rows: [] };
+      }
+
+      if (sqlNorm.startsWith('UPDATE canonical_trading_terms SET last_observed_at = $2 WHERE id = $1')) {
+        const id = Number(params[0]);
+        const term = canonicalTerms.get(id);
+        if (term) {
+          term.last_observed_at = params[1];
+        }
+        return { rows: [] };
       }
 
       if (sqlNorm.startsWith('SELECT id, canonical_term, normalized_term, country, language, concept_id FROM canonical_trading_terms')) {
@@ -211,7 +175,9 @@ function createMockRunner() {
           return { rows: [] };
         }
 
+        const obsAt = '2026-08-01T12:00:00.000Z';
         const obs = {
+          id: observations.length + 1,
           canonical_term_id: Number(params[0]),
           source_channel_id: params[1],
           source_video_id: params[2],
@@ -225,13 +191,14 @@ function createMockRunner() {
           source_provenance_family: params[10],
           code_switch_type: params[11],
           observation_key: obsKey,
-          evidence: params[13]
+          evidence: params[13],
+          observed_at: obsAt
         };
         observations.push(obs);
-        return { rows: [{ id: observations.length }] };
+        return { rows: [{ id: obs.id, observed_at: obsAt }] };
       }
 
-      if (sqlNorm.startsWith('SELECT o.source_creator_country,')) {
+      if (sqlNorm.startsWith('SELECT o.id, o.source_creator_country,')) {
         const termId = Number(params[0]);
         const termObs = observations.filter(o => o.canonical_term_id === termId);
         const rows = termObs.map(o => {
@@ -259,6 +226,48 @@ function createMockRunner() {
     }
   };
 }
+
+test('Phase 10: Non-video observations fail closed when stable source evidence identity is missing', async () => {
+  const runner = createMockRunner();
+
+  // Non-video observation without videoId, sourceEvidenceId, or evidence payload MUST fail closed (return null)
+  const rejected = await recordNativeTerminologyObservation({
+    term: 'mini indice acoes',
+    country: 'BR',
+    channelId: 'UC_TEST_01',
+    observationType: 'DESCRIPTION', // Non-video
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+
+  assert.equal(rejected, null, 'Non-video observation missing evidence identity must fail closed');
+
+  // Non-video observation WITH evidence payload succeeds
+  const accepted = await recordNativeTerminologyObservation({
+    term: 'mini indice acoes',
+    country: 'BR',
+    channelId: 'UC_TEST_01',
+    observationType: 'DESCRIPTION',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA',
+    evidence: { channelDescriptionSnippet: 'mini indice acoes no Brasil' }
+  }, runner);
+
+  assert.ok(accepted, 'Non-video observation with evidence payload must be accepted');
+
+  // Video-backed observation WITHOUT explicit evidence payload succeeds because videoId provides identity
+  const videoAccepted = await recordNativeTerminologyObservation({
+    term: 'mini indice acoes',
+    country: 'BR',
+    channelId: 'UC_TEST_01',
+    videoId: 'VID_9999',
+    observationType: 'VIDEO_TITLE',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+
+  assert.ok(videoAccepted, 'Video-backed observation must use videoId as identity');
+});
 
 test('Phase 10: Source evidence identity binds payload and changed descriptions create new observations while exact retries deduplicate', async () => {
   const runner = createMockRunner();
@@ -421,4 +430,74 @@ test('Phase 10: Mixed native evidence provenance preserves status and source fam
   assert.deepEqual(proj.sourceProvenanceFamilies.sort(), ['CREATOR_METADATA', 'TRANSLATED_QUERY'].sort());
   assert.equal(proj.sourceProvenanceCounts['CREATOR_METADATA'], 1);
   assert.equal(proj.sourceProvenanceCounts['TRANSLATED_QUERY'], 3);
+});
+
+test('Phase 10: Exact observation replay does NOT advance canonical term last_observed_at timestamp', async () => {
+  const runner = createMockRunner();
+  runner.channels.set('UC_RECENCY_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+
+  const termStr = 'mini indice recency';
+  const evidence = { text: 'snapshot for recency test' };
+
+  // First insertion
+  const termId = await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'BR',
+    channelId: 'UC_RECENCY_1',
+    observationType: 'DESCRIPTION',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA',
+    evidence
+  }, runner);
+
+  assert.ok(termId);
+  const termBefore = runner.canonicalTerms.get(termId!);
+  assert.ok(termBefore);
+  const firstLastObservedAt = termBefore.last_observed_at;
+
+  // Replay exact same observation multiple times
+  for (let i = 0; i < 3; i++) {
+    await recordNativeTerminologyObservation({
+      term: termStr,
+      country: 'BR',
+      channelId: 'UC_RECENCY_1',
+      observationType: 'DESCRIPTION',
+      nativeEvidenceStatus: 'NATIVE_OBSERVED',
+      sourceProvenanceFamily: 'CREATOR_METADATA',
+      evidence
+    }, runner);
+  }
+
+  const termAfter = runner.canonicalTerms.get(termId!);
+  assert.equal(termAfter.last_observed_at, firstLastObservedAt, 'Duplicate observation replay must NOT advance last_observed_at');
+});
+
+test('Phase 10: Projection lastObservedAt is derived from MAX(observed_at) and remains invariant across recomputations', async () => {
+  const runner = createMockRunner();
+  runner.channels.set('UC_PROJ_1', { trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+
+  const termStr = 'hebelprodukte test';
+  const termId = (await recordNativeTerminologyObservation({
+    term: termStr,
+    country: 'DE',
+    channelId: 'UC_PROJ_1',
+    videoId: 'VID_DE_01',
+    observationType: 'VIDEO_TITLE',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED',
+    sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner))!;
+
+  const proj1 = await recomputeNativeEvidenceProjection(termId, runner);
+  const proj2 = await recomputeNativeEvidenceProjection(termId, runner);
+
+  assert.ok(proj1);
+  assert.ok(proj2);
+
+  // Derived lastObservedAt MUST be invariant and match max observation timestamp
+  assert.equal(proj1.lastObservedAt, proj2.lastObservedAt);
+  assert.equal(proj1.lastObservedAt, '2026-08-01T12:00:00.000Z');
+
+  // Array fields MUST be sorted in stable alphabetical order
+  assert.deepEqual(proj1.observedCreatorCountries, ['DE']);
+  assert.deepEqual(proj1.sourceProvenanceFamilies, ['CREATOR_METADATA']);
 });

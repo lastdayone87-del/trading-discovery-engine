@@ -211,7 +211,7 @@ export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
 /**
  * Recomputes native evidence projections deterministically from `terminology_observations` and `channels`.
  * Preserves distributions for provenance status, source family, and code-switching.
- * Ensures full idempotency and idempotency retry safety.
+ * Derives lastObservedAt from maximum observation timestamp and applies deterministic tie-breaking.
  */
 export async function recomputeNativeEvidenceProjection(
   canonicalTermId: number,
@@ -230,9 +230,10 @@ export async function recomputeNativeEvidenceProjection(
   if (!termRes.rows[0]) return null;
   const term = termRes.rows[0];
 
-  // Aggregate observations joined with channel trading status for true quality creator counting
+  // Aggregate observations deterministically sorted by observed_at ASC, id ASC
   const obsRes = await runner.query(
     `SELECT
+       o.id,
        o.source_creator_country,
        o.target_market_country,
        o.locale,
@@ -242,11 +243,13 @@ export async function recomputeNativeEvidenceProjection(
        o.source_provenance_family,
        o.community_fingerprint,
        o.source_channel_id,
+       o.observed_at,
        c.trading_status,
        c.quality_score
      FROM terminology_observations o
      LEFT JOIN channels c ON c.channel_id = o.source_channel_id
-     WHERE o.canonical_term_id = $1`,
+     WHERE o.canonical_term_id = $1
+     ORDER BY o.observed_at ASC, o.id ASC`,
     [canonicalTermId]
   );
 
@@ -272,8 +275,16 @@ export async function recomputeNativeEvidenceProjection(
   const codeSwitchTypeCounts: Record<string, number> = {};
   let codeSwitchedCount = 0;
   let structuredMatched = false;
+  let maxObservedAtDate: Date | null = null;
 
   for (const r of rows) {
+    if (r.observed_at) {
+      const dt = new Date(r.observed_at);
+      if (!maxObservedAtDate || dt > maxObservedAtDate) {
+        maxObservedAtDate = dt;
+      }
+    }
+
     if (r.source_channel_id) {
       allCreators.add(r.source_channel_id);
       // Explicit Quality Creator Criteria: TRADING_CONFIRMED and quality_score >= 50
@@ -308,14 +319,20 @@ export async function recomputeNativeEvidenceProjection(
     }
   }
 
-  // Determine dominant locale
+  // Stable sorted arrays
+  const sortedCreatorCountries = Array.from(creatorCountries).sort();
+  const sortedMarketCountries = Array.from(marketCountries).sort();
+  const sortedCodeSwitchTypes = Object.keys(codeSwitchTypeCounts).sort();
+  const sortedProvenanceFamilies = Object.keys(provenanceCounts).sort();
+
+  // Determine dominant locale with deterministic tie-breaking (alphabetical)
   let dominantLocale = term.language || 'und';
-  let maxLocaleCount = 0;
-  for (const [loc, cnt] of locales.entries()) {
-    if (cnt > maxLocaleCount) {
-      maxLocaleCount = cnt;
-      dominantLocale = loc;
-    }
+  const sortedLocales = Array.from(locales.entries()).sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0].localeCompare(b[0]);
+  });
+  if (sortedLocales.length > 0) {
+    dominantLocale = sortedLocales[0][0];
   }
 
   // Primary native evidence status (summary field)
@@ -329,24 +346,26 @@ export async function recomputeNativeEvidenceProjection(
   const codeSwitchRatio = rawObservationCount > 0 ? codeSwitchedCount / rawObservationCount : 0.0;
   const isCodeSwitched = codeSwitchRatio > 0.3;
 
-  // Determine dominant code-switch type from actual observation distributions
+  // Determine dominant code-switch type with deterministic tie-breaking
   let dominantCodeSwitchType: CodeSwitchType = 'NONE';
-  let maxCsCount = 0;
-  for (const [csT, count] of Object.entries(codeSwitchTypeCounts)) {
-    if (csT !== 'NONE' && count > maxCsCount) {
-      maxCsCount = count;
-      dominantCodeSwitchType = csT as CodeSwitchType;
-    }
+  const sortedCsTypes = Object.entries(codeSwitchTypeCounts)
+    .filter(([t]) => t !== 'NONE')
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].localeCompare(b[0]);
+    });
+  if (sortedCsTypes.length > 0) {
+    dominantCodeSwitchType = sortedCsTypes[0][0] as CodeSwitchType;
   }
 
-  // Primary source provenance family (summary field)
+  // Primary source provenance family with deterministic tie-breaking
   let primaryFamily: SourceProvenanceFamily = 'CREATOR_METADATA';
-  let maxFamCount = 0;
-  for (const [fam, count] of Object.entries(provenanceCounts)) {
-    if (count > maxFamCount) {
-      maxFamCount = count;
-      primaryFamily = fam as SourceProvenanceFamily;
-    }
+  const sortedFamilies = Object.entries(provenanceCounts).sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0].localeCompare(b[0]);
+  });
+  if (sortedFamilies.length > 0) {
+    primaryFamily = sortedFamilies[0][0] as SourceProvenanceFamily;
   }
 
   const distinctCreatorCount = allCreators.size;
@@ -373,19 +392,20 @@ export async function recomputeNativeEvidenceProjection(
   }
 
   const finalConfidence = Math.min(0.95, Math.max(0.0, confidence));
-  const now = new Date().toISOString();
+  const derivedLastObservedAt = maxObservedAtDate ? maxObservedAtDate.toISOString() : new Date().toISOString();
+  const nowUpdatedAt = new Date().toISOString();
 
   const projection: CountryNativeEvidenceProjection = {
     canonicalTermId,
     conceptId: term.concept_id || null,
     country: term.country,
     dominantLocale,
-    observedCreatorCountries: Array.from(creatorCountries),
-    observedMarketCountries: Array.from(marketCountries),
+    observedCreatorCountries: sortedCreatorCountries,
+    observedMarketCountries: sortedMarketCountries,
     codeSwitchRatio,
     isCodeSwitched,
     codeSwitchType: dominantCodeSwitchType,
-    codeSwitchTypes: Object.keys(codeSwitchTypeCounts),
+    codeSwitchTypes: sortedCodeSwitchTypes,
     codeSwitchTypeCounts,
     rawObservationCount,
     nativeObservedCount,
@@ -398,12 +418,12 @@ export async function recomputeNativeEvidenceProjection(
     structuredEntityMatched: structuredMatched,
     nativeEvidenceStatus,
     sourceProvenanceFamily: primaryFamily,
-    sourceProvenanceFamilies: Object.keys(provenanceCounts),
+    sourceProvenanceFamilies: sortedProvenanceFamilies,
     sourceProvenanceCounts: provenanceCounts,
     nativeConfidenceScore: finalConfidence,
     nativeProposalEligible,
-    lastObservedAt: now,
-    updatedAt: now
+    lastObservedAt: derivedLastObservedAt,
+    updatedAt: nowUpdatedAt
   };
 
   // Upsert into country_native_evidence_projections idempotently
@@ -492,7 +512,7 @@ export async function recomputeNativeEvidenceProjection(
  * Extracts and records native candidate market terms from channel/video metadata.
  * Uses deterministic observation keys binding stable evidence identity to ensure observation idempotency and retry safety.
  * For non-video observations, fails closed (returns null) if no stable evidence identity is provided.
- * Invokes refreshTerminologyLifecycle and recomputeNativeEvidenceProjection only when a new observation is actually inserted.
+ * Updates canonical term last_observed_at, refreshes lifecycle, and recomputes projections ONLY when a new observation is actually inserted.
  */
 export async function recordNativeTerminologyObservation(args: {
   term: string;
@@ -526,16 +546,26 @@ export async function recordNativeTerminologyObservation(args: {
   const canonical = args.term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
   const codeSwitching = detectCodeSwitching(canonical, args.locale ? args.locale.split('-')[0] : 'und');
 
-  // Insert or fetch canonical trading term
+  // Insert or fetch canonical trading term WITHOUT touching last_observed_at on conflict
   const saved = await runner.query(
     `INSERT INTO canonical_trading_terms(canonical_term, normalized_term, country, language, script, term_type, first_observed_at, last_observed_at)
      VALUES($1, $2, $3, $4, $5, 'TERMINOLOGY', now(), now())
-     ON CONFLICT(country, normalized_term) DO UPDATE SET last_observed_at = now()
+     ON CONFLICT(country, normalized_term) DO NOTHING
      RETURNING id`,
     [canonical, norm, args.country.toUpperCase(), codeSwitching.dominantLanguage, inferScript(canonical)]
   );
 
-  const termId = Number(saved.rows[0].id);
+  let termId: number;
+  if (saved.rows && saved.rows[0]) {
+    termId = Number(saved.rows[0].id);
+  } else {
+    const existing = await runner.query(
+      `SELECT id FROM canonical_trading_terms WHERE country = $1 AND normalized_term = $2`,
+      [args.country.toUpperCase(), norm]
+    );
+    if (!existing.rows || !existing.rows[0]) return null;
+    termId = Number(existing.rows[0].id);
+  }
 
   const creatorCountry = (args.sourceCreatorCountry || args.country).toUpperCase();
   const marketCountry = (args.targetMarketCountry || args.country).toUpperCase();
@@ -563,7 +593,7 @@ export async function recordNativeTerminologyObservation(args: {
      )
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT (observation_key) DO NOTHING
-     RETURNING id`,
+     RETURNING id, observed_at`,
     [
       termId,
       args.channelId || null,
@@ -582,8 +612,14 @@ export async function recordNativeTerminologyObservation(args: {
     ]
   );
 
-  // Invoke authoritative terminology lifecycle refresh & projection recompute ONLY if a new observation was actually inserted!
+  // Invoke authoritative terminology lifecycle refresh, update canonical last_observed_at & recompute projection
+  // ONLY if a new observation row was actually inserted!
   if (obsInsert.rows && obsInsert.rows.length > 0) {
+    const obsAt = obsInsert.rows[0].observed_at || new Date().toISOString();
+    await runner.query(
+      `UPDATE canonical_trading_terms SET last_observed_at = $2 WHERE id = $1`,
+      [termId, obsAt]
+    );
     await refreshTerminologyLifecycle(termId, undefined, runner);
     await recomputeNativeEvidenceProjection(termId, runner);
   }
