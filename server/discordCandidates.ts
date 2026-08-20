@@ -36,7 +36,10 @@ export const canonicalDiscordInviteId=(code:string)=>`discord:${String(code||'')
 const candidate=(value:Omit<DiscordCandidate,'candidateId'>):DiscordCandidate=>{
   const canonicalInviteId=value.nativeInviteCode?canonicalDiscordInviteId(value.nativeInviteCode):undefined;
   const observation:DiscordCandidateObservation={sourceSurface:value.sourceSurface,sourceUrl:value.sourceUrl,rawLocator:value.rawLocator,sourcePageUrl:value.sourceUrl,extractionConfidence:value.extractionConfidence};
-  return {...value,canonicalInviteId,observations:value.observations?.length?value.observations:[observation],candidateId:id(value)};
+  // A native invite is one logical candidate regardless of which creator
+  // surface emitted it. Provenance belongs in observations, not in identity.
+  const candidateId=id(canonicalInviteId?{canonicalInviteId}:{locatorType:value.locatorType,rawLocator:value.rawLocator.toLowerCase()});
+  return {...value,canonicalInviteId,observations:value.observations?.length?value.observations:[observation],candidateId};
 };
 export const makeDiscordCandidate=candidate;
 

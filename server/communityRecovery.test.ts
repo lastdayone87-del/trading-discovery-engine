@@ -54,6 +54,14 @@ test('shouldReactivateCommunityRecovery reactivates FAILED_PERMANENT after fresh
   assert.ok(check.reasonCodes.includes('COMMUNITY_FRESHNESS_INTERVAL_EXPIRED'));
 });
 
+test('legacy semantic terminal evidence is not resurrected',()=>{
+  const channel=mockChannel('FAILED_PERMANENT','2026-01-01T00:00:00Z');
+  channel.discord_validation_status='COMPLETED';
+  const check=shouldReactivateCommunityRecovery(channel,undefined,true,Date.parse('2026-03-01T00:00:00Z'));
+  assert.equal(check.reactivate,false);
+  assert.deepEqual(check.reasonCodes,['SEMANTIC_TERMINAL_EVIDENCE_PRESERVED']);
+});
+
 test('reactivateCommunityRecovery resets scan_status to ENRICHMENT_PENDING while preserving history', () => {
   const channel = mockChannel();
   channel.inspection_trail = [{ step: 'BIO', title: 'Prior Failed Attempt', status: 'NOT_FOUND', timestamp: '2026-01-01T00:00:00Z' }];

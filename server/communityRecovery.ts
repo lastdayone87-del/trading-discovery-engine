@@ -22,6 +22,13 @@ export function shouldReactivateCommunityRecovery(
     return { reactivate: false, reasonCodes: ['SCAN_STATUS_NOT_RECOVERABLE_FAILURE'] };
   }
 
+  // FAILED is the canonical operational state. Legacy FAILED_PERMANENT is
+  // recoverable only when it carries operational/unknown validation evidence;
+  // an explicitly completed semantic terminal decision is not resurrected.
+  if(channel.scan_status==='FAILED_PERMANENT'&&channel.discord_validation_status==='COMPLETED'){
+    return {reactivate:false,reasonCodes:['SEMANTIC_TERMINAL_EVIDENCE_PRESERVED']};
+  }
+
   const reasons: string[] = [];
 
   if (isManualRecheck) {
@@ -89,7 +96,7 @@ export async function reconcileCommunityAcquisitionRecovery(
 
   const db = await getDb();
   const rows = await db.query(
-    `SELECT c.channel_id FROM channels c WHERE c.scan_status IN('FAILED','FAILED_PERMANENT') AND (c.last_checked IS NULL OR c.last_checked < now() - interval '30 days') ORDER BY c.last_checked ASC LIMIT $1`,
+    `SELECT c.channel_id FROM channels c WHERE c.scan_status IN('FAILED','FAILED_PERMANENT') AND c.discord_validation_status <> 'COMPLETED' AND (c.last_checked IS NULL OR c.last_checked < now() - interval '30 days') ORDER BY c.last_checked ASC LIMIT $1`,
     [Math.min(100, Math.max(1, limit))]
   );
 

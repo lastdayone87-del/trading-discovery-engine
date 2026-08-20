@@ -22,5 +22,10 @@ export function discordValidationRank(validation:{operationalOutcome?:string;rel
  * candidates within the same ownership tier, so an active partner community
  * cannot replace a creator-owned candidate merely because it validates first. */
 export function discordCandidateCompositeRank(candidate:DiscordCandidate,validation:{operationalOutcome?:string;relevanceStatus?:string;status?:string}):number{
-  return discordOwnershipRank(candidate)*1000+discordValidationRank(validation);
+  // A usable validation always outranks an operationally unavailable or
+  // invalid candidate. Ownership remains authoritative within the same
+  // validation tier, so a healthy partner still cannot replace a healthy
+  // creator-owned community.
+  const usable=validation.operationalOutcome==='SUCCEEDED'?10000:0;
+  return usable+discordOwnershipRank(candidate)*1000+discordValidationRank(validation);
 }

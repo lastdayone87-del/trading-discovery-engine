@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
+import {nextChannelScanAttempts} from './queueManager';
 
 const db=readFileSync('server/db.ts','utf8');
 const queue=readFileSync('server/queueManager.ts','utf8');
@@ -26,7 +27,9 @@ test('operational retry exhaustion remains recoverable instead of FAILED_PERMANE
   assert.match(retryFailure,/scan_status='FAILED'/);
   assert.match(retryFailure,/discord_validation_status='RETRY_PENDING'/);
   assert.doesNotMatch(retryFailure,/FAILED_PERMANENT/);
-  assert.match(queue,/channel\.scan_attempts\+1/);
+  assert.equal(nextChannelScanAttempts(6,false),7);
+  assert.equal(nextChannelScanAttempts(7,true),0);
+  assert.match(queue,/nextChannelScanAttempts\(channel\.scan_attempts/);
   assert.doesNotMatch(queue,/channel\.scan_attempts\+selected\.attempts\.length/);
 });
 
