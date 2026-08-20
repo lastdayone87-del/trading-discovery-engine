@@ -12,6 +12,7 @@ import {
 import { observeTerminology } from './terminologyIntelligence';
 import { getDb } from './db';
 import fs from 'node:fs';
+import { projectionProposalProvenance } from './discoveryProposalGenerators';
 
 test('Phase 10: normalizeNativeTerm preserves diacritics, ticker symbols, and multi-word phrases', () => {
   assert.equal(normalizeNativeTerm('  Ações Brasil  '), 'ações brasil');
@@ -53,6 +54,17 @@ test('Phase 10: computeEvidenceChecksum recursively canonicalizes nested evidenc
 
   assert.ok(checkA.length > 0);
   assert.equal(checkA, checkB, 'Semantically identical evidence objects with different key insertion order must produce identical checksums');
+});
+
+test('Phase 10: projection proposal provenance preserves all governed native evidence families', () => {
+  assert.equal(projectionProposalProvenance('NATIVE_OBSERVED', 'CREATOR_METADATA', 1).sourceProvenance,
+    'observed_native_evidence:creator_metadata:canonical_projection:1');
+  assert.equal(projectionProposalProvenance('BOOTSTRAP_SEED', 'COUNTRY_VOCABULARY', 2).sourceProvenance,
+    'bootstrap_vocabulary:country_vocabulary:canonical_projection:2');
+  assert.equal(projectionProposalProvenance('BOOTSTRAP_SEED', 'STATIC_BOOTSTRAP', 3).sourceProvenance,
+    'bootstrap_vocabulary:static_bootstrap:canonical_projection:3');
+  assert.equal(projectionProposalProvenance('TRANSLATED_SEED', 'TRANSLATED_QUERY', 4).sourceProvenance,
+    'translated_seed:translated_query:canonical_projection:4');
 });
 
 /**
@@ -297,6 +309,22 @@ test('Phase 10: observeTerminology automatically feeds Phase 10 native evidence 
   assert.ok(proj, 'observeTerminology must generate Phase 10 projection');
 });
 
+test('Phase 10: canonical country casing cannot create a parallel canonical term', async () => {
+  const runner = createMockRunner();
+  runner.canonicalTerms.set(77, {
+    id: 77, canonical_term: 'options flow', normalized_term: 'options flow',
+    country: 'United States', language: 'en', term_type: 'TERMINOLOGY',
+    lifecycle_status: 'CANDIDATE', search_eligible: false,
+    first_observed_at: '2026-08-01T00:00:00.000Z', last_observed_at: '2026-08-01T00:00:00.000Z'
+  });
+  const termId = await observeTerminology({
+    term: 'options flow', country: 'UNITED STATES', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'country-case-video'
+  }, runner);
+  assert.equal(termId, 77);
+  assert.equal(runner.canonicalTerms.size, 1);
+});
+
 test('Phase 10: Separate creator geography, market geography, and code-switching languages', async () => {
   const runner = createMockRunner();
 
@@ -314,8 +342,8 @@ test('Phase 10: Separate creator geography, market geography, and code-switching
 
   const deObs = runner.observations.find(o => o.canonical_term_id === deTermId);
   assert.ok(deObs);
-  assert.equal(deObs.source_creator_country, 'DE');
-  assert.equal(deObs.target_market_country, 'US');
+  assert.equal(deObs.source_creator_country, 'Germany');
+  assert.equal(deObs.target_market_country, 'United States');
   assert.equal(deObs.is_code_switched, true);
   assert.equal(deObs.native_language, 'de', 'native_language must represent context language de');
   assert.equal(deObs.term_language, 'en', 'term_language must represent embedded term language en');
@@ -530,7 +558,7 @@ test('Phase 10: Projection lastObservedAt is derived from MAX(observed_at) and r
   assert.equal(proj1.lastObservedAt, '2026-08-01T12:00:00.000Z');
 
   // Array fields MUST be sorted in stable alphabetical order
-  assert.deepEqual(proj1.observedCreatorCountries, ['DE']);
+  assert.deepEqual(proj1.observedCreatorCountries, ['Germany']);
   assert.deepEqual(proj1.sourceProvenanceFamilies, ['CREATOR_METADATA']);
 });
 

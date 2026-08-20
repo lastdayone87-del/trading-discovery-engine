@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { completeQueryRun, getDb } from './db';
 import { observeTerminology } from './terminologyIntelligence';
-import { generateCountryNativeProposals } from './discoveryProposalGenerators';
+import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
@@ -117,6 +117,30 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     const persisted = proposals.find(proposal => proposal.supportingEvidence.canonicalTermId === firstId);
     assert.ok(persisted, 'persisted eligible native projection must feed the production proposal generator');
     assert.equal(persisted.supportingEvidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+
+    const bootstrap = buildFrontierProposal({
+      proposalFamily: 'COUNTRY_NATIVE', country, concept: term,
+      sourceProvenance: `bootstrap_vocabulary:static_seed:${term}`,
+      supportingEvidence: {
+        provenanceType: 'bootstrap_vocabulary', nativeEvidenceStatus: 'BOOTSTRAP_SEED',
+        sourceProvenanceFamily: 'STATIC_BOOTSTRAP', nativeTerm: term, market: country
+      },
+      confidence: 0.4, noveltyRationale: 'bootstrap first'
+    });
+    await persistFrontierProposals([bootstrap]);
+    await persistFrontierProposals([persisted!]);
+    await persistFrontierProposals([bootstrap]);
+    const upgraded = await db.query(
+      `SELECT count(*)::int count, max(source_provenance) source_provenance,
+              max(supporting_evidence->>'nativeEvidenceStatus') native_status,
+              max(confidence)::float confidence
+       FROM frontier_discovery_proposals WHERE dedup_key=$1`,
+      [bootstrap.dedupKey]
+    );
+    assert.equal(upgraded.rows[0].count, 1);
+    assert.equal(upgraded.rows[0].native_status, 'NATIVE_OBSERVED');
+    assert.match(upgraded.rows[0].source_provenance, /^observed_native_evidence:/);
+    assert.ok(Math.abs(upgraded.rows[0].confidence - persisted!.confidence) < 1e-6);
 
     const query = await db.query(
       `INSERT INTO query_library(query,normalized_query,country,collection,intent)

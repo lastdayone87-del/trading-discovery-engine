@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getDb } from './db';
-import { buildDiscoveryNeighborhood, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
+import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
+import { canonicalCountry } from './countryInference';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -73,6 +74,7 @@ export function buildFrontierProposal(params: {
   confidence?: number;
   noveltyRationale: string;
   ttlDays?: number;
+  preserveCountryIdentity?: boolean;
 }): DiscoveryFrontierProposal {
   const dimensions: DiscoveryNeighborhoodDimensions = {
     country: params.country,
@@ -94,7 +96,7 @@ export function buildFrontierProposal(params: {
   return {
     dedupKey,
     proposalFamily: params.proposalFamily,
-    country: params.country.toUpperCase().trim(),
+    country: params.preserveCountryIdentity ? canonicalCountry(params.country) : params.country.toUpperCase().trim(),
     language: params.language ? params.language.trim() : null,
     concept: params.concept.trim(),
     targetNeighborhoodKey: neighborhood.neighborhoodKey,
@@ -230,8 +232,28 @@ const NATIVE_FINANCIAL_SEEDS: Record<string, string[]> = {
   IN: ['Nifty 50 options', 'Bank Nifty daytrading', 'Indian stock market', 'Zerodha trading', 'crypto India']
 };
 
+export function projectionProposalProvenance(
+  nativeEvidenceStatus: string,
+  sourceProvenanceFamily: string,
+  canonicalTermId: number
+): { provenanceType: string; sourceProvenance: string } {
+  const identity = `canonical_projection:${canonicalTermId}`;
+  if (nativeEvidenceStatus === 'NATIVE_OBSERVED') {
+    return { provenanceType: 'observed_native_evidence', sourceProvenance: `observed_native_evidence:${sourceProvenanceFamily.toLowerCase()}:${identity}` };
+  }
+  if (nativeEvidenceStatus === 'TRANSLATED_SEED' || sourceProvenanceFamily === 'TRANSLATED_QUERY') {
+    return { provenanceType: 'translated_seed', sourceProvenance: `translated_seed:translated_query:${identity}` };
+  }
+  if (sourceProvenanceFamily === 'COUNTRY_VOCABULARY') {
+    return { provenanceType: 'bootstrap_vocabulary', sourceProvenance: `bootstrap_vocabulary:country_vocabulary:${identity}` };
+  }
+  return { provenanceType: 'bootstrap_vocabulary', sourceProvenance: `bootstrap_vocabulary:static_bootstrap:${identity}` };
+}
+
 export async function generateCountryNativeProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
-  const normC = country.toUpperCase().trim();
+  const canonicalC = canonicalCountry(country);
+  const normC = canonicalC.toUpperCase();
+  const seedKey = country.toUpperCase().trim();
 
   try {
     const db = await getDb().catch(() => null);
@@ -261,17 +283,19 @@ export async function generateCountryNativeProposals(country: string, limit = 10
 
       if (nativeProjRes.rows.length > 0) {
         return nativeProjRes.rows.map(row => {
-          const isObserved = row.native_evidence_status === 'NATIVE_OBSERVED';
-          const provenanceType = isObserved ? 'observed_native_evidence' : 'bootstrap_vocabulary';
+          const provenance = projectionProposalProvenance(
+            row.native_evidence_status,
+            row.source_provenance_family,
+            Number(row.canonical_term_id)
+          );
           return buildFrontierProposal({
             proposalFamily: 'COUNTRY_NATIVE',
-            country: normC,
+            country: canonicalC,
+            preserveCountryIdentity: true,
             concept: row.canonical_term,
-            sourceProvenance: isObserved
-              ? `observed_native_evidence:canonical_trading_terms:${row.canonical_term_id}:${row.canonical_term}`
-              : `bootstrap_vocabulary:static_seed:${row.canonical_term}`,
+            sourceProvenance: provenance.sourceProvenance,
             supportingEvidence: {
-              provenanceType,
+              provenanceType: provenance.provenanceType,
               nativeEvidenceStatus: row.native_evidence_status,
               sourceProvenanceFamily: row.source_provenance_family,
               canonicalTermId: Number(row.canonical_term_id),
@@ -284,7 +308,7 @@ export async function generateCountryNativeProposals(country: string, limit = 10
               observedCreatorCountries: row.observed_creator_countries || [],
               observedMarketCountries: row.observed_market_countries || [],
               nativeTerm: row.canonical_term,
-              market: normC
+              market: canonicalC
             },
             confidence: Number(row.native_confidence_score),
             noveltyRationale: `Generated from eligible country-native concept projection for ${normC}.`
@@ -326,7 +350,8 @@ export async function generateCountryNativeProposals(country: string, limit = 10
           return observedTerms.map(term =>
             buildFrontierProposal({
               proposalFamily: 'COUNTRY_NATIVE',
-              country: normC,
+              country: canonicalC,
+              preserveCountryIdentity: true,
               concept: term,
               sourceProvenance: `bootstrap_vocabulary:country_vocabularies:${term}`,
               supportingEvidence: {
@@ -335,7 +360,7 @@ export async function generateCountryNativeProposals(country: string, limit = 10
                 sourceProvenanceFamily: 'COUNTRY_VOCABULARY',
                 sourceTable: 'country_vocabularies',
                 nativeTerm: term,
-                market: normC
+                market: canonicalC
               },
               confidence: 0.85,
               noveltyRationale: `Generated from governed country vocabulary bootstrap evidence for ${normC}.`
@@ -349,11 +374,12 @@ export async function generateCountryNativeProposals(country: string, limit = 10
   }
 
   // 3. Fallback to static seed dictionary explicitly identified as bootstrap_vocabulary
-  const seeds = NATIVE_FINANCIAL_SEEDS[normC] || ['local exchange trading', 'stock market investing', 'crypto trading'];
+  const seeds = NATIVE_FINANCIAL_SEEDS[seedKey] || NATIVE_FINANCIAL_SEEDS[normC] || ['local exchange trading', 'stock market investing', 'crypto trading'];
   return seeds.slice(0, limit).map(seed =>
     buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
-      country: normC,
+      country: canonicalC,
+      preserveCountryIdentity: true,
       concept: seed,
       sourceProvenance: `bootstrap_vocabulary:static_seed:${seed}`,
       supportingEvidence: {
@@ -362,7 +388,7 @@ export async function generateCountryNativeProposals(country: string, limit = 10
         sourceProvenanceFamily: 'STATIC_BOOTSTRAP',
         isBootstrapSeed: true,
         nativeTerm: seed,
-        market: normC
+        market: canonicalC
       },
       confidence: 0.65,
       noveltyRationale: `Generated from bootstrap seed dictionary for ${normC}.`
@@ -377,7 +403,7 @@ export async function materializeBoundedCountryNativeProposals(
 ): Promise<{ generated: number; persisted: number; proposals: DiscoveryFrontierProposal[] }> {
   const globalCap = Math.min(100, Math.max(1, Math.floor(config.globalCap ?? 25)));
   const perCountryCap = Math.min(globalCap, Math.max(1, Math.floor(config.perCountryCap ?? 5)));
-  const normalizedCountries = [...new Set(countries.map(country => country.toUpperCase().trim()).filter(Boolean))].sort();
+  const normalizedCountries = [...new Set(countries.map(canonicalCountry).filter(Boolean))].sort();
   const generated = (await Promise.all(normalizedCountries.map(country =>
     generateCountryNativeProposals(country, perCountryCap).catch(() => [])
   ))).flat();
@@ -446,7 +472,8 @@ export async function generateTemporalProposals(country: string, limit = 10): Pr
 }
 
 /**
- * Persists proposals into database with deduplication (ON CONFLICT (dedup_key) DO NOTHING).
+ * Persists proposals with stable identity; COUNTRY_NATIVE evidence upgrades only
+ * when deterministic provenance precedence is strictly stronger.
  */
 export async function persistFrontierProposals(
   proposals: DiscoveryFrontierProposal[]
@@ -456,6 +483,18 @@ export async function persistFrontierProposals(
   let inserted = 0;
 
   for (const p of proposals) {
+    if (p.targetNeighborhoodKey) {
+      const d = p.targetDimensions;
+      await db.query(
+        `INSERT INTO discovery_neighborhoods(
+           neighborhood_key,neighborhood_checksum,country,language,query_intent,
+           primary_term_family,retrieval_lane,search_ordering,instrument_or_theme,source_family,metadata
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'{}'::jsonb)
+         ON CONFLICT(neighborhood_key) DO NOTHING`,
+        [p.targetNeighborhoodKey, createNeighborhoodChecksum(p.targetNeighborhoodKey), d.country, d.language,
+          d.queryIntent, d.primaryTermFamily, d.retrievalLane, d.searchOrdering, d.instrumentOrTheme, d.sourceFamily]
+      );
+    }
     const res = await db.query(
       `INSERT INTO frontier_discovery_proposals(
          dedup_key, proposal_family, country, language, concept,
@@ -463,7 +502,30 @@ export async function persistFrontierProposals(
          supporting_evidence, confidence, novelty_rationale, trial_status, expires_at
        )
        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-       ON CONFLICT(dedup_key) DO NOTHING`,
+       ON CONFLICT(dedup_key) DO UPDATE SET
+         country=excluded.country,
+         language=excluded.language,
+         target_neighborhood_key=excluded.target_neighborhood_key,
+         target_dimensions=excluded.target_dimensions,
+         source_provenance=excluded.source_provenance,
+         supporting_evidence=excluded.supporting_evidence,
+         confidence=excluded.confidence,
+         novelty_rationale=excluded.novelty_rationale,
+         expires_at=excluded.expires_at
+       WHERE frontier_discovery_proposals.proposal_family='COUNTRY_NATIVE'
+         AND excluded.proposal_family='COUNTRY_NATIVE'
+         AND (CASE
+           WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+           WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+           WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+           WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+           ELSE 0 END)
+         > (CASE
+           WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+           WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+           WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+           WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+           ELSE 0 END)`,
       [
         p.dedupKey,
         p.proposalFamily,

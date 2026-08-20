@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
+import { canonicalCountry } from './countryInference';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
 
@@ -310,8 +311,8 @@ export async function recomputeNativeEvidenceProjection(
       }
     }
 
-    if (r.source_creator_country) creatorCountries.add(r.source_creator_country.toUpperCase());
-    if (r.target_market_country) marketCountries.add(r.target_market_country.toUpperCase());
+    if (r.source_creator_country) creatorCountries.add(canonicalCountry(r.source_creator_country));
+    if (r.target_market_country) marketCountries.add(canonicalCountry(r.target_market_country));
     if (r.community_fingerprint) communities.add(r.community_fingerprint);
 
     if (r.locale && r.locale !== 'und') {
@@ -608,7 +609,7 @@ export async function attributeCountryNativePerformance(args: {
       args.allocationDecisionId || null,
       args.queryId || null,
       args.queryRunId || null,
-      args.country.toUpperCase(),
+      canonicalCountry(args.country),
       args.nativeEvidenceStatus,
       args.sourceProvenanceFamily,
       Boolean(args.isCodeSwitched),

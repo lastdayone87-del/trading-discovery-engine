@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
+import { canonicalCountry } from './countryInference';
 import {
   computeEvidenceChecksum,
   computeObservationKey,
@@ -81,6 +82,7 @@ export async function observeTerminology(args: {
 }, clientOverride?: Queryable): Promise<number | null> {
   const canonical = args.term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
   const normalized = normalizeTerm(canonical);
+  const country = canonicalCountry(args.country);
   if (normalized.length < 2 || normalized.length > 80) return null;
 
   const isVideoBacked = Boolean(args.videoId && args.videoId.trim() !== '');
@@ -123,7 +125,7 @@ export async function observeTerminology(args: {
      VALUES($1, $2, $3, $4, $5, $6, now(), now())
      ON CONFLICT(country, normalized_term) DO NOTHING
      RETURNING id`,
-    [canonical, normalized, args.country.toUpperCase(), contextLang, inferScript(canonical), args.termType]
+    [canonical, normalized, country, contextLang, inferScript(canonical), args.termType]
   );
 
   let termId: number;
@@ -132,15 +134,15 @@ export async function observeTerminology(args: {
   } else {
     const existing = await runner.query(
       `SELECT id FROM canonical_trading_terms WHERE country = $1 AND normalized_term = $2`,
-      [args.country.toUpperCase(), normalized]
+      [country, normalized]
     );
     if (!existing.rows || !existing.rows[0]) return null;
     termId = Number(existing.rows[0].id);
   }
 
   // 2. Resolve native creator/locale evidence status
-  let resolvedCreatorCountry: string | null = args.sourceCreatorCountry ? args.sourceCreatorCountry.toUpperCase() : null;
-  let resolvedMarketCountry: string | null = args.targetMarketCountry ? args.targetMarketCountry.toUpperCase() : null;
+  let resolvedCreatorCountry: string | null = args.sourceCreatorCountry ? canonicalCountry(args.sourceCreatorCountry) : null;
+  let resolvedMarketCountry: string | null = args.targetMarketCountry ? canonicalCountry(args.targetMarketCountry) : null;
 
   if (!resolvedCreatorCountry && args.channelId) {
     const channelRes = await runner.query(
@@ -149,14 +151,14 @@ export async function observeTerminology(args: {
     ).catch(() => ({ rows: [] }));
 
     if (channelRes.rows && channelRes.rows[0] && channelRes.rows[0].country) {
-      resolvedCreatorCountry = String(channelRes.rows[0].country).toUpperCase();
+      resolvedCreatorCountry = canonicalCountry(String(channelRes.rows[0].country));
     }
   }
 
   let resolvedNativeStatus: NativeEvidenceStatus | null = args.nativeEvidenceStatus || null;
   let resolvedProvenanceFamily: SourceProvenanceFamily | null = args.sourceProvenanceFamily || null;
 
-  if (!resolvedNativeStatus && resolvedCreatorCountry && resolvedCreatorCountry === args.country.toUpperCase()) {
+  if (!resolvedNativeStatus && resolvedCreatorCountry && resolvedCreatorCountry === country) {
     resolvedNativeStatus = 'NATIVE_OBSERVED';
     resolvedProvenanceFamily = 'CREATOR_METADATA';
   }
@@ -258,7 +260,7 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
   if (!learned) return;
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return;
-  const terms = await runner.query('SELECT id FROM canonical_trading_terms WHERE country=$1 AND normalized_term=$2', [query.country, learned]);
+  const terms = await runner.query('SELECT id FROM canonical_trading_terms WHERE country=$1 AND normalized_term=$2', [canonicalCountry(query.country), learned]);
   for (const row of terms.rows) {
     const yieldScore = metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0;
     await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
@@ -277,13 +279,13 @@ export async function getTerminologyDashboard(country?: string, clientOverride?:
     LEFT JOIN LATERAL (SELECT COUNT(DISTINCT source_channel_id) distinct_creators FROM terminology_observations WHERE canonical_term_id=t.id) o ON true
     LEFT JOIN LATERAL (SELECT SUM(executions) executions,SUM(new_creators) new_creators,COALESCE(SUM(decayed_yield_score*executions)/NULLIF(SUM(executions),0),0) decayed_yield_score,json_object_agg(retrieval_lane,lane_yield) lanes FROM (SELECT retrieval_lane,SUM(executions) executions,SUM(new_creators) new_creators,AVG(decayed_yield_score) lane_yield FROM terminology_performance WHERE canonical_term_id=t.id GROUP BY retrieval_lane) x) p ON true
     LEFT JOIN LATERAL (SELECT json_agg(json_build_object('type',event_type,'from',from_status,'to',to_status,'reason',reason,'at',created_at) ORDER BY created_at DESC) history FROM terminology_lifecycle_events WHERE canonical_term_id=t.id) e ON true
-    WHERE ($1::text IS NULL OR t.country=$1) ORDER BY t.search_eligible DESC,p.decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST`, [country || null]);
+    WHERE ($1::text IS NULL OR t.country=$1) ORDER BY t.search_eligible DESC,p.decayed_yield_score DESC,t.last_observed_at DESC NULLS LAST`, [country ? canonicalCountry(country) : null]);
   return result.rows;
 }
 
 export async function getPlannerTerminology(country: string, clientOverride?: Queryable): Promise<Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }>> {
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return [];
-  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [country]);
+  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country)]);
   return result.rows.map(row => ({ id: Number(row.id), term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }));
 }
