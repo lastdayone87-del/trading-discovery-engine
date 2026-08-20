@@ -1202,23 +1202,21 @@ async function attributeCompletedCountryNativeRun(client: EventClient, runId: st
 }): Promise<void> {
   const lineage = await client.query(
     `SELECT d.decision_id, d.proposal_id, d.coverage_gain, r.query_id, r.country,
-            p.supporting_evidence
+            d.proposal_evidence_snapshot
      FROM frontier_allocation_decisions d
-     JOIN frontier_discovery_proposals p ON p.proposal_id=d.proposal_id
      JOIN query_runs r ON r.id=d.query_run_id
      WHERE d.query_run_id=$1
        AND d.allocation_origin='FRONTIER_CANARY'
        AND d.decision_status='COMMITTED'
-       AND p.proposal_family='COUNTRY_NATIVE'
+       AND d.proposal_evidence_snapshot->>'proposalFamily'='COUNTRY_NATIVE'
      ORDER BY d.created_at, d.decision_id
      LIMIT 1`,
     [runId]
   );
   if (!lineage.rowCount) return;
   const row = lineage.rows[0];
-  const evidence = typeof row.supporting_evidence === 'string'
-    ? JSON.parse(row.supporting_evidence)
-    : row.supporting_evidence || {};
+  const snapshot = typeof row.proposal_evidence_snapshot === 'string' ? JSON.parse(row.proposal_evidence_snapshot) : row.proposal_evidence_snapshot || {};
+  const evidence = snapshot.supportingEvidence || {};
   const canonicalTermId = Number(evidence.canonicalTermId);
   const nativeEvidenceStatus = String(evidence.nativeEvidenceStatus || '');
   const sourceProvenanceFamily = String(evidence.sourceProvenanceFamily || '');

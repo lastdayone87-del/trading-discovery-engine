@@ -290,6 +290,7 @@ export async function recomputeNativeEvidenceProjection(
   let translatedSeedCount = 0;
 
   const provenanceCounts: Record<string, number> = {};
+  const provenanceCountsByStatus: Record<string, Record<string, number>> = {};
   const codeSwitchTypeCounts: Record<string, number> = {};
   let codeSwitchedCount = 0;
   let structuredMatched = false;
@@ -331,9 +332,9 @@ export async function recomputeNativeEvidenceProjection(
 
     const family = r.source_provenance_family || 'UNCLASSIFIED';
     provenanceCounts[family] = (provenanceCounts[family] || 0) + 1;
-
-    if (family === 'STRUCTURED_LOCAL_ENTITY') {
-      structuredMatched = true;
+    if (r.native_evidence_status) {
+      const byStatus = provenanceCountsByStatus[r.native_evidence_status] ||= {};
+      byStatus[family] = (byStatus[family] || 0) + 1;
     }
   }
 
@@ -380,13 +381,15 @@ export async function recomputeNativeEvidenceProjection(
 
   // Primary source provenance family with deterministic tie-breaking
   let primaryFamily: SourceProvenanceFamily = 'CREATOR_METADATA';
-  const sortedFamilies = Object.entries(provenanceCounts).sort((a, b) => {
+  const winningProvenanceCounts = provenanceCountsByStatus[nativeEvidenceStatus] || {};
+  const sortedFamilies = Object.entries(winningProvenanceCounts).sort((a, b) => {
     if (b[1] !== a[1]) return b[1] - a[1];
     return a[0].localeCompare(b[0]);
   });
   if (sortedFamilies.length > 0 && sortedFamilies[0][0] !== 'UNCLASSIFIED') {
     primaryFamily = sortedFamilies[0][0] as SourceProvenanceFamily;
   }
+  structuredMatched = Boolean(winningProvenanceCounts.STRUCTURED_LOCAL_ENTITY);
 
   const distinctCreatorCount = allCreators.size;
   const qualityCreatorCount = qualityCreators.size;

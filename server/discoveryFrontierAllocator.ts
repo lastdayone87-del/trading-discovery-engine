@@ -25,6 +25,7 @@ export interface NeighborhoodCandidate {
   isSaturating: boolean;
   proposalId?: string;
   proposalFamily?: string;
+  proposalEvidenceSnapshot?: Record<string, unknown> | null;
   lastAllocatedAt?: string | null;
   recentAllocationCount: number;
   expectedQuotaCost: number;
@@ -64,6 +65,7 @@ export interface AllocationDecision {
     knownCreatorRatio: number;
   };
   proposalId?: string | null;
+  proposalEvidenceSnapshot?: Record<string, unknown> | null;
   selectionScore: number;
   scoreComponents: ScoringComponents;
   candidateNeighborhoodCount: number;
@@ -252,6 +254,9 @@ export async function getNeighborhoodCandidates(
       COALESCE((fs.evidence->>'isSaturating')::boolean, false) AS is_saturating,
       p.proposal_id::text AS proposal_id,
       p.proposal_family,
+      p.supporting_evidence AS proposal_supporting_evidence,
+      p.source_provenance AS proposal_source_provenance,
+      p.confidence AS proposal_confidence,
       recent.last_allocated_at,
       COALESCE(recent.alloc_count, 0)::int AS recent_allocation_count
     FROM discovery_neighborhoods n
@@ -269,7 +274,7 @@ export async function getNeighborhoodCandidates(
       ORDER BY observed_at DESC LIMIT 1
     ) obs ON true
     LEFT JOIN LATERAL (
-      SELECT proposal_id, proposal_family
+      SELECT proposal_id, proposal_family, supporting_evidence, source_provenance, confidence
       FROM frontier_discovery_proposals
       WHERE target_neighborhood_key = n.neighborhood_key
         AND trial_status = 'PENDING'
@@ -318,6 +323,12 @@ export async function getNeighborhoodCandidates(
       isSaturating: Boolean(row.is_saturating),
       proposalId: row.proposal_id || undefined,
       proposalFamily: row.proposal_family || undefined,
+      proposalEvidenceSnapshot: row.proposal_id ? {
+        proposalFamily: row.proposal_family,
+        sourceProvenance: row.proposal_source_provenance,
+        confidence: Number(row.proposal_confidence),
+        supportingEvidence: typeof row.proposal_supporting_evidence === 'string' ? JSON.parse(row.proposal_supporting_evidence) : row.proposal_supporting_evidence
+      } : null,
       lastAllocatedAt: row.last_allocated_at || null,
       recentAllocationCount: Number(row.recent_allocation_count || 0),
       expectedQuotaCost: 100
@@ -430,6 +441,7 @@ export async function evaluateShadowFrontierAllocation(input: {
       knownCreatorRatio: selectedCandidate.knownCreatorRatio
     },
     proposalId: selectedCandidate.proposalId || null,
+    proposalEvidenceSnapshot: selectedCandidate.proposalEvidenceSnapshot || null,
     selectionScore: selectedScoreComponents.totalScore,
     scoreComponents: selectedScoreComponents,
     candidateNeighborhoodCount: candidates.length,
@@ -452,9 +464,10 @@ export async function evaluateShadowFrontierAllocation(input: {
          frontier_state, expected_marginal_value, uncertainty, coverage_gain,
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
-         deferred, quota_reserved, quota_consumed, quota_day, policy_version
+         deferred, quota_reserved, quota_consumed, quota_day, policy_version,
+         proposal_evidence_snapshot, proposal_evidence_checksum
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,
@@ -480,7 +493,9 @@ export async function evaluateShadowFrontierAllocation(input: {
         decision.quotaReserved,
         decision.quotaConsumed,
         decision.quotaDay,
-        decision.policyVersion
+        decision.policyVersion,
+        JSON.stringify(decision.proposalEvidenceSnapshot),
+        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null
       ]
     ).catch((error: unknown) => console.warn('[FrontierAllocator] Failed to persist shadow decision:', error));
   }
@@ -676,6 +691,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
         knownCreatorRatio: topCandidate.knownCreatorRatio
       },
       proposalId: topCandidate.proposalId || null,
+      proposalEvidenceSnapshot: topCandidate.proposalEvidenceSnapshot || null,
       selectionScore: topScore.totalScore,
       scoreComponents: topScore,
       candidateNeighborhoodCount: candidates.length,
@@ -696,9 +712,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
          frontier_state, expected_marginal_value, uncertainty, coverage_gain,
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
-         deferred, quota_reserved, quota_consumed, quota_day, policy_version
+         deferred, quota_reserved, quota_consumed, quota_day, policy_version,
+         proposal_evidence_snapshot, proposal_evidence_checksum
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,
@@ -724,7 +741,9 @@ export async function evaluateFrontierCanaryAllocation(input: {
         decision.quotaReserved,
         decision.quotaConsumed,
         decision.quotaDay,
-        decision.policyVersion
+        decision.policyVersion,
+        JSON.stringify(decision.proposalEvidenceSnapshot),
+        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null
       ]
     );
 

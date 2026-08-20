@@ -200,7 +200,11 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     // Materialize proposal-only evidence inside the existing producer cycle.
     // Phase 8 remains the sole allocation authority; generation failures cannot
     // block the legacy Query Intelligence scheduler.
-    await materializeBoundedCountryNativeProposals(countries, { globalCap: 25, perCountryCap: 5 })
+    await materializeBoundedCountryNativeProposals(countries, {
+      globalCap: 25,
+      perCountryCap: 5,
+      cycleIdentity: now.toISOString()
+    })
       .catch(error => console.warn('[FrontierProposals] Country-native generation warning:', error));
 
     currentCountryIndex = Number(await getAppSetting('qi_current_country_index', '0')) || 0;

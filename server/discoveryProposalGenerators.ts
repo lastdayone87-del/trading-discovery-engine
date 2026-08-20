@@ -272,7 +272,8 @@ export async function generateCountryNativeProposals(country: string, limit = 10
            p.is_code_switched,
            p.code_switch_type,
            p.observed_creator_countries,
-           p.observed_market_countries
+           p.observed_market_countries,
+           p.last_observed_at
          FROM country_native_evidence_projections p
          JOIN canonical_trading_terms t ON t.id = p.canonical_term_id
          WHERE UPPER(p.country) = $1 AND p.native_proposal_eligible = true
@@ -307,6 +308,9 @@ export async function generateCountryNativeProposals(country: string, limit = 10
               codeSwitchType: row.code_switch_type || 'NONE',
               observedCreatorCountries: row.observed_creator_countries || [],
               observedMarketCountries: row.observed_market_countries || [],
+              lastObservedAt: row.last_observed_at instanceof Date
+                ? row.last_observed_at.toISOString()
+                : row.last_observed_at,
               nativeTerm: row.canonical_term,
               market: canonicalC
             },
@@ -399,21 +403,47 @@ export async function generateCountryNativeProposals(country: string, limit = 10
 /** Bounded Phase 10 materialization for the existing autonomous producer cycle. */
 export async function materializeBoundedCountryNativeProposals(
   countries: string[],
-  config: { globalCap?: number; perCountryCap?: number } = {}
+  config: { globalCap?: number; perCountryCap?: number; cycleIdentity?: string } = {}
 ): Promise<{ generated: number; persisted: number; proposals: DiscoveryFrontierProposal[] }> {
   const globalCap = Math.min(100, Math.max(1, Math.floor(config.globalCap ?? 25)));
   const perCountryCap = Math.min(globalCap, Math.max(1, Math.floor(config.perCountryCap ?? 5)));
   const normalizedCountries = [...new Set(countries.map(canonicalCountry).filter(Boolean))].sort();
-  const generated = (await Promise.all(normalizedCountries.map(country =>
-    generateCountryNativeProposals(country, perCountryCap).catch(() => [])
-  ))).flat();
-  const seen = new Set<string>();
-  const proposals = generated
-    .sort((a, b) => a.country.localeCompare(b.country) || a.dedupKey.localeCompare(b.dedupKey))
-    .filter(proposal => !seen.has(proposal.dedupKey) && Boolean(seen.add(proposal.dedupKey)))
-    .slice(0, globalCap);
+  const groups = await Promise.all(normalizedCountries.map(async country => ({
+    country,
+    proposals: await generateCountryNativeProposals(country, perCountryCap).catch(() => [])
+  })));
+  const proposals = selectFairCountryNativeProposals(groups, globalCap, config.cycleIdentity ?? 'default');
   const persisted = await persistFrontierProposals(proposals);
   return { generated: proposals.length, persisted, proposals };
+}
+
+/** Deterministic rotating round-robin selection prevents lexicographic country starvation. */
+export function selectFairCountryNativeProposals(
+  groups: Array<{ country: string; proposals: DiscoveryFrontierProposal[] }>,
+  globalCap: number,
+  cycleIdentity: string
+): DiscoveryFrontierProposal[] {
+  const ordered = groups
+    .map(group => ({ ...group, proposals: [...group.proposals].sort((a, b) => a.dedupKey.localeCompare(b.dedupKey)) }))
+    .filter(group => group.proposals.length > 0)
+    .sort((a, b) => a.country.localeCompare(b.country));
+  if (!ordered.length || globalCap <= 0) return [];
+  const offset = Number.parseInt(createHash('sha256').update(cycleIdentity).digest('hex').slice(0, 8), 16) % ordered.length;
+  const rotated = [...ordered.slice(offset), ...ordered.slice(0, offset)];
+  const seen = new Set<string>();
+  const selected: DiscoveryFrontierProposal[] = [];
+  const maxDepth = Math.max(...rotated.map(group => group.proposals.length));
+  for (let depth = 0; depth < maxDepth && selected.length < globalCap; depth++) {
+    for (const group of rotated) {
+      const proposal = group.proposals[depth];
+      if (proposal && !seen.has(proposal.dedupKey)) {
+        seen.add(proposal.dedupKey);
+        selected.push(proposal);
+        if (selected.length >= globalCap) break;
+      }
+    }
+  }
+  return selected;
 }
 
 // 6. COVERAGE_GAP Generator
@@ -473,7 +503,8 @@ export async function generateTemporalProposals(country: string, limit = 10): Pr
 
 /**
  * Persists proposals with stable identity; COUNTRY_NATIVE evidence upgrades only
- * when deterministic provenance precedence is strictly stronger.
+ * when deterministic provenance precedence is stronger, or same-tier evidence
+ * improves monotonically without losing an already persisted signal.
  */
 export async function persistFrontierProposals(
   proposals: DiscoveryFrontierProposal[]
@@ -514,7 +545,7 @@ export async function persistFrontierProposals(
          expires_at=excluded.expires_at
        WHERE frontier_discovery_proposals.proposal_family='COUNTRY_NATIVE'
          AND excluded.proposal_family='COUNTRY_NATIVE'
-         AND (CASE
+         AND ((CASE
            WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
            WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
            WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
@@ -525,7 +556,34 @@ export async function persistFrontierProposals(
            WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
            WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
            WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
-           ELSE 0 END)`,
+           ELSE 0 END)
+         OR (
+           (CASE
+             WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+             WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+             WHEN excluded.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+             WHEN excluded.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+             ELSE 0 END)
+           = (CASE
+             WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='NATIVE_OBSERVED' THEN 400
+             WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='COUNTRY_VOCABULARY' THEN 300
+             WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
+             WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
+             ELSE 0 END)
+           AND COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
+           AND COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
+           AND excluded.confidence >= frontier_discovery_proposals.confidence
+           AND COALESCE(excluded.supporting_evidence->'observedCreatorCountries','[]'::jsonb) @> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedCreatorCountries','[]'::jsonb)
+           AND COALESCE(excluded.supporting_evidence->'observedMarketCountries','[]'::jsonb) @> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedMarketCountries','[]'::jsonb)
+           AND (
+             COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
+             OR COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
+             OR excluded.confidence > frontier_discovery_proposals.confidence
+             OR (COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+                 AND (COALESCE(excluded.supporting_evidence->'observedCreatorCountries','[]'::jsonb) <> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedCreatorCountries','[]'::jsonb)
+                   OR COALESCE(excluded.supporting_evidence->'observedMarketCountries','[]'::jsonb) <> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedMarketCountries','[]'::jsonb)))
+           )
+         ))`,
       [
         p.dedupKey,
         p.proposalFamily,

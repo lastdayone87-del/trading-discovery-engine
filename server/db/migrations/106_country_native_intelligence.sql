@@ -18,6 +18,27 @@ CREATE INDEX IF NOT EXISTS idx_term_obs_market_country ON terminology_observatio
 CREATE INDEX IF NOT EXISTS idx_term_obs_status ON terminology_observations(native_evidence_status);
 CREATE INDEX IF NOT EXISTS idx_term_obs_key ON terminology_observations(observation_key);
 
+ALTER TABLE frontier_allocation_decisions
+  ADD COLUMN IF NOT EXISTS proposal_evidence_snapshot JSONB,
+  ADD COLUMN IF NOT EXISTS proposal_evidence_checksum TEXT;
+
+CREATE OR REPLACE FUNCTION preserve_frontier_proposal_evidence_snapshot()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.proposal_evidence_snapshot IS NOT NULL AND
+     (NEW.proposal_evidence_snapshot IS DISTINCT FROM OLD.proposal_evidence_snapshot OR
+      NEW.proposal_evidence_checksum IS DISTINCT FROM OLD.proposal_evidence_checksum) THEN
+    RAISE EXCEPTION 'frontier proposal evidence snapshot is immutable after allocation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_preserve_frontier_proposal_evidence_snapshot ON frontier_allocation_decisions;
+CREATE TRIGGER trg_preserve_frontier_proposal_evidence_snapshot
+BEFORE UPDATE OF proposal_evidence_snapshot, proposal_evidence_checksum ON frontier_allocation_decisions
+FOR EACH ROW EXECUTE FUNCTION preserve_frontier_proposal_evidence_snapshot();
+
 -- 2. Derived, idempotent aggregate country-native evidence projection table
 CREATE TABLE IF NOT EXISTS country_native_evidence_projections (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
