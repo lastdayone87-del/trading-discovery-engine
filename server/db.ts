@@ -1419,7 +1419,7 @@ export async function completeQueryRun(runId: string, metrics: {
     if (run.rowCount) await recordNeighborhoodAnalyticsAfterRun(runId, metrics);
     // Phase 12 is observation-only. Failure must never interrupt autonomous
     // discovery or change the authoritative completion transaction.
-    if (run.rowCount) {
+    {
       const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
       await captureCompletedRunObservation(runId).catch(error => console.warn('[DiscoveryTrustEvaluation] Observation capture failed:', error));
     }
@@ -1478,9 +1478,13 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
     await db.query(`UPDATE query_runs SET status='RETRYING',error=$2 WHERE id=$1`, [runId, message]);
     return;
   }
-  const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now() WHERE id=$1 RETURNING query_id`, [runId, message]);
+  const code=String((error as any)?.code||'').toUpperCase();
+  const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':'PROVIDER_FAILURE';
+  const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),performance_details=jsonb_set(performance_details,'{failureKind}',to_jsonb($3::text),true) WHERE id=$1 RETURNING query_id`, [runId, message, failureKind]);
   if (run.rowCount) await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
   await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+  const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
+  await captureCompletedRunObservation(runId).catch(captureError => console.warn('[DiscoveryTrustEvaluation] Failure observation capture failed:', captureError));
 }
 
 export async function tryReserveQuota(args: {

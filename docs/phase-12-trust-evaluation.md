@@ -14,11 +14,14 @@ scheduler. Phase 12 is allowed to insert only evaluation observations/snapshots.
 Allocation decisions and `proposal_evidence_snapshot` are immutable historical
 state. Proposal lifecycle and creator classification are mutable operational
 state. A run observation records both the allocation snapshot and a separately
-timestamped classification observation. Later evidence/proposal/classification
-changes never rewrite it; a deliberate new snapshot revision is required.
+timestamped, checksummed classification observation. Late classification creates
+an immutable per-run observation revision; it never updates an earlier revision.
+Later evidence/proposal/classification changes therefore cannot rewrite history.
 
-Completion commits before best-effort evaluation capture. Capture is unique by
-query run, so duplicate completion/retry cannot double count. Snapshot identity is
+Completion commits before best-effort evaluation capture. Completion replay invokes
+capture again, and terminal failures use the same best-effort path; identical
+outcome checksums deduplicate while genuinely late outcomes create a revision.
+Snapshot identity is
 `cohort + half-open UTC window + evaluator version + revision`; an identical retry
 is idempotent and a changed source checksum requires a new revision. Reads are
 bounded to 10,000 ordered runs and diagnostics to 500 snapshots. Evaluation has
@@ -32,13 +35,16 @@ latency, results and creator outcomes. Provenance is never parsed from query tex
 Deterministic cohorts cover overall, legacy/frontier allocation origin, proposal
 family, country, language, independent source family and concept over `[start,end)`.
 
-Per-query yield divides each new/relevant/quality/confirmed count by completed run
+Per-query yield divides each new/relevant/quality/confirmed count by terminal run
 count. Precision divides those useful-new outcomes by new creators. Novelty is new
 over distinct creators; redundancy is known over distinct creators. Efficiency is
 quota over relevant-new creators (null when none), plus request/allocation counts
-and latency. Failure/wrong-country/irrelevant rates use completed runs or raw
-results as explicitly named. Coverage counts distinct persisted countries,
-languages, concepts and source families. Totals are presented beside normalized
+and latency. Failure rates use terminal runs; wrong-country and irrelevant rates use
+distinct creators because those funnel outcomes are creator-level. Provider request count is the greater of observed
+page depth and authoritative quota cost divided by the 100-unit search cost.
+Coverage counts distinct persisted countries, languages, concepts and source
+families; expansion requires no earlier persisted observation of that identity.
+Totals and explicit denominator fields are presented beside normalized
 rates, so legacy/frontier traffic differences cannot masquerade as performance.
 
 “Incremental” is limited to directly observed novelty (`was_known=false`) at the
@@ -54,7 +60,9 @@ relevance precision. Fewer than 20 completed queries is always
 thresholds produce `HEALTHY`, `WATCH`, or `DEGRADED`. Status never disables work.
 Provider failures affect operational degradation, not semantic evidence.
 
-Country-Native grouping uses its frozen native evidence/provenance. OSINT grouping
+Country-Native grouping uses its frozen canonical-term identity, locale/language,
+native status and provenance. New proposals persist these fields at allocation;
+older snapshots retain their canonical term ID without reconstruction. OSINT grouping
 uses the frozen canonical concept and deduplicated `sourceFamilies` snapshot;
 corroboration quality remains separate from retrieval outcome quality. Stale and
 expired proposals remain lifecycle metrics in their existing authorities and must
