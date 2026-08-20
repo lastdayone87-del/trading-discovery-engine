@@ -507,7 +507,7 @@ export async function recomputeNativeEvidenceProjection(
        native_confidence_score = EXCLUDED.native_confidence_score,
        native_proposal_eligible = EXCLUDED.native_proposal_eligible,
        last_observed_at = EXCLUDED.last_observed_at,
-       updated_at = EXCLUDED.updated_at`,
+       updated_at = GREATEST(EXCLUDED.updated_at, country_native_evidence_projections.updated_at + interval '1 millisecond')`,
     [
       canonicalTermId,
       projection.conceptId,
@@ -543,6 +543,36 @@ export async function recomputeNativeEvidenceProjection(
   );
 
   return projection;
+}
+
+/** Refreshes only projections whose append-only observations reference the reclassified creator. */
+export async function refreshCountryNativeProjectionsForCreator(
+  channelId: string,
+  clientOverride?: Queryable
+): Promise<number> {
+  const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+  if (!runner) return 0;
+  const affected = await runner.query(
+    `SELECT DISTINCT canonical_term_id
+     FROM terminology_observations
+     WHERE source_channel_id=$1 AND native_evidence_status IS NOT NULL
+     ORDER BY canonical_term_id`,
+    [channelId]
+  );
+  for (const row of affected.rows) {
+    const projection = await recomputeNativeEvidenceProjection(Number(row.canonical_term_id), runner);
+    if (!projection?.nativeProposalEligible) {
+      await runner.query(
+        `UPDATE frontier_discovery_proposals
+         SET trial_status='DISABLED'
+         WHERE proposal_family='COUNTRY_NATIVE'
+           AND supporting_evidence->>'canonicalTermId'=$1
+           AND trial_status='PENDING'`,
+        [String(row.canonical_term_id)]
+      );
+    }
+  }
+  return affected.rows.length;
 }
 
 /**

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { completeQueryRun, getDb } from './db';
+import { completeQueryRun, getChannelById, getDb, upsertChannel } from './db';
 import { observeTerminology } from './terminologyIntelligence';
 import { buildFrontierProposal, countryNativeEvidenceChecksum, countryNativeEvidenceVersion, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
@@ -80,6 +80,53 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.equal(projection.rows[0].quality_creator_count, 2);
     assert.equal(projection.rows[0].native_quality_creator_count, 2);
     assert.equal(projection.rows[0].native_proposal_eligible, true);
+
+    const reclassified = await getChannelById(channels[0]);
+    assert.ok(reclassified);
+    reclassified!.quality_score = 50;
+    await upsertChannel(reclassified!);
+    let refreshedQuality = await db.query(
+      `SELECT native_quality_creator_count,native_proposal_eligible,updated_at FROM country_native_evidence_projections WHERE canonical_term_id=$1`,
+      [firstId]
+    );
+    assert.equal(refreshedQuality.rows[0].native_quality_creator_count, 1, '56+ to 50 removes native quality qualification');
+    assert.equal(refreshedQuality.rows[0].native_proposal_eligible, false);
+
+    reclassified!.quality_score = 54;
+    await upsertChannel(reclassified!);
+    reclassified!.quality_score = 55;
+    await upsertChannel(reclassified!);
+    refreshedQuality = await db.query(
+      `SELECT native_quality_creator_count,native_proposal_eligible,updated_at FROM country_native_evidence_projections WHERE canonical_term_id=$1`,
+      [firstId]
+    );
+    assert.equal(refreshedQuality.rows[0].native_quality_creator_count, 2, '54 to 55 adds native quality qualification');
+    assert.equal(refreshedQuality.rows[0].native_proposal_eligible, true);
+
+    reclassified!.trading_status = 'NON_TRADING';
+    await upsertChannel(reclassified!);
+    refreshedQuality = await db.query(
+      `SELECT native_quality_creator_count,native_proposal_eligible,updated_at FROM country_native_evidence_projections WHERE canonical_term_id=$1`,
+      [firstId]
+    );
+    assert.equal(refreshedQuality.rows[0].native_quality_creator_count, 1, 'trading-confirmed to non-trading removes qualification');
+    const affectedUpdatedAt = new Date(refreshedQuality.rows[0].updated_at).toISOString();
+
+    const unrelatedId = `P10_UNRELATED_${suffix}`;
+    await db.query(
+      `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+       VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','phase10-test',now(),90,'TRADING_CONFIRMED')`,
+      [unrelatedId, `https://youtube.com/channel/${unrelatedId}`, country]
+    );
+    const unrelated = await getChannelById(unrelatedId);
+    unrelated!.quality_score = 10;
+    await upsertChannel(unrelated!);
+    assert.equal(new Date((await db.query('SELECT updated_at FROM country_native_evidence_projections WHERE canonical_term_id=$1',[firstId])).rows[0].updated_at).toISOString(), affectedUpdatedAt,
+      'unrelated creator reclassification must not touch the projection');
+
+    reclassified!.trading_status = 'TRADING_CONFIRMED';
+    await upsertChannel(reclassified!);
+    assert.equal((await db.query('SELECT native_quality_creator_count FROM country_native_evidence_projections WHERE canonical_term_id=$1',[firstId])).rows[0].native_quality_creator_count, 2);
 
     await attributeCountryNativePerformance({
       attributionKey: `native-attribution:${firstId}:run-1`,
@@ -274,6 +321,42 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
           nativeQualityCreatorCount: 1
         } })]
     );
+    const immutableSnapshot = (await db.query(
+      'SELECT proposal_evidence_snapshot FROM frontier_allocation_decisions WHERE decision_id=$1',
+      [`decision:${suffix}`]
+    )).rows[0].proposal_evidence_snapshot;
+    reclassified!.quality_score = 50;
+    await upsertChannel(reclassified!);
+    assert.deepEqual((await db.query(
+      'SELECT proposal_evidence_snapshot FROM frontier_allocation_decisions WHERE decision_id=$1',
+      [`decision:${suffix}`]
+    )).rows[0].proposal_evidence_snapshot, immutableSnapshot, 'committed allocation snapshot remains immutable after creator reclassification');
+    assert.equal((await generateCountryNativeProposals(country, 20)).some(p => p.supportingEvidence.canonicalTermId === firstId), false,
+      'subsequent proposal generation observes the refreshed underqualified projection');
+    const downgradedStructuredProposal = (await generateCountryNativeProposals(country, 20)).find(
+      p => p.supportingEvidence.canonicalTermId === Number(revisionTerm.rows[0].id)
+    );
+    assert.equal(downgradedStructuredProposal?.supportingEvidence.nativeQualityCreatorCount, 1);
+    await persistFrontierProposals([downgradedStructuredProposal!]);
+    assert.equal((await db.query(
+      'SELECT supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1',
+      [downgradedStructuredProposal!.dedupKey]
+    )).rows[0].supporting_evidence.nativeQualityCreatorCount, 1);
+    reclassified!.quality_score = 55;
+    await upsertChannel(reclassified!);
+    const subsequentProposal = (await generateCountryNativeProposals(country, 20)).find(
+      p => p.supportingEvidence.canonicalTermId === Number(revisionTerm.rows[0].id)
+    );
+    assert.equal(subsequentProposal?.supportingEvidence.nativeQualityCreatorCount, 2,
+      'subsequent proposal evidence uses the refreshed qualifying classification');
+    await persistFrontierProposals([subsequentProposal!]);
+    const refreshedPersistedProposal = await db.query(
+      `SELECT trial_status,supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1`,
+      [subsequentProposal!.dedupKey]
+    );
+    assert.equal(refreshedPersistedProposal.rows[0].trial_status, 'PENDING');
+    assert.equal(refreshedPersistedProposal.rows[0].supporting_evidence.nativeQualityCreatorCount, 2,
+      'future Phase 8 allocation reads refreshed persisted evidence');
     await db.query(`UPDATE frontier_discovery_proposals SET supporting_evidence=$2 WHERE proposal_id=$1`, [
       proposal.rows[0].proposal_id, JSON.stringify({ canonicalTermId: null, nativeEvidenceStatus: 'TRANSLATED_SEED', sourceProvenanceFamily: 'TRANSLATED_QUERY' })
     ]);

@@ -22,7 +22,7 @@ import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidenc
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
-import { calculateQueryFunnel, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
+import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 
 const { Pool } = pg;
@@ -347,7 +347,14 @@ export async function getChannelById(channelId: string): Promise<ChannelRecord |
 
 export async function upsertChannel(channel: ChannelRecord): Promise<void> {
   const db = await getDb();
-  await db.query(`INSERT INTO channels (
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const prior = await client.query(
+      'SELECT quality_score,trading_status FROM channels WHERE channel_id=$1 FOR UPDATE',
+      [channel.channel_id]
+    );
+    await client.query(`INSERT INTO channels (
     channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,updated_at
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,now())
   ON CONFLICT(channel_id) DO UPDATE SET
@@ -363,7 +370,22 @@ export async function upsertChannel(channel: ChannelRecord): Promise<void> {
     channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
     channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
     channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED'
-  ]);
+    ]);
+    if (prior.rowCount) {
+      const before = isQualityCreator(prior.rows[0].trading_status, Number(prior.rows[0].quality_score || 0));
+      const after = isQualityCreator(channel.trading_status || 'UNCERTAIN', Number(channel.quality_score || 0));
+      if (before !== after) {
+        const { refreshCountryNativeProjectionsForCreator } = await import('./countryNativeIntelligence');
+        await refreshCountryNativeProjectionsForCreator(channel.channel_id, client);
+      }
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getCountryVocabularies(): Promise<CountryVocabulary[]> {

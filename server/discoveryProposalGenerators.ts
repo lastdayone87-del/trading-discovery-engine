@@ -321,6 +321,7 @@ export async function generateCountryNativeProposals(country: string, limit = 10
            p.observed_creator_countries,
            p.observed_market_countries,
            p.last_observed_at
+           ,p.updated_at AS projection_updated_at
          FROM country_native_evidence_projections p
          JOIN canonical_trading_terms t ON t.id = p.canonical_term_id
          WHERE UPPER(p.country) = $1 AND p.native_proposal_eligible = true
@@ -356,6 +357,8 @@ export async function generateCountryNativeProposals(country: string, limit = 10
               isCodeSwitched: Boolean(row.is_code_switched),
               structuredEntityMatched: Boolean(row.structured_entity_matched),
               evidenceRevision: String(row.evidence_revision || '0'),
+              projectionRevision: row.projection_updated_at instanceof Date
+                ? row.projection_updated_at.toISOString() : row.projection_updated_at,
               codeSwitchType: row.code_switch_type || 'NONE',
               observedCreatorCountries: row.observed_creator_countries || [],
               observedMarketCountries: row.observed_market_countries || [],
@@ -596,6 +599,7 @@ export async function persistFrontierProposals(
          supporting_evidence=excluded.supporting_evidence,
          confidence=excluded.confidence,
          novelty_rationale=excluded.novelty_rationale,
+         trial_status=excluded.trial_status,
          expires_at=excluded.expires_at
        WHERE frontier_discovery_proposals.proposal_family='COUNTRY_NATIVE'
          AND excluded.proposal_family='COUNTRY_NATIVE'
@@ -624,20 +628,22 @@ export async function persistFrontierProposals(
              WHEN frontier_discovery_proposals.supporting_evidence->>'nativeEvidenceStatus'='TRANSLATED_SEED' THEN 200
              WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
              ELSE 0 END)
-           AND COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
-           AND COALESCE((excluded.supporting_evidence->>'nativeQualityCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'nativeQualityCreatorCount')::int,0)
-           AND COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
-           AND excluded.confidence >= frontier_discovery_proposals.confidence
-           AND COALESCE(excluded.supporting_evidence->'observedCreatorCountries','[]'::jsonb) @> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedCreatorCountries','[]'::jsonb)
-           AND COALESCE(excluded.supporting_evidence->'observedMarketCountries','[]'::jsonb) @> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedMarketCountries','[]'::jsonb)
            AND (
              COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
                > COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
              OR (
                COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
                  = COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
-               AND COALESCE((excluded.supporting_evidence->>'evidenceRevision')::numeric,0)
+               AND (
+                 COALESCE((excluded.supporting_evidence->>'evidenceRevision')::numeric,0)
                    > COALESCE((frontier_discovery_proposals.supporting_evidence->>'evidenceRevision')::numeric,0)
+                 OR (
+                   COALESCE((excluded.supporting_evidence->>'evidenceRevision')::numeric,0)
+                     = COALESCE((frontier_discovery_proposals.supporting_evidence->>'evidenceRevision')::numeric,0)
+                   AND COALESCE((excluded.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
+                     > COALESCE((frontier_discovery_proposals.supporting_evidence->>'projectionRevision')::timestamptz,'epoch'::timestamptz)
+                 )
+               )
              )
            )
          ))`,
