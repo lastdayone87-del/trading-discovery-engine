@@ -11,6 +11,7 @@ export type ProposalFamily =
   | 'CREATOR_NEIGHBORHOOD'
   | 'PLAYLIST_TOPIC'
   | 'COUNTRY_NATIVE'
+  | 'EXTERNAL_OSINT'
   | 'COVERAGE_GAP'
   | 'TEMPORAL';
 
@@ -118,10 +119,10 @@ export function buildFrontierProposal(params: {
     language: params.language || null,
     queryIntent: params.intent || 'GENERAL',
     primaryTermFamily: params.primaryTermFamily || params.concept,
-    retrievalLane: params.retrievalLane || (params.proposalFamily === 'COUNTRY_NATIVE' ? 'VIDEO' : 'ORGANIC'),
+    retrievalLane: params.retrievalLane || (params.proposalFamily === 'COUNTRY_NATIVE' || params.proposalFamily === 'EXTERNAL_OSINT' ? 'VIDEO' : 'ORGANIC'),
     searchOrdering: params.searchOrdering || 'RELEVANCE',
     instrumentOrTheme: params.instrumentOrTheme || null,
-    sourceFamily: params.sourceFamily || (params.proposalFamily === 'COUNTRY_NATIVE' ? 'automated_query' : 'frontier_proposal')
+    sourceFamily: params.sourceFamily || (params.proposalFamily === 'COUNTRY_NATIVE' || params.proposalFamily === 'EXTERNAL_OSINT' ? 'automated_query' : 'frontier_proposal')
   };
 
   const neighborhood = buildDiscoveryNeighborhood(dimensions);
