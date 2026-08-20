@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getDb } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry } from './countryInference';
+import { computeEvidenceChecksum } from './countryNativeIntelligence';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -55,6 +56,31 @@ export function createProposalDedupKey(
   return createHash('sha256').update(raw).digest('hex');
 }
 
+export function countryNativeEvidenceChecksum(evidence: Record<string, unknown>): string {
+  const { evidenceChecksum: _previousChecksum, ...mutableEvidence } = evidence;
+  return computeEvidenceChecksum(mutableEvidence);
+}
+
+export function effectiveProjectionProposalEvidence(row: {
+  native_evidence_status: string;
+  source_provenance_family: string;
+  source_provenance_families?: string[];
+  bootstrap_seed_count?: number | string;
+  quality_creator_count?: number | string;
+}): { nativeEvidenceStatus: string; sourceProvenanceFamily: string; nativeGateSatisfied: boolean } {
+  const nativeGateSatisfied = row.native_evidence_status === 'NATIVE_OBSERVED' &&
+    (Number(row.quality_creator_count) >= 2 || row.source_provenance_family === 'STRUCTURED_LOCAL_ENTITY');
+  const families = row.source_provenance_families || [];
+  return {
+    nativeGateSatisfied,
+    nativeEvidenceStatus: nativeGateSatisfied ? row.native_evidence_status
+      : Number(row.bootstrap_seed_count) > 0 ? 'BOOTSTRAP_SEED' : row.native_evidence_status,
+    sourceProvenanceFamily: nativeGateSatisfied ? row.source_provenance_family
+      : families.includes('COUNTRY_VOCABULARY') ? 'COUNTRY_VOCABULARY'
+        : Number(row.bootstrap_seed_count) > 0 ? 'STATIC_BOOTSTRAP' : row.source_provenance_family
+  };
+}
+
 /**
  * Constructs a candidate proposal object with deterministic dedup key and neighborhood.
  */
@@ -93,6 +119,10 @@ export function buildFrontierProposal(params: {
   const ttl = params.ttlDays ?? 14;
   const expiresAt = new Date(Date.now() + ttl * 86_400_000).toISOString();
 
+  const supportingEvidence = params.supportingEvidence || {};
+  const versionedEvidence = params.proposalFamily === 'COUNTRY_NATIVE'
+    ? { ...supportingEvidence, evidenceChecksum: countryNativeEvidenceChecksum(supportingEvidence) }
+    : supportingEvidence;
   return {
     dedupKey,
     proposalFamily: params.proposalFamily,
@@ -102,7 +132,7 @@ export function buildFrontierProposal(params: {
     targetNeighborhoodKey: neighborhood.neighborhoodKey,
     targetDimensions: neighborhood.dimensions,
     sourceProvenance: params.sourceProvenance,
-    supportingEvidence: params.supportingEvidence || {},
+    supportingEvidence: versionedEvidence,
     confidence: Math.max(0.0, Math.min(1.0, params.confidence ?? 0.5)),
     noveltyRationale: params.noveltyRationale,
     trialStatus: 'PENDING',
@@ -267,6 +297,8 @@ export async function generateCountryNativeProposals(country: string, limit = 10
            p.native_confidence_score,
            p.native_evidence_status,
            p.source_provenance_family,
+           p.source_provenance_families,
+           p.bootstrap_seed_count,
            p.quality_creator_count,
            p.distinct_creator_count,
            p.is_code_switched,
@@ -284,9 +316,10 @@ export async function generateCountryNativeProposals(country: string, limit = 10
 
       if (nativeProjRes.rows.length > 0) {
         return nativeProjRes.rows.map(row => {
+          const effective = effectiveProjectionProposalEvidence(row);
           const provenance = projectionProposalProvenance(
-            row.native_evidence_status,
-            row.source_provenance_family,
+            effective.nativeEvidenceStatus,
+            effective.sourceProvenanceFamily,
             Number(row.canonical_term_id)
           );
           return buildFrontierProposal({
@@ -297,8 +330,8 @@ export async function generateCountryNativeProposals(country: string, limit = 10
             sourceProvenance: provenance.sourceProvenance,
             supportingEvidence: {
               provenanceType: provenance.provenanceType,
-              nativeEvidenceStatus: row.native_evidence_status,
-              sourceProvenanceFamily: row.source_provenance_family,
+              nativeEvidenceStatus: effective.nativeEvidenceStatus,
+              sourceProvenanceFamily: effective.sourceProvenanceFamily,
               canonicalTermId: Number(row.canonical_term_id),
               conceptId: row.concept_id || null,
               nativeConfidenceScore: Number(row.native_confidence_score),
@@ -403,7 +436,7 @@ export async function generateCountryNativeProposals(country: string, limit = 10
 /** Bounded Phase 10 materialization for the existing autonomous producer cycle. */
 export async function materializeBoundedCountryNativeProposals(
   countries: string[],
-  config: { globalCap?: number; perCountryCap?: number; cycleIdentity?: string } = {}
+  config: { globalCap?: number; perCountryCap?: number; fairnessCursor?: number } = {}
 ): Promise<{ generated: number; persisted: number; proposals: DiscoveryFrontierProposal[] }> {
   const globalCap = Math.min(100, Math.max(1, Math.floor(config.globalCap ?? 25)));
   const perCountryCap = Math.min(globalCap, Math.max(1, Math.floor(config.perCountryCap ?? 5)));
@@ -412,7 +445,7 @@ export async function materializeBoundedCountryNativeProposals(
     country,
     proposals: await generateCountryNativeProposals(country, perCountryCap).catch(() => [])
   })));
-  const proposals = selectFairCountryNativeProposals(groups, globalCap, config.cycleIdentity ?? 'default');
+  const proposals = selectFairCountryNativeProposals(groups, globalCap, config.fairnessCursor ?? 0);
   const persisted = await persistFrontierProposals(proposals);
   return { generated: proposals.length, persisted, proposals };
 }
@@ -421,14 +454,14 @@ export async function materializeBoundedCountryNativeProposals(
 export function selectFairCountryNativeProposals(
   groups: Array<{ country: string; proposals: DiscoveryFrontierProposal[] }>,
   globalCap: number,
-  cycleIdentity: string
+  fairnessCursor: number
 ): DiscoveryFrontierProposal[] {
   const ordered = groups
-    .map(group => ({ ...group, proposals: [...group.proposals].sort((a, b) => a.dedupKey.localeCompare(b.dedupKey)) }))
+    .map(group => ({ ...group, proposals: [...group.proposals] }))
     .filter(group => group.proposals.length > 0)
     .sort((a, b) => a.country.localeCompare(b.country));
   if (!ordered.length || globalCap <= 0) return [];
-  const offset = Number.parseInt(createHash('sha256').update(cycleIdentity).digest('hex').slice(0, 8), 16) % ordered.length;
+  const offset = Math.max(0, Math.floor(fairnessCursor)) % ordered.length;
   const rotated = [...ordered.slice(offset), ...ordered.slice(0, offset)];
   const seen = new Set<string>();
   const selected: DiscoveryFrontierProposal[] = [];
@@ -579,9 +612,8 @@ export async function persistFrontierProposals(
              COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
              OR COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
              OR excluded.confidence > frontier_discovery_proposals.confidence
-             OR (COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
-                 AND (COALESCE(excluded.supporting_evidence->'observedCreatorCountries','[]'::jsonb) <> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedCreatorCountries','[]'::jsonb)
-                   OR COALESCE(excluded.supporting_evidence->'observedMarketCountries','[]'::jsonb) <> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedMarketCountries','[]'::jsonb)))
+             OR excluded.supporting_evidence->>'evidenceChecksum'
+                IS DISTINCT FROM frontier_discovery_proposals.supporting_evidence->>'evidenceChecksum'
            )
          ))`,
       [

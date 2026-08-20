@@ -397,10 +397,10 @@ export async function recomputeNativeEvidenceProjection(
 
   // Native Proposal Eligibility Rule:
   // Requires native_observed_count >= 1 AND (qualityCreatorCount >= 2 OR structuredMatched) OR governed country_vocabularies / BOOTSTRAP_SEED
+  const governedBootstrapEvidence = bootstrapSeedCount > 0 || Boolean(provenanceCounts.COUNTRY_VOCABULARY);
   const nativeProposalEligible =
     (nativeObservedCount >= 1 && (qualityCreatorCount >= 2 || structuredMatched)) ||
-    nativeEvidenceStatus === 'BOOTSTRAP_SEED' ||
-    primaryFamily === 'COUNTRY_VOCABULARY';
+    governedBootstrapEvidence;
 
   // Calculate Native Confidence Score (0.0 to 1.0)
   let confidence = 0.20; // Base

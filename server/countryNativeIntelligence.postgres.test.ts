@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { completeQueryRun, getDb } from './db';
 import { observeTerminology } from './terminologyIntelligence';
-import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
+import { buildFrontierProposal, countryNativeEvidenceChecksum, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
@@ -142,24 +142,28 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.match(upgraded.rows[0].source_provenance, /^observed_native_evidence:/);
     assert.ok(Math.abs(upgraded.rows[0].confidence - persisted!.confidence) < 1e-6);
 
+    const versionEvidence = <T extends Record<string, unknown>>(evidence: T): T & { evidenceChecksum: string } => ({
+      ...evidence,
+      evidenceChecksum: countryNativeEvidenceChecksum(evidence)
+    });
     const creatorRefresh = {
       ...persisted!,
-      supportingEvidence: {
+      supportingEvidence: versionEvidence({
         ...persisted!.supportingEvidence,
         qualityCreatorCount: Number(persisted!.supportingEvidence.qualityCreatorCount || 0) + 1,
         distinctCreatorCount: Number(persisted!.supportingEvidence.distinctCreatorCount || 0) + 1
-      }
+      })
     };
     assert.equal(await persistFrontierProposals([creatorRefresh]), 1, 'higher same-tier creator evidence must refresh');
     const confidenceRefresh = { ...creatorRefresh, confidence: creatorRefresh.confidence + 0.01 };
     assert.equal(await persistFrontierProposals([confidenceRefresh]), 1, 'higher same-tier confidence must refresh');
     const geographyRefresh = {
       ...confidenceRefresh,
-      supportingEvidence: {
+      supportingEvidence: versionEvidence({
         ...confidenceRefresh.supportingEvidence,
         lastObservedAt: '2099-01-01T00:00:00.000Z',
         observedCreatorCountries: [...new Set([...((confidenceRefresh.supportingEvidence as Record<string, unknown>).observedCreatorCountries as string[] || []), 'Austria'])]
-      }
+      })
     };
     assert.equal(await persistFrontierProposals([geographyRefresh]), 1, 'newer same-tier expanded geography must refresh');
     assert.equal(await persistFrontierProposals([persisted!]), 0, 'weaker same-tier replay must remain a no-op');
@@ -170,6 +174,19 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.ok(Math.abs(refreshed.rows[0].confidence - confidenceRefresh.confidence) < 1e-6);
     assert.ok(refreshed.rows[0].supporting_evidence.observedCreatorCountries.includes('Austria'));
     assert.equal(Number(refreshed.rows[0].supporting_evidence.qualityCreatorCount), Number(creatorRefresh.supportingEvidence.qualityCreatorCount));
+
+    const codeSwitchRefresh = {
+      ...geographyRefresh,
+      supportingEvidence: versionEvidence({ ...geographyRefresh.supportingEvidence, isCodeSwitched: true, codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' })
+    };
+    assert.equal(await persistFrontierProposals([codeSwitchRefresh]), 1, 'code-switch-only same-tier change must refresh');
+    const provenanceRefresh = {
+      ...codeSwitchRefresh,
+      sourceProvenance: `observed_native_evidence:structured_local_entity:${firstId}`,
+      supportingEvidence: versionEvidence({ ...codeSwitchRefresh.supportingEvidence, sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY' })
+    };
+    assert.equal(await persistFrontierProposals([provenanceRefresh]), 1, 'primary same-tier provenance-only change must refresh');
+    assert.equal(await persistFrontierProposals([provenanceRefresh]), 0, 'canonical evidence exact replay must remain a no-op');
 
     const query = await db.query(
       `INSERT INTO query_library(query,normalized_query,country,collection,intent)

@@ -12,7 +12,7 @@ import {
 import { observeTerminology } from './terminologyIntelligence';
 import { getDb } from './db';
 import fs from 'node:fs';
-import { projectionProposalProvenance, selectFairCountryNativeProposals, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
+import { effectiveProjectionProposalEvidence, projectionProposalProvenance, selectFairCountryNativeProposals, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 
 test('Phase 10: normalizeNativeTerm preserves diacritics, ticker symbols, and multi-word phrases', () => {
   assert.equal(normalizeNativeTerm('  Ações Brasil  '), 'ações brasil');
@@ -599,21 +599,83 @@ test('Phase 10: projection primary provenance is selected only from the winning 
   assert.deepEqual(projection?.sourceProvenanceFamilies, ['CREATOR_METADATA', 'TRANSLATED_QUERY']);
 });
 
-test('Phase 10: rotating round robin is deterministic, globally bounded, and avoids country starvation', () => {
+test('Phase 10: governed bootstrap eligibility survives mixed weak native evidence without overstating native validation', async () => {
+  const runner = createMockRunner();
+  const bootstrapId = await observeTerminology({
+    term: 'governed mixed term', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    videoId: 'governed-bootstrap', nativeEvidenceStatus: 'BOOTSTRAP_SEED', sourceProvenanceFamily: 'COUNTRY_VOCABULARY'
+  }, runner);
+  let projection = await recomputeNativeEvidenceProjection(bootstrapId!, runner);
+  assert.equal(projection?.nativeProposalEligible, true, 'governed vocabulary alone is eligible');
+  assert.equal(projection?.nativeEvidenceStatus, 'BOOTSTRAP_SEED');
+
+  await observeTerminology({
+    term: 'governed mixed term', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    videoId: 'weak-native', channelId: 'weak-native-creator',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+  projection = await recomputeNativeEvidenceProjection(bootstrapId!, runner);
+  assert.equal(projection?.nativeProposalEligible, true, 'governed eligibility survives one weak native creator');
+  assert.equal(projection?.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+  assert.equal(projection?.qualityCreatorCount, 0, 'the native evidence itself remains below validation gate');
+
+  runner.channels.set('quality-native-1', { country: 'Germany', trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+  runner.channels.set('quality-native-2', { country: 'Germany', trading_status: 'TRADING_CONFIRMED', quality_score: 80 });
+  for (const channelId of ['quality-native-1', 'quality-native-2']) {
+    await observeTerminology({
+      term: 'governed mixed term', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+      videoId: `video-${channelId}`, channelId,
+      nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA'
+    }, runner);
+  }
+  projection = await recomputeNativeEvidenceProjection(bootstrapId!, runner);
+  assert.equal(projection?.nativeProposalEligible, true);
+  assert.ok((projection?.qualityCreatorCount || 0) >= 2, 'qualifying native evidence independently meets the native gate');
+
+  const translatedRunner = createMockRunner();
+  const translatedId = await observeTerminology({
+    term: 'translated only term', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    videoId: 'translated-only', nativeEvidenceStatus: 'TRANSLATED_SEED', sourceProvenanceFamily: 'TRANSLATED_QUERY'
+  }, translatedRunner);
+  const translated = await recomputeNativeEvidenceProjection(translatedId!, translatedRunner);
+  assert.equal(translated?.nativeProposalEligible, false, 'translated seed cannot inherit governed-bootstrap eligibility');
+});
+
+test('Phase 10: mixed projection proposal labeling distinguishes governed fallback from validated native evidence', () => {
+  assert.deepEqual(effectiveProjectionProposalEvidence({
+    native_evidence_status: 'BOOTSTRAP_SEED', source_provenance_family: 'COUNTRY_VOCABULARY',
+    source_provenance_families: ['COUNTRY_VOCABULARY'], bootstrap_seed_count: 1, quality_creator_count: 0
+  }), { nativeEvidenceStatus: 'BOOTSTRAP_SEED', sourceProvenanceFamily: 'COUNTRY_VOCABULARY', nativeGateSatisfied: false });
+  assert.deepEqual(effectiveProjectionProposalEvidence({
+    native_evidence_status: 'NATIVE_OBSERVED', source_provenance_family: 'CREATOR_METADATA',
+    source_provenance_families: ['COUNTRY_VOCABULARY', 'CREATOR_METADATA'], bootstrap_seed_count: 1, quality_creator_count: 1
+  }), { nativeEvidenceStatus: 'BOOTSTRAP_SEED', sourceProvenanceFamily: 'COUNTRY_VOCABULARY', nativeGateSatisfied: false });
+  assert.deepEqual(effectiveProjectionProposalEvidence({
+    native_evidence_status: 'NATIVE_OBSERVED', source_provenance_family: 'CREATOR_METADATA',
+    source_provenance_families: ['COUNTRY_VOCABULARY', 'CREATOR_METADATA'], bootstrap_seed_count: 1, quality_creator_count: 2
+  }), { nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA', nativeGateSatisfied: true });
+  assert.deepEqual(effectiveProjectionProposalEvidence({
+    native_evidence_status: 'TRANSLATED_SEED', source_provenance_family: 'TRANSLATED_QUERY',
+    source_provenance_families: ['TRANSLATED_QUERY'], bootstrap_seed_count: 0, quality_creator_count: 0
+  }), { nativeEvidenceStatus: 'TRANSLATED_SEED', sourceProvenanceFamily: 'TRANSLATED_QUERY', nativeGateSatisfied: false });
+});
+
+test('Phase 10: persisted-cursor round robin preserves generator ranking and has a bounded fairness guarantee', () => {
   const countries = Array.from({ length: 12 }, (_, index) => `Country ${index}`);
   const groups = countries.map(country => ({
     country,
     proposals: Array.from({ length: 3 }, (_, index) => ({
-      proposalFamily: 'COUNTRY_NATIVE', country, dedupKey: `${country}:${index}`
+      proposalFamily: 'COUNTRY_NATIVE', country, dedupKey: `${country}:${2 - index}`, concept: index === 0 ? 'highest-ranked' : 'lower-ranked'
     } as DiscoveryFrontierProposal))
   }));
-  const first = selectFairCountryNativeProposals(groups, 5, 'cycle-0');
-  assert.deepEqual(selectFairCountryNativeProposals(groups, 5, 'cycle-0'), first);
+  const first = selectFairCountryNativeProposals(groups, 5, 0);
+  assert.deepEqual(selectFairCountryNativeProposals(groups, 5, 0), first);
   assert.equal(first.length, 5);
   assert.equal(new Set(first.map(proposal => proposal.country)).size, 5);
+  assert.ok(first.every(proposal => proposal.concept === 'highest-ranked'));
   const served = new Set<string>();
-  for (let cycle = 0; cycle < 100; cycle++) {
-    const selected = selectFairCountryNativeProposals(groups, 5, `cycle-${cycle}`);
+  for (let cursor = 0; cursor < countries.length; cursor += 5) {
+    const selected = selectFairCountryNativeProposals(groups, 5, cursor);
     assert.ok(selected.length <= 5);
     selected.forEach(proposal => served.add(proposal.country));
   }
@@ -624,7 +686,8 @@ test('Phase 10: the existing autonomous producer materializes only bounded nativ
   const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
   assert.match(source, /materializeBoundedCountryNativeProposals/);
   assert.doesNotMatch(source, /generateFrontierProposalsForCountry/);
-  assert.match(source, /cycleIdentity: now\.toISOString\(\)/);
+  assert.match(source, /country_native_materialization_cursor/);
+  assert.match(source, /fairnessCursor: nativeFairnessCursor/);
   assert.ok(
     source.indexOf('materializeBoundedCountryNativeProposals') < source.indexOf('evaluateShadowFrontierAllocation({ opportunityKey'),
     'proposal materialization must precede the existing Phase 8 allocation boundary'

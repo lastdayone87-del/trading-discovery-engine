@@ -200,11 +200,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
     // Materialize proposal-only evidence inside the existing producer cycle.
     // Phase 8 remains the sole allocation authority; generation failures cannot
     // block the legacy Query Intelligence scheduler.
+    const nativeFairnessCursor = Math.max(0, Number(await getAppSetting('country_native_materialization_cursor', '0')) || 0);
     await materializeBoundedCountryNativeProposals(countries, {
       globalCap: 25,
       perCountryCap: 5,
-      cycleIdentity: now.toISOString()
-    })
+      fairnessCursor: nativeFairnessCursor
+    }).then(() => setAppSetting('country_native_materialization_cursor', String(nativeFairnessCursor + 25)))
       .catch(error => console.warn('[FrontierProposals] Country-native generation warning:', error));
 
     currentCountryIndex = Number(await getAppSetting('qi_current_country_index', '0')) || 0;
