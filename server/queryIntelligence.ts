@@ -492,7 +492,7 @@ export async function generateCandidateQueriesForCountry(
   return newQueries;
 }
 
-/** Governed Query Intelligence boundary for an immutable Phase 8 native allocation. */
+/** Governed Query Intelligence boundary for immutable Phase 8 concept allocations. */
 export async function constructCountryNativeAllocationQuery(args: {
   country: string;
   decisionId: string;
@@ -502,11 +502,12 @@ export async function constructCountryNativeAllocationQuery(args: {
 }): Promise<QueryRecord | null> {
   await assertCountryAllowed(args.country, 'query_generation');
   const snapshot = args.proposalEvidenceSnapshot;
-  if (snapshot?.proposalFamily !== 'COUNTRY_NATIVE') return null;
+  if (!['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(snapshot?.proposalFamily)) return null;
   if (snapshot.targetNeighborhoodKey !== createNeighborhoodKey(args.targetNeighborhoodDimensions) ||
       createNeighborhoodKey(snapshot.targetDimensions as DiscoveryNeighborhoodDimensions) !== snapshot.targetNeighborhoodKey) return null;
   const evidence = snapshot.supportingEvidence || {};
-  const nativeTerm = typeof evidence.nativeTerm === 'string' ? evidence.nativeTerm.trim() : '';
+  const nativeTerm = typeof evidence.nativeTerm === 'string' ? evidence.nativeTerm.trim()
+    : typeof evidence.canonicalConcept === 'string' ? evidence.canonicalConcept.trim() : '';
   if (!nativeTerm || !evidence.evidenceChecksum) return null;
   const vocabs = await getCountryVocabularies();
   const countryVocabulary = vocabs.find(v => v.country.toLowerCase() === args.country.toLowerCase());

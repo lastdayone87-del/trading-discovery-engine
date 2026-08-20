@@ -30,6 +30,7 @@ import {
 } from './discoveryFrontierAllocator';
 import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
 import { materializeBoundedCountryNativeProposals } from './discoveryProposalGenerators';
+import { materializeStoredExternalOsintProposals } from './externalOsint';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -208,6 +209,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       fairnessCursor: nativeFairnessCursor
     }).then(() => setAppSetting('country_native_materialization_cursor', String(nativeFairnessCursor + 25)))
       .catch(error => console.warn('[FrontierProposals] Country-native generation warning:', error));
+    const osintEnabled = await getAppSetting('external_osint_materialization_enabled', 'false') === 'true';
+    await materializeStoredExternalOsintProposals({ enabled: osintEnabled, deadlineMs: 2_500 })
+      .catch(error => console.warn('[FrontierProposals] External OSINT degradation; legacy discovery continues:', error));
 
     currentCountryIndex = Number(await getAppSetting('qi_current_country_index', '0')) || 0;
     const cooldownMinutes = await numericSetting('query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', 360, 1, 10080);
@@ -252,6 +256,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
 
       let selected: { queryRecord: any; selectionStrategy: any; reason: string };
       const nativeSnapshot = frontierAllocationInfo?.decision?.proposalEvidenceSnapshot;
+      const governedConceptProposal = ['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(nativeSnapshot?.proposalFamily);
 
       if (research) {
         selected = {
@@ -260,7 +265,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
           reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
         };
       } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
-        const nativeQuery = nativeSnapshot?.proposalFamily === 'COUNTRY_NATIVE'
+        const nativeQuery = governedConceptProposal
           ? await constructCountryNativeAllocationQuery({
               country,
               decisionId: frontierAllocationInfo.decision.decisionId,
@@ -269,7 +274,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
               proposalEvidenceSnapshot: nativeSnapshot
             })
           : null;
-        const targeted = nativeSnapshot?.proposalFamily === 'COUNTRY_NATIVE'
+        const targeted = governedConceptProposal
           ? null
           : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
         if (nativeQuery) {
@@ -289,7 +294,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
             );
           }
           frontierAllocationInfo.authorized = false;
-          if (nativeSnapshot?.proposalFamily === 'COUNTRY_NATIVE') {
+          if (governedConceptProposal) {
             // Fail closed for the selected proposal. Do not spend this opportunity
             // on an unrelated generic query after releasing its reservation.
             continue;
@@ -309,7 +314,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
         log(`Withheld autonomous query #${selected.queryRecord.id} "${selected.queryRecord.query}" (${selected.queryRecord.country}) before YouTube: ${queryAuthority.reasonCodes.join(', ')}.`);
         if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
           const reason = `Query authority rejected query: ${queryAuthority.reasonCodes.join(', ')}`;
-          if (frontierAllocationInfo.decision?.proposalEvidenceSnapshot?.proposalFamily === 'COUNTRY_NATIVE') {
+          if (['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(frontierAllocationInfo.decision?.proposalEvidenceSnapshot?.proposalFamily)) {
             await quarantineUnexecutableAllocation(frontierAllocationInfo.decision.decisionId, reason);
           } else await releaseAllocationDecision(frontierAllocationInfo.decision.decisionId, reason);
           frontierAllocationInfo.authorized = false;
@@ -351,7 +356,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string): Promi
       }], workerId, cooldownMinutes).catch(async error => {
         if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
           const detail = error instanceof Error ? error.message : String(error);
-          const deterministicNativeMismatch = nativeSnapshot?.proposalFamily === 'COUNTRY_NATIVE' &&
+          const deterministicNativeMismatch = governedConceptProposal &&
             /PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD|FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH/.test(detail);
           const disposition = deterministicNativeMismatch ? quarantineUnexecutableAllocation : releaseAllocationDecision;
           await disposition(frontierAllocationInfo.decision.decisionId, `Scheduling transaction failed: ${detail}`);
