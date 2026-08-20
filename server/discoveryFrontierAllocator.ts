@@ -8,6 +8,7 @@ import {
 } from './discoveryNeighborhood';
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
+import { isOsintSnapshotFresh } from './externalOsint';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -647,6 +648,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
       }
 
       const elig = evaluateNeighborhoodEligibility(cand, { now });
+      if (!isOsintSnapshotFresh(cand.proposalEvidenceSnapshot || {}, now)) {
+        rejectionReasons[cand.neighborhoodKey] = ['STALE_OSINT_EVIDENCE'];
+        continue;
+      }
       if (!elig.eligible) {
         rejectionReasons[cand.neighborhoodKey] = elig.rejectionReasons;
         continue;
@@ -727,6 +732,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
         targetDimensions: lockedDimensions,
         supportingEvidence: lockedEvidence
       };
+      if (!isOsintSnapshotFresh(lockedProposalSnapshot, now)) {
+        if (client) await runner.query('COMMIT');
+        return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_OSINT_EVIDENCE' };
+      }
     }
 
     const decisionId = createHash('sha256')
