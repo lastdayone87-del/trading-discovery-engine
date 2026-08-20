@@ -41,6 +41,7 @@ import { inspectEntityResolution, moderateEntityBinding, proposeEntityBinding } 
 import { configureTemporalFrontier, createFrontierRun, inspectTemporalFrontier, recordFrontierOutcome, recordTemporalRelationship, sealFrontierSnapshot } from './server/temporalResearchFrontier';
 import { inspectGovernedAdaptation, recordFalseNegativeIncident } from './server/governedAdaptation';
 import { getFrontierDiagnostics, getFrontierBaselineComparison } from './server/discoveryFrontierTrials';
+import { getDiscoveryTrustDiagnostics, materializeEvaluationWindow } from './server/discoveryTrustEvaluation';
 import { configurePersistentResearch, inspectPersistentResearch, proposeDiscoveryAction, proposeResearchHypothesis, recordDiscoveryOutcome, registerDiscoveryProvider, registerResearchProgram, upsertCoverageCell } from './server/persistentResearch';
 import { evaluatePersistentResearchPolicy, recordExternalNominations, runPersistentResearchCycle } from './server/persistentResearchController';
 import {
@@ -187,6 +188,8 @@ async function startServer() {
   app.post('/api/temporal-research-frontier/control',async(req,res)=>{try{res.json(await configureTemporalFrontier({...req.body,idempotencyKey:req.header('idempotency-key')||req.body.idempotencyKey,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='FRONTIER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.get('/api/discovery/frontier/diagnostics',async(_req,res)=>{try{res.json(await getFrontierDiagnostics());}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/discovery/frontier/comparison',async(req,res)=>{try{res.json(await getFrontierBaselineComparison(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/discovery/evaluation',async(req,res)=>{try{res.json(await getDiscoveryTrustDiagnostics({windowStart:String(req.query.window_start),windowEnd:String(req.query.window_end)}));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/discovery/evaluation/snapshots',async(req,res)=>{try{res.status(201).json(await materializeEvaluationWindow({windowStart:String(req.body.windowStart),windowEnd:String(req.body.windowEnd),dimension:req.body.dimension,value:req.body.value,revision:req.body.revision}));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/governed-adaptation',async(req,res)=>{try{res.json(await inspectGovernedAdaptation(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/persistent-research',async(req,res)=>{try{res.json(await inspectPersistentResearch(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/persistent-research/programs',async(req,res)=>{try{res.status(201).json(await registerResearchProgram({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
