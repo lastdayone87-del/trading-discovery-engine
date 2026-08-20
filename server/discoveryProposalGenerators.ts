@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getDb } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
-import { canonicalCountry } from './countryInference';
+import { canonicalCountry, countryIsoAlias } from './countryInference';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
 
 export type ProposalFamily =
@@ -65,7 +65,8 @@ export function countryNativeEvidenceVersion(evidence: Record<string, unknown>, 
   const observedAt = typeof evidence.lastObservedAt === 'string' && !Number.isNaN(Date.parse(evidence.lastObservedAt))
     ? new Date(evidence.lastObservedAt).toISOString()
     : '1970-01-01T00:00:00.000Z';
-  return `${observedAt}|${checksum}`;
+  const revision = String(evidence.evidenceRevision || '0').padStart(20, '0');
+  return `${observedAt}|${revision}|${checksum}`;
 }
 
 export function effectiveProjectionProposalEvidence(row: {
@@ -313,6 +314,7 @@ export async function generateCountryNativeProposals(country: string, limit = 10
            p.native_quality_creator_count,
            p.distinct_creator_count,
            p.structured_entity_matched,
+           p.evidence_revision,
            p.is_code_switched,
            p.code_switch_type,
            p.observed_creator_countries,
@@ -351,6 +353,8 @@ export async function generateCountryNativeProposals(country: string, limit = 10
               nativeQualityCreatorCount: Number(row.native_quality_creator_count),
               distinctCreatorCount: Number(row.distinct_creator_count),
               isCodeSwitched: Boolean(row.is_code_switched),
+              structuredEntityMatched: Boolean(row.structured_entity_matched),
+              evidenceRevision: String(row.evidence_revision || '0'),
               codeSwitchType: row.code_switch_type || 'NONE',
               observedCreatorCountries: row.observed_creator_countries || [],
               observedMarketCountries: row.observed_market_countries || [],
@@ -424,7 +428,10 @@ export async function generateCountryNativeProposals(country: string, limit = 10
   }
 
   // 3. Fallback to static seed dictionary explicitly identified as bootstrap_vocabulary
-  const seeds = NATIVE_FINANCIAL_SEEDS[seedKey] || NATIVE_FINANCIAL_SEEDS[normC] || ['local exchange trading', 'stock market investing', 'crypto trading'];
+  const isoSeedKey = countryIsoAlias(canonicalC);
+  const seeds = (isoSeedKey ? NATIVE_FINANCIAL_SEEDS[isoSeedKey] : undefined) ||
+    NATIVE_FINANCIAL_SEEDS[seedKey] || NATIVE_FINANCIAL_SEEDS[normC] ||
+    ['local exchange trading', 'stock market investing', 'crypto trading'];
   return seeds.slice(0, limit).map(seed =>
     buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
@@ -628,14 +635,8 @@ export async function persistFrontierProposals(
              OR (
                COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
                  = COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
-               AND (
-                 COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
-                 OR COALESCE((excluded.supporting_evidence->>'nativeQualityCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'nativeQualityCreatorCount')::int,0)
-                 OR COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
-                 OR excluded.confidence > frontier_discovery_proposals.confidence
-                 OR COALESCE(excluded.supporting_evidence->>'evidenceVersion','')
-                    > COALESCE(frontier_discovery_proposals.supporting_evidence->>'evidenceVersion','')
-               )
+               AND COALESCE((excluded.supporting_evidence->>'evidenceRevision')::numeric,0)
+                   > COALESCE((frontier_discovery_proposals.supporting_evidence->>'evidenceRevision')::numeric,0)
              )
            )
          ))`,

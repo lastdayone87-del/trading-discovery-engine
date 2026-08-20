@@ -43,6 +43,7 @@ export interface CountryNativeEvidenceProjection {
   nativeQualityCreatorCount: number;
   distinctCommunityCount: number;
   structuredEntityMatched: boolean;
+  evidenceRevision: string;
   nativeEvidenceStatus: NativeEvidenceStatus;
   sourceProvenanceFamily: SourceProvenanceFamily;
   sourceProvenanceFamilies: string[];
@@ -297,8 +298,11 @@ export async function recomputeNativeEvidenceProjection(
   let codeSwitchedCount = 0;
   let structuredMatched = false;
   let maxObservedAtDate: Date | null = null;
+  let evidenceRevision = 0n;
 
   for (const r of rows) {
+    const observationRevision = BigInt(r.id || 0);
+    if (observationRevision > evidenceRevision) evidenceRevision = observationRevision;
     if (r.observed_at) {
       const dt = new Date(r.observed_at);
       if (!maxObservedAtDate || dt > maxObservedAtDate) {
@@ -444,6 +448,7 @@ export async function recomputeNativeEvidenceProjection(
     nativeQualityCreatorCount,
     distinctCommunityCount,
     structuredEntityMatched: structuredMatched,
+    evidenceRevision: evidenceRevision.toString(),
     nativeEvidenceStatus,
     sourceProvenanceFamily: primaryFamily,
     sourceProvenanceFamilies: sortedProvenanceFamilies,
@@ -464,14 +469,14 @@ export async function recomputeNativeEvidenceProjection(
        raw_observation_count, native_observed_count, bootstrap_seed_count,
        translated_seed_count, native_observed_ratio,
        distinct_creator_count, quality_creator_count, native_quality_creator_count, distinct_community_count,
-       structured_entity_matched, native_evidence_status, source_provenance_family,
+       structured_entity_matched, evidence_revision, native_evidence_status, source_provenance_family,
        source_provenance_families, source_provenance_counts,
        native_confidence_score, native_proposal_eligible,
        last_observed_at, updated_at
      )
      VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-       $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+       $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
      )
      ON CONFLICT (canonical_term_id) DO UPDATE SET
        concept_id = EXCLUDED.concept_id,
@@ -494,6 +499,7 @@ export async function recomputeNativeEvidenceProjection(
        native_quality_creator_count = EXCLUDED.native_quality_creator_count,
        distinct_community_count = EXCLUDED.distinct_community_count,
        structured_entity_matched = EXCLUDED.structured_entity_matched,
+       evidence_revision = EXCLUDED.evidence_revision,
        native_evidence_status = EXCLUDED.native_evidence_status,
        source_provenance_family = EXCLUDED.source_provenance_family,
        source_provenance_families = EXCLUDED.source_provenance_families,
@@ -524,6 +530,7 @@ export async function recomputeNativeEvidenceProjection(
       projection.nativeQualityCreatorCount,
       projection.distinctCommunityCount,
       projection.structuredEntityMatched,
+      projection.evidenceRevision,
       projection.nativeEvidenceStatus,
       projection.sourceProvenanceFamily,
       JSON.stringify(projection.sourceProvenanceFamilies),
@@ -588,6 +595,7 @@ export async function attributeCountryNativePerformance(args: {
   nativeEvidenceStatus: NativeEvidenceStatus;
   sourceProvenanceFamily: SourceProvenanceFamily;
   isCodeSwitched?: boolean;
+  structuredEntityMatched?: boolean;
   rawResults?: number;
   uniqueCreators?: number;
   newCreators?: number;
@@ -605,12 +613,12 @@ export async function attributeCountryNativePerformance(args: {
     `INSERT INTO country_native_performance_attribution (
        attribution_key, canonical_term_id, proposal_id, allocation_decision_id,
        query_id, query_run_id, country,
-       native_evidence_status, source_provenance_family, is_code_switched,
+       native_evidence_status, source_provenance_family, is_code_switched, structured_entity_matched,
        executed_at, raw_results, unique_creators, new_creators, relevant_new_creators,
        quality_creators, confirmed_trading_creators, quota_consumed,
        yield_score, coverage_expansion_gain
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), $11, $12, $13, $14, $15, $16, $17, $18, $19)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), $12, $13, $14, $15, $16, $17, $18, $19, $20)
      ON CONFLICT (attribution_key) DO NOTHING`,
     [
       args.attributionKey,
@@ -623,6 +631,7 @@ export async function attributeCountryNativePerformance(args: {
       args.nativeEvidenceStatus,
       args.sourceProvenanceFamily,
       Boolean(args.isCodeSwitched),
+      Boolean(args.structuredEntityMatched),
       args.rawResults || 0,
       args.uniqueCreators || 0,
       args.newCreators || 0,

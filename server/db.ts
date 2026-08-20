@@ -1252,6 +1252,7 @@ async function attributeCompletedCountryNativeRun(client: EventClient, runId: st
     nativeEvidenceStatus: nativeEvidenceStatus as NativeEvidenceStatus,
     sourceProvenanceFamily: sourceProvenanceFamily as SourceProvenanceFamily,
     isCodeSwitched: Boolean(evidence.isCodeSwitched),
+    structuredEntityMatched: Boolean(evidence.structuredEntityMatched),
     rawResults: metrics.rawResults,
     uniqueCreators: metrics.distinctResults,
     newCreators: metrics.newChannels,

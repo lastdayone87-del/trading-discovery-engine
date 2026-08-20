@@ -118,6 +118,46 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.ok(persisted, 'persisted eligible native projection must feed the production proposal generator');
     assert.equal(persisted.supportingEvidence.nativeEvidenceStatus, 'NATIVE_OBSERVED');
 
+    const revisionTerm = await db.query(
+      `INSERT INTO canonical_trading_terms(canonical_term,normalized_term,country,term_type,first_observed_at,last_observed_at)
+       VALUES($1,$1,$2,'TERMINOLOGY',$3,$3) RETURNING id`,
+      [`revision term ${suffix}`, country, '2026-08-20T10:00:00.000Z']
+    );
+    for (const channelId of channels) {
+      await db.query(
+        `INSERT INTO terminology_observations(
+           canonical_term_id,source_channel_id,observation_type,observed_at,evidence,
+           native_evidence_status,source_provenance_family,is_code_switched,code_switch_type
+         ) VALUES($1,$2,'VIDEO_TITLE',$3,'{}'::jsonb,'NATIVE_OBSERVED','CREATOR_METADATA',false,'NONE')`,
+        [revisionTerm.rows[0].id, channelId, '2026-08-20T10:00:00.000Z']
+      );
+    }
+    await recomputeNativeEvidenceProjection(Number(revisionTerm.rows[0].id), db);
+    const causalProposalA = (await generateCountryNativeProposals(country, 20)).find(p => p.supportingEvidence.canonicalTermId === Number(revisionTerm.rows[0].id));
+    assert.ok(causalProposalA);
+    await persistFrontierProposals([causalProposalA!]);
+    await db.query(
+      `INSERT INTO terminology_observations(
+         canonical_term_id,observation_type,observed_at,evidence,native_evidence_status,
+         source_provenance_family,is_code_switched,code_switch_type
+       ) VALUES($1,'ENRICHMENT',$2,'{}'::jsonb,'NATIVE_OBSERVED','STRUCTURED_LOCAL_ENTITY',true,'NATIVE_DOMINANT_ENGLISH_FINANCE')`,
+      [revisionTerm.rows[0].id, '2026-08-20T10:00:00.000Z']
+    );
+    await recomputeNativeEvidenceProjection(Number(revisionTerm.rows[0].id), db);
+    const causalProposalB = (await generateCountryNativeProposals(country, 20)).find(p => p.supportingEvidence.canonicalTermId === Number(revisionTerm.rows[0].id));
+    assert.ok(causalProposalB);
+    assert.equal(causalProposalB!.supportingEvidence.lastObservedAt, causalProposalA!.supportingEvidence.lastObservedAt);
+    assert.ok(BigInt(String(causalProposalB!.supportingEvidence.evidenceRevision)) > BigInt(String(causalProposalA!.supportingEvidence.evidenceRevision)));
+    assert.equal(await persistFrontierProposals([causalProposalB!]), 1);
+    assert.equal(await persistFrontierProposals([causalProposalA!]), 0, 'lower append-only observation revision cannot overwrite equal-time evidence');
+    const causalWinner = await db.query(
+      `SELECT supporting_evidence FROM frontier_discovery_proposals WHERE dedup_key=$1`,
+      [causalProposalB!.dedupKey]
+    );
+    assert.equal(causalWinner.rows[0].supporting_evidence.evidenceRevision, causalProposalB!.supportingEvidence.evidenceRevision);
+    assert.equal(causalWinner.rows[0].supporting_evidence.structuredEntityMatched, true);
+    assert.equal(causalWinner.rows[0].supporting_evidence.isCodeSwitched, true);
+
     const bootstrap = buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE', country, concept: term,
       sourceProvenance: `bootstrap_vocabulary:static_seed:${term}`,
@@ -150,17 +190,20 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
       ...persisted!,
       supportingEvidence: versionEvidence({
         ...persisted!.supportingEvidence,
+        evidenceRevision: String(BigInt(String(persisted!.supportingEvidence.evidenceRevision || '0')) + 1n),
         qualityCreatorCount: Number(persisted!.supportingEvidence.qualityCreatorCount || 0) + 1,
         distinctCreatorCount: Number(persisted!.supportingEvidence.distinctCreatorCount || 0) + 1
       })
     };
     assert.equal(await persistFrontierProposals([creatorRefresh]), 1, 'higher same-tier creator evidence must refresh');
-    const confidenceRefresh = { ...creatorRefresh, confidence: creatorRefresh.confidence + 0.01 };
+    const confidenceRefresh = { ...creatorRefresh, confidence: creatorRefresh.confidence + 0.01,
+      supportingEvidence: versionEvidence({ ...creatorRefresh.supportingEvidence, evidenceRevision: String(BigInt(String(creatorRefresh.supportingEvidence.evidenceRevision)) + 1n) }) };
     assert.equal(await persistFrontierProposals([confidenceRefresh]), 1, 'higher same-tier confidence must refresh');
     const geographyRefresh = {
       ...confidenceRefresh,
       supportingEvidence: versionEvidence({
         ...confidenceRefresh.supportingEvidence,
+        evidenceRevision: String(BigInt(String(confidenceRefresh.supportingEvidence.evidenceRevision)) + 1n),
         lastObservedAt: '2099-01-01T00:00:00.000Z',
         observedCreatorCountries: [...new Set([...((confidenceRefresh.supportingEvidence as Record<string, unknown>).observedCreatorCountries as string[] || []), 'Austria'])]
       })
@@ -177,24 +220,24 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
 
     const codeSwitchRefresh = {
       ...geographyRefresh,
-      supportingEvidence: versionEvidence({ ...geographyRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:01.000Z', isCodeSwitched: true, codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' })
+      supportingEvidence: versionEvidence({ ...geographyRefresh.supportingEvidence, evidenceRevision: String(BigInt(String(geographyRefresh.supportingEvidence.evidenceRevision)) + 1n), lastObservedAt: '2099-01-01T00:00:01.000Z', isCodeSwitched: true, codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' })
     };
     assert.equal(await persistFrontierProposals([codeSwitchRefresh]), 1, 'code-switch-only same-tier change must refresh');
     const provenanceRefresh = {
       ...codeSwitchRefresh,
       sourceProvenance: `observed_native_evidence:structured_local_entity:${firstId}`,
-      supportingEvidence: versionEvidence({ ...codeSwitchRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:02.000Z', sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY' })
+      supportingEvidence: versionEvidence({ ...codeSwitchRefresh.supportingEvidence, evidenceRevision: String(BigInt(String(codeSwitchRefresh.supportingEvidence.evidenceRevision)) + 1n), lastObservedAt: '2099-01-01T00:00:02.000Z', sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY' })
     };
     assert.equal(await persistFrontierProposals([provenanceRefresh]), 1, 'primary same-tier provenance-only change must refresh');
     assert.equal(await persistFrontierProposals([provenanceRefresh]), 0, 'canonical evidence exact replay must remain a no-op');
     assert.equal(await persistFrontierProposals([codeSwitchRefresh]), 0, 'stale evidence cannot overwrite newer same-tier evidence');
 
-    const equalTimestampA = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' }) };
-    const equalTimestampB = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'ENGLISH_DOMINANT_NATIVE_MARKET' }) };
-    const [lowerVersion, higherVersion] = [equalTimestampA, equalTimestampB].sort((a, b) => String(a.supportingEvidence.evidenceVersion).localeCompare(String(b.supportingEvidence.evidenceVersion)));
-    assert.equal(await persistFrontierProposals([lowerVersion]), 1);
-    assert.equal(await persistFrontierProposals([higherVersion]), 1, 'equal timestamp must converge to deterministic maximum evidence version');
-    assert.equal(await persistFrontierProposals([lowerVersion]), 0, 'lower equal-timestamp version cannot overwrite deterministic winner');
+    const revisionA = BigInt(String(provenanceRefresh.supportingEvidence.evidenceRevision)) + 1n;
+    const equalTimestampA = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, evidenceRevision: String(revisionA), lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' }) };
+    const equalTimestampB = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, evidenceRevision: String(revisionA + 1n), lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'ENGLISH_DOMINANT_NATIVE_MARKET' }) };
+    assert.equal(await persistFrontierProposals([equalTimestampA]), 1);
+    assert.equal(await persistFrontierProposals([equalTimestampB]), 1, 'equal timestamp must accept higher authoritative observation revision');
+    assert.equal(await persistFrontierProposals([equalTimestampA]), 0, 'lower equal-timestamp revision cannot overwrite authoritative winner');
 
     const query = await db.query(
       `INSERT INTO query_library(query,normalized_query,country,collection,intent)
@@ -213,7 +256,8 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
        ) VALUES($1,'COUNTRY_NATIVE',$2,$3,'{}'::jsonb,$4,$5,$6) RETURNING proposal_id`,
       [`phase10:${suffix}`, country, term, `native:${suffix}`, JSON.stringify({
         canonicalTermId: firstId, nativeEvidenceStatus: 'NATIVE_OBSERVED',
-        sourceProvenanceFamily: 'CREATOR_METADATA', isCodeSwitched: true
+        sourceProvenanceFamily: 'CREATOR_METADATA', isCodeSwitched: true, structuredEntityMatched: true,
+        nativeQualityCreatorCount: 1
       }), 'phase10 integration']
     );
     await db.query(
@@ -224,7 +268,8 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
       [`decision:${suffix}`, `opportunity:${suffix}`, country, proposal.rows[0].proposal_id, run.rows[0].id,
         JSON.stringify({ proposalFamily: 'COUNTRY_NATIVE', supportingEvidence: {
           canonicalTermId: firstId, nativeEvidenceStatus: 'NATIVE_OBSERVED',
-          sourceProvenanceFamily: 'CREATOR_METADATA', isCodeSwitched: true
+          sourceProvenanceFamily: 'CREATOR_METADATA', isCodeSwitched: true, structuredEntityMatched: true,
+          nativeQualityCreatorCount: 1
         } })]
     );
     await db.query(`UPDATE frontier_discovery_proposals SET supporting_evidence=$2 WHERE proposal_id=$1`, [
@@ -251,7 +296,8 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
               max(proposal_id::text) proposal_id, max(relevant_new_creators)::int relevant,
               max(quality_creators)::int quality, max(quota_consumed)::int quota,
               max(native_evidence_status) native_status, max(source_provenance_family) provenance_family,
-              max(canonical_term_id)::int canonical_term_id
+              max(canonical_term_id)::int canonical_term_id,
+              bool_or(structured_entity_matched) structured_entity_matched
        FROM country_native_performance_attribution WHERE query_run_id=$1`,
       [run.rows[0].id]
     );
@@ -265,6 +311,7 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.equal(productionAttribution.rows[0].native_status, 'NATIVE_OBSERVED');
     assert.equal(productionAttribution.rows[0].provenance_family, 'CREATOR_METADATA');
     assert.equal(productionAttribution.rows[0].canonical_term_id, firstId);
+    assert.equal(productionAttribution.rows[0].structured_entity_matched, true);
 
     await assert.rejects(
       db.query(`UPDATE frontier_allocation_decisions SET proposal_evidence_snapshot='{}'::jsonb WHERE decision_id=$1`, [`decision:${suffix}`]),

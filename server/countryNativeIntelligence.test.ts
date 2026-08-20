@@ -12,7 +12,7 @@ import {
 import { observeTerminology } from './terminologyIntelligence';
 import { getDb } from './db';
 import fs from 'node:fs';
-import { effectiveProjectionProposalEvidence, projectionProposalProvenance, selectFairCountryNativeProposals, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
+import { effectiveProjectionProposalEvidence, generateCountryNativeProposals, projectionProposalProvenance, selectFairCountryNativeProposals, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 
 test('Phase 10: normalizeNativeTerm preserves diacritics, ticker symbols, and multi-word phrases', () => {
   assert.equal(normalizeNativeTerm('  Ações Brasil  '), 'ações brasil');
@@ -65,6 +65,19 @@ test('Phase 10: projection proposal provenance preserves all governed native evi
     'bootstrap_vocabulary:static_bootstrap:canonical_projection:3');
   assert.equal(projectionProposalProvenance('TRANSLATED_SEED', 'TRANSLATED_QUERY', 4).sourceProvenance,
     'translated_seed:translated_query:canonical_projection:4');
+});
+
+test('Phase 10: canonical country identities and ISO aliases resolve localized static seeds', async () => {
+  for (const [country, expected] of [
+    ['Germany', 'DAX trading'], ['DE', 'DAX trading'],
+    ['Japan', '日経平均'], ['JP', '日経平均'],
+    ['United States', 'S&P 500 futures'], ['US', 'S&P 500 futures']
+  ] as const) {
+    const proposals = await generateCountryNativeProposals(country, 1);
+    assert.equal(proposals[0]?.concept, expected, `${country} must use its localized authoritative alias seed set`);
+  }
+  const generic = await generateCountryNativeProposals('Atlantis', 1);
+  assert.equal(generic[0]?.concept, 'local exchange trading');
 });
 
 /**
@@ -257,14 +270,15 @@ function createMockRunner() {
           nativeQualityCreatorCount: params[18],
           distinctCommunityCount: params[19],
           structuredEntityMatched: params[20],
-          nativeEvidenceStatus: params[21],
-          sourceProvenanceFamily: params[22],
-          sourceProvenanceFamilies: parseArr(params[23]),
-          sourceProvenanceCounts: typeof params[24] === 'string' ? JSON.parse(params[24]) : params[24],
-          nativeConfidenceScore: params[25],
-          nativeProposalEligible: params[26],
-          lastObservedAt: params[27],
-          updatedAt: params[28]
+          evidenceRevision: params[21],
+          nativeEvidenceStatus: params[22],
+          sourceProvenanceFamily: params[23],
+          sourceProvenanceFamilies: parseArr(params[24]),
+          sourceProvenanceCounts: typeof params[25] === 'string' ? JSON.parse(params[25]) : params[25],
+          nativeConfidenceScore: params[26],
+          nativeProposalEligible: params[27],
+          lastObservedAt: params[28],
+          updatedAt: params[29]
         });
         return { rows: [] };
       }
