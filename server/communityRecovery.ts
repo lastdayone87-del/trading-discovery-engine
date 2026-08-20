@@ -18,8 +18,8 @@ export function shouldReactivateCommunityRecovery(
   isManualRecheck = false,
   now = Date.now()
 ): CommunityRecoveryReactivationReason {
-  if (channel.scan_status !== 'FAILED_PERMANENT') {
-    return { reactivate: false, reasonCodes: ['SCAN_STATUS_NOT_FAILED_PERMANENT'] };
+  if (channel.scan_status !== 'FAILED_PERMANENT' && channel.scan_status !== 'FAILED') {
+    return { reactivate: false, reasonCodes: ['SCAN_STATUS_NOT_RECOVERABLE_FAILURE'] };
   }
 
   const reasons: string[] = [];
@@ -68,7 +68,7 @@ export function reactivateCommunityRecovery(
         step: 'BIO',
         title: 'Community Acquisition Reactivated',
         status: 'FOUND',
-        details: `Reactivated from FAILED_PERMANENT: ${reasonCodes.join(', ')}`,
+        details: `Reactivated from recoverable operational failure: ${reasonCodes.join(', ')}`,
         timestamp: now
       }
     ]
@@ -89,7 +89,7 @@ export async function reconcileCommunityAcquisitionRecovery(
 
   const db = await getDb();
   const rows = await db.query(
-    `SELECT c.channel_id FROM channels c WHERE c.scan_status='FAILED_PERMANENT' AND (c.last_checked IS NULL OR c.last_checked < now() - interval '30 days') ORDER BY c.last_checked ASC LIMIT $1`,
+    `SELECT c.channel_id FROM channels c WHERE c.scan_status IN('FAILED','FAILED_PERMANENT') AND (c.last_checked IS NULL OR c.last_checked < now() - interval '30 days') ORDER BY c.last_checked ASC LIMIT $1`,
     [Math.min(100, Math.max(1, limit))]
   );
 

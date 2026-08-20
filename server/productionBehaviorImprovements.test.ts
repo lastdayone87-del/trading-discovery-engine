@@ -23,7 +23,7 @@ test('dashboard migration provides listing and activity indexes',()=>{
 
 test('page and revision requests share one complete filter serialization',()=>{
   const params=channelListingSearchParams({search:'alpha',country:'Germany',countryStatus:'CONFIRMED',tradingStatus:'TRADING_CONFIRMED',discordStatus:'ACTIVE',scanStatus:'COMPLETED'},true);
-  assert.deepEqual([...params.entries()],[['include_rejected','true'],['search','alpha'],['country','Germany'],['country_status','CONFIRMED'],['trading_status','TRADING_CONFIRMED'],['discord_status','ACTIVE'],['scan_status','COMPLETED']]);
+  assert.deepEqual([...params.entries()],[['include_rejected','true'],['diagnostics_only','true'],['search','alpha'],['country','Germany'],['country_status','CONFIRMED'],['trading_status','TRADING_CONFIRMED'],['discord_status','ACTIVE'],['scan_status','COMPLETED']]);
 });
 
 test('dashboard summary and revision endpoints are operator-authorized',()=>{

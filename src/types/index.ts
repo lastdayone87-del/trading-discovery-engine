@@ -6,7 +6,7 @@ export interface DashboardOperationalSummary {
   activeDiscords: number;
   pendingScans: number;
   pendingReviews: number;
-  scope: { storedChannels: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'; operationalMetrics: 'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'; pendingReviews: 'DURABLE_REVIEW_QUEUE' };
+  scope: { storedChannels: 'ALL_STORED_CHANNELS'; operationalMetrics: 'ALL_STORED_CHANNELS'; pendingReviews: 'DURABLE_REVIEW_QUEUE' };
   deployment: { environment: string; service: string; instance: string };
 }
 
@@ -141,6 +141,7 @@ export interface ChannelRecord {
   discord_liveness_status?: DiscordLivenessStatus;
   discord_relevance_status?: DiscordRelevanceStatus;
   discord_validation_status?: DiscordValidationStatus;
+  discord_candidates?: Array<{candidate_id:string;raw_locator:string;normalized_locator:string;locator_type:string;source_surface?:string;source_url?:string;candidate_status:string;validation_status:string;liveness_status:string;relevance_status:string;retryable:boolean;attempt_count:number;last_checked?:string;failure_reason?:string;selected:boolean}>;
   post_approval_job_status?: 'PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
   post_approval_job_error?: string;
   scan_status: ScanStatus;

@@ -115,6 +115,8 @@ export async function appendOperatorAuditEvent(event: AuditEvent): Promise<void>
 export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=await getDb();const res=await db.query(`SELECT id,actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata,created_at FROM operator_audit_events ORDER BY created_at DESC LIMIT $1`,[Math.min(Math.max(limit,1),500)]);return res.rows;}
 export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);}
 export interface DiscordAttemptCandidate {candidateId?:string;rawLocator?:string;locatorType?:string;resolvedLocator?:string;sourceSurface?:string;sourceUrl?:string}
+export async function persistDiscordCandidates(channelId:string,candidates:DiscordAttemptCandidate[]):Promise<void>{const db=await getDb();for(const candidate of candidates){if(!candidate.candidateId)continue;await db.query(`INSERT INTO discord_candidates(channel_id,candidate_id,raw_locator,normalized_locator,locator_type,source_surface,source_url) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(channel_id,candidate_id) DO UPDATE SET raw_locator=excluded.raw_locator,normalized_locator=excluded.normalized_locator,locator_type=excluded.locator_type,source_surface=excluded.source_surface,source_url=excluded.source_url`,[channelId,candidate.candidateId,candidate.rawLocator||'',candidate.resolvedLocator||candidate.rawLocator||'',candidate.locatorType||'UNKNOWN',candidate.sourceSurface||null,candidate.sourceUrl||null]);}}
+export async function selectDiscordCandidate(channelId:string,candidateId:string):Promise<void>{const db=await getDb();await db.query(`UPDATE discord_candidates SET selected=(candidate_id=$2) WHERE channel_id=$1`,[channelId,candidateId]);}
 export async function appendDiscordCheckAttempts(channelId:string,inviteLocator:string,semanticStatus:string,attempts:Array<{attemptNumber:number;operationalOutcome:string;retryable:boolean;httpStatus?:number;providerErrorClass?:string;providerErrorCode?:number;responseContentType?:string;reason:string;checkedAt:string}>,candidate:DiscordAttemptCandidate={}):Promise<void>{const db=await getDb();for(const attempt of attempts)await db.query(`INSERT INTO discord_check_attempts(attempt_key,channel_id,invite_locator,semantic_status,operational_outcome,retryable,attempt_number,http_status,provider_error_class,reason,provenance,policy_version,checked_at,candidate_id,raw_locator,locator_type,resolved_locator,source_surface,source_url,response_content_type,provider_error_code) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'discord-check-policy-v2',$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT(attempt_key) DO NOTHING`,[`${channelId}:${attempt.checkedAt}:${attempt.attemptNumber}`,channelId,inviteLocator,semanticStatus,attempt.operationalOutcome,attempt.retryable,attempt.attemptNumber,attempt.httpStatus||null,attempt.providerErrorClass||null,attempt.reason,JSON.stringify({provider:'discord',operation:'invite-lookup',candidateLocatorPreserved:true}),attempt.checkedAt,candidate.candidateId||null,candidate.rawLocator||null,candidate.locatorType||null,candidate.resolvedLocator||inviteLocator,candidate.sourceSurface||null,candidate.sourceUrl||null,attempt.responseContentType||null,attempt.providerErrorCode||null]);}
 export async function countDiscordInvalidObservations(channelId:string,candidateId:string|undefined,inviteLocator:string):Promise<number>{const db=await getDb();const result=await db.query(`SELECT count(*)::int count FROM discord_check_attempts WHERE channel_id=$1 AND (candidate_id=$2 OR (candidate_id IS NULL AND invite_locator=$3)) AND operational_outcome IN('INVALID_OBSERVED','CONFIRMED_INVALID')`,[channelId,candidateId||null,inviteLocator]);return Number(result.rows[0]?.count||0);}
 export async function appendExternalAcquisitionObservations(channelId:string,observations:Array<{requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:string;required:boolean;outcome:string;retryable:boolean;httpStatus?:number;failureClass?:string;detail:string;observedAt:string}>):Promise<void>{const db=await getDb();for(const [index,observation] of observations.entries())await db.query(`INSERT INTO external_acquisition_observations(observation_key,channel_id,requested_url,final_url,outcome,retryable,http_status,failure_class,detail,provenance,policy_version,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'external-community-acquisition-v2',$11) ON CONFLICT(observation_key) DO NOTHING`,[`${channelId}:${observation.observedAt}:${index}:${observation.requestedUrl}`,channelId,observation.requestedUrl,observation.finalUrl||null,observation.outcome,observation.retryable,observation.httpStatus||null,observation.failureClass||null,observation.detail,JSON.stringify({provider:'external-link',boundedDepth:2,surface:observation.surface,required:observation.required,wrapperUrl:observation.wrapperUrl||null}),observation.observedAt]);}
@@ -248,6 +250,7 @@ function rowToChannel(row: any): ChannelRecord {
     discord_candidate_locator: row.discord_candidate_locator || null,
     discord_candidate_id:row.discord_candidate_id||null,discord_candidate_raw_locator:row.discord_candidate_raw_locator||null,discord_candidate_type:row.discord_candidate_type||null,
     discord_resolution_status:row.discord_resolution_status||'NOT_ATTEMPTED',discord_liveness_status:row.discord_liveness_status||'NOT_CHECKED',discord_relevance_status:row.discord_relevance_status||'NOT_CHECKED',discord_validation_status:row.discord_validation_status||'NOT_STARTED',
+    discord_candidates: parseJson(row.discord_candidates, []),
     post_approval_job_status: row.post_approval_job_status || undefined,
     post_approval_job_error: row.post_approval_job_error || undefined
   };
@@ -259,7 +262,7 @@ export async function getAllChannels(): Promise<ChannelRecord[]> {
   return res.rows.map(rowToChannel);
 }
 
-export interface ChannelListingFilter {includeRejected:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
+export interface ChannelListingFilter {includeRejected?:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
 // The NOT EXISTS check makes policy changes effective immediately, even for a
@@ -290,25 +293,22 @@ export function resolveChannelListingServingScope(defaultServing:{predicate:stri
   return defaultServing;
 }
 async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelListingFilter):Promise<{where:string;values:string[];scope:string}> {
-  const defaultServing=await dashboardServingPredicate(db);
-  const serving=resolveChannelListingServingScope(defaultServing,args.includeRejected,Boolean(args.diagnosticsOnly));
-  const clauses=[serving.predicate]; const values:string[]=[];
-  // Low-audience rows are retained for auditability, but the normal operator
-  // corpus should not be diluted by channels intentionally skipped for budget.
-  // An explicit scan-status filter opts into this corpus.
-  const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
-  if(!args.includeRejected&&!args.diagnosticsOnly&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT (subscriber_count ~ '^[0-9]+$' AND subscriber_count::integer < 30)`);
+  // The Channels Table is the operational system of record. Release serving
+  // policy remains available to its own consumers, but can never narrow this
+  // master listing. Diagnostics is an explicit excluded-only convenience view.
+  const clauses=[args.diagnosticsOnly?`NOT (${(await dashboardServingPredicate(db)).predicate})`:'TRUE']; const values:string[]=[];
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
   add('discord_status',args.discordStatus); add('scan_status',args.scanStatus);
-  return {where:clauses.join(' AND '),values,scope:serving.scope};
+  return {where:clauses.join(' AND '),values,scope:args.diagnosticsOnly?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'};
 }
 
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
   const columns=`channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,
+    COALESCE((SELECT jsonb_agg(to_jsonb(dc) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
     (SELECT last_error FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_error`;
   const [page,summary]=await Promise.all([
@@ -327,16 +327,15 @@ export async function getChannelListingRevision(args:ChannelListingFilter):Promi
 export interface DashboardOperationalSummary {storedChannels:number;activeDiscords:number;pendingScans:number;pendingReviews:number;scope:{storedChannels:string;operationalMetrics:string;pendingReviews:string};deployment:{environment:string;service:string;instance:string}}
 export async function getDashboardOperationalSummary(env:NodeJS.ProcessEnv=process.env):Promise<DashboardOperationalSummary> {
   const db=await getDb();
-  // One aggregate query preserves the summary-endpoint optimization while the
-  // shared eligibility predicate prevents KPI/listing population drift.
-  const serving=await dashboardServingPredicate(db);const result=await db.query(`SELECT COUNT(*)::int stored_channels,
+  // Stored means every durable channel row; serving eligibility is a separate policy.
+  const result=await db.query(`SELECT COUNT(*)::int stored_channels,
     COUNT(*) FILTER(WHERE discord_status IN('ACTIVE','ACTIVE_LOW_VOLUME'))::int active_discords,
     COUNT(*) FILTER(WHERE scan_status IN('PENDING','LOCKED','ENRICHMENT_PENDING','ENRICHING','NEEDS_REVIEW'))::int pending_scans,
     (SELECT COUNT(*)::int FROM channel_reviews WHERE state='PENDING') pending_reviews
-    FROM channels WHERE ${serving.predicate}`);
+    FROM channels`);
   const row=result.rows[0];
   return {storedChannels:Number(row.stored_channels||0),activeDiscords:Number(row.active_discords||0),pendingScans:Number(row.pending_scans||0),pendingReviews:Number(row.pending_reviews||0),
-    scope:{storedChannels:serving.scope,operationalMetrics:serving.scope,pendingReviews:'DURABLE_REVIEW_QUEUE'},
+    scope:{storedChannels:'ALL_STORED_CHANNELS',operationalMetrics:'ALL_STORED_CHANNELS',pendingReviews:'DURABLE_REVIEW_QUEUE'},
     deployment:{environment:env.RAILWAY_ENVIRONMENT_NAME||env.DEPLOYMENT_ENVIRONMENT||env.NODE_ENV||'unknown',service:env.RAILWAY_SERVICE_NAME||env.SERVICE_NAME||'trading-discovery-engine',instance:env.RAILWAY_DEPLOYMENT_ID?.slice(0,12)||env.DEPLOYMENT_ID?.slice(0,12)||'local'}};
 }
 export async function getChannelById(channelId: string): Promise<ChannelRecord | null> {
