@@ -630,12 +630,13 @@ export async function enqueueChildAndCommitPageReservation(input: {
   try {
     if (client) await activeRunner.query('BEGIN');
 
-    // 1. Enqueue child job inside transaction
+    // 1. Enqueue child job inside transaction with preventReopen: true
     const childJob = await enqueueJob(input.jobType, input.jobPayload, {
       priority: input.priority ?? 20,
       maxAttempts: input.maxAttempts ?? 3,
       idempotencyKey: input.idempotencyKey,
-      clientOverride: activeRunner
+      clientOverride: activeRunner,
+      preventReopen: true
     });
 
     // 2. Commit page reservation if pageReservationId was provided
