@@ -62,3 +62,10 @@ test('explicit trading context still permits rendered fallback when creator DB l
   assert.equal(renderedCalls,1);
   assert.ok(result.discordCandidates?.some(candidate=>candidate.nativeInviteCode==='rendered-room'));
 });
+
+test('a validated alternative outranks a creator-owned candidate with an operational provider failure',()=>{
+  const creator=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/creator','YOUTUBE_ABOUT','https://youtube.test/channel'))[0];
+  const alternative=mergeDiscordCandidates(extractDiscordCandidates('https://discord.gg/alternative','CHANNEL_EXTERNAL_LINKS','https://youtube.test/channel'))[0];
+  assert.ok(discordCandidateCompositeRank(alternative,{operationalOutcome:'SUCCEEDED',status:'ACTIVE',relevanceStatus:'TRADING_RELEVANT'})>
+    discordCandidateCompositeRank(creator,{operationalOutcome:'TIMEOUT',status:'UNCERTAIN',relevanceStatus:'NOT_CHECKED'}));
+});

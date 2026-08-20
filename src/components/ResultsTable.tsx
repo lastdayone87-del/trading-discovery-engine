@@ -65,12 +65,9 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     const matchesTradingStatus = selectedTradingStatus === 'ALL' || c.trading_status === selectedTradingStatus;
     const matchesDiscordStatus = selectedDiscordStatus === 'ALL' || c.discord_status === selectedDiscordStatus;
     const matchesScanStatus = selectedScanStatus === 'ALL' || c.scan_status === selectedScanStatus;
-    const matchesLowAudienceVisibility = selectedScanStatus === 'SKIPPED_LOW_AUDIENCE'
-      ? c.scan_status === 'SKIPPED_LOW_AUDIENCE'
-      : c.scan_status !== 'SKIPPED_LOW_AUDIENCE';
     const matchesReviewView = !pendingReviewOnly || (c.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(c.channel_id));
 
-    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView;
+    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesReviewView;
   }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds]);
 
   const handleCopyLink = (url: string, id: string) => {
@@ -509,6 +506,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       {c.discord_liveness_status==='INVALID_OBSERVED'&&<div className="text-[10px] text-amber-600">Invalid observation awaiting confirmation</div>}
                       {c.discord_candidate_type&&<div className="text-[10px] text-slate-400">Locator: {c.discord_candidate_type.replaceAll('_',' ')}</div>}
                       {c.discord_candidate_locator && !c.discord_invite && <div className="mt-0.5 max-w-48 truncate font-mono text-[10px] text-slate-500" title={c.discord_candidate_locator}>Candidate retained: {c.discord_candidate_locator.replace('https://','')}</div>}
+                      {(c.discord_candidates?.length||0)>0&&<details className="mt-1 text-[10px]"><summary className="cursor-pointer font-semibold text-indigo-600">{c.discord_candidates!.length} candidate{c.discord_candidates!.length===1?'':'s'} · view</summary><div className="mt-1 space-y-1 min-w-64">{c.discord_candidates!.map(candidate=><div key={candidate.candidate_id} className="rounded border border-slate-200 p-1.5 dark:border-slate-700"><div className="font-mono break-all">{candidate.normalized_locator} {candidate.selected&&<b className="text-emerald-600">· SELECTED</b>}</div><div>{candidate.source_observations?.map(item=>item.sourceSurface).filter(Boolean).join(', ')||candidate.source_surface||'Unknown source'} · {candidate.candidate_status} · {candidate.validation_status}</div><div>Liveness: {candidate.liveness_status} · Relevance: {candidate.relevance_status} · Attempts: {candidate.attempt_count}</div><div>{candidate.retryable?'Retryable':'Terminal'}{candidate.last_checked?` · ${new Date(candidate.last_checked).toLocaleString()}`:''}</div>{candidate.failure_reason&&<div className="text-rose-600">{candidate.failure_reason}</div>}</div>)}</div></details>}
                     </td>
 
                     {/* Scan Status */}

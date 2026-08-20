@@ -25,6 +25,8 @@ import {
   getDailyYouTubeQuotaBudget,
   getYouTubeKeyPool,
   appendDiscordCheckAttempts,
+  persistDiscordCandidates,
+  selectDiscordCandidate,
   countDiscordInvalidObservations,
   appendExternalAcquisitionObservations,
   getNeighborhoodForQueryRun
@@ -534,7 +536,7 @@ export async function processNextSearchJob(
     if (job.type === 'RETRY_COMMUNITY_ACQUISITION' && terminal) {
       const channelId=String(job.payload?.channelId||'');
       const channel=channelId?await getChannelById(channelId):null;
-      if(channel){channel.scan_status='FAILED_PERMANENT';channel.scan_attempts=Math.max(channel.scan_attempts||0,job.attempts);channel.last_checked=new Date().toISOString();await upsertChannel(channel);}
+      if(channel){channel.scan_status='FAILED';channel.discord_validation_status='RETRY_PENDING';channel.scan_attempts=Math.max(channel.scan_attempts||0,job.attempts);channel.last_checked=new Date().toISOString();await upsertChannel(channel);}
     }
     const runId = String(job.payload?.queryRunId || '');
     if (runId) await failQueryRun(runId, err, terminal);
@@ -556,6 +558,12 @@ export interface ProcessDiscoveredChannelOutcome {
   discordStatus: DiscordStatus;
   discordInvite: string | null;
   channelRecord?: ChannelRecord;
+}
+
+/** Channel attempts count lifecycle executions. Provider/candidate attempts are
+ * independently durable in discord_check_attempts and must not inflate this. */
+export function nextChannelScanAttempts(current:number,terminalSemanticOrSuccess:boolean):number{
+  return terminalSemanticOrSuccess?0:Math.max(0,current)+1;
 }
 
 /**
@@ -684,6 +692,7 @@ export async function inspectAndValidateChannel(
       // community is found. A live-but-ambiguous or live-but-non-trading first
       // invite is a fallback, not a reason to suppress a stronger later invite.
       const candidates=structuredCandidates.length?structuredCandidates:[{candidateId:`legacy:${discoveredInvite}`,locatorType:'NATIVE_INVITE' as const,sourceSurface:'CHANNEL_EXTERNAL_LINKS' as const,rawLocator:discoveredInvite,nativeInviteCode:discoveredInvite,normalizedLocator:`https://discord.gg/${discoveredInvite}`,extractionConfidence:'EXPLICIT' as const}];
+      await persistDiscordCandidates(channel.channel_id,candidates.map(candidate=>({candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:candidate.normalizedLocator,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,observations:candidate.observations})));
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
       for(const candidate of candidates){
@@ -713,9 +722,9 @@ export async function inspectAndValidateChannel(
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
       const sameValidatedCandidate=!channel.discord_candidate_id||channel.discord_candidate_id===selectedCandidate.candidateId;
       const shouldProjectValidation=!alreadyValidatedSuccess||selected.operationalOutcome==='SUCCEEDED'||(selected.operationalOutcome==='CONFIRMED_INVALID'&&sameValidatedCandidate);
-      if(shouldProjectValidation)Object.assign(channel,projectDiscordValidation(channel,selected,selectedCandidate));
+      if(shouldProjectValidation){Object.assign(channel,projectDiscordValidation(channel,selected,selectedCandidate));await selectDiscordCandidate(channel.channel_id,selectedCandidate.candidateId);}
       channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
-      channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:channel.scan_attempts+selected.attempts.length;
+      channel.scan_attempts=nextChannelScanAttempts(channel.scan_attempts,selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID');
       channel.last_checked=now;
       reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:true});
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
