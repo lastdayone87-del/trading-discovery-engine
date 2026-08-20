@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS country_native_evidence_projections (
   native_observed_ratio REAL NOT NULL DEFAULT 0.0,
   distinct_creator_count INTEGER NOT NULL DEFAULT 0,
   quality_creator_count INTEGER NOT NULL DEFAULT 0,
+  native_quality_creator_count INTEGER NOT NULL DEFAULT 0,
   distinct_community_count INTEGER NOT NULL DEFAULT 0,
   structured_entity_matched BOOLEAN NOT NULL DEFAULT false,
   native_evidence_status TEXT NOT NULL DEFAULT 'NATIVE_OBSERVED' CHECK (native_evidence_status IN ('NATIVE_OBSERVED', 'BOOTSTRAP_SEED', 'TRANSLATED_SEED')),

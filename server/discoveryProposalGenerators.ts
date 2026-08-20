@@ -57,8 +57,15 @@ export function createProposalDedupKey(
 }
 
 export function countryNativeEvidenceChecksum(evidence: Record<string, unknown>): string {
-  const { evidenceChecksum: _previousChecksum, ...mutableEvidence } = evidence;
+  const { evidenceChecksum: _previousChecksum, evidenceVersion: _previousVersion, ...mutableEvidence } = evidence;
   return computeEvidenceChecksum(mutableEvidence);
+}
+
+export function countryNativeEvidenceVersion(evidence: Record<string, unknown>, checksum: string): string {
+  const observedAt = typeof evidence.lastObservedAt === 'string' && !Number.isNaN(Date.parse(evidence.lastObservedAt))
+    ? new Date(evidence.lastObservedAt).toISOString()
+    : '1970-01-01T00:00:00.000Z';
+  return `${observedAt}|${checksum}`;
 }
 
 export function effectiveProjectionProposalEvidence(row: {
@@ -67,9 +74,11 @@ export function effectiveProjectionProposalEvidence(row: {
   source_provenance_families?: string[];
   bootstrap_seed_count?: number | string;
   quality_creator_count?: number | string;
+  native_quality_creator_count?: number | string;
+  structured_entity_matched?: boolean;
 }): { nativeEvidenceStatus: string; sourceProvenanceFamily: string; nativeGateSatisfied: boolean } {
   const nativeGateSatisfied = row.native_evidence_status === 'NATIVE_OBSERVED' &&
-    (Number(row.quality_creator_count) >= 2 || row.source_provenance_family === 'STRUCTURED_LOCAL_ENTITY');
+    (Number(row.native_quality_creator_count) >= 2 || Boolean(row.structured_entity_matched));
   const families = row.source_provenance_families || [];
   return {
     nativeGateSatisfied,
@@ -120,8 +129,9 @@ export function buildFrontierProposal(params: {
   const expiresAt = new Date(Date.now() + ttl * 86_400_000).toISOString();
 
   const supportingEvidence = params.supportingEvidence || {};
+  const evidenceChecksum = countryNativeEvidenceChecksum(supportingEvidence);
   const versionedEvidence = params.proposalFamily === 'COUNTRY_NATIVE'
-    ? { ...supportingEvidence, evidenceChecksum: countryNativeEvidenceChecksum(supportingEvidence) }
+    ? { ...supportingEvidence, evidenceChecksum, evidenceVersion: countryNativeEvidenceVersion(supportingEvidence, evidenceChecksum) }
     : supportingEvidence;
   return {
     dedupKey,
@@ -300,7 +310,9 @@ export async function generateCountryNativeProposals(country: string, limit = 10
            p.source_provenance_families,
            p.bootstrap_seed_count,
            p.quality_creator_count,
+           p.native_quality_creator_count,
            p.distinct_creator_count,
+           p.structured_entity_matched,
            p.is_code_switched,
            p.code_switch_type,
            p.observed_creator_countries,
@@ -336,6 +348,7 @@ export async function generateCountryNativeProposals(country: string, limit = 10
               conceptId: row.concept_id || null,
               nativeConfidenceScore: Number(row.native_confidence_score),
               qualityCreatorCount: Number(row.quality_creator_count),
+              nativeQualityCreatorCount: Number(row.native_quality_creator_count),
               distinctCreatorCount: Number(row.distinct_creator_count),
               isCodeSwitched: Boolean(row.is_code_switched),
               codeSwitchType: row.code_switch_type || 'NONE',
@@ -604,16 +617,26 @@ export async function persistFrontierProposals(
              WHEN frontier_discovery_proposals.supporting_evidence->>'sourceProvenanceFamily'='STATIC_BOOTSTRAP' THEN 100
              ELSE 0 END)
            AND COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
+           AND COALESCE((excluded.supporting_evidence->>'nativeQualityCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'nativeQualityCreatorCount')::int,0)
            AND COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) >= COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
            AND excluded.confidence >= frontier_discovery_proposals.confidence
            AND COALESCE(excluded.supporting_evidence->'observedCreatorCountries','[]'::jsonb) @> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedCreatorCountries','[]'::jsonb)
            AND COALESCE(excluded.supporting_evidence->'observedMarketCountries','[]'::jsonb) @> COALESCE(frontier_discovery_proposals.supporting_evidence->'observedMarketCountries','[]'::jsonb)
            AND (
-             COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
-             OR COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
-             OR excluded.confidence > frontier_discovery_proposals.confidence
-             OR excluded.supporting_evidence->>'evidenceChecksum'
-                IS DISTINCT FROM frontier_discovery_proposals.supporting_evidence->>'evidenceChecksum'
+             COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+               > COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+             OR (
+               COALESCE((excluded.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+                 = COALESCE((frontier_discovery_proposals.supporting_evidence->>'lastObservedAt')::timestamptz,'epoch'::timestamptz)
+               AND (
+                 COALESCE((excluded.supporting_evidence->>'qualityCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'qualityCreatorCount')::int,0)
+                 OR COALESCE((excluded.supporting_evidence->>'nativeQualityCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'nativeQualityCreatorCount')::int,0)
+                 OR COALESCE((excluded.supporting_evidence->>'distinctCreatorCount')::int,0) > COALESCE((frontier_discovery_proposals.supporting_evidence->>'distinctCreatorCount')::int,0)
+                 OR excluded.confidence > frontier_discovery_proposals.confidence
+                 OR COALESCE(excluded.supporting_evidence->>'evidenceVersion','')
+                    > COALESCE(frontier_discovery_proposals.supporting_evidence->>'evidenceVersion','')
+               )
+             )
            )
          ))`,
       [

@@ -40,6 +40,7 @@ export interface CountryNativeEvidenceProjection {
   nativeObservedRatio: number;
   distinctCreatorCount: number;
   qualityCreatorCount: number;
+  nativeQualityCreatorCount: number;
   distinctCommunityCount: number;
   structuredEntityMatched: boolean;
   nativeEvidenceStatus: NativeEvidenceStatus;
@@ -280,6 +281,7 @@ export async function recomputeNativeEvidenceProjection(
 
   const allCreators = new Set<string>();
   const qualityCreators = new Set<string>();
+  const nativeQualityCreators = new Set<string>();
   const creatorCountries = new Set<string>();
   const marketCountries = new Set<string>();
   const communities = new Set<string>();
@@ -309,6 +311,7 @@ export async function recomputeNativeEvidenceProjection(
       // Explicit Quality Creator Criteria: TRADING_CONFIRMED and quality_score >= 50
       if (r.trading_status === 'TRADING_CONFIRMED' && (r.quality_score || 0) >= 50) {
         qualityCreators.add(r.source_channel_id);
+        if (r.native_evidence_status === 'NATIVE_OBSERVED') nativeQualityCreators.add(r.source_channel_id);
       }
     }
 
@@ -393,24 +396,25 @@ export async function recomputeNativeEvidenceProjection(
 
   const distinctCreatorCount = allCreators.size;
   const qualityCreatorCount = qualityCreators.size;
+  const nativeQualityCreatorCount = nativeQualityCreators.size;
   const distinctCommunityCount = communities.size;
 
   // Native Proposal Eligibility Rule:
   // Requires native_observed_count >= 1 AND (qualityCreatorCount >= 2 OR structuredMatched) OR governed country_vocabularies / BOOTSTRAP_SEED
   const governedBootstrapEvidence = bootstrapSeedCount > 0 || Boolean(provenanceCounts.COUNTRY_VOCABULARY);
   const nativeProposalEligible =
-    (nativeObservedCount >= 1 && (qualityCreatorCount >= 2 || structuredMatched)) ||
+    (nativeObservedCount >= 1 && (nativeQualityCreatorCount >= 2 || structuredMatched)) ||
     governedBootstrapEvidence;
 
   // Calculate Native Confidence Score (0.0 to 1.0)
   let confidence = 0.20; // Base
   if (structuredMatched) confidence += 0.30;
   if (nativeObservedCount >= 1) confidence += 0.20;
-  confidence += Math.min(0.30, qualityCreatorCount * 0.10);
+  confidence += Math.min(0.30, nativeQualityCreatorCount * 0.10);
   confidence += Math.min(0.10, distinctCommunityCount * 0.05);
 
   // Single creator cap constraint: If qualityCreatorCount <= 1 and not structured, cap native proposal confidence at 0.45
-  if (qualityCreatorCount <= 1 && !structuredMatched && nativeEvidenceStatus !== 'BOOTSTRAP_SEED') {
+  if (nativeQualityCreatorCount <= 1 && !structuredMatched && nativeEvidenceStatus !== 'BOOTSTRAP_SEED') {
     confidence = Math.min(0.45, confidence);
   }
 
@@ -437,6 +441,7 @@ export async function recomputeNativeEvidenceProjection(
     nativeObservedRatio,
     distinctCreatorCount,
     qualityCreatorCount,
+    nativeQualityCreatorCount,
     distinctCommunityCount,
     structuredEntityMatched: structuredMatched,
     nativeEvidenceStatus,
@@ -458,7 +463,7 @@ export async function recomputeNativeEvidenceProjection(
        code_switch_types, code_switch_type_counts,
        raw_observation_count, native_observed_count, bootstrap_seed_count,
        translated_seed_count, native_observed_ratio,
-       distinct_creator_count, quality_creator_count, distinct_community_count,
+       distinct_creator_count, quality_creator_count, native_quality_creator_count, distinct_community_count,
        structured_entity_matched, native_evidence_status, source_provenance_family,
        source_provenance_families, source_provenance_counts,
        native_confidence_score, native_proposal_eligible,
@@ -466,7 +471,7 @@ export async function recomputeNativeEvidenceProjection(
      )
      VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-       $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+       $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
      )
      ON CONFLICT (canonical_term_id) DO UPDATE SET
        concept_id = EXCLUDED.concept_id,
@@ -486,6 +491,7 @@ export async function recomputeNativeEvidenceProjection(
        native_observed_ratio = EXCLUDED.native_observed_ratio,
        distinct_creator_count = EXCLUDED.distinct_creator_count,
        quality_creator_count = EXCLUDED.quality_creator_count,
+       native_quality_creator_count = EXCLUDED.native_quality_creator_count,
        distinct_community_count = EXCLUDED.distinct_community_count,
        structured_entity_matched = EXCLUDED.structured_entity_matched,
        native_evidence_status = EXCLUDED.native_evidence_status,
@@ -515,6 +521,7 @@ export async function recomputeNativeEvidenceProjection(
       projection.nativeObservedRatio,
       projection.distinctCreatorCount,
       projection.qualityCreatorCount,
+      projection.nativeQualityCreatorCount,
       projection.distinctCommunityCount,
       projection.structuredEntityMatched,
       projection.nativeEvidenceStatus,

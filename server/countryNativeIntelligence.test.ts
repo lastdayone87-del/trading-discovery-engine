@@ -254,16 +254,17 @@ function createMockRunner() {
           nativeObservedRatio: params[15],
           distinctCreatorCount: params[16],
           qualityCreatorCount: params[17],
-          distinctCommunityCount: params[18],
-          structuredEntityMatched: params[19],
-          nativeEvidenceStatus: params[20],
-          sourceProvenanceFamily: params[21],
-          sourceProvenanceFamilies: parseArr(params[22]),
-          sourceProvenanceCounts: typeof params[23] === 'string' ? JSON.parse(params[23]) : params[23],
-          nativeConfidenceScore: params[24],
-          nativeProposalEligible: params[25],
-          lastObservedAt: params[26],
-          updatedAt: params[27]
+          nativeQualityCreatorCount: params[18],
+          distinctCommunityCount: params[19],
+          structuredEntityMatched: params[20],
+          nativeEvidenceStatus: params[21],
+          sourceProvenanceFamily: params[22],
+          sourceProvenanceFamilies: parseArr(params[23]),
+          sourceProvenanceCounts: typeof params[24] === 'string' ? JSON.parse(params[24]) : params[24],
+          nativeConfidenceScore: params[25],
+          nativeProposalEligible: params[26],
+          lastObservedAt: params[27],
+          updatedAt: params[28]
         });
         return { rows: [] };
       }
@@ -652,12 +653,75 @@ test('Phase 10: mixed projection proposal labeling distinguishes governed fallba
   }), { nativeEvidenceStatus: 'BOOTSTRAP_SEED', sourceProvenanceFamily: 'COUNTRY_VOCABULARY', nativeGateSatisfied: false });
   assert.deepEqual(effectiveProjectionProposalEvidence({
     native_evidence_status: 'NATIVE_OBSERVED', source_provenance_family: 'CREATOR_METADATA',
-    source_provenance_families: ['COUNTRY_VOCABULARY', 'CREATOR_METADATA'], bootstrap_seed_count: 1, quality_creator_count: 2
+    source_provenance_families: ['COUNTRY_VOCABULARY', 'CREATOR_METADATA'], bootstrap_seed_count: 1,
+    quality_creator_count: 2, native_quality_creator_count: 2
   }), { nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA', nativeGateSatisfied: true });
   assert.deepEqual(effectiveProjectionProposalEvidence({
     native_evidence_status: 'TRANSLATED_SEED', source_provenance_family: 'TRANSLATED_QUERY',
     source_provenance_families: ['TRANSLATED_QUERY'], bootstrap_seed_count: 0, quality_creator_count: 0
   }), { nativeEvidenceStatus: 'TRANSLATED_SEED', sourceProvenanceFamily: 'TRANSLATED_QUERY', nativeGateSatisfied: false });
+  assert.deepEqual(effectiveProjectionProposalEvidence({
+    native_evidence_status: 'NATIVE_OBSERVED', source_provenance_family: 'CREATOR_METADATA',
+    source_provenance_families: ['COUNTRY_VOCABULARY', 'CREATOR_METADATA', 'STRUCTURED_LOCAL_ENTITY'],
+    bootstrap_seed_count: 1, quality_creator_count: 1, native_quality_creator_count: 0, structured_entity_matched: true
+  }), { nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA', nativeGateSatisfied: true });
+});
+
+test('Phase 10: non-native quality creators cannot satisfy the native multi-creator gate', async () => {
+  const runner = createMockRunner();
+  for (const channelId of ['translated-quality-1', 'translated-quality-2', 'bootstrap-quality-1']) {
+    runner.channels.set(channelId, { country: 'Germany', trading_status: 'TRADING_CONFIRMED', quality_score: 90 });
+    await observeTerminology({
+      term: 'native scoped quality', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+      videoId: `video-${channelId}`, channelId,
+      nativeEvidenceStatus: channelId.startsWith('translated') ? 'TRANSLATED_SEED' : 'BOOTSTRAP_SEED',
+      sourceProvenanceFamily: channelId.startsWith('translated') ? 'TRANSLATED_QUERY' : 'STATIC_BOOTSTRAP'
+    }, runner);
+  }
+  runner.channels.set('weak-native-quality', { country: 'Germany', trading_status: 'TRADING_CONFIRMED', quality_score: 90 });
+  const termId = await observeTerminology({
+    term: 'native scoped quality', country: 'Germany', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    videoId: 'video-weak-native', channelId: 'weak-native-quality',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA'
+  }, runner);
+  const projection = await recomputeNativeEvidenceProjection(termId!, runner);
+  assert.equal(projection?.qualityCreatorCount, 4);
+  assert.equal(projection?.nativeQualityCreatorCount, 1);
+  assert.equal(projection?.nativeEvidenceStatus, 'NATIVE_OBSERVED');
+  assert.equal(projection?.structuredEntityMatched, false);
+});
+
+test('Phase 10: persisted structured native match survives dominant creator provenance and governed bootstrap', async () => {
+  const runner = createMockRunner();
+  let termId: number | null = null;
+  for (let index = 0; index < 3; index++) {
+    termId = await observeTerminology({
+      term: 'structured mixed native', country: 'Brazil', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+      videoId: `creator-metadata-${index}`, channelId: `ordinary-creator-${index}`,
+      nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA'
+    }, runner);
+  }
+  await observeTerminology({
+    term: 'structured mixed native', country: 'Brazil', termType: 'TERMINOLOGY', observationType: 'ENRICHMENT',
+    sourceEvidenceId: 'structured-b3-entity', nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY'
+  }, runner);
+  await observeTerminology({
+    term: 'structured mixed native', country: 'Brazil', termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    videoId: 'governed-vocabulary', nativeEvidenceStatus: 'BOOTSTRAP_SEED', sourceProvenanceFamily: 'COUNTRY_VOCABULARY'
+  }, runner);
+  const projection = await recomputeNativeEvidenceProjection(termId!, runner);
+  assert.equal(projection?.sourceProvenanceFamily, 'CREATOR_METADATA', 'creator metadata remains the dominant same-status family');
+  assert.equal(projection?.structuredEntityMatched, true, 'structured native evidence is persisted independently of dominance');
+  assert.equal(projection?.nativeProposalEligible, true);
+  assert.deepEqual(effectiveProjectionProposalEvidence({
+    native_evidence_status: projection!.nativeEvidenceStatus,
+    source_provenance_family: projection!.sourceProvenanceFamily,
+    source_provenance_families: projection!.sourceProvenanceFamilies,
+    bootstrap_seed_count: projection!.bootstrapSeedCount,
+    quality_creator_count: projection!.qualityCreatorCount,
+    native_quality_creator_count: projection!.nativeQualityCreatorCount,
+    structured_entity_matched: projection!.structuredEntityMatched
+  }), { nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA', nativeGateSatisfied: true });
 });
 
 test('Phase 10: persisted-cursor round robin preserves generator ranking and has a bounded fairness guarantee', () => {

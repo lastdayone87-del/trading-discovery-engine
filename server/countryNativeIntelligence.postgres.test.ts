@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { completeQueryRun, getDb } from './db';
 import { observeTerminology } from './terminologyIntelligence';
-import { buildFrontierProposal, countryNativeEvidenceChecksum, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
+import { buildFrontierProposal, countryNativeEvidenceChecksum, countryNativeEvidenceVersion, generateCountryNativeProposals, persistFrontierProposals } from './discoveryProposalGenerators';
 import { attributeCountryNativePerformance } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
@@ -142,10 +142,10 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
     assert.match(upgraded.rows[0].source_provenance, /^observed_native_evidence:/);
     assert.ok(Math.abs(upgraded.rows[0].confidence - persisted!.confidence) < 1e-6);
 
-    const versionEvidence = <T extends Record<string, unknown>>(evidence: T): T & { evidenceChecksum: string } => ({
-      ...evidence,
-      evidenceChecksum: countryNativeEvidenceChecksum(evidence)
-    });
+    const versionEvidence = <T extends Record<string, unknown>>(evidence: T): T & { evidenceChecksum: string; evidenceVersion: string } => {
+      const evidenceChecksum = countryNativeEvidenceChecksum(evidence);
+      return { ...evidence, evidenceChecksum, evidenceVersion: countryNativeEvidenceVersion(evidence, evidenceChecksum) };
+    };
     const creatorRefresh = {
       ...persisted!,
       supportingEvidence: versionEvidence({
@@ -177,16 +177,24 @@ test('Phase 10 PostgreSQL: migration, replay, projection persistence, legacy neu
 
     const codeSwitchRefresh = {
       ...geographyRefresh,
-      supportingEvidence: versionEvidence({ ...geographyRefresh.supportingEvidence, isCodeSwitched: true, codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' })
+      supportingEvidence: versionEvidence({ ...geographyRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:01.000Z', isCodeSwitched: true, codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' })
     };
     assert.equal(await persistFrontierProposals([codeSwitchRefresh]), 1, 'code-switch-only same-tier change must refresh');
     const provenanceRefresh = {
       ...codeSwitchRefresh,
       sourceProvenance: `observed_native_evidence:structured_local_entity:${firstId}`,
-      supportingEvidence: versionEvidence({ ...codeSwitchRefresh.supportingEvidence, sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY' })
+      supportingEvidence: versionEvidence({ ...codeSwitchRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:02.000Z', sourceProvenanceFamily: 'STRUCTURED_LOCAL_ENTITY' })
     };
     assert.equal(await persistFrontierProposals([provenanceRefresh]), 1, 'primary same-tier provenance-only change must refresh');
     assert.equal(await persistFrontierProposals([provenanceRefresh]), 0, 'canonical evidence exact replay must remain a no-op');
+    assert.equal(await persistFrontierProposals([codeSwitchRefresh]), 0, 'stale evidence cannot overwrite newer same-tier evidence');
+
+    const equalTimestampA = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE' }) };
+    const equalTimestampB = { ...provenanceRefresh, supportingEvidence: versionEvidence({ ...provenanceRefresh.supportingEvidence, lastObservedAt: '2099-01-01T00:00:03.000Z', codeSwitchType: 'ENGLISH_DOMINANT_NATIVE_MARKET' }) };
+    const [lowerVersion, higherVersion] = [equalTimestampA, equalTimestampB].sort((a, b) => String(a.supportingEvidence.evidenceVersion).localeCompare(String(b.supportingEvidence.evidenceVersion)));
+    assert.equal(await persistFrontierProposals([lowerVersion]), 1);
+    assert.equal(await persistFrontierProposals([higherVersion]), 1, 'equal timestamp must converge to deterministic maximum evidence version');
+    assert.equal(await persistFrontierProposals([lowerVersion]), 0, 'lower equal-timestamp version cannot overwrite deterministic winner');
 
     const query = await db.query(
       `INSERT INTO query_library(query,normalized_query,country,collection,intent)
