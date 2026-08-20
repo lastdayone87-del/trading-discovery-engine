@@ -281,6 +281,8 @@ export async function getNeighborhoodCandidates(
       WHERE target_neighborhood_key = n.neighborhood_key
         AND trial_status = 'PENDING'
         AND (expires_at IS NULL OR expires_at > $1)
+        AND (proposal_family <> 'EXTERNAL_OSINT'
+          OR COALESCE((supporting_evidence->>'expiresAt')::timestamptz, '-infinity'::timestamptz) > $1)
       ORDER BY created_at DESC LIMIT 1
     ) p ON true
     LEFT JOIN LATERAL (
@@ -682,7 +684,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
     if (topCandidate.proposalId) {
       const selectedEvidence = (topCandidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
       const canonicalTermId = Number(selectedEvidence.canonicalTermId);
-      if (Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+      if (topCandidate.proposalFamily === 'COUNTRY_NATIVE' && Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
         await runner.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR SHARE', [canonicalTermId]);
         const projection = await runner.query(
           `SELECT native_evidence_status,source_provenance_family,source_provenance_families,

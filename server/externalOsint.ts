@@ -133,7 +133,12 @@ export async function runOsintAdapter(adapter: OsintAdapter): Promise<{ observat
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), adapter.timeoutMs);
     try {
-      const inputs = await adapter.fetch(controller.signal);
+      const inputs = await Promise.race([
+        adapter.fetch(controller.signal),
+        new Promise<never>((_, reject) => {
+          controller.signal.addEventListener('abort', () => reject(new Error('OSINT_ADAPTER_TIMEOUT')), { once: true });
+        })
+      ]);
       return { observations: inputs.slice(0, adapter.maxRequests).map(normalizeExternalObservation), degraded: false };
     } catch (error) { lastError = error instanceof Error ? error.message : String(error); }
     finally { clearTimeout(timer); }
@@ -172,6 +177,20 @@ export function buildExternalOsintProposal(evidence: OsintEvidenceAggregate, rev
 
 export async function persistExternalOsintProposal(proposal: DiscoveryFrontierProposal, runner?: Queryable): Promise<boolean> {
   const db=runner||await getDb(); const d=proposal.targetDimensions;
+  // Resolve to the existing terminology authority when it already knows this
+  // identity. OSINT retains distinct evidence/proposal provenance and never
+  // creates or mutates canonical terminology on its own.
+  const canonical = await db.query(
+    `SELECT id,concept_id FROM canonical_trading_terms
+     WHERE country=$1 AND normalized_term=$2 LIMIT 1`,
+    [proposal.country, normalizeNativeTerm(proposal.concept)]
+  );
+  if (canonical.rowCount) {
+    const supportingEvidence = { ...proposal.supportingEvidence,
+      canonicalTermId: Number(canonical.rows[0].id), conceptId: canonical.rows[0].concept_id || null };
+    proposal = { ...proposal, supportingEvidence: { ...supportingEvidence,
+      evidenceChecksum: checksum(supportingEvidence) } };
+  }
   await db.query(`INSERT INTO discovery_neighborhoods(neighborhood_key,neighborhood_checksum,country,language,query_intent,primary_term_family,retrieval_lane,search_ordering,instrument_or_theme,source_family,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'{}') ON CONFLICT(neighborhood_key) DO NOTHING`,[proposal.targetNeighborhoodKey,createNeighborhoodChecksum(proposal.targetNeighborhoodKey!),d.country,d.language,d.queryIntent,d.primaryTermFamily,d.retrievalLane,d.searchOrdering,d.instrumentOrTheme,d.sourceFamily]);
   const result=await db.query(`INSERT INTO frontier_discovery_proposals(dedup_key,proposal_family,country,language,concept,target_neighborhood_key,target_dimensions,source_provenance,supporting_evidence,confidence,novelty_rationale,trial_status,expires_at) VALUES($1,'EXTERNAL_OSINT',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(dedup_key) DO UPDATE SET source_provenance=excluded.source_provenance,supporting_evidence=excluded.supporting_evidence,confidence=excluded.confidence,expires_at=excluded.expires_at WHERE frontier_discovery_proposals.proposal_family='EXTERNAL_OSINT' AND frontier_discovery_proposals.trial_status NOT IN ('TRIED','EXPIRED') AND COALESCE((excluded.supporting_evidence->>'evidenceRevision')::numeric,0)>COALESCE((frontier_discovery_proposals.supporting_evidence->>'evidenceRevision')::numeric,0)`,[proposal.dedupKey,proposal.country,proposal.language,proposal.concept,proposal.targetNeighborhoodKey,JSON.stringify(proposal.targetDimensions),proposal.sourceProvenance,JSON.stringify(proposal.supportingEvidence),proposal.confidence,proposal.noveltyRationale,proposal.trialStatus,proposal.expiresAt]); return result.rowCount===1;
 }
@@ -201,6 +220,6 @@ export function isOsintSnapshotFresh(snapshot: Record<string, any>, now=new Date
 
 export async function attributeExternalOsintOutcome(input:{ decisionId:string; queryRunId:string; quotaConsumed:number; rawResults:number; distinctCreators:number; newCreators:number; relevantNewCreators:number; qualityNewCreators:number; confirmedCreators:number; wrongCountryResults?:number; coverageExpansion?:number },runner?:Queryable):Promise<boolean>{
   const db=runner||await getDb();
-  const result=await db.query(`INSERT INTO external_osint_performance_attribution(attribution_key,proposal_id,allocation_decision_id,query_run_id,source_families,canonical_concept,country,evidence_snapshot,quota_consumed,raw_results,distinct_creators,new_creators,relevant_new_creators,quality_new_creators,confirmed_creators,wrong_country_results,coverage_expansion,yield_score) SELECT encode(digest(d.decision_id||':'||$2,'sha256'),'hex'),d.proposal_id,d.decision_id,$2,(d.proposal_evidence_snapshot->'supportingEvidence'->'sourceFamilies'),d.proposal_evidence_snapshot->'supportingEvidence'->>'canonicalConcept',d.selected_country,d.proposal_evidence_snapshot,$3,$4,$5,$6,$7,$8,$9,$10,$11,CASE WHEN $3>0 THEN $8::float/$3 ELSE 0 END FROM frontier_allocation_decisions d WHERE d.decision_id=$1 AND d.proposal_evidence_snapshot->>'proposalFamily'='EXTERNAL_OSINT' ON CONFLICT(attribution_key) DO NOTHING`,[input.decisionId,input.queryRunId,input.quotaConsumed,input.rawResults,input.distinctCreators,input.newCreators,input.relevantNewCreators,input.qualityNewCreators,input.confirmedCreators,input.wrongCountryResults||0,input.coverageExpansion||0]);
+  const result=await db.query(`INSERT INTO external_osint_performance_attribution(attribution_key,proposal_id,allocation_decision_id,query_run_id,source_families,canonical_concept,country,evidence_snapshot,quota_consumed,raw_results,distinct_creators,new_creators,relevant_new_creators,quality_new_creators,confirmed_creators,wrong_country_results,coverage_expansion,yield_score) SELECT encode(digest(d.decision_id||':'||$2::text,'sha256'),'hex'),d.proposal_id,d.decision_id,$2::uuid,(d.proposal_evidence_snapshot->'supportingEvidence'->'sourceFamilies'),d.proposal_evidence_snapshot->'supportingEvidence'->>'canonicalConcept',d.selected_country,d.proposal_evidence_snapshot,$3::int,$4::int,$5::int,$6::int,$7::int,$8::int,$9::int,$10::int,$11::float,CASE WHEN $4::int>0 THEN ($8::int)::float/$4::int ELSE 0 END FROM frontier_allocation_decisions d WHERE d.decision_id=$1 AND d.proposal_evidence_snapshot->>'proposalFamily'='EXTERNAL_OSINT' ON CONFLICT(attribution_key) DO NOTHING`,[input.decisionId,input.queryRunId,input.quotaConsumed,input.rawResults,input.distinctCreators,input.newCreators,input.relevantNewCreators,input.qualityNewCreators,input.confirmedCreators,input.wrongCountryResults||0,input.coverageExpansion||0]);
   return result.rowCount===1;
 }
