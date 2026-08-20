@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'; import test from 'node:test';
 import { authenticate, routePolicyInventory, validateOperatorConfiguration } from './operatorAuth';
 
+test('Phase 12 diagnostics and materialization routes are governed',()=>{
+ assert.ok(routePolicyInventory.some(r=>r.method==='GET'&&r.pattern.includes('discovery\\/evaluation')));
+ assert.ok(routePolicyInventory.some(r=>r.method==='POST'&&r.pattern.includes('evaluation\\/snapshots')));
+});
+
 test('maps admin, operator, and transitional reviewer credentials without exposing tokens',()=>{
  const env={ADMIN_API_TOKEN:'a',ADMIN_IDENTITY:'root',OPERATOR_API_TOKEN:'o',OPERATOR_IDENTITY:'ops',REVIEW_API_TOKEN:'r',DEFAULT_REVIEWER_IDENTITY:'review'};
  assert.deepEqual(authenticate('a',env),{actorId:'root',actorHash:authenticate('a',env)?.actorHash,role:'admin'});

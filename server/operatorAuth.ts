@@ -13,6 +13,8 @@ declare global { namespace Express { interface Request { requestId: string; oper
 const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; action: string }> = [
   { method:'GET', pattern:/^\/api\/health$/, policy:'public', action:'health.read' },
   { method:'GET', pattern:/^\/api\/provider-metrics$/, policy:'operator', action:'providers.metrics.read' },
+  { method:'GET', pattern:/^\/api\/discovery\/evaluation$/, policy:'operator', action:'discovery.evaluation.read' },
+  { method:'POST', pattern:/^\/api\/discovery\/evaluation\/snapshots$/, policy:'operator', action:'discovery.evaluation.materialize' },
   { method:'GET', pattern:/^\/api\/diagnostics\/enrichment-backlog$/, policy:'operator', action:'diagnostics.enrichment-backlog.read' },
   { method:'GET', pattern:/^\/api\/validation-status$/, policy:'operator', action:'validation.read' },
   { method:'GET', pattern:/^\/api\/measurement\/replay$/, policy:'operator', action:'measurement.replay.read' },
