@@ -15,6 +15,10 @@ import { validateLedgerInput, type ValidationKind, type ValidationStatus } from 
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
+import { buildRetrievalConfiguration } from './retrievalConfiguration';
+import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
+import { reserveRetrievalCanaryTreatment, commitRetrievalCanaryReservation, releaseRetrievalCanaryReservation } from './retrievalPolicyCanary';
+import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
@@ -417,7 +421,7 @@ export async function performManualDatabaseBackup():Promise<{success:boolean;tim
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
 export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; }
-export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string}={}):Promise<DurableJob>{const db=await getDb(); const res=await db.query(`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END RETURNING *`,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]); return rowToJob(res.rows[0]);}
+export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean}={}):Promise<DurableJob>{const db=opts.clientOverride||await getDb(); const sql=opts.preventReopen?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`:`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END RETURNING *`; const res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]); return rowToJob(res.rows[0]);}
 function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||''};}
 export async function claimNextJob(workerId:string,types?:string[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN'); const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) ORDER BY priority DESC,created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`,[types||null]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,$2,'PROCESSING')`,[job.id,upd.rows[0].attempts]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);}catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}
   // Trace persistence is deliberately outside the claim transaction. The old
@@ -562,20 +566,108 @@ export async function scheduleAutonomousQueryRuns(
       );
       const video = laneCounts.rows[0]?.video || 0;
       const total = laneCounts.rows[0]?.total || 0;
-      const retrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
+      const controlRetrievalLane = allocateRetrievalLane(video, total, videoLanePercent);
       const orderingCounts = await client.query(
         `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
          FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
       );
-      const searchOrdering = allocateSearchOrdering(retrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+      const controlSearchOrdering = allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+
+      const controlConfig = buildRetrievalConfiguration({
+        searchOrdering: controlSearchOrdering,
+        retrievalLane: controlRetrievalLane,
+        requestedPageDepth: 1
+      });
+
+      let retrievalLane = controlRetrievalLane;
+      let searchOrdering = controlSearchOrdering;
+      let retrievalConfigKey = controlConfig.configKey;
+      let treatmentOrigin: 'CONTROL' | 'CANARY_TREATMENT' = 'CONTROL';
+      let requestedPageDepth = 1;
+      let canaryReservationId: string | undefined;
+
+      const { neighborhood } = mapQueryRunToNeighborhood(
+        { runId: 'pending', queryId: candidate.query.id, country: candidate.query.country, retrievalLane: controlRetrievalLane, searchOrdering: controlSearchOrdering, source: 'automated_query' },
+        candidate.query
+      );
+
+      const oppKey = candidate.frontierDecisionId || (candidate.allocationProvenance?.assignmentKey ? String(candidate.allocationProvenance.assignmentKey) : `opp:q${candidate.query.id}:strat_${candidate.strategy}:n${candidate.query.times_executed || 0}`);
+
+      // Query actual Phase 8 neighborhood frontier state and saturation evidence
+      const fsRes = await client.query(
+        `SELECT
+           COALESCE(fs.state, 'UNEXPLORED') AS frontier_state,
+           COALESCE(obs.known_creator_ratio, 0)::float AS known_creator_ratio,
+           COALESCE(obs.result_set_overlap, 0)::float AS result_set_overlap,
+           COALESCE((fs.evidence->>'isSaturating')::boolean, false) AS is_saturating
+         FROM discovery_neighborhoods dn
+         LEFT JOIN discovery_neighborhood_frontier_states fs ON fs.neighborhood_key = dn.neighborhood_key
+         LEFT JOIN LATERAL (
+           SELECT known_creator_ratio, result_set_overlap
+           FROM neighborhood_observations
+           WHERE neighborhood_key = dn.neighborhood_key
+           ORDER BY observed_at DESC LIMIT 1
+         ) obs ON true
+         WHERE dn.neighborhood_key = $1`,
+        [neighborhood.neighborhoodKey]
+      );
+
+      const frontierState = fsRes.rows[0]?.frontier_state || 'UNEXPLORED';
+      const isSaturating = Boolean(fsRes.rows[0]?.is_saturating) || (
+        Number(fsRes.rows[0]?.result_set_overlap || 0) >= 0.85 &&
+        Number(fsRes.rows[0]?.known_creator_ratio || 0) >= 0.85
+      );
+
+      // Phase 9 Canary Treatment Reservation under transaction advisory lock
+      const canaryTreatment = await reserveRetrievalCanaryTreatment({
+        opportunityKey: oppKey,
+        neighborhoodKey: neighborhood.neighborhoodKey,
+        retrievalLane: controlRetrievalLane,
+        defaultOrdering: controlSearchOrdering,
+        frontierState,
+        isSaturating,
+        clientOverride: client
+      });
+
+      if (canaryTreatment.authorized && canaryTreatment.config && canaryTreatment.reservation) {
+        retrievalLane = canaryTreatment.config.retrievalLane;
+        searchOrdering = canaryTreatment.config.searchOrdering;
+        retrievalConfigKey = canaryTreatment.config.configKey;
+        requestedPageDepth = canaryTreatment.config.requestedPageDepth;
+        treatmentOrigin = 'CANARY_TREATMENT';
+        canaryReservationId = canaryTreatment.reservation.reservationId;
+      }
+
+      const executedConfig = buildRetrievalConfiguration({
+        searchOrdering,
+        retrievalLane,
+        requestedPageDepth
+      });
 
       const origin = candidate.allocationOrigin || 'LEGACY';
       const run = await client.query(
-        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin)
-         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8) RETURNING id`,
-        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) }), origin]
+        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin)
+         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10) RETURNING id`,
+        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) }), origin, retrievalConfigKey, treatmentOrigin]
       );
       const runId = run.rows[0].id;
+
+      if (canaryReservationId) {
+        const committed = await commitRetrievalCanaryReservation(canaryReservationId, runId, client);
+        if (!committed) {
+          throw new Error(`RETRIEVAL_CANARY_COMMIT_FAILED: Reservation ${canaryReservationId} could not be committed for run ${runId}`);
+        }
+      }
+
+      // Shadow recommendation recording at scheduling boundary (zero serving authority)
+      await evaluateShadowRetrievalRecommendation({
+        opportunityKey: `opp:${runId}`,
+        queryRunId: runId,
+        neighborhoodKey: neighborhood.neighborhoodKey,
+        controlConfig,
+        executedConfig,
+        clientOverride: client
+      }).catch(err => console.warn('[RetrievalPolicyShadow] Shadow recommendation recording error:', err));
 
       if (candidate.frontierDecisionId && origin === 'FRONTIER_CANARY') {
         const commitRes = await client.query(
@@ -610,7 +702,10 @@ export async function scheduleAutonomousQueryRuns(
           country: candidate.query.country,
           source: 'automated_query',
           retrievalLane,
-          searchOrdering
+          searchOrdering,
+          retrievalConfigKey,
+          retrievalTreatmentOrigin: treatmentOrigin,
+          requestedPageDepth
         }), `search-run:${runId}`]
       );
       const jobId = job.rows[0].id;
