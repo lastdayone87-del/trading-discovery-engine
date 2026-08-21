@@ -417,6 +417,37 @@ export async function searchYouTubeChannels(
   return (await searchYouTubeChannelPage(query, countryName, vocab, lane, null, ordering, undefined, priority)).channels;
 }
 
+/** Resolve a staged locator only through the official YouTube Data API. Handles use
+ * channels.list(forHandle); video IDs use videos.list(snippet). No text-name
+ * matching is permitted because ambiguous names are not authoritative identity. */
+export async function resolveYouTubeLocatorAuthoritatively(identity: string, type: 'HANDLE' | 'VIDEO_ID' | 'CHANNEL_ID'): Promise<string | null> {
+  if (type === 'CHANNEL_ID') return /^UC[A-Za-z0-9_-]{22}$/.test(identity) ? identity : null;
+  const keys = getYouTubeKeyPool();
+  if (!keys.length) throw new Error('YOUTUBE_RESOLUTION_CAPACITY_UNAVAILABLE');
+  const acquisition = youtubePoolBackoff.beginAcquisition();
+  try {
+    for (let attempt = 0; attempt < keys.length; attempt++) {
+      const apiKey = keys[attempt];
+      const url = type === 'HANDLE'
+        ? buildYouTubeApiUrl('channels', apiKey, { part: 'id', forHandle: identity.replace(/^@/, '') })
+        : buildYouTubeApiUrl('videos', apiKey, { part: 'snippet', id: identity });
+      try {
+        const response = await youtubeFetch(url, `resolve-${type.toLowerCase()}`, 1, attempt + 1, acquisition, 'enrichment', apiKey);
+        const data = await readYouTubeJsonObject(response, `resolve-${type.toLowerCase()}`);
+        await incrementQuota(1);
+        const channelId = type === 'HANDLE' ? data.items?.[0]?.id : data.items?.[0]?.snippet?.channelId;
+        if (typeof channelId === 'string' && /^UC[A-Za-z0-9_-]{22}$/.test(channelId)) return channelId;
+        return null;
+      } catch (error) {
+        if (attempt === keys.length - 1) throw error;
+      }
+    }
+    return null;
+  } finally {
+    acquisition.release();
+  }
+}
+
 export interface YouTubeChannelPage {
   channels: DiscoveredChannelRaw[];
   nextPageToken: string | null;

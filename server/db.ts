@@ -439,6 +439,76 @@ export async function saveExtractedTerm(country:string,term:string,category:'ter
 export async function getExtractedVocabulary(country?:string):Promise<ExtractedTermRecord[]>{const db=await getDb(); const res=country?await db.query('SELECT * FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC',[country]):await db.query('SELECT * FROM extracted_trading_vocabulary ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC'); return res.rows.map(r=>({id:r.id,country:r.country,term:r.term,category:r.category,source_channel_id:r.source_channel_id||undefined,occurrences:r.occurrences||1,first_extracted:iso(r.first_extracted)||'',last_extracted:iso(r.last_extracted)||'',trust_tier:r.trust_tier||3,validation_count:r.validation_count||0}));}
 export async function getAppSetting(key:string,defaultValue=''):Promise<string>{const db=await getDb(); const res=await db.query('SELECT setting_value FROM app_settings WHERE setting_key=$1',[key]); return res.rows[0]?.setting_value ?? defaultValue;}
 export async function setAppSetting(key:string,value:string):Promise<void>{const db=await getDb(); await db.query('INSERT INTO app_settings(setting_key,setting_value) VALUES($1,$2) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value',[key,value]);}
+
+export interface ProviderRequestReservation {
+  requestId: string;
+  reservationId: string;
+  providerKey: string;
+  reservedCents: number;
+  costUsd: number;
+  pricingVersion: string;
+  budgetDay: string;
+  cycleKey: string;
+}
+
+/** Phase 8/9 provider-neutral reservation ledger. The row lock is the distributed
+ * authority for provider cost, per-cycle requests, daily cost, and concurrency. */
+export async function reserveProviderRequest(args:{provider:ProviderAllocation;requestId:string;queryRunId?:string|null}):Promise<ProviderRequestReservation>{
+  const db=await getDb(); const client=await db.connect();
+  try{
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`provider-budget:${args.provider.providerKey}`]);
+    const settings=await client.query(`SELECT setting_key,setting_value FROM app_settings WHERE setting_key LIKE 'brave_%'`);
+    const setting=new Map<string,string>(settings.rows.map((r:any)=>[r.setting_key,String(r.setting_value??'')]));
+    const reg=await client.query(`SELECT mode FROM discovery_provider_registry WHERE provider_key=$1 FOR SHARE`,[args.provider.providerKey]);
+    const mode=String(reg.rows[0]?.mode||'OFF');
+    if(['OFF','PAUSED','RETIRED'].includes(mode)) throw Object.assign(new Error('PROVIDER_DISABLED'),{code:'PROVIDER_DISABLED',retryable:false});
+    const cooldownUntil=Date.parse(setting.get('brave_cooldown_until')||'');
+    if(Number.isFinite(cooldownUntil)&&cooldownUntil>Date.now()) throw Object.assign(new Error('PROVIDER_COOLDOWN'),{code:'PROVIDER_COOLDOWN',retryable:true,retryAfterMs:cooldownUntil-Date.now()});
+    const costUsd=Number(setting.get('brave_cost_per_request_usd')||process.env.BRAVE_COST_PER_REQUEST_USD||'0.005');
+    const pricingVersion=setting.get('brave_pricing_version')||'UNVERSIONED';
+    if(!Number.isFinite(costUsd)||costUsd<0) throw new Error('INVALID_PROVIDER_PRICE');
+    const reservedCents=Math.max(0,Math.ceil(costUsd*100));
+    const budgetDay=new Date().toISOString().slice(0,10);
+    const cycleKey=setting.get('brave_cycle_key')||'default';
+    const dailyCapCents=Math.max(0,Math.round(Number(setting.get('brave_daily_cost_cap_usd')||'0')*100));
+    const cycleCap=Math.max(0,Math.floor(Number(setting.get('brave_per_cycle_request_cap')||'0')));
+    const concurrencyCap=Math.max(0,Math.floor(Number(setting.get('brave_concurrency_cap')||'1')));
+    const prior=await client.query(`SELECT * FROM provider_request_ledger WHERE request_id=$1 FOR UPDATE`,[args.requestId]);
+    if(prior.rowCount){
+      const r=prior.rows[0];
+      if(['RESERVED','SUCCEEDED'].includes(r.status)){await client.query('COMMIT');return {requestId:r.request_id,reservationId:r.reservation_id,providerKey:r.provider_key,reservedCents:Number(r.reserved_cents),costUsd:Number(r.reserved_cents)/100,pricingVersion:r.pricing_version,budgetDay:String(r.budget_day),cycleKey:r.cycle_key};}
+      throw Object.assign(new Error('PROVIDER_REQUEST_ALREADY_SETTLED'),{code:'PROVIDER_REQUEST_ALREADY_SETTLED'});
+    }
+    await client.query(`INSERT INTO provider_budget_ledger(provider_key,budget_day,cycle_key) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,[args.provider.providerKey,budgetDay,cycleKey]);
+    await client.query(`SELECT provider_key FROM provider_budget_ledger WHERE provider_key=$1 AND budget_day=$2 AND cycle_key=$3 FOR UPDATE`,[args.provider.providerKey,budgetDay,cycleKey]);
+    await client.query(`SELECT provider_key,budget_day,cycle_key FROM provider_budget_ledger WHERE provider_key=$1 AND budget_day=$2 FOR UPDATE`,[args.provider.providerKey,budgetDay]);
+    const current=await client.query(`SELECT COALESCE(SUM(reserved_cents+consumed_cents),0)::bigint AS daily_cost, COALESCE(SUM(requests_attempted),0)::int AS cycle_requests FROM provider_budget_ledger WHERE provider_key=$1 AND budget_day=$2 AND cycle_key=$3`,[args.provider.providerKey,budgetDay,cycleKey]);
+    const active=await client.query(`SELECT COALESCE(SUM(active_requests),0)::int AS active_requests FROM provider_budget_ledger WHERE provider_key=$1 AND budget_day=$2`,[args.provider.providerKey,budgetDay]);
+    if(dailyCapCents>0&&Number(current.rows[0].daily_cost)+reservedCents>dailyCapCents) throw Object.assign(new Error('PROVIDER_DAILY_COST_CAP_EXCEEDED'),{code:'PROVIDER_DAILY_COST_CAP_EXCEEDED'});
+    if(cycleCap>0&&Number(current.rows[0].cycle_requests)>=cycleCap) throw Object.assign(new Error('PROVIDER_PER_CYCLE_REQUEST_CAP_EXCEEDED'),{code:'PROVIDER_PER_CYCLE_REQUEST_CAP_EXCEEDED'});
+    if(Number(active.rows[0].active_requests)>=concurrencyCap) throw Object.assign(new Error('PROVIDER_CONCURRENCY_CAP_EXCEEDED'),{code:'PROVIDER_CONCURRENCY_CAP_EXCEEDED',retryable:true,retryAfterMs:1000});
+    const reservationId=`provider:${args.provider.providerKey}:${args.requestId}`;
+    await client.query(`INSERT INTO provider_request_ledger(request_id,provider_key,query_run_id,reservation_id,budget_day,cycle_key,status,reserved_cents,pricing_version) VALUES($1,$2,$3,$4,$5,$6,'RESERVED',$7,$8)`,[args.requestId,args.provider.providerKey,args.queryRunId||null,reservationId,budgetDay,cycleKey,reservedCents,pricingVersion]);
+    await client.query(`UPDATE provider_budget_ledger SET reserved_cents=reserved_cents+$4,requests_attempted=requests_attempted+1,active_requests=active_requests+1,updated_at=now() WHERE provider_key=$1 AND budget_day=$2 AND cycle_key=$3`,[args.provider.providerKey,budgetDay,cycleKey,reservedCents]);
+    await client.query('COMMIT');
+    return {requestId:args.requestId,reservationId,providerKey:args.provider.providerKey,reservedCents,costUsd,pricingVersion,budgetDay,cycleKey};
+  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
+
+export async function settleProviderRequest(requestId:string,status:'SUCCEEDED'|'FAILED'|'RATE_LIMITED',actualCostUsd=0,errorCode?:string):Promise<boolean>{
+  const db=await getDb(); const client=await db.connect();
+  try{
+    await client.query('BEGIN');
+    const row=await client.query(`SELECT * FROM provider_request_ledger WHERE request_id=$1 FOR UPDATE`,[requestId]);
+    if(!row.rowCount){await client.query('ROLLBACK');return false;}
+    const r=row.rows[0]; if(r.status!=='RESERVED'){await client.query('COMMIT');return false;}
+    const consumedCents=status==='SUCCEEDED'?Math.max(0,Math.ceil(Number(actualCostUsd)*100)):0;
+    await client.query(`UPDATE provider_request_ledger SET status=$2,consumed_cents=$3,reserved_cents=0,settled_at=now(),error_code=$4 WHERE request_id=$1`,[requestId,status,consumedCents,errorCode||null]);
+    await client.query(`UPDATE provider_budget_ledger SET reserved_cents=GREATEST(0,reserved_cents-$4),consumed_cents=consumed_cents+$5,requests_succeeded=requests_succeeded+$6,requests_failed=requests_failed+$7,rate_limited=rate_limited+$8,active_requests=GREATEST(0,active_requests-1),updated_at=now() WHERE provider_key=$1 AND budget_day=$2 AND cycle_key=$3`,[r.provider_key,r.budget_day,r.cycle_key,Number(r.reserved_cents),consumedCents,status==='SUCCEEDED'?1:0,status==='FAILED'?1:0,status==='RATE_LIMITED'?1:0]);
+    await client.query('COMMIT');return true;
+  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
 export async function purgeSyntheticTestChannels():Promise<number>{const db=await getDb(); const res=await db.query("DELETE FROM channels WHERE channel_id LIKE 'UC_STRESS_TEST_%' RETURNING channel_id"); return res.rowCount||0;}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
@@ -456,7 +526,7 @@ export async function claimNextJob(workerId:string,types?:string[]):Promise<Dura
   return claimed;}
 export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
-const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT']);
+const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','PROVIDER_COOLDOWN','PROVIDER_CONCURRENCY_CAP_EXCEEDED','BRAVE_API_RATE_LIMIT_429','BRAVE_API_TIMEOUT','BRAVE_API_NETWORK_FAILURE','BRAVE_API_HTTP_500','BRAVE_API_HTTP_502','BRAVE_API_HTTP_503','BRAVE_API_HTTP_504']);
 const TRANSIENT_HTTP_STATUS=new Set([408,425,429,500,502,503,504]);
 const MAX_TRANSIENT_RETRY_AGE_MS=Math.max(60_000,Number(process.env.MAX_TRANSIENT_RETRY_AGE_MS||6*60*60_000));
 export function isRetryableInfrastructureFailure(error:any):boolean{
@@ -466,6 +536,7 @@ export function isRetryableInfrastructureFailure(error:any):boolean{
   const errorClass=String(error?.errorClass||'').toUpperCase();
   if(TRANSIENT_PROVIDER_CODES.has(code)||TRANSIENT_HTTP_STATUS.has(status))return true;
   if(name==='TimeoutError')return true;
+  if(error?.retryable===true)return true;
   if(error?.retryable===true&&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(errorClass))return true;
   return false;
 }
@@ -1393,6 +1464,12 @@ export async function completeQueryRun(runId: string, metrics: {
   qualityChannels: number;
   communitiesDiscovered: number;
   quotaUsed: number;
+  providerCostUsd?: number;
+  providerRequestsAttempted?: number;
+  providerRequestsSucceeded?: number;
+  providerRequestsFailed?: number;
+  providerRateLimited?: number;
+  providerPagesRetrieved?: number;
 }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
@@ -1402,11 +1479,16 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE query_runs SET status='COMPLETED',raw_results=$2,distinct_results=$3,duplicate_results=$4,
        known_channels=$5,new_channels=$6,country_rejected=$7,non_trading=$8,uncertain=$9,needs_review=$10,
        trading_confirmed=$11,unique_channels=$12,quality_channels=$13,communities_discovered=$14,quota_used=$15,
-       performance_details=$16,completed_at=now() WHERE id=$1 AND status<>'COMPLETED' RETURNING query_id`,
+       provider_cost_usd=COALESCE($16,provider_cost_usd),provider_requests_attempted=COALESCE($17,provider_requests_attempted),
+       provider_requests_succeeded=COALESCE($18,provider_requests_succeeded),provider_requests_failed=COALESCE($19,provider_requests_failed),
+       provider_rate_limited=COALESCE($20,provider_rate_limited),provider_pages_retrieved=COALESCE($21,provider_pages_retrieved),
+       performance_details=$22,completed_at=now() WHERE id=$1 AND status<>'COMPLETED' RETURNING query_id`,
       [runId, metrics.rawResults, metrics.distinctResults, metrics.duplicateResults, metrics.knownChannels,
        metrics.newChannels, metrics.countryRejected, metrics.nonTrading, metrics.uncertain, metrics.needsReview,
        metrics.tradingConfirmed, metrics.uniqueChannels, metrics.qualityChannels, metrics.communitiesDiscovered,
-       metrics.quotaUsed, JSON.stringify(metrics)]
+       metrics.quotaUsed, metrics.providerCostUsd ?? null, metrics.providerRequestsAttempted ?? null,
+       metrics.providerRequestsSucceeded ?? null, metrics.providerRequestsFailed ?? null, metrics.providerRateLimited ?? null,
+       metrics.providerPagesRetrieved ?? null, JSON.stringify(metrics)]
     );
     if (run.rowCount) await client.query(`UPDATE query_run_components SET performance_details=$2 WHERE query_run_id=$1`, [runId, JSON.stringify(metrics)]);
     if (run.rowCount) {

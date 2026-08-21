@@ -19,7 +19,10 @@ import {
   tryReserveQuota,
   finishQuotaReservation,
   topUpQuotaReservation,
+  reserveProviderRequest,
+  settleProviderRequest,
   getAppSetting,
+  setAppSetting,
   heartbeatJob,
   recordQueryRunSightings,
   getDailyYouTubeQuotaBudget,
@@ -69,6 +72,7 @@ import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
+import { processPendingStagedCandidates } from './candidateStaging';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -157,7 +161,7 @@ export async function addAutomatedCountrySearch(countryName: string, provenance?
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER'>,
+  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER'>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -170,6 +174,7 @@ export async function processNextSearchJob(
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
   if (!qStatus.discordValidation.isPaused && (!claimableOverride || claimableOverride.includes('RETRY_COMMUNITY_ACQUISITION'))) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
@@ -217,6 +222,11 @@ export async function processNextSearchJob(
     if(job.type==='PROPOSE_CONCEPT_RESOLUTION'){await processConceptResolutionJob(job);return true;}
     if(job.type==='OFFLINE_CANDIDATE_EVALUATION'){await processOfflineEvaluationJob(job);return true;}
     if(job.type==='PERSISTENT_RESEARCH_EXTERNAL_PROVIDER'){await processStructuredProviderJob(job,recordExternalNominations);return true;}
+    if(job.type==='RESOLVE_STAGED_CANDIDATE'){
+      await processPendingStagedCandidates();
+      await completeJob(job.id);
+      return true;
+    }
     if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannel);return true;}
     if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannel);return true;}
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
@@ -358,29 +368,52 @@ export async function processNextSearchJob(
 
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
     let providerQuotaUnits = 0;
-    let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null } | null = null;
+    let providerCostUsd = 0;
+    let providerRequestsAttempted = 0;
+    let providerRequestsSucceeded = 0;
+    let providerRequestsFailed = 0;
+    let providerRateLimited = 0;
+    let providerPagesRetrieved = 0;
+    let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null; providerCostUsd?: number; providerRequestId?: string } | null = null;
     if (queryRunId) {
-      providerQuotaUnits=100;
-      const providerReservationUnits=providerQuotaUnits;
-      const budget=getDailyYouTubeQuotaBudget();
-      const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
-      if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerReservationUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
+      const allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
+      const lineage=await (await getDb()).query(`SELECT provider_allocation_snapshot FROM query_runs WHERE id=$1`,[queryRunId]);
+      if(!lineage.rowCount)throw new Error('PHASE9_PROVIDER_LINEAGE_MISSING');
+      const dbProvider=providerSnapshot(lineage.rows[0].provider_allocation_snapshot);
+      if(dbProvider.providerKey!==allocatedProvider.providerKey||dbProvider.retrievalSurface!==allocatedProvider.retrievalSurface||dbProvider.capability!==allocatedProvider.capability||dbProvider.costDomain!==allocatedProvider.costDomain||dbProvider.continuationOwner!==allocatedProvider.continuationOwner)throw new Error('PHASE9_PROVIDER_LINEAGE_MISMATCH');
+      const braveProvider=allocatedProvider.costDomain==='BRAVE_SEARCH_API';
+      let providerRequestId: string | null = null;
+      if(braveProvider){
+        providerRequestId=`${autonomousOperationId}:provider-request`;
+        await reserveProviderRequest({provider:allocatedProvider,requestId:providerRequestId,queryRunId});
+        providerRequestsAttempted=1;
+      } else {
+        providerQuotaUnits=100;
+        const budget=getDailyYouTubeQuotaBudget();
+        const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
+        if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
+      }
       try {
-        const allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
-        const lineage=await (await getDb()).query(`SELECT provider_allocation_snapshot FROM query_runs WHERE id=$1`,[queryRunId]);
-        if(!lineage.rowCount)throw new Error('PHASE9_PROVIDER_LINEAGE_MISSING');
-        const dbProvider=providerSnapshot(lineage.rows[0].provider_allocation_snapshot);
-        if(dbProvider.providerKey!==allocatedProvider.providerKey||dbProvider.retrievalSurface!==allocatedProvider.retrievalSurface||dbProvider.capability!==allocatedProvider.capability||dbProvider.costDomain!==allocatedProvider.costDomain||dbProvider.continuationOwner!==allocatedProvider.continuationOwner)throw new Error('PHASE9_PROVIDER_LINEAGE_MISMATCH');
-        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
-          const toppedUp=await topUpQuotaReservation({
-            operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',
-            additionalUnits,dailyBudget:budget,allocationPercent:percent
-          });
+        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
+          if(braveProvider) return;
+          const budget=getDailyYouTubeQuotaBudget();
+          const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
+          const toppedUp=await topUpQuotaReservation({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',additionalUnits,dailyBudget:budget,allocationPercent:percent});
           if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
         },priority:'autonomous'});
-        await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
-      } catch (error) {
-        await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,false);
+        if(braveProvider){
+          providerRequestsSucceeded=1; providerPagesRetrieved=1; providerCostUsd=Number(searchPage.providerCostUsd||0);
+          await settleProviderRequest(providerRequestId!, 'SUCCEEDED', providerCostUsd);
+          await (await getDb()).query(`UPDATE query_runs SET provider_cost_usd=provider_cost_usd+$2,provider_requests_attempted=provider_requests_attempted+1,provider_requests_succeeded=provider_requests_succeeded+1,provider_pages_retrieved=provider_pages_retrieved+1 WHERE id=$1`,[queryRunId,providerCostUsd]);
+        } else await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
+      } catch (error:any) {
+        if(braveProvider){
+          const rateLimited=String(error?.code||'').toUpperCase()==='BRAVE_API_RATE_LIMIT_429';
+          if(rateLimited)providerRateLimited=1; else providerRequestsFailed=1;
+          await settleProviderRequest(providerRequestId!, rateLimited?'RATE_LIMITED':'FAILED', 0, String(error?.code||error?.message||'PROVIDER_FAILURE'));
+          await (await getDb()).query(`UPDATE query_runs SET provider_requests_attempted=provider_requests_attempted+1,provider_requests_failed=provider_requests_failed+$2,provider_rate_limited=provider_rate_limited+$3 WHERE id=$1`,[queryRunId,rateLimited?0:1,rateLimited?1:0]);
+          if(rateLimited&&Number(error?.retryAfterMs)>0) await setAppSetting('brave_cooldown_until',new Date(Date.now()+Number(error.retryAfterMs)).toISOString()).catch(()=>undefined);
+        } else await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,false);
         throw error;
       }
     }
@@ -487,14 +520,30 @@ export async function processNextSearchJob(
         return true;
       }
       const finalMetrics=await getAutonomousRunMetrics(queryRunId);
-      const quotaConsumed=pageNumber*100;
+      if (job.payload.provider?.costDomain === 'BRAVE_SEARCH_API') {
+        const providerTotals = await (await getDb()).query(`SELECT provider_cost_usd,provider_requests_attempted,provider_requests_succeeded,provider_requests_failed,provider_rate_limited,provider_pages_retrieved FROM query_runs WHERE id=$1`, [queryRunId]);
+        const totals = providerTotals.rows[0] || {};
+        providerCostUsd = Number(totals.provider_cost_usd || providerCostUsd);
+        providerRequestsAttempted = Number(totals.provider_requests_attempted || providerRequestsAttempted);
+        providerRequestsSucceeded = Number(totals.provider_requests_succeeded || providerRequestsSucceeded);
+        providerRequestsFailed = Number(totals.provider_requests_failed || providerRequestsFailed);
+        providerRateLimited = Number(totals.provider_rate_limited || providerRateLimited);
+        providerPagesRetrieved = Number(totals.provider_pages_retrieved || providerPagesRetrieved);
+      }
+      const quotaConsumed=providerCostUsd>0?0:pageNumber*100;
       const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed });
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
         uniqueChannels: finalMetrics.newChannels,
         qualityChannels: finalMetrics.qualityChannels,
         communitiesDiscovered: finalMetrics.communitiesDiscovered,
-        quotaUsed: quotaConsumed
+        quotaUsed: quotaConsumed,
+        providerCostUsd,
+        providerRequestsAttempted,
+        providerRequestsSucceeded,
+        providerRequestsFailed,
+        providerRateLimited,
+        providerPagesRetrieved
       });
       await addQueryExecutionLog({
         query_id: queryId, query, country, executed_at: new Date().toISOString(),

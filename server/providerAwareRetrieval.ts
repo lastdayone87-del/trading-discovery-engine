@@ -18,11 +18,19 @@ export const YOUTUBE_SEARCH_PROVIDER: ProviderAllocation = Object.freeze({
   continuationOwner: 'PHASE_9'
 });
 
-export interface RetrievalPage { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null }
+export interface RetrievalPage {
+  channels: DiscoveredChannelRaw[];
+  rawResultCount: number;
+  nextPageToken?: string | null;
+  providerCostUsd?: number;
+  providerRequestId?: string;
+}
 export interface RetrievalRequest {
   provider: ProviderAllocation; query: string; country: string; vocabulary?: CountryVocabulary;
   lane: RetrievalLane; cursor: string | null; ordering: SearchOrdering;
-  reserveAdditionalUnits?: (units:number)=>Promise<void>; priority?: 'autonomous'|'manual';
+  queryRunId?: string;
+  reserveAdditionalUnits?: (units:number)=>Promise<void>;
+  priority?: 'autonomous'|'manual';
 }
 
 export type RetrievalExecutor = (request: RetrievalRequest) => Promise<RetrievalPage>;
@@ -43,10 +51,9 @@ export function registerRetrievalExecutor(
   ) {
     throw new Error('INVALID_PROVIDER_REGISTRATION');
   }
-  registeredExecutors.set(provider.providerKey, {
-    provider: Object.freeze({ ...provider }),
-    executor
-  });
+  const fullKey = `${provider.providerKey}:${provider.retrievalSurface}`;
+  const entry = { provider: Object.freeze({ ...provider }), executor };
+  registeredExecutors.set(fullKey, entry);
 }
 
 export function clearRegisteredExecutorsForTest(): void {
@@ -85,7 +92,8 @@ export function providerSnapshot(value: Partial<ProviderAllocation> | null | und
     continuationOwner: 'PHASE_9'
   };
 
-  const registered = registeredExecutors.get(key);
+  const fullKey = `${key}:${snapshot.retrievalSurface}`;
+  const registered = registeredExecutors.get(fullKey);
   if (registered) {
     if (
       snapshot.retrievalSurface !== registered.provider.retrievalSurface ||
@@ -103,7 +111,8 @@ export function providerSnapshot(value: Partial<ProviderAllocation> | null | und
 /** Phase 9's sole provider dispatch boundary. Unknown or mismatched allocations fail closed. */
 export async function executeAllocatedRetrievalPage(request: RetrievalRequest): Promise<RetrievalPage> {
   const p = providerSnapshot(request.provider);
-  const entry = registeredExecutors.get(p.providerKey);
+  const fullKey = `${p.providerKey}:${p.retrievalSurface}`;
+  const entry = registeredExecutors.get(fullKey);
   if (!entry) {
     throw new Error('UNREGISTERED_OR_MISMATCHED_RETRIEVAL_PROVIDER');
   }
