@@ -548,6 +548,9 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
     const retryAfterMs=Number(error?.retryAfterMs);
     const exponentialMs=Math.min(15*60_000,30_000*Math.pow(2,Math.max(0,attempts-1)));
     const scheduled=Number.isFinite(retryAt)?Math.max(now,retryAt):Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;
+    const providerCode=String(error?.code||'').toUpperCase();
+    const boundedCooldown=providerCode==='YOUTUBE_PROVIDERS_COOLING_DOWN'||providerCode==='YOUTUBE_PROVIDER_POOL_EXHAUSTED';
+    if(boundedCooldown&&attempts>=maxAttempts)return {disposition:'FAILED'};
     return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:scheduled};
   }
   return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};

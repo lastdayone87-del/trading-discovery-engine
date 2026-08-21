@@ -50,10 +50,10 @@ test('manual, enrichment, and autonomous state transitions reuse the durable job
   assert.match(source, /MANUAL_SEARCH_PAGE' && terminal[\s\S]*ENRICH_CHANNEL' && terminal[\s\S]*failQueryRun\(runId, err, terminal\)/);
 });
 
-test('an expired provider retryAt remains retryable without consuming the final attempt', () => {
+test('an expired provider retryAt is terminal at the final bounded attempt', () => {
   const now = 10_000;
   const decision = decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt:now-1},3,3,now);
-  assert.deepEqual(decision,{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:now});
+  assert.deepEqual(decision,{disposition:'FAILED'});
   assert.deepEqual(decideJobFailure(new Error('genuine enrichment failure'),3,3,now),{disposition:'FAILED'});
 });
 
