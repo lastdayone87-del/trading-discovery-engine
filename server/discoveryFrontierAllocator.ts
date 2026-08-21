@@ -717,7 +717,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
       }
 
       const elig = evaluateNeighborhoodEligibility(cand, { now });
-      if (!isOsintSnapshotFresh(cand.proposalEvidenceSnapshot || {}, now)) {
+      if (cand.proposalId && !isOsintSnapshotFresh(cand.proposalEvidenceSnapshot || {}, now)) {
         rejectionReasons[cand.neighborhoodKey] = ['STALE_OSINT_EVIDENCE'];
         continue;
       }

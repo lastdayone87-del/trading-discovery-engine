@@ -29,6 +29,11 @@ test('provider-targeted frontier allocation scopes candidate loading to the requ
   assert.match(source, /input\.allowedCountries\?\.length === 1 \? input\.allowedCountries\[0\] : undefined/);
 });
 
+test('ordinary no-proposal frontier neighborhoods bypass the OSINT freshness gate', () => {
+  const source = readFileSync(new URL('./discoveryFrontierAllocator.ts', import.meta.url), 'utf8');
+  assert.match(source, /if \(cand\.proposalId && !isOsintSnapshotFresh\(cand\.proposalEvidenceSnapshot \|\| \{\}, now\)\)/);
+});
+
 test('frontier candidates reconstruct canonical dimensions when metadata is empty', async () => {
   const mockClient = {
     query: async (sql: string) => sql.includes('discovery_neighborhoods') ? { rows: [{
