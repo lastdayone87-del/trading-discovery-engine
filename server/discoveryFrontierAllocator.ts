@@ -8,6 +8,7 @@ import {
 } from './discoveryNeighborhood';
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
+import { isOsintSnapshotFresh } from './externalOsint';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -280,6 +281,8 @@ export async function getNeighborhoodCandidates(
       WHERE target_neighborhood_key = n.neighborhood_key
         AND trial_status = 'PENDING'
         AND (expires_at IS NULL OR expires_at > $1)
+        AND (proposal_family <> 'EXTERNAL_OSINT'
+          OR COALESCE((supporting_evidence->>'expiresAt')::timestamptz, '-infinity'::timestamptz) > $1)
       ORDER BY created_at DESC LIMIT 1
     ) p ON true
     LEFT JOIN LATERAL (
@@ -647,6 +650,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
       }
 
       const elig = evaluateNeighborhoodEligibility(cand, { now });
+      if (!isOsintSnapshotFresh(cand.proposalEvidenceSnapshot || {}, now)) {
+        rejectionReasons[cand.neighborhoodKey] = ['STALE_OSINT_EVIDENCE'];
+        continue;
+      }
       if (!elig.eligible) {
         rejectionReasons[cand.neighborhoodKey] = elig.rejectionReasons;
         continue;
@@ -677,7 +684,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
     if (topCandidate.proposalId) {
       const selectedEvidence = (topCandidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
       const canonicalTermId = Number(selectedEvidence.canonicalTermId);
-      if (Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
+      if (topCandidate.proposalFamily === 'COUNTRY_NATIVE' && Number.isSafeInteger(canonicalTermId) && canonicalTermId > 0) {
         await runner.query('SELECT id FROM canonical_trading_terms WHERE id=$1 FOR SHARE', [canonicalTermId]);
         const projection = await runner.query(
           `SELECT native_evidence_status,source_provenance_family,source_provenance_families,
@@ -727,6 +734,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
         targetDimensions: lockedDimensions,
         supportingEvidence: lockedEvidence
       };
+      if (!isOsintSnapshotFresh(lockedProposalSnapshot, now)) {
+        if (client) await runner.query('COMMIT');
+        return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'STALE_OSINT_EVIDENCE' };
+      }
     }
 
     const decisionId = createHash('sha256')

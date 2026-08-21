@@ -734,7 +734,7 @@ export async function scheduleAutonomousQueryRuns(
              FROM frontier_allocation_decisions d
              WHERE d.decision_id=$1 AND d.proposal_id=p.proposal_id
                AND d.decision_status='COMMITTED' AND p.trial_status='PENDING'
-               AND p.proposal_family='COUNTRY_NATIVE'
+               AND p.proposal_family IN ('COUNTRY_NATIVE','EXTERNAL_OSINT')
              RETURNING p.proposal_id`, [candidate.frontierDecisionId]
           );
           if (!consumed.rowCount) throw new Error(`FRONTIER_PROPOSAL_CONSUME_FAILED: ${candidate.frontierDecisionId}`);
@@ -1328,6 +1328,46 @@ async function attributeCompletedCountryNativeRun(client: EventClient, runId: st
   }, client);
 }
 
+async function attributeCompletedExternalOsintRun(client: EventClient, runId: string, metrics: {
+  rawResults: number; distinctResults: number; newChannels: number; tradingConfirmed: number;
+  qualityChannels: number; countryRejected: number; quotaUsed: number;
+}): Promise<void> {
+  const lineage = await client.query(
+    `SELECT d.decision_id
+     FROM frontier_allocation_decisions d
+     WHERE d.query_run_id=$1 AND d.allocation_origin='FRONTIER_CANARY'
+       AND d.decision_status='COMMITTED'
+       AND d.proposal_evidence_snapshot->>'proposalFamily'='EXTERNAL_OSINT'
+     ORDER BY d.created_at,d.decision_id LIMIT 1`, [runId]
+  );
+  if (!lineage.rowCount) return;
+  const exact = await client.query(
+    `SELECT COUNT(DISTINCT s.channel_id) FILTER (
+       WHERE s.persisted AND NOT s.was_known
+         AND s.funnel_outcome IN ('TRADING_CONFIRMED','NEEDS_REVIEW'))::int relevant_new_creators,
+       COUNT(DISTINCT s.channel_id) FILTER (
+       WHERE s.persisted AND NOT s.was_known AND s.funnel_outcome='TRADING_CONFIRMED'
+         AND c.quality_score>=${QUALITY_CREATOR_SCORE_THRESHOLD})::int quality_new_creators
+     FROM channel_sightings s LEFT JOIN channels c ON c.channel_id=s.channel_id
+     WHERE s.query_run_id=$1`, [runId]
+  );
+  const observed = exact.rows[0] || {};
+  const { attributeExternalOsintOutcome } = await import('./externalOsint');
+  await attributeExternalOsintOutcome({
+    decisionId: lineage.rows[0].decision_id,
+    queryRunId: runId,
+    quotaConsumed: metrics.quotaUsed,
+    rawResults: metrics.rawResults,
+    distinctCreators: metrics.distinctResults,
+    newCreators: metrics.newChannels,
+    relevantNewCreators: Number(observed.relevant_new_creators || 0),
+    qualityNewCreators: Number(observed.quality_new_creators || 0),
+    confirmedCreators: metrics.tradingConfirmed,
+    wrongCountryResults: metrics.countryRejected,
+    coverageExpansion: metrics.distinctResults > 0 ? metrics.newChannels / metrics.distinctResults : 0
+  }, client);
+}
+
 export async function completeQueryRun(runId: string, metrics: {
   rawResults: number;
   distinctResults: number;
@@ -1366,7 +1406,7 @@ export async function completeQueryRun(runId: string, metrics: {
          WHERE id=$1`, [run.rows[0].query_id]
       );
     }
-    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});await attributeCompletedCountryNativeRun(client,runId,metrics);}
+    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});await attributeCompletedCountryNativeRun(client,runId,metrics);await attributeCompletedExternalOsintRun(client,runId,metrics);}
     if (run.rowCount) await client.query(
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
