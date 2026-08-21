@@ -1,4 +1,5 @@
 import { getDb } from './db';
+import { normalizeYouTubeLocator } from './braveSearch';
 
 export interface PendingStagedCandidate {
   id: string;
@@ -86,30 +87,72 @@ export async function updateStagedCandidateResolution(
 /**
  * Processes pending staged candidates by resolving handles, videos, or channel IDs via YouTube API.
  * Identity resolution establishes canonical YouTube identity only (resolution_status = RESOLVED).
+ * External evidence candidates must contain explicit supported YouTube locators in evidence; arbitrary pages without YouTube locators are marked SKIPPED.
  * Trading relevance, country validation, and creator legitimacy remain UNVALIDATED until explicit pipeline admission.
  */
 export async function processPendingStagedCandidates(
   resolveChannelFn?: (identity: string, type: string) => Promise<string | null>,
   clientOverride?: any
-): Promise<{ processed: number; resolved: number; deferred: number }> {
+): Promise<{ processed: number; resolved: number; deferred: number; skipped: number }> {
   const pending = await getPendingStagedCandidates(50, clientOverride);
   if (pending.length === 0) {
-    return { processed: 0, resolved: 0, deferred: 0 };
+    return { processed: 0, resolved: 0, deferred: 0, skipped: 0 };
   }
 
   let processed = 0;
   let resolved = 0;
   let deferred = 0;
+  let skipped = 0;
 
   for (const cand of pending) {
     if (cand.candidateType === 'CHANNEL_ID') {
       await updateStagedCandidateResolution(cand.id, {
         resolutionStatus: 'RESOLVED',
         resolvedChannelId: cand.normalizedIdentity,
-        validationStatus: 'UNVALIDATED' // Must remain UNVALIDATED until trading/country validation
+        validationStatus: 'UNVALIDATED'
       }, clientOverride);
       processed++;
       resolved++;
+      continue;
+    }
+
+    if (cand.candidateType === 'EXTERNAL_EVIDENCE') {
+      // Check if metadata snippet or title contains an explicit YouTube locator
+      const snippet = String(cand.metadata.snippet || cand.metadata.title || '');
+      const extractedLoc = normalizeYouTubeLocator(snippet);
+      if (extractedLoc && extractedLoc.candidateType !== 'EXTERNAL_EVIDENCE') {
+        if (resolveChannelFn) {
+          try {
+            const channelId = await resolveChannelFn(extractedLoc.normalizedIdentity, extractedLoc.candidateType);
+            if (channelId) {
+              await updateStagedCandidateResolution(cand.id, {
+                resolutionStatus: 'RESOLVED',
+                resolvedChannelId: channelId,
+                validationStatus: 'UNVALIDATED'
+              }, clientOverride);
+              resolved++;
+            } else {
+              await updateStagedCandidateResolution(cand.id, {
+                resolutionStatus: 'FAILED',
+                duplicateRejectionReason: 'EXTERNAL_EVIDENCE_RESOLUTION_FAILED'
+              }, clientOverride);
+            }
+            processed++;
+          } catch {
+            deferred++;
+          }
+        } else {
+          deferred++;
+        }
+      } else {
+        // No explicit YouTube locator in external evidence page: mark SKIPPED (evidence preserved without guessing)
+        await updateStagedCandidateResolution(cand.id, {
+          resolutionStatus: 'SKIPPED',
+          duplicateRejectionReason: 'NO_EXPLICIT_YOUTUBE_LOCATOR_IN_EVIDENCE'
+        }, clientOverride);
+        processed++;
+        skipped++;
+      }
       continue;
     }
 
@@ -120,7 +163,7 @@ export async function processPendingStagedCandidates(
           await updateStagedCandidateResolution(cand.id, {
             resolutionStatus: 'RESOLVED',
             resolvedChannelId: channelId,
-            validationStatus: 'UNVALIDATED' // Must remain UNVALIDATED until trading/country validation
+            validationStatus: 'UNVALIDATED'
           }, clientOverride);
           resolved++;
         } else {
@@ -131,14 +174,12 @@ export async function processPendingStagedCandidates(
         }
         processed++;
       } catch (err) {
-        // Leave candidate as PENDING (deferred) when resolution fails or capacity unavailable
         deferred++;
       }
     } else {
-      // Without explicit resolver, defer candidates safely in PENDING state
       deferred++;
     }
   }
 
-  return { processed, resolved, deferred };
+  return { processed, resolved, deferred, skipped };
 }

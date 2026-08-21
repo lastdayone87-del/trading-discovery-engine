@@ -140,10 +140,57 @@ test('fetchBraveSearchResults handles 429 rate limits fail-closed', async () => 
   );
 });
 
-test('provider-aware retrieval executes registered Brave provider under mock control plane', async () => {
+test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while setting nextPageToken', async () => {
   const mockFetch = async () => new Response(JSON.stringify({
     web: {
-      total: 1,
+      total: 100,
+      results: [
+        {
+          title: 'UK Trader Channel',
+          url: 'https://www.youtube.com/channel/UC1111111111111111111111',
+          description: 'Trading in London'
+        }
+      ]
+    }
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+  const mockDbShadow = {
+    query: async (sql: string) => {
+      if (sql.includes('app_settings')) return { rows: [] };
+      if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'SHADOW' }] };
+      if (sql.includes('discovery_candidate_staging')) return { rows: [{ backlog_count: 0 }] };
+      if (sql.includes('query_runs')) return { rows: [{ daily_requests: 0 }] };
+      return { rows: [] };
+    }
+  };
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = mockFetch as any;
+  process.env.BRAVE_SEARCH_API_KEY = 'test-key';
+
+  try {
+    const page = await executeBraveSearchRetrieval({
+      provider: BRAVE_DIRECT_PROVIDER,
+      query: 'trading london',
+      country: 'GB',
+      lane: 'KEYWORD_SEARCH',
+      cursor: null,
+      ordering: 'RELEVANCE'
+    }, mockDbShadow);
+
+    // SHADOW mode: candidate staged, but channels array returned empty to Phase 9
+    assert.equal(page.channels.length, 0);
+    assert.equal(page.rawResultCount, 1);
+    assert.equal(page.nextPageToken, '20'); // nextPageToken non-null because total 100 > 20
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('executeBraveSearchRetrieval returns channels in ACTIVE mode', async () => {
+  const mockFetch = async () => new Response(JSON.stringify({
+    web: {
+      total: 50,
       results: [
         {
           title: 'UK Trader Channel',
@@ -157,7 +204,7 @@ test('provider-aware retrieval executes registered Brave provider under mock con
   const mockDbActive = {
     query: async (sql: string) => {
       if (sql.includes('app_settings')) return { rows: [] };
-      if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'SHADOW' }] };
+      if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'ACTIVE' }] };
       if (sql.includes('discovery_candidate_staging')) return { rows: [{ backlog_count: 0 }] };
       if (sql.includes('query_runs')) return { rows: [{ daily_requests: 0 }] };
       return { rows: [] };
@@ -180,6 +227,7 @@ test('provider-aware retrieval executes registered Brave provider under mock con
 
     assert.equal(page.channels.length, 1);
     assert.equal(page.channels[0].channelId, 'UC1111111111111111111111');
+    assert.equal(page.nextPageToken, '20');
   } finally {
     globalThis.fetch = origFetch;
   }

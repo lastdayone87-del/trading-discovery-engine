@@ -62,3 +62,37 @@ test('processPendingStagedCandidates preserves UNVALIDATED validation status dur
   assert.equal(updatedInput.resolvedChannelId, 'UC1234567890123456789012');
   assert.equal(updatedInput.validationStatus, 'UNVALIDATED'); // Must remain UNVALIDATED
 });
+
+test('processPendingStagedCandidates skips external evidence without explicit YouTube locators', async () => {
+  let updatedStatus: string | null = null;
+  const mockDb = {
+    query: async (sql: string, params: any[]) => {
+      if (sql.includes('SELECT')) {
+        return {
+          rows: [{
+            id: 'staging-id-2',
+            staging_key: 'key-2',
+            provider_key: 'brave-search',
+            candidate_type: 'EXTERNAL_EVIDENCE',
+            normalized_identity: 'example.com/trader-blog',
+            raw_locator: 'https://example.com/trader-blog',
+            country: 'GB',
+            discovery_mode: 'EXTERNAL_OSINT',
+            resolution_status: 'PENDING',
+            metadata: { title: 'General trading blog page' }
+          }]
+        };
+      }
+      if (sql.includes('UPDATE')) {
+        updatedStatus = params[1];
+        return { rowCount: 1 };
+      }
+      return { rows: [] };
+    }
+  };
+
+  const result = await processPendingStagedCandidates(undefined, mockDb);
+
+  assert.equal(result.skipped, 1);
+  assert.equal(updatedStatus, 'SKIPPED');
+});

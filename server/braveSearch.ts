@@ -100,6 +100,7 @@ const NOISE_TITLE_SNIPPET_PATTERNS = [
 
 /**
  * Enforces runtime control plane rules fail-closed: kill switch, rollout mode, daily request caps, and backlog threshold backpressure.
+ * The discovery_provider_registry table is the sole authoritative store for provider mode.
  */
 export async function checkBraveControlPlane(clientOverride?: any): Promise<BraveControlPlaneStatus> {
   // Emergency env kill switch check
@@ -300,7 +301,7 @@ export function buildBraveSearchRequest(
 }
 
 /**
- * Executes a single Brave Search API request with resilience, error handling, and accounting.
+ * Executes a single Brave Search API request with resilience, bounded deadline timeout (AbortController), and error handling.
  */
 export async function fetchBraveSearchResults(
   query: string,
@@ -309,31 +310,47 @@ export async function fetchBraveSearchResults(
   mode: 'DIRECT_YOUTUBE' | 'EXTERNAL_OSINT',
   offset = 0,
   count = 20,
-  fetchFn: typeof fetch = globalThis.fetch
+  fetchFn: typeof fetch = globalThis.fetch,
+  parentSignal?: AbortSignal
 ): Promise<{ response: BraveSearchResponse; status: number; cost: number | null }> {
   const req = buildBraveSearchRequest(query, country, language, mode, offset, count);
   const configuredCostStr = process.env.BRAVE_COST_PER_REQUEST_USD;
   const costPerReqUsd = configuredCostStr ? Number(configuredCostStr) : null;
 
-  const res = await fetchFn(req.url, {
-    method: 'GET',
-    headers: req.headers
-  });
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.BRAVE_TIMEOUT_MS || 10000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (res.status === 429) {
-    throw new Error('BRAVE_API_RATE_LIMIT_429');
+  let combinedSignal = controller.signal;
+  if (parentSignal) {
+    if (parentSignal.aborted) controller.abort();
+    else parentSignal.addEventListener('abort', () => controller.abort(), { once: true });
   }
 
-  if (!res.ok) {
-    throw new Error(`BRAVE_API_ERROR_HTTP_${res.status}`);
-  }
+  try {
+    const res = await fetchFn(req.url, {
+      method: 'GET',
+      headers: req.headers,
+      signal: combinedSignal
+    });
 
-  const json = (await res.json()) as BraveSearchResponse;
-  return {
-    response: json,
-    status: res.status,
-    cost: costPerReqUsd && Number.isFinite(costPerReqUsd) ? costPerReqUsd : null
-  };
+    if (res.status === 429) {
+      throw new Error('BRAVE_API_RATE_LIMIT_429');
+    }
+
+    if (!res.ok) {
+      throw new Error(`BRAVE_API_ERROR_HTTP_${res.status}`);
+    }
+
+    const json = (await res.json()) as BraveSearchResponse;
+    return {
+      response: json,
+      status: res.status,
+      cost: costPerReqUsd && Number.isFinite(costPerReqUsd) ? costPerReqUsd : null
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -429,7 +446,7 @@ export async function stageDiscoveredCandidates(
           JSON.stringify({ confidence: cand.confidence }),
           cand.candidateType === 'CHANNEL_ID' ? 'RESOLVED' : 'PENDING',
           'UNVALIDATED', // Always staged as UNVALIDATED until trading/country validation
-          JSON.stringify({ title: cand.title })
+          JSON.stringify({ title: cand.title, snippet: cand.snippet })
         ]
       );
 
@@ -439,7 +456,8 @@ export async function stageDiscoveredCandidates(
         duplicateCount++;
       }
     } catch (err) {
-      console.warn('[BraveSearch] Staging insert error:', err);
+      console.error('[BraveSearch] Critical staging insert failure:', err);
+      throw err; // Fail retrieval call if staging fails so candidates are not silently lost
     }
   }
 
@@ -486,6 +504,20 @@ export async function executeBraveSearchRetrieval(
       client: clientOverride
     });
 
+    // Determine pagination exhaustion from web search total result count, not candidate count
+    const totalWebResults = response.web?.total || 0;
+    const nextOffset = offset + count;
+    const nextPageToken = nextOffset < totalWebResults ? String(nextOffset) : null;
+
+    // SHADOW mode: records observations & stages candidates without returning active channels
+    if (ctrl.mode === 'SHADOW') {
+      return {
+        channels: [],
+        rawResultCount: response.web?.results?.length || 0,
+        nextPageToken
+      };
+    }
+
     const channels: DiscoveredChannelRaw[] = candidates
       .filter((c) => c.candidateType === 'CHANNEL_ID')
       .map((c) => ({
@@ -496,10 +528,6 @@ export async function executeBraveSearchRetrieval(
         thumbnailUrl: '',
         country: request.country
       }));
-
-    const nextOffset = offset + count;
-    const totalResults = response.web?.total || 0;
-    const nextPageToken = nextOffset < totalResults && candidates.length > 0 ? String(nextOffset) : null;
 
     return {
       channels,
