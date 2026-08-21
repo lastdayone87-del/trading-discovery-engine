@@ -647,7 +647,7 @@ async function startServer() {
           return res.status(400).json({ error: 'Only one governed Brave direct-search canary run is supported.', code: 'UNSUPPORTED_PROVIDER_TARGET' });
         }
       }
-      const result = await runAutonomousDiscoveryCycle(country, providerTargetRequested ? { targetProviderKey: providerKey, requiredCapability: capability, maxRuns: 1, allowShadowProvider: true } : undefined);
+      const result = await runAutonomousDiscoveryCycle(country, providerTargetRequested ? { targetProviderKey: providerKey, requiredCapability: capability, allocationType: 'FRONTIER_CANARY', maxRuns: 1, allowShadowProvider: true } : undefined);
       res.json(result);
     } catch (err: any) {
       sendOperationError(res, err);
