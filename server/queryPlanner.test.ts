@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
-import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
+import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
 
 function query(overrides: Partial<QueryRecord>): QueryRecord {
@@ -27,6 +27,25 @@ function query(overrides: Partial<QueryRecord>): QueryRecord {
 function term(id: number, value: string, tier: 2 | 3, occurrences: number): ExtractedTermRecord {
   return { id, country: 'Germany', term: value, category: 'terminology', occurrences, first_extracted: '2026-01-01T00:00:00.000Z', last_extracted: '2026-01-02T00:00:00.000Z', trust_tier: tier, validation_count: tier === 2 ? occurrences : 0 };
 }
+
+test('frontier targeted fallback preserves a valid canonical term and rejects unsafe prose', () => {
+  const planned = planFrontierTargetedQuery({
+    country: 'Australia',
+    target: {
+      country: 'Australia', language: null, queryIntent: 'market_analysis', primaryTermFamily: 'ASX analysis',
+      retrievalLane: 'VIDEO', searchOrdering: 'RELEVANCE', instrumentOrTheme: null, sourceFamily: 'automated_query'
+    }
+  });
+  assert.equal(planned?.query, 'ASX analysis');
+  assert.equal(planned?.metadata.queryTemplate, 'FRONTIER_TARGETED');
+  assert.equal(planFrontierTargetedQuery({
+    country: 'Australia',
+    target: {
+      country: 'Australia', language: null, queryIntent: 'education', primaryTermFamily: 'investor education weekly market update',
+      retrievalLane: 'VIDEO', searchOrdering: 'RELEVANCE', instrumentOrTheme: null, sourceFamily: 'automated_query'
+    }
+  }), null);
+});
 
 test('hard cooldown removes identical historical queries from eligibility', () => {
   const now = new Date('2026-07-28T12:00:00.000Z');
