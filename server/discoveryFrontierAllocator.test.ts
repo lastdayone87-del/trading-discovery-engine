@@ -23,6 +23,18 @@ test('frontier candidate loading uses the migrated metadata dimensions column', 
   assert.doesNotMatch(source, /ORDER BY n\.updated_at DESC/);
 });
 
+test('frontier candidates reconstruct canonical dimensions when metadata is empty', async () => {
+  const mockClient = {
+    query: async (sql: string) => sql.includes('discovery_neighborhoods') ? { rows: [{
+      neighborhood_key: 'australia|none|general|aud pairs|video|relevance|none|automated_query',
+      country: 'Australia', language: null, query_intent: 'GENERAL', primary_term_family: 'aud pairs', retrieval_lane: 'VIDEO', search_ordering: 'RELEVANCE', instrument_or_theme: null, source_family: 'automated_query', dimensions: {}, frontier_state: 'UNEXPLORED', expected_marginal_value: 0, uncertainty: 1, coverage_gain: .5, known_creator_ratio: 0, result_set_overlap: 0, is_saturating: false, proposal_id: null, last_allocated_at: null, recent_allocation_count: 0
+    }] } : { rows: [] }
+  };
+  const candidates = await getNeighborhoodCandidates('Australia', new Date(), mockClient);
+  assert.equal(candidates.length, 1);
+  assert.equal(createNeighborhoodKey(candidates[0].dimensions), candidates[0].neighborhoodKey);
+});
+
 test('evaluateNeighborhoodEligibility rejects HARMFUL and SATURATED candidates', () => {
   const baseDims = {
     country: 'US',

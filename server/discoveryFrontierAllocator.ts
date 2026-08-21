@@ -250,6 +250,13 @@ export async function getNeighborhoodCandidates(
     SELECT
       n.neighborhood_key,
       n.country,
+      n.language,
+      n.query_intent,
+      n.primary_term_family,
+      n.retrieval_lane,
+      n.search_ordering,
+      n.instrument_or_theme,
+      n.source_family,
       n.metadata AS dimensions,
       COALESCE(fs.state, 'UNEXPLORED') AS frontier_state,
       COALESCE(mv.expected_marginal_value, 0)::float AS expected_marginal_value,
@@ -309,13 +316,13 @@ export async function getNeighborhoodCandidates(
     const rawDims = typeof row.dimensions === 'string' ? JSON.parse(row.dimensions) : (row.dimensions || {});
     const dimensions: DiscoveryNeighborhoodDimensions = {
       country: row.country || targetCountry || 'US',
-      language: rawDims.language || null,
-      queryIntent: rawDims.queryIntent || 'GENERAL',
-      primaryTermFamily: rawDims.primaryTermFamily || 'trading',
-      retrievalLane: rawDims.retrievalLane || 'KEYWORD_SEARCH',
-      searchOrdering: rawDims.searchOrdering || 'RELEVANCE',
-      instrumentOrTheme: rawDims.instrumentOrTheme || null,
-      sourceFamily: rawDims.sourceFamily || 'automated_query'
+      language: row.language ?? rawDims.language ?? null,
+      queryIntent: row.query_intent || rawDims.queryIntent || 'GENERAL',
+      primaryTermFamily: row.primary_term_family || rawDims.primaryTermFamily || 'trading',
+      retrievalLane: row.retrieval_lane || rawDims.retrievalLane || 'KEYWORD_SEARCH',
+      searchOrdering: row.search_ordering || rawDims.searchOrdering || 'RELEVANCE',
+      instrumentOrTheme: row.instrument_or_theme ?? rawDims.instrumentOrTheme ?? null,
+      sourceFamily: row.source_family || rawDims.sourceFamily || 'automated_query'
     };
 
     return {
