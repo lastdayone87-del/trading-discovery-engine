@@ -430,6 +430,7 @@ export async function evaluateShadowFrontierAllocation(input: {
     ? input.legacyNeighborhoodKey === selectedCandidate.neighborhoodKey
     : input.legacyCountry.toLowerCase() === selectedCandidate.country.toLowerCase();
 
+  const shadowProvider = providerSnapshot(undefined);
   const decision: AllocationDecision = {
     decisionId,
     opportunityKey: input.opportunityKey,
@@ -460,6 +461,15 @@ export async function evaluateShadowFrontierAllocation(input: {
     quotaConsumed: 0,
     quotaDay,
     policyVersion: PERSISTENT_RESEARCH_PHASE8_VERSION,
+    provider: shadowProvider,
+    providerReservationId: `shadow:${decisionId}`,
+    providerEligibilitySnapshot: {
+      providerKey: shadowProvider.providerKey,
+      retrievalSurface: shadowProvider.retrievalSurface,
+      capability: shadowProvider.capability,
+      costDomain: shadowProvider.costDomain,
+      shadow: true
+    },
     createdAt: now.toISOString()
   };
 
@@ -473,9 +483,11 @@ export async function evaluateShadowFrontierAllocation(input: {
          saturation_evidence, proposal_id, selection_score, score_components,
          candidate_neighborhood_count, rejection_reasons, agreed_with_legacy,
          deferred, quota_reserved, quota_consumed, quota_day, policy_version,
-         proposal_evidence_snapshot, proposal_evidence_checksum
+         proposal_evidence_snapshot, proposal_evidence_checksum,
+         provider_key, retrieval_surface, provider_capability, cost_domain,
+         provider_reservation_id, provider_reserved_amount, provider_consumed_amount, provider_eligibility_snapshot, continuation_owner
        )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
        ON CONFLICT(decision_id) DO NOTHING`,
       [
         decision.decisionId,

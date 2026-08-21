@@ -51,6 +51,19 @@ test('malformed provider snapshot is rejected', () => {
   );
 });
 
+test('future providers do not default to YouTube identity, YOUTUBE_NATIVE or YOUTUBE_DATA_API when provider fields are omitted', () => {
+  const incompleteBrave: Partial<ProviderAllocation> = {
+    providerKey: 'brave-search',
+    retrievalSurface: 'BRAVE_WEB'
+    // costDomain and capability omitted
+  };
+
+  assert.throws(
+    () => providerSnapshot(incompleteBrave),
+    /INVALID_PROVIDER_ALLOCATION_SNAPSHOT/
+  );
+});
+
 test('unknown provider cannot execute without a registered executor', async () => {
   const braveProvider: ProviderAllocation = {
     providerKey: 'brave-search',
@@ -73,7 +86,7 @@ test('unknown provider cannot execute without a registered executor', async () =
   );
 });
 
-test('hypothetical non-YouTube provider can execute when registered via executor dispatch map', async () => {
+test('hypothetical non-YouTube provider can execute when registered via executor dispatch map with non-100 cost model', async () => {
   const mockBraveProvider: ProviderAllocation = {
     providerKey: 'brave-search-mock',
     retrievalSurface: 'BRAVE_WEB_MOCK',
@@ -82,9 +95,9 @@ test('hypothetical non-YouTube provider can execute when registered via executor
     continuationOwner: 'PHASE_9'
   };
 
-  let executorCalled = false;
+  let reservedUnitsCount = 0;
   const mockExecutor = async (req: RetrievalRequest): Promise<RetrievalPage> => {
-    executorCalled = true;
+    if (req.reserveAdditionalUnits) await req.reserveAdditionalUnits(1);
     return {
       channels: [{
         channelId: 'c_brave_1',
@@ -107,12 +120,14 @@ test('hypothetical non-YouTube provider can execute when registered via executor
       country: 'US',
       lane: 'VIDEO',
       cursor: null,
-      ordering: 'RELEVANCE'
+      ordering: 'RELEVANCE',
+      reserveAdditionalUnits: async (units) => {
+        reservedUnitsCount += units;
+      }
     });
 
-    assert.ok(executorCalled);
     assert.equal(result.channels.length, 1);
-    assert.equal(result.channels[0].channelId, 'c_brave_1');
+    assert.equal(reservedUnitsCount, 1, 'Brave provider must be able to reserve 1 unit without being forced to 100');
   } finally {
     clearRegisteredExecutorsForTest();
   }
@@ -142,7 +157,7 @@ test('wrong capability or wrong cost domain is rejected during snapshot/executio
   );
 });
 
-test('migration 111 is additive, backfills official-only history and protects lineage', () => {
+test('migration 111 is additive, backfills official-only history, protects lineage, and sets no silent YouTube defaults', () => {
   const sql = readFileSync(new URL('./db/migrations/111_provider_aware_phase8_phase9.sql', import.meta.url), 'utf8');
   for (const field of ['provider_key', 'retrieval_surface', 'provider_capability', 'cost_domain', 'provider_reservation_id', 'provider_eligibility_snapshot', 'continuation_owner']) {
     assert.match(sql, new RegExp(field));
@@ -151,6 +166,8 @@ test('migration 111 is additive, backfills official-only history and protects li
   assert.match(sql, /IMMUTABLE_PROVIDER_ALLOCATION_LINEAGE/);
   assert.match(sql, /IMMUTABLE_QUERY_RUN_PROVIDER_LINEAGE/);
   assert.doesNotMatch(sql, /DROP TABLE|DROP COLUMN|TRUNCATE/i);
+  assert.doesNotMatch(sql, /ALTER COLUMN provider_key SET DEFAULT 'youtube-search'/);
+  assert.doesNotMatch(sql, /ALTER COLUMN provider_reserved_amount SET DEFAULT 100/);
 });
 
 test('Phase 8 registry validation and Phase 9 governed dispatch are wired', () => {

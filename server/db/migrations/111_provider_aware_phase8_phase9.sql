@@ -22,13 +22,14 @@ UPDATE frontier_allocation_decisions SET
 WHERE provider_key IS NULL;
 
 ALTER TABLE frontier_allocation_decisions
-  ALTER COLUMN provider_key SET DEFAULT 'youtube-search',ALTER COLUMN retrieval_surface SET DEFAULT 'YOUTUBE_NATIVE',ALTER COLUMN provider_capability SET DEFAULT 'SEARCH_YOUTUBE',ALTER COLUMN cost_domain SET DEFAULT 'YOUTUBE_DATA_API',
-  ALTER COLUMN provider_reservation_id SET DEFAULT 'legacy-compatible',ALTER COLUMN provider_reserved_amount SET DEFAULT 100,
-  ALTER COLUMN provider_eligibility_snapshot SET DEFAULT '{"providerKey":"youtube-search","mode":"ACTIVE","compatibilityDefault":true}'::jsonb,ALTER COLUMN continuation_owner SET DEFAULT 'PHASE_9',
-  ALTER COLUMN provider_key SET NOT NULL, ALTER COLUMN retrieval_surface SET NOT NULL,
-  ALTER COLUMN provider_capability SET NOT NULL, ALTER COLUMN cost_domain SET NOT NULL,
-  ALTER COLUMN provider_reservation_id SET NOT NULL, ALTER COLUMN provider_reserved_amount SET NOT NULL,
-  ALTER COLUMN provider_eligibility_snapshot SET NOT NULL, ALTER COLUMN continuation_owner SET NOT NULL,
+  ALTER COLUMN provider_key SET NOT NULL,
+  ALTER COLUMN retrieval_surface SET NOT NULL,
+  ALTER COLUMN provider_capability SET NOT NULL,
+  ALTER COLUMN cost_domain SET NOT NULL,
+  ALTER COLUMN provider_reservation_id SET NOT NULL,
+  ALTER COLUMN provider_reserved_amount SET NOT NULL,
+  ALTER COLUMN provider_eligibility_snapshot SET NOT NULL,
+  ALTER COLUMN continuation_owner SET NOT NULL,
   ADD CONSTRAINT frontier_provider_amounts_check CHECK(provider_reserved_amount>=0 AND provider_consumed_amount>=0),
   ADD CONSTRAINT frontier_provider_snapshot_check CHECK(jsonb_typeof(provider_eligibility_snapshot)='object'),
   ADD CONSTRAINT frontier_phase9_continuation_check CHECK(continuation_owner='PHASE_9');
@@ -38,13 +39,17 @@ ALTER TABLE query_runs ADD COLUMN IF NOT EXISTS provider_key TEXT REFERENCES dis
  ADD COLUMN IF NOT EXISTS retrieval_surface TEXT, ADD COLUMN IF NOT EXISTS provider_capability TEXT,
  ADD COLUMN IF NOT EXISTS cost_domain TEXT, ADD COLUMN IF NOT EXISTS provider_allocation_snapshot JSONB,
  ADD COLUMN IF NOT EXISTS provider_cursor JSONB NOT NULL DEFAULT '{}'::jsonb;
+
 UPDATE query_runs SET provider_key='youtube-search',retrieval_surface='YOUTUBE_NATIVE',provider_capability='SEARCH_YOUTUBE',cost_domain='YOUTUBE_DATA_API',
  provider_allocation_snapshot=jsonb_build_object('providerKey','youtube-search','retrievalSurface','YOUTUBE_NATIVE','capability','SEARCH_YOUTUBE','costDomain','YOUTUBE_DATA_API','continuationOwner','PHASE_9','historicBackfill',true)
 WHERE provider_key IS NULL;
-ALTER TABLE query_runs ALTER COLUMN provider_key SET NOT NULL,ALTER COLUMN retrieval_surface SET NOT NULL,
- ALTER COLUMN provider_key SET DEFAULT 'youtube-search',ALTER COLUMN retrieval_surface SET DEFAULT 'YOUTUBE_NATIVE',ALTER COLUMN provider_capability SET DEFAULT 'SEARCH_YOUTUBE',ALTER COLUMN cost_domain SET DEFAULT 'YOUTUBE_DATA_API',
- ALTER COLUMN provider_allocation_snapshot SET DEFAULT '{"providerKey":"youtube-search","retrievalSurface":"YOUTUBE_NATIVE","capability":"SEARCH_YOUTUBE","costDomain":"YOUTUBE_DATA_API","continuationOwner":"PHASE_9","compatibilityDefault":true}'::jsonb,
- ALTER COLUMN provider_capability SET NOT NULL,ALTER COLUMN cost_domain SET NOT NULL,ALTER COLUMN provider_allocation_snapshot SET NOT NULL,
+
+ALTER TABLE query_runs
+ ALTER COLUMN provider_key SET NOT NULL,
+ ALTER COLUMN retrieval_surface SET NOT NULL,
+ ALTER COLUMN provider_capability SET NOT NULL,
+ ALTER COLUMN cost_domain SET NOT NULL,
+ ALTER COLUMN provider_allocation_snapshot SET NOT NULL,
  ADD CONSTRAINT query_run_provider_snapshot_check CHECK(jsonb_typeof(provider_allocation_snapshot)='object'),
  ADD CONSTRAINT query_run_provider_cursor_check CHECK(jsonb_typeof(provider_cursor)='object');
 CREATE INDEX IF NOT EXISTS query_runs_provider_completed_idx ON query_runs(provider_key,retrieval_surface,completed_at);
