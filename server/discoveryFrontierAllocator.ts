@@ -298,7 +298,7 @@ export async function getNeighborhoodCandidates(
         AND decision_status IN ('RESERVED', 'COMMITTED')
     ) recent ON true
     ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($3)' : ''}
-    ORDER BY n.updated_at DESC
+    ORDER BY n.last_observed_at DESC
     LIMIT 50
   `;
 
