@@ -23,7 +23,9 @@ test('provider-targeted canary cycles are admin-gated and use the governed autho
   assert.match(server,/req\.operator\?\.role !== 'admin'/);
   assert.match(server,/providerKey !== 'brave-search' \|\| capability !== 'SEARCH_BRAVE_DIRECT'/);
   assert.match(server,/runAutonomousDiscoveryCycle\(country, providerTargetRequested/);
+  assert.match(server,/Number\(maxRuns\) !== 1/);
   assert.match(autonomous,/targetProviderKey: providerTarget\?\.targetProviderKey/);
+  assert.match(autonomous,/Math\.min\(calculatedCapacity, Math\.max\(1, Math\.floor\(providerTarget\.maxRuns\)\)\)/);
   assert.match(authority,/targetProviderKey: input\.targetProviderKey/);
 });
 
