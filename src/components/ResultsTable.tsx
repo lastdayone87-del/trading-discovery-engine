@@ -65,9 +65,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
     const matchesTradingStatus = selectedTradingStatus === 'ALL' || c.trading_status === selectedTradingStatus;
     const matchesDiscordStatus = selectedDiscordStatus === 'ALL' || c.discord_status === selectedDiscordStatus;
     const matchesScanStatus = selectedScanStatus === 'ALL' || c.scan_status === selectedScanStatus;
+    const matchesLowAudienceVisibility = selectedScanStatus === 'SKIPPED_LOW_AUDIENCE' || c.scan_status !== 'SKIPPED_LOW_AUDIENCE';
     const matchesReviewView = !pendingReviewOnly || (c.scan_status === 'NEEDS_REVIEW' && !decidedChannelIds.has(c.channel_id));
 
-    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesReviewView;
+    return matchesSearch && matchesCountry && matchesCountryStatus && matchesTradingStatus && matchesDiscordStatus && matchesScanStatus && matchesLowAudienceVisibility && matchesReviewView;
   }),[channels,searchTerm,selectedCountry,selectedCountryStatus,selectedTradingStatus,selectedDiscordStatus,selectedScanStatus,pendingReviewOnly,decidedChannelIds]);
 
   const handleCopyLink = (url: string, id: string) => {
