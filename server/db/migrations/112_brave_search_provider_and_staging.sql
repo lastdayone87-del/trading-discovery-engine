@@ -7,7 +7,7 @@ INSERT INTO discovery_provider_registry (
   'brave-search', 'brave', 'RETRIEVAL',
   '["SEARCH_BRAVE_DIRECT", "SEARCH_BRAVE_EXTERNAL_OSINT"]'::jsonb,
   'BRAVE_SEARCH_API', 'https://brave.com/search/api/terms/',
-  'ACTIVE', 100, 'system:migration-112'
+  'SHADOW', 100, 'system:migration-112'
 ) ON CONFLICT (provider_key) DO UPDATE SET
   capabilities = EXCLUDED.capabilities,
   quota_domain = EXCLUDED.quota_domain,
@@ -63,10 +63,10 @@ CREATE INDEX IF NOT EXISTS idx_candidate_staging_discovered_at ON discovery_cand
 
 -- App settings for Brave control plane
 INSERT INTO app_settings(setting_key, setting_value) VALUES
-  ('brave_provider_mode', 'ACTIVE'),
+  ('brave_provider_mode', 'SHADOW'),
   ('brave_kill_switch', 'false'),
   ('brave_daily_request_cap', '1000'),
   ('brave_per_cycle_request_cap', '20'),
   ('brave_staging_backlog_threshold', '500'),
-  ('brave_cost_per_request_usd', '0.003')
+  ('brave_cost_per_request_usd', '')
 ON CONFLICT (setting_key) DO NOTHING;

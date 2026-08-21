@@ -45,10 +45,11 @@ test('evaluateBraveCandidateNoise identifies low-quality SEO and spam', () => {
   assert.equal(evaluateBraveCandidateNoise(spamItem).isNoise, true);
 });
 
-test('buildBraveSearchRequest constructs valid endpoint URL and headers', () => {
-  const req = buildBraveSearchRequest('forex trading', 'GB', 'DIRECT_YOUTUBE', 0, 20, 'test-key-123');
+test('buildBraveSearchRequest constructs valid endpoint URL, headers, and dynamic search_lang', () => {
+  const req = buildBraveSearchRequest('forex trading', 'GB', 'es', 'DIRECT_YOUTUBE', 0, 20, 'test-key-123');
   assert.ok(req.url.includes('site%3Ayoutube.com+forex+trading') || req.url.includes('site:youtube.com'));
   assert.ok(req.url.includes('country=gb'));
+  assert.ok(req.url.includes('search_lang=es'));
   assert.equal(req.headers['X-Subscription-Token'], 'test-key-123');
 });
 
@@ -98,11 +99,37 @@ test('checkBraveControlPlane respects emergency kill switch env', async () => {
   }
 });
 
+test('checkBraveControlPlane fails closed on database error', async () => {
+  const mockDbWithError = {
+    query: async () => { throw new Error('DB_CONNECTION_ERROR'); }
+  };
+  const status = await checkBraveControlPlane(mockDbWithError);
+  assert.equal(status.allowed, false);
+  assert.equal(status.reason, 'CONTROL_PLANE_CHECK_FAILED');
+});
+
+test('checkBraveControlPlane enforces staging backlog threshold backpressure', async () => {
+  const mockDbWithHighBacklog = {
+    query: async (sql: string) => {
+      if (sql.includes('app_settings')) return { rows: [{ setting_key: 'brave_staging_backlog_threshold', setting_value: '10' }] };
+      if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'ACTIVE' }] };
+      if (sql.includes('discovery_candidate_staging')) return { rows: [{ backlog_count: 50 }] };
+      if (sql.includes('query_runs')) return { rows: [{ daily_requests: 0 }] };
+      return { rows: [] };
+    }
+  };
+
+  const status = await checkBraveControlPlane(mockDbWithHighBacklog);
+  assert.equal(status.allowed, false);
+  assert.equal(status.reason, 'STAGING_BACKLOG_THRESHOLD_EXCEEDED');
+  assert.equal(status.backlogThresholdExceeded, true);
+});
+
 test('fetchBraveSearchResults handles 429 rate limits fail-closed', async () => {
   const mockFetch = async () => new Response('Rate limit exceeded', { status: 429 });
   process.env.BRAVE_SEARCH_API_KEY = 'test-key';
   await assert.rejects(
-    async () => fetchBraveSearchResults('forex', 'US', 'DIRECT_YOUTUBE', 0, 20, mockFetch as any),
+    async () => fetchBraveSearchResults('forex', 'US', 'en', 'DIRECT_YOUTUBE', 0, 20, mockFetch as any),
     /BRAVE_API_RATE_LIMIT_429/
   );
 });

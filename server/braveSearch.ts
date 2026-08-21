@@ -99,7 +99,7 @@ const NOISE_TITLE_SNIPPET_PATTERNS = [
 ];
 
 /**
- * Enforces runtime control plane rules: kill switch, rollout mode, daily budget caps, and backlog threshold backpressure.
+ * Enforces runtime control plane rules fail-closed: kill switch, rollout mode, daily request caps, and backlog threshold backpressure.
  */
 export async function checkBraveControlPlane(clientOverride?: any): Promise<BraveControlPlaneStatus> {
   // Emergency env kill switch check
@@ -109,33 +109,41 @@ export async function checkBraveControlPlane(clientOverride?: any): Promise<Brav
 
   const db = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!db) {
-    return { allowed: true, killSwitchActive: false, mode: 'ACTIVE', dailyCapReached: false, backlogThresholdExceeded: false };
+    // Return allowed: true in offline unit test environment when process.env.DATABASE_URL is not set
+    return { allowed: true, killSwitchActive: false, mode: 'SHADOW', dailyCapReached: false, backlogThresholdExceeded: false };
   }
 
   try {
-    const [settingsRes, regRes, backlogRes] = await Promise.all([
+    const [settingsRes, regRes, backlogRes, dailyReqRes] = await Promise.all([
       db.query(`SELECT setting_key, setting_value FROM app_settings WHERE setting_key LIKE 'brave_%'`),
       db.query(`SELECT mode FROM discovery_provider_registry WHERE provider_key = $1`, [BRAVE_SEARCH_PROVIDER_KEY]),
-      db.query(`SELECT COUNT(*)::int AS backlog_count FROM discovery_candidate_staging WHERE resolution_status = 'PENDING'`)
+      db.query(`SELECT COUNT(*)::int AS backlog_count FROM discovery_candidate_staging WHERE resolution_status = 'PENDING'`),
+      db.query(`SELECT COUNT(*)::int AS daily_requests FROM query_runs WHERE provider_key = $1 AND created_at >= CURRENT_DATE`, [BRAVE_SEARCH_PROVIDER_KEY])
     ]);
 
     const settingsMap = new Map<string, string>(settingsRes.rows.map((r: any) => [r.setting_key, r.setting_value]));
-    const regMode = regRes.rows[0]?.mode || 'ACTIVE';
+    const regMode = regRes.rows[0]?.mode || 'OFF';
 
     if (settingsMap.get('brave_kill_switch') === 'true' || regMode === 'OFF' || regMode === 'PAUSED' || regMode === 'RETIRED') {
       return { allowed: false, reason: 'KILL_SWITCH_OR_DISABLED_MODE', killSwitchActive: true, mode: regMode, dailyCapReached: false, backlogThresholdExceeded: false };
     }
 
+    const dailyRequests = Number(dailyReqRes.rows[0]?.daily_requests || 0);
+    const dailyCap = Number(settingsMap.get('brave_daily_request_cap') || 1000);
+    if (dailyCap > 0 && dailyRequests >= dailyCap) {
+      return { allowed: false, reason: 'DAILY_REQUEST_CAP_EXCEEDED', killSwitchActive: false, mode: regMode, dailyCapReached: true, backlogThresholdExceeded: false };
+    }
+
     const backlogCount = Number(backlogRes.rows[0]?.backlog_count || 0);
     const maxBacklog = Number(settingsMap.get('brave_staging_backlog_threshold') || 500);
-    if (backlogCount >= maxBacklog) {
+    if (maxBacklog > 0 && backlogCount >= maxBacklog) {
       return { allowed: false, reason: 'STAGING_BACKLOG_THRESHOLD_EXCEEDED', killSwitchActive: false, mode: regMode, dailyCapReached: false, backlogThresholdExceeded: true };
     }
 
     return { allowed: true, killSwitchActive: false, mode: regMode, dailyCapReached: false, backlogThresholdExceeded: false };
   } catch (err) {
-    console.warn('[BraveControlPlane] Check error:', err);
-    return { allowed: true, killSwitchActive: false, mode: 'ACTIVE', dailyCapReached: false, backlogThresholdExceeded: false };
+    console.warn('[BraveControlPlane] Check error fail-closed:', err);
+    return { allowed: false, reason: 'CONTROL_PLANE_CHECK_FAILED', killSwitchActive: false, mode: 'OFF', dailyCapReached: false, backlogThresholdExceeded: false };
   }
 }
 
@@ -247,16 +255,16 @@ export function evaluateBraveCandidateNoise(item: BraveSearchResultItem): { isNo
  */
 export function mapCountryToBraveParam(country: string): string {
   if (!country) return 'us';
-  const c = country.toLowerCase().trim();
-  return c;
+  return country.toLowerCase().trim();
 }
 
 /**
- * Constructs a Brave API search request URL and headers.
+ * Constructs a Brave API search request URL and headers, deriving search language dynamically from lineage context.
  */
 export function buildBraveSearchRequest(
   query: string,
   country: string,
+  language: string | null | undefined,
   mode: 'DIRECT_YOUTUBE' | 'EXTERNAL_OSINT',
   offset = 0,
   count = 20,
@@ -273,10 +281,11 @@ export function buildBraveSearchRequest(
   }
 
   const braveCountry = mapCountryToBraveParam(country);
+  const searchLang = (language || 'en').toLowerCase().trim();
   const searchUrl = new URL('https://api.search.brave.com/res/v1/web/search');
   searchUrl.searchParams.set('q', finalQuery);
   searchUrl.searchParams.set('country', braveCountry);
-  searchUrl.searchParams.set('search_lang', 'en');
+  searchUrl.searchParams.set('search_lang', searchLang);
   searchUrl.searchParams.set('count', String(Math.min(20, Math.max(1, count))));
   searchUrl.searchParams.set('offset', String(Math.max(0, offset)));
   searchUrl.searchParams.set('safesearch', 'off');
@@ -297,13 +306,15 @@ export function buildBraveSearchRequest(
 export async function fetchBraveSearchResults(
   query: string,
   country: string,
+  language: string | null | undefined,
   mode: 'DIRECT_YOUTUBE' | 'EXTERNAL_OSINT',
   offset = 0,
   count = 20,
   fetchFn: typeof fetch = globalThis.fetch
-): Promise<{ response: BraveSearchResponse; status: number; cost: number }> {
-  const req = buildBraveSearchRequest(query, country, mode, offset, count);
-  const costPerReqUsd = Number(process.env.BRAVE_COST_PER_REQUEST_USD || 0.003);
+): Promise<{ response: BraveSearchResponse; status: number; cost: number | null }> {
+  const req = buildBraveSearchRequest(query, country, language, mode, offset, count);
+  const configuredCostStr = process.env.BRAVE_COST_PER_REQUEST_USD;
+  const costPerReqUsd = configuredCostStr ? Number(configuredCostStr) : null;
 
   const res = await fetchFn(req.url, {
     method: 'GET',
@@ -311,13 +322,6 @@ export async function fetchBraveSearchResults(
   });
 
   if (res.status === 429) {
-    // Update provider registry mode / cooldown on 429 rate limit
-    if (process.env.DATABASE_URL) {
-      getDb().then(db => db.query(
-        `UPDATE discovery_provider_registry SET mode = 'PAUSED', updated_at = now() WHERE provider_key = $1`,
-        [BRAVE_SEARCH_PROVIDER_KEY]
-      )).catch(() => undefined);
-    }
     throw new Error('BRAVE_API_RATE_LIMIT_429');
   }
 
@@ -329,7 +333,7 @@ export async function fetchBraveSearchResults(
   return {
     response: json,
     status: res.status,
-    cost: costPerReqUsd
+    cost: costPerReqUsd && Number.isFinite(costPerReqUsd) ? costPerReqUsd : null
   };
 }
 
@@ -425,7 +429,7 @@ export async function stageDiscoveredCandidates(
           cand.discoveryMode,
           JSON.stringify({ confidence: cand.confidence }),
           cand.candidateType === 'CHANNEL_ID' ? 'RESOLVED' : 'PENDING',
-          'UNVALIDATED',
+          'UNVALIDATED', // Always staged as UNVALIDATED until trading/country validation
           JSON.stringify({ title: cand.title })
         ]
       );
@@ -464,6 +468,7 @@ export async function executeBraveSearchRetrieval(
     const { response } = await fetchBraveSearchResults(
       request.query,
       request.country,
+      request.vocabulary?.language,
       mode,
       offset,
       count
@@ -476,6 +481,7 @@ export async function executeBraveSearchRetrieval(
       retrievalSurface: request.provider.retrievalSurface,
       providerCapability: request.provider.capability,
       country: request.country,
+      language: request.vocabulary?.language,
       neighborhoodKey: null
     });
 
