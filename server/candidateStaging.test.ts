@@ -63,7 +63,7 @@ test('processPendingStagedCandidates preserves UNVALIDATED validation status dur
   assert.equal(updatedInput.validationStatus, 'UNVALIDATED'); // Must remain UNVALIDATED
 });
 
-test('processPendingStagedCandidates skips external evidence without explicit YouTube locators', async () => {
+test('processPendingStagedCandidates defers external evidence without explicit YouTube locators', async () => {
   let updatedStatus: string | null = null;
   const mockDb = {
     query: async (sql: string, params: any[]) => {
@@ -93,6 +93,7 @@ test('processPendingStagedCandidates skips external evidence without explicit Yo
 
   const result = await processPendingStagedCandidates(undefined, mockDb);
 
-  assert.equal(result.skipped, 1);
-  assert.equal(updatedStatus, 'SKIPPED');
+  assert.equal(result.deferred, 1);
+  assert.equal(result.skipped, 0);
+  assert.equal(updatedStatus, null);
 });

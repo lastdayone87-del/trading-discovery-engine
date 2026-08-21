@@ -44,6 +44,7 @@ export interface BraveSearchResponse {
   query?: {
     original?: string;
     show_strict_warning?: boolean;
+    more_results_available?: boolean;
   };
 }
 
@@ -66,6 +67,22 @@ export interface BraveControlPlaneStatus {
   mode: string;
   dailyCapReached: boolean;
   backlogThresholdExceeded: boolean;
+  cooldownActive?: boolean;
+}
+
+export class BraveProviderError extends Error {
+  code: string;
+  status?: number;
+  retryAfterMs?: number;
+  retryable: boolean;
+  constructor(code: string, message = code, options: { status?: number; retryAfterMs?: number; retryable?: boolean } = {}) {
+    super(message);
+    this.name = 'BraveProviderError';
+    this.code = code;
+    this.status = options.status;
+    this.retryAfterMs = options.retryAfterMs;
+    this.retryable = options.retryable ?? false;
+  }
 }
 
 // Low quality / noise patterns for Brave web search filtering
@@ -108,7 +125,7 @@ export async function checkBraveControlPlane(clientOverride?: any): Promise<Brav
     return { allowed: false, reason: 'EMERGENCY_ENV_KILL_SWITCH', killSwitchActive: true, mode: 'OFF', dailyCapReached: false, backlogThresholdExceeded: false };
   }
 
-  const db = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+  const db = clientOverride === null ? null : (clientOverride || (process.env.DATABASE_URL ? await getDb() : null));
   if (!db) {
     return { allowed: false, reason: 'CONTROL_PLANE_UNAVAILABLE_FAIL_CLOSED', killSwitchActive: false, mode: 'OFF', dailyCapReached: false, backlogThresholdExceeded: false };
   }
@@ -118,14 +135,19 @@ export async function checkBraveControlPlane(clientOverride?: any): Promise<Brav
       db.query(`SELECT setting_key, setting_value FROM app_settings WHERE setting_key LIKE 'brave_%'`),
       db.query(`SELECT mode FROM discovery_provider_registry WHERE provider_key = $1`, [BRAVE_SEARCH_PROVIDER_KEY]),
       db.query(`SELECT COUNT(*)::int AS backlog_count FROM discovery_candidate_staging WHERE resolution_status = 'PENDING'`),
-      db.query(`SELECT COUNT(*)::int AS daily_requests FROM query_runs WHERE provider_key = $1 AND created_at >= CURRENT_DATE`, [BRAVE_SEARCH_PROVIDER_KEY])
+      db.query(`SELECT COALESCE(SUM(requests_attempted),0)::int AS daily_requests FROM provider_budget_ledger WHERE provider_key = $1 AND budget_day = CURRENT_DATE`, [BRAVE_SEARCH_PROVIDER_KEY])
     ]);
 
     const settingsMap = new Map<string, string>(settingsRes.rows.map((r: any) => [r.setting_key, r.setting_value]));
     const regMode = regRes.rows[0]?.mode || 'OFF';
 
     if (settingsMap.get('brave_kill_switch') === 'true' || regMode === 'OFF' || regMode === 'PAUSED' || regMode === 'RETIRED') {
-      return { allowed: false, reason: 'KILL_SWITCH_OR_DISABLED_MODE', killSwitchActive: true, mode: regMode, dailyCapReached: false, backlogThresholdExceeded: false };
+      return { allowed: false, reason: settingsMap.get('brave_kill_switch') === 'true' ? 'KILL_SWITCH_OR_DISABLED_MODE' : 'PROVIDER_MODE_DISABLED', killSwitchActive: settingsMap.get('brave_kill_switch') === 'true', mode: regMode, dailyCapReached: false, backlogThresholdExceeded: false };
+    }
+
+    const cooldownUntil = Date.parse(settingsMap.get('brave_cooldown_until') || '');
+    if (Number.isFinite(cooldownUntil) && cooldownUntil > Date.now()) {
+      return { allowed: false, reason: 'PROVIDER_COOLDOWN', killSwitchActive: false, mode: regMode, dailyCapReached: false, backlogThresholdExceeded: false, cooldownActive: true };
     }
 
     const dailyRequests = Number(dailyReqRes.rows[0]?.daily_requests || 0);
@@ -316,40 +338,37 @@ export async function fetchBraveSearchResults(
   const req = buildBraveSearchRequest(query, country, language, mode, offset, count);
   const configuredCostStr = process.env.BRAVE_COST_PER_REQUEST_USD;
   const costPerReqUsd = configuredCostStr ? Number(configuredCostStr) : null;
-
   const controller = new AbortController();
-  const timeoutMs = Number(process.env.BRAVE_TIMEOUT_MS || 10000);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  let combinedSignal = controller.signal;
+  const timeoutMs = Math.max(1, Number(process.env.BRAVE_TIMEOUT_MS || 10000));
+  const deadline = new Promise<never>((_, reject) => setTimeout(() => {
+    controller.abort();
+    reject(new BraveProviderError('BRAVE_API_TIMEOUT', 'Brave Search API deadline exceeded', { retryable: true }));
+  }, timeoutMs));
   if (parentSignal) {
     if (parentSignal.aborted) controller.abort();
     else parentSignal.addEventListener('abort', () => controller.abort(), { once: true });
   }
-
   try {
-    const res = await fetchFn(req.url, {
-      method: 'GET',
-      headers: req.headers,
-      signal: combinedSignal
-    });
-
+    const res = await Promise.race([
+      fetchFn(req.url, { method: 'GET', headers: req.headers, signal: controller.signal }),
+      deadline
+    ]);
     if (res.status === 429) {
-      throw new Error('BRAVE_API_RATE_LIMIT_429');
+      const reset = Number(res.headers.get('X-RateLimit-Reset') || 0);
+      throw new BraveProviderError('BRAVE_API_RATE_LIMIT_429', 'BRAVE_API_RATE_LIMIT_429: Brave Search API rate limit', { status: 429, retryAfterMs: Number.isFinite(reset) && reset > 0 ? reset * 1000 : 1000, retryable: true });
     }
-
-    if (!res.ok) {
-      throw new Error(`BRAVE_API_ERROR_HTTP_${res.status}`);
-    }
-
-    const json = (await res.json()) as BraveSearchResponse;
-    return {
-      response: json,
-      status: res.status,
-      cost: costPerReqUsd && Number.isFinite(costPerReqUsd) ? costPerReqUsd : null
-    };
-  } finally {
-    clearTimeout(timer);
+    if (res.status === 401 || res.status === 403) throw new BraveProviderError('BRAVE_API_AUTHENTICATION_FAILURE', `Brave Search API authentication failed: ${res.status}`, { status: res.status });
+    if (res.status >= 500) throw new BraveProviderError(`BRAVE_API_HTTP_${res.status}`, `Brave Search API server failure: ${res.status}`, { status: res.status, retryable: true });
+    if (!res.ok) throw new BraveProviderError(`BRAVE_API_HTTP_${res.status}`, `Brave Search API HTTP failure: ${res.status}`, { status: res.status });
+    let json: BraveSearchResponse;
+    try { json = (await res.json()) as BraveSearchResponse; }
+    catch { throw new BraveProviderError('BRAVE_API_MALFORMED_RESPONSE', 'Brave Search API returned malformed JSON'); }
+    if (!json || typeof json !== 'object' || (json.web?.results !== undefined && !Array.isArray(json.web.results))) throw new BraveProviderError('BRAVE_API_MALFORMED_RESPONSE', 'Brave Search API response shape is invalid');
+    return { response: json, status: res.status, cost: costPerReqUsd !== null && Number.isFinite(costPerReqUsd) ? costPerReqUsd : null };
+  } catch (error: any) {
+    if (error instanceof BraveProviderError) throw error;
+    if (error?.name === 'AbortError') throw new BraveProviderError('BRAVE_API_TIMEOUT', 'Brave Search API aborted', { retryable: true });
+    throw new BraveProviderError('BRAVE_API_NETWORK_FAILURE', String(error?.message || error), { retryable: true });
   }
 }
 
@@ -414,50 +433,75 @@ export async function stageDiscoveredCandidates(
   let duplicateCount = 0;
 
   for (const cand of candidates) {
-    const stagingKey = createHash('sha256')
-      .update(`${context.providerKey}:${cand.candidateType}:${cand.normalizedIdentity}:${context.country}`)
-      .digest('hex')
-      .slice(0, 32);
+    const canonicalIdentity = cand.candidateType === 'CHANNEL_ID'
+      ? `YOUTUBE_CHANNEL:${cand.normalizedIdentity}`
+      : `${cand.candidateType}:${cand.normalizedIdentity.toLowerCase()}`;
+    const canonicalCandidateKey = createHash('sha256').update(canonicalIdentity).digest('hex');
+    const observationKey = createHash('sha256').update([
+      canonicalCandidateKey, context.providerKey, context.retrievalSurface,
+      context.queryRunId || '', context.opportunityKey || '', context.country,
+      context.language || '', context.neighborhoodKey || '', cand.rawLocator
+    ].join('|')).digest('hex');
+    const derivedMetadata = {
+      confidence: cand.confidence,
+      titleDigest: cand.title ? createHash('sha256').update(cand.title).digest('hex') : null,
+      snippetDigest: cand.snippet ? createHash('sha256').update(cand.snippet).digest('hex') : null,
+      rawLocatorDigest: createHash('sha256').update(cand.rawLocator).digest('hex')
+    };
 
     try {
       const res = await db.query(
         `INSERT INTO discovery_candidate_staging(
-           staging_key, provider_key, retrieval_surface, provider_capability, candidate_type,
+           staging_key, canonical_candidate_key, provider_key, retrieval_surface, provider_capability, candidate_type,
            normalized_identity, raw_locator, query_run_id, opportunity_key, country, language,
            neighborhood_key, discovery_mode, provenance, resolution_status, validation_status, metadata
          )
-         VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-         ON CONFLICT (staging_key) DO NOTHING
-         RETURNING id`,
+         VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+         ON CONFLICT (staging_key) DO UPDATE SET updated_at=now()
+         RETURNING id, (xmax=0) AS inserted`,
         [
-          stagingKey,
+          canonicalCandidateKey,
+          canonicalCandidateKey,
           context.providerKey,
           context.retrievalSurface,
           context.providerCapability,
           cand.candidateType,
           cand.normalizedIdentity,
-          cand.rawLocator,
+          cand.candidateType === 'EXTERNAL_EVIDENCE' ? cand.normalizedIdentity : cand.rawLocator,
           context.queryRunId || null,
           context.opportunityKey || null,
           context.country,
           context.language || null,
           context.neighborhoodKey || null,
           cand.discoveryMode,
-          JSON.stringify({ confidence: cand.confidence }),
+          JSON.stringify({ confidence: cand.confidence, canonicalIdentity }),
           cand.candidateType === 'CHANNEL_ID' ? 'RESOLVED' : 'PENDING',
-          'UNVALIDATED', // Always staged as UNVALIDATED until trading/country validation
-          JSON.stringify({ title: cand.title, snippet: cand.snippet })
+          'UNVALIDATED',
+          JSON.stringify(derivedMetadata)
         ]
       );
-
-      if (res.rowCount) {
-        stagedCount++;
-      } else {
-        duplicateCount++;
-      }
+      const stagingId = res.rows?.[0]?.id;
+      if (!stagingId) throw new Error('CANDIDATE_STAGING_ID_MISSING');
+      await db.query(
+        `INSERT INTO discovery_candidate_observations(
+           observation_key, staging_id, canonical_candidate_key, provider_key, retrieval_surface,
+           provider_capability, candidate_type, normalized_identity, raw_locator, query_run_id,
+           opportunity_key, country, language, neighborhood_key, discovery_mode, provenance, metadata
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+         ON CONFLICT(observation_key) DO NOTHING`,
+        [observationKey, stagingId, canonicalCandidateKey, context.providerKey, context.retrievalSurface,
+          context.providerCapability, cand.candidateType, cand.normalizedIdentity,
+          cand.candidateType === 'EXTERNAL_EVIDENCE' ? cand.normalizedIdentity : cand.rawLocator,
+          context.queryRunId || null, context.opportunityKey || null, context.country,
+          context.language || null, context.neighborhoodKey || null, cand.discoveryMode,
+          JSON.stringify({ provider: context.providerKey, confidence: cand.confidence, canonicalIdentity }),
+          JSON.stringify(derivedMetadata)]
+      );
+      if (res.rows?.[0]?.inserted === true || res.rows?.[0]?.inserted === 'true') stagedCount++;
+      else duplicateCount++;
     } catch (err) {
       console.error('[BraveSearch] Critical staging insert failure:', err);
-      throw err; // Fail retrieval call if staging fails so candidates are not silently lost
+      throw err;
     }
   }
 
@@ -483,10 +527,10 @@ export async function executeBraveSearchRetrieval(
   const count = 20;
 
   try {
-    const { response } = await fetchBraveSearchResults(
+    const { response, cost } = await fetchBraveSearchResults(
       request.query,
       request.country,
-      request.vocabulary?.language,
+      request.vocabulary?.languages?.[0],
       mode,
       offset,
       count
@@ -498,16 +542,18 @@ export async function executeBraveSearchRetrieval(
       providerKey: request.provider.providerKey,
       retrievalSurface: request.provider.retrievalSurface,
       providerCapability: request.provider.capability,
+      queryRunId: request.queryRunId || null,
       country: request.country,
-      language: request.vocabulary?.language,
+      language: request.vocabulary?.languages?.[0],
       neighborhoodKey: null,
       client: clientOverride
     });
 
-    // Determine pagination exhaustion from web search total result count, not candidate count
-    const totalWebResults = response.web?.total || 0;
-    const nextOffset = offset + count;
-    const nextPageToken = nextOffset < totalWebResults ? String(nextOffset) : null;
+    // Brave documents page-style offset semantics and exposes an explicit continuation flag.
+    // Never infer continuation from candidate count or run unbounded offsets.
+    const nextOffset = offset + 1;
+    const maxOffset = Math.max(0, Number(process.env.BRAVE_MAX_OFFSET || 9));
+    const nextPageToken = response.query?.more_results_available === true && nextOffset <= maxOffset ? String(nextOffset) : null;
 
     // SHADOW mode: records observations & stages candidates without returning active channels
     if (ctrl.mode === 'SHADOW') {
@@ -522,8 +568,10 @@ export async function executeBraveSearchRetrieval(
       .filter((c) => c.candidateType === 'CHANNEL_ID')
       .map((c) => ({
         channelId: c.normalizedIdentity,
-        title: c.title || c.normalizedIdentity,
+        channelName: c.title || c.normalizedIdentity,
+        youtubeUrl: `https://www.youtube.com/channel/${c.normalizedIdentity}`,
         description: c.snippet || '',
+        videoTitles: [],
         publishedAt: new Date().toISOString(),
         thumbnailUrl: '',
         country: request.country
@@ -532,7 +580,9 @@ export async function executeBraveSearchRetrieval(
     return {
       channels,
       rawResultCount: response.web?.results?.length || 0,
-      nextPageToken
+      nextPageToken,
+      providerCostUsd: cost,
+      providerRequestId: request.queryRunId ? `${request.queryRunId}:${offset}` : undefined
     };
   } catch (err) {
     console.error('[BraveSearch] Retrieval execution error:', err);

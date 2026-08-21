@@ -142,6 +142,7 @@ test('fetchBraveSearchResults handles 429 rate limits fail-closed', async () => 
 
 test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while setting nextPageToken', async () => {
   const mockFetch = async () => new Response(JSON.stringify({
+    query: { more_results_available: true },
     web: {
       total: 100,
       results: [
@@ -156,6 +157,7 @@ test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while se
 
   const mockDbShadow = {
     query: async (sql: string) => {
+      if (sql.includes('INSERT INTO discovery_candidate_staging')) return { rows: [{ id: 'staging-shadow', inserted: true }] };
       if (sql.includes('app_settings')) return { rows: [] };
       if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'SHADOW' }] };
       if (sql.includes('discovery_candidate_staging')) return { rows: [{ backlog_count: 0 }] };
@@ -173,7 +175,7 @@ test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while se
       provider: BRAVE_DIRECT_PROVIDER,
       query: 'trading london',
       country: 'GB',
-      lane: 'KEYWORD_SEARCH',
+      lane: 'CHANNEL',
       cursor: null,
       ordering: 'RELEVANCE'
     }, mockDbShadow);
@@ -181,7 +183,7 @@ test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while se
     // SHADOW mode: candidate staged, but channels array returned empty to Phase 9
     assert.equal(page.channels.length, 0);
     assert.equal(page.rawResultCount, 1);
-    assert.equal(page.nextPageToken, '20'); // nextPageToken non-null because total 100 > 20
+    assert.equal(page.nextPageToken, '1'); // Brave continuation is controlled by more_results_available and bounded offset
   } finally {
     globalThis.fetch = origFetch;
   }
@@ -189,6 +191,7 @@ test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while se
 
 test('executeBraveSearchRetrieval returns channels in ACTIVE mode', async () => {
   const mockFetch = async () => new Response(JSON.stringify({
+    query: { more_results_available: true },
     web: {
       total: 50,
       results: [
@@ -203,6 +206,7 @@ test('executeBraveSearchRetrieval returns channels in ACTIVE mode', async () => 
 
   const mockDbActive = {
     query: async (sql: string) => {
+      if (sql.includes('INSERT INTO discovery_candidate_staging')) return { rows: [{ id: 'staging-active', inserted: true }] };
       if (sql.includes('app_settings')) return { rows: [] };
       if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'ACTIVE' }] };
       if (sql.includes('discovery_candidate_staging')) return { rows: [{ backlog_count: 0 }] };
@@ -220,14 +224,14 @@ test('executeBraveSearchRetrieval returns channels in ACTIVE mode', async () => 
       provider: BRAVE_DIRECT_PROVIDER,
       query: 'trading london',
       country: 'GB',
-      lane: 'KEYWORD_SEARCH',
+      lane: 'CHANNEL',
       cursor: null,
       ordering: 'RELEVANCE'
     }, mockDbActive);
 
     assert.equal(page.channels.length, 1);
     assert.equal(page.channels[0].channelId, 'UC1111111111111111111111');
-    assert.equal(page.nextPageToken, '20');
+    assert.equal(page.nextPageToken, '1');
   } finally {
     globalThis.fetch = origFetch;
   }

@@ -18,11 +18,19 @@ export const YOUTUBE_SEARCH_PROVIDER: ProviderAllocation = Object.freeze({
   continuationOwner: 'PHASE_9'
 });
 
-export interface RetrievalPage { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null }
+export interface RetrievalPage {
+  channels: DiscoveredChannelRaw[];
+  rawResultCount: number;
+  nextPageToken?: string | null;
+  providerCostUsd?: number;
+  providerRequestId?: string;
+}
 export interface RetrievalRequest {
   provider: ProviderAllocation; query: string; country: string; vocabulary?: CountryVocabulary;
   lane: RetrievalLane; cursor: string | null; ordering: SearchOrdering;
-  reserveAdditionalUnits?: (units:number)=>Promise<void>; priority?: 'autonomous'|'manual';
+  queryRunId?: string;
+  reserveAdditionalUnits?: (units:number)=>Promise<void>;
+  priority?: 'autonomous'|'manual';
 }
 
 export type RetrievalExecutor = (request: RetrievalRequest) => Promise<RetrievalPage>;
