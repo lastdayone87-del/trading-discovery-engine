@@ -31,6 +31,21 @@ test('Provider 2 PostgreSQL reservation and settlement are replay-safe and distr
   await settleProviderRequest(admitted.value.requestId, 'FAILED', 0, 'TEST_FAILURE');
 });
 
+test('Provider 2 ACTIVE_GLOBAL mode and kill switch remain governed and reversible', { skip: !enabled }, async () => {
+  const db = await getDb();
+  await db.query("UPDATE discovery_provider_registry SET mode='ACTIVE_GLOBAL', updated_by='test:provider2-active-global' WHERE provider_key='brave-search'");
+  await db.query("UPDATE app_settings SET setting_value='false' WHERE setting_key='brave_kill_switch'");
+  const active = await db.query("SELECT mode FROM discovery_provider_registry WHERE provider_key='brave-search'");
+  assert.equal(active.rows[0].mode, 'ACTIVE_GLOBAL');
+  await db.query("UPDATE app_settings SET setting_value='true' WHERE setting_key='brave_kill_switch'");
+  const kill = await db.query("SELECT setting_value FROM app_settings WHERE setting_key='brave_kill_switch'");
+  assert.equal(kill.rows[0].setting_value, 'true');
+  await db.query("UPDATE app_settings SET setting_value='false' WHERE setting_key='brave_kill_switch'");
+  await db.query("UPDATE discovery_provider_registry SET mode='SHADOW', updated_by='test:provider2-rollback' WHERE provider_key='brave-search'");
+  const restored = await db.query("SELECT mode FROM discovery_provider_registry WHERE provider_key='brave-search'");
+  assert.equal(restored.rows[0].mode, 'SHADOW');
+});
+
 test('Provider 2 PostgreSQL staging converges canonical identity while retaining observations', { skip: !enabled }, async () => {
   const db = await getDb();
   await db.query("DELETE FROM discovery_candidate_observations WHERE opportunity_key LIKE 'provider2-pg-test-%'");

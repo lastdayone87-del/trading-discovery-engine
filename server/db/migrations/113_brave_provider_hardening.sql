@@ -140,7 +140,8 @@ INSERT INTO app_settings(setting_key, setting_value) VALUES
   ('brave_pagination_max_pages', '3'),
   ('brave_cooldown_until', ''),
   ('brave_cycle_key', 'default')
-ON CONFLICT (setting_key) DO NOTHING;
+ON CONFLICT (setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value
+WHERE NULLIF(BTRIM(app_settings.setting_value), '') IS NULL;
 
 UPDATE discovery_provider_registry
 SET cost_unit='USD_PER_REQUEST', pricing_version=COALESCE(NULLIF((SELECT setting_value FROM app_settings WHERE setting_key='brave_pricing_version'), ''), pricing_version)

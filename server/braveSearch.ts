@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { getDb } from './db';
+import { getAppSetting, getDb } from './db';
 import {
   registerRetrievalExecutor,
   providerSnapshot,
@@ -336,8 +336,8 @@ export async function fetchBraveSearchResults(
   parentSignal?: AbortSignal
 ): Promise<{ response: BraveSearchResponse; status: number; cost: number | null }> {
   const req = buildBraveSearchRequest(query, country, language, mode, offset, count);
-  const configuredCostStr = process.env.BRAVE_COST_PER_REQUEST_USD;
-  const costPerReqUsd = configuredCostStr ? Number(configuredCostStr) : null;
+  const configuredCostStr = process.env.BRAVE_COST_PER_REQUEST_USD || (process.env.DATABASE_URL ? await getAppSetting('brave_cost_per_request_usd', '') : '');
+  const costPerReqUsd = configuredCostStr.trim() ? Number(configuredCostStr) : null;
   const controller = new AbortController();
   const timeoutMs = Math.max(1, Number(process.env.BRAVE_TIMEOUT_MS || 10000));
   const deadline = new Promise<never>((_, reject) => setTimeout(() => {
