@@ -1,4 +1,5 @@
 import type { CountryVocabulary, ExtractedTermRecord, QueryIntent, QueryRecord } from '../src/types';
+import type { DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { admitOrganicQueryCandidates, type OrganicQueryCandidate } from './organicQueryExpansion';
 import { assessLanguageCapability, type GlobalLanguageContext } from './globalLanguageModel';
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
@@ -122,6 +123,31 @@ export function rotateAwayFromMostRecentIntent(eligible: QueryRecord[], history:
  * The learned native surface remains a modifier; the existing curated/country
  * vocabulary atom policy supplies the independently authorized retrieval anchor.
  */
+export function planFrontierTargetedQuery(args: {
+  country: string;
+  target: DiscoveryNeighborhoodDimensions;
+}): PlannedQuery | null {
+  const query = args.target.primaryTermFamily.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (!query || !isRetrievalOrientedQuery(args.country, query)) return null;
+  return {
+    query,
+    intent: (args.target.queryIntent || 'strategy') as QueryIntent,
+    primaryTerm: query,
+    knowledgeTiers: [1],
+    generationMode: 'EXPLORATION',
+    generationReason: 'Governed frontier target fallback using an existing canonical neighborhood primary-term family.',
+    discoveryObjective: 'Test the selected frontier neighborhood while discovering relevant trading creators.',
+    metadata: {
+      country: args.country,
+      queryTemplate: 'FRONTIER_TARGETED',
+      retrievalOptimized: true,
+      tokenCount: queryTokenCount(query),
+      scriptValidated: true,
+      targetNeighborhoodDimensions: args.target
+    }
+  };
+}
+
 export function planCountryNativeProposalQuery(args: {
   country: string;
   nativeTerm: string;

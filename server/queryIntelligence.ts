@@ -14,7 +14,7 @@ import {
   getAppSetting
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
-import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
+import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
 import { executeProviderCall } from './providerResilience';
@@ -415,6 +415,24 @@ export async function selectNextQueryForCountry(
         selected = matchingGenerated;
         strategy = 'NEIGHBORHOOD_TARGETED';
         reason = `Generated candidate matching targeted frontier neighborhood key "${targetKey}": ${selected.query}.`;
+      } else {
+        const plannedTarget = planFrontierTargetedQuery({ country, target });
+        if (plannedTarget) {
+          selected = await upsertQueryRecord({
+            query: plannedTarget.query,
+            country,
+            collection: 'EXPERIMENTAL',
+            intent: plannedTarget.intent,
+            knowledgeTiers: plannedTarget.knowledgeTiers,
+            generationMode: plannedTarget.generationMode,
+            generationReason: plannedTarget.generationReason,
+            discoveryObjective: plannedTarget.discoveryObjective,
+            primaryTerm: plannedTarget.primaryTerm,
+            generationMetadata: plannedTarget.metadata
+          });
+          strategy = 'NEIGHBORHOOD_TARGETED';
+          reason = `Constructed governed fallback for targeted frontier neighborhood key "${targetKey}".`;
+        }
       }
     }
   }
