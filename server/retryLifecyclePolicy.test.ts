@@ -10,9 +10,14 @@ test('quota/provider capacity waits without consuming an attempt even without re
   assert.ok((result.runAfter||0)>now);
 });
 
-test('provider cooldown honors retryAt without consuming an attempt',()=>{
+test('provider cooldown honors retryAt while consuming the bounded attempt budget',()=>{
   const retryAt=now+60_000;
   assert.deepEqual(decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt},2,3,now),{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:retryAt});
+  assert.deepEqual(decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt},3,3,now),{disposition:'FAILED'});
+});
+
+test('provider pool exhaustion becomes terminal at max attempts',()=>{
+  assert.equal(decideJobFailure({code:'YOUTUBE_PROVIDER_POOL_EXHAUSTED',retryAt:now+60_000},3,3,now).disposition,'FAILED');
 });
 
 test('common network/provider outages are retryable infrastructure failures',()=>{
