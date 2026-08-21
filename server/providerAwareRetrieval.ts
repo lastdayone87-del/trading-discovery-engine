@@ -43,10 +43,10 @@ export function registerRetrievalExecutor(
   ) {
     throw new Error('INVALID_PROVIDER_REGISTRATION');
   }
-  registeredExecutors.set(provider.providerKey, {
-    provider: Object.freeze({ ...provider }),
-    executor
-  });
+  const fullKey = `${provider.providerKey}:${provider.retrievalSurface}`;
+  const entry = { provider: Object.freeze({ ...provider }), executor };
+  registeredExecutors.set(fullKey, entry);
+  registeredExecutors.set(provider.providerKey, entry);
 }
 
 export function clearRegisteredExecutorsForTest(): void {
@@ -85,7 +85,7 @@ export function providerSnapshot(value: Partial<ProviderAllocation> | null | und
     continuationOwner: 'PHASE_9'
   };
 
-  const registered = registeredExecutors.get(key);
+  const registered = registeredExecutors.get(`${key}:${value.retrievalSurface}`) || registeredExecutors.get(key);
   if (registered) {
     if (
       snapshot.retrievalSurface !== registered.provider.retrievalSurface ||
@@ -103,7 +103,7 @@ export function providerSnapshot(value: Partial<ProviderAllocation> | null | und
 /** Phase 9's sole provider dispatch boundary. Unknown or mismatched allocations fail closed. */
 export async function executeAllocatedRetrievalPage(request: RetrievalRequest): Promise<RetrievalPage> {
   const p = providerSnapshot(request.provider);
-  const entry = registeredExecutors.get(p.providerKey);
+  const entry = registeredExecutors.get(`${p.providerKey}:${p.retrievalSurface}`) || registeredExecutors.get(p.providerKey);
   if (!entry) {
     throw new Error('UNREGISTERED_OR_MISMATCHED_RETRIEVAL_PROVIDER');
   }
