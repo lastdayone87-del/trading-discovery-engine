@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {providerSnapshot,YOUTUBE_SEARCH_PROVIDER,executeAllocatedRetrievalPage} from './providerAwareRetrieval';
+import {providerSnapshot,YOUTUBE_SEARCH_PROVIDER,executeAllocatedRetrievalPage,assertSameProviderAllocation} from './providerAwareRetrieval';
 
 test('current production provider contract preserves official YouTube semantics',()=>{
  assert.deepEqual(YOUTUBE_SEARCH_PROVIDER,{providerKey:'youtube-search',retrievalSurface:'YOUTUBE_NATIVE',capability:'SEARCH_YOUTUBE',costDomain:'YOUTUBE_DATA_API',continuationOwner:'PHASE_9'});
@@ -13,10 +13,18 @@ test('unknown provider and mid-run lineage changes fail closed before execution'
  await assert.rejects(executeAllocatedRetrievalPage({provider:{...YOUTUBE_SEARCH_PROVIDER,capability:'OTHER'} as any,query:'x',country:'US',lane:'VIDEO',cursor:null,ordering:'RELEVANCE'}),/UNREGISTERED_OR_MISMATCHED/);
 });
 
+test('JSONB key reordering does not reject identical durable lineage',()=>{
+ const reordered={continuationOwner:'PHASE_9',costDomain:'YOUTUBE_DATA_API',capability:'SEARCH_YOUTUBE',retrievalSurface:'YOUTUBE_NATIVE',providerKey:'youtube-search'};
+ assert.deepEqual(assertSameProviderAllocation(reordered,YOUTUBE_SEARCH_PROVIDER),YOUTUBE_SEARCH_PROVIDER);
+ assert.throws(()=>assertSameProviderAllocation({...reordered,costDomain:'OTHER'},YOUTUBE_SEARCH_PROVIDER),/INVALID_PROVIDER_ALLOCATION_SNAPSHOT/);
+});
+
 test('migration is additive, backfills official-only history and protects lineage',()=>{
  const sql=readFileSync(new URL('./db/migrations/111_provider_aware_phase8_phase9.sql',import.meta.url),'utf8');
  for(const field of ['provider_key','retrieval_surface','provider_capability','cost_domain','provider_reservation_id','provider_eligibility_snapshot','continuation_owner'])assert.match(sql,new RegExp(field));
  assert.match(sql,/WHERE provider_key IS NULL/);assert.match(sql,/IMMUTABLE_PROVIDER_ALLOCATION_LINEAGE/);
+ assert.doesNotMatch(sql,/UPDATE query_runs SET provider_key/,'completed historic query runs must be backfilled by additive defaults without firing their immutability trigger');
+ assert.match(sql,/IMMUTABLE_QUERY_RUN_PROVIDER_LINEAGE/);
  assert.doesNotMatch(sql,/DROP TABLE|DROP COLUMN|TRUNCATE/i);
 });
 

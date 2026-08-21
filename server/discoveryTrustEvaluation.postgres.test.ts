@@ -17,7 +17,8 @@ test('Phase 12 PostgreSQL: persisted lineage, late outcomes, concurrency, window
     const captures=await Promise.all(Array.from({length:8},()=>captureCompletedRunObservation(runId!)));assert.equal(captures.filter(Boolean).length,1); assert.equal(await captureCompletedRunObservation(runId),false);
     let observation=(await db.query('SELECT * FROM discovery_evaluation_run_observations WHERE query_run_id=$1',[runId])).rows[0];
     assert.equal(observation.proposal_family,'EXTERNAL_OSINT'); assert.deepEqual(observation.source_families,['PUBLICATION']); assert.equal(observation.provider_requests,2);
-    assert.deepEqual(observation.allocation_snapshot,allocation);
+    assert.deepEqual(observation.allocation_snapshot.proposalEvidence,allocation);
+    assert.equal(observation.allocation_snapshot.provider.providerKey,'youtube-search');assert.equal(observation.allocation_snapshot.provider.retrievalSurface,'YOUTUBE_NATIVE');
 
     // A current classification arriving later creates a new immutable revision;
     // it never mutates the frozen allocation-time evidence.
@@ -25,7 +26,7 @@ test('Phase 12 PostgreSQL: persisted lineage, late outcomes, concurrency, window
     await db.query(`INSERT INTO channel_sightings(query_run_id,query_id,channel_id,result_rank,was_known,persisted,country_outcome,trading_outcome,funnel_outcome,page_number) VALUES($1,$2,$3,1,false,true,'ACCEPTED','TRADING_CONFIRMED','TRADING_CONFIRMED',2)`,[runId,queryId,channelId]);
     assert.equal(await captureCompletedRunObservation(runId),true);
     const revisions=await db.query('SELECT observation_revision,quality_new_creators,confirmed_new_creators,allocation_snapshot FROM discovery_evaluation_run_observations WHERE query_run_id=$1 ORDER BY observation_revision',[runId]);
-    assert.equal(revisions.rowCount,2); assert.deepEqual(revisions.rows.map(x=>x.quality_new_creators),[0,1]); revisions.rows.forEach(x=>assert.deepEqual(x.allocation_snapshot,allocation));
+    assert.equal(revisions.rowCount,2); assert.deepEqual(revisions.rows.map(x=>x.quality_new_creators),[0,1]); revisions.rows.forEach(x=>assert.deepEqual(x.allocation_snapshot.proposalEvidence,allocation));
     await assert.rejects(db.query('UPDATE discovery_evaluation_run_observations SET quota_consumed=0 WHERE query_run_id=$1',[runId]),/immutable/);
 
     const concurrent=await Promise.all(Array.from({length:8},()=>materializeEvaluationWindow({windowStart:start,windowEnd:end,dimension:'concept',value:suffix})));

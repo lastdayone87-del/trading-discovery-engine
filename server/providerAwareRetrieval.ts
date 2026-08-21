@@ -29,7 +29,17 @@ export async function executeAllocatedRetrievalPage(request: RetrievalRequest):P
 
 export function providerSnapshot(value:Partial<ProviderAllocation>|null|undefined):ProviderAllocation {
   if (!value) return YOUTUBE_SEARCH_PROVIDER;
-  const snapshot={...value} as ProviderAllocation;
-  if (JSON.stringify(snapshot)!==JSON.stringify(YOUTUBE_SEARCH_PROVIDER)) throw new Error('INVALID_PROVIDER_ALLOCATION_SNAPSHOT');
+  const snapshot={providerKey:value.providerKey,retrievalSurface:value.retrievalSurface,capability:value.capability,costDomain:value.costDomain,continuationOwner:value.continuationOwner} as ProviderAllocation;
+  if (snapshot.providerKey!==YOUTUBE_SEARCH_PROVIDER.providerKey || snapshot.retrievalSurface!==YOUTUBE_SEARCH_PROVIDER.retrievalSurface ||
+      snapshot.capability!==YOUTUBE_SEARCH_PROVIDER.capability || snapshot.costDomain!==YOUTUBE_SEARCH_PROVIDER.costDomain ||
+      snapshot.continuationOwner!==YOUTUBE_SEARCH_PROVIDER.continuationOwner) throw new Error('INVALID_PROVIDER_ALLOCATION_SNAPSHOT');
   return Object.freeze(snapshot);
+}
+
+export function assertSameProviderAllocation(durable:unknown,payload:unknown):ProviderAllocation {
+  const durableSnapshot=providerSnapshot(durable as Partial<ProviderAllocation>);
+  const payloadSnapshot=providerSnapshot(payload as Partial<ProviderAllocation>);
+  for(const key of Object.keys(YOUTUBE_SEARCH_PROVIDER) as Array<keyof ProviderAllocation>)
+    if(durableSnapshot[key]!==payloadSnapshot[key])throw new Error('PHASE9_PROVIDER_LINEAGE_MISMATCH');
+  return durableSnapshot;
 }
