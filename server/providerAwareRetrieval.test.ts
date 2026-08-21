@@ -177,4 +177,6 @@ test('Phase 8 registry validation and Phase 9 governed dispatch are wired', () =
   assert.match(allocator, /providerEligibilitySnapshot/);
   assert.match(queue, /executeAllocatedRetrievalPage/);
   assert.match(queue, /PHASE9_PROVIDER_LINEAGE_MISMATCH/);
+  const db = readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  assert.match(db, /mode IN \('ACTIVE','ACTIVE_GLOBAL','CANARY'\)/);
 });

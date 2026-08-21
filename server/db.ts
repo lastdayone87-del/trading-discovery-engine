@@ -645,7 +645,7 @@ export async function scheduleAutonomousQueryRuns(
         if(!lineage.rowCount)throw new Error('PROVIDER_ALLOCATION_LINEAGE_MISSING');
         allocatedProvider=providerSnapshot({providerKey:lineage.rows[0].provider_key,retrievalSurface:lineage.rows[0].retrieval_surface,capability:lineage.rows[0].provider_capability,costDomain:lineage.rows[0].cost_domain,continuationOwner:lineage.rows[0].continuation_owner});
       }
-      const eligibleProvider=await client.query(`SELECT 1 FROM discovery_provider_registry WHERE provider_key=$1 AND mode IN ('ACTIVE','CANARY') AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,[allocatedProvider.providerKey,allocatedProvider.costDomain,allocatedProvider.capability]);
+      const eligibleProvider=await client.query(`SELECT 1 FROM discovery_provider_registry WHERE provider_key=$1 AND mode IN ('ACTIVE','ACTIVE_GLOBAL','CANARY') AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,[allocatedProvider.providerKey,allocatedProvider.costDomain,allocatedProvider.capability]);
       if(!eligibleProvider.rowCount)throw new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE');
       const nativeLineage = (candidate.query.generation_metadata?.countryNativeAllocation || {}) as Record<string, unknown>;
       const allocatedDimensions = candidate.allocationOrigin === 'FRONTIER_CANARY' && nativeLineage.targetNeighborhoodKey
