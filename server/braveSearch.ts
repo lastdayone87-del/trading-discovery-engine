@@ -13,7 +13,7 @@ export const BRAVE_SEARCH_PROVIDER_KEY = 'brave-search';
 
 export const BRAVE_DIRECT_PROVIDER: ProviderAllocation = Object.freeze({
   providerKey: BRAVE_SEARCH_PROVIDER_KEY,
-  retrievalSurface: 'BRAVE_YOUTUBE_DIRECT',
+  retrievalSurface: 'BRAVE_NATIVE',
   capability: 'SEARCH_BRAVE_DIRECT',
   costDomain: 'BRAVE_SEARCH_API',
   continuationOwner: 'PHASE_9'
