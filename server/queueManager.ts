@@ -370,6 +370,7 @@ export async function processNextSearchJob(
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
     let providerQuotaUnits = 0;
     let providerCostUsd = 0;
+    let providerPricingVersion = 'UNVERSIONED';
     let providerRequestsAttempted = 0;
     let providerRequestsSucceeded = 0;
     let providerRequestsFailed = 0;
@@ -386,7 +387,8 @@ export async function processNextSearchJob(
       let providerRequestId: string | null = null;
       if(braveProvider){
         providerRequestId=`${autonomousOperationId}:provider-request`;
-        await reserveProviderRequest({provider:allocatedProvider,requestId:providerRequestId,queryRunId});
+        const reservation = await reserveProviderRequest({provider:allocatedProvider,requestId:providerRequestId,queryRunId});
+        providerPricingVersion = reservation.pricingVersion;
         providerRequestsAttempted=1;
       } else {
         providerQuotaUnits=100;
@@ -403,9 +405,9 @@ export async function processNextSearchJob(
           if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
         },priority:'autonomous'});
         if(braveProvider){
-          providerRequestsSucceeded=1; providerPagesRetrieved=1; providerCostUsd=Number(searchPage.providerCostUsd||0);
+          providerRequestsSucceeded=1; providerPagesRetrieved=1; providerCostUsd=Number(searchPage.providerCostUsd ?? 0);
           await settleProviderRequest(providerRequestId!, 'SUCCEEDED', providerCostUsd);
-          await (await getDb()).query(`UPDATE query_runs SET provider_cost_usd=provider_cost_usd+$2,provider_requests_attempted=provider_requests_attempted+1,provider_requests_succeeded=provider_requests_succeeded+1,provider_pages_retrieved=provider_pages_retrieved+1 WHERE id=$1`,[queryRunId,providerCostUsd]);
+          await (await getDb()).query(`UPDATE query_runs SET provider_cost_usd=provider_cost_usd+$2,provider_pricing_version=$3,provider_requests_attempted=provider_requests_attempted+1,provider_requests_succeeded=provider_requests_succeeded+1,provider_pages_retrieved=provider_pages_retrieved+1 WHERE id=$1`,[queryRunId,providerCostUsd,providerPricingVersion]);
         } else await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
       } catch (error:any) {
         if(braveProvider){

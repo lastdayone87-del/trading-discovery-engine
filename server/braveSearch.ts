@@ -583,7 +583,9 @@ export async function executeBraveSearchRetrieval(
       return {
         channels: [],
         rawResultCount: response.web?.results?.length || 0,
-        nextPageToken
+        nextPageToken,
+        providerCostUsd: cost,
+        providerRequestId: request.queryRunId ? `${request.queryRunId}:${offset}` : undefined
       };
     }
 

@@ -180,8 +180,10 @@ test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while se
   };
 
   const origFetch = globalThis.fetch;
+  const origCost = process.env.BRAVE_COST_PER_REQUEST_USD;
   globalThis.fetch = mockFetch as any;
   process.env.BRAVE_SEARCH_API_KEY = 'test-key';
+  process.env.BRAVE_COST_PER_REQUEST_USD = '0.005';
 
   try {
     const page = await executeBraveSearchRetrieval({
@@ -190,15 +192,20 @@ test('executeBraveSearchRetrieval returns empty channels in SHADOW mode while se
       country: 'GB',
       lane: 'CHANNEL',
       cursor: null,
-      ordering: 'RELEVANCE'
+      ordering: 'RELEVANCE',
+      queryRunId: 'shadow-canary-test-run'
     }, mockDbShadow);
 
     // SHADOW mode: candidate staged, but channels array returned empty to Phase 9
     assert.equal(page.channels.length, 0);
     assert.equal(page.rawResultCount, 1);
     assert.equal(page.nextPageToken, '1'); // Brave continuation is controlled by more_results_available and bounded offset
+    assert.equal(page.providerCostUsd, 0.005);
+    assert.equal(page.providerRequestId, 'shadow-canary-test-run:0');
   } finally {
     globalThis.fetch = origFetch;
+    if (origCost === undefined) delete process.env.BRAVE_COST_PER_REQUEST_USD;
+    else process.env.BRAVE_COST_PER_REQUEST_USD = origCost;
   }
 });
 
