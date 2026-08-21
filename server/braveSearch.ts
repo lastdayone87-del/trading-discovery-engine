@@ -281,6 +281,28 @@ export function mapCountryToBraveParam(country: string): string {
 }
 
 /**
+ * Converts repository vocabulary labels into Brave's supported search_lang codes.
+ * Unknown values fail closed to English rather than sending an invalid full name.
+ */
+export function mapLanguageToBraveParam(language: string | null | undefined): string {
+  const normalized = (language || '').toLowerCase().trim();
+  if (/^[a-z]{2}(?:-[a-z]{2,4})?$/.test(normalized)) return normalized.split('-')[0];
+  const languageCodes: Record<string, string> = {
+    arabic: 'ar', basque: 'eu', bengali: 'bn', bulgarian: 'bg', catalan: 'ca',
+    chinese: 'zh-hans', croatian: 'hr', czech: 'cs', danish: 'da', dutch: 'nl',
+    estonian: 'et', finnish: 'fi', french: 'fr', galician: 'gl', german: 'de',
+    greek: 'el', gujarati: 'gu', hebrew: 'he', hindi: 'hi', hungarian: 'hu',
+    icelandic: 'is', indonesian: 'id', italian: 'it', japanese: 'ja', kannada: 'kn',
+    korean: 'ko', latvian: 'lv', lithuanian: 'lt', malay: 'ms', malayalam: 'ml',
+    marathi: 'mr', norwegian: 'nb', polish: 'pl', portuguese: 'pt', punjabi: 'pa',
+    romanian: 'ro', russian: 'ru', serbian: 'sr', slovak: 'sk', slovenian: 'sl',
+    spanish: 'es', swahili: 'sw', swedish: 'sv', tamil: 'ta', telugu: 'te',
+    thai: 'th', turkish: 'tr', ukrainian: 'uk', vietnamese: 'vi', english: 'en'
+  };
+  return languageCodes[normalized] || 'en';
+}
+
+/**
  * Constructs a Brave API search request URL and headers, deriving search language dynamically from lineage context.
  */
 export function buildBraveSearchRequest(
@@ -303,7 +325,7 @@ export function buildBraveSearchRequest(
   }
 
   const braveCountry = mapCountryToBraveParam(country);
-  const searchLang = (language || 'en').toLowerCase().trim();
+  const searchLang = mapLanguageToBraveParam(language);
   const searchUrl = new URL('https://api.search.brave.com/res/v1/web/search');
   searchUrl.searchParams.set('q', finalQuery);
   searchUrl.searchParams.set('country', braveCountry);
@@ -317,6 +339,7 @@ export function buildBraveSearchRequest(
     headers: {
       'Accept': 'application/json',
       'Accept-Encoding': 'gzip',
+      'Cache-Control': 'no-cache',
       'X-Subscription-Token': apiKey
     }
   };
