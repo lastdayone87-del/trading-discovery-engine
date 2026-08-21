@@ -18,7 +18,9 @@ import { createNeighborhoodKey } from './discoveryNeighborhood';
 test('frontier candidate loading uses the migrated metadata dimensions column', () => {
   const source = readFileSync(new URL('./discoveryFrontierAllocator.ts', import.meta.url), 'utf8');
   assert.match(source, /n\.metadata AS dimensions/);
+  assert.match(source, /ORDER BY n\.last_observed_at DESC/);
   assert.doesNotMatch(source, /SELECT[\\s\\S]*n\.dimensions,/);
+  assert.doesNotMatch(source, /ORDER BY n\.updated_at DESC/);
 });
 
 test('evaluateNeighborhoodEligibility rejects HARMFUL and SATURATED candidates', () => {
