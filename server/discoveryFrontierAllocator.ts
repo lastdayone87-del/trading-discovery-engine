@@ -250,7 +250,7 @@ export async function getNeighborhoodCandidates(
     SELECT
       n.neighborhood_key,
       n.country,
-      n.dimensions,
+      n.metadata AS dimensions,
       COALESCE(fs.state, 'UNEXPLORED') AS frontier_state,
       COALESCE(mv.expected_marginal_value, 0)::float AS expected_marginal_value,
       COALESCE((fs.evidence->>'uncertainty')::float, CASE WHEN fs.state = 'UNEXPLORED' THEN 1.0 ELSE 0.5 END) AS uncertainty,
