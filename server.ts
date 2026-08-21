@@ -639,15 +639,15 @@ async function startServer() {
   // 19. Run Autonomous Discovery Cycle On-Demand
   app.post('/api/query-intelligence/run-cycle', async (req, res) => {
     try {
-      const { country, providerKey, capability } = req.body || {};
-      const providerTargetRequested = providerKey !== undefined || capability !== undefined;
+      const { country, providerKey, capability, maxRuns } = req.body || {};
+      const providerTargetRequested = providerKey !== undefined || capability !== undefined || maxRuns !== undefined;
       if (providerTargetRequested) {
         if (req.operator?.role !== 'admin') return res.status(403).json({ error: 'Administrator role required for provider-targeted canary cycles.', code: 'FORBIDDEN' });
-        if (providerKey !== 'brave-search' || capability !== 'SEARCH_BRAVE_DIRECT') {
-          return res.status(400).json({ error: 'Only the governed Brave direct-search canary target is supported.', code: 'UNSUPPORTED_PROVIDER_TARGET' });
+        if (providerKey !== 'brave-search' || capability !== 'SEARCH_BRAVE_DIRECT' || Number(maxRuns) !== 1) {
+          return res.status(400).json({ error: 'Only one governed Brave direct-search canary run is supported.', code: 'UNSUPPORTED_PROVIDER_TARGET' });
         }
       }
-      const result = await runAutonomousDiscoveryCycle(country, providerTargetRequested ? { targetProviderKey: providerKey, requiredCapability: capability } : undefined);
+      const result = await runAutonomousDiscoveryCycle(country, providerTargetRequested ? { targetProviderKey: providerKey, requiredCapability: capability, maxRuns: 1 } : undefined);
       res.json(result);
     } catch (err: any) {
       sendOperationError(res, err);

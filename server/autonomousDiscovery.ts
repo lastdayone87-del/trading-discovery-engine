@@ -129,7 +129,7 @@ export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCount
  * Produces a quota-paced batch of durable work. It deliberately performs no
  * YouTube or channel processing; workers are the only autonomous executors.
  */
-export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
+export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; maxRuns?: number }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
   if (targetCountry) await assertCountryAllowed(targetCountry, 'autonomous_cycle');
   if (isCycleRunning) throw new Error('An autonomous discovery producer cycle is already in progress.');
 
@@ -165,7 +165,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     if (snapshot.awakenedQuotaDeferredJobs > 0) {
       log(`Pacific quota-day rollover reactivated ${snapshot.awakenedQuotaDeferredJobs} quota-deferred job(s).`);
     }
-    const capacity = calculateDiscoveryCapacity({
+    const calculatedCapacity = calculateDiscoveryCapacity({
       batchSize: config.batchSize,
       targetQueueDepth: config.targetQueueDepth,
       currentQueueDepth: snapshot.queueDepth,
@@ -175,6 +175,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       unitsReserved: snapshot.autonomousUnitsReserved,
       minutesSinceUtcMidnight: snapshot.minutesSinceQuotaDayStart
     });
+    const capacity = providerTarget?.maxRuns ? Math.min(calculatedCapacity, Math.max(1, Math.floor(providerTarget.maxRuns))) : calculatedCapacity;
 
     if (capacity === 0) {
       lastReport = {
