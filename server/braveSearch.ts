@@ -109,8 +109,7 @@ export async function checkBraveControlPlane(clientOverride?: any): Promise<Brav
 
   const db = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!db) {
-    // Return allowed: true in offline unit test environment when process.env.DATABASE_URL is not set
-    return { allowed: true, killSwitchActive: false, mode: 'SHADOW', dailyCapReached: false, backlogThresholdExceeded: false };
+    return { allowed: false, reason: 'CONTROL_PLANE_UNAVAILABLE_FAIL_CLOSED', killSwitchActive: false, mode: 'OFF', dailyCapReached: false, backlogThresholdExceeded: false };
   }
 
   try {
@@ -451,9 +450,10 @@ export async function stageDiscoveredCandidates(
  * Adapter executor function registered with registerRetrievalExecutor.
  */
 export async function executeBraveSearchRetrieval(
-  request: RetrievalRequest
+  request: RetrievalRequest,
+  clientOverride?: any
 ): Promise<RetrievalPage> {
-  const ctrl = await checkBraveControlPlane();
+  const ctrl = await checkBraveControlPlane(clientOverride);
   if (!ctrl.allowed) {
     throw new Error(`BRAVE_PROVIDER_DISABLED: ${ctrl.reason}`);
   }
@@ -482,7 +482,8 @@ export async function executeBraveSearchRetrieval(
       providerCapability: request.provider.capability,
       country: request.country,
       language: request.vocabulary?.language,
-      neighborhoodKey: null
+      neighborhoodKey: null,
+      client: clientOverride
     });
 
     const channels: DiscoveredChannelRaw[] = candidates

@@ -87,6 +87,12 @@ test('extractCandidatesFromBraveResponse extracts valid candidates and filters d
   assert.equal(osintCandidates[2].candidateType, 'EXTERNAL_EVIDENCE');
 });
 
+test('checkBraveControlPlane strictly fails closed when DB is unavailable', async () => {
+  const status = await checkBraveControlPlane(null);
+  assert.equal(status.allowed, false);
+  assert.equal(status.reason, 'CONTROL_PLANE_UNAVAILABLE_FAIL_CLOSED');
+});
+
 test('checkBraveControlPlane respects emergency kill switch env', async () => {
   const origEnv = process.env.BRAVE_KILL_SWITCH;
   process.env.BRAVE_KILL_SWITCH = 'true';
@@ -112,7 +118,7 @@ test('checkBraveControlPlane enforces staging backlog threshold backpressure', a
   const mockDbWithHighBacklog = {
     query: async (sql: string) => {
       if (sql.includes('app_settings')) return { rows: [{ setting_key: 'brave_staging_backlog_threshold', setting_value: '10' }] };
-      if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'ACTIVE' }] };
+      if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'SHADOW' }] };
       if (sql.includes('discovery_candidate_staging')) return { rows: [{ backlog_count: 50 }] };
       if (sql.includes('query_runs')) return { rows: [{ daily_requests: 0 }] };
       return { rows: [] };
@@ -134,7 +140,7 @@ test('fetchBraveSearchResults handles 429 rate limits fail-closed', async () => 
   );
 });
 
-test('provider-aware retrieval executes registered Brave provider', async () => {
+test('provider-aware retrieval executes registered Brave provider under mock control plane', async () => {
   const mockFetch = async () => new Response(JSON.stringify({
     web: {
       total: 1,
@@ -148,19 +154,29 @@ test('provider-aware retrieval executes registered Brave provider', async () => 
     }
   }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 
+  const mockDbActive = {
+    query: async (sql: string) => {
+      if (sql.includes('app_settings')) return { rows: [] };
+      if (sql.includes('discovery_provider_registry')) return { rows: [{ mode: 'SHADOW' }] };
+      if (sql.includes('discovery_candidate_staging')) return { rows: [{ backlog_count: 0 }] };
+      if (sql.includes('query_runs')) return { rows: [{ daily_requests: 0 }] };
+      return { rows: [] };
+    }
+  };
+
   const origFetch = globalThis.fetch;
   globalThis.fetch = mockFetch as any;
   process.env.BRAVE_SEARCH_API_KEY = 'test-key';
 
   try {
-    const page = await executeAllocatedRetrievalPage({
+    const page = await executeBraveSearchRetrieval({
       provider: BRAVE_DIRECT_PROVIDER,
       query: 'trading london',
       country: 'GB',
       lane: 'KEYWORD_SEARCH',
       cursor: null,
       ordering: 'RELEVANCE'
-    });
+    }, mockDbActive);
 
     assert.equal(page.channels.length, 1);
     assert.equal(page.channels[0].channelId, 'UC1111111111111111111111');
