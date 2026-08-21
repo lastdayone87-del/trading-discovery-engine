@@ -293,16 +293,22 @@ export function resolveChannelListingServingScope(defaultServing:{predicate:stri
   if(includeRejected)return {predicate:'TRUE',scope:'ALL_CHANNELS'};
   return defaultServing;
 }
-async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelListingFilter):Promise<{where:string;values:string[];scope:string}> {
-  // The Channels Table is the operational system of record. Release serving
-  // policy remains available to its own consumers, but can never narrow this
-  // master listing. Diagnostics is an explicit excluded-only convenience view.
-  const clauses=[args.diagnosticsOnly?`NOT (${(await dashboardServingPredicate(db)).predicate})`:'TRUE']; const values:string[]=[];
+export function buildChannelListingWhere(defaultServing:{predicate:string;scope:string},args:ChannelListingFilter):{where:string;values:string[];scope:string} {
+  // The Channels Table remains the operational system of record. Low-audience
+  // rows are retained for auditability, but are not part of the normal view.
+  // An explicit scan-status selection (or the explicit diagnostics corpus)
+  // opts into those stored rows without changing their status or qualification.
+  const clauses=[args.diagnosticsOnly?`NOT (${defaultServing.predicate})`:'TRUE']; const values:string[]=[];
+  const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
+  if(!args.includeRejected&&!args.diagnosticsOnly&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE'`);
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
   add('discord_status',args.discordStatus); add('scan_status',args.scanStatus);
   return {where:clauses.join(' AND '),values,scope:args.diagnosticsOnly?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'};
+}
+async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelListingFilter):Promise<{where:string;values:string[];scope:string}> {
+  return buildChannelListingWhere(await dashboardServingPredicate(db),args);
 }
 
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {

@@ -8,10 +8,11 @@ const queue=readFileSync('server/queueManager.ts','utf8');
 const migration=readFileSync('server/db/migrations/110_discord_candidates.sql','utf8');
 const ui=readFileSync('src/components/ResultsTable.tsx','utf8');
 
-test('master listing starts from TRUE and explicit filters are the only normal restrictions',()=>{
+test('master listing retains rows but excludes low-audience skips unless explicitly selected',()=>{
   assert.match(db,/const clauses=\[args\.diagnosticsOnly\?[\s\S]+:'TRUE'\]/);
   assert.match(db,/scope:args\.diagnosticsOnly\?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'/);
-  assert.doesNotMatch(db,/explicitlyViewingLowAudience/);
+  assert.match(db,/const explicitlyViewingLowAudience=args\.scanStatus==='SKIPPED_LOW_AUDIENCE'/);
+  assert.match(db,/!explicitlyViewingLowAudience\)clauses\.push\(`scan_status <> 'SKIPPED_LOW_AUDIENCE'`\)/);
 });
 
 test('Stored Channels is an unqualified persisted row count',()=>{
