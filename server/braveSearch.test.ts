@@ -4,6 +4,7 @@ import {
   normalizeYouTubeLocator,
   evaluateBraveCandidateNoise,
   buildBraveSearchRequest,
+  mapLanguageToBraveParam,
   extractCandidatesFromBraveResponse,
   stageDiscoveredCandidates,
   fetchBraveSearchResults,
@@ -43,6 +44,18 @@ test('evaluateBraveCandidateNoise identifies low-quality SEO and spam', () => {
 
   const spamItem = { title: 'Best 10 Brokers with Promo Code', url: 'https://example.com/promo' };
   assert.equal(evaluateBraveCandidateNoise(spamItem).isNoise, true);
+});
+
+test('Brave language labels map to supported search_lang codes and requests include no-cache', () => {
+  assert.equal(mapLanguageToBraveParam('English'), 'en');
+  assert.equal(mapLanguageToBraveParam('English (Australia)'), 'en');
+  assert.equal(mapLanguageToBraveParam('French'), 'fr');
+  assert.equal(mapLanguageToBraveParam('en-AU'), 'en');
+  assert.equal(mapLanguageToBraveParam(undefined), 'en');
+  const req = buildBraveSearchRequest('forex trading', 'Australia', 'English', 'DIRECT_YOUTUBE', 0, 20, 'test-key-123');
+  assert.ok(req.url.includes('country=australia'));
+  assert.ok(req.url.includes('search_lang=en'));
+  assert.equal(req.headers['Cache-Control'], 'no-cache');
 });
 
 test('buildBraveSearchRequest constructs valid endpoint URL, headers, and dynamic search_lang', () => {
