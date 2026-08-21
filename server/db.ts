@@ -24,7 +24,7 @@ import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type Segmen
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, type ProviderAllocation } from './providerAwareRetrieval';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -570,6 +570,7 @@ export interface AutonomousQueryCandidate {
   frontierDecisionId?: string;
   targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
   provider?: ProviderAllocation;
+  allowShadowProvider?: boolean;
 }
 
 export interface AutonomousSchedulingSnapshot {
@@ -645,8 +646,15 @@ export async function scheduleAutonomousQueryRuns(
         if(!lineage.rowCount)throw new Error('PROVIDER_ALLOCATION_LINEAGE_MISSING');
         allocatedProvider=providerSnapshot({providerKey:lineage.rows[0].provider_key,retrievalSurface:lineage.rows[0].retrieval_surface,capability:lineage.rows[0].provider_capability,costDomain:lineage.rows[0].cost_domain,continuationOwner:lineage.rows[0].continuation_owner});
       }
-      const eligibleProvider=await client.query(`SELECT 1 FROM discovery_provider_registry WHERE provider_key=$1 AND mode IN ('ACTIVE','ACTIVE_GLOBAL','CANARY') AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,[allocatedProvider.providerKey,allocatedProvider.costDomain,allocatedProvider.capability]);
+      const allowShadowBraveCanary = candidate.allowShadowProvider === true &&
+        candidate.allocationOrigin === 'FRONTIER_CANARY' &&
+        allocatedProvider.providerKey === 'brave-search' &&
+        allocatedProvider.capability === 'SEARCH_BRAVE_DIRECT';
+      const eligibleProvider=await client.query(`SELECT mode FROM discovery_provider_registry WHERE provider_key=$1 AND (mode IN ('ACTIVE','ACTIVE_GLOBAL','CANARY') OR (mode='SHADOW' AND $4::boolean AND provider_key='brave-search' AND capabilities ? 'SEARCH_BRAVE_DIRECT')) AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,[allocatedProvider.providerKey,allocatedProvider.costDomain,allocatedProvider.capability,allowShadowBraveCanary]);
       if(!eligibleProvider.rowCount)throw new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE');
+      if(!isShadowBraveCanaryAllowed({mode: eligibleProvider.rows[0].mode, providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, allowShadowProvider: candidate.allowShadowProvider})) {
+        if (eligibleProvider.rows[0].mode === 'SHADOW') throw new Error('SHADOW_PROVIDER_REQUIRES_EXPLICIT_BRAVE_CANARY');
+      }
       const nativeLineage = (candidate.query.generation_metadata?.countryNativeAllocation || {}) as Record<string, unknown>;
       const allocatedDimensions = candidate.allocationOrigin === 'FRONTIER_CANARY' && nativeLineage.targetNeighborhoodKey
         ? candidate.targetNeighborhoodDimensions

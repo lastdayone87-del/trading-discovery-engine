@@ -18,6 +18,22 @@ export const YOUTUBE_SEARCH_PROVIDER: ProviderAllocation = Object.freeze({
   continuationOwner: 'PHASE_9'
 });
 
+/**
+ * SHADOW is never eligible for ordinary allocation. The only exception is the
+ * explicitly admin-gated, exactly-one-run Brave direct-search canary path.
+ */
+export function isShadowBraveCanaryAllowed(input: {
+  mode: string;
+  providerKey: string;
+  capability: string;
+  allowShadowProvider?: boolean;
+}): boolean {
+  return input.mode === 'SHADOW' &&
+    input.allowShadowProvider === true &&
+    input.providerKey === 'brave-search' &&
+    input.capability === 'SEARCH_BRAVE_DIRECT';
+}
+
 export interface RetrievalPage {
   channels: DiscoveredChannelRaw[];
   rawResultCount: number;

@@ -129,7 +129,7 @@ export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCount
  * Produces a quota-paced batch of durable work. It deliberately performs no
  * YouTube or channel processing; workers are the only autonomous executors.
  */
-export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; maxRuns?: number }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
+export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; maxRuns?: number; allowShadowProvider?: boolean }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
   if (targetCountry) await assertCountryAllowed(targetCountry, 'autonomous_cycle');
   if (isCycleRunning) throw new Error('An autonomous discovery producer cycle is already in progress.');
 
@@ -242,7 +242,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             estimatedQuotaUnits: 100,
             availableAutonomousCapacity: capacity - scheduled.length,
             targetProviderKey: providerTarget?.targetProviderKey,
-            requiredCapability: providerTarget?.requiredCapability
+            requiredCapability: providerTarget?.requiredCapability,
+            allowShadowProvider: providerTarget?.allowShadowProvider
           });
         creatorAllocation = authority.assignment;
         country = authority.country;
@@ -343,6 +344,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         allocationOrigin: frontierAllocationInfo?.authorized ? 'FRONTIER_CANARY' : 'LEGACY',
         frontierDecisionId: frontierAllocationInfo?.authorized ? frontierAllocationInfo.decision?.decisionId : undefined,
         targetNeighborhoodDimensions: frontierAllocationInfo?.authorized ? frontierAllocationInfo.targetNeighborhoodDimensions : undefined,
+        allowShadowProvider: providerTarget?.allowShadowProvider,
         allocationProvenance: creatorAllocation ? {
           assignmentId: creatorAllocation.assignmentId,
           assignmentKey: creatorAllocation.assignmentKey,
