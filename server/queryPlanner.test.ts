@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { ExtractedTermRecord, QueryRecord } from '../src/types';
 import { isCountryScriptCompatible, isRetrievalOrientedQuery, limitRepeatedPrimaryTerms, normalizeQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, queryTokenCount, rotateAwayFromMostRecentIntent } from './queryPlanner';
 import { ORGANIC_QUERY_POLICY_VERSION } from './organicQueryExpansion';
+import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 
 function query(overrides: Partial<QueryRecord>): QueryRecord {
   return {
@@ -36,8 +37,12 @@ test('frontier targeted fallback preserves a valid canonical term and rejects un
       retrievalLane: 'VIDEO', searchOrdering: 'RELEVANCE', instrumentOrTheme: null, sourceFamily: 'automated_query'
     }
   });
-  assert.equal(planned?.query, 'ASX analysis');
-  assert.equal(planned?.metadata.queryTemplate, 'FRONTIER_TARGETED');
+  assert.equal(planned?.query, 'trading ASX analysis');
+  assert.equal(planned?.metadata.queryTemplate, 'ANCHOR_LEARNED');
+  assert.equal((planned?.metadata as any).retrievalSpecificity?.eligibility, 'STANDALONE');
+  assert.equal((planned?.metadata as any).atoms?.length, 2);
+  assert.equal((planned?.metadata as any).atoms?.[0]?.role, 'ANCHOR');
+  assert.equal((planned?.metadata as any).atoms?.[1]?.role, 'MODIFIER');
   assert.equal(planFrontierTargetedQuery({
     country: 'Australia',
     target: {
@@ -45,6 +50,25 @@ test('frontier targeted fallback preserves a valid canonical term and rejects un
       retrievalLane: 'VIDEO', searchOrdering: 'RELEVANCE', instrumentOrTheme: null, sourceFamily: 'automated_query'
     }
   }), null);
+});
+
+test('frontier targeted fallback carries current execution-time authority provenance', () => {
+  const planned = planFrontierTargetedQuery({
+    country: 'Australia',
+    target: {
+      country: 'Australia', language: null, queryIntent: 'market_analysis', primaryTermFamily: 'ASX analysis',
+      retrievalLane: 'VIDEO', searchOrdering: 'RELEVANCE', instrumentOrTheme: null, sourceFamily: 'automated_query'
+    }
+  });
+  assert.ok(planned);
+  const decision = evaluateAutonomousQueryAuthority(query({
+    country: 'Australia',
+    query: planned.query,
+    generation_mode: planned.generationMode,
+    generation_metadata: planned.metadata
+  }));
+  assert.equal(decision.eligible, true);
+  assert.ok(decision.reasonCodes.includes('EXECUTION_TIME_REVALIDATION_PASSED'));
 });
 
 test('hard cooldown removes identical historical queries from eligibility', () => {
