@@ -697,7 +697,9 @@ export async function evaluateFrontierCanaryAllocation(input: {
 
     // Fetch Candidates & Score
     const candidates = await getNeighborhoodCandidates(
-      input.allowedCountries?.length === 1 ? input.allowedCountries[0] : undefined,
+      input.targetProviderKey && input.legacyCountry
+        ? input.legacyCountry
+        : input.allowedCountries?.length === 1 ? input.allowedCountries[0] : undefined,
       now,
       runner
     );

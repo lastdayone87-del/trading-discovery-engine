@@ -23,6 +23,12 @@ test('frontier candidate loading uses the migrated metadata dimensions column', 
   assert.doesNotMatch(source, /ORDER BY n\.updated_at DESC/);
 });
 
+test('provider-targeted frontier allocation scopes candidate loading to the requested country', () => {
+  const source = readFileSync(new URL('./discoveryFrontierAllocator.ts', import.meta.url), 'utf8');
+  assert.match(source, /input\.targetProviderKey && input\.legacyCountry\s*\n\s*\? input\.legacyCountry/);
+  assert.match(source, /input\.allowedCountries\?\.length === 1 \? input\.allowedCountries\[0\] : undefined/);
+});
+
 test('frontier candidates reconstruct canonical dimensions when metadata is empty', async () => {
   const mockClient = {
     query: async (sql: string) => sql.includes('discovery_neighborhoods') ? { rows: [{
