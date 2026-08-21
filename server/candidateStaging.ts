@@ -84,8 +84,9 @@ export async function updateStagedCandidateResolution(
 }
 
 /**
- * Processes pending staged candidates by resolving handles, videos, or channel IDs via YouTube API,
- * or leaving them safely staged as PENDING when YouTube capacity is unavailable.
+ * Processes pending staged candidates by resolving handles, videos, or channel IDs via YouTube API.
+ * Identity resolution establishes canonical YouTube identity only (resolution_status = RESOLVED).
+ * Trading relevance, country validation, and creator legitimacy remain UNVALIDATED until explicit pipeline admission.
  */
 export async function processPendingStagedCandidates(
   resolveChannelFn?: (identity: string, type: string) => Promise<string | null>,
@@ -105,7 +106,7 @@ export async function processPendingStagedCandidates(
       await updateStagedCandidateResolution(cand.id, {
         resolutionStatus: 'RESOLVED',
         resolvedChannelId: cand.normalizedIdentity,
-        validationStatus: 'VALIDATED'
+        validationStatus: 'UNVALIDATED' // Must remain UNVALIDATED until trading/country validation
       }, clientOverride);
       processed++;
       resolved++;
@@ -119,7 +120,7 @@ export async function processPendingStagedCandidates(
           await updateStagedCandidateResolution(cand.id, {
             resolutionStatus: 'RESOLVED',
             resolvedChannelId: channelId,
-            validationStatus: 'VALIDATED'
+            validationStatus: 'UNVALIDATED' // Must remain UNVALIDATED until trading/country validation
           }, clientOverride);
           resolved++;
         } else {
