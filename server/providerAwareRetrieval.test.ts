@@ -170,6 +170,11 @@ test('migration 111 is additive, backfills official-only history, protects linea
   assert.doesNotMatch(sql, /ALTER COLUMN provider_reserved_amount SET DEFAULT 100/);
 });
 
+test('production queue worker loads Brave executor registration before dispatch', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /import ['"]\.\/braveSearch['"]/);
+});
+
 test('Phase 8 registry validation and Phase 9 governed dispatch are wired', () => {
   const allocator = readFileSync(new URL('./discoveryFrontierAllocator.ts', import.meta.url), 'utf8');
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
