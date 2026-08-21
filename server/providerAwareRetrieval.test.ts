@@ -7,6 +7,7 @@ import {
   executeAllocatedRetrievalPage,
   registerRetrievalExecutor,
   clearRegisteredExecutorsForTest,
+  isShadowBraveCanaryAllowed,
   type ProviderAllocation,
   type RetrievalRequest,
   type RetrievalPage
@@ -21,6 +22,13 @@ test('current production provider contract preserves official YouTube semantics'
     continuationOwner: 'PHASE_9'
   });
   assert.equal(providerSnapshot(undefined), YOUTUBE_SEARCH_PROVIDER);
+});
+
+test('only the explicit Brave direct-search canary may allocate a SHADOW provider', () => {
+  assert.equal(isShadowBraveCanaryAllowed({ mode: 'SHADOW', providerKey: 'brave-search', capability: 'SEARCH_BRAVE_DIRECT', allowShadowProvider: true }), true);
+  assert.equal(isShadowBraveCanaryAllowed({ mode: 'SHADOW', providerKey: 'brave-search', capability: 'SEARCH_BRAVE_DIRECT', allowShadowProvider: false }), false);
+  assert.equal(isShadowBraveCanaryAllowed({ mode: 'SHADOW', providerKey: 'youtube-search', capability: 'SEARCH_YOUTUBE', allowShadowProvider: true }), false);
+  assert.equal(isShadowBraveCanaryAllowed({ mode: 'CANARY', providerKey: 'brave-search', capability: 'SEARCH_BRAVE_DIRECT', allowShadowProvider: true }), false);
 });
 
 test('provider contract accepts a hypothetical non-YouTube provider shape structurally', () => {
@@ -184,4 +192,6 @@ test('Phase 8 registry validation and Phase 9 governed dispatch are wired', () =
   assert.match(queue, /PHASE9_PROVIDER_LINEAGE_MISMATCH/);
   const db = readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
   assert.match(db, /mode IN \('ACTIVE','ACTIVE_GLOBAL','CANARY'\)/);
+  assert.match(db, /isShadowBraveCanaryAllowed/);
+  assert.match(db, /allowShadowProvider/);
 });

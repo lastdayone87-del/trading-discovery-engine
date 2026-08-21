@@ -9,7 +9,7 @@ import {
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
-import { providerSnapshot, type ProviderAllocation } from './providerAwareRetrieval';
+import { isShadowBraveCanaryAllowed, providerSnapshot, type ProviderAllocation } from './providerAwareRetrieval';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -543,6 +543,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
   availableAutonomousCapacity?: number;
   targetProviderKey?: string;
   requiredCapability?: string;
+  allowShadowProvider?: boolean;
   now?: Date;
   client?: any;
 }): Promise<{
@@ -615,17 +616,22 @@ export async function evaluateFrontierCanaryAllocation(input: {
     // by Phase 8; Phase 9 may not consult mutable registry state to switch provider.
     const targetProviderKey = input.targetProviderKey;
     const requiredCapability = input.requiredCapability || 'SEARCH_YOUTUBE';
+    const allowShadowBraveCanary = input.allowShadowProvider === true &&
+      targetProviderKey === 'brave-search' &&
+      requiredCapability === 'SEARCH_BRAVE_DIRECT';
     const providerQuery = targetProviderKey
       ? `SELECT provider_key, provider_family, capabilities, quota_domain, mode, daily_cost_cap, configuration_version, updated_at
-         FROM discovery_provider_registry WHERE provider_key=$1 AND mode IN ('ACTIVE', 'CANARY') FOR SHARE`
+         FROM discovery_provider_registry
+         WHERE provider_key=$1 AND (mode IN ('ACTIVE', 'CANARY') OR (mode='SHADOW' AND $2::boolean AND provider_key='brave-search' AND capabilities ? 'SEARCH_BRAVE_DIRECT')) FOR SHARE`
       : `SELECT provider_key, provider_family, capabilities, quota_domain, mode, daily_cost_cap, configuration_version, updated_at
          FROM discovery_provider_registry WHERE mode IN ('ACTIVE', 'CANARY') AND capabilities ? $1
          ORDER BY CASE WHEN mode = 'ACTIVE' THEN 1 ELSE 2 END, provider_key FOR SHARE`;
-    const providerParams = targetProviderKey ? [targetProviderKey] : [requiredCapability];
+    const providerParams = targetProviderKey ? [targetProviderKey, allowShadowBraveCanary] : [requiredCapability];
     const providerResult = await runner.query(providerQuery, providerParams);
     const providerRow = providerResult.rows[0];
 
-    if (!providerRow || !Array.isArray(providerRow.capabilities) || !providerRow.capabilities.includes(requiredCapability)) {
+    if (!providerRow || !Array.isArray(providerRow.capabilities) || !providerRow.capabilities.includes(requiredCapability) ||
+      (providerRow.mode === 'SHADOW' && !isShadowBraveCanaryAllowed({ mode: providerRow.mode, providerKey: providerRow.provider_key, capability: requiredCapability, allowShadowProvider: input.allowShadowProvider }))) {
       if (client) await runner.query('COMMIT');
       return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'PROVIDER_INELIGIBLE_OR_CAPABILITY_MISMATCH' };
     }
