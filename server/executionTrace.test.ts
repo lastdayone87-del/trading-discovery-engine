@@ -16,6 +16,17 @@ test('manual discovery persists evidence for every pre-provider execution bounda
   assert.match(youtube,/recordFirstYouTubeRequest\(operation\)/);
 });
 
+test('provider-targeted canary cycles are admin-gated and use the governed authority path',()=>{
+  const server=fs.readFileSync(new URL('../server.ts',import.meta.url),'utf8');
+  const autonomous=fs.readFileSync(new URL('./autonomousDiscovery.ts',import.meta.url),'utf8');
+  const authority=fs.readFileSync(new URL('./creatorIntelligence/authority.ts',import.meta.url),'utf8');
+  assert.match(server,/req\.operator\?\.role !== 'admin'/);
+  assert.match(server,/providerKey !== 'brave-search' \|\| capability !== 'SEARCH_BRAVE_DIRECT'/);
+  assert.match(server,/runAutonomousDiscoveryCycle\(country, providerTargetRequested/);
+  assert.match(autonomous,/targetProviderKey: providerTarget\?\.targetProviderKey/);
+  assert.match(authority,/targetProviderKey: input\.targetProviderKey/);
+});
+
 test('dashboard operator actions remain operator-authorized while database maintenance remains admin-only',()=>{
   const policy=(method:string,path:string)=>routePolicyInventory.find(route=>route.method===method&&new RegExp(route.pattern).test(path))?.policy;
   assert.equal(policy('POST','/api/query-intelligence/run-cycle'),'operator');

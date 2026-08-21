@@ -61,6 +61,8 @@ export async function allocateCreatorSearchAuthority(input: {
   assignedAt: string;
   estimatedQuotaUnits?: number;
   availableAutonomousCapacity?: number;
+  targetProviderKey?: string;
+  requiredCapability?: string;
 }): Promise<{
   country: string;
   assignment?: CreatorCanaryAssignment;
@@ -80,6 +82,8 @@ export async function allocateCreatorSearchAuthority(input: {
     allowedCountries: input.allowedCountries,
     estimatedQuotaUnits: input.estimatedQuotaUnits,
     availableAutonomousCapacity: input.availableAutonomousCapacity,
+    targetProviderKey: input.targetProviderKey,
+    requiredCapability: input.requiredCapability,
     now: input.assignedAt ? new Date(input.assignedAt) : new Date()
   }).catch(error => ({
     authorized: false,
