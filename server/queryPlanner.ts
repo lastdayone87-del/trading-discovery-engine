@@ -127,22 +127,29 @@ export function planFrontierTargetedQuery(args: {
   country: string;
   target: DiscoveryNeighborhoodDimensions;
 }): PlannedQuery | null {
-  const query = args.target.primaryTermFamily.normalize('NFKC').trim().replace(/\s+/g, ' ');
-  if (!query || !isRetrievalOrientedQuery(args.country, query)) return null;
+  const targetTerm = args.target.primaryTermFamily.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  const anchor = atom('trading', 'METHOD', (args.target.queryIntent || 'strategy') as QueryIntent, 1, 'CURATED');
+  const neighborhood = atom(targetTerm, 'NEIGHBORHOOD', (args.target.queryIntent || 'strategy') as QueryIntent, 1, 'COUNTRY_VOCABULARY');
+  const query = `${anchor.term} ${neighborhood.term}`.trim();
+  if (!targetTerm || !isRetrievalOrientedQuery(args.country, query)) return null;
   return {
     query,
     intent: (args.target.queryIntent || 'strategy') as QueryIntent,
-    primaryTerm: query,
+    primaryTerm: targetTerm,
     knowledgeTiers: [1],
     generationMode: 'EXPLORATION',
-    generationReason: 'Governed frontier target fallback using an existing canonical neighborhood primary-term family.',
+    generationReason: 'Governed frontier target fallback using an authorized trading anchor and canonical neighborhood modifier.',
     discoveryObjective: 'Test the selected frontier neighborhood while discovering relevant trading creators.',
     metadata: {
       country: args.country,
-      queryTemplate: 'FRONTIER_TARGETED',
+      queryTemplate: 'ANCHOR_LEARNED',
       retrievalOptimized: true,
       tokenCount: queryTokenCount(query),
       scriptValidated: true,
+      retrievalSpecificity: { ...anchor.retrievalPolicy },
+      atoms: [anchor, neighborhood].map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
+      localTier1Term: anchor.term,
+      learnedTerm: targetTerm,
       targetNeighborhoodDimensions: args.target
     }
   };
