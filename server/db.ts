@@ -24,6 +24,7 @@ import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type Segmen
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, type ProviderAllocation } from './providerAwareRetrieval';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -497,6 +498,7 @@ export interface AutonomousQueryCandidate {
   allocationOrigin?: 'FRONTIER_CANARY' | 'LEGACY';
   frontierDecisionId?: string;
   targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
+  provider?: ProviderAllocation;
 }
 
 export interface AutonomousSchedulingSnapshot {
@@ -566,6 +568,14 @@ export async function scheduleAutonomousQueryRuns(
   try {
     await client.query('BEGIN');
     for (const candidate of candidates) {
+      let allocatedProvider=providerSnapshot(candidate.provider||YOUTUBE_SEARCH_PROVIDER);
+      if(candidate.frontierDecisionId){
+        const lineage=await client.query(`SELECT provider_key,retrieval_surface,provider_capability,cost_domain,continuation_owner FROM frontier_allocation_decisions WHERE decision_id=$1 FOR UPDATE`,[candidate.frontierDecisionId]);
+        if(!lineage.rowCount)throw new Error('PROVIDER_ALLOCATION_LINEAGE_MISSING');
+        allocatedProvider=providerSnapshot({providerKey:lineage.rows[0].provider_key,retrievalSurface:lineage.rows[0].retrieval_surface,capability:lineage.rows[0].provider_capability,costDomain:lineage.rows[0].cost_domain,continuationOwner:lineage.rows[0].continuation_owner});
+      }
+      const eligibleProvider=await client.query(`SELECT 1 FROM discovery_provider_registry WHERE provider_key=$1 AND mode IN ('ACTIVE','CANARY') AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,[allocatedProvider.providerKey,allocatedProvider.costDomain,allocatedProvider.capability]);
+      if(!eligibleProvider.rowCount)throw new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE');
       const nativeLineage = (candidate.query.generation_metadata?.countryNativeAllocation || {}) as Record<string, unknown>;
       const allocatedDimensions = candidate.allocationOrigin === 'FRONTIER_CANARY' && nativeLineage.targetNeighborhoodKey
         ? candidate.targetNeighborhoodDimensions
@@ -689,9 +699,9 @@ export async function scheduleAutonomousQueryRuns(
 
       const origin = candidate.allocationOrigin || 'LEGACY';
       const run = await client.query(
-        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin)
-         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10) RETURNING id`,
-        [candidate.query.id, candidate.query.country, candidate.strategy, candidate.reason, retrievalLane, searchOrdering, JSON.stringify({ ...(candidate.query.generation_metadata || {}), ...(candidate.allocationProvenance ? { creatorIntelligenceAllocation: candidate.allocationProvenance } : {}) }), origin, retrievalConfigKey, treatmentOrigin]
+        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
+         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+        [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
       );
       const runId = run.rows[0].id;
 
@@ -760,12 +770,13 @@ export async function scheduleAutonomousQueryRuns(
           retrievalConfigKey,
           retrievalTreatmentOrigin: treatmentOrigin,
           requestedPageDepth
+          ,provider:allocatedProvider
         }), `search-run:${runId}`]
       );
       const jobId = job.rows[0].id;
       await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
 
-      await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
+      await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     await client.query('COMMIT');
@@ -1410,6 +1421,9 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
+    if(run.rowCount)await client.query(`UPDATE frontier_allocation_decisions
+      SET quota_consumed=$2,provider_consumed_amount=$2
+      WHERE query_run_id=$1 AND decision_status='COMMITTED' AND provider_key=(SELECT provider_key FROM query_runs WHERE id=$1)`,[runId,metrics.quotaUsed]);
     await client.query('COMMIT');
 
     // Await post-commit best-effort observation analytics (Phases 2-4).
