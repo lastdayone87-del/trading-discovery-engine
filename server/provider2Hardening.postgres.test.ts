@@ -61,7 +61,7 @@ test('Provider 2 PostgreSQL staging converges canonical identity while retaining
     isNoise: false
   };
   const [direct, osint] = await Promise.all([
-    stageDiscoveredCandidates([candidate], { providerKey: 'brave-search', retrievalSurface: 'BRAVE_YOUTUBE_DIRECT', providerCapability: 'SEARCH_BRAVE_DIRECT', opportunityKey: 'provider2-pg-test-direct', country: 'GB', language: 'en' }),
+    stageDiscoveredCandidates([candidate], { providerKey: 'brave-search', retrievalSurface: 'BRAVE_NATIVE', providerCapability: 'SEARCH_BRAVE_DIRECT', opportunityKey: 'provider2-pg-test-direct', country: 'GB', language: 'en' }),
     stageDiscoveredCandidates([candidate], { providerKey: 'brave-search', retrievalSurface: 'BRAVE_EXTERNAL_OSINT', providerCapability: 'SEARCH_BRAVE_EXTERNAL_OSINT', opportunityKey: 'provider2-pg-test-osint', country: 'US', language: 'en' })
   ]);
   const canonical = await db.query("SELECT COUNT(*)::int AS count FROM discovery_candidate_staging WHERE normalized_identity='UC1234567890123456789012'");
