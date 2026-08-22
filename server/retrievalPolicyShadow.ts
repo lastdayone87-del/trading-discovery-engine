@@ -98,36 +98,23 @@ export async function evaluatePreferredRetrievalConfig(
   };
 }
 
-/**
- * Evaluates and persists a shadow retrieval policy recommendation at the scheduling boundary.
- *
- * ZERO SERVING AUTHORITY:
- * Returns diagnostic evaluation without altering search ordering, retrieval lane,
- * page depth, or continuation.
- */
-export async function evaluateShadowRetrievalRecommendation(
-  input: ShadowRetrievalRecommendationInput
-): Promise<ShadowRetrievalRecommendationResult> {
-  const now = input.now || new Date();
-  const runner = input.clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
+const SHADOW_SAVEPOINT = 'retrieval_policy_shadow_recommendation';
 
-  if (runner) {
-    await ensureRetrievalConfigurationPersisted(input.controlConfig, runner);
-    await ensureRetrievalConfigurationPersisted(input.executedConfig, runner);
-  }
+function shadowFailureClass(error: unknown): string {
+  if (error instanceof Error && error.name) return error.name;
+  if (typeof error === 'string' && error.trim()) return 'STRING_ERROR';
+  return 'UNKNOWN_ERROR';
+}
 
-  const { recommendedConfig, expectedMarginalValue, uncertainty, evidence } =
-    await evaluatePreferredRetrievalConfig(input.neighborhoodKey, input.executedConfig, runner);
-
-  if (runner) {
-    await ensureRetrievalConfigurationPersisted(recommendedConfig, runner);
-  }
-
-  const differsFromControl = recommendedConfig.configKey !== input.controlConfig.configKey;
-  const differsFromExecuted = recommendedConfig.configKey !== input.executedConfig.configKey;
-  const expectedQuotaImpact = (recommendedConfig.requestedPageDepth - input.executedConfig.requestedPageDepth) * 100;
-
-  const result: ShadowRetrievalRecommendationResult = {
+function buildShadowRecommendationResult(
+  input: ShadowRetrievalRecommendationInput,
+  now: Date,
+  recommendedConfig: RetrievalConfiguration,
+  expectedMarginalValue: number,
+  uncertainty: number,
+  evidence: Record<string, unknown>
+): ShadowRetrievalRecommendationResult {
+  return {
     opportunityKey: input.opportunityKey,
     queryRunId: input.queryRunId || null,
     neighborhoodKey: input.neighborhoodKey,
@@ -136,14 +123,87 @@ export async function evaluateShadowRetrievalRecommendation(
     recommendedConfigKey: recommendedConfig.configKey,
     expectedMarginalValue,
     uncertainty,
-    expectedQuotaImpact,
-    differsFromControl,
-    differsFromExecuted,
+    expectedQuotaImpact: (recommendedConfig.requestedPageDepth - input.executedConfig.requestedPageDepth) * 100,
+    differsFromControl: recommendedConfig.configKey !== input.controlConfig.configKey,
+    differsFromExecuted: recommendedConfig.configKey !== input.executedConfig.configKey,
     evidence,
     createdAt: now.toISOString()
   };
+}
 
-  if (runner) {
+/**
+ * Evaluates and persists a shadow retrieval policy recommendation at the scheduling boundary.
+ *
+ * ZERO SERVING AUTHORITY:
+ * Returns diagnostic evaluation without altering search ordering, retrieval lane,
+ * page depth, or continuation. Optional shadow persistence is isolated from a
+ * caller-owned transaction and skipped when its neighborhood parent is absent.
+ */
+export async function evaluateShadowRetrievalRecommendation(
+  input: ShadowRetrievalRecommendationInput
+): Promise<ShadowRetrievalRecommendationResult> {
+  const now = input.now || new Date();
+  const suppliedRunner = input.clientOverride || null;
+  const pool = suppliedRunner ? null : (process.env.DATABASE_URL ? await getDb() : null);
+  const runner = suppliedRunner || (pool ? await pool.connect() : null);
+  const ownsTransaction = !suppliedRunner && Boolean(runner);
+
+  if (!runner) {
+    const { recommendedConfig, expectedMarginalValue, uncertainty, evidence } =
+      await evaluatePreferredRetrievalConfig(input.neighborhoodKey, input.executedConfig, runner);
+    return buildShadowRecommendationResult(
+      input,
+      now,
+      recommendedConfig,
+      expectedMarginalValue,
+      uncertainty,
+      { ...evidence, shadowPersistenceStatus: 'NOT_PERSISTED_NO_RUNNER' }
+    );
+  }
+
+  let savepointOpen = false;
+  try {
+    if (ownsTransaction) await runner.query('BEGIN');
+    await runner.query(`SAVEPOINT ${SHADOW_SAVEPOINT}`);
+    savepointOpen = true;
+
+    const parent = await runner.query(
+      'SELECT 1 FROM discovery_neighborhoods WHERE neighborhood_key = $1 LIMIT 1',
+      [input.neighborhoodKey]
+    );
+    if (!parent.rowCount) {
+      await runner.query(`RELEASE SAVEPOINT ${SHADOW_SAVEPOINT}`);
+      savepointOpen = false;
+      if (ownsTransaction) await runner.query('ROLLBACK');
+      return buildShadowRecommendationResult(
+        input,
+        now,
+        input.executedConfig,
+        0,
+        1,
+        {
+          shadowPersistenceStatus: 'SKIPPED_NEIGHBORHOOD_PARENT_MISSING',
+          neighborhoodKeyValidated: false,
+          evaluatedConfigKey: input.executedConfig.configKey
+        }
+      );
+    }
+
+    await ensureRetrievalConfigurationPersisted(input.controlConfig, runner);
+    await ensureRetrievalConfigurationPersisted(input.executedConfig, runner);
+    const { recommendedConfig, expectedMarginalValue, uncertainty, evidence } =
+      await evaluatePreferredRetrievalConfig(input.neighborhoodKey, input.executedConfig, runner);
+    await ensureRetrievalConfigurationPersisted(recommendedConfig, runner);
+
+    const result = buildShadowRecommendationResult(
+      input,
+      now,
+      recommendedConfig,
+      expectedMarginalValue,
+      uncertainty,
+      { ...evidence, shadowPersistenceStatus: 'PERSISTED', neighborhoodKeyValidated: true }
+    );
+
     await runner.query(
       `INSERT INTO retrieval_policy_shadow_recommendations(
          opportunity_key, query_run_id, neighborhood_key, control_config_key,
@@ -167,8 +227,42 @@ export async function evaluateShadowRetrievalRecommendation(
         JSON.stringify(result.evidence),
         result.createdAt
       ]
-    ).catch((err: unknown) => console.warn('[RetrievalPolicyShadow] Failed to record shadow recommendation:', err));
+    );
+    await runner.query(`RELEASE SAVEPOINT ${SHADOW_SAVEPOINT}`);
+    savepointOpen = false;
+    if (ownsTransaction) await runner.query('COMMIT');
+    return result;
+  } catch (error: unknown) {
+    if (savepointOpen) {
+      try {
+        await runner.query(`ROLLBACK TO SAVEPOINT ${SHADOW_SAVEPOINT}`);
+        await runner.query(`RELEASE SAVEPOINT ${SHADOW_SAVEPOINT}`);
+      } catch (isolationError: unknown) {
+        console.warn('[RetrievalPolicyShadow] Failed to restore caller transaction after isolated shadow failure:', shadowFailureClass(isolationError));
+      }
+    }
+    if (ownsTransaction) {
+      try {
+        await runner.query('ROLLBACK');
+      } catch (rollbackError: unknown) {
+        console.warn('[RetrievalPolicyShadow] Failed to roll back private shadow transaction:', shadowFailureClass(rollbackError));
+      }
+    }
+    const failureClass = shadowFailureClass(error);
+    console.warn('[RetrievalPolicyShadow] Shadow recommendation skipped after isolated failure:', failureClass);
+    return buildShadowRecommendationResult(
+      input,
+      now,
+      input.executedConfig,
+      0,
+      1,
+      {
+        shadowPersistenceStatus: 'SKIPPED_ISOLATED_FAILURE',
+        neighborhoodKeyValidated: false,
+        shadowFailureClass: failureClass
+      }
+    );
+  } finally {
+    if (ownsTransaction) runner.release();
   }
-
-  return result;
 }
