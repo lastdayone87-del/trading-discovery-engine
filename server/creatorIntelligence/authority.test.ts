@@ -41,6 +41,7 @@ test('scheduler delegates top-level allocation before unchanged Query Intelligen
   const scheduler = readFileSync(new URL('../autonomousDiscovery.ts', import.meta.url), 'utf8');
   assert.ok(scheduler.indexOf('allocateCreatorSearchAuthority') < scheduler.indexOf('selectNextQueryForCountry(country)'));
   assert.match(scheduler, /const legacyCountry = countries/); assert.match(scheduler, /country = authority\.country/); assert.match(scheduler, /legacy Query Intelligence fallback continues/);
+  assert.match(scheduler, /geographicAllocationIntent: providerTarget\?\.geographicAllocationIntent \|\| 'PIN_LEGACY_COUNTRY'/);
   const authority = readFileSync(new URL('./authority.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(authority, /searchYouTube|enqueueJob|scheduleAutonomousQueryRuns|allocateRetrievalLane|allocateSearchOrdering|INSERT INTO jobs|INSERT INTO quota_reservations/);
 });

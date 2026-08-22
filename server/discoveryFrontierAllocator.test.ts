@@ -11,6 +11,7 @@ import {
   getNeighborhoodCandidates,
   getFrontierAllocationDiagnostics,
   getFrontierAllocationControlComparison,
+  resolveFrontierCandidateCountry,
   type NeighborhoodCandidate
 } from './discoveryFrontierAllocator';
 import { createNeighborhoodKey } from './discoveryNeighborhood';
@@ -23,10 +24,31 @@ test('frontier candidate loading uses the migrated metadata dimensions column', 
   assert.doesNotMatch(source, /ORDER BY n\.updated_at DESC/);
 });
 
-test('provider-targeted frontier allocation scopes candidate loading to the requested country', () => {
+test('geographic allocation intent explicitly controls pinned versus global candidate loading', () => {
+  for (const legacyCountry of ['France', 'Canada', 'Germany', 'Ireland', 'Italy', 'Japan', 'Luxembourg', 'Singapore', 'Spain', 'United Arab Emirates']) {
+    assert.equal(resolveFrontierCandidateCountry({ legacyCountry, geographicAllocationIntent: 'PIN_LEGACY_COUNTRY' }), legacyCountry);
+  }
+  assert.equal(resolveFrontierCandidateCountry({ legacyCountry: 'France', geographicAllocationIntent: 'ALLOW_GLOBAL' }), undefined);
+
   const source = readFileSync(new URL('./discoveryFrontierAllocator.ts', import.meta.url), 'utf8');
-  assert.match(source, /input\.targetProviderKey && input\.legacyCountry\s*\n\s*\? input\.legacyCountry/);
-  assert.match(source, /input\.allowedCountries\?\.length === 1 \? input\.allowedCountries\[0\] : undefined/);
+  assert.match(source, /const geographicAllocationIntent = input\.geographicAllocationIntent \|\| 'ALLOW_GLOBAL'/);
+  assert.match(source, /getNeighborhoodCandidates\(candidateCountry, now, runner\)/);
+  assert.doesNotMatch(source, /input\.allowedCountries\?\.length === 1 \? input\.allowedCountries\[0\] : undefined/);
+});
+
+test('pinned mode cannot steal another country when the requested country has no candidate', async () => {
+  let candidateTarget: unknown;
+  const mockClient = {
+    query: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('discovery_neighborhoods')) {
+        candidateTarget = params?.[2];
+        return { rows: [] };
+      }
+      return { rows: [] };
+    }
+  };
+  await getNeighborhoodCandidates(resolveFrontierCandidateCountry({ legacyCountry: 'France', geographicAllocationIntent: 'PIN_LEGACY_COUNTRY' }), new Date(), mockClient);
+  assert.equal(candidateTarget, 'France');
 });
 
 test('ordinary no-proposal frontier neighborhoods bypass the OSINT freshness gate', () => {

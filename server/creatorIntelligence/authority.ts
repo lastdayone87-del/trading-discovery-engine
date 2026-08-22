@@ -1,7 +1,7 @@
 import { getDb } from '../db';
 import { creatorIntelligenceChecksum, type CreatorDiscoveryObjective, type CreatorProgramLifecycle } from './contracts';
 import { allocateCreatorSearchCanary, CREATOR_SEARCH_CANARY_POLICY_VERSION, type CreatorCanaryAssignment } from './canary';
-import { evaluateFrontierCanaryAllocation, type AllocationDecision } from '../discoveryFrontierAllocator';
+import { evaluateFrontierCanaryAllocation, type AllocationDecision, type GeographicAllocationIntent } from '../discoveryFrontierAllocator';
 import type { DiscoveryNeighborhoodDimensions } from '../discoveryNeighborhood';
 
 export const CREATOR_SEARCH_AUTHORITY_POLICY_VERSION = 'creator-search-allocation-authority-v1';
@@ -64,6 +64,7 @@ export async function allocateCreatorSearchAuthority(input: {
   targetProviderKey?: string;
   requiredCapability?: string;
   allowShadowProvider?: boolean;
+  geographicAllocationIntent: GeographicAllocationIntent;
 }): Promise<{
   country: string;
   assignment?: CreatorCanaryAssignment;
@@ -86,6 +87,7 @@ export async function allocateCreatorSearchAuthority(input: {
     targetProviderKey: input.targetProviderKey,
     requiredCapability: input.requiredCapability,
     allowShadowProvider: input.allowShadowProvider,
+    geographicAllocationIntent: input.geographicAllocationIntent,
     now: input.assignedAt ? new Date(input.assignedAt) : new Date()
   }).catch(error => ({
     authorized: false,
