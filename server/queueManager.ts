@@ -553,7 +553,7 @@ export async function processNextSearchJob(
         providerPagesRetrieved = Number(totals.provider_pages_retrieved || providerPagesRetrieved);
       }
       const quotaConsumed=providerCostUsd>0?0:pageNumber*100;
-      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed });
+      const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
         uniqueChannels: finalMetrics.newChannels,
@@ -565,9 +565,13 @@ export async function processNextSearchJob(
         providerRequestsSucceeded,
         providerRequestsFailed,
         providerRateLimited,
-        providerPagesRetrieved
+        providerPagesRetrieved,
+        averageQualityScore: finalMetrics.averageQualityScore,
+        performanceScore: performance.performanceScore,
+        newCollection: performance.newCollection
       });
       await addQueryExecutionLog({
+        query_run_id: queryRunId,
         query_id: queryId, query, country, executed_at: new Date().toISOString(),
         channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
         quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,

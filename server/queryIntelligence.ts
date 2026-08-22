@@ -650,7 +650,7 @@ export async function constructCountryNativeAllocationQuery(args: {
 export async function evaluateQueryPerformance(
   queryRecord: QueryRecord,
   metrics: QueryFunnelMetrics,
-  attribution: { retrievalLane?: string; searchOrdering?: string; quotaConsumed?: number } = {}
+  attribution: { retrievalLane?: string; searchOrdering?: string; quotaConsumed?: number; persist?: boolean } = {}
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
   const performanceScore = metrics.performanceScore;
   const newCollection = selectQueryCollection(queryRecord.collection, queryRecord.times_executed, metrics);
@@ -680,22 +680,24 @@ export async function evaluateQueryPerformance(
     }
   }
 
-  await updateQueryExecutionStats(queryRecord.id, {
-    totalChannelsFound: metrics.distinctResults,
-    uniqueChannelsFound: metrics.newChannels,
-    qualityChannelsFound: metrics.qualityChannels,
-    communityChannelsFound: metrics.communitiesDiscovered,
-    avgQualityScore: metrics.averageQualityScore,
-    performanceScore,
-    newCollection
-  });
-  await attributeTerminologyPerformance(
-    queryRecord,
-    metrics,
-    attribution.quotaConsumed || 0,
-    attribution.retrievalLane,
-    attribution.searchOrdering
-  );
+  if (attribution.persist !== false) {
+    await updateQueryExecutionStats(queryRecord.id, {
+      totalChannelsFound: metrics.distinctResults,
+      uniqueChannelsFound: metrics.newChannels,
+      qualityChannelsFound: metrics.qualityChannels,
+      communityChannelsFound: metrics.communitiesDiscovered,
+      avgQualityScore: metrics.averageQualityScore,
+      performanceScore,
+      newCollection
+    });
+    await attributeTerminologyPerformance(
+      queryRecord,
+      metrics,
+      attribution.quotaConsumed || 0,
+      attribution.retrievalLane,
+      attribution.searchOrdering
+    );
+  }
 
   return {
     performanceScore,
