@@ -24,9 +24,11 @@ const COUNTRY_SEARCH_HINTS: Record<string, CountrySearchHintConfig> = {
   belgium: { regionCode: 'BE', relevanceLanguage: 'nl', relevanceLanguages: ['nl', 'fr', 'de'] },
   australia: { regionCode: 'AU', relevanceLanguage: 'en' },
   canada: { regionCode: 'CA', relevanceLanguage: 'en', relevanceLanguages: ['en', 'fr'] },
+  luxembourg: { regionCode: 'LU', relevanceLanguage: 'lb', relevanceLanguages: ['lb', 'fr', 'de'] },
   japan: { regionCode: 'JP', relevanceLanguage: 'ja' },
   'south korea': { regionCode: 'KR', relevanceLanguage: 'ko' },
   singapore: { regionCode: 'SG', relevanceLanguage: 'en' },
+  'united arab emirates': { regionCode: 'AE', relevanceLanguage: 'ar', relevanceLanguages: ['ar', 'en'] },
   denmark: { regionCode: 'DK', relevanceLanguage: 'da' },
   sweden: { regionCode: 'SE', relevanceLanguage: 'sv' },
   norway: { regionCode: 'NO', relevanceLanguage: 'no' },
@@ -52,7 +54,7 @@ const LANGUAGE_CODES: Record<string, string> = {
 const normalizeCountry = (country: string) => country.normalize('NFKC').trim().toLocaleLowerCase('en');
 const normalizeLanguage = (language: string) => language.trim().toLocaleLowerCase('en').split(/[-_]/)[0];
 
-function languageCode(value: string): string {
+export function normalizeLanguageCode(value: string): string {
   const normalized = normalizeLanguage(value);
   return LANGUAGE_CODES[normalized] || (/^[a-z]{2}$/.test(normalized) ? normalized : '');
 }
@@ -61,7 +63,7 @@ export function countrySearchLanguageCandidates(countryName: string, declaredLan
   const configured = COUNTRY_SEARCH_HINTS[normalizeCountry(countryName)];
   if (!configured) return [];
   const configuredLanguages = configured.relevanceLanguages || (configured.relevanceLanguage ? [configured.relevanceLanguage] : []);
-  const declared = declaredLanguages.map(languageCode).filter(Boolean);
+  const declared = declaredLanguages.map(normalizeLanguageCode).filter(Boolean);
   return [...new Set([...configuredLanguages, ...declared.filter(code => configuredLanguages.includes(code))])];
 }
 
@@ -70,10 +72,10 @@ export function countrySearchHints(countryName: string, declaredLanguages: strin
   if (!configured) return {};
 
   const fallbackLanguage = declaredLanguages
-    .map(languageCode)
+    .map(normalizeLanguageCode)
     .find(language => /^[a-z]{2}$/.test(language));
   const candidates = countrySearchLanguageCandidates(countryName, declaredLanguages);
-  const preferred = preferredLanguage ? languageCode(preferredLanguage) : '';
+  const preferred = preferredLanguage ? normalizeLanguageCode(preferredLanguage) : '';
   const relevanceLanguage = preferred && candidates.includes(preferred)
     ? preferred
     : candidates[0] || configured.relevanceLanguage || fallbackLanguage;

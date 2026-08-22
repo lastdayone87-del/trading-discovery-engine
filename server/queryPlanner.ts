@@ -3,6 +3,7 @@ import type { DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { admitOrganicQueryCandidates, type OrganicQueryCandidate } from './organicQueryExpansion';
 import { assessLanguageCapability, type GlobalLanguageContext } from './globalLanguageModel';
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
+import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
@@ -161,6 +162,9 @@ export function planCountryNativeProposalQuery(args: {
   countryVocabulary?: CountryVocabulary;
   targetIntent: string;
   allocationLineage: Record<string, unknown>;
+  language?: string | null;
+  locale?: string | null;
+  dominantLocale?: string | null;
 }): PlannedQuery | null {
   const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
   if (!nativeTerm || queryTokenCount(nativeTerm) > 3) return null;
@@ -170,6 +174,12 @@ export function planCountryNativeProposalQuery(args: {
     .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
   if (!anchor) return null;
   const query = `${anchor.term} ${nativeTerm}`;
+  const languageEvidence = [args.language, args.locale, args.dominantLocale]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  const supportedLanguages = countrySearchLanguageCandidates(args.country, args.countryVocabulary?.languages || []);
+  const preferredLanguage = languageEvidence
+    .map(normalizeLanguageCode)
+    .find(language => language && supportedLanguages.includes(language));
   return {
     query,
     intent: (args.targetIntent || anchor.intent) as QueryIntent,
@@ -190,7 +200,11 @@ export function planCountryNativeProposalQuery(args: {
       atoms: [anchor, learned].map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
       localTier1Term: anchor.term,
       learnedTerm: nativeTerm,
-      countryNativeAllocation: args.allocationLineage
+      countryNativeAllocation: args.allocationLineage,
+      language: args.language || undefined,
+      locale: args.locale || undefined,
+      dominantLocale: args.dominantLocale || undefined,
+      preferredLanguage
     }
   };
 }

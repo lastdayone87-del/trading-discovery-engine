@@ -31,7 +31,8 @@ test('Stage 7: the queue uses existing query/evidence metadata as a language pre
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const retrieval = readFileSync(new URL('./providerAwareRetrieval.ts', import.meta.url), 'utf8');
   const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
-  assert.match(queue, /queryMetadata\.language, queryMetadata\.locale, queryMetadata\.dominantLocale/);
+  assert.match(queue, /preferredLanguageFromQueryMetadata\(queryMetadata\)/);
+  assert.match(queue, /metadata\.preferredLanguage, metadata\.language, metadata\.locale, metadata\.dominantLocale/);
   assert.match(queue, /preferredLanguage/);
   assert.match(retrieval, /preferredLanguage: request\.preferredLanguage/);
   assert.match(youtube, /countrySearchHints\(countryName, vocab\?\.languages \|\| \[\], lifecycle\?\.preferredLanguage\)/);
