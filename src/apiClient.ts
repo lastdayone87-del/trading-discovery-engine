@@ -38,19 +38,10 @@ export function nextPacificQuotaResetAt(quotaDay: string): Date | null {
   return new Date(candidate);
 }
 
-/**
- * The backend has one aggregate quota ledger, not per-key metering. Older UI code
- * rendered that aggregate as if it were sequential per-key consumption, which
- * produced fake 10,000/10,000 rows. Keep the operational key status, but mark
- * per-key consumption as untracked and turn the quota-day label into the actual
- * next Pacific reset instant before the legacy QueueMonitor renders it.
- */
+/** Normalize only the reset presentation; per-key quota values come from the durable backend projection. */
 export function normalizeQueueStatusForDashboard(payload: any): any {
   if (!payload || typeof payload !== 'object' || !payload.quota || typeof payload.quota !== 'object') return payload;
   const quota = { ...payload.quota };
-  if (Array.isArray(quota.keyUsage)) {
-    quota.keyUsage = quota.keyUsage.map((item: any) => ({ ...item, unitsUsed: '—', limit: 'not tracked' }));
-  }
   const nextReset = nextPacificQuotaResetAt(quota.lastReset);
   if (nextReset) quota.lastReset = `next ${nextReset.toLocaleString()}`;
   return { ...payload, quota };

@@ -275,6 +275,7 @@ export interface KeyQuotaUsage {
   keyIndex: number;
   maskedKey: string;
   unitsUsed: number;
+  remaining: number;
   limit: number;
   isActive: boolean;
   status: 'Active' | 'Cooling Down' | 'Daily Quota Exhausted' | 'Unavailable';

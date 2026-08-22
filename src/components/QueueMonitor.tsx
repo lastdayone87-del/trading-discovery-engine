@@ -267,13 +267,13 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
                     <div key={ku.keyIndex} className="flex items-center justify-between text-[11px] bg-white dark:bg-slate-900 px-2 py-1 rounded border border-slate-200/80 dark:border-slate-800">
                       <div className="flex items-center gap-1.5">
                         <span className={`w-1.5 h-1.5 rounded-full ${ku.isActive ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
-                        <span className="font-mono font-medium text-slate-700 dark:text-slate-300">Key #{ku.keyIndex} ({ku.maskedKey})</span>
+                        <span className="font-mono font-medium text-slate-700 dark:text-slate-300">Key #{ku.keyIndex}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${providerStatusStyle(ku.status)}`} title={ku.retryAt ? `Recovery scheduled for ${ku.retryAt}` : undefined}>
                           {ku.status}
                         </span>
-                        <span className="font-mono text-slate-500 dark:text-slate-400">{ku.unitsUsed} / {ku.limit}</span>
+                        <span className="font-mono text-slate-500 dark:text-slate-400" title={`${ku.remaining} units remaining`}>{ku.unitsUsed} / {ku.limit} <span className="text-[10px]">({ku.remaining} left)</span></span>
                       </div>
                     </div>
                   ))}

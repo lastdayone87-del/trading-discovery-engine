@@ -119,7 +119,7 @@ export async function fetchYouTubeFeaturedChannels(sourceChannelId: string, maxi
     try {
       response = await youtubeFetch(url, 'featured-channel-sections', FEATURED_CHANNEL_PROVIDER_COST, 1, acquisition, 'enrichment', keys[index]);
     } catch (error) { recordProviderFailure(keys[index], error); acquisition.providerFailed(isQuotaExceeded(error) ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE'); throw error; }
-    await incrementQuota(FEATURED_CHANNEL_PROVIDER_COST);
+    await incrementQuota(FEATURED_CHANNEL_PROVIDER_COST, getYouTubeResponseProviderKey(response));
     return parseFeaturedChannelSections({ sourceChannelId, maximumFanout, response: await readYouTubeJsonObject(response, 'featured-channel-sections'), observedAt: new Date().toISOString() });
   } finally { acquisition.release(); }
 }
@@ -132,7 +132,7 @@ export async function fetchYouTubePlaylistChannels(playlistId:string,limit:numbe
   try {
     const providerIndexes=availableKeyIndexes(keys);
     for(let attempt=0;attempt<providerIndexes.length;attempt++){const index=providerIndexes[attempt];
-      try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);const data=await readYouTubeJsonObject(response, 'playlist-items');await incrementQuota(1);
+      try{const url=buildYouTubeApiUrl('playlistItems',keys[index],{part:'snippet',playlistId,maxResults});const response=await youtubeFetch(url,'playlist-items',1,attempt+1,acquisition,'enrichment',keys[index]);const data=await readYouTubeJsonObject(response, 'playlist-items');await incrementQuota(1, getYouTubeResponseProviderKey(response));
         return (data.items||[]).map((item:any)=>({channelId:String(item.snippet?.videoOwnerChannelId||''),channelName:String(item.snippet?.videoOwnerChannelTitle||''),description:String(item.snippet?.description||''),videoTitles:[String(item.snippet?.title||'')],observedAt})).filter((x:PlaylistChannelObservation)=>x.channelId&&x.channelName);
       }catch(error){recordProviderFailure(keys[index],error);if(isQuotaExceeded(error))quotaExceededCount++;if(attempt===providerIndexes.length-1){acquisition.providerFailed(quotaExceededCount===providerIndexes.length?'QUOTA_EXHAUSTED':'INDETERMINATE');throwIfAllProvidersCoolingDown(keys);throw error;}}
     }throw new Error('All configured YouTube API keys failed for playlist inspection.');
@@ -312,6 +312,12 @@ export async function youtubeHttpError(response:Response,trace?:(stage:string)=>
  * provider edges occasionally return plain text or HTML with a successful
  * transport status; those responses are operationally retryable, not data.
  */
+export function getYouTubeResponseProviderKey(response: Response): string {
+  const providerKey = youtubeResponseProviderContext.get(response)?.providerKey;
+  if (!providerKey) throw new Error('YOUTUBE_PROVIDER_KEY_CONTEXT_MISSING');
+  return providerKey;
+}
+
 export async function readYouTubeJsonObject<T extends Record<string, any> = Record<string, any>>(response: Response, operation: string): Promise<T> {
   const context = youtubeResponseProviderContext.get(response);
   try {
@@ -434,7 +440,7 @@ export async function resolveYouTubeLocatorAuthoritatively(identity: string, typ
       try {
         const response = await youtubeFetch(url, `resolve-${type.toLowerCase()}`, 1, attempt + 1, acquisition, 'enrichment', apiKey);
         const data = await readYouTubeJsonObject(response, `resolve-${type.toLowerCase()}`);
-        await incrementQuota(1);
+        await incrementQuota(1, getYouTubeResponseProviderKey(response));
         const channelId = type === 'HANDLE' ? data.items?.[0]?.id : data.items?.[0]?.snippet?.channelId;
         if (typeof channelId === 'string' && /^UC[A-Za-z0-9_-]{22}$/.test(channelId)) return channelId;
         return null;
@@ -503,7 +509,7 @@ export async function searchYouTubeChannelPage(
 
         if (res.ok) {
           console.log(`[YouTube Outbound Trace] search-${attempt + 1} before quota-write at server/youtube.ts:261`);
-          await incrementQuota(100); // 100 units for YouTube Search call
+          await incrementQuota(100, getYouTubeResponseProviderKey(res)); // 100 units for YouTube Search call
           console.log(`[YouTube Outbound Trace] search-${attempt + 1} after quota-write at server/youtube.ts:261`);
           console.log(`[YouTube Outbound Trace] search-${attempt + 1} before success-body-read at server/youtube.ts:264`);
           const data = await readYouTubeJsonObject(res, 'search');
@@ -552,7 +558,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
 
       if (res.ok) {
         acquiredResponse = true;
-        await incrementQuota(100);
+        await incrementQuota(100, getYouTubeResponseProviderKey(res));
         const data = await readYouTubeJsonObject(res, 'recent-videos-search');
         const videoIds: string[] = [];
         const snippets: string[] = [];
@@ -569,7 +575,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
           const videosUrl = buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:videoIds.join(',')});
           const vRes = await youtubeFetch(videosUrl,'video-details',1,1,acquisition,'enrichment',apiKey);
           if (vRes.ok) {
-            await incrementQuota(1);
+            await incrementQuota(1, getYouTubeResponseProviderKey(vRes));
             const vData = await readYouTubeJsonObject(vRes, 'video-details');
             const fullDescs: string[] = [];
             for (const item of vData.items || []) {
@@ -638,13 +644,13 @@ export async function fetchYouTubeChannelEnrichment(
         const recentUrl = buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,order:'date',type:'video',maxResults:10});
         const recentResponse = await youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition,priority,apiKey);
         uploadsCheckpoint = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
-        await incrementQuota(100);
+        await incrementQuota(100, getYouTubeResponseProviderKey(recentResponse));
       }
       if(!channelCheckpoint){
         if(attempt>0)await topUp(1);
         const channelResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition,priority,apiKey);
         channelCheckpoint = await readYouTubeJsonObject(channelResponse, 'channel-details');
-        await incrementQuota(1);
+        await incrementQuota(1, getYouTubeResponseProviderKey(channelResponse));
       }
       const recentData=uploadsCheckpoint;
       const channelData=channelCheckpoint;
@@ -671,11 +677,11 @@ export async function fetchYouTubeChannelEnrichment(
           if(attempt>0)await topUp(100);
           const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition,priority,apiKey);
           playlistsCheckpoint=await readYouTubeJsonObject(playlistResponse,'enrichment-playlists');
-          await incrementQuota(100);
+          await incrementQuota(100, getYouTubeResponseProviderKey(playlistResponse));
         }
         const playlistPayload=playlistsCheckpoint;
         playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
-        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);videoDetailsCheckpoint=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await incrementQuota(1);}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}
+        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);videoDetailsCheckpoint=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await incrementQuota(1, getYouTubeResponseProviderKey(videoResponse));}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}
       }
 
       return {
@@ -728,7 +734,7 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
       const data = await readYouTubeJsonObject(response, 'channel-country-metadata');
       const channel = data.items?.[0];
       if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
-      await incrementQuota(1);
+      await incrementQuota(1, getYouTubeResponseProviderKey(response));
       const officialCountry = channel.brandingSettings?.channel?.country;
       const subscriberCount = channel.statistics?.hiddenSubscriberCount === true ? fallback.subscriberCount : (channel.statistics?.subscriberCount || fallback.subscriberCount);
       return { ...fallback, description: channel.snippet?.description || fallback.description,
