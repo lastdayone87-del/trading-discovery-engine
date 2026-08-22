@@ -12,6 +12,12 @@ import { FEATURED_CHANNEL_PROVIDER_COST, parseFeaturedChannelSections, type Feat
 export type { SearchOrdering } from './searchOrdering';
 export type { RetrievalLane } from './retrievalLanes';
 
+export interface YouTubeProviderLifecycle {
+  requestId?: string;
+  runId?: string;
+  jobId?: string;
+}
+
 /**
  * STRICT BANNED KEYWORD SANITIZER
  * Strips any occurrence of 'discord' or related forbidden search keywords.
@@ -217,7 +223,7 @@ export function buildYouTubeApiUrl(
   return url.toString();
 }
 
-async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition,priority:YouTubeRequestPriority='enrichment',providerKey?:string):Promise<Response>{
+async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition,priority:YouTubeRequestPriority='enrichment',providerKey?:string,lifecycle?:YouTubeProviderLifecycle):Promise<Response>{
   const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
   const trace = (stage: string) => console.log(`[YouTube Outbound Trace] ${traceId} ${stage}`);
   trace('entered youtubeFetch; before timeout-setting-read at server/youtube.ts:119');
@@ -247,7 +253,8 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           trace(`reselected provider at dispatch (key #${dispatchIndex+1})`);
         }
       }
-      return executeProviderCall({context:{provider:'youtube',operation,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
+      const providerRequestId = lifecycle?.requestId ? `${lifecycle.requestId}:attempt:${attempt}` : undefined;
+      return executeProviderCall({context:{provider:'youtube',operation,requestId:providerRequestId,runId:lifecycle?.runId,jobId:lifecycle?.jobId,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
         trace('before first-request-record at server/youtube.ts:128');
         await recordFirstYouTubeRequest(operation);
         trace('after first-request-record at server/youtube.ts:128');
@@ -469,7 +476,8 @@ export async function searchYouTubeChannelPage(
   pageToken?: string | null,
   ordering: SearchOrdering = 'RELEVANCE',
   onAdditionalQuota?: YouTubeAdditionalQuotaCallback,
-  priority: YouTubeRequestPriority = 'autonomous'
+  priority: YouTubeRequestPriority = 'autonomous',
+  lifecycle?: YouTubeProviderLifecycle
 ): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
@@ -504,7 +512,7 @@ export async function searchYouTubeChannelPage(
         });
 
         console.log(`[YouTube Outbound Trace] search-${attempt + 1} before youtubeFetch at server/youtube.ts:255`);
-        const res = await youtubeFetch(searchUrl,'search',100,attempt+1,acquisition,priority,apiKey);
+        const res = await youtubeFetch(searchUrl,'search',100,attempt+1,acquisition,priority,apiKey,lifecycle);
         console.log(`[YouTube Outbound Trace] search-${attempt + 1} after youtubeFetch at server/youtube.ts:255`);
 
         if (res.ok) {

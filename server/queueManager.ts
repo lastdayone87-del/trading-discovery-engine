@@ -41,7 +41,7 @@ import { runChannelInspection } from './inspector';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
-import {executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
+import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, selectNextQueryForCountry } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
@@ -370,7 +370,10 @@ export async function processNextSearchJob(
     }
     const vocabs = await getCountryVocabularies();
     const vocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
-    if (queryRunId) await startQueryRun(queryRunId);
+    if (queryRunId) {
+      const started = await startQueryRun(queryRunId);
+      if (!started) { await completeJob(job.id); return true; }
+    }
     if (queryRunId && pageNumber > 1 && await autonomousPageExists(queryRunId,pageNumber)) { await completeJob(job.id); return true; }
 
     const autonomousOperationId=queryRunId?`${queryRunId}:${pageNumber}`:'';
@@ -403,7 +406,8 @@ export async function processNextSearchJob(
         if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
       }
       try {
-        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
+        const providerRequestBaseId = buildProviderRequestBaseId({queryRunId,jobId:job.id,jobAttempt:job.attempts,pageNumber});
+        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
           if(braveProvider) return;
           const budget=getDailyYouTubeQuotaBudget();
           const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));

@@ -235,7 +235,7 @@ test('preferred YouTube provider advances only after validated response success'
 
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
-  assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey\)/);
+  assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey(?:,lifecycle)?\)/);
   assert.match(source, /youtubeFetch\(recentUrl,'channel-uploads',100,attempt\+1,acquisition,priority,apiKey\)/);
   assert.match(source, /youtubeFetch\(channelUrl,'channel-details',1,attempt\+1,acquisition,priority,apiKey\)/);
 });
