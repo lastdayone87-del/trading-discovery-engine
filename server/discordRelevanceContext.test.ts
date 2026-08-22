@@ -66,6 +66,22 @@ test('validator keeps explicit Discord-native non-trading evidence authoritative
   assert.equal(result.inviteUrl,null);
 });
 
+test('mixed Discord-native evidence remains uncertainty even with strong creator context',async()=>{
+  const result=await validateDiscordInvite('mixed',{
+    parentContext:{tradingStatus:'TRADING_CONFIRMED',tradingConfidence:93,tradingCategory:'Order Flow',creatorName:'Lunar - Trading Academy',country:'United States',sourceSurface:'YOUTUBE_ABOUT',ownershipStatus:'CREATOR_OWNED',ownershipConfidence:95},
+    fetchImpl:async()=>liveResponse({code:'mixed',guildName:'Trading Gaming Community'}),emitProviderEvent:noopEmit as any
+  });
+  assert.equal(result.status,'UNCERTAIN');
+  assert.equal(result.relevanceStatus,'UNCERTAIN');
+  assert.equal(result.nativeRelevanceConflict,true);
+  assert.equal(result.inviteUrl,null);
+  const candidate={...creatorCandidate(),ownershipStatus:'CREATOR_OWNED' as const,ownershipConfidence:95};
+  const effective=applyCreatorAssociationToDiscordValidation(channel(),result,candidate);
+  assert.equal(effective.status,'UNCERTAIN');
+  assert.equal(effective.relevanceStatus,'UNCERTAIN');
+  assert.equal(effective.inviteUrl,null);
+});
+
 test('production queue supplies complete candidate-specific parentContext to validator',()=>{
   const queue=readFileSync('server/queueManager.ts','utf8');
   assert.match(queue,/validateDiscordInvite\(candidate\.nativeInviteCode,\{\s*parentContext:\{/);
@@ -77,6 +93,8 @@ test('production queue supplies complete candidate-specific parentContext to val
   assert.match(queue,/sourceSurface:candidate\.sourceSurface/);
   assert.match(queue,/ownershipStatus:candidate\.ownershipStatus/);
   assert.match(queue,/ownershipConfidence:candidate\.ownershipConfidence/);
+  const projection=readFileSync('server/discordProjection.ts','utf8');
+  assert.match(projection,/!validation\.nativeRelevanceConflict/);
 });
 
 test('generic active Discord from strong creator-owned trading source is promoted by association',async()=>{
