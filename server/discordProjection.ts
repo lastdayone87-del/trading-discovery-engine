@@ -28,7 +28,8 @@ export function applyCreatorAssociationToDiscordValidation(
     validation.relevanceStatus==='UNCERTAIN'&&
     current.trading_status==='TRADING_CONFIRMED'&&
     parentConfidence>=80&&
-    creatorOwned;
+    creatorOwned&&
+    !validation.nativeRelevanceConflict;
   if(!eligible)return validation;
 
   const status=Number(validation.approximateMemberCount||0)>=50?'ACTIVE':'ACTIVE_LOW_VOLUME';

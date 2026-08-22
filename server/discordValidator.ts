@@ -20,6 +20,8 @@ export interface DiscordValidationResult {
   approximateMemberCount?: number;
   approximatePresenceCount?: number;
   relevanceReason?: string;
+  /** Discord-native positive and negative signals conflict; association must not erase that uncertainty. */
+  nativeRelevanceConflict?: boolean;
   evidenceCoverage?:DiscordEvidenceCoverage;
   candidateInviteUrl: string;
   operationalOutcome: DiscordOperationalOutcome;
@@ -242,6 +244,10 @@ export async function validateDiscordInvite(inviteCode:string, options?:DiscordV
       if(association.creatorOwned&&association.parentTerms.length>0)confidence+=10;
       if(matchedNegative.length>0)confidence-=matchedNegative.length*35;
       confidence=Math.max(0,Math.min(99,confidence));
+
+      if(matchedNegative.length>0&&matchedTrading.length>0){
+        return result({status:'UNCERTAIN',confidence,inviteUrl:null,guildName:guildName||'Discord Server',approximateMemberCount:memberCount,approximatePresenceCount:presenceCount,evidenceCoverage:coverage,nativeRelevanceConflict:true,relevanceReason:`Conflicting Discord-native/public relevance evidence remained unresolved (trading matches: ${matchedTrading.slice(0,4).join(', ')}; non-trading matches: ${matchedNegative.slice(0,4).join(', ')}; ${coverageSummary(coverage)})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'UNCERTAIN',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'});
+      }
 
       if(matchedNegative.length>0&&matchedTrading.length===0){
         return result({status:'NON_TRADING',confidence,inviteUrl:null,guildName:guildName||'Discord Server',approximateMemberCount:memberCount,approximatePresenceCount:presenceCount,evidenceCoverage:coverage,relevanceReason:`Non-trading server detected from Discord-native/public metadata (matched: ${matchedNegative.join(', ')}; ${coverageSummary(coverage)})`,operationalOutcome:'SUCCEEDED',retryable:false,livenessStatus:'ACTIVE',relevanceStatus:'NON_TRADING',resolutionStatus:'RESOLVED',validationStatus:'SUCCEEDED'});
