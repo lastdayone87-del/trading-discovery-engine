@@ -349,12 +349,13 @@ export async function processNextSearchJob(
 
     // Execution-time query authority revalidation: every non-manual search job
     // must satisfy the current retrieval-policy before YouTube quota is spent.
+    let authorityQueryRecord: Awaited<ReturnType<typeof getQueryById>> = null;
     if (source !== 'manual_search') {
-      const qRecord = queryId
+      authorityQueryRecord = queryId
         ? await getQueryById(queryId)
-        : (await getQueriesByCountry(country)).find(q => q.query.toLowerCase() === query.toLowerCase());
-      if (qRecord) {
-        const queryAuthority = evaluateAutonomousQueryAuthority(qRecord);
+        : (await getQueriesByCountry(country)).find(q => q.query.toLowerCase() === query.toLowerCase()) || null;
+      if (authorityQueryRecord) {
+        const queryAuthority = evaluateAutonomousQueryAuthority(authorityQueryRecord);
         if (!queryAuthority.eligible) {
           console.log(`[Unified Query Authority] Withheld automated search job ${job.id} for "${query}" (${country}) before spending YouTube quota: ${queryAuthority.reasonCodes.join(', ')}.`);
           if (queryRunId) await failQueryRun(queryRunId, new Error(`Query authority withheld: ${queryAuthority.reasonCodes.join(', ')}`), true);
@@ -407,7 +408,10 @@ export async function processNextSearchJob(
       }
       try {
         const providerRequestBaseId = buildProviderRequestBaseId({queryRunId,jobId:job.id,jobAttempt:job.attempts,pageNumber});
-        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
+        const queryMetadata = authorityQueryRecord?.generation_metadata || {};
+        const preferredLanguage = [queryMetadata.language, queryMetadata.locale, queryMetadata.dominantLocale]
+          .find(value => typeof value === 'string' && value.trim().length > 0) as string | undefined;
+        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
           if(braveProvider) return;
           const budget=getDailyYouTubeQuotaBudget();
           const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));

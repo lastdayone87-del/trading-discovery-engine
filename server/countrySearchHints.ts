@@ -3,11 +3,15 @@ export interface CountrySearchHints {
   relevanceLanguage?: string;
 }
 
+interface CountrySearchHintConfig extends CountrySearchHints {
+  relevanceLanguages?: string[];
+}
+
 /**
  * Retrieval hints only. They bias YouTube search toward the market we are
  * researching but MUST NOT be consumed as creator-country evidence.
  */
-const COUNTRY_SEARCH_HINTS: Record<string, CountrySearchHints> = {
+const COUNTRY_SEARCH_HINTS: Record<string, CountrySearchHintConfig> = {
   'united states': { regionCode: 'US', relevanceLanguage: 'en' },
   'united kingdom': { regionCode: 'GB', relevanceLanguage: 'en' },
   germany: { regionCode: 'DE', relevanceLanguage: 'de' },
@@ -15,11 +19,11 @@ const COUNTRY_SEARCH_HINTS: Record<string, CountrySearchHints> = {
   spain: { regionCode: 'ES', relevanceLanguage: 'es' },
   netherlands: { regionCode: 'NL', relevanceLanguage: 'nl' },
   italy: { regionCode: 'IT', relevanceLanguage: 'it' },
-  switzerland: { regionCode: 'CH', relevanceLanguage: 'de' },
+  switzerland: { regionCode: 'CH', relevanceLanguage: 'de', relevanceLanguages: ['de', 'fr', 'it'] },
   austria: { regionCode: 'AT', relevanceLanguage: 'de' },
-  belgium: { regionCode: 'BE', relevanceLanguage: 'nl' },
+  belgium: { regionCode: 'BE', relevanceLanguage: 'nl', relevanceLanguages: ['nl', 'fr', 'de'] },
   australia: { regionCode: 'AU', relevanceLanguage: 'en' },
-  canada: { regionCode: 'CA', relevanceLanguage: 'en' },
+  canada: { regionCode: 'CA', relevanceLanguage: 'en', relevanceLanguages: ['en', 'fr'] },
   japan: { regionCode: 'JP', relevanceLanguage: 'ja' },
   'south korea': { regionCode: 'KR', relevanceLanguage: 'ko' },
   singapore: { regionCode: 'SG', relevanceLanguage: 'en' },
@@ -37,22 +41,46 @@ const COUNTRY_SEARCH_HINTS: Record<string, CountrySearchHints> = {
   india: { regionCode: 'IN', relevanceLanguage: 'en' }
 };
 
-const normalizeCountry = (country: string) => country.normalize('NFKC').trim().toLocaleLowerCase('en');
+const LANGUAGE_CODES: Record<string, string> = {
+  english: 'en', french: 'fr', german: 'de', dutch: 'nl', italian: 'it',
+  danish: 'da', swedish: 'sv', norwegian: 'no', finnish: 'fi', portuguese: 'pt',
+  spanish: 'es', japanese: 'ja', korean: 'ko', arabic: 'ar', hindi: 'hi',
+  'mandarin chinese': 'zh', chinese: 'zh', malay: 'ms', tamil: 'ta', irish: 'ga',
+  maori: 'mi', 'māori': 'mi', luxembourgish: 'lb'
+};
 
-export function countrySearchHints(countryName: string, declaredLanguages: string[] = []): CountrySearchHints {
+const normalizeCountry = (country: string) => country.normalize('NFKC').trim().toLocaleLowerCase('en');
+const normalizeLanguage = (language: string) => language.trim().toLocaleLowerCase('en').split(/[-_]/)[0];
+
+function languageCode(value: string): string {
+  const normalized = normalizeLanguage(value);
+  return LANGUAGE_CODES[normalized] || (/^[a-z]{2}$/.test(normalized) ? normalized : '');
+}
+
+export function countrySearchLanguageCandidates(countryName: string, declaredLanguages: string[] = []): string[] {
+  const configured = COUNTRY_SEARCH_HINTS[normalizeCountry(countryName)];
+  if (!configured) return [];
+  const configuredLanguages = configured.relevanceLanguages || (configured.relevanceLanguage ? [configured.relevanceLanguage] : []);
+  const declared = declaredLanguages.map(languageCode).filter(Boolean);
+  return [...new Set([...configuredLanguages, ...declared.filter(code => configuredLanguages.includes(code))])];
+}
+
+export function countrySearchHints(countryName: string, declaredLanguages: string[] = [], preferredLanguage?: string): CountrySearchHints {
   const configured = COUNTRY_SEARCH_HINTS[normalizeCountry(countryName)];
   if (!configured) return {};
 
-  // The curated country hint is authoritative for retrieval. Vocabulary
-  // languages are intentionally not converted into country evidence; they are
-  // only a fallback when the country mapping has no language preference.
   const fallbackLanguage = declaredLanguages
-    .map(language => language.trim().toLocaleLowerCase('en'))
+    .map(languageCode)
     .find(language => /^[a-z]{2}$/.test(language));
+  const candidates = countrySearchLanguageCandidates(countryName, declaredLanguages);
+  const preferred = preferredLanguage ? languageCode(preferredLanguage) : '';
+  const relevanceLanguage = preferred && candidates.includes(preferred)
+    ? preferred
+    : candidates[0] || configured.relevanceLanguage || fallbackLanguage;
 
   return {
     regionCode: configured.regionCode,
-    relevanceLanguage: configured.relevanceLanguage || fallbackLanguage
+    relevanceLanguage
   };
 }
 

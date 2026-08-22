@@ -16,6 +16,7 @@ export interface YouTubeProviderLifecycle {
   requestId?: string;
   runId?: string;
   jobId?: string;
+  preferredLanguage?: string;
 }
 
 /**
@@ -486,7 +487,7 @@ export async function searchYouTubeChannelPage(
 ): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
-  const searchHints = countrySearchHints(countryName, vocab?.languages || []);
+  const searchHints = countrySearchHints(countryName, vocab?.languages || [], lifecycle?.preferredLanguage);
 
   const keyPool = getYouTubeKeyPool();
   const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));
