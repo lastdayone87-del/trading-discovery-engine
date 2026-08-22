@@ -177,6 +177,78 @@ test('exploration floor and ceiling adjust score weights', () => {
   assert.ok(ceilingScore.totalScore < normalScore.totalScore);
 });
 
+test('shadow persistence binds all 35 declared frontier-decision values', async () => {
+  let insertParams: unknown[] | undefined;
+  const client = {
+    query: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('INSERT INTO frontier_allocation_decisions')) {
+        insertParams = params;
+      }
+      return { rows: [] };
+    }
+  };
+  const decision = await evaluateShadowFrontierAllocation({
+    opportunityKey: 'opp_shadow_bind_test',
+    legacyCountry: 'France',
+    client,
+    candidates: [{
+      neighborhoodKey: 'FR|fr|GENERAL|cac|KEYWORD_SEARCH|RELEVANCE|none|automated_query',
+      country: 'France',
+      dimensions: { country: 'FR', language: 'fr', queryIntent: 'GENERAL', primaryTermFamily: 'cac', retrievalLane: 'KEYWORD_SEARCH', searchOrdering: 'RELEVANCE', instrumentOrTheme: null, sourceFamily: 'automated_query' },
+      frontierState: 'PROBING', expectedMarginalValue: 20, uncertainty: .8, coverageGain: .6,
+      knownCreatorRatio: .1, resultSetOverlap: .1, isSaturating: false, recentAllocationCount: 0, expectedQuotaCost: 100
+    }]
+  });
+  assert.equal(insertParams?.length, 35);
+  assert.deepEqual(insertParams?.slice(26), [
+    decision.provider?.providerKey,
+    decision.provider?.retrievalSurface,
+    decision.provider?.capability,
+    decision.provider?.costDomain,
+    decision.providerReservationId,
+    decision.quotaReserved,
+    decision.quotaConsumed,
+    JSON.stringify(decision.providerEligibilitySnapshot),
+    decision.provider?.continuationOwner
+  ]);
+});
+
+test('shadow persistence rolls back to its savepoint so a failed insert cannot poison the caller transaction', async () => {
+  let insertAttempted = false;
+  let poisoned = false;
+  let rolledBack = false;
+  const client = {
+    query: async (sql: string, _params?: unknown[]) => {
+      if (sql.includes('INSERT INTO frontier_allocation_decisions')) {
+        insertAttempted = true;
+        poisoned = true;
+        throw new Error('bind message supplies 26 parameters, but prepared statement requires 35');
+      }
+      if (sql.startsWith('SAVEPOINT ')) return { rows: [] };
+      if (sql.startsWith('ROLLBACK TO SAVEPOINT ')) { poisoned = false; rolledBack = true; return { rows: [] }; }
+      if (sql.startsWith('RELEASE SAVEPOINT ')) return { rows: [] };
+      if (sql.includes('frontier_allocation_decisions') || sql.includes('app_settings')) return { rows: [] };
+      if (sql === 'SELECT 1') {
+        if (poisoned) throw new Error('current transaction is aborted');
+        return { rows: [{ ok: 1 }] };
+      }
+      return { rows: [] };
+    }
+  };
+  await evaluateShadowFrontierAllocation({
+    opportunityKey: 'opp_shadow_isolation_test', legacyCountry: 'Germany', client,
+    candidates: [{
+      neighborhoodKey: 'DE|de|GENERAL|dax|KEYWORD_SEARCH|RELEVANCE|none|automated_query', country: 'Germany',
+      dimensions: { country: 'DE', language: 'de', queryIntent: 'GENERAL', primaryTermFamily: 'dax', retrievalLane: 'KEYWORD_SEARCH', searchOrdering: 'RELEVANCE', instrumentOrTheme: null, sourceFamily: 'automated_query' },
+      frontierState: 'PROBING', expectedMarginalValue: 20, uncertainty: .8, coverageGain: .6,
+      knownCreatorRatio: .1, resultSetOverlap: .1, isSaturating: false, recentAllocationCount: 0, expectedQuotaCost: 100
+    }]
+  });
+  assert.equal(insertAttempted, true);
+  assert.equal(rolledBack, true);
+  assert.deepEqual((await client.query('SELECT 1')).rows, [{ ok: 1 }]);
+});
+
 test('evaluateShadowFrontierAllocation produces valid shadow decision with zero scheduling side-effects', async () => {
   const mockCandidate: NeighborhoodCandidate = {
     neighborhoodKey: 'DE|de|GENERAL|dax|KEYWORD_SEARCH|RELEVANCE|none|automated_query',

@@ -494,7 +494,10 @@ export async function evaluateShadowFrontierAllocation(input: {
 
   if (input.client || process.env.DATABASE_URL) {
     const db = input.client || await getDb();
-    await db.query(
+    const savepoint = input.client ? 'frontier_shadow_persist' : null;
+    try {
+      if (savepoint) await db.query(`SAVEPOINT ${savepoint}`);
+      await db.query(
       `INSERT INTO frontier_allocation_decisions(
          decision_id, opportunity_key, allocation_origin, decision_status, legacy_target_country,
          legacy_target_neighborhood_key, selected_neighborhood_key, selected_country,
@@ -534,9 +537,23 @@ export async function evaluateShadowFrontierAllocation(input: {
         decision.quotaDay,
         decision.policyVersion,
         JSON.stringify(decision.proposalEvidenceSnapshot),
-        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null
+        decision.proposalEvidenceSnapshot ? createHash('sha256').update(JSON.stringify(decision.proposalEvidenceSnapshot)).digest('hex') : null,
+        decision.provider!.providerKey,
+        decision.provider!.retrievalSurface,
+        decision.provider!.capability,
+        decision.provider!.costDomain,
+        decision.providerReservationId,
+        decision.quotaReserved,
+        decision.quotaConsumed,
+        JSON.stringify(decision.providerEligibilitySnapshot),
+        decision.provider!.continuationOwner
       ]
-    ).catch((error: unknown) => console.warn('[FrontierAllocator] Failed to persist shadow decision:', error));
+      );
+      if (savepoint) await db.query(`RELEASE SAVEPOINT ${savepoint}`);
+    } catch (error: unknown) {
+      if (savepoint) await db.query(`ROLLBACK TO SAVEPOINT ${savepoint}`).catch(() => undefined);
+      console.warn('[FrontierAllocator] Failed to persist shadow decision:', error);
+    }
   }
 
   return decision;
