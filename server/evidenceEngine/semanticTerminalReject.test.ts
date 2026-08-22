@@ -143,6 +143,14 @@ test('repeated independent creator videos can establish creator-level UNRELATED'
   assert.ok(decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 });
 
+test('semantic negative evidence across separate creator video items aggregates by source family', () => {
+  const first={...semanticUnrelated(96,[{field:'video_title',sourceId:'video-1',sourceFamilyId:'youtube-video:1'}]),id:'semantic-unrelated-1'};
+  const second={...semanticUnrelated(96,[{field:'video_title',sourceId:'video-2',sourceFamilyId:'youtube-video:2'}]),id:'semantic-unrelated-2'};
+  const { decision } = decide([first,second]);
+  assert.equal(decision.status, 'NON_TRADING');
+  assert.ok(decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
+});
+
 test('multiple fields from the same video family are still one observation', () => {
   const correlated = semanticUnrelated(96, [
     { field: 'video_title', sourceId: 'video-1-title', sourceFamilyId: 'youtube-video:1' },
