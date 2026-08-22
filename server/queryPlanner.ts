@@ -273,8 +273,12 @@ export function planDiverseQueries(args: {
     terminology: term
   }));
   const provenByTerm = new Map(proven.map(item => [normalizeQuery(item.atom.term), item.terminology]));
+  // Legacy extracted vocabulary is not the governed terminology lifecycle. Only
+  // terms independently validated by at least two confirmed creators may remain
+  // eligible here; CANDIDATE/OBSERVED tier-3 terms stay evidence-only until the
+  // canonical terminology lifecycle promotes them into `provenTerminology`.
   const legacyLearned = args.learnedVocabulary
-    .filter(term => term.trust_tier === 2 ? (term.validation_count || 0) >= 2 : true)
+    .filter(term => term.trust_tier === 2 && (term.validation_count || 0) >= 2)
     .filter(term => !proven.some(item => normalizeQuery(item.atom.term) === normalizeQuery(term.term)))
     .map(term => ({ atom: atom(term.term, 'LEARNED', 'strategy', term.trust_tier === 2 ? 2 : 3, 'LEARNED'), terminology: undefined }));
   const learnedCandidates = [...proven, ...legacyLearned].flatMap(({ atom: learnedAtom, terminology }, index) => {
