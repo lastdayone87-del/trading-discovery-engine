@@ -25,6 +25,7 @@ import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, type ProviderAllocation } from './providerAwareRetrieval';
+import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -433,10 +434,34 @@ export async function toggleQueuePause(queueName:string,isPaused:boolean):Promis
 
 export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(); }
 export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);}
-export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; }
+export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; remaining:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
-export async function getQuota():Promise<QuotaInfoExtended>{const db=await getDb(); const today=getYouTubeQuotaDay(); const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey); let res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'"); if(!res.rowCount){await db.query("INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset) VALUES('youtube',0,$1,$2)",[limit,today]); res=await db.query("SELECT * FROM quota_tracker WHERE id='youtube'");} let row=res.rows[0]; if(row.last_reset!==today){await db.query("UPDATE quota_tracker SET units_used=0,daily_limit=$1,last_reset=$2 WHERE id='youtube'",[limit,today]); row={...row,units_used:0,daily_limit:limit,last_reset:today};} else await db.query("UPDATE quota_tracker SET daily_limit=$1 WHERE id='youtube'",[limit]); return {unitsUsed:row.units_used||0,dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:keys.map((k,i)=>{const provider=youtubeProviderCooldown.status(k);return {keyIndex:i+1,maskedKey:k.length>8?`${k.slice(0,4)}...${k.slice(-4)}`:'****',unitsUsed:Math.max(0,Math.min(perKey,(row.units_used||0)-i*perKey)),limit:perKey,isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};}
-export async function incrementQuota(units:number):Promise<void>{const db=await getDb(); await getQuota(); await db.query("UPDATE quota_tracker SET units_used=units_used+$1 WHERE id='youtube'",[units]);}
+
+type QueryExecutor={query:(text:string,values?:any[])=>Promise<any>};
+async function ensureYouTubeQuotaDay(db:QueryExecutor, today:string, limit:number):Promise<void>{
+  await db.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset) VALUES('youtube',0,$1,$2)
+    ON CONFLICT(id) DO UPDATE SET units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,daily_limit=excluded.daily_limit,last_reset=excluded.last_reset`,[limit,today]);
+}
+
+async function ensureYouTubeKeyRows(db:QueryExecutor, today:string, keys:string[], perKey:number):Promise<void>{
+  for(const [index,key] of keys.entries()) await db.query(`INSERT INTO youtube_key_quota_usage(quota_day,key_fingerprint,key_index,units_used,daily_limit) VALUES($1,$2,$3,0,$4)
+    ON CONFLICT(quota_day,key_fingerprint) DO UPDATE SET key_index=excluded.key_index,daily_limit=excluded.daily_limit,updated_at=now()`,[today,fingerprintYouTubeKey(key),index+1,perKey]);
+}
+
+export async function getQuota():Promise<QuotaInfoExtended>{
+  const db=await getDb(); const today=getYouTubeQuotaDay(); const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey);
+  await ensureYouTubeQuotaDay(db,today,limit); await ensureYouTubeKeyRows(db,today,keys,perKey);
+  const [aggregate,keyRows]=await Promise.all([db.query("SELECT units_used,last_reset FROM quota_tracker WHERE id='youtube'"),db.query('SELECT key_fingerprint,key_index,units_used,daily_limit FROM youtube_key_quota_usage WHERE quota_day=$1 ORDER BY key_index',[today])]);
+  const row=aggregate.rows[0]||{units_used:0,last_reset:today}; const projection=projectYouTubeQuotaUsage(keys,keyRows.rows.map(row=>({keyFingerprint:String(row.key_fingerprint),keyIndex:Number(row.key_index),unitsUsed:Number(row.units_used||0),dailyLimit:Number(row.daily_limit||perKey)})),perKey);
+  return {unitsUsed:Number(row.units_used||0),dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:projection.map((item,index)=>{const key=keys[index];const provider=youtubeProviderCooldown.status(key);return {...item,maskedKey:'****',isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};
+}
+
+export async function incrementQuota(units:number, providerKey:string):Promise<void>{
+  if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
+  const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
+  const db=await getDb(); const client=await db.connect(); const today=getYouTubeQuotaDay(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey);
+  try{await client.query('BEGIN');await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+}
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
 
