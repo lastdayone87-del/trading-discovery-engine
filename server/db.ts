@@ -26,6 +26,7 @@ import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
+import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -667,10 +668,15 @@ export async function getAutonomousSchedulingSnapshot(): Promise<AutonomousSched
   };
 }
 
+export interface ScheduleAutonomousQueryDiagnosticContext {
+  onDiagnostic: (diagnostic: DiscoveryCandidateDiagnosticPatch) => void;
+}
+
 export async function scheduleAutonomousQueryRuns(
   candidates: AutonomousQueryCandidate[],
   workerId: string,
-  cooldownMinutes: number
+  cooldownMinutes: number,
+  diagnosticContext?: ScheduleAutonomousQueryDiagnosticContext
 ): Promise<ScheduledAutonomousRun[]> {
   const db = await getDb();
   const configuredVideoPercent = Number(await getAppSetting('discovery_video_lane_percent', process.env.DISCOVERY_VIDEO_LANE_PERCENT || '70'));
@@ -679,9 +685,20 @@ export async function scheduleAutonomousQueryRuns(
   const datePercent = Math.min(100, Math.max(0, Number.isFinite(configuredDatePercent) ? configuredDatePercent : 10));
   const client = await db.connect();
   const scheduled: ScheduledAutonomousRun[] = [];
+  let candidateDiagnostic: DiscoveryCandidateDiagnosticPatch = {};
+  let activeOperation = 'scheduling_transaction';
+  const setDiagnostic = (patch: DiscoveryCandidateDiagnosticPatch) => { candidateDiagnostic = { ...candidateDiagnostic, ...patch }; };
+  const flushDiagnostic = (patch: DiscoveryCandidateDiagnosticPatch = {}) => diagnosticContext?.onDiagnostic({ ...candidateDiagnostic, ...patch });
+  const failStep = async (operation: string, error: unknown): Promise<never> => {
+    const sanitized = sanitizeSchedulingError(error);
+    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: operation, sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
+    throw error;
+  };
   try {
     await client.query('BEGIN');
     for (const candidate of candidates) {
+      candidateDiagnostic = {};
+      activeOperation = 'provider_lineage_lookup';
       let allocatedProvider=providerSnapshot(candidate.provider||YOUTUBE_SEARCH_PROVIDER);
       if(candidate.frontierDecisionId){
         const lineage=await client.query(`SELECT provider_key,retrieval_surface,provider_capability,cost_domain,continuation_owner FROM frontier_allocation_decisions WHERE decision_id=$1 FOR UPDATE`,[candidate.frontierDecisionId]);
@@ -692,8 +709,13 @@ export async function scheduleAutonomousQueryRuns(
         candidate.allocationOrigin === 'FRONTIER_CANARY' &&
         allocatedProvider.providerKey === 'brave-search' &&
         allocatedProvider.capability === 'SEARCH_BRAVE_DIRECT';
-      const eligibleProvider=await client.query(`SELECT mode FROM discovery_provider_registry WHERE provider_key=$1 AND (mode IN ('ACTIVE','ACTIVE_GLOBAL','CANARY') OR (mode='SHADOW' AND $4::boolean AND provider_key='brave-search' AND capabilities ? 'SEARCH_BRAVE_DIRECT')) AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,[allocatedProvider.providerKey,allocatedProvider.costDomain,allocatedProvider.capability,allowShadowBraveCanary]);
-      if(!eligibleProvider.rowCount)throw new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE');
+      let eligibleProvider;
+      activeOperation = 'provider_registry_query';
+      try {
+        eligibleProvider = await client.query(`SELECT mode FROM discovery_provider_registry WHERE provider_key=$1 AND (mode IN ('ACTIVE','ACTIVE_GLOBAL','CANARY') OR (mode='SHADOW' AND $4::boolean AND provider_key='brave-search' AND capabilities ? 'SEARCH_BRAVE_DIRECT')) AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,[allocatedProvider.providerKey,allocatedProvider.costDomain,allocatedProvider.capability,allowShadowBraveCanary]);
+      } catch (error) { await failStep('provider_registry_query', error); }
+      setDiagnostic({ provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, providerRegistryOutcome: eligibleProvider.rowCount ? 'ELIGIBLE' : 'INELIGIBLE', providerRegistryReasonCode: eligibleProvider.rowCount ? undefined : 'ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE' });
+      if(!eligibleProvider.rowCount) await failStep('provider_registry_eligibility', new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE'));
       if(!isShadowBraveCanaryAllowed({mode: eligibleProvider.rows[0].mode, providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, allowShadowProvider: candidate.allowShadowProvider})) {
         if (eligibleProvider.rows[0].mode === 'SHADOW') throw new Error('SHADOW_PROVIDER_REQUIRES_EXPLICIT_BRAVE_CANARY');
       }
@@ -705,6 +727,7 @@ export async function scheduleAutonomousQueryRuns(
           createNeighborhoodKey(allocatedDimensions) !== nativeLineage.targetNeighborhoodKey)) {
         throw new Error('FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH');
       }
+      activeOperation = 'query_library_reservation';
       const reserved = await client.query(
         `UPDATE query_library
          SET reserved_at=now(), reserved_until=now()+interval '20 minutes', reserved_by=$2, last_queued_at=now()
@@ -716,11 +739,16 @@ export async function scheduleAutonomousQueryRuns(
          RETURNING *`,
         [candidate.query.id, workerId, String(cooldownMinutes)]
       );
-      if (!reserved.rowCount) continue;
+      if(!reserved.rowCount) {
+        flushDiagnostic({ selectedQueryId: candidate.query.id, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'SKIPPED', reservationReasonCode: 'RESERVATION_PRECONDITION_ZERO_ROWS', disposition: 'SKIPPED', reasonCode: 'RESERVATION_PRECONDITION_ZERO_ROWS' });
+        continue;
+      }
+      setDiagnostic({ selectedQueryId: candidate.query.id, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'RESERVED', reservationReasonCode: 'RESERVED' });
 
       // Allocate one search lane per run, so dual-lane learning does not double
       // traffic. The deficit allocator converges to the configured mix and gives
       // VIDEO the primary share by default.
+      activeOperation = 'retrieval_lane_counts';
       const laneCounts = await client.query(
         `SELECT COUNT(*) FILTER (WHERE retrieval_lane='VIDEO')::int AS video,
                 COUNT(*)::int AS total
@@ -731,6 +759,7 @@ export async function scheduleAutonomousQueryRuns(
       const controlRetrievalLane = allocatedDimensions
         ? allocatedDimensions.retrievalLane as RetrievalLane
         : allocateRetrievalLane(video, total, videoLanePercent);
+      activeOperation = 'search_ordering_counts';
       const orderingCounts = await client.query(
         `SELECT COUNT(*) FILTER (WHERE search_ordering='DATE')::int AS date, COUNT(*)::int AS total
          FROM query_runs WHERE retrieval_lane='VIDEO' AND scheduled_at >= date_trunc('day', now() AT TIME ZONE 'UTC')`
@@ -763,6 +792,7 @@ export async function scheduleAutonomousQueryRuns(
       const oppKey = candidate.frontierDecisionId || (candidate.allocationProvenance?.assignmentKey ? String(candidate.allocationProvenance.assignmentKey) : `opp:q${candidate.query.id}:strat_${candidate.strategy}:n${candidate.query.times_executed || 0}`);
 
       // Query actual Phase 8 neighborhood frontier state and saturation evidence
+      activeOperation = 'frontier_state_lookup';
       const fsRes = await client.query(
         `SELECT
            COALESCE(fs.state, 'UNEXPLORED') AS frontier_state,
@@ -788,6 +818,7 @@ export async function scheduleAutonomousQueryRuns(
       );
 
       // Phase 9 Canary Treatment Reservation under transaction advisory lock
+      activeOperation = 'phase9_treatment_reservation';
       const canaryTreatment = await reserveRetrievalCanaryTreatment({
         opportunityKey: oppKey,
         neighborhoodKey: neighborhood.neighborhoodKey,
@@ -798,6 +829,7 @@ export async function scheduleAutonomousQueryRuns(
         clientOverride: client
       });
 
+      setDiagnostic({ phase9TreatmentOutcome: canaryTreatment.authorized ? 'AUTHORIZED' : 'NOT_AUTHORIZED', phase9TreatmentReasonCode: canaryTreatment.reason });
       if (canaryTreatment.authorized && canaryTreatment.config && canaryTreatment.reservation) {
         retrievalLane = canaryTreatment.config.retrievalLane;
         searchOrdering = canaryTreatment.config.searchOrdering;
@@ -819,18 +851,19 @@ export async function scheduleAutonomousQueryRuns(
       });
 
       const origin = candidate.allocationOrigin || 'LEGACY';
-      const run = await client.query(
-        `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
-         VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-        [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
-      );
+      let run;
+      try {
+        run = await client.query(
+          `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
+           VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
+        );
+      } catch (error) { await failStep('query_run_insert', error); }
       const runId = run.rows[0].id;
 
       if (canaryReservationId) {
         const committed = await commitRetrievalCanaryReservation(canaryReservationId, runId, client);
-        if (!committed) {
-          throw new Error(`RETRIEVAL_CANARY_COMMIT_FAILED: Reservation ${canaryReservationId} could not be committed for run ${runId}`);
-        }
+        if (!committed) await failStep('retrieval_canary_commit', new Error(`RETRIEVAL_CANARY_COMMIT_FAILED: Reservation ${canaryReservationId} could not be committed for run ${runId}`));
       }
 
       // Shadow recommendation recording at scheduling boundary (zero serving authority)
@@ -871,13 +904,17 @@ export async function scheduleAutonomousQueryRuns(
         }
       }
       for (const component of queryComponents(candidate.query)) {
-        await client.query(
-          `INSERT INTO query_run_components(query_run_id,component_type,term,normalized_term,knowledge_tier,position)
-           VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
-          [runId, component.type, component.term.trim(), component.term.normalize('NFKC').trim().toLocaleLowerCase('en'), component.tier, component.position]
-        );
+        try {
+          await client.query(
+            `INSERT INTO query_run_components(query_run_id,component_type,term,normalized_term,knowledge_tier,position)
+             VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+            [runId, component.type, component.term.trim(), component.term.normalize('NFKC').trim().toLocaleLowerCase('en'), component.tier, component.position]
+          );
+        } catch (error) { await failStep('query_run_component_insert', error); }
       }
-      const job = await client.query(
+      let job: any;
+      try {
+        job = await client.query(
         `INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key)
          VALUES('SEARCH_YOUTUBE',$1,20,3,$2) RETURNING id`,
         [JSON.stringify({
@@ -893,13 +930,19 @@ export async function scheduleAutonomousQueryRuns(
           requestedPageDepth
           ,provider:allocatedProvider
         }), `search-run:${runId}`]
-      );
+        );
+      } catch (error) { await failStep('child_job_insert', error); }
       const jobId = job.rows[0].id;
-      await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
+      try { await client.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]); }
+      catch (error) { await failStep('query_run_job_linkage', error); }
 
-      await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
+      try {
+        await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
+      } catch (error) { await failStep('decision_event_persistence', error); }
+      flushDiagnostic({ selectedQueryId: candidate.query.id, queryRunId: runId, jobId, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'RESERVED', reservationReasonCode: 'QUERY_LIBRARY_RESERVED', schedulingOutcome: 'SCHEDULED', schedulingOperation: 'query_run_job_and_selection_commit', disposition: 'SCHEDULED', reasonCode: 'SCHEDULED' });
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
+    activeOperation = 'scheduling_commit';
     await client.query('COMMIT');
 
     // Observation persistence runs AFTER scheduling transaction commit.
@@ -927,6 +970,8 @@ export async function scheduleAutonomousQueryRuns(
 
     return scheduled;
   } catch (error) {
+    const sanitized = sanitizeSchedulingError(error);
+    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: activeOperation, sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
     await client.query('ROLLBACK');
     throw error;
   } finally {
