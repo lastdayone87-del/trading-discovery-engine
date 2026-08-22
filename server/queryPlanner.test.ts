@@ -96,6 +96,22 @@ test('intent rotation avoids immediately repeating the most recently executed in
   assert.deepEqual(rotateAwayFromMostRecentIntent([forex, psychology], [recent]).map(item => item.id), [3]);
 });
 
+test('unvalidated legacy vocabulary cannot bypass the governed terminology lifecycle', () => {
+  const planned = planDiverseQueries({
+    country: 'Germany',
+    count: 20,
+    countryVocabulary: {
+      country: 'Germany', languages: ['German'], native_trading_terminology: ['Börsenanalyse', 'Marktstruktur'],
+      popular_instruments: ['DAX 40', 'Bund Futures'], local_market_phrases: ['Börse Frankfurt'], common_content_format_names: ['Tagesanalyse']
+    },
+    learnedVocabulary: [term(10, 'liquidity', 3, 12), term(11, 'orderflow', 2, 4)],
+    existingQueries: [],
+    mode: 'EXPLORATION'
+  });
+  assert.equal(planned.some(item => normalizeQuery(item.query).includes('liquidity')), false);
+  assert.equal(planned.some(item => normalizeQuery(item.query).includes('orderflow')), true);
+});
+
 test('planner creates short, unique, attributable retrieval queries', () => {
   const planned = planDiverseQueries({
     country: 'Germany',
