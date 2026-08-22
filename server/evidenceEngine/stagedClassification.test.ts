@@ -29,6 +29,19 @@ test('one incidental field abstains rather than turning score into confirmation'
   assert.equal(stage(report, 'CORROBORATION').disposition, 'ABSTAIN');
 });
 
+test('video-title terminology alone remains uncertain and explains the abstention', () => {
+  const weak = evidence('weak-title', {
+    category: 'TERMINOLOGY',
+    finalWeight: 35,
+    rawWeight: 40,
+    provenance: { provider: 'video_metadata', type: 'terminology', matchedTerm: 'trading', sourceRef: 'v1', fields: [{ field: 'video_title', sourceId: 'v1' }] }
+  });
+  const report = evaluateClassificationStages({ channel_name: 'A', description: '' }, [weak], collection());
+  assert.equal(report.lifecycleAction, 'REVIEW');
+  assert.equal(stage(report, 'CORROBORATION').disposition, 'ABSTAIN');
+  assert.ok(stage(report, 'CORROBORATION').reasonCodes.includes('WEAK_VIDEO_TERMINOLOGY_ONLY'));
+});
+
 test('missing evidence enriches and affirmative dominant contradiction rejects', () => {
   assert.equal(evaluateClassificationStages({ channel_name: '', description: '' }, [], collection({ sufficiency: 'MISSING', reasonCodes: ['NO_CLASSIFIABLE_METADATA'] })).lifecycleAction, 'ENRICH');
   const negative = evidence('gaming', { polarity: 'NEGATIVE', category: 'IRRELEVANT_DOMAIN', rawMatches: ['gaming'], finalWeight: -30 });
