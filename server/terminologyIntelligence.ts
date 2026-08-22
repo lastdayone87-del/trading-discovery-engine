@@ -158,7 +158,9 @@ export async function observeTerminology(args: {
   let resolvedNativeStatus: NativeEvidenceStatus | null = args.nativeEvidenceStatus || null;
   let resolvedProvenanceFamily: SourceProvenanceFamily | null = args.sourceProvenanceFamily || null;
 
-  if (!resolvedNativeStatus && resolvedCreatorCountry && resolvedCreatorCountry === country) {
+  const sameCountryCreator = Boolean(resolvedCreatorCountry && resolvedCreatorCountry === country);
+  const termLanguageMatchesContext = contextLang !== 'und' && codeSwitching.termLanguage === contextLang;
+  if (!resolvedNativeStatus && sameCountryCreator && termLanguageMatchesContext) {
     resolvedNativeStatus = 'NATIVE_OBSERVED';
     resolvedProvenanceFamily = 'CREATOR_METADATA';
   }

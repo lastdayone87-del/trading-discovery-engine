@@ -313,7 +313,8 @@ test('Phase 10: observeTerminology automatically feeds Phase 10 native evidence 
     termType: 'TERMINOLOGY',
     observationType: 'VIDEO_TITLE',
     channelId: 'UC_INGESTION_1',
-    videoId: 'VID_INGEST_100'
+    videoId: 'VID_INGEST_100',
+    locale: 'de-DE'
   }, runner);
 
   assert.ok(termId);
@@ -379,6 +380,49 @@ test('Phase 10: Separate creator geography, market geography, and code-switching
   const brObs = runner.observations.find(o => o.canonical_term_id === brTermId);
   assert.ok(brObs);
   assert.equal(brObs.target_market_country, null, 'Unspecified target market country must be NULL, not defaulted');
+});
+
+test('Stage 6: same-country provenance does not falsely promote pure-English terminology', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'forex trading strategy', country: 'DE', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_DE_EN_1',
+    sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', locale: 'de-DE'
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.native_language, 'de');
+  assert.equal(observation.term_language, 'en');
+  assert.equal(observation.is_code_switched, false);
+  assert.equal(observation.native_evidence_status, null);
+  assert.equal(observation.source_provenance_family, null);
+});
+
+test('Stage 6: native and legitimate code-switched terminology remain distinguishable', async () => {
+  const nativeRunner = createMockRunner();
+  const nativeTermId = await observeTerminology({
+    term: 'analyse technique actions', country: 'FR', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_FR_NATIVE_1',
+    sourceCreatorCountry: 'FR', targetMarketCountry: 'FR', locale: 'fr-FR'
+  }, nativeRunner);
+  const nativeObservation = nativeRunner.observations.find(row => row.canonical_term_id === nativeTermId);
+  assert.ok(nativeObservation);
+  assert.equal(nativeObservation.term_language, 'fr');
+  assert.equal(nativeObservation.native_evidence_status, 'NATIVE_OBSERVED');
+
+  const mixedRunner = createMockRunner();
+  const mixedTermId = await observeTerminology({
+    term: 'DAX opening range breakout', country: 'DE', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_DE_MIXED_1',
+    sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', locale: 'de-DE'
+  }, mixedRunner);
+  const mixedObservation = mixedRunner.observations.find(row => row.canonical_term_id === mixedTermId);
+  assert.ok(mixedObservation);
+  assert.equal(mixedObservation.native_language, 'de');
+  assert.equal(mixedObservation.term_language, 'en');
+  assert.equal(mixedObservation.is_code_switched, true);
+  assert.equal(mixedObservation.code_switch_type, 'NATIVE_DOMINANT_ENGLISH_FINANCE');
+  assert.equal(mixedObservation.native_evidence_status, null);
 });
 
 test('Phase 10: Non-video observations fail closed when stable source evidence identity is missing', async () => {

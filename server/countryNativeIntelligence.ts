@@ -199,16 +199,33 @@ export function detectCodeSwitching(text: string, defaultLanguage = 'und'): {
     };
   }
 
-  // English trading terms embedded in non-English text
-  const englishFinanceTokens = ['scalping', 'daytrade', 'breakout', 'swing', 'options', 'futures', 'forex', 'rsi', 'macd', 'setup', 'trader'];
-  const words = norm.split(/\s+/);
-  const hasEnglishToken = words.some(w => englishFinanceTokens.includes(w));
-  const hasNativeTokens = words.some(w => !englishFinanceTokens.includes(w) && w.length >= 3);
+  // English trading terms embedded in non-English text. The classifier keeps
+  // code-switched finance vocabulary valid, but it must not call a wholly
+  // English term native merely because the creator is from the target country.
+  const englishFinanceTokens = new Set([
+    'scalping', 'daytrade', 'breakout', 'swing', 'options', 'futures', 'forex',
+    'rsi', 'macd', 'setup', 'trader', 'trading', 'trade', 'strategy', 'market',
+    'analysis', 'technical', 'fundamental', 'price', 'action', 'volume',
+    'support', 'resistance', 'chart', 'indicator', 'investing', 'investment',
+    'stock', 'stocks', 'crypto', 'bitcoin', 'financial', 'finance', 'flow',
+    'structure', 'opening', 'range'
+  ]);
+  const words = norm.split(/\s+/).filter(word => word.length >= 3 && !GENERIC_STOPWORDS.has(word));
+  const hasEnglishToken = words.some(w => englishFinanceTokens.has(w));
+  const hasNativeTokens = words.some(w => !englishFinanceTokens.has(w));
 
-  if (hasEnglishToken && hasNativeTokens && defaultLanguage !== 'en' && defaultLanguage !== 'und') {
+  if (hasEnglishToken && defaultLanguage !== 'en' && defaultLanguage !== 'und') {
+    if (hasNativeTokens) {
+      return {
+        isCodeSwitched: true,
+        codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE',
+        dominantLanguage: defaultLanguage,
+        termLanguage: 'en'
+      };
+    }
     return {
-      isCodeSwitched: true,
-      codeSwitchType: 'NATIVE_DOMINANT_ENGLISH_FINANCE',
+      isCodeSwitched: false,
+      codeSwitchType: 'NONE',
       dominantLanguage: defaultLanguage,
       termLanguage: 'en'
     };
