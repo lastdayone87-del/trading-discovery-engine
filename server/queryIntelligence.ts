@@ -17,6 +17,7 @@ import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
+import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { executeProviderCall } from './providerResilience';
 import { appendProviderCallEvent } from './db';
 import { getPublishedOrganicQueryCandidates } from './organicQueryExpansion';
@@ -192,7 +193,8 @@ export async function extractVocabularyFromCreator(
   channel: ChannelRecord,
   videoTitles: string[] = [],
   description: string = '',
-  humanApproved = false
+  humanApproved = false,
+  languageContext?: ExplicitTerminologyLanguageContext
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
   const ai = getAIClient();
@@ -214,7 +216,7 @@ export async function extractVocabularyFromCreator(
         { value: description, type: 'DESCRIPTION' }
       ];
       for (const source of sources.filter(item => item.value.toLocaleLowerCase('en').includes(inst.toLocaleLowerCase('en')))) {
-        await observeTerminology({ term: inst, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : source.type, channelId: channel.channel_id, humanApproved, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: source.type } });
+        await observeTerminology({ term: inst, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : source.type, channelId: channel.channel_id, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: source.type } });
       }
     }
   }
@@ -249,25 +251,25 @@ Return ONLY a valid JSON object with format:
         if (Array.isArray(parsed.terminology)) {
           for (const t of parsed.terminology) {
             await saveExtractedTerm(channel.country, t, 'terminology', channel.channel_id);
-            await observeTerminology({ term: String(t), country: channel.country, termType: 'TERMINOLOGY', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
+            await observeTerminology({ term: String(t), country: channel.country, termType: 'TERMINOLOGY', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
         if (Array.isArray(parsed.instruments)) {
           for (const i of parsed.instruments) {
             await saveExtractedTerm(channel.country, i, 'instrument', channel.channel_id);
-            await observeTerminology({ term: String(i), country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
+            await observeTerminology({ term: String(i), country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
         if (Array.isArray(parsed.phrases)) {
           for (const p of parsed.phrases) {
             await saveExtractedTerm(channel.country, p, 'phrase', channel.channel_id);
-            await observeTerminology({ term: String(p), country: channel.country, termType: 'PHRASE', observationType: 'ENRICHMENT', channelId: channel.channel_id, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
+            await observeTerminology({ term: String(p), country: channel.country, termType: 'PHRASE', observationType: 'ENRICHMENT', channelId: channel.channel_id, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
         if (Array.isArray(parsed.formats)) {
           for (const f of parsed.formats) {
             await saveExtractedTerm(channel.country, f, 'format', channel.channel_id);
-            await observeTerminology({ term: String(f), country: channel.country, termType: 'FORMAT', observationType: 'ENRICHMENT', channelId: channel.channel_id, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
+            await observeTerminology({ term: String(f), country: channel.country, termType: 'FORMAT', observationType: 'ENRICHMENT', channelId: channel.channel_id, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
           }
         }
       }
@@ -583,6 +585,11 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
       nativeTerm,
       countryVocabulary,
       targetIntent: args.targetNeighborhoodDimensions.queryIntent,
+      language: typeof evidence.language === 'string' ? evidence.language : null,
+      locale: typeof evidence.locale === 'string' ? evidence.locale : null,
+      dominantLocale: typeof evidence.dominantLocale === 'string'
+        ? evidence.dominantLocale
+        : typeof evidence.dominant_locale === 'string' ? evidence.dominant_locale : null,
       allocationLineage: {
         decisionId: args.decisionId,
         proposalId: args.proposalId,

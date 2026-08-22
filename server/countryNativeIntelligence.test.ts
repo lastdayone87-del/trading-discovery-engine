@@ -902,3 +902,48 @@ test('Phase 10: a novel native proposal is represented by the governed Query Int
   assert.equal(planCountryNativeProposalQuery({ country: 'Unknown', nativeTerm: 'novel', targetIntent: 'strategy', allocationLineage: {} }), null,
     'an unconstructable native proposal fails closed without a generic query');
 });
+
+test('Final integration: missing language evidence remains und and neutral', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'analyse marché local', country: 'FR', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_FR_UNKNOWN_1',
+    sourceCreatorCountry: 'FR', targetMarketCountry: 'FR'
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.native_language, 'und');
+  assert.equal(observation.term_language, 'und');
+  assert.equal(observation.native_evidence_status, null);
+  assert.equal(observation.source_provenance_family, null);
+});
+
+test('Final integration: human approval does not fabricate language evidence', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'forex trading strategy approved', country: 'DE', termType: 'TERMINOLOGY',
+    observationType: 'HUMAN_APPROVED_CHANNEL', videoId: 'VID_DE_APPROVED_1',
+    sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', humanApproved: true
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.native_language, 'und');
+  assert.equal(observation.term_language, 'und');
+  assert.equal(observation.native_evidence_status, null);
+  assert.equal(observation.source_provenance_family, null);
+});
+
+test('Final integration: explicit German context promotes agreeing German terminology', async () => {
+  const runner = createMockRunner();
+  const termId = await observeTerminology({
+    term: 'hebelprodukte aktien', country: 'DE', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', videoId: 'VID_DE_EXPLICIT_1',
+    sourceCreatorCountry: 'DE', targetMarketCountry: 'DE', language: 'de'
+  }, runner);
+  const observation = runner.observations.find(row => row.canonical_term_id === termId);
+  assert.ok(observation);
+  assert.equal(observation.native_language, 'de');
+  assert.equal(observation.term_language, 'de');
+  assert.equal(observation.native_evidence_status, 'NATIVE_OBSERVED');
+  assert.equal(observation.source_provenance_family, 'CREATOR_METADATA');
+});

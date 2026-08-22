@@ -58,6 +58,7 @@ import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecover
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
+import { selectExplicitTerminologyLanguageContext, type ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
@@ -159,6 +160,11 @@ export async function addAutomatedCountrySearch(countryName: string, provenance?
   return [selected.queryRecord.query];
 }
 
+export function preferredLanguageFromQueryMetadata(metadata: Record<string, unknown>): string | undefined {
+  return [metadata.preferredLanguage, metadata.language, metadata.locale, metadata.dominantLocale]
+    .find(value => typeof value === 'string' && value.trim().length > 0) as string | undefined;
+}
+
 /**
  * Worker loop that processes one durable search or enrichment job.
  */
@@ -252,7 +258,7 @@ export async function processNextSearchJob(
         refreshed.quality_score=quality.score; refreshed.quality_breakdown=quality.breakdown;
         await upsertChannel(refreshed);
         if(quality.score>=55) {
-          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true);
+          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true,result.languageContext);
           const db=await getDb();
           await db.query(`UPDATE extracted_vocabulary_sources SET provenance='HUMAN_APPROVED',eligible_after_enrichment=true WHERE channel_id=$1`,[channelId]);
           await enqueueTermHarvest({channelId,text,lineage:'HUMAN_APPROVED',approved:true});
@@ -409,8 +415,7 @@ export async function processNextSearchJob(
       try {
         const providerRequestBaseId = buildProviderRequestBaseId({queryRunId,jobId:job.id,jobAttempt:job.attempts,pageNumber});
         const queryMetadata = authorityQueryRecord?.generation_metadata || {};
-        const preferredLanguage = [queryMetadata.language, queryMetadata.locale, queryMetadata.dominantLocale]
-          .find(value => typeof value === 'string' && value.trim().length > 0) as string | undefined;
+        const preferredLanguage = preferredLanguageFromQueryMetadata(queryMetadata);
         searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
           if(braveProvider) return;
           const budget=getDailyYouTubeQuotaBudget();
@@ -930,11 +935,11 @@ export interface ManualRecheckResult {
   debugLog?: any;
   code?: string;
   retryable?: boolean;
-  errorClass?: ManualRecheckErrorClass;
+    errorClass?: ManualRecheckErrorClass;
   retryAt?: number;
   retryAfterMs?: number;
+  languageContext?: ExplicitTerminologyLanguageContext;
 }
-
 const OFFICIAL_RECHECK_UNITS_PER_PROVIDER = 101;
 const MANUAL_RECHECK_ERROR_CLASSES = new Set<ManualRecheckErrorClass>([
   'TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'PERMANENT_INPUT', 'CREDENTIALS_EXHAUSTED'
@@ -1101,7 +1106,8 @@ export async function triggerManualRecheck(
       return {
         success: true,
         message: `Manual re-scan completed for ${channel.channel_name}. Trading classification and downstream inspection were refreshed from current evidence.`,
-        channel: updatedChannel
+        channel: updatedChannel,
+        languageContext: selectExplicitTerminologyLanguageContext(freshCandidate)
       };
     } catch (error: any) {
       const detail = error instanceof Error ? error.message : String(error);

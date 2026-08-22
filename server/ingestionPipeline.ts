@@ -12,6 +12,7 @@ import {
   getAppSetting
 } from './db';
 import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
+import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import {ConfigurableWeightedStrategy,evaluateClassificationStages,type EvidenceCollectionReport,type RawChannelInput} from './evidenceEngine';
@@ -562,7 +563,7 @@ export async function processChannelThroughPipeline(
   // discoveries are persisted, but must not train autonomous terminology until
   // an explicit human approval supplies independent provenance.
   if (qualityResult.score >= 55 && source !== 'manual_search') {
-    await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description);
+    await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate));
     await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
   }
 
