@@ -37,6 +37,12 @@ function isPromotionalOrAdjacentNegative(item: EvidenceItem): boolean {
   return item.category === 'HYPE_SPECULATION' || item.category === 'NON_TRADING_ADJACENT';
 }
 
+function isWeakVideoTerminologyEvidence(item: EvidenceItem): boolean {
+  if (item.polarity !== 'POSITIVE' || item.category !== 'TERMINOLOGY') return false;
+  const fields = item.provenance?.fields || [];
+  return fields.length > 0 && fields.every(field => field.field === 'video_title');
+}
+
 function terminalContradictionWeights(negative: EvidenceItem[], positiveWeight: number) {
   const terminalNegative = negative.filter(item => item.category === 'IRRELEVANT_DOMAIN' && !isPromotionalOrAdjacentNegative(item));
   const terminalNegativeWeight = terminalNegative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
@@ -94,9 +100,10 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const independentObservations=independence.independentFamilyCount>=2 && observations.size>=2 && (observationFamilies.size>=2 || attributableFields.filter(f=>f.field==='video_title'||f.field==='video_description').length>=2);
   const corroborated = repeatedCreatorIndependent || (corroborating.length > 0 && (repeated || independentObservations || ((sources.size >= 2 || independentDimensions.size >= 2)&&independence.independentFamilyCount>=2)));
   const corroborationEvidence = repeatedCreatorIndependent ? [...corroborating, ...repeatedCreatorHypothesis] : corroborating;
+  const weakVideoTerminologyOnly = positive.length > 0 && positive.every(isWeakVideoTerminologyEvidence);
   const corroboration = corroborated
     ? result('CORROBORATION', 'PASS', [repeatedCreatorIndependent ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED' : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
-    : result('CORROBORATION', 'ABSTAIN', [corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
+    : result('CORROBORATION', 'ABSTAIN', [weakVideoTerminologyOnly?'WEAK_VIDEO_TERMINOLOGY_ONLY':corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
   const contradiction = semanticUnrelatedCandidate
     ? result('CONTRADICTION','FAIL',['CREATOR_LEVEL_SEMANTIC_UNRELATED_CANDIDATE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
     : dominantContradiction

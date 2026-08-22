@@ -121,6 +121,17 @@ test('semantic evidence from one isolated video cannot use the shortcut', () => 
   assert.equal(decision.status, 'UNCERTAIN');
 });
 
+test('direct confirmation cannot rely on weak video-title terminology alone', () => {
+  const weakTitle: EvidenceItem = {
+    id: 'weak-title', source: 'video_metadata', polarity: 'POSITIVE', category: 'TERMINOLOGY', fact: 'Trading term in a title', rawMatches: ['trading'], confidence: 90,
+    reliability: 'HIGH', reliabilityMultiplier: 0.85, rawWeight: 40, finalWeight: 35, timestamp: new Date(0).toISOString(),
+    provenance: { provider: 'video_metadata', type: 'terminology', matchedTerm: 'trading', sourceRef: 'video-1', fields: [{ field: 'video_title', sourceId: 'video-1' }] }
+  };
+  const decision = evaluateUnifiedDecisionPolicy({ evidence: [weakTitle], collection: makeCollection(), lifecycleAction: 'CONFIRM', minimumPositiveWeight: 25, minimumTradingScore: 68 });
+  assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(decision.reasonCodes.includes('SUBSTANTIVE_POSITIVE_EVIDENCE_REQUIRED'));
+});
+
 test('repeated independent creator videos can establish creator-level UNRELATED', () => {
   const repeated = semanticUnrelated(96, [
     { field: 'video_title', sourceId: 'video-1', sourceFamilyId: 'youtube-video:1' },
