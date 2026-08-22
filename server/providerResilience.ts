@@ -5,10 +5,11 @@ export type ProviderErrorClass = 'TIMEOUT'|'CANCELLED'|'RATE_LIMIT'|'TRANSIENT'|
 
 export interface ProviderCallContext {
   provider: string; operation: string; requestId?: string; runId?: string; jobId?: string;
+  requestMetadata?: Record<string, string | null>;
   attempt?: number; reservedCost?: number; actualCost?: number; policyVersion?: string;
 }
 export interface ProviderCallEvent extends Required<Pick<ProviderCallContext,'provider'|'operation'>> {
-  id: string; requestId?: string; runId?: string; jobId?: string; attempt: number;
+  id: string; requestId?: string; runId?: string; jobId?: string; requestMetadata?: Record<string, string | null>; attempt: number;
   status: ProviderStatus; latencyMs: number; reservedCost: number; actualCost: number;
   errorClass?: ProviderErrorClass; policyVersion: string; occurredAt: string;
 }
@@ -191,7 +192,7 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     return {
       persistOutcome:async(event:ProviderCallEvent,persistenceContext?:GeminiPersistenceContext)=>{
         if(!client)return;
-        await queryWithDeadline(client,`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt],persistenceContext?.signal??signal,persistenceContext?.deadlineAtMs??deadlineAtMs);
+        await queryWithDeadline(client,`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt],persistenceContext?.signal??signal,persistenceContext?.deadlineAtMs??deadlineAtMs);
       },
       release:async()=>{if(!client)return;const leasedClient=client;client=undefined;try{await leasedClient.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000});leasedClient.release();}catch{leasedClient.release(true);}}
     };
@@ -210,7 +211,7 @@ function safeProviderReasons(values?:string[]):string[]{
 
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
   const started=Date.now(), id=randomUUID(), controller=new AbortController();
-  const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
+  const base={id,provider:args.context.provider,operation:args.context.operation,requestId:args.context.requestId,runId:args.context.runId,jobId:args.context.jobId,requestMetadata:args.context.requestMetadata,attempt:args.context.attempt||1,reservedCost:args.context.reservedCost||0,policyVersion:args.context.policyVersion||'provider-resilience-v1'};
   let capacityLease:GeminiCapacityLease|undefined;
   let timer:ReturnType<typeof setTimeout>|undefined; let timedOut=false;
   const abort=()=>controller.abort(args.signal?.reason); args.signal?.addEventListener('abort',abort,{once:true});

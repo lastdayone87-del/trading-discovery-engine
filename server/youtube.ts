@@ -254,7 +254,12 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
         }
       }
       const providerRequestId = lifecycle?.requestId ? `${lifecycle.requestId}:attempt:${attempt}` : undefined;
-      return executeProviderCall({context:{provider:'youtube',operation,requestId:providerRequestId,runId:lifecycle?.runId,jobId:lifecycle?.jobId,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
+      const dispatchedRequest = new URL(dispatchedUrl);
+      const requestMetadata = {
+        regionCode: dispatchedRequest.searchParams.get('regionCode'),
+        relevanceLanguage: dispatchedRequest.searchParams.get('relevanceLanguage')
+      };
+      return executeProviderCall({context:{provider:'youtube',operation,requestId:providerRequestId,runId:lifecycle?.runId,jobId:lifecycle?.jobId,requestMetadata,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
         trace('before first-request-record at server/youtube.ts:128');
         await recordFirstYouTubeRequest(operation);
         trace('after first-request-record at server/youtube.ts:128');
