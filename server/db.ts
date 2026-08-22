@@ -22,11 +22,13 @@ import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidenc
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
 import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState';
-import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
+import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
+import { attributeTerminologyPerformance } from './terminologyIntelligence';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
 import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
+import { classifyProviderCapacityFailure } from './providerCapacityDiagnostics';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -473,7 +475,7 @@ export async function getQueryByText(queryText:string):Promise<QueryRecord|null>
 export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;}):Promise<QueryRecord>{const db=await getDb(); const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' '); const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[query,normalizeQueryText(query),record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(record.generationMetadata||{})]); return rowToQuery(res.rows[0]);}
 export async function updateQueryExecutionStats(queryId:number,stats:{totalChannelsFound:number;uniqueChannelsFound:number;qualityChannelsFound:number;communityChannelsFound:number;avgQualityScore:number;performanceScore:number;newCollection?:'PROVEN'|'EXPERIMENTAL'|'REJECTED';}):Promise<void>{const db=await getDb(); await db.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`,[stats.totalChannelsFound,stats.uniqueChannelsFound,stats.qualityChannelsFound,stats.communityChannelsFound,stats.avgQualityScore,stats.performanceScore,stats.newCollection||null,queryId]);}
 export async function setQueryCollection(queryId:number,collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED'):Promise<void>{const db=await getDb(); await db.query('UPDATE query_library SET collection=$1 WHERE id=$2',[collection,queryId]);}
-export async function addQueryExecutionLog(log:{query_id?:number;query:string;country:string;executed_at:string;channels_discovered:number;unique_new_channels:number;quality_creators_discovered:number;communities_discovered:number;cycle_quality_score:number;logs?:string[];}):Promise<void>{const db=await getDb(); await db.query(`INSERT INTO query_execution_logs(query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,[log.query_id||null,log.query,log.country,log.executed_at,log.channels_discovered,log.unique_new_channels,log.quality_creators_discovered,log.communities_discovered,log.cycle_quality_score,JSON.stringify(log.logs||[])]);}
+export async function addQueryExecutionLog(log:{query_id?:number;query_run_id?:string;query:string;country:string;executed_at:string;channels_discovered:number;unique_new_channels:number;quality_creators_discovered:number;communities_discovered:number;cycle_quality_score:number;logs?:string[];}):Promise<void>{const db=await getDb(); await db.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`,[log.query_run_id||null,log.query_id||null,log.query,log.country,log.executed_at,log.channels_discovered,log.unique_new_channels,log.quality_creators_discovered,log.communities_discovered,log.cycle_quality_score,JSON.stringify(log.logs||[])]);}
 export async function getRecentQueryExecutionLogs(limit=20):Promise<QueryExecutionLog[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_execution_logs ORDER BY executed_at DESC LIMIT $1',[limit]); return res.rows.map(r=>({id:r.id,query_id:r.query_id||undefined,query:r.query,country:r.country,executed_at:iso(r.executed_at)||'',channels_discovered:r.channels_discovered||0,unique_new_channels:r.unique_new_channels||0,quality_creators_discovered:r.quality_creators_discovered||0,communities_discovered:r.communities_discovered||0,cycle_quality_score:r.cycle_quality_score||0,logs:parseJson(r.logs,[])}));}
 export async function saveExtractedTerm(country:string,term:string,category:'terminology'|'instrument'|'phrase'|'format',sourceChannelId?:string):Promise<void>{const db=await getDb(); const clean=term.trim(); if(!clean)return; const saved=await db.query(`INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,1,now(),now(),3,0) ON CONFLICT(country,term) DO UPDATE SET occurrences=extracted_trading_vocabulary.occurrences+1,last_extracted=now(),source_channel_id=COALESCE($4,extracted_trading_vocabulary.source_channel_id) RETURNING id`,[country,clean,category,sourceChannelId||null]); if(sourceChannelId){await db.query(`INSERT INTO extracted_vocabulary_sources(term_id,channel_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM channels WHERE channel_id=$2 AND trading_status='TRADING_CONFIRMED') ON CONFLICT DO NOTHING`,[saved.rows[0].id,sourceChannelId]); await db.query(`UPDATE extracted_trading_vocabulary v SET validation_count=s.confirmed_sources,trust_tier=CASE WHEN s.confirmed_sources>=2 THEN 2 ELSE 3 END FROM (SELECT COUNT(DISTINCT evs.channel_id)::int confirmed_sources FROM extracted_vocabulary_sources evs JOIN channels c ON c.channel_id=evs.channel_id AND c.trading_status='TRADING_CONFIRMED' WHERE evs.term_id=$1) s WHERE v.id=$1`,[saved.rows[0].id]);}}
 export async function getExtractedVocabulary(country?:string):Promise<ExtractedTermRecord[]>{const db=await getDb(); const res=country?await db.query('SELECT * FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC',[country]):await db.query('SELECT * FROM extracted_trading_vocabulary ORDER BY trust_tier ASC,occurrences DESC,last_extracted DESC'); return res.rows.map(r=>({id:r.id,country:r.country,term:r.term,category:r.category,source_channel_id:r.source_channel_id||undefined,occurrences:r.occurrences||1,first_extracted:iso(r.first_extracted)||'',last_extracted:iso(r.last_extracted)||'',trust_tier:r.trust_tier||3,validation_count:r.validation_count||0}));}
@@ -1641,6 +1643,9 @@ export async function completeQueryRun(runId: string, metrics: {
   providerRequestsFailed?: number;
   providerRateLimited?: number;
   providerPagesRetrieved?: number;
+  averageQualityScore?: number;
+  performanceScore?: number;
+  newCollection?: 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED';
 }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
@@ -1686,7 +1691,30 @@ export async function completeQueryRun(runId: string, metrics: {
          WHERE id=$1`, [run.rows[0].query_id]
       );
     }
-    if(run.rowCount){const context=await client.query(`SELECT country,retrieval_lane,job_id,completed_at FROM query_runs WHERE id=$1`,[runId]);const row=context.rows[0];await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});await attributeCompletedCountryNativeRun(client,runId,metrics);await attributeCompletedExternalOsintRun(client,runId,metrics);}
+    if(run.rowCount){
+      const context=await client.query(`SELECT qr.country,qr.retrieval_lane,qr.search_ordering,qr.job_id,qr.completed_at,q.* FROM query_runs qr JOIN query_library q ON q.id=qr.query_id WHERE qr.id=$1`,[runId]);
+      const row=context.rows[0];
+      await appendOutcomeWith(client,{eventKey:`query-run:${runId}:funnel:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_FUNNEL_RECORDED',verificationStatus:'PROVISIONAL',sourceEventKey:`query-run:${runId}:selected:v1`,queryId:run.rows[0].query_id,queryRunId:runId,jobId:row.job_id,country:row.country,retrievalLane:row.retrieval_lane,eventTime:iso(row.completed_at)!,payload:{...metrics}});
+      await attributeCompletedCountryNativeRun(client,runId,metrics);
+      await attributeCompletedExternalOsintRun(client,runId,metrics);
+      const attributionMetrics: QueryFunnelMetrics = {
+        rawResults: metrics.rawResults, distinctResults: metrics.distinctResults, duplicateResults: metrics.duplicateResults,
+        knownChannels: metrics.knownChannels, newChannels: metrics.newChannels, countryRejected: metrics.countryRejected,
+        nonTrading: metrics.nonTrading, uncertain: metrics.uncertain, needsReview: metrics.needsReview,
+        tradingConfirmed: metrics.tradingConfirmed, qualityChannels: metrics.qualityChannels,
+        communitiesDiscovered: metrics.communitiesDiscovered, averageQualityScore: metrics.averageQualityScore || 0,
+        noveltyRatio: metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0,
+        countryPrecision: metrics.distinctResults ? (metrics.distinctResults - metrics.countryRejected) / metrics.distinctResults : 0,
+        tradingPrecision: (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) ? metrics.tradingConfirmed / (metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed) : 0,
+        performanceScore: metrics.performanceScore || 0
+      };
+      const marker = await client.query(`INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics) VALUES($1,$2,'query-run-accounting-v1',$3,$4) ON CONFLICT(query_run_id) DO NOTHING RETURNING query_run_id`, [runId, run.rows[0].query_id, metrics.performanceScore || 0, JSON.stringify(attributionMetrics)]);
+      if (marker.rowCount) {
+        await client.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`, [metrics.distinctResults, metrics.newChannels, metrics.qualityChannels, metrics.communitiesDiscovered, metrics.averageQualityScore || 0, metrics.performanceScore || 0, metrics.newCollection || null, run.rows[0].query_id]);
+        await client.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`, [runId, run.rows[0].query_id, row.query, row.country, iso(row.completed_at)!, metrics.distinctResults, metrics.newChannels, metrics.qualityChannels, metrics.communitiesDiscovered, metrics.performanceScore || 0, JSON.stringify([`Durable autonomous ${row.retrieval_lane} lane run ${runId} completed via linked query-run accounting.`])]);
+        await attributeTerminologyPerformance(rowToQuery(row), attributionMetrics, metrics.quotaUsed, row.retrieval_lane, row.search_ordering, client);
+      }
+    }
     if (run.rowCount) await client.query(
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
@@ -1757,21 +1785,25 @@ export async function recordQueryRunSightings(runId: string, queryId: number, si
 export async function failQueryRun(runId: string, error: unknown, terminal: boolean): Promise<void> {
   const db = await getDb();
   const message = String((error as any)?.message || error).slice(0, 2000);
+  const capacity = classifyProviderCapacityFailure(error);
+  const capacityMetadata = capacity ? { providerCapacityReason: capacity.reason, providerCapacityRetryable: capacity.retryable, ...(capacity.retryAt ? { providerCapacityRetryAt: capacity.retryAt } : {}) } : {};
+  const capacityJson = JSON.stringify(capacityMetadata);
   if (!terminal) {
-    await db.query(      `UPDATE query_runs SET status='RETRYING',error=$2
-       WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED')`, [runId, message]);
+    await db.query(`UPDATE query_runs SET status='RETRYING',error=$2,performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
+       WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED')`, [runId, message, capacityJson]);
     return;
   }
   const code=String((error as any)?.code||'').toUpperCase();
-  const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':'PROVIDER_FAILURE';
+  const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':capacity ? 'PROVIDER_CAPACITY' : 'PROVIDER_FAILURE';
+  const failureMetadata = JSON.stringify({ failureKind, ...capacityMetadata });
   const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
     provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search') ELSE provider_requests_attempted END,
     provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
     provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
     provider_rate_limited=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='RATE_LIMITED') ELSE provider_rate_limited END,
     provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
-    performance_details=jsonb_set(performance_details,'{failureKind}',to_jsonb($3::text),true)
-    WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureKind]);
+    performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
+    WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureMetadata]);
   if (run.rowCount) {
     await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
     await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
