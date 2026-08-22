@@ -49,6 +49,8 @@ export interface RetrievalRequest {
   requestId?: string;
   /** Durable queue job identity for provider-event correlation. */
   jobId?: string;
+  /** Optional language selected by persisted query/evidence metadata. */
+  preferredLanguage?: string;
   reserveAdditionalUnits?: (units:number)=>Promise<void>;
   priority?: 'autonomous'|'manual';
 }
@@ -94,7 +96,7 @@ function registerDefaultExecutors(): void {
   registerRetrievalExecutor(YOUTUBE_SEARCH_PROVIDER, async (request) => {
     return searchYouTubeChannelPage(
       request.query, request.country, request.vocabulary, request.lane, request.cursor, request.ordering, request.reserveAdditionalUnits, request.priority,
-      { requestId: request.requestId, runId: request.queryRunId, jobId: request.jobId }
+      { requestId: request.requestId, runId: request.queryRunId, jobId: request.jobId, preferredLanguage: request.preferredLanguage }
     );
   });
 }
