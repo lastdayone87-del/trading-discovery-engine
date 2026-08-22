@@ -22,6 +22,7 @@ import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creat
 import { allocateCreatorSearchAuthority } from './creatorIntelligence/authority';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import {
+  type GeographicAllocationIntent,
   evaluateShadowFrontierAllocation,
   commitAllocationQueryRun,
   releaseAllocationDecision,
@@ -129,7 +130,7 @@ export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCount
  * Produces a quota-paced batch of durable work. It deliberately performs no
  * YouTube or channel processing; workers are the only autonomous executors.
  */
-export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
+export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean; geographicAllocationIntent?: GeographicAllocationIntent }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
   if (targetCountry) await assertCountryAllowed(targetCountry, 'autonomous_cycle');
   if (isCycleRunning) throw new Error('An autonomous discovery producer cycle is already in progress.');
 
@@ -243,7 +244,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             availableAutonomousCapacity: capacity - scheduled.length,
             targetProviderKey: providerTarget?.targetProviderKey,
             requiredCapability: providerTarget?.requiredCapability,
-            allowShadowProvider: providerTarget?.allowShadowProvider
+            allowShadowProvider: providerTarget?.allowShadowProvider,
+            geographicAllocationIntent: providerTarget?.geographicAllocationIntent || 'PIN_LEGACY_COUNTRY'
           });
         creatorAllocation = authority.assignment;
         country = authority.country;

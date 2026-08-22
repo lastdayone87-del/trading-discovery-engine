@@ -15,6 +15,18 @@ export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-
 
 export type DecisionStatus = 'RESERVED' | 'COMMITTED' | 'RELEASED' | 'DEFERRED';
 
+/** Geographic scope is explicit so ordinary persistent-country opportunities cannot silently use global candidates. */
+export type GeographicAllocationIntent = 'PIN_LEGACY_COUNTRY' | 'ALLOW_GLOBAL';
+
+export function resolveFrontierCandidateCountry(input: {
+  legacyCountry: string;
+  geographicAllocationIntent: GeographicAllocationIntent;
+}): string | undefined {
+  return input.geographicAllocationIntent === 'PIN_LEGACY_COUNTRY'
+    ? input.legacyCountry
+    : undefined;
+}
+
 export interface NeighborhoodCandidate {
   neighborhoodKey: string;
   country: string;
@@ -544,6 +556,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
   targetProviderKey?: string;
   requiredCapability?: string;
   allowShadowProvider?: boolean;
+  geographicAllocationIntent?: GeographicAllocationIntent;
   now?: Date;
   client?: any;
 }): Promise<{
@@ -696,13 +709,12 @@ export async function evaluateFrontierCanaryAllocation(input: {
     }
 
     // Fetch Candidates & Score
-    const candidates = await getNeighborhoodCandidates(
-      input.targetProviderKey && input.legacyCountry
-        ? input.legacyCountry
-        : input.allowedCountries?.length === 1 ? input.allowedCountries[0] : undefined,
-      now,
-      runner
-    );
+    const geographicAllocationIntent = input.geographicAllocationIntent || 'ALLOW_GLOBAL';
+    const candidateCountry = resolveFrontierCandidateCountry({
+      legacyCountry: input.legacyCountry,
+      geographicAllocationIntent
+    });
+    const candidates = await getNeighborhoodCandidates(candidateCountry, now, runner);
 
     const expStatus = await getPacificQuotaDayExplorationStatus(now, runner);
     const rejectionReasons: Record<string, string[]> = {};
