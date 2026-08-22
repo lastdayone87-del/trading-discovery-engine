@@ -253,7 +253,11 @@ function rowToChannel(row: any): ChannelRecord {
     discord_resolution_status:row.discord_resolution_status||'NOT_ATTEMPTED',discord_liveness_status:row.discord_liveness_status||'NOT_CHECKED',discord_relevance_status:row.discord_relevance_status||'NOT_CHECKED',discord_validation_status:row.discord_validation_status||'NOT_STARTED',
     discord_candidates: parseJson(row.discord_candidates, []),
     post_approval_job_status: row.post_approval_job_status || undefined,
-    post_approval_job_error: row.post_approval_job_error || undefined
+    post_approval_job_error: row.post_approval_job_error || undefined,
+    community_retry_job_status: row.community_retry_job_status || undefined,
+    community_retry_job_attempts: row.community_retry_job_attempts == null ? undefined : Number(row.community_retry_job_attempts),
+    community_retry_job_max_attempts: row.community_retry_job_max_attempts == null ? undefined : Number(row.community_retry_job_max_attempts),
+    community_retry_job_run_after: iso(row.community_retry_job_run_after),
   };
 }
 
@@ -317,7 +321,11 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
   const columns=`channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,
     COALESCE((SELECT jsonb_agg(to_jsonb(dc) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
-    (SELECT last_error FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_error`;
+    (SELECT last_error FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_error,
+    (SELECT status FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_status,
+    (SELECT attempts FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_attempts,
+    (SELECT max_attempts FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_max_attempts,
+    (SELECT run_after FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_run_after`;
   const [page,summary]=await Promise.all([
     db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY first_seen DESC,channel_id LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
     db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values)

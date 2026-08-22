@@ -72,6 +72,7 @@ import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { processPendingStagedCandidates } from './candidateStaging';
 
@@ -212,7 +213,12 @@ export async function processNextSearchJob(
     if(job.type==='RETRY_COMMUNITY_ACQUISITION'){
       const channel=await getChannelById(String(job.payload.channelId||''));
       if(!channel){await completeJob(job.id);return true;}
-      await inspectAndValidateChannel(channel,undefined,false,false,false);
+      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false);
+      if(inspectionResult && inspectionResult.retryDirective?.attemptFree){
+        const directive=inspectionResult.retryDirective;
+        const deferred=Object.assign(new Error(`Community acquisition deferred: ${directive.reason}`),{code:directive.code,retryable:true,retryAt:directive.retryAt});
+        throw deferred;
+      }
       const refreshed=await getChannelById(channel.channel_id);
       if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT')throw new Error('Retryable community acquisition remains unresolved');
       await completeJob(job.id);return true;
@@ -644,7 +650,7 @@ export async function inspectAndValidateChannel(
   isManualScan: boolean = false,
   enableDebug: boolean = false,
   scheduleRetry: boolean = true
-): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>> } | void> {
+): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
     return;
@@ -661,6 +667,8 @@ export async function inspectAndValidateChannel(
 
   let finalDebugLog: any = null;
   let inspection: Awaited<ReturnType<typeof runChannelInspection>> | null = null;
+  let retryDirective: CommunityRetryDirective | undefined;
+  let attemptFree = false;
   try {
     // 1. Re-check Country Validation before Discord scanning
     const valRes = await validateChannelCountry(
@@ -781,28 +789,35 @@ export async function inspectAndValidateChannel(
       const sameValidatedCandidate=!channel.discord_candidate_id||channel.discord_candidate_id===selectedCandidate.candidateId;
       const shouldProjectValidation=!alreadyValidatedSuccess||selected.operationalOutcome==='SUCCEEDED'||(selected.operationalOutcome==='CONFIRMED_INVALID'&&sameValidatedCandidate);
       if(shouldProjectValidation){Object.assign(channel,projectDiscordValidation(channel,selected,selectedCandidate));await selectDiscordCandidate(channel.channel_id,selectedCandidate.candidateId);}
+      attemptFree=attemptFreeDiscordValidation(selected.operationalOutcome,selected.retryable);
       channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
-      channel.scan_attempts=nextChannelScanAttempts(channel.scan_attempts,selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID');
+      channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:attemptFree?Math.max(0,channel.scan_attempts):nextChannelScanAttempts(channel.scan_attempts,false);
       channel.last_checked=now;
       reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:true});
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
+      retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined}:undefined;
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+      const requiredAcquisitionFailures=(inspection.acquisitionOutcomes||[]).filter(item=>item.required&&item.outcome==='ACQUISITION_FAILED');
+      const hasRetryableAcquisitionFailure=requiredAcquisitionFailures.some(item=>item.retryable);
       if(!alreadyValidatedSuccess){
         channel.discord_status='UNCERTAIN';
-        channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';channel.discord_validation_status='RETRY_PENDING';
+        channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';
+        channel.discord_validation_status=hasRetryableAcquisitionFailure?'RETRY_PENDING':'FAILED_OPERATIONAL';
         channel.discord_resolution_status=channel.discord_resolution_status||'RESOLVED';
         channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':'NOT_DISCOVERED';
       }
       reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
+      retryDirective=inspection.retryDirective;
+      attemptFree=Boolean(retryDirective?.attemptFree);
       channel.scan_status='FAILED';
-      channel.scan_attempts++;
+      if(!retryDirective?.attemptFree)channel.scan_attempts++;
       // An incomplete rescan cannot erase an earlier discovered locator. The
       // append-only checks remain authoritative until a new validation replaces
       // this compatibility projection.
       channel.last_checked=now;
-      if(inspection.acquisitionOutcomes?.some(item=>item.retryable)&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
+      if(retryDirective?.attemptFree&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
     } else {
       // Nothing Found After All Steps
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
@@ -823,7 +838,9 @@ export async function inspectAndValidateChannel(
     // Preserve any structured discovery even when validation or later
     // processing throws. This must run before catch persistence and retry.
     reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
-    channel.scan_attempts++;
+    attemptFree=isAttemptFreeCommunityFailure(err);
+    retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err)}:undefined;
+    if(!attemptFree)channel.scan_attempts++;
     // Durable RETRY_COMMUNITY_ACQUISITION owns the retry budget. Keep channel
     // state retryable here so an internal scan counter cannot prematurely stop
     // a job that still has durable attempts remaining.
@@ -832,7 +849,7 @@ export async function inspectAndValidateChannel(
   } finally {
     await upsertChannel(channel);
   }
-  return { debugLog: enableDebug ? finalDebugLog : undefined, inspection };
+  return { debugLog: enableDebug ? finalDebugLog : undefined, inspection, retryDirective };
 }
 
 export function communityAcquisitionRetryKey(channelId:string):string{return `community-acquisition-retry:${channelId}`;}
