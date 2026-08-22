@@ -510,7 +510,118 @@ export async function generateCandidateQueriesForCountry(
   return newQueries;
 }
 
+/** Typed rejection outcomes for the immutable Phase 8 -> Query Intelligence boundary. */
+export type QueryIntelligenceAuthorizationCode =
+  | 'COUNTRY_EXCLUDED'
+  | 'PROPOSAL_FAMILY_UNSUPPORTED'
+  | 'TARGET_NEIGHBORHOOD_MISMATCH'
+  | 'NATIVE_TERM_MISSING'
+  | 'EVIDENCE_CHECKSUM_MISSING'
+  | 'QUERY_SPECIFICITY_REJECTED'
+  | 'RETRIEVAL_ANCHOR_UNAVAILABLE'
+  | 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM';
+
+export type QueryIntelligenceAuthorizationOutcome =
+  | { status: 'AUTHORIZED'; code: 'AUTHORIZED'; queryRecord: QueryRecord }
+  | { status: 'REJECTED'; code: QueryIntelligenceAuthorizationCode; queryRecord: null }
+  | { status: 'SYSTEM_ERROR'; code: 'AUTHORIZATION_SYSTEM_ERROR'; errorClass: string; queryRecord: null };
+
+type CountryNativeAuthorizationInput = {
+  country: string;
+  decisionId: string;
+  proposalId: string;
+  targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
+  proposalEvidenceSnapshot: Record<string, any>;
+};
+
+export type QueryIntelligenceAuthorizationInputResult =
+  | { status: 'VALID'; nativeTerm: string; evidence: Record<string, any>; targetKey: string }
+  | { status: 'REJECTED'; code: Exclude<QueryIntelligenceAuthorizationCode, 'COUNTRY_EXCLUDED' | 'RETRIEVAL_ANCHOR_UNAVAILABLE' | 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM'> };
+
+/** Pure, database-free classification of the immutable proposal/evidence input. */
+export function classifyCountryNativeAuthorizationInput(args: CountryNativeAuthorizationInput): QueryIntelligenceAuthorizationInputResult {
+  const snapshot = args.proposalEvidenceSnapshot;
+  if (!['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(snapshot?.proposalFamily)) {
+    return { status: 'REJECTED', code: 'PROPOSAL_FAMILY_UNSUPPORTED' };
+  }
+  const targetKey = createNeighborhoodKey(args.targetNeighborhoodDimensions);
+  if (snapshot.targetNeighborhoodKey !== targetKey ||
+      createNeighborhoodKey(snapshot.targetDimensions as DiscoveryNeighborhoodDimensions) !== snapshot.targetNeighborhoodKey) {
+    return { status: 'REJECTED', code: 'TARGET_NEIGHBORHOOD_MISMATCH' };
+  }
+  const evidence = snapshot.supportingEvidence || {};
+  const nativeTerm = typeof evidence.nativeTerm === 'string' ? evidence.nativeTerm.trim()
+    : typeof evidence.canonicalConcept === 'string' ? evidence.canonicalConcept.trim() : '';
+  if (!nativeTerm) return { status: 'REJECTED', code: 'NATIVE_TERM_MISSING' };
+  if (!evidence.evidenceChecksum) return { status: 'REJECTED', code: 'EVIDENCE_CHECKSUM_MISSING' };
+  if (nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ').split(/\s+/).length > 3) {
+    return { status: 'REJECTED', code: 'QUERY_SPECIFICITY_REJECTED' };
+  }
+  return { status: 'VALID', nativeTerm, evidence, targetKey };
+}
+
 /** Governed Query Intelligence boundary for immutable Phase 8 concept allocations. */
+export async function authorizeCountryNativeAllocationQuery(args: CountryNativeAuthorizationInput): Promise<QueryIntelligenceAuthorizationOutcome> {
+  try {
+    try {
+      await assertCountryAllowed(args.country, 'query_generation');
+    } catch (error: any) {
+      if (error?.code === 'COUNTRY_EXCLUDED') {
+        return { status: 'REJECTED', code: 'COUNTRY_EXCLUDED', queryRecord: null };
+      }
+      return { status: 'SYSTEM_ERROR', code: 'AUTHORIZATION_SYSTEM_ERROR', errorClass: 'COUNTRY_SCOPE_VALIDATION_FAILURE', queryRecord: null };
+    }
+
+    const inputResult = classifyCountryNativeAuthorizationInput(args);
+    if (inputResult.status === 'REJECTED') return { status: 'REJECTED', code: inputResult.code, queryRecord: null };
+    const { nativeTerm, evidence, targetKey } = inputResult;
+
+    const vocabs = await getCountryVocabularies();
+    const countryVocabulary = vocabs.find(v => v.country.toLowerCase() === args.country.toLowerCase());
+    const planned = planCountryNativeProposalQuery({
+      country: args.country,
+      nativeTerm,
+      countryVocabulary,
+      targetIntent: args.targetNeighborhoodDimensions.queryIntent,
+      allocationLineage: {
+        decisionId: args.decisionId,
+        proposalId: args.proposalId,
+        targetNeighborhoodKey: targetKey,
+        targetNeighborhoodDimensions: args.targetNeighborhoodDimensions,
+        evidenceChecksum: evidence.evidenceChecksum,
+        canonicalTermId: evidence.canonicalTermId ?? null,
+        evidenceRevision: evidence.evidenceRevision ?? null
+      }
+    });
+    if (!planned) return { status: 'REJECTED', code: 'RETRIEVAL_ANCHOR_UNAVAILABLE', queryRecord: null };
+    if (!planned.query.normalize('NFKC').toLocaleLowerCase('en').includes(nativeTerm.normalize('NFKC').toLocaleLowerCase('en'))) {
+      return { status: 'REJECTED', code: 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM', queryRecord: null };
+    }
+
+    const queryRecord = await upsertQueryRecord({
+      query: planned.query,
+      country: args.country,
+      collection: 'EXPERIMENTAL',
+      intent: planned.intent,
+      knowledgeTiers: planned.knowledgeTiers,
+      generationMode: planned.generationMode,
+      generationReason: planned.generationReason,
+      discoveryObjective: planned.discoveryObjective,
+      primaryTerm: planned.primaryTerm,
+      generationMetadata: planned.metadata
+    });
+    return { status: 'AUTHORIZED', code: 'AUTHORIZED', queryRecord };
+  } catch (error: any) {
+    return {
+      status: 'SYSTEM_ERROR',
+      code: 'AUTHORIZATION_SYSTEM_ERROR',
+      errorClass: typeof error?.code === 'string' ? error.code : error?.name === 'Error' ? 'UNCLASSIFIED_ERROR' : 'AUTHORIZATION_FAILURE',
+      queryRecord: null
+    };
+  }
+}
+
+/** Backward-compatible nullable adapter for non-diagnostic callers. */
 export async function constructCountryNativeAllocationQuery(args: {
   country: string;
   decisionId: string;
@@ -518,45 +629,8 @@ export async function constructCountryNativeAllocationQuery(args: {
   targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
   proposalEvidenceSnapshot: Record<string, any>;
 }): Promise<QueryRecord | null> {
-  await assertCountryAllowed(args.country, 'query_generation');
-  const snapshot = args.proposalEvidenceSnapshot;
-  if (!['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(snapshot?.proposalFamily)) return null;
-  if (snapshot.targetNeighborhoodKey !== createNeighborhoodKey(args.targetNeighborhoodDimensions) ||
-      createNeighborhoodKey(snapshot.targetDimensions as DiscoveryNeighborhoodDimensions) !== snapshot.targetNeighborhoodKey) return null;
-  const evidence = snapshot.supportingEvidence || {};
-  const nativeTerm = typeof evidence.nativeTerm === 'string' ? evidence.nativeTerm.trim()
-    : typeof evidence.canonicalConcept === 'string' ? evidence.canonicalConcept.trim() : '';
-  if (!nativeTerm || !evidence.evidenceChecksum) return null;
-  const vocabs = await getCountryVocabularies();
-  const countryVocabulary = vocabs.find(v => v.country.toLowerCase() === args.country.toLowerCase());
-  const planned = planCountryNativeProposalQuery({
-    country: args.country,
-    nativeTerm,
-    countryVocabulary,
-    targetIntent: args.targetNeighborhoodDimensions.queryIntent,
-    allocationLineage: {
-      decisionId: args.decisionId,
-      proposalId: args.proposalId,
-      targetNeighborhoodKey: createNeighborhoodKey(args.targetNeighborhoodDimensions),
-      targetNeighborhoodDimensions: args.targetNeighborhoodDimensions,
-      evidenceChecksum: evidence.evidenceChecksum,
-      canonicalTermId: evidence.canonicalTermId ?? null,
-      evidenceRevision: evidence.evidenceRevision ?? null
-    }
-  });
-  if (!planned || !planned.query.normalize('NFKC').toLocaleLowerCase('en').includes(nativeTerm.normalize('NFKC').toLocaleLowerCase('en'))) return null;
-  return upsertQueryRecord({
-    query: planned.query,
-    country: args.country,
-    collection: 'EXPERIMENTAL',
-    intent: planned.intent,
-    knowledgeTiers: planned.knowledgeTiers,
-    generationMode: planned.generationMode,
-    generationReason: planned.generationReason,
-    discoveryObjective: planned.discoveryObjective,
-    primaryTerm: planned.primaryTerm,
-    generationMetadata: planned.metadata
-  });
+  const outcome = await authorizeCountryNativeAllocationQuery(args);
+  return outcome.status === 'AUTHORIZED' ? outcome.queryRecord : null;
 }
 
 // ==========================================

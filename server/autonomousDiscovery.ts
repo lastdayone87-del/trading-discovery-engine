@@ -13,7 +13,7 @@ import {
   getDailyYouTubeQuotaBudget
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
-import { constructCountryNativeAllocationQuery, selectNextQueryForCountry } from './queryIntelligence';
+import { authorizeCountryNativeAllocationQuery, selectNextQueryForCountry } from './queryIntelligence';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
@@ -271,8 +271,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
         };
       } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
-        const nativeQuery = governedConceptProposal
-          ? await constructCountryNativeAllocationQuery({
+        const nativeAuthorization = governedConceptProposal
+          ? await authorizeCountryNativeAllocationQuery({
               country,
               decisionId: frontierAllocationInfo.decision.decisionId,
               proposalId: frontierAllocationInfo.decision.proposalId,
@@ -280,6 +280,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
               proposalEvidenceSnapshot: nativeSnapshot
             })
           : null;
+        const nativeQuery = nativeAuthorization?.status === 'AUTHORIZED' ? nativeAuthorization.queryRecord : null;
         const targeted = governedConceptProposal
           ? null
           : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
@@ -294,10 +295,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         } else {
           // Query Intelligence could not construct/find a targeted action for this neighborhood; defer decision and revert to legacy control
           if (frontierAllocationInfo.decision?.decisionId) {
-            await quarantineUnexecutableAllocation(
-              frontierAllocationInfo.decision.decisionId,
-              'Query Intelligence could not authorize a query for the selected immutable proposal/neighborhood evidence'
-            );
+            const diagnostic = nativeAuthorization?.status === 'REJECTED'
+              ? `QUERY_INTELLIGENCE_AUTHORIZATION_REJECTED:${nativeAuthorization.code}`
+              : nativeAuthorization?.status === 'SYSTEM_ERROR'
+                ? `QUERY_INTELLIGENCE_AUTHORIZATION_SYSTEM_ERROR:${nativeAuthorization.errorClass}`
+                : 'QUERY_INTELLIGENCE_AUTHORIZATION_REJECTED:TARGETED_QUERY_NOT_AVAILABLE';
+            await quarantineUnexecutableAllocation(frontierAllocationInfo.decision.decisionId, diagnostic);
           }
           frontierAllocationInfo.authorized = false;
           if (governedConceptProposal) {
