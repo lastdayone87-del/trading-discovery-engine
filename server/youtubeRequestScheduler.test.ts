@@ -254,3 +254,9 @@ test('search propagates the earliest retry when its final eligible provider ente
   const search = source.slice(source.indexOf('export async function searchYouTubeChannelPage'), source.indexOf('/**\n * Fetches recent video titles'));
   assert.match(search, /recordProviderFailure\(apiKey, e\)[\s\S]*throwIfAllProvidersCoolingDown\(keyPool\)/);
 });
+
+test('recent-video description provider exhaustion propagates all-provider cooldown', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const recent = source.slice(source.indexOf('export async function fetchRecentVideoDescriptionsFromAPI'), source.indexOf('/**\n * Fetches richer official channel metadata'));
+  assert.match(recent, /acquisition\.providerFailed\([\s\S]*throwIfAllProvidersCoolingDown\(keyPool\)/);
+});

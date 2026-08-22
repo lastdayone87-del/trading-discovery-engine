@@ -591,6 +591,9 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
   }
 
   acquisition.providerFailed(quotaExceededCount === keyPool.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
+  // Preserve a structured provider-capacity error so the community retry worker
+  // can defer without consuming a meaningful retry opportunity.
+  throwIfAllProvidersCoolingDown(keyPool);
 
   if(!acquiredResponse)throw new Error('Recent-video description API acquisition failed for every configured provider.');
   return [];

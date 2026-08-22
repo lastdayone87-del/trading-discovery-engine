@@ -10,6 +10,12 @@ test('quota/provider capacity waits without consuming an attempt even without re
   assert.ok((result.runAfter||0)>now);
 });
 
+test('community acquisition capacity failure is attempt-free and honors provider retryAt',()=>{
+  const retryAt=now+90_000;
+  const result=decideJobFailure({code:'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',retryable:true,retryAt},5,5,now);
+  assert.deepEqual(result,{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:retryAt});
+});
+
 test('provider cooldown honors retryAt while consuming the bounded attempt budget',()=>{
   const retryAt=now+60_000;
   assert.deepEqual(decideJobFailure({code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryAt},2,3,now),{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:retryAt});
