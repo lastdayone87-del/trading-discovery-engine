@@ -672,6 +672,66 @@ export interface ScheduleAutonomousQueryDiagnosticContext {
   onDiagnostic: (diagnostic: DiscoveryCandidateDiagnosticPatch) => void;
 }
 
+/**
+ * Repair only the proven stale-run invariant: a YouTube query run may remain
+ * active after its linked SEARCH_YOUTUBE job has reached terminal FAILED.
+ * This is deliberately scoped to the query being considered, does not delete
+ * history, and never reopens or bypasses an active/non-terminal job.
+ */
+export async function reconcileTerminalQueryRunsForQuery(client: any, queryId: number): Promise<number> {
+  const result = await client.query(`
+    WITH orphaned AS (
+      SELECT qr.id, qr.query_id
+      FROM query_runs qr
+      JOIN jobs j ON j.id = qr.job_id
+      WHERE qr.query_id = $1
+        AND qr.status IN ('SCHEDULED','RUNNING','RETRYING')
+        AND j.type = 'SEARCH_YOUTUBE'
+        AND j.status = 'FAILED'
+        AND j.attempts >= j.max_attempts
+      FOR UPDATE OF qr
+    ), closed AS (
+      UPDATE query_runs qr
+      SET status = 'FAILED',
+          completed_at = COALESCE(qr.completed_at, now()),
+          error = COALESCE(qr.error, 'ORPHANED_TERMINAL_JOB_FAILURE'),
+          performance_details = jsonb_set(
+            COALESCE(qr.performance_details, '{}'::jsonb),
+            '{failureKind}',
+            to_jsonb('ORPHANED_TERMINAL_JOB_FAILURE'::text),
+            true
+          )
+      FROM orphaned o
+      WHERE qr.id = o.id
+      RETURNING qr.id, qr.query_id
+    )
+    SELECT id, query_id FROM closed`, [queryId]);
+
+  if (!result.rows?.length) return 0;
+  const runIds = result.rows.map((row: any) => String(row.id));
+  const queryIds = [...new Set(result.rows.map((row: any) => Number(row.query_id)))];
+  await client.query(
+    `UPDATE quota_reservations
+     SET status='RELEASED'
+     WHERE operation_type='SEARCH_YOUTUBE'
+       AND operation_id=ANY($1::text[])
+       AND status='RESERVED'`,
+    [runIds]
+  );
+  await client.query(
+    `UPDATE query_library q
+     SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL
+     WHERE q.id=ANY($1::int[])
+       AND NOT EXISTS (
+         SELECT 1 FROM query_runs active
+         WHERE active.query_id=q.id
+           AND active.status IN ('SCHEDULED','RUNNING','RETRYING')
+       )`,
+    [queryIds]
+  );
+  return runIds.length;
+}
+
 export async function scheduleAutonomousQueryRuns(
   candidates: AutonomousQueryCandidate[],
   workerId: string,
@@ -727,6 +787,10 @@ export async function scheduleAutonomousQueryRuns(
           createNeighborhoodKey(allocatedDimensions) !== nativeLineage.targetNeighborhoodKey)) {
         throw new Error('FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH');
       }
+      activeOperation = 'query_run_orphan_reconciliation';
+      const reconciledRunCount = await reconcileTerminalQueryRunsForQuery(client, candidate.query.id);
+      if (reconciledRunCount) setDiagnostic({ reservationRecoveryOutcome: 'ORPHANED_TERMINAL_RUNS_RECONCILED' });
+
       activeOperation = 'query_library_reservation';
       const reserved = await client.query(
         `UPDATE query_library
