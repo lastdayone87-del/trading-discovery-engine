@@ -42,6 +42,7 @@ export interface DiscoveryCandidateDiagnostic {
   phase9TreatmentOutcome?: 'AUTHORIZED' | 'NOT_AUTHORIZED' | 'NOT_REACHED';
   phase9TreatmentReasonCode?: string;
   reservationOutcome?: 'RESERVED' | 'SKIPPED' | 'NOT_REACHED';
+  reservationRecoveryOutcome?: 'ORPHANED_TERMINAL_RUNS_RECONCILED';
   reservationReasonCode?: string;
   schedulingOutcome?: 'SCHEDULED' | 'FAILED' | 'NOT_REACHED';
   schedulingOperation?: string;
