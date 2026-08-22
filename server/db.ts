@@ -1384,10 +1384,22 @@ export async function getQueryById(queryId: number): Promise<QueryRecord | null>
   return res.rows[0] ? rowToQuery(res.rows[0]) : null;
 }
 
-export async function startQueryRun(runId: string): Promise<void> {
+export async function startQueryRun(runId: string): Promise<boolean> {
   const db = await getDb();
-  await db.query(`UPDATE query_runs SET status='RUNNING',started_at=COALESCE(started_at,now()) WHERE id=$1`, [runId]);
-  await db.query(`UPDATE quota_reservations SET expires_at=now()+interval '20 minutes' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+  const started = await db.query(`UPDATE query_runs
+    SET status='RUNNING',started_at=COALESCE(started_at,now())
+    WHERE id=$1 AND status IN ('SCHEDULED','RETRYING')
+    RETURNING status`, [runId]);
+  if (started.rowCount) {
+    await db.query(`UPDATE quota_reservations SET expires_at=now()+interval '20 minutes' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+    return true;
+  }
+  const current = await db.query(`SELECT status FROM query_runs WHERE id=$1`, [runId]);
+  if (!current.rowCount) throw new Error('QUERY_RUN_NOT_FOUND');
+  const status = String(current.rows[0].status);
+  if (status === 'RUNNING') return true;
+  if (status === 'COMPLETED' || status === 'FAILED') return false;
+  throw new Error(`QUERY_RUN_INVALID_START_STATE:${status}`);
 }
 
 async function attributeCompletedCountryNativeRun(client: EventClient, runId: string, metrics: {
@@ -1529,10 +1541,17 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE query_runs SET status='COMPLETED',raw_results=$2,distinct_results=$3,duplicate_results=$4,
        known_channels=$5,new_channels=$6,country_rejected=$7,non_trading=$8,uncertain=$9,needs_review=$10,
        trading_confirmed=$11,unique_channels=$12,quality_channels=$13,communities_discovered=$14,quota_used=$15,
-       provider_cost_usd=COALESCE($16,provider_cost_usd),provider_requests_attempted=COALESCE($17,provider_requests_attempted),
-       provider_requests_succeeded=COALESCE($18,provider_requests_succeeded),provider_requests_failed=COALESCE($19,provider_requests_failed),
-       provider_rate_limited=COALESCE($20,provider_rate_limited),provider_pages_retrieved=COALESCE($21,provider_pages_retrieved),
-       performance_details=$22,completed_at=now() WHERE id=$1 AND status<>'COMPLETED' RETURNING query_id`,
+       provider_cost_usd=COALESCE($16,provider_cost_usd),
+       provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search') ELSE COALESCE($17,provider_requests_attempted) END,
+       provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE COALESCE($18,provider_requests_succeeded) END,
+       provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE COALESCE($19,provider_requests_failed) END,
+       provider_rate_limited=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='RATE_LIMITED') ELSE COALESCE($20,provider_rate_limited) END,
+       provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE COALESCE($21,provider_pages_retrieved) END,
+       performance_details=$22,completed_at=now() WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED')
+       AND (provider_key IS NULL OR provider_key <> 'youtube-search' OR EXISTS (
+         SELECT 1 FROM provider_call_events e
+         WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS'
+       )) RETURNING query_id`,
       [runId, metrics.rawResults, metrics.distinctResults, metrics.duplicateResults, metrics.knownChannels,
        metrics.newChannels, metrics.countryRejected, metrics.nonTrading, metrics.uncertain, metrics.needsReview,
        metrics.tradingConfirmed, metrics.uniqueChannels, metrics.qualityChannels, metrics.communitiesDiscovered,
@@ -1540,6 +1559,16 @@ export async function completeQueryRun(runId: string, metrics: {
        metrics.providerRequestsSucceeded ?? null, metrics.providerRequestsFailed ?? null, metrics.providerRateLimited ?? null,
        metrics.providerPagesRetrieved ?? null, JSON.stringify(metrics)]
     );
+    if (!run.rowCount) {
+      const state = await client.query(`SELECT status FROM query_runs WHERE id=$1`, [runId]);
+      if (!state.rowCount) throw new Error('QUERY_RUN_NOT_FOUND');
+      const status = String(state.rows[0].status);
+      if (status === 'COMPLETED' || status === 'FAILED') {
+        await client.query('COMMIT');
+        return;
+      }
+      throw new Error('QUERY_RUN_COMPLETION_REQUIRES_SUCCESSFUL_PROVIDER_ATTEMPT');
+    }
     if (run.rowCount) await client.query(`UPDATE query_run_components SET performance_details=$2 WHERE query_run_id=$1`, [runId, JSON.stringify(metrics)]);
     if (run.rowCount) {
       await client.query(
@@ -1620,16 +1649,26 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const db = await getDb();
   const message = String((error as any)?.message || error).slice(0, 2000);
   if (!terminal) {
-    await db.query(`UPDATE query_runs SET status='RETRYING',error=$2 WHERE id=$1`, [runId, message]);
+    await db.query(      `UPDATE query_runs SET status='RETRYING',error=$2
+       WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED')`, [runId, message]);
     return;
   }
   const code=String((error as any)?.code||'').toUpperCase();
   const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':'PROVIDER_FAILURE';
-  const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),performance_details=jsonb_set(performance_details,'{failureKind}',to_jsonb($3::text),true) WHERE id=$1 RETURNING query_id`, [runId, message, failureKind]);
-  if (run.rowCount) await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
-  await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
-  const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
-  await captureCompletedRunObservation(runId).catch(captureError => console.warn('[DiscoveryTrustEvaluation] Failure observation capture failed:', captureError));
+  const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
+    provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search') ELSE provider_requests_attempted END,
+    provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
+    provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
+    provider_rate_limited=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='RATE_LIMITED') ELSE provider_rate_limited END,
+    provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1 AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
+    performance_details=jsonb_set(performance_details,'{failureKind}',to_jsonb($3::text),true)
+    WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureKind]);
+  if (run.rowCount) {
+    await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
+    await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+    const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
+    await captureCompletedRunObservation(runId).catch(captureError => console.warn('[DiscoveryTrustEvaluation] Failure observation capture failed:', captureError));
+  }
 }
 
 export async function tryReserveQuota(args: {

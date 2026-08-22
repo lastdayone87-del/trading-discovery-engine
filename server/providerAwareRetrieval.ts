@@ -45,11 +45,24 @@ export interface RetrievalRequest {
   provider: ProviderAllocation; query: string; country: string; vocabulary?: CountryVocabulary;
   lane: RetrievalLane; cursor: string | null; ordering: SearchOrdering;
   queryRunId?: string;
+  /** Stable logical page identity; provider attempts append their attempt number. */
+  requestId?: string;
+  /** Durable queue job identity for provider-event correlation. */
+  jobId?: string;
   reserveAdditionalUnits?: (units:number)=>Promise<void>;
   priority?: 'autonomous'|'manual';
 }
 
 export type RetrievalExecutor = (request: RetrievalRequest) => Promise<RetrievalPage>;
+
+export function buildProviderRequestBaseId(input: {
+  queryRunId: string;
+  jobId: string;
+  jobAttempt: number;
+  pageNumber: number;
+}): string {
+  return `query-run:${input.queryRunId}:job:${input.jobId}:attempt:${input.jobAttempt}:page:${input.pageNumber}`;
+}
 
 const registeredExecutors = new Map<string, { provider: ProviderAllocation; executor: RetrievalExecutor }>();
 
@@ -80,7 +93,8 @@ export function clearRegisteredExecutorsForTest(): void {
 function registerDefaultExecutors(): void {
   registerRetrievalExecutor(YOUTUBE_SEARCH_PROVIDER, async (request) => {
     return searchYouTubeChannelPage(
-      request.query, request.country, request.vocabulary, request.lane, request.cursor, request.ordering, request.reserveAdditionalUnits, request.priority
+      request.query, request.country, request.vocabulary, request.lane, request.cursor, request.ordering, request.reserveAdditionalUnits, request.priority,
+      { requestId: request.requestId, runId: request.queryRunId, jobId: request.jobId }
     );
   });
 }

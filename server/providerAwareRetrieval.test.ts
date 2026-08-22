@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  buildProviderRequestBaseId,
   providerSnapshot,
   YOUTUBE_SEARCH_PROVIDER,
   executeAllocatedRetrievalPage,
@@ -29,6 +30,13 @@ test('only the explicit Brave direct-search canary may allocate a SHADOW provide
   assert.equal(isShadowBraveCanaryAllowed({ mode: 'SHADOW', providerKey: 'brave-search', capability: 'SEARCH_BRAVE_DIRECT', allowShadowProvider: false }), false);
   assert.equal(isShadowBraveCanaryAllowed({ mode: 'SHADOW', providerKey: 'youtube-search', capability: 'SEARCH_YOUTUBE', allowShadowProvider: true }), false);
   assert.equal(isShadowBraveCanaryAllowed({ mode: 'CANARY', providerKey: 'brave-search', capability: 'SEARCH_BRAVE_DIRECT', allowShadowProvider: true }), false);
+});
+
+test('provider request identity is deterministic and contains no provider secret', () => {
+  const base = buildProviderRequestBaseId({ queryRunId: 'run-1', jobId: 'job-1', jobAttempt: 2, pageNumber: 3 });
+  assert.equal(base, 'query-run:run-1:job:job-1:attempt:2:page:3');
+  assert.equal(`${base}:attempt:4`, 'query-run:run-1:job:job-1:attempt:2:page:3:attempt:4');
+  assert.doesNotMatch(base, /key|secret|token/i);
 });
 
 test('provider contract accepts a hypothetical non-YouTube provider shape structurally', () => {
@@ -176,6 +184,18 @@ test('migration 111 is additive, backfills official-only history, protects linea
   assert.doesNotMatch(sql, /DROP TABLE|DROP COLUMN|TRUNCATE/i);
   assert.doesNotMatch(sql, /ALTER COLUMN provider_key SET DEFAULT 'youtube-search'/);
   assert.doesNotMatch(sql, /ALTER COLUMN provider_reserved_amount SET DEFAULT 100/);
+});
+
+test('allocated retrieval forwards query-run, request, and job lifecycle identities to the default YouTube executor', () => {
+  const retrieval = readFileSync(new URL('./providerAwareRetrieval.ts', import.meta.url), 'utf8');
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  assert.match(retrieval, /request\.requestId/);
+  assert.match(retrieval, /runId: request\.queryRunId/);
+  assert.match(retrieval, /jobId: request\.jobId/);
+  assert.match(queue, /requestId:providerRequestBaseId,jobId:job\.id/);
+  assert.match(youtube, /providerRequestId = lifecycle\?\.requestId \? `\$\{lifecycle\.requestId\}:attempt:\$\{attempt\}`/);
+  assert.match(youtube, /runId:lifecycle\?\.runId,jobId:lifecycle\?\.jobId/);
 });
 
 test('production queue worker loads Brave executor registration before dispatch', () => {

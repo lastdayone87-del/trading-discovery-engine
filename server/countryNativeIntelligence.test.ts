@@ -825,7 +825,7 @@ test('Phase 10: every scheduler skip has an explicit reservation disposition and
   assert.match(allocator, /STALE_RESERVATION_RECOVERED/);
   assert.match(db, /SET trial_status='TRIED'/);
   assert.match(db, /p\.trial_status='PENDING'/);
-  assert.match(db, /WHERE id=\$1 AND status<>'COMPLETED'/);
+  assert.match(db, /WHERE id=\$1 AND status NOT IN \(\'COMPLETED\',\'FAILED\'\)/);
 });
 
 test('Phase 10: authoritative query completion attributes native outcomes through persisted allocation lineage', () => {
