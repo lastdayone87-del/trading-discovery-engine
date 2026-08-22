@@ -46,6 +46,7 @@ import './braveSearch';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, selectNextQueryForCountry } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
+import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
 import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
@@ -601,6 +602,22 @@ export async function processNextSearchJob(
     const terminal=disposition==='FAILED';
     if(investigationId&&investigationStepId)await failInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,attempt:job.attempts,terminal,failureClass:String(err?.code||err?.name||'WORKER_FAILURE')}).catch(error=>console.error(`[Investigation:${investigationId}] Failure transition failed:`,error));
     if (job.type === 'MANUAL_SEARCH_PAGE' && terminal) await failManualSearch(String(job.payload.sessionId||''), err);
+    if (job.type === 'POST_APPROVAL_ENRICH' && terminal) {
+      const channelId = String(job.payload?.channelId || '');
+      const channel = channelId ? await getChannelById(channelId) : null;
+      if (channel) {
+        const projection = resolveTerminalEnrichmentFailure(channel, terminal);
+        if (projection.shouldProject) {
+          channel.scan_status = projection.scanStatus;
+          channel.trading_status = projection.tradingStatus;
+          channel.discord_status = projection.discordStatus;
+          channel.discord_validation_status = projection.discordValidationStatus;
+          channel.scan_attempts = Math.max(channel.scan_attempts || 0, job.attempts);
+          channel.last_checked = new Date().toISOString();
+          await upsertChannel(channel);
+        }
+      }
+    }
     if (job.type === 'ENRICH_CHANNEL' && terminal) {
       const channelId = String(job.payload?.channelId || '');
       const channel = channelId ? await getChannelById(channelId) : null;
