@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { decayWeight, decideLifecycle, inferScript, normalizeTerm } from './terminologyIntelligence';
+import { decayWeight, decideLifecycle, getTerminologyDashboard, inferScript, normalizeTerm } from './terminologyIntelligence';
 
 test('normalization is Unicode-safe and stable across whitespace variants', () => {
   assert.equal(normalizeTerm('  ＮＱ   Futures '), 'nq futures');
@@ -32,4 +32,21 @@ test('poor repeated production yield demotes without deleting evidence', () => {
   const result = decideLifecycle({ current: 'PROVEN_SEARCH_TERM', decayedEvidence: 20, distinctCreators: 8, distinctCommunities: 5, executions: 6, decayedYield: 0.04, termType: 'TERMINOLOGY' });
   assert.equal(result.status, 'DEMOTED');
   assert.match(result.reason, /demotion threshold/);
+});
+
+test('terminology dashboard projects the weighted yield before aggregating the derived relation', async () => {
+  let capturedSql = '';
+  const runner = {
+    async query(sql: string) {
+      capturedSql = sql;
+      return { rows: [] };
+    }
+  } as any;
+
+  await getTerminologyDashboard(undefined, runner);
+
+  assert.match(capturedSql, /SUM\(decayed_yield_score\*executions\) weighted_yield_total/);
+  assert.match(capturedSql, /SUM\(weighted_yield_total\)\/NULLIF\(SUM\(executions\),0\)/);
+  const derivedRelation = capturedSql.match(/FROM \(SELECT ([\s\S]+?) FROM terminology_performance/)?.[1] || '';
+  assert.match(derivedRelation, /weighted_yield_total/);
 });
