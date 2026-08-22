@@ -75,6 +75,7 @@ export async function allocateCreatorSearchAuthority(input: {
     allocationOrigin: 'FRONTIER_CANARY' | 'LEGACY';
     targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
     decision?: AllocationDecision;
+    reason?: string;
   };
 }> {
   // 1. Evaluate Bounded Frontier Neighborhood Canary Authority
@@ -106,7 +107,8 @@ export async function allocateCreatorSearchAuthority(input: {
         authorized: true,
         allocationOrigin: 'FRONTIER_CANARY',
         targetNeighborhoodDimensions: frontierResult.targetNeighborhoodDimensions,
-        decision
+        decision,
+        reason: frontierResult.reason
       }
     };
   }
@@ -117,7 +119,7 @@ export async function allocateCreatorSearchAuthority(input: {
   const control = controlResult.rows[0];
   if (!control?.top_level_authority_enabled) {
     const assignment = await allocateCreatorSearchCanary({ opportunityKey: input.opportunityKey, country: input.legacyCountry, assignedAt: input.assignedAt, estimatedQuotaUnits: input.estimatedQuotaUnits });
-    return { country: input.legacyCountry, assignment, legacyFallback: assignment.assignmentStatus !== 'CANARY_ALLOCATED' };
+    return { country: input.legacyCountry, assignment, legacyFallback: assignment.assignmentStatus !== 'CANARY_ALLOCATED', frontierAllocation: { authorized: false, allocationOrigin: 'LEGACY', reason: frontierResult.reason } };
   }
   const allowed = [...new Set(input.allowedCountries.map(country => country.normalize('NFKC').trim().toLocaleLowerCase('en')).filter(Boolean))].sort();
   const readiness = await db.query(`SELECT * FROM creator_readiness_shadow_runs WHERE cutoff_at<=$1 AND result='PASS' ORDER BY cutoff_at DESC,created_at DESC LIMIT 1`, [input.assignedAt]);
@@ -154,5 +156,5 @@ export async function allocateCreatorSearchAuthority(input: {
     await db.query(`INSERT INTO creator_search_authority_assignment_links(link_key,authority_decision_id,canary_assignment_id,legacy_country,treatment_country,executed_country,policy_version,linked_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(link_key) DO NOTHING`, [linkKey, authorityDecisionId, assignment.assignmentId, input.legacyCountry, targetCountry, executedCountry, CREATOR_SEARCH_AUTHORITY_POLICY_VERSION, input.assignedAt]);
   }
   const treatment = assignment.assignmentStatus === 'CANARY_ALLOCATED';
-  return { country: treatment ? targetCountry : input.legacyCountry, assignment, authorityDecisionKey, legacyFallback: !treatment };
+  return { country: treatment ? targetCountry : input.legacyCountry, assignment, authorityDecisionKey, legacyFallback: !treatment, frontierAllocation: { authorized: false, allocationOrigin: 'LEGACY', reason: frontierResult.reason } };
 }

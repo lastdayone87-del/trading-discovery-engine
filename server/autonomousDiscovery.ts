@@ -32,6 +32,8 @@ import {
 import { reconcileYouTubeQuotaRolloverAndGetAutonomousSnapshot } from './quotaRolloverReconciliation';
 import { materializeBoundedCountryNativeProposals } from './discoveryProposalGenerators';
 import { materializeStoredExternalOsintProposals } from './externalOsint';
+import { randomUUID } from 'node:crypto';
+import { createDiscoveryCycleDiagnostics, recordDiscoveryCandidateDiagnostic, sanitizeSchedulingError, type DiscoveryCandidateDiagnostic, type DiscoveryCandidateDiagnosticPatch, type DiscoveryCycleDiagnostics } from './discoveryTelemetry';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -48,6 +50,7 @@ interface DiscoveryProducerReport {
   queuedCount?: number;
   queueDepth?: number;
   remainingAutonomousQuota?: number;
+  diagnostics?: DiscoveryCycleDiagnostics;
 }
 
 interface DiscoveryCycleStatus {
@@ -130,11 +133,28 @@ export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCount
  * Produces a quota-paced batch of durable work. It deliberately performs no
  * YouTube or channel processing; workers are the only autonomous executors.
  */
-export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean; geographicAllocationIntent?: GeographicAllocationIntent }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
+export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean; geographicAllocationIntent?: GeographicAllocationIntent }, requestId?: string): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
   if (targetCountry) await assertCountryAllowed(targetCountry, 'autonomous_cycle');
   if (isCycleRunning) throw new Error('An autonomous discovery producer cycle is already in progress.');
 
   const workerId = `autonomous_producer_${process.pid}`;
+  const cycleId = randomUUID();
+  const diagnostics: DiscoveryCycleDiagnostics = createDiscoveryCycleDiagnostics({ cycleId, requestId, targetCountry });
+  type CandidateDiagnosticState = DiscoveryCandidateDiagnosticPatch & { legacyCountry?: string; attempt?: number };
+  let candidateDiagnosticRecorded = false;
+  const recordCandidateDiagnostic = (patch: CandidateDiagnosticState) => {
+    if (candidateDiagnosticRecorded) return;
+    candidateDiagnosticRecorded = true;
+    const { legacyCountry, attempt, disposition = 'FAILED', reasonCode = 'UNKNOWN_SCHEDULING_FAILURE', ...rest } = patch;
+    const candidate: DiscoveryCandidateDiagnostic = {
+      cycleId, requestId, targetCountry,
+      legacyCountry: legacyCountry || targetCountry || 'MULTI',
+      attempt: attempt || diagnostics.candidateAttempts,
+      disposition, reasonCode,
+      ...rest
+    };
+    recordDiscoveryCandidateDiagnostic(diagnostics, candidate);
+  };
   if (!await acquireSchedulerLock('autonomous_discovery', workerId)) {
     throw new Error('Autonomous discovery scheduler lock is already held by another producer.');
   }
@@ -151,7 +171,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       return {
         country: 'N/A', query: 'N/A', strategy: 'PAUSED', discoveredCount: 0,
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0,
-        newCollection: 'NONE', summary: 'Query Intelligence is paused.', logs, isPaused: true
+        newCollection: 'NONE',         summary: 'Query Intelligence is paused.', logs, diagnostics, isPaused: true
+
       };
     }
 
@@ -177,6 +198,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       minutesSinceUtcMidnight: snapshot.minutesSinceQuotaDayStart
     }, providerTarget);
     const capacity = providerTarget?.maxRuns ? Math.min(calculatedCapacity, Math.max(1, Math.floor(providerTarget.maxRuns))) : calculatedCapacity;
+    diagnostics.capacity = capacity;
 
     if (capacity === 0) {
       lastReport = {
@@ -184,7 +206,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'NONE',
         queuedCount: 0, queueDepth: snapshot.queueDepth,
         remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved),
-        summary: 'No work scheduled: queue target or paced autonomous quota capacity is exhausted.'
+        summary: 'No work scheduled: queue target or paced autonomous quota capacity is exhausted.', diagnostics
       };
       return { ...lastReport, logs };
     }
@@ -225,6 +247,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     while (scheduled.length < capacity && attempts < capacity * Math.max(3, countries.length)) {
       const legacyCountry = countries[(currentCountryIndex + attempts) % countries.length];
       attempts++;
+      diagnostics.candidateAttempts++;
+      candidateDiagnosticRecorded = false;
+      let candidateDiagnostic: CandidateDiagnosticState = { legacyCountry, attempt: attempts, phase8Result: 'NOT_REACHED', providerRegistryOutcome: 'NOT_REACHED', reservationOutcome: 'NOT_REACHED', schedulingOutcome: 'NOT_REACHED' };
       const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
 
         // Shadow frontier evaluation (zero scheduling authority)
@@ -250,6 +275,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         creatorAllocation = authority.assignment;
         country = authority.country;
           frontierAllocationInfo = authority.frontierAllocation;
+        candidateDiagnostic = { ...candidateDiagnostic, phase8Result: frontierAllocationInfo?.reason || 'NOT_REACHED' };
       } catch (error) {
         console.warn('[CreatorIntelligence] Search allocation authority unavailable; legacy Query Intelligence fallback continues:', error instanceof Error ? error.message : error);
       }
@@ -270,6 +296,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           selectionStrategy: 'UCB1_EXPLORATION' as const,
           reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
         };
+        candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'PERSISTENT_RESEARCH', selectedQueryId: selected.queryRecord.id };
       } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
         const nativeAuthorization = governedConceptProposal
           ? await authorizeCountryNativeAllocationQuery({
@@ -290,8 +317,10 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             selectionStrategy: 'NEIGHBORHOOD_TARGETED',
             reason: 'Query Intelligence constructed the selected immutable COUNTRY_NATIVE proposal through governed retrieval policy.'
           };
+          candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'COUNTRY_NATIVE', selectedQueryId: selected.queryRecord.id };
         } else if (targeted?.selectionStrategy === 'NEIGHBORHOOD_TARGETED') {
           selected = targeted;
+          candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'NEIGHBORHOOD_TARGETED', selectedQueryId: selected.queryRecord.id };
         } else {
           // Query Intelligence could not construct/find a targeted action for this neighborhood; defer decision and revert to legacy control
           if (frontierAllocationInfo.decision?.decisionId) {
@@ -306,19 +335,33 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           if (governedConceptProposal) {
             // Fail closed for the selected proposal. Do not spend this opportunity
             // on an unrelated generic query after releasing its reservation.
+            candidateDiagnostic = {
+              ...candidateDiagnostic,
+              selectionSource: 'COUNTRY_NATIVE',
+              authorityOutcome: nativeAuthorization?.status === 'AUTHORIZED' ? 'ELIGIBLE' : 'REJECTED',
+              authorityReasonCodes: nativeAuthorization?.status === 'REJECTED' ? [nativeAuthorization.code] : undefined,
+              disposition: 'SKIPPED',
+              reasonCode: 'QUERY_INTELLIGENCE_AUTHORITY_REJECTED',
+              schedulingOutcome: 'NOT_REACHED'
+            };
+            recordCandidateDiagnostic(candidateDiagnostic);
             continue;
           }
           country = legacyCountry;
           selected = await selectNextQueryForCountry(legacyCountry);
+          candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY_FALLBACK', selectedQueryId: selected.queryRecord.id };
         }
       } else {
         selected = await selectNextQueryForCountry(country);
+        candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY', selectedQueryId: selected.queryRecord.id };
       }
 
       // Every query source is revalidated immediately before scheduling. Stored
       // PROVEN/EXPERIMENTAL queries and research allocations are not grandfathered
       // across retrieval-policy upgrades.
       const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord);
+      candidateDiagnostic = { ...candidateDiagnostic, selectedQueryId: selected.queryRecord.id, authorityOutcome: queryAuthority.eligible ? 'ELIGIBLE' : 'REJECTED', authorityReasonCodes: queryAuthority.reasonCodes };
+      diagnostics.candidatesSelected++;
       if (!queryAuthority.eligible) {
         log(`Withheld autonomous query #${selected.queryRecord.id} "${selected.queryRecord.query}" (${selected.queryRecord.country}) before YouTube: ${queryAuthority.reasonCodes.join(', ')}.`);
         if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
@@ -330,6 +373,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         }
         await setQueryCollection(selected.queryRecord.id, 'REJECTED')
           .catch(error => console.warn('[Autonomous Producer] Failed to quarantine unsafe query:', error));
+        candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'QUERY_INTELLIGENCE_AUTHORITY_REJECTED', schedulingOutcome: 'NOT_REACHED' };
+        recordCandidateDiagnostic(candidateDiagnostic);
         continue;
       }
 
@@ -340,6 +385,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           await releaseAllocationDecision(frontierAllocationInfo.decision.decisionId, 'Batch diversity guard skipped reserved allocation');
           frontierAllocationInfo.authorized = false;
         }
+        candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'BATCH_DIVERSITY_GUARD', schedulingOutcome: 'NOT_REACHED' };
+        recordCandidateDiagnostic(candidateDiagnostic);
         continue;
       }
       const created = await scheduleAutonomousQueryRuns([{
@@ -363,7 +410,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           policyVersion: creatorAllocation.policyVersion,
           queryAuthority: 'QUERY_INTELLIGENCE'
         } : { status: 'LEGACY_FALLBACK', reason: 'CANARY_ALLOCATION_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
-      }], workerId, cooldownMinutes).catch(async error => {
+      }], workerId, cooldownMinutes, {
+        onDiagnostic: patch => recordCandidateDiagnostic({ ...candidateDiagnostic, ...patch })
+      }).catch(async error => {
         if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
           const detail = error instanceof Error ? error.message : String(error);
           const deterministicNativeMismatch = governedConceptProposal &&
@@ -372,6 +421,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           await disposition(frontierAllocationInfo.decision.decisionId, `Scheduling transaction failed: ${detail}`);
           frontierAllocationInfo.authorized = false;
         }
+        const sanitized = sanitizeSchedulingError(error);
+        recordCandidateDiagnostic({ ...candidateDiagnostic, schedulingOutcome: 'FAILED', schedulingOperation: 'scheduling_transaction', sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
         return [];
       });
 
@@ -382,6 +433,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         if (research) await markResearchActionQueued(research.actionId, created[0].runId);
         usedIntents.add(intent);
         usedPrimaryTerms.add(primaryTerm);
+      } else if (!candidateDiagnosticRecorded) {
+        candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'RESERVATION_PRECONDITION_ZERO_ROWS', schedulingOutcome: 'NOT_REACHED' };
+        recordCandidateDiagnostic(candidateDiagnostic);
       } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
         await releaseAllocationDecision(
           frontierAllocationInfo.decision.decisionId,
@@ -401,7 +455,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'PENDING',
       queuedCount: scheduled.length, queueDepth: snapshot.queueDepth + scheduled.length,
       remainingAutonomousQuota: Math.max(0, Math.floor(config.dailyQuotaBudget * config.autonomousQuotaPercent / 100) - snapshot.autonomousUnitsUsed - snapshot.autonomousUnitsReserved - scheduled.length * 100),
-      summary: `Scheduled ${scheduled.length} diverse durable search job(s); workers own all YouTube execution.`
+      summary: `Scheduled ${scheduled.length} diverse durable search job(s); workers own all YouTube execution.`,
+      diagnostics
     };
     log(lastReport.summary);
     await updateSchedulerState('autonomous_discovery', { last_run_at: lastRunTime, last_report: lastReport });
