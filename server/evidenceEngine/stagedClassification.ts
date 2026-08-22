@@ -3,6 +3,7 @@ import type {
   LifecycleAction, RawChannelInput, StagedClassificationReport
 } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
+import { hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
 
 export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
 
@@ -55,13 +56,8 @@ function terminalContradictionWeights(negative: EvidenceItem[], positiveWeight: 
  * positive blockers remain the responsibility of decisionPolicy.ts. */
 function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], collection: EvidenceCollectionReport): boolean {
   if (collection.terminalNegativeSufficiency?.status !== 'SUFFICIENT' || !collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
-  return negative.some(item => {
-    if (item.source !== 'gemini_semantic' || item.category !== 'IRRELEVANT_DOMAIN' || item.provenance?.semantic?.taxonomyLabel !== 'UNRELATED') return false;
-    const fields=item.provenance?.fields||[];
-    if(fields.some(field=>field.field==='channel_bio')) return true;
-    const videoFamilies=new Set(fields.filter(field=>field.field==='video_title'||field.field==='video_description').map(field=>field.sourceFamilyId||field.sourceId).filter(Boolean));
-    return videoFamilies.size>=2;
-  });
+  const semanticUnrelated=negative.filter(item => item.source === 'gemini_semantic' && item.category === 'IRRELEVANT_DOMAIN' && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED');
+  return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
 export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport): StagedClassificationReport {

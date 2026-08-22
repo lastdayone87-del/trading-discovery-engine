@@ -16,8 +16,8 @@ function isWeakVideoTerminologyEvidence(item:EvidenceItem):boolean{
   return fields.length>0&&fields.every(field=>field.field==='video_title');
 }
 
-function hasCreatorLevelUnrelatedAttribution(item:EvidenceItem):boolean{
-  const fields=item.provenance?.fields||[];
+export function hasCreatorLevelUnrelatedAttribution(items:EvidenceItem[]):boolean{
+  const fields=items.flatMap(item=>item.provenance?.fields||[]);
   if(fields.some(field=>field.field==='channel_bio')) return true;
   const videoFamilies=new Set(fields.filter(field=>field.field==='video_title'||field.field==='video_description').map(field=>field.sourceFamilyId||field.sourceId).filter((value):value is string=>Boolean(value)));
   return videoFamilies.size>=2;
@@ -27,11 +27,12 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
   const substantivePositiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   if(substantivePositiveWeight>0) return false;
-  return evidence.some(item=>item.source==='gemini_semantic'&&item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE&&hasCreatorLevelUnrelatedAttribution(item));
+  const semanticUnrelated=evidence.filter(item=>item.source==='gemini_semantic'&&item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
+  return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
 function qualifiesDominantAttributedContradiction(evidence:EvidenceItem[],collection:EvidenceCollectionReport):boolean{
-  if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage)return false;
+  if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT')return false;
   const positiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   const terminalNegativeWeight=evidence.filter(item=>item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN').reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   return terminalNegativeWeight>=25&&(positiveWeight===0||terminalNegativeWeight>positiveWeight*1.5);
