@@ -1421,14 +1421,14 @@ export async function recordNeighborhoodAnalyticsAfterRun(
       ? await db.query(
           `SELECT
              COUNT(DISTINCT no.query_run_id)::int AS total_executions,
-             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2->>'attributed_quota')::int), 0)::int AS total_quota,
-             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2->>'quality_new_count')::int), 0)::int AS valuable_new,
+             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2::text->>'attributed_quota')::int), 0)::int AS total_quota,
+             COALESCE(SUM((no.metadata->'size_band_breakdown'->$2::text->>'quality_new_count')::int), 0)::int AS valuable_new,
              COALESCE(AVG(no.result_set_overlap), 0)::float AS avg_overlap,
              ARRAY_AGG(DISTINCT dn.source_family) AS sources
            FROM neighborhood_observations no
            JOIN discovery_neighborhoods dn ON dn.neighborhood_key = no.neighborhood_key
            WHERE no.observed_at >= now() - interval '30 days'
-             AND (no.metadata->'size_band_breakdown'->$2) IS NOT NULL`,
+             AND (no.metadata->'size_band_breakdown'->$2::text) IS NOT NULL`,
           [seg.type, seg.key]
         )
       : await db.query(
@@ -1442,13 +1442,13 @@ export async function recordNeighborhoodAnalyticsAfterRun(
            JOIN discovery_neighborhoods dn ON dn.neighborhood_key = no.neighborhood_key
            WHERE no.observed_at >= now() - interval '30 days'
              AND (
-               ($1 = 'COUNTRY' AND dn.country = $2) OR
-               ($1 = 'LANGUAGE' AND dn.language = $2) OR
-               ($1 = 'INTENT' AND dn.query_intent = $2) OR
-               ($1 = 'INSTRUMENT' AND dn.instrument_or_theme = $2) OR
-               ($1 = 'SOURCE' AND dn.source_family = $2) OR
-               ($1 = 'ORDERING' AND dn.search_ordering = $2) OR
-               ($1 = 'NEIGHBORHOOD' AND dn.neighborhood_key = $2)
+               ($1::text = 'COUNTRY' AND dn.country = $2::text) OR
+               ($1::text = 'LANGUAGE' AND dn.language = $2::text) OR
+               ($1::text = 'INTENT' AND dn.query_intent = $2::text) OR
+               ($1::text = 'INSTRUMENT' AND dn.instrument_or_theme = $2::text) OR
+               ($1::text = 'SOURCE' AND dn.source_family = $2::text) OR
+               ($1::text = 'ORDERING' AND dn.search_ordering = $2::text) OR
+               ($1::text = 'NEIGHBORHOOD' AND dn.neighborhood_key = $2::text)
              )`,
           [seg.type, seg.key]
         );
