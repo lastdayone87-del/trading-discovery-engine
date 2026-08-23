@@ -332,7 +332,11 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               ) : (
                 filteredChannels.map(c => {
                   const automaticRetryActive = c.community_retry_job_status === 'PENDING' || c.community_retry_job_status === 'PROCESSING';
-                  const automaticRetryExhausted = c.community_retry_job_status === 'FAILED';
+                  const automaticRetryTerminal = c.community_retry_job_status === 'FAILED';
+                  const automaticRetryBudgetExhausted = automaticRetryTerminal
+                    && c.community_retry_job_attempts != null
+                    && c.community_retry_job_max_attempts != null
+                    && c.community_retry_job_attempts >= c.community_retry_job_max_attempts;
                   return (
                   <tr key={c.channel_id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors">
                     
@@ -506,7 +510,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       </div>
                       {c.discord_liveness_status&&c.discord_liveness_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Liveness: <b>{c.discord_liveness_status.replaceAll('_',' ')}</b></div>}
                       {c.discord_relevance_status&&c.discord_relevance_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Relevance: <b>{c.discord_relevance_status.replaceAll('_',' ')}</b></div>}
-                      {c.discord_validation_status==='RETRY_PENDING'&&<div className="text-[10px] font-semibold text-amber-600">{automaticRetryActive ? `Automatic retry ${c.community_retry_job_status === 'PROCESSING' ? 'in progress' : 'queued'}` : automaticRetryExhausted ? 'Automatic retries exhausted · Re-check Now required' : 'No automatic retry queued · Re-check Now required'}</div>}
+                      {c.discord_validation_status==='RETRY_PENDING'&&<div className="text-[10px] font-semibold text-amber-600">{automaticRetryActive ? `Automatic retry ${c.community_retry_job_status === 'PROCESSING' ? 'in progress' : 'queued'}` : automaticRetryTerminal ? automaticRetryBudgetExhausted ? 'Automatic retry budget exhausted · governed recovery available' : 'Automatic retry stopped after terminal failure · governed recovery available' : 'No automatic retry queued · governed recovery available'}</div>}
+                      {c.discord_validation_status==='RETRY_PENDING'&&c.community_retry_job_attempts!=null&&c.community_retry_job_max_attempts!=null&&<div className="text-[10px] text-slate-500">Retry job attempts: {c.community_retry_job_attempts}/{c.community_retry_job_max_attempts}{c.community_retry_job_run_after&&c.community_retry_job_status==='PENDING'?` · next ${new Date(c.community_retry_job_run_after).toLocaleString()}`:''}</div>}
                       {c.discord_liveness_status==='INVALID_OBSERVED'&&<div className="text-[10px] text-amber-600">Invalid observation awaiting confirmation</div>}
                       {c.discord_candidate_type&&<div className="text-[10px] text-slate-400">Locator: {c.discord_candidate_type.replaceAll('_',' ')}</div>}
                       {c.discord_candidate_locator && !c.discord_invite && <div className="mt-0.5 max-w-48 truncate font-mono text-[10px] text-slate-500" title={c.discord_candidate_locator}>Candidate retained: {c.discord_candidate_locator.replace('https://','')}</div>}
@@ -526,17 +531,19 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           ? 'text-rose-600 dark:text-rose-400 font-bold'
                           : 'text-slate-500'
                       }`}>
-                        {c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? automaticRetryActive ? 'RETRY QUEUED' : automaticRetryExhausted ? 'RETRY EXHAUSTED' : 'RECHECK REQUIRED' : c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status === 'ENRICHING' ? 'ENRICHING (Reclassifying)' : c.scan_status}
+                        {c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? automaticRetryActive ? 'RETRY QUEUED' : automaticRetryTerminal ? automaticRetryBudgetExhausted ? 'RETRY BUDGET EXHAUSTED' : 'RETRY TERMINAL' : 'RECOVERY AVAILABLE' : c.scan_status === 'LOCKED' ? 'LOCKED (Scanning)' : c.scan_status === 'ENRICHING' ? 'ENRICHING (Reclassifying)' : c.scan_status}
                       </span>
                       {c.scan_attempts > 0 && (
                         <span className="block text-[10px] text-slate-400 mt-0.5">
-                          Attempts: {c.scan_attempts}
+                          Scan attempts: {c.scan_attempts}
                         </span>
                       )}
                       {c.trading_status==='TRADING_CONFIRMED'&&c.scan_status==='ENRICHMENT_PENDING'&&<span className="block text-[10px] text-indigo-600 mt-1">Approved → enrichment {c.post_approval_job_status?.toLowerCase()||'queued'}</span>}
+                      {c.trading_status==='TRADING_CONFIRMED'&&c.scan_status==='FAILED'&&c.post_approval_job_status==='FAILED'&&<span className="block text-[10px] text-amber-600 mt-1" title={c.post_approval_job_error}>Approved → enrichment failed · governed recovery available</span>}
                       {c.post_approval_job_status==='PROCESSING'&&<span className="block text-[10px] text-indigo-600 mt-1">Post-approval enrichment processing</span>}
                       {c.post_approval_job_status==='COMPLETED'&&<span className="block text-[10px] text-emerald-600 mt-1">Post-approval enrichment completed</span>}
-                      {c.post_approval_job_status==='FAILED'&&<span className="block text-[10px] text-amber-600 mt-1" title={c.post_approval_job_error}>Post-approval enrichment failed</span>}
+                      {c.post_approval_job_status==='FAILED'&&<span className="block text-[10px] text-amber-600 mt-1" title={c.post_approval_job_error}>Post-approval enrichment failed · job terminal</span>}
+                      {c.post_approval_job_status&&c.post_approval_job_attempts!=null&&c.post_approval_job_max_attempts!=null&&<span className="block text-[10px] text-slate-500 mt-0.5">Enrichment job attempts: {c.post_approval_job_attempts}/{c.post_approval_job_max_attempts}{c.post_approval_job_run_after&&c.post_approval_job_status==='PENDING'?` · next ${new Date(c.post_approval_job_run_after).toLocaleString()}`:''}</span>}
                     </td>
 
                     {/* Last Scanned */}
@@ -598,7 +605,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                         }`}
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${recheckingId === c.channel_id ? 'animate-spin' : ''}`} />
-                        <span>{c.scan_status === 'LOCKED' ? 'Currently processing' : 'Re-check Now'}</span>
+                        <span>{c.scan_status === 'LOCKED' ? 'Currently processing' : 'Governed recheck'}</span>
                       </button>
                     </td>
 

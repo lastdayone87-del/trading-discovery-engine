@@ -37,7 +37,7 @@ test('provider-capacity failures persist stable diagnostic metadata without chan
 });
 
 test('reservation predicate and PART K recovery remain present and unchanged in the scheduling seam', () => {
-  assert.match(dbSource, /reconcileTerminalQueryRunsForQuery\(client, candidate\.query\.id\)/);
+  assert.match(dbSource, /reconcileQueryRunJobLifecycleForQuery\(client, candidate\.query\.id\)/);
   assert.match(dbSource, /AND \(reserved_until IS NULL OR reserved_until <= now\(\)\)/);
   assert.match(dbSource, /AND NOT EXISTS \(SELECT 1 FROM query_runs qr WHERE qr\.query_id=query_library\.id AND qr\.status IN \('SCHEDULED','RUNNING','RETRYING'\)\)/);
 });
