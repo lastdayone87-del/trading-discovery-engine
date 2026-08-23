@@ -80,13 +80,13 @@ test('hard cooldown removes identical historical queries from eligibility', () =
   assert.deepEqual(queriesOutsideCooldown([recent, duplicateWithDifferentCase, old], now, 360).map(item => item.id), [2]);
 });
 
-test('primary-term limiter blocks an overused pattern while preserving alternatives', () => {
+test('primary-term limiter blocks recently overused patterns while preserving never-executed candidates and alternatives', () => {
   const now = new Date('2026-07-28T12:00:00.000Z');
   const overused = query({ id: 1, primary_term: 'market analysis', last_executed: '2026-07-28T11:00:00.000Z' });
   const secondUse = query({ id: 2, query: 'DAX market analysis live', primary_term: 'market analysis', last_executed: '2026-07-28T10:00:00.000Z' });
   const candidateA = query({ id: 3, query: 'AEX market analysis', primary_term: 'market analysis' });
   const candidateB = query({ id: 4, query: 'Options risk lesson', primary_term: 'options risk analysis' });
-  assert.deepEqual(limitRepeatedPrimaryTerms([candidateA, candidateB], [overused, secondUse], now, 360, 2).map(item => item.id), [4]);
+  assert.deepEqual(limitRepeatedPrimaryTerms([candidateA, candidateB], [overused, secondUse], now, 360, 2).map(item => item.id), [3, 4]);
 });
 
 test('intent rotation avoids immediately repeating the most recently executed intent', () => {
