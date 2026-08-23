@@ -985,11 +985,11 @@ export async function scheduleAutonomousQueryRuns(
         const commitRes = await client.query(
           `UPDATE frontier_allocation_decisions
            SET decision_status = 'COMMITTED',
-               query_run_id = $2
-           WHERE decision_id = $1
+               query_run_id = $2::uuid
+           WHERE decision_id = $1::text
              AND allocation_origin = 'FRONTIER_CANARY'
              AND decision_status = 'RESERVED'
-             AND (query_run_id IS NULL OR query_run_id = $2)
+             AND (query_run_id IS NULL OR query_run_id = $2::uuid)
            RETURNING id`,
           [candidate.frontierDecisionId, runId]
         );
