@@ -16,13 +16,14 @@ export type EnqueueCommunityRecoveryJob = (channelId: string) => Promise<void>;
 export const COMMUNITY_ACTIVE_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 
 // The generic job failure policy has a six-hour transient-age ceiling based on
-// jobs.created_at. Community capacity deferrals are intentionally attempt-free,
-// so they must not age into a terminal result merely because provider capacity
-// stayed unavailable. Renew the retry epoch before that generic ceiling while
-// preserving normal run_after backoff and the durable execution history.
+// jobs.created_at. Capacity deferrals are intentionally attempt-free, so they
+// must not age into a terminal result merely because provider capacity stayed
+// unavailable. Renew the retry epoch before that generic ceiling while
+// preserving normal run_after backoff and durable execution history.
 export const COMMUNITY_CAPACITY_RETRY_LEASE_MS = 5 * 60 * 60_000;
 const COMMUNITY_CAPACITY_DEFERRED_PREFIX = 'Community acquisition deferred:';
 const COMMUNITY_CAPACITY_TERMINAL_PREFIX = 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED: Community acquisition deferred:';
+const ENRICHMENT_CAPACITY_ERROR_FRAGMENT = 'ENRICHMENT YouTube quota allocation is exhausted';
 
 /**
  * FAILED_PERMANENT records operational retry exhaustion history for a specific
@@ -44,35 +45,23 @@ export function shouldReactivateCommunityRecovery(
     return { reactivate: false, reasonCodes: ['SEMANTIC_TERMINAL_STATE_PRESERVED'] };
   }
 
-  // FAILED is the canonical operational state. Legacy FAILED_PERMANENT is
-  // recoverable only when it carries operational/unknown validation evidence;
-  // an explicitly completed semantic terminal decision is not resurrected.
   if (channel.scan_status === 'FAILED_PERMANENT' && channel.discord_validation_status === 'COMPLETED') {
     return { reactivate: false, reasonCodes: ['SEMANTIC_TERMINAL_EVIDENCE_PRESERVED'] };
   }
 
   const reasons: string[] = [];
 
-  if (isManualRecheck) {
-    reasons.push('OPERATOR_NOMINATED_RECHECK');
-  }
-
-  if (candidate?.channelLinks && candidate.channelLinks.length > 0) {
-    reasons.push('NEWLY_OBSERVED_EXTERNAL_LINKS');
-  }
+  if (isManualRecheck) reasons.push('OPERATOR_NOMINATED_RECHECK');
+  if (candidate?.channelLinks && candidate.channelLinks.length > 0) reasons.push('NEWLY_OBSERVED_EXTERNAL_LINKS');
 
   if (channel.activity_band === 'VERY_ACTIVE' || channel.activity_band === 'ACTIVE') {
     const ageSinceLastCheckedMs = channel.last_checked ? now - Date.parse(channel.last_checked) : Number.POSITIVE_INFINITY;
-    if (ageSinceLastCheckedMs >= COMMUNITY_ACTIVE_RECOVERY_COOLDOWN_MS) {
-      reasons.push('HIGH_CREATOR_ACTIVITY');
-    }
+    if (ageSinceLastCheckedMs >= COMMUNITY_ACTIVE_RECOVERY_COOLDOWN_MS) reasons.push('HIGH_CREATOR_ACTIVITY');
   }
 
   if (channel.last_checked) {
     const ageDays = (now - Date.parse(channel.last_checked)) / 86_400_000;
-    if (ageDays >= 30) {
-      reasons.push('COMMUNITY_FRESHNESS_INTERVAL_EXPIRED');
-    }
+    if (ageDays >= 30) reasons.push('COMMUNITY_FRESHNESS_INTERVAL_EXPIRED');
   } else {
     reasons.push('NO_PRIOR_CHECK_TIMESTAMP');
   }
@@ -111,18 +100,12 @@ let lastCommunityRecoveryReconciliationAt = 0;
 
 /**
  * Reactivates operational community failures and reopens exactly one durable
- * retry window for each selected channel. The existing job idempotency key is
- * deliberately reused: enqueueJob reopens only a terminal job, resets that
- * job's current attempt window, and cannot duplicate an active PENDING or
- * PROCESSING owner. Semantic terminal channels are excluded in SQL and again
- * by shouldReactivateCommunityRecovery.
- *
- * Capacity-only community deferrals are a special operational case: they are
- * attempt-free by contract. The generic queue age ceiling is therefore not a
- * valid terminal signal for them. Active capacity-deferred jobs have their
- * retry epoch renewed before that ceiling, and any already-terminalized job
- * whose latest error proves the same capacity-only condition is reopened
- * immediately rather than waiting 24 hours for activity recovery.
+ * retry window for each selected channel. It also repairs the adjacent generic
+ * enrichment-capacity case: ENRICH_CHANNEL quota deferrals are attempt-free,
+ * so the generic six-hour job-age ceiling must not turn them into channel
+ * failures. This reconciliation renews active capacity-only retry epochs and
+ * reopens only terminal enrichment jobs whose persisted error proves quota
+ * capacity was the cause.
  */
 export async function reconcileCommunityAcquisitionRecovery(
   getDb: () => Promise<any>,
@@ -137,10 +120,8 @@ export async function reconcileCommunityAcquisitionRecovery(
 
   const db = await getDb();
 
-  // Compatibility bridge for the generic transient-age policy: an active
-  // community retry that is waiting only on provider capacity must keep its
-  // attempt-free retry window alive. This does not change run_after, attempts,
-  // or job_attempts history, and therefore cannot create a hot retry loop.
+  // Keep active community capacity deferrals younger than the generic transient
+  // age ceiling. This does not change run_after, attempts, or attempt history.
   await db.query(
     `UPDATE jobs
         SET created_at=now(), updated_at=now()
@@ -149,6 +130,49 @@ export async function reconcileCommunityAcquisitionRecovery(
         AND last_error LIKE $1
         AND created_at < now() - ($2 || ' milliseconds')::interval`,
     [`${COMMUNITY_CAPACITY_DEFERRED_PREFIX}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+  );
+
+  // ENRICH_CHANNEL uses the same attempt-free quota signal. Prevent an old
+  // pending enrichment job from becoming terminal merely because it waited for
+  // the next quota window longer than the generic six-hour age ceiling.
+  await db.query(
+    `UPDATE jobs
+        SET created_at=now(), updated_at=now()
+      WHERE type='ENRICH_CHANNEL'
+        AND status IN('PENDING','PROCESSING')
+        AND last_error LIKE $1
+        AND created_at < now() - ($2 || ' milliseconds')::interval`,
+    [`%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+  );
+
+  // Repair historical/current enrichment rows already terminalized solely by
+  // quota capacity. The job remains the same durable owner; its retry epoch is
+  // renewed, the claim increment is undone because the failure was attempt-free,
+  // and the channel projection returns to ENRICHMENT_PENDING. Semantic terminal
+  // channels are deliberately excluded.
+  await db.query(
+    `WITH recovered AS (
+       UPDATE jobs j
+          SET status='PENDING',
+              attempts=GREATEST(0,j.attempts-1),
+              created_at=now(),
+              updated_at=now(),
+              locked_by=NULL,
+              locked_at=NULL,
+              completed_at=NULL
+        WHERE j.type='ENRICH_CHANNEL'
+          AND j.status='FAILED'
+          AND j.last_error LIKE $1
+        RETURNING j.payload->>'channelId' AS channel_id
+     )
+     UPDATE channels c
+        SET scan_status='ENRICHMENT_PENDING',updated_at=now()
+       FROM recovered r
+      WHERE c.channel_id=r.channel_id
+        AND c.scan_status='FAILED'
+        AND c.country_status <> 'REJECTED'
+        AND c.trading_status NOT IN('NON_TRADING','HUMAN_REJECTED')`,
+    [`OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%${ENRICHMENT_CAPACITY_ERROR_FRAGMENT}%`]
   );
 
   const rows = await db.query(
@@ -209,19 +233,12 @@ export async function reconcileCommunityAcquisitionRecovery(
     const updated = reactivateCommunityRecovery(channelRecord, triggerCheck.reasonCodes, new Date(now).toISOString());
     await upsertChannel(updated);
     try {
-      // enqueueJob intentionally reuses the terminal job id, but its generic
-      // age clock is created_at. Reset only the proven capacity-terminal job's
-      // retry epoch so reopening cannot immediately terminalize again.
       if (capacityTerminal && row.capacity_retry_job_id) {
         await db.query(
           `UPDATE jobs SET created_at=now(),updated_at=now() WHERE id=$1 AND status='FAILED'`,
           [row.capacity_retry_job_id]
         );
       }
-      // Persist the operational projection before reopening work so a worker
-      // cannot complete the new job and then be overwritten by this function.
-      // If enqueue fails, restore the prior failure projection and let the next
-      // reconciliation tick retry the complete recovery operation.
       if (enqueueRecoveryJob) await enqueueRecoveryJob(channelRecord.channel_id);
     } catch (error) {
       await upsertChannel(channelRecord);
