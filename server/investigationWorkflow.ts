@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { getAppSetting, getDb, type DurableJob } from './db';
+import { getAppSetting, getDb, isRetryableInfrastructureFailure, type DurableJob } from './db';
 
 export const INVESTIGATION_POLICY_VERSION='investigation-workflow-v1';
 export class InvestigationDeadlineExceededError extends Error {readonly code='INVESTIGATION_DEADLINE_EXCEEDED';constructor(){super('Investigation deadline exceeded.');this.name='InvestigationDeadlineExceededError';}}
@@ -9,7 +9,7 @@ export interface InvestigationProjection {state:InvestigationState;version:numbe
 const stable=(value:unknown):string=>JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))):item);
 export const investigationChecksum=(value:unknown)=>createHash('sha256').update(stable(value)).digest('hex');
 export function parseInvestigationDeadlineMinutes(value:unknown,fallback=30):number{const raw=String(value??'').trim();if(!/^\d+$/.test(raw))return fallback;const normalized=raw.replace(/^0+/,'')||'0';if(normalized==='0'||normalized.length>10||(normalized.length===10&&normalized>'2147483647'))return fallback;const parsed=Number(normalized);return Number.isInteger(parsed)&&parsed>0?parsed:fallback;}
-export function shouldRefreshOperationalRetryDeadline(stepState:StepState,failureClass:unknown):boolean{return stepState==='RETRYING'&&String(failureClass||'')==='OperationalEnrichmentProviderError';}
+export function shouldRefreshOperationalRetryDeadline(stepState:StepState,failureClass:unknown):boolean{if(stepState!=='RETRYING')return false;const normalized=String(failureClass||'');return normalized==='OperationalEnrichmentProviderError'||isRetryableInfrastructureFailure({code:normalized,name:normalized});}
 export function reduceInvestigation(projection:InvestigationProjection,event:{type:'SCHEDULE'|'COMPLETE'|'FAIL'|'SKIP'|'SUPERSEDE';sequence?:number;resultingStatus?:string;terminal?:boolean}):InvestigationProjection{
   if(projection.state!=='ACTIVE'&&event.type!=='SUPERSEDE')return projection;
   if(event.type==='SUPERSEDE')return {...projection,state:'SUPERSEDED',version:projection.version+1,hasPendingSuccessor:false};
