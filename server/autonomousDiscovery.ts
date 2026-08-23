@@ -348,11 +348,35 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             continue;
           }
           country = legacyCountry;
-          selected = await selectNextQueryForCountry(legacyCountry);
+          const fallbackSelection = await selectNextQueryForCountry(legacyCountry);
+          if (!fallbackSelection) {
+            candidateDiagnostic = {
+              ...candidateDiagnostic,
+              selectionSource: 'LEGACY_FALLBACK',
+              disposition: 'SKIPPED',
+              reasonCode: 'QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY',
+              schedulingOutcome: 'NOT_REACHED'
+            };
+            recordCandidateDiagnostic(candidateDiagnostic);
+            continue;
+          }
+          selected = fallbackSelection;
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY_FALLBACK', selectedQueryId: selected.queryRecord.id };
         }
       } else {
-        selected = await selectNextQueryForCountry(country);
+        const legacySelection = await selectNextQueryForCountry(country);
+        if (!legacySelection) {
+          candidateDiagnostic = {
+            ...candidateDiagnostic,
+            selectionSource: 'LEGACY',
+            disposition: 'SKIPPED',
+            reasonCode: 'QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY',
+            schedulingOutcome: 'NOT_REACHED'
+          };
+          recordCandidateDiagnostic(candidateDiagnostic);
+          continue;
+        }
+        selected = legacySelection;
         candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY', selectedQueryId: selected.queryRecord.id };
       }
 
