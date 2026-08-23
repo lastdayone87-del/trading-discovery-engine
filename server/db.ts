@@ -263,6 +263,11 @@ function rowToChannel(row: any): ChannelRecord {
     community_retry_job_attempts: row.community_retry_job_attempts == null ? undefined : Number(row.community_retry_job_attempts),
     community_retry_job_max_attempts: row.community_retry_job_max_attempts == null ? undefined : Number(row.community_retry_job_max_attempts),
     community_retry_job_run_after: iso(row.community_retry_job_run_after),
+    community_retry_job_error: row.community_retry_job_error || undefined,
+    community_retry_job_execution_count: row.community_retry_job_execution_count == null ? undefined : Number(row.community_retry_job_execution_count),
+    community_retry_job_deferral_count: row.community_retry_job_deferral_count == null ? undefined : Number(row.community_retry_job_deferral_count),
+    community_retry_job_last_execution_at: iso(row.community_retry_job_last_execution_at),
+    community_retry_job_last_execution_status: row.community_retry_job_last_execution_status || undefined,
   };
 }
 
@@ -349,7 +354,12 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
     (SELECT status FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_status,
     (SELECT attempts FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_attempts,
     (SELECT max_attempts FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_max_attempts,
-    (SELECT run_after FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_run_after`;
+    (SELECT run_after FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_run_after,
+    (SELECT last_error FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_error,
+    (SELECT COUNT(*)::int FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1)) community_retry_job_execution_count,
+    (SELECT COUNT(*)::int FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) AND a.error LIKE '%Community acquisition deferred:%') community_retry_job_deferral_count,
+    (SELECT started_at FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) ORDER BY a.started_at DESC LIMIT 1) community_retry_job_last_execution_at,
+    (SELECT status FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) ORDER BY a.started_at DESC LIMIT 1) community_retry_job_last_execution_status`;
   const [page,summary]=await Promise.all([
     db.query(`SELECT ${columns} FROM channels WHERE ${where} ORDER BY first_seen DESC,channel_id LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,limit,offset]),
     db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values)
