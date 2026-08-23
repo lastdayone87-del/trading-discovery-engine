@@ -16,7 +16,15 @@ test('producer persists a structured diagnostic report alongside the compatible 
   assert.match(source, /diagnostics:\s*DiscoveryCycleDiagnostics/);
   assert.match(source, /scheduleAutonomousQueryRuns\(\[[\s\S]*?onDiagnostic: patch => recordCandidateDiagnostic/);
   assert.match(source, /queuedCount: scheduled\.length[\s\S]*?diagnostics/);
+  assert.match(source, /queries: scheduled\.map\(item => item\.query\.query\)/);
   assert.match(source, /candidateAttempts\+\+/);
+});
+
+test('automated route reports the durable scheduled-query list and count without collapsing a batch', () => {
+  const server = here('../server.ts');
+  assert.match(server, /const queries = report\.queries \|\|/);
+  assert.match(server, /Scheduled \$\{report\.queuedCount \|\| 0\} governed queries/);
+  assert.match(server, /queuedCount: report\.queuedCount \|\| 0/);
 });
 
 test('scheduler exposes distinct operation labels and never passes query text to diagnostics', () => {

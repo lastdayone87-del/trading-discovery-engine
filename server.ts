@@ -421,8 +421,8 @@ async function startServer() {
       // Kick off processing for the durable Phase 9 job created by the producer.
       processNextSearchJob().catch(() => {});
 
-      const queries = report.queuedCount ? [report.query] : [];
-      res.json({ message: `Generated ${queries.length} native queries for ${country}. Jobs queued.`, queries, queuedCount: report.queuedCount || 0, diagnostics: report.diagnostics });
+      const queries = report.queries || (report.queuedCount && report.query && report.query !== 'NONE' ? report.query.split(' | ') : []);
+      res.json({ message: `Scheduled ${report.queuedCount || 0} governed queries for ${country}. Jobs queued.`, queries, queuedCount: report.queuedCount || 0, diagnostics: report.diagnostics });
     } catch (err: any) {
       sendOperationError(res, err);
     }
