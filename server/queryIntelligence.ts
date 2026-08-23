@@ -309,7 +309,7 @@ export async function selectNextQueryForCountry(
   queryRecord: QueryRecord;
   selectionStrategy: 'UCB1_EXPLOITATION' | 'UCB1_EXPLORATION' | 'COLD_START_GENERATION' | 'NEIGHBORHOOD_TARGETED';
   reason: string;
-}> {
+} | null> {
   const now = new Date();
   const queries = (await getQueriesByCountry(country)).filter(query => {
     const reservedUntil = (query as QueryRecord & { reserved_until?: string | null }).reserved_until;
@@ -326,6 +326,7 @@ export async function selectNextQueryForCountry(
   if (queries.length === 0) {
     const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START');
     const selected = generated[0];
+    if (!selected) return null;
     return {
       queryRecord: selected,
       selectionStrategy: 'COLD_START_GENERATION',
@@ -340,10 +341,11 @@ export async function selectNextQueryForCountry(
   if (eligible.length === 0) {
     const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION');
     const selected = generated[0];
+    if (!selected) return null;
     return {
       queryRecord: selected,
       selectionStrategy: 'UCB1_EXPLORATION',
-      reason: `${selected.generation_reason} Existing queries were unavailable due to the ${cooldownMinutes}-minute cooldown or primary-term diversity limit.`
+      reason: `${selected.generation_reason || selected.query} Existing queries were unavailable due to the ${cooldownMinutes}-minute cooldown or primary-term diversity limit.`
     };
   }
 
@@ -461,6 +463,7 @@ export async function selectNextQueryForCountry(
     reason = `${strategy === 'UCB1_EXPLOITATION' ? 'Exploitation retained a historically successful query' : 'Exploration selected the best eligible candidate'} outside the ${cooldownMinutes}-minute cooldown (UCB ${selected.ucb_score}). ${selected.generation_reason || ''}`.trim();
   }
 
+  if (!selected) return null;
   return { queryRecord: selected, selectionStrategy: strategy, reason };
 }
 
