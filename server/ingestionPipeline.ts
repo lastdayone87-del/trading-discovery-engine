@@ -442,8 +442,12 @@ export async function processChannelThroughPipeline(
     const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
     const reviewEligibility=evaluateReviewEligibilityV2(reviewEligibilityInput);
     const lifecycle = resolveUncertainLifecycle(shouldReview,reviewEligibility);
-    const finalUncertainStatus = lifecycle.tradingStatus==='NEEDS_REVIEW'?'UNCERTAIN':lifecycle.tradingStatus;
-    const finalScanStatus = lifecycle.scanStatus==='NEEDS_REVIEW'?'COMPLETED':lifecycle.scanStatus;
+    // Preserve an evidence-complete human-ambiguity decision as NEEDS_REVIEW.
+    // resolveUncertainLifecycle already keeps low-information, degraded, active,
+    // and non-candidate cases machine-owned; remapping its review result to
+    // UNCERTAIN/COMPLETED silently stranded useful human-adjudication work.
+    const finalUncertainStatus = lifecycle.tradingStatus;
+    const finalScanStatus = lifecycle.scanStatus;
 
     const uncertainChannel: ChannelRecord = existing || {
       channel_id: candidate.channelId,
