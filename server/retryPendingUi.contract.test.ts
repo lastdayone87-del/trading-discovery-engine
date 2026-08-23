@@ -21,4 +21,13 @@ test('recoverable Discord validation distinguishes queued, budget-exhausted, ter
   assert.match(db,/community_retry_job_attempts/);
   assert.match(db,/community_retry_job_max_attempts/);
   assert.match(db,/community_retry_job_run_after/);
+  assert.match(db,/community_retry_job_execution_count/);
+  assert.match(db,/community_retry_job_deferral_count/);
+  assert.match(db,/community_retry_job_last_execution_at/);
+  assert.match(db,/a\.error LIKE '%Community acquisition deferred:%'/);
+  assert.match(db,/job_attempts/);
+  assert.match(resultsTable,/Retry-window attempts/);
+  assert.match(resultsTable,/Observed executions/);
+  assert.match(resultsTable,/capacity deferrals/);
+  assert.match(resultsTable,/RETRY DUE/);
 });

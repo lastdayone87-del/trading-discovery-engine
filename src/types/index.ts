@@ -151,6 +151,11 @@ export interface ChannelRecord {
   community_retry_job_attempts?: number;
   community_retry_job_max_attempts?: number;
   community_retry_job_run_after?: string | null;
+  community_retry_job_error?: string;
+  community_retry_job_execution_count?: number;
+  community_retry_job_deferral_count?: number;
+  community_retry_job_last_execution_at?: string | null;
+  community_retry_job_last_execution_status?: string;
   scan_status: ScanStatus;
   scan_attempts: number;
   discovery_source: DiscoverySource;
