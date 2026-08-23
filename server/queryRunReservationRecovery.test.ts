@@ -50,7 +50,7 @@ test('PART K PostgreSQL: terminal failed SEARCH_YOUTUBE job closes its stale act
     )).rows[0];
     assert.equal(run.status, 'FAILED');
     assert.ok(run.completed_at);
-    assert.equal(run.failure_kind, 'ORPHANED_TERMINAL_JOB_FAILURE');
+    assert.equal(run.failure_kind, 'ORPHANED_FAILED_JOB_STATE');
     const library = (await db.query(
       `SELECT reserved_at,reserved_until,reserved_by FROM query_library WHERE id=$1`, [queryId]
     )).rows[0];
@@ -115,23 +115,27 @@ test('PART K PostgreSQL: a non-terminal linked job does not get reconciled or re
   }
 });
 
-test('PART K unit: reconciliation only targets terminal failed linked jobs and preserves the reservation SQL boundary', async () => {
+test('PART K unit: reconciliation targets every failed linked job without a max-attempt gate and preserves the reservation boundary', async () => {
   const calls: Array<{ sql: string; params?: any[] }> = [];
   const client = {
     query: async (sql: string, params?: any[]) => {
       calls.push({ sql, params });
-      if (sql.includes('WITH orphaned')) return { rows: [{ id: 'run-1', query_id: 233 }] };
-      return { rows: [] };
+      if (sql.includes('SELECT qr.id AS query_run_id')) return { rows: [{
+        query_run_id: 'run-1', query_id: 233, query_run_status: 'RUNNING', query_run_error: null,
+        job_id: 'job-1', job_status: 'FAILED', last_error: 'old retry marker', run_after: null, job_completed_at: null
+      }], rowCount: 1 };
+      if (sql.includes("SET status='FAILED'")) return { rows: [{ query_id: 233 }], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
     }
   };
   assert.equal(await reconcileTerminalQueryRunsForQuery(client, 233), 1);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   assert.match(calls[0].sql, /j\.type = 'SEARCH_YOUTUBE'/);
-  assert.match(calls[0].sql, /j\.status = 'FAILED'/);
-  assert.match(calls[0].sql, /j\.attempts >= j\.max_attempts/);
+  assert.match(calls[0].sql, /j\.status/);
+  assert.doesNotMatch(calls[0].sql, /j\.attempts >= j\.max_attempts/);
   assert.match(calls[0].sql, /qr\.status IN \('SCHEDULED','RUNNING','RETRYING'\)/);
-  assert.match(calls[1].sql, /status='RELEASED'/);
-  assert.match(calls[2].sql, /NOT EXISTS/);
+  assert.match(calls[2].sql, /status='RELEASED'/);
+  assert.match(calls[3].sql, /NOT EXISTS/);
 });
 
 test('PART K unit: no orphaned row produces no cleanup writes', async () => {

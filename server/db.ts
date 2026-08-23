@@ -29,6 +29,7 @@ import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, 
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure } from './providerCapacityDiagnostics';
+import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -326,6 +327,9 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
     COALESCE((SELECT jsonb_agg(to_jsonb(dc) ORDER BY dc.selected DESC,dc.last_checked DESC NULLS LAST,dc.discovered_at) FROM discord_candidates dc WHERE dc.channel_id=channels.channel_id),'[]'::jsonb) discord_candidates,
     (SELECT status FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_status,
     (SELECT last_error FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_error,
+    (SELECT attempts FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_attempts,
+    (SELECT max_attempts FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_max_attempts,
+    (SELECT run_after FROM jobs WHERE type='POST_APPROVAL_ENRICH' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) post_approval_job_run_after,
     (SELECT status FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_status,
     (SELECT attempts FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_attempts,
     (SELECT max_attempts FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_max_attempts,
@@ -675,63 +679,97 @@ export interface ScheduleAutonomousQueryDiagnosticContext {
 }
 
 /**
- * Repair only the proven stale-run invariant: a YouTube query run may remain
- * active after its linked SEARCH_YOUTUBE job has reached terminal FAILED.
- * This is deliberately scoped to the query being considered, does not delete
- * history, and never reopens or bypasses an active/non-terminal job.
+ * Reconcile the proven query-run/job ownership invariant. A pending retry is
+ * made explicit as RETRYING; a failed job closes its active run and releases
+ * its reservation. This is scoped to the query being considered, does not
+ * delete history, and never bypasses an active/non-terminal job.
  */
-export async function reconcileTerminalQueryRunsForQuery(client: any, queryId: number): Promise<number> {
-  const result = await client.query(`
-    WITH orphaned AS (
-      SELECT qr.id, qr.query_id
-      FROM query_runs qr
-      JOIN jobs j ON j.id = qr.job_id
-      WHERE qr.query_id = $1
-        AND qr.status IN ('SCHEDULED','RUNNING','RETRYING')
-        AND j.type = 'SEARCH_YOUTUBE'
-        AND j.status = 'FAILED'
-        AND j.attempts >= j.max_attempts
-      FOR UPDATE OF qr
-    ), closed AS (
-      UPDATE query_runs qr
-      SET status = 'FAILED',
-          completed_at = COALESCE(qr.completed_at, now()),
-          error = COALESCE(qr.error, 'ORPHANED_TERMINAL_JOB_FAILURE'),
-          performance_details = jsonb_set(
-            COALESCE(qr.performance_details, '{}'::jsonb),
-            '{failureKind}',
-            to_jsonb('ORPHANED_TERMINAL_JOB_FAILURE'::text),
-            true
-          )
-      FROM orphaned o
-      WHERE qr.id = o.id
-      RETURNING qr.id, qr.query_id
-    )
-    SELECT id, query_id FROM closed`, [queryId]);
+export interface QueryRunJobLifecycleReconciliation {
+  retryOwnershipAligned: number;
+  terminalRunsClosed: number;
+}
 
-  if (!result.rows?.length) return 0;
-  const runIds = result.rows.map((row: any) => String(row.id));
-  const queryIds = [...new Set(result.rows.map((row: any) => Number(row.query_id)))];
-  await client.query(
-    `UPDATE quota_reservations
-     SET status='RELEASED'
-     WHERE operation_type='SEARCH_YOUTUBE'
-       AND operation_id=ANY($1::text[])
-       AND status='RESERVED'`,
-    [runIds]
-  );
-  await client.query(
-    `UPDATE query_library q
-     SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL
-     WHERE q.id=ANY($1::int[])
-       AND NOT EXISTS (
-         SELECT 1 FROM query_runs active
-         WHERE active.query_id=q.id
-           AND active.status IN ('SCHEDULED','RUNNING','RETRYING')
-       )`,
-    [queryIds]
-  );
-  return runIds.length;
+/**
+ * Reconcile the durable owner of an autonomous query execution without
+ * weakening reservation or retry controls. A pending job with a scheduled
+ * retry keeps the query run active as RETRYING and keeps its reservation. A
+ * legacy FAILED job is requeued only when its persisted operational-retry
+ * marker and remaining attempt budget prove that it was meant to retry. All
+ * other FAILED jobs close the active query run and release its reservation.
+ */
+export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId: number): Promise<QueryRunJobLifecycleReconciliation> {
+  const result = await client.query(`
+    SELECT qr.id AS query_run_id, qr.query_id, qr.status AS query_run_status,
+           qr.error AS query_run_error, j.id AS job_id, j.status AS job_status,
+           j.attempts, j.max_attempts, j.last_error, j.run_after,
+           j.completed_at AS job_completed_at
+    FROM query_runs qr
+    JOIN jobs j ON j.id = qr.job_id
+    WHERE qr.query_id = $1
+      AND qr.status IN ('SCHEDULED','RUNNING','RETRYING')
+      AND j.type = 'SEARCH_YOUTUBE'
+    FOR UPDATE OF qr, j`, [queryId]);
+
+  const summary: QueryRunJobLifecycleReconciliation = {
+    retryOwnershipAligned: 0,
+    terminalRunsClosed: 0
+  };
+  const terminalQueryIds = new Set<number>();
+
+  for (const row of result.rows || []) {
+    const decision = decideQueryRunJobLifecycle({
+      queryRunStatus: row.query_run_status as QueryRunLifecycleStatus,
+      jobStatus: row.job_status as QueryJobLifecycleStatus,
+      jobLastError: row.last_error,
+      jobRunAfter: row.run_after,
+      jobCompletedAt: row.job_completed_at
+    });
+
+    if (decision.action === 'ALIGN_RETRY_WAIT') {
+      await client.query(`
+        UPDATE query_runs
+        SET status='RETRYING',
+            performance_details=COALESCE(performance_details,'{}'::jsonb)||$2::jsonb
+        WHERE id=$1 AND status IN ('SCHEDULED','RUNNING','RETRYING')`, [row.query_run_id, JSON.stringify({ retryOwnership: 'JOB_RETRY_PENDING', retryOwnershipReason: decision.reasonCode })]);
+      summary.retryOwnershipAligned++;
+      continue;
+    }
+
+    if (decision.action !== 'TERMINALIZE_QUERY_RUN') continue;
+    const closed = await client.query(`
+      UPDATE query_runs
+      SET status='FAILED', completed_at=COALESCE(completed_at,now()),
+          error=COALESCE(error,$2),
+          performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
+      WHERE id=$1 AND status IN ('SCHEDULED','RUNNING','RETRYING')
+      RETURNING query_id`, [row.query_run_id, row.query_run_error || row.last_error || 'ORPHANED_FAILED_JOB_STATE', JSON.stringify({ failureKind: 'ORPHANED_FAILED_JOB_STATE', retryOwnership: 'RELEASED' })]);
+    if (!closed.rowCount) continue;
+    summary.terminalRunsClosed++;
+    terminalQueryIds.add(Number(closed.rows[0].query_id));
+    await client.query(`
+      UPDATE quota_reservations
+      SET status='RELEASED'
+      WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [String(row.query_run_id)]);
+  }
+
+  if (terminalQueryIds.size) {
+    await client.query(`
+      UPDATE query_library q
+      SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL
+      WHERE q.id=ANY($1::int[])
+        AND NOT EXISTS (
+          SELECT 1 FROM query_runs active
+          WHERE active.query_id=q.id
+            AND active.status IN ('SCHEDULED','RUNNING','RETRYING')
+        )`, [[...terminalQueryIds]]);
+  }
+  return summary;
+}
+
+/** Backward-compatible count for callers that only report terminal recovery. */
+export async function reconcileTerminalQueryRunsForQuery(client: any, queryId: number): Promise<number> {
+  const summary = await reconcileQueryRunJobLifecycleForQuery(client, queryId);
+  return summary.terminalRunsClosed;
 }
 
 export async function scheduleAutonomousQueryRuns(
@@ -790,8 +828,9 @@ export async function scheduleAutonomousQueryRuns(
         throw new Error('FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH');
       }
       activeOperation = 'query_run_orphan_reconciliation';
-      const reconciledRunCount = await reconcileTerminalQueryRunsForQuery(client, candidate.query.id);
-      if (reconciledRunCount) setDiagnostic({ reservationRecoveryOutcome: 'ORPHANED_TERMINAL_RUNS_RECONCILED' });
+      const lifecycleRecovery = await reconcileQueryRunJobLifecycleForQuery(client, candidate.query.id);
+      if (lifecycleRecovery.retryOwnershipAligned) setDiagnostic({ reservationRecoveryOutcome: 'RETRY_WAIT_OWNERSHIP_ALIGNED' });
+      if (lifecycleRecovery.terminalRunsClosed) setDiagnostic({ reservationRecoveryOutcome: 'ORPHANED_FAILED_RUNS_RECONCILED' });
 
       activeOperation = 'query_library_reservation';
       const reserved = await client.query(
