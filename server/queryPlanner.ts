@@ -258,7 +258,7 @@ export function planDiverseQueries(args: {
   const supportedLanguages = countrySearchLanguageCandidates(args.country, args.countryVocabulary?.languages || []);
   const intentUsage = new Map<QueryIntent, number>();
   args.existingQueries.forEach(query => intentUsage.set(query.intent, (intentUsage.get(query.intent) || 0) + 1));
-  const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'INSTRUMENT_MARKET' | 'MARKET_INSTRUMENT' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic?: ReturnType<typeof admitOrganicQueryCandidates>[number] }> = anchors.filter(searchAtom=>searchAtom.retrievalPolicy.eligibility==='STANDALONE'||searchAtom.retrievalPolicy.eligibility==='ANCHOR_ONLY').map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
+  const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'INSTRUMENT_MARKET' | 'MARKET_INSTRUMENT' | 'METHOD_INSTRUMENT' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic?: ReturnType<typeof admitOrganicQueryCandidates>[number] }> = anchors.filter(searchAtom=>searchAtom.retrievalPolicy.eligibility==='STANDALONE'||searchAtom.retrievalPolicy.eligibility==='ANCHOR_ONLY').map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
 
   // Only combine semantically compatible atoms: a concrete instrument/market
   // anchor plus one trading method. Formats and unrelated concepts never mix.
@@ -292,6 +292,18 @@ export function planDiverseQueries(args: {
       .map(instrument => ({ atoms: [market, instrument], template: 'MARKET_INSTRUMENT' as const })))
     .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
   candidates.push(...marketInstrumentPairs);
+
+  // A governed method can also lead a compound query when paired with a
+  // concrete instrument modifier. This is distinct from unsafe standalone
+  // generic-method retrieval and prevents countries with one curated
+  // instrument anchor from exhausting their finite query space.
+  const methodInstrumentPairs = authorizedAnchors
+    .filter(item => item.type === 'METHOD')
+    .flatMap(method => anchors
+      .filter(item => item.type === 'INSTRUMENT')
+      .map(instrument => ({ atoms: [method, instrument], template: 'METHOD_INSTRUMENT' as const })))
+    .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
+  candidates.push(...methodInstrumentPairs);
 
   const proven = (args.provenTerminology || []).map(term => ({
     atom: atom(term.term, 'LEARNED', 'strategy', term.lifecycle === 'PROVEN_SEARCH_TERM' ? 1 : 2, 'LEARNED'),
@@ -355,6 +367,8 @@ export function planDiverseQueries(args: {
               ? 'Combined a concrete local instrument with a local market or exchange context.'
             : candidate.template === 'MARKET_INSTRUMENT'
               ? 'Combined an authorized local market or exchange anchor with a concrete instrument context.'
+            : candidate.template === 'METHOD_INSTRUMENT'
+              ? 'Combined an authorized local trading method anchor with a concrete instrument context.'
             : candidate.template === 'ANCHOR_LEARNED'
             ? `Combined one compact Tier 1 local anchor with constrained Tier ${candidate.atoms[1].tier} learned vocabulary.`
             : candidate.template === 'ORGANIC_STANDALONE'
