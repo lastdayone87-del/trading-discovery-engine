@@ -110,7 +110,7 @@ export function limitRepeatedPrimaryTerms(queries: QueryRecord[], allQueries: Qu
     const key = normalizeQuery(query.primary_term);
     usage.set(key, (usage.get(key) || 0) + 1);
   }
-  return queries.filter(query => !query.primary_term || (usage.get(normalizeQuery(query.primary_term)) || 0) < maxUses);
+  return queries.filter(query => !query.last_executed || !query.primary_term || (usage.get(normalizeQuery(query.primary_term)) || 0) < maxUses);
 }
 
 export function rotateAwayFromMostRecentIntent(eligible: QueryRecord[], history: QueryRecord[]): QueryRecord[] {
