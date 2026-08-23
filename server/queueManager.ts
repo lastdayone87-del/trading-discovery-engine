@@ -43,7 +43,7 @@ import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from 
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
-import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, selectNextQueryForCountry } from './queryIntelligence';
+import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
@@ -136,29 +136,6 @@ export async function addManualCountrySearch(userQuery: string, countryName: str
   }
 
   return { baseJob, expandedQueries };
-}
-
-/**
- * Generates and enqueues country native queries for an automated discovery run.
- */
-export async function addAutomatedCountrySearch(countryName: string, provenance?: JobProvenance): Promise<string[]> {
-  await assertCountryAllowed(countryName, 'automated_search_generation');
-  const vocabs = await getCountryVocabularies();
-  const vocab = vocabs.find(v => v.country.toLowerCase() === countryName.toLowerCase());
-
-  if (!vocab) {
-    throw new Error(`Country '${countryName}' not found in allowed vocabulary database.`);
-  }
-
-  const selected = await selectNextQueryForCountry(countryName);
-  const authority = evaluateAutonomousQueryAuthority(selected.queryRecord);
-  if (!authority.eligible) {
-    console.log(`[Unified Query Authority] Automated country search query "${selected.queryRecord.query}" (${countryName}) withheld before queuing: ${authority.reasonCodes.join(', ')}.`);
-    return [];
-  }
-
-  await addSearchJob(selected.queryRecord.query, countryName, 'automated_query', provenance);
-  return [selected.queryRecord.query];
 }
 
 export function preferredLanguageFromQueryMetadata(metadata: Record<string, unknown>): string | undefined {
