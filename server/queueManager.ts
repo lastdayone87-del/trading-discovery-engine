@@ -153,7 +153,7 @@ export async function processNextSearchJob(
   await recoverStaleJobs();
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
-  await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel);
+  await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), enqueueCommunityAcquisitionRetry);
   triggerPhaseBObservationReconciliation();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
