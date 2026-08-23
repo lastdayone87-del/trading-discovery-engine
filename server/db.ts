@@ -1759,7 +1759,7 @@ export async function completeQueryRun(runId: string, metrics: {
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
     if(run.rowCount)await client.query(`UPDATE frontier_allocation_decisions
-      SET quota_consumed=$2,provider_consumed_amount=$2
+      SET quota_consumed=$2::int,provider_consumed_amount=$2::bigint
       WHERE query_run_id=$1 AND decision_status='COMMITTED' AND provider_key=(SELECT provider_key FROM query_runs WHERE id=$1)`,[runId,metrics.quotaUsed]);
     await client.query('COMMIT');
 
