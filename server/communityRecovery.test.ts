@@ -31,6 +31,26 @@ test('FAILED_PERMANENT without triggers remains dormant', () => {
   assert.ok(check.reasonCodes.includes('NO_REACTIVATION_TRIGGER_MATCHED'));
 });
 
+test('active-creator recovery does not reopen immediately after a recent terminal failure', () => {
+  const channel = Object.assign(mockChannel('FAILED', '2026-08-23T08:30:00Z'), {
+    activity_band: 'VERY_ACTIVE',
+    discord_validation_status: 'RETRY_PENDING'
+  });
+  const check = shouldReactivateCommunityRecovery(channel, undefined, false, Date.parse('2026-08-23T12:00:00Z'));
+  assert.equal(check.reactivate, false);
+  assert.deepEqual(check.reasonCodes, ['NO_REACTIVATION_TRIGGER_MATCHED']);
+});
+
+test('active-creator recovery reopens after the durable cooldown', () => {
+  const channel = Object.assign(mockChannel('FAILED', '2026-08-22T11:00:00Z'), {
+    activity_band: 'VERY_ACTIVE',
+    discord_validation_status: 'RETRY_PENDING'
+  });
+  const check = shouldReactivateCommunityRecovery(channel, undefined, false, Date.parse('2026-08-23T12:00:00Z'));
+  assert.equal(check.reactivate, true);
+  assert.ok(check.reasonCodes.includes('HIGH_CREATOR_ACTIVITY'));
+});
+
 test('shouldReactivateCommunityRecovery reactivates FAILED_PERMANENT on newly observed links', () => {
   const channel = mockChannel();
   const check = shouldReactivateCommunityRecovery(channel, {
@@ -118,6 +138,7 @@ test('automatic reconciliation reopens one governed retry window for an active c
   assert.equal(persisted[0].discord_validation_status, 'RETRY_PENDING');
   assert.equal(persisted[0].trading_status, undefined);
   assert.match(queries[0].sql, /activity_band IN\('ACTIVE','VERY_ACTIVE'\)/);
+  assert.match(queries[0].sql, /last_checked < now\(\) - interval '24 hours'/);
   assert.match(queries[0].sql, /NOT EXISTS/);
   assert.match(queries[0].sql, /status IN\('PENDING','PROCESSING'\)/);
 });

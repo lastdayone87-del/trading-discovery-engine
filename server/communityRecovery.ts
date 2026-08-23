@@ -8,6 +8,13 @@ export interface CommunityRecoveryReactivationReason {
 
 export type EnqueueCommunityRecoveryJob = (channelId: string) => Promise<void>;
 
+// High-activity recovery is intentionally more frequent than the 30-day
+// freshness trigger, but it must not reopen a terminal retry window on every
+// worker tick after an attempt-free or exhausted failure. The channel's
+// last_checked timestamp is advanced by the failure projection, so this
+// cooldown is durable without adding a schema field.
+export const COMMUNITY_ACTIVE_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
+
 /**
  * FAILED_PERMANENT records operational retry exhaustion history for a specific
  * historical attempt. It is never a permanent claim that a creator will never
@@ -46,7 +53,10 @@ export function shouldReactivateCommunityRecovery(
   }
 
   if (channel.activity_band === 'VERY_ACTIVE' || channel.activity_band === 'ACTIVE') {
-    reasons.push('HIGH_CREATOR_ACTIVITY');
+    const ageSinceLastCheckedMs = channel.last_checked ? now - Date.parse(channel.last_checked) : Number.POSITIVE_INFINITY;
+    if (ageSinceLastCheckedMs >= COMMUNITY_ACTIVE_RECOVERY_COOLDOWN_MS) {
+      reasons.push('HIGH_CREATOR_ACTIVITY');
+    }
   }
 
   if (channel.last_checked) {
@@ -119,7 +129,10 @@ export async function reconcileCommunityAcquisitionRecovery(
         AND (
           c.last_checked IS NULL
           OR c.last_checked < now() - interval '30 days'
-          OR c.activity_band IN('ACTIVE','VERY_ACTIVE')
+          OR (
+            c.activity_band IN('ACTIVE','VERY_ACTIVE')
+            AND c.last_checked < now() - interval '24 hours'
+          )
         )
         AND NOT EXISTS (
           SELECT 1 FROM jobs j
