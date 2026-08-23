@@ -137,6 +137,23 @@ test('planner creates short, unique, attributable retrieval queries', () => {
   assert.ok(planned.filter(item => item.knowledgeTiers.includes(3)).length <= Math.ceil(planned.length / 5));
 });
 
+test('multilingual query plans rotate supported provider languages with explicit lineage', () => {
+  const planned = planDiverseQueries({
+    country: 'Switzerland',
+    count: 6,
+    countryVocabulary: {
+      country: 'Switzerland', languages: ['German', 'French', 'Italian'], native_trading_terminology: ['Börsenanalyse Schweiz', 'Devisenhandel'],
+      popular_instruments: ['SMI', 'CHF'], local_market_phrases: ['SIX Swiss Exchange'], common_content_format_names: ['Schweizer Marktupdate']
+    },
+    learnedVocabulary: [], existingQueries: [], mode: 'COLD_START'
+  });
+  const selected = planned.map(item => (item.metadata.languageLineage as any)?.selectedLanguage);
+  assert.deepEqual(selected.slice(0, 3), ['de', 'fr', 'it']);
+  assert.ok(selected.every(language => ['de', 'fr', 'it'].includes(language)));
+  assert.deepEqual((planned[1].metadata.languageLineage as any).supportedLanguages, ['de', 'fr', 'it']);
+  assert.equal((planned[1].metadata.languageLineage as any).ordinal, 2);
+});
+
 test('planner uses native compact vocabulary in every supported market', () => {
   const expected: Record<string, RegExp> = {
     'United States': /NQ Futures|ES Futures|Order Flow/,

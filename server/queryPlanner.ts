@@ -255,6 +255,7 @@ export function planDiverseQueries(args: {
   const blocked = new Set(args.existingQueries.map(item => normalizeQuery(item.query)));
   const generated = new Set<string>();
   const anchors = countryAtoms(args.country, args.countryVocabulary);
+  const supportedLanguages = countrySearchLanguageCandidates(args.country, args.countryVocabulary?.languages || []);
   const intentUsage = new Map<QueryIntent, number>();
   args.existingQueries.forEach(query => intentUsage.set(query.intent, (intentUsage.get(query.intent) || 0) + 1));
   const candidates: Array<{ atoms: SearchAtom[]; template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC'; organic?: ReturnType<typeof admitOrganicQueryCandidates>[number] }> = anchors.filter(searchAtom=>searchAtom.retrievalPolicy.eligibility==='STANDALONE'||searchAtom.retrievalPolicy.eligibility==='ANCHOR_ONLY').map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
@@ -315,6 +316,7 @@ export function planDiverseQueries(args: {
     if (hasTier3) tier3Used++;
     const tiers = [...new Set(candidate.atoms.map(item => item.tier))] as QueryKnowledgeTier[];
     const primary = candidate.atoms[0];
+    const preferredLanguage = supportedLanguages.length ? supportedLanguages[planned.length % supportedLanguages.length] : undefined;
     planned.push({
       query,
       intent: primary.intent,
@@ -341,6 +343,13 @@ export function planDiverseQueries(args: {
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,
         learnedTerm: candidate.atoms.find(item => item.type === 'LEARNED')?.term,
+        preferredLanguage,
+        languageLineage: preferredLanguage ? {
+          policy: 'COUNTRY_SUPPORTED_LANGUAGE_ROTATION_V1',
+          supportedLanguages,
+          selectedLanguage: preferredLanguage,
+          ordinal: planned.length + 1
+        } : undefined,
         terminologyId: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.id,
         terminologyLifecycle: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.lifecycle,
         terminologyDecayedYield: provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))?.score,
