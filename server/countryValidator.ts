@@ -1,6 +1,6 @@
 import type { CountryMetadataStatus, CountryStatus } from '../src/types';
 import { getExcludedCountries, getCountryVocabularies } from './db';
-import { CountryInferenceEvidence, inferChannelCountry } from './countryInference';
+import { canonicalCountry, CountryInferenceEvidence, inferChannelCountry } from './countryInference';
 
 export interface ValidationResult {
   score: number;
@@ -47,6 +47,20 @@ export function creatorLevelCountryEvidence(channelData: {
  * Compatibility adapter for existing pipeline callers. All inference and
  * precedence decisions live in the dedicated countryInference module.
  */
+export function applyTargetCountryBoundary(result: ValidationResult, targetCountryName: string): ValidationResult {
+  const target = canonicalCountry(targetCountryName);
+  const detected = result.detectedCountry ? canonicalCountry(result.detectedCountry) : null;
+  const globalContext = !targetCountryName.trim() || ['GLOBAL', 'ALL', '*', 'WORLDWIDE'].includes(target.toLocaleUpperCase('en'));
+  if (globalContext || !detected || result.status === 'REJECTED' || detected === target) return result;
+  const reason = `Creator country ${detected} does not match pinned discovery country ${target}.`;
+  return {
+    ...result,
+    status: 'REJECTED',
+    rejectionReason: reason,
+    decisionLogs: `${result.decisionLogs}\nTarget Country Boundary: REJECTED — ${reason}`
+  };
+}
+
 export async function validateChannelCountry(
   channelData: {
     channelName: string;
@@ -81,12 +95,12 @@ export async function validateChannelCountry(
     ...(evidenceLines.length ? evidenceLines : ['  No country evidence found.'])
   ].join('\n');
 
-  return {
+  return applyTargetCountryBoundary({
     score: inference.confidence,
     status: inference.status,
     detectedCountry: inference.detectedCountry,
     rejectionReason: inference.rejectionReason,
     decisionLogs,
     evidence: inference.evidence
-  };
+  }, targetCountryName);
 }

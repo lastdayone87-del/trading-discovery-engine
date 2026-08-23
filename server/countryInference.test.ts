@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { applyTargetCountryBoundary } from './countryValidator';
 import { CountryInferenceInput, inferChannelCountry } from './countryInference';
+
+const asValidationResult = (result: ReturnType<typeof inferChannelCountry>) => ({
+  score: result.confidence,
+  status: result.status,
+  detectedCountry: result.detectedCountry,
+  rejectionReason: result.rejectionReason,
+  decisionLogs: result.reasoning,
+  evidence: result.evidence
+});
 
 const multilingualCases: Array<{ language: string; country: string; input: CountryInferenceInput }> = [
   { language: 'Arabic', country: 'Saudi Arabia', input: { channelName: 'متداول الرياض', aboutBio: 'تحليل فني للأسهم في تداول السعودية والسوق المحلي', videoTitles: ['نظرة على مؤشر تاسي'], discoveryCountry: 'United States' } },
@@ -113,4 +123,46 @@ test('returns ordered, structured evidence for every available signal tier', () 
   ]) assert.ok(sources.has(source as any), `missing ${source}`);
   assert.deepEqual(result.evidence.map(item => item.priority), [...result.evidence.map(item => item.priority)].sort((a, b) => a - b));
   assert.ok(result.evidence.every(item => item.detectedCountry && item.reasoning && item.confidence >= 0));
+});
+
+
+test('target-country boundary rejects a strongly attributed non-target creator', () => {
+  const inferred = inferChannelCountry({
+    aboutBio: 'Trader italiano based in Milano covering Borsa Italiana and FTSE MIB',
+    discoveryCountry: 'Germany'
+  });
+  assert.equal(inferred.detectedCountry, 'Italy');
+  assert.equal(inferred.status, 'CONFIRMED');
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
+  assert.equal(bounded.status, 'REJECTED');
+  assert.match(bounded.rejectionReason || '', /does not match pinned discovery country Germany/);
+});
+
+test('target-country boundary preserves a matching strong country decision', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'DE', discoveryCountry: 'Germany' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
+  assert.equal(bounded.status, 'CONFIRMED');
+  assert.equal(bounded.detectedCountry, 'Germany');
+  assert.equal(bounded.rejectionReason, undefined);
+});
+
+test('target-country boundary preserves unresolved country uncertainty', () => {
+  const inferred = inferChannelCountry({ channelName: 'Trading Channel', discoveryCountry: 'Germany' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
+  assert.equal(bounded.status, 'UNCERTAIN');
+  assert.equal(bounded.detectedCountry, 'Germany');
+});
+
+test('target-country boundary bypasses intentional global discovery context', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'IT', discoveryCountry: 'GLOBAL' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'GLOBAL');
+  assert.equal(bounded.status, 'CONFIRMED');
+  assert.equal(bounded.detectedCountry, 'Italy');
+});
+
+test('target-country boundary preserves an existing policy rejection', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'IN', discoveryCountry: 'Germany' }, [{ country_name: 'India', reason: 'Configured regional exclusion' }]);
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
+  assert.equal(bounded.status, 'REJECTED');
+  assert.match(bounded.rejectionReason || '', /Configured regional exclusion/);
 });
