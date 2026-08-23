@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
+import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import type { ChannelRecord } from '../src/types';
 
 const root = process.cwd();
@@ -54,6 +54,19 @@ test('shouldReactivateCommunityRecovery reactivates FAILED_PERMANENT after fresh
   assert.ok(check.reasonCodes.includes('COMMUNITY_FRESHNESS_INTERVAL_EXPIRED'));
 });
 
+test('semantic terminal channel states are never resurrected by operational recovery',()=>{
+  for (const overrides of [
+    { country_status: 'REJECTED' },
+    { trading_status: 'NON_TRADING' },
+    { trading_status: 'HUMAN_REJECTED' }
+  ]) {
+    const channel = Object.assign(mockChannel('FAILED_PERMANENT', '2026-01-01T00:00:00Z'), overrides);
+    const check = shouldReactivateCommunityRecovery(channel, undefined, false, Date.parse('2026-03-01T00:00:00Z'));
+    assert.equal(check.reactivate, false);
+    assert.equal(check.reasonCodes[0], 'SEMANTIC_TERMINAL_STATE_PRESERVED');
+  }
+});
+
 test('legacy semantic terminal evidence is not resurrected',()=>{
   const channel=mockChannel('FAILED_PERMANENT','2026-01-01T00:00:00Z');
   channel.discord_validation_status='COMPLETED';
@@ -75,10 +88,63 @@ test('reactivateCommunityRecovery resets scan_status to ENRICHMENT_PENDING while
   assert.ok(reactivated.inspection_trail[1].title.includes('Reactivated'));
 });
 
+test('automatic reconciliation reopens one governed retry window for an active creator and preserves job ownership rules', async () => {
+  const channel = Object.assign(mockChannel('FAILED_PERMANENT', '2026-08-15T00:00:00Z'), {
+    activity_band: 'VERY_ACTIVE',
+    discord_validation_status: 'RETRY_PENDING'
+  });
+  const queries: Array<{ sql: string; values: unknown[] }> = [];
+  const enqueued: string[] = [];
+  const events: string[] = [];
+  const persisted: ChannelRecord[] = [];
+  const count = await reconcileCommunityAcquisitionRecovery(
+    async () => ({
+      query: async (sql: string, values: unknown[]) => {
+        queries.push({ sql, values });
+        return { rows: [{ channel_id: channel.channel_id }] };
+      }
+    }),
+    async () => channel,
+    async (updated: ChannelRecord) => { persisted.push(updated); events.push(`persist:${updated.scan_status}`); },
+    1,
+    Date.parse('2026-08-23T09:00:00Z'),
+    async (channelId: string) => { enqueued.push(channelId); events.push(`enqueue:${channelId}`); }
+  );
+
+  assert.equal(count, 1);
+  assert.deepEqual(enqueued, [channel.channel_id]);
+  assert.deepEqual(events, ['persist:ENRICHMENT_PENDING', `enqueue:${channel.channel_id}`]);
+  assert.equal(persisted[0].scan_status, 'ENRICHMENT_PENDING');
+  assert.equal(persisted[0].discord_validation_status, 'RETRY_PENDING');
+  assert.equal(persisted[0].trading_status, undefined);
+  assert.match(queries[0].sql, /activity_band IN\('ACTIVE','VERY_ACTIVE'\)/);
+  assert.match(queries[0].sql, /NOT EXISTS/);
+  assert.match(queries[0].sql, /status IN\('PENDING','PROCESSING'\)/);
+});
+
+test('automatic reconciliation restores the prior failure projection when recovery-job reopening fails', async () => {
+  const channel = Object.assign(mockChannel('FAILED', '2026-08-15T00:00:00Z'), { activity_band: 'ACTIVE', discord_validation_status: 'RETRY_PENDING' });
+  const persisted: ChannelRecord[] = [];
+  await assert.rejects(
+    reconcileCommunityAcquisitionRecovery(
+      async () => ({ query: async () => ({ rows: [{ channel_id: channel.channel_id }] }) }),
+      async () => channel,
+      async (updated: ChannelRecord) => { persisted.push(updated); },
+      1,
+      Date.parse('2026-08-23T09:01:00Z'),
+      async () => { throw new Error('recovery enqueue unavailable'); }
+    ),
+    /recovery enqueue unavailable/
+  );
+  assert.deepEqual(persisted.map(item => item.scan_status), ['ENRICHMENT_PENDING', 'FAILED']);
+  assert.equal(persisted[1].trading_status, channel.trading_status);
+});
+
 test('production ingestion and manual recheck entry points invoke community recovery reactivation', () => {
   const pipeSource = read('server/ingestionPipeline.ts');
   const queueSource = read('server/queueManager.ts');
 
   assert.match(pipeSource, /shouldReactivateCommunityRecovery\(existing, candidate, isManualScan\)/);
   assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
+  assert.match(queueSource, /reconcileCommunityAcquisitionRecovery\(getDb, getChannelById, upsertChannel, 20, Date\.now\(\), enqueueCommunityAcquisitionRetry\)/);
 });
