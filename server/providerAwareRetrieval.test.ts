@@ -194,7 +194,9 @@ test('allocated retrieval forwards query-run, request, and job lifecycle identit
   assert.match(retrieval, /runId: request\.queryRunId/);
   assert.match(retrieval, /jobId: request\.jobId/);
   assert.match(queue, /requestId:providerRequestBaseId,jobId:job\.id/);
-  assert.match(youtube, /providerRequestId = lifecycle\?\.requestId \? `\$\{lifecycle\.requestId\}:attempt:\$\{attempt\}`/);
+  assert.match(youtube, /providerDispatchAttempt/);
+  assert.match(youtube, /buildYouTubeProviderRequestId\(lifecycle\?\.requestId, dispatchAttempt\)/);
+  assert.match(youtube, /attempt:dispatchAttempt/);
   assert.match(youtube, /runId:lifecycle\?\.runId,jobId:lifecycle\?\.jobId/);
 });
 
