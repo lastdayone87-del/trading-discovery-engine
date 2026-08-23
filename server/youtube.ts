@@ -224,8 +224,15 @@ export function buildYouTubeApiUrl(
   return url.toString();
 }
 
+export function buildYouTubeProviderRequestId(logicalRequestId: string | undefined, dispatchAttempt: number): string | undefined {
+  if (!logicalRequestId) return undefined;
+  if (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt < 1) throw new Error('INVALID_PROVIDER_DISPATCH_ATTEMPT');
+  return `${logicalRequestId}:provider-attempt:${dispatchAttempt}`;
+}
+
 async function youtubeFetch(url:string,operation:string,actualCost:number,attempt=1,acquisition?:YouTubePoolAcquisition,priority:YouTubeRequestPriority='enrichment',providerKey?:string,lifecycle?:YouTubeProviderLifecycle):Promise<Response>{
   const traceId = `${operation}-${attempt}-${++outboundTraceSequence}`;
+  let providerDispatchAttempt = 0;
   const trace = (stage: string) => console.log(`[YouTube Outbound Trace] ${traceId} ${stage}`);
   trace('entered youtubeFetch; before timeout-setting-read at server/youtube.ts:119');
   const configuredTimeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
@@ -235,6 +242,7 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
   trace('before scheduler-run at server/youtube.ts:126');
   try {
     return await youtubeRequestScheduler.run(()=>{
+      const dispatchAttempt = ++providerDispatchAttempt;
       let dispatchedUrl=url;
       if(providerKey){
         const livePool=getYouTubeKeyPool();
@@ -254,13 +262,13 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           trace(`reselected provider at dispatch (key #${dispatchIndex+1})`);
         }
       }
-      const providerRequestId = lifecycle?.requestId ? `${lifecycle.requestId}:attempt:${attempt}` : undefined;
+      const providerRequestId = buildYouTubeProviderRequestId(lifecycle?.requestId, dispatchAttempt);
       const dispatchedRequest = new URL(dispatchedUrl);
       const requestMetadata = {
         regionCode: dispatchedRequest.searchParams.get('regionCode'),
         relevanceLanguage: dispatchedRequest.searchParams.get('relevanceLanguage')
       };
-      return executeProviderCall({context:{provider:'youtube',operation,requestId:providerRequestId,runId:lifecycle?.runId,jobId:lifecycle?.jobId,requestMetadata,attempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
+      return executeProviderCall({context:{provider:'youtube',operation,requestId:providerRequestId,runId:lifecycle?.runId,jobId:lifecycle?.jobId,requestMetadata,attempt:dispatchAttempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
         trace('before first-request-record at server/youtube.ts:128');
         await recordFirstYouTubeRequest(operation);
         trace('after first-request-record at server/youtube.ts:128');
