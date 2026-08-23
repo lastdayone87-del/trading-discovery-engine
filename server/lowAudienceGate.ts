@@ -7,11 +7,17 @@ export interface LowAudienceGateResult {
 export function parseSubscriberCountNumber(raw?: string): number | undefined {
   if (!raw) return undefined;
   const normalized = String(raw).trim().toUpperCase();
-  if (!normalized || normalized === 'HIDDEN' || normalized === 'UNAVAILABLE') return undefined;
+  if (!normalized || normalized === 'HIDDEN' || normalized === 'UNAVAILABLE' || normalized === 'UNKNOWN' || normalized === 'N/A' || normalized === 'NA') return undefined;
 
-  if (/^\d+$/.test(normalized)) return parseInt(normalized, 10);
-  if (/^[\d.]+\s*K$/.test(normalized)) return Math.round(parseFloat(normalized) * 1000);
-  if (/^[\d.]+\s*M$/.test(normalized)) return Math.round(parseFloat(normalized) * 1000000);
+  const compact = normalized.replace(/,/g, '');
+  const numeric = compact.match(/^(\d+)$/);
+  const subscribers = compact.match(/^(\d+)\s+SUBSCRIBERS?$/);
+  const thousands = compact.match(/^([\d.]+)\s*K(?:\s+SUBSCRIBERS?)?$/);
+  const millions = compact.match(/^([\d.]+)\s*M(?:\s+SUBSCRIBERS?)?$/);
+  if (numeric) return parseInt(numeric[1], 10);
+  if (subscribers) return parseInt(subscribers[1], 10);
+  if (thousands) return Math.round(parseFloat(thousands[1]) * 1000);
+  if (millions) return Math.round(parseFloat(millions[1]) * 1000000);
   return undefined;
 }
 
@@ -30,4 +36,17 @@ export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold =
     return { shouldSkipDeepEnrichment: true, subscriberCountNumber: count, reasonCode: 'LOW_AUDIENCE_SKIP' };
   }
   return { shouldSkipDeepEnrichment: false, subscriberCountNumber: count, reasonCode: 'SUFFICIENT_AUDIENCE_PROCEED' };
+}
+
+/**
+ * A fresh known-low audience result may update a preserved completed row so
+ * the stored record remains auditable but leaves the normal operator corpus.
+ * Unknown audience data never qualifies, and non-completed workflow states
+ * remain visible to their owning workflow instead of being hidden here.
+ */
+export function shouldReclassifyPreservedCompletedChannel(
+  existingScanStatus: string | undefined,
+  gate: LowAudienceGateResult,
+): boolean {
+  return existingScanStatus === 'COMPLETED' && gate.shouldSkipDeepEnrichment;
 }

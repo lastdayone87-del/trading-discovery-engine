@@ -28,7 +28,7 @@ import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
-import { evaluateLowAudienceGate } from './lowAudienceGate';
+import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 
 export interface IngestionCandidate extends DiscoveredChannelRaw {
@@ -117,6 +117,37 @@ export async function processChannelThroughPipeline(
     // Preserve terminal rows for every ordinary discovery lane. Explicit
     // operator recheck is the only supported terminal override.
     if (shouldPreserveExistingChannel(existing, source, isManualScan)) {
+      const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
+      if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate)) {
+        console.log(`[Unified Ingestion Pipeline] Refreshing preserved completed channel '${candidate.channelName}' as low-audience after fresh official subscriber metadata.`);
+        existing.subscriber_count = candidate.subscriberCount;
+        existing.scan_status = 'SKIPPED_LOW_AUDIENCE';
+        existing.last_checked = now;
+        existing.inspection_trail = [
+          ...(existing.inspection_trail || []),
+          {
+            step: 'BIO',
+            title: 'Low-Audience Budget Gate',
+            status: 'SKIPPED',
+            details: `Subscribers: ${candidate.subscriberCount} (< 30). Stored and skipped deep enrichment.`,
+            timestamp: now,
+          },
+        ];
+        await upsertChannel(existing);
+        return {
+          channelId: candidate.channelId,
+          channelName: candidate.channelName,
+          isNew: false,
+          wasKnown: true,
+          persisted: true,
+          countryStatus: existing.country_status,
+          tradingStatus: existing.trading_status || 'UNCERTAIN',
+          discordStatus: existing.discord_status,
+          discordInvite: existing.discord_invite || null,
+          channelRecord: existing,
+          skippedTerminalState: true,
+        };
+      }
       console.log(
         `[Unified Ingestion Pipeline] Channel '${candidate.channelName}' (${candidate.channelId}) is already in database (Country: ${existing.country_status}, Trading: ${existing.trading_status}, Scan: ${existing.scan_status}). Preserving existing record.`
       );

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseSubscriberCountNumber, evaluateLowAudienceGate } from './lowAudienceGate';
+import { parseSubscriberCountNumber, evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 
 const root = process.cwd();
 const read = (p: string) => fs.readFileSync(path.join(root, p), 'utf8');
@@ -14,6 +14,8 @@ test('parseSubscriberCountNumber correctly parses numeric and compact formats', 
   assert.equal(parseSubscriberCountNumber('30'), 30);
   assert.equal(parseSubscriberCountNumber('1.2K'), 1200);
   assert.equal(parseSubscriberCountNumber('1M'), 1000000);
+  assert.equal(parseSubscriberCountNumber('1.2K subscribers'), 1200);
+  assert.equal(parseSubscriberCountNumber('29 subscribers'), 29);
   assert.equal(parseSubscriberCountNumber('hidden'), undefined);
   assert.equal(parseSubscriberCountNumber(undefined), undefined);
 });
@@ -35,6 +37,20 @@ test('evaluateLowAudienceGate allows reactivation when subscriber count grows fr
 
   const grown = evaluateLowAudienceGate('35');
   assert.equal(grown.shouldSkipDeepEnrichment, false);
+});
+
+test('preserved completed rows are reclassified only when fresh audience evidence is known low', () => {
+  assert.equal(shouldReclassifyPreservedCompletedChannel('COMPLETED', evaluateLowAudienceGate('1')), true);
+  assert.equal(shouldReclassifyPreservedCompletedChannel('COMPLETED', evaluateLowAudienceGate('hidden')), false);
+  assert.equal(shouldReclassifyPreservedCompletedChannel('ENRICHMENT_PENDING', evaluateLowAudienceGate('1')), false);
+  assert.equal(shouldReclassifyPreservedCompletedChannel('COMPLETED', evaluateLowAudienceGate('30')), false);
+});
+
+test('ingestionPipeline refreshes preserved completed rows without hiding unknown audience rows', () => {
+  const source = read('server/ingestionPipeline.ts');
+  assert.match(source, /shouldReclassifyPreservedCompletedChannel\(existing\.scan_status, refreshedAudienceGate\)/);
+  assert.match(source, /existing\.scan_status = 'SKIPPED_LOW_AUDIENCE'/);
+  assert.match(source, /const refreshedAudienceGate = evaluateLowAudienceGate\(candidate\.subscriberCount\)/);
 });
 
 test('ingestionPipeline enforces country hard-rejection before low-audience budget gate', () => {
