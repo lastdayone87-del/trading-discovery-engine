@@ -48,6 +48,7 @@ interface DiscoveryProducerReport {
   newCollection: string;
   summary: string;
   queuedCount?: number;
+  queries?: string[];
   queueDepth?: number;
   remainingAutonomousQuota?: number;
   diagnostics?: DiscoveryCycleDiagnostics;
@@ -475,6 +476,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     lastReport = {
       country: scheduled.length === 1 ? scheduled[0].query.country : 'MULTI',
       query: scheduled.map(item => item.query.query).join(' | ') || 'NONE',
+      queries: scheduled.map(item => item.query.query),
       strategy: 'DURABLE_BATCH_PRODUCER', discoveredCount: 0, uniqueCount: 0,
       qualityCreatorsCount: 0, performanceScore: 0, newCollection: 'PENDING',
       queuedCount: scheduled.length, queueDepth: snapshot.queueDepth + scheduled.length,

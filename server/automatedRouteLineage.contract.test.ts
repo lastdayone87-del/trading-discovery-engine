@@ -9,7 +9,8 @@ test('authenticated automated search routes through the governed autonomous prod
   const server = here('../server.ts');
   assert.match(server, /runAutonomousDiscoveryCycle\(country, undefined, req\.requestId\)/);
   assert.match(server, /const report = await runAutonomousDiscoveryCycle\(country, undefined, req\.requestId\);/);
-  assert.match(server, /const queries = report\.queuedCount \? \[report\.query\] : \[\];/);
+  assert.match(server, /const queries = report\.queries \|\|/);
+  assert.match(server, /Scheduled \$\{report\.queuedCount \|\| 0\} governed queries/);
   assert.doesNotMatch(server, /addAutomatedCountrySearch/);
 });
 
