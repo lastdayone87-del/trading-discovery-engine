@@ -15,6 +15,15 @@ export type EnqueueCommunityRecoveryJob = (channelId: string) => Promise<void>;
 // cooldown is durable without adding a schema field.
 export const COMMUNITY_ACTIVE_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 
+// The generic job failure policy has a six-hour transient-age ceiling based on
+// jobs.created_at. Community capacity deferrals are intentionally attempt-free,
+// so they must not age into a terminal result merely because provider capacity
+// stayed unavailable. Renew the retry epoch before that generic ceiling while
+// preserving normal run_after backoff and the durable execution history.
+export const COMMUNITY_CAPACITY_RETRY_LEASE_MS = 5 * 60 * 60_000;
+const COMMUNITY_CAPACITY_DEFERRED_PREFIX = 'Community acquisition deferred:';
+const COMMUNITY_CAPACITY_TERMINAL_PREFIX = 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED: Community acquisition deferred:';
+
 /**
  * FAILED_PERMANENT records operational retry exhaustion history for a specific
  * historical attempt. It is never a permanent claim that a creator will never
@@ -107,6 +116,13 @@ let lastCommunityRecoveryReconciliationAt = 0;
  * job's current attempt window, and cannot duplicate an active PENDING or
  * PROCESSING owner. Semantic terminal channels are excluded in SQL and again
  * by shouldReactivateCommunityRecovery.
+ *
+ * Capacity-only community deferrals are a special operational case: they are
+ * attempt-free by contract. The generic queue age ceiling is therefore not a
+ * valid terminal signal for them. Active capacity-deferred jobs have their
+ * retry epoch renewed before that ceiling, and any already-terminalized job
+ * whose latest error proves the same capacity-only condition is reopened
+ * immediately rather than waiting 24 hours for activity recovery.
  */
 export async function reconcileCommunityAcquisitionRecovery(
   getDb: () => Promise<any>,
@@ -120,8 +136,38 @@ export async function reconcileCommunityAcquisitionRecovery(
   lastCommunityRecoveryReconciliationAt = now;
 
   const db = await getDb();
+
+  // Compatibility bridge for the generic transient-age policy: an active
+  // community retry that is waiting only on provider capacity must keep its
+  // attempt-free retry window alive. This does not change run_after, attempts,
+  // or job_attempts history, and therefore cannot create a hot retry loop.
+  await db.query(
+    `UPDATE jobs
+        SET created_at=now(), updated_at=now()
+      WHERE type='RETRY_COMMUNITY_ACQUISITION'
+        AND status IN('PENDING','PROCESSING')
+        AND last_error LIKE $1
+        AND created_at < now() - ($2 || ' milliseconds')::interval`,
+    [`${COMMUNITY_CAPACITY_DEFERRED_PREFIX}%`, String(COMMUNITY_CAPACITY_RETRY_LEASE_MS)]
+  );
+
   const rows = await db.query(
-    `SELECT c.channel_id FROM channels c
+    `SELECT c.channel_id,
+            retry_job.id AS capacity_retry_job_id,
+            COALESCE(
+              retry_job.status='FAILED'
+              AND retry_job.last_error LIKE $2,
+              false
+            ) AS capacity_terminal
+       FROM channels c
+       LEFT JOIN LATERAL (
+         SELECT j.id,j.status,j.last_error
+           FROM jobs j
+          WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
+            AND j.payload->>'channelId'=c.channel_id
+          ORDER BY j.created_at DESC
+          LIMIT 1
+       ) retry_job ON true
       WHERE c.scan_status IN('FAILED','FAILED_PERMANENT')
         AND c.discord_validation_status <> 'COMPLETED'
         AND c.trading_status NOT IN('NON_TRADING','HUMAN_REJECTED')
@@ -133,6 +179,10 @@ export async function reconcileCommunityAcquisitionRecovery(
             c.activity_band IN('ACTIVE','VERY_ACTIVE')
             AND c.last_checked < now() - interval '24 hours'
           )
+          OR (
+            retry_job.status='FAILED'
+            AND retry_job.last_error LIKE $2
+          )
         )
         AND NOT EXISTS (
           SELECT 1 FROM jobs j
@@ -140,21 +190,34 @@ export async function reconcileCommunityAcquisitionRecovery(
              AND j.payload->>'channelId'=c.channel_id
              AND j.status IN('PENDING','PROCESSING')
         )
-      ORDER BY c.last_checked ASC NULLS FIRST
+      ORDER BY (retry_job.status='FAILED' AND retry_job.last_error LIKE $2) DESC,
+               c.last_checked ASC NULLS FIRST
       LIMIT $1`,
-    [Math.min(100, Math.max(1, limit))]
+    [Math.min(100, Math.max(1, limit)), `${COMMUNITY_CAPACITY_TERMINAL_PREFIX}%`]
   );
 
   let reactivatedCount = 0;
   for (const row of rows.rows) {
     const channelRecord = await getChannelById(row.channel_id);
     if (!channelRecord) continue;
-    const triggerCheck = shouldReactivateCommunityRecovery(channelRecord, undefined, false, now);
+    const capacityTerminal = row.capacity_terminal === true;
+    const triggerCheck = capacityTerminal
+      ? { reactivate: true, reasonCodes: ['ATTEMPT_FREE_CAPACITY_RETRY_REOPENED'] }
+      : shouldReactivateCommunityRecovery(channelRecord, undefined, false, now);
     if (!triggerCheck.reactivate) continue;
 
     const updated = reactivateCommunityRecovery(channelRecord, triggerCheck.reasonCodes, new Date(now).toISOString());
     await upsertChannel(updated);
     try {
+      // enqueueJob intentionally reuses the terminal job id, but its generic
+      // age clock is created_at. Reset only the proven capacity-terminal job's
+      // retry epoch so reopening cannot immediately terminalize again.
+      if (capacityTerminal && row.capacity_retry_job_id) {
+        await db.query(
+          `UPDATE jobs SET created_at=now(),updated_at=now() WHERE id=$1 AND status='FAILED'`,
+          [row.capacity_retry_job_id]
+        );
+      }
       // Persist the operational projection before reopening work so a worker
       // cannot complete the new job and then be overwritten by this function.
       // If enqueue fails, restore the prior failure projection and let the next
