@@ -215,3 +215,34 @@ test('planner expands from governed multisource concepts with complete provenanc
   assert.deepEqual((organic?.metadata.organicProvenance as any).sourceRefs, ['playlist:PL1:title:0-17', 'video:V2:title:5-22']);
   assert.equal((organic?.metadata.organicProvenance as any).conceptId, 'concept-market-profile');
 });
+
+test('planner produces novel local instrument-market variants when every current Belgium query is in cooldown', () => {
+  const countryVocabulary = {
+    country: 'Belgium',
+    languages: ['Dutch', 'French', 'German'],
+    native_trading_terminology: ['beursanalyse België', 'technische analyse', 'analyse boursière belge', 'handel in aandelen'],
+    popular_instruments: ['BEL 20', 'EURUSD', 'Euronext Brussels'],
+    local_market_phrases: ['Brusselse beurs', 'Bourse de Bruxelles'],
+    common_content_format_names: ['marktupdate', 'analyse hebdomadaire']
+  };
+  const existing = [
+    'BEL20', 'Beursanalyse', 'BEL 20', 'EURUSD', 'Brusselse beurs Beursanalyse',
+    'BEL20 Beursanalyse', 'BEL20 ES', 'BEL20 beursanalyse België', 'EURUSD Beursanalyse',
+    'EURUSD beursanalyse België', 'EURUSD technische analyse', 'Euronext Brussels Beursanalyse',
+    'BEL 20 Beursanalyse', 'Beursanalyse ETH', 'BEL20 technische analyse'
+  ].map((value, id) => query({ id: id + 1, country: 'Belgium', query: value, last_executed: '2026-08-23T10:29:30.000Z' }));
+  const planned = planDiverseQueries({
+    country: 'Belgium',
+    count: 4,
+    countryVocabulary,
+    learnedVocabulary: [],
+    existingQueries: existing,
+    provenTerminology: [],
+    organicCandidates: [],
+    mode: 'EXPLORATION'
+  });
+  assert.equal(planned.length, 4);
+  assert.ok(planned.every(item => !existing.some(saved => normalizeQuery(saved.query) === normalizeQuery(item.query))));
+  assert.ok(planned.every(item => item.metadata.queryTemplate === 'INSTRUMENT_MARKET'));
+  assert.ok(planned.every(item => /BEL|EURUSD/i.test(item.query)));
+});
