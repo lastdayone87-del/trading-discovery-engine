@@ -285,6 +285,18 @@ export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
     WHERE lower(regexp_replace(trim(excluded.country_name), '\\s+', ' ', 'g')) =
       lower(regexp_replace(trim(channels.country), '\\s+', ' ', 'g'))
   )`;
+// Defense in depth for legacy/preserved rows whose scan status was not
+// refreshed after a known low audience count arrived. Unknown or unparseable
+// values intentionally do not match and therefore remain visible.
+export const KNOWN_LOW_AUDIENCE_SQL = `(
+  CASE
+    WHEN subscriber_count IS NULL OR btrim(subscriber_count)='' THEN NULL
+    WHEN upper(btrim(subscriber_count)) ~ '^[0-9]+([[:space:]]+SUBSCRIBERS?)?$' THEN regexp_replace(upper(btrim(subscriber_count)),'[^0-9]','','g')::numeric
+    WHEN upper(btrim(subscriber_count)) ~ '^[0-9]+([.][0-9]+)?[[:space:]]*K([[:space:]]+SUBSCRIBERS?)?$' THEN regexp_replace(upper(btrim(subscriber_count)),'[^0-9.]','','g')::numeric*1000
+    WHEN upper(btrim(subscriber_count)) ~ '^[0-9]+([.][0-9]+)?[[:space:]]*M([[:space:]]+SUBSCRIBERS?)?$' THEN regexp_replace(upper(btrim(subscriber_count)),'[^0-9.]','','g')::numeric*1000000
+    ELSE NULL
+  END < 30
+)`;
 async function dashboardServingPredicate(db:InstanceType<typeof Pool>):Promise<{predicate:string;scope:string}>{
   const result=await db.query(`SELECT s.setting_value,p.mode,p.activation_id,g.decision
     FROM app_settings s LEFT JOIN release5_rollout_projection p ON p.capability='DASHBOARD_CORPUS'
@@ -309,11 +321,15 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   // opts into those stored rows without changing their status or qualification.
   const clauses=[args.diagnosticsOnly?`NOT (${defaultServing.predicate})`:'TRUE']; const values:string[]=[];
   const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
-  if(!args.includeRejected&&!args.diagnosticsOnly&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE'`);
+  if(!args.includeRejected&&!args.diagnosticsOnly&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT ${KNOWN_LOW_AUDIENCE_SQL}`);
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
-  add('discord_status',args.discordStatus); add('scan_status',args.scanStatus);
+  add('discord_status',args.discordStatus);
+  if(args.scanStatus==='SKIPPED_LOW_AUDIENCE'){
+    values.push(args.scanStatus);
+    clauses.push(`(scan_status=$${values.length} OR ${KNOWN_LOW_AUDIENCE_SQL})`);
+  }else add('scan_status',args.scanStatus);
   return {where:clauses.join(' AND '),values,scope:args.diagnosticsOnly?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'};
 }
 async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelListingFilter):Promise<{where:string;values:string[];scope:string}> {

@@ -10,6 +10,7 @@ test('default channel listing excludes low-audience skips while retaining the re
   const result = buildChannelListingWhere(serving, baseFilters);
   assert.match(result.where, /scan_status <> 'SKIPPED_LOW_AUDIENCE'/);
   assert.doesNotMatch(result.where, /subscriber_count::integer < 30/);
+  assert.match(result.where, /NOT \([\s\S]*CASE[\s\S]*subscriber_count/);
   assert.deepEqual(result.values, []);
 });
 
@@ -17,7 +18,15 @@ test('explicit low-audience scan filter opts into only those stored rows', () =>
   const result = buildChannelListingWhere(serving, { ...baseFilters, scanStatus: 'SKIPPED_LOW_AUDIENCE' });
   assert.doesNotMatch(result.where, /scan_status <> 'SKIPPED_LOW_AUDIENCE'/);
   assert.match(result.where, /scan_status=\$1/);
+  assert.match(result.where, /OR \([\s\S]*CASE[\s\S]*subscriber_count/);
   assert.deepEqual(result.values, ['SKIPPED_LOW_AUDIENCE']);
+});
+
+test('unknown or unavailable audience remains visible under the default contract', () => {
+  const result = buildChannelListingWhere(serving, baseFilters);
+  assert.match(result.where, /NOT \([\s\S]*CASE[\s\S]*subscriber_count/);
+  assert.match(result.where, /subscriber_count IS NULL/);
+  assert.match(result.where, /ELSE NULL/);
 });
 
 test('other explicit scan statuses, search, and combined filters preserve default exclusion', () => {

@@ -12,7 +12,7 @@ test('master listing retains rows but excludes low-audience skips unless explici
   assert.match(db,/const clauses=\[args\.diagnosticsOnly\?[\s\S]+:'TRUE'\]/);
   assert.match(db,/scope:args\.diagnosticsOnly\?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'/);
   assert.match(db,/const explicitlyViewingLowAudience=args\.scanStatus==='SKIPPED_LOW_AUDIENCE'/);
-  assert.match(db,/!explicitlyViewingLowAudience\)clauses\.push\(`scan_status <> 'SKIPPED_LOW_AUDIENCE'`\)/);
+  assert.match(db,/!explicitlyViewingLowAudience\)clauses\.push\(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT \$\{KNOWN_LOW_AUDIENCE_SQL\}`\)/);
 });
 
 test('Stored Channels is an unqualified persisted row count',()=>{
