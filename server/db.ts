@@ -288,7 +288,7 @@ export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
 // Defense in depth for legacy/preserved rows whose scan status was not
 // refreshed after a known low audience count arrived. Unknown or unparseable
 // values intentionally do not match and therefore remain visible.
-export const KNOWN_LOW_AUDIENCE_SQL = `(
+export const KNOWN_LOW_AUDIENCE_SQL = `COALESCE((
   CASE
     WHEN subscriber_count IS NULL OR btrim(subscriber_count)='' THEN NULL
     WHEN upper(btrim(subscriber_count)) ~ '^[0-9]+([[:space:]]+SUBSCRIBERS?)?$' THEN regexp_replace(upper(btrim(subscriber_count)),'[^0-9]','','g')::numeric
@@ -296,7 +296,7 @@ export const KNOWN_LOW_AUDIENCE_SQL = `(
     WHEN upper(btrim(subscriber_count)) ~ '^[0-9]+([.][0-9]+)?[[:space:]]*M([[:space:]]+SUBSCRIBERS?)?$' THEN regexp_replace(upper(btrim(subscriber_count)),'[^0-9.]','','g')::numeric*1000000
     ELSE NULL
   END < 30
-)`;
+), false)`;
 async function dashboardServingPredicate(db:InstanceType<typeof Pool>):Promise<{predicate:string;scope:string}>{
   const result=await db.query(`SELECT s.setting_value,p.mode,p.activation_id,g.decision
     FROM app_settings s LEFT JOIN release5_rollout_projection p ON p.capability='DASHBOARD_CORPUS'
