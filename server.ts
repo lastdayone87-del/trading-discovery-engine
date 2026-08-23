@@ -47,7 +47,6 @@ import { evaluatePersistentResearchPolicy, recordExternalNominations, runPersist
 import {
   addSearchJob,
   addManualCountrySearch,
-  addAutomatedCountrySearch,
   triggerManualRecheck,
   processNextSearchJob,
   executeFullManualSearch,
@@ -417,12 +416,13 @@ async function startServer() {
         return res.status(400).json({ error: 'Missing country parameter.' });
       }
 
-      const queries = await addAutomatedCountrySearch(country, { actorId: req.operator!.actorId, requestId: req.requestId });
+      const report = await runAutonomousDiscoveryCycle(country, undefined, req.requestId);
       
-      // Kick off processing
+      // Kick off processing for the durable Phase 9 job created by the producer.
       processNextSearchJob().catch(() => {});
 
-      res.json({ message: `Generated ${queries.length} native queries for ${country}. Jobs queued.`, queries });
+      const queries = report.queuedCount ? [report.query] : [];
+      res.json({ message: `Generated ${queries.length} native queries for ${country}. Jobs queued.`, queries, queuedCount: report.queuedCount || 0, diagnostics: report.diagnostics });
     } catch (err: any) {
       sendOperationError(res, err);
     }
