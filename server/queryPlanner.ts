@@ -263,7 +263,8 @@ export function planDiverseQueries(args: {
   // Only combine semantically compatible atoms: a concrete instrument/market
   // anchor plus one trading method. Formats and unrelated concepts never mix.
   const methods = anchors.filter(item => item.type === 'METHOD');
-  const compatiblePairs = anchors
+  const authorizedAnchors = anchors.filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility));
+  const compatiblePairs = authorizedAnchors
     .filter(item => item.type === 'INSTRUMENT' || item.type === 'MARKET')
     .flatMap(anchor => methods.map(method => ({ atoms: [anchor, method], template: 'COMPACT_PAIR' as const })))
     .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
@@ -273,7 +274,7 @@ export function planDiverseQueries(args: {
   // country-specific retrieval shape when the finite method combinations have
   // all been used recently. It preserves the hard cooldown and deduplication
   // gates while providing a novel variant without inventing terminology.
-  const instrumentMarketPairs = anchors
+  const instrumentMarketPairs = authorizedAnchors
     .filter(item => item.type === 'INSTRUMENT')
     .flatMap(instrument => anchors
       .filter(item => item.type === 'MARKET')
