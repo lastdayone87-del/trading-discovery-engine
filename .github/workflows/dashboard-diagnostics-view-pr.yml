@@ -6,6 +6,9 @@ on:
     paths:
       - 'server.ts'
       - 'server/db.ts'
+      - 'server/dbCore.ts'
+      - 'server/db/migrations/120_transient_retry_age_anchor.sql'
+      - 'server/investigationWorkflow.test.ts'
       - 'server/dashboardDiagnosticsPolicy.test.ts'
       - 'src/App.tsx'
       - 'src/apiClient.ts'
@@ -32,6 +35,8 @@ jobs:
         run: npm ci
       - name: Diagnostics view regression tests
         run: node --import tsx --test server/dashboardDiagnosticsPolicy.test.ts src/channelListingQuery.test.ts src/apiClient.test.ts
+      - name: Retry lifecycle regression tests
+        run: node --import tsx --test server/investigationWorkflow.test.ts
       - name: TypeScript
         run: npm run lint
       - name: Build
