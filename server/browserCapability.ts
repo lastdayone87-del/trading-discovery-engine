@@ -1,5 +1,3 @@
-import { chromium } from 'playwright';
-
 export type BrowserCapabilityStatus = 'UNKNOWN' | 'READY' | 'UNAVAILABLE';
 export type BrowserFailureClass =
   | 'BROWSER_BINARY_MISSING'
@@ -79,6 +77,7 @@ export function markBrowserCapabilityUnavailable(error: unknown): BrowserCapabil
 
 export async function probeBrowserCapability(): Promise<BrowserCapabilitySnapshot> {
   try {
+    const { chromium } = await import('playwright');
     const browser = await chromium.launch(browserLaunchOptions());
     const version = browser.version();
     await browser.close();
