@@ -1,5 +1,5 @@
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
-import { classifyBrowserFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, type BrowserFailureClass } from './browserCapability';
+import { browserLaunchOptions, classifyBrowserFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, type BrowserFailureClass } from './browserCapability';
 import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
   DEFAULT_RENDERED_MAX_SESSION_ROTATIONS,
@@ -142,7 +142,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           sameDomainDelaySecs: 1,
           navigationTimeoutSecs: Math.ceil(limits.navigationTimeoutMs / 1000),
           requestHandlerTimeoutSecs: Math.ceil(limits.totalTimeoutMs / 1000),
-          launchContext: { launchOptions: { headless: true } },
+          launchContext: { launchOptions: browserLaunchOptions() },
           preNavigationHooks: [async ({ page }) => {
             await page.route('**/*', async route => {
               const type = route.request().resourceType();

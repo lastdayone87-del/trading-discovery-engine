@@ -16,6 +16,12 @@ export interface BrowserCapabilitySnapshot {
 
 export const BROWSER_RUNTIME_UNAVAILABLE = 'BROWSER_RUNTIME_UNAVAILABLE';
 
+export function browserLaunchOptions(): { headless: true; args?: string[] } {
+  return process.getuid?.() === 0
+    ? { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+    : { headless: true };
+}
+
 let snapshot: BrowserCapabilitySnapshot = { status: 'UNKNOWN' };
 
 function errorText(error: unknown): string {
@@ -30,7 +36,7 @@ export function classifyBrowserFailure(error: unknown): BrowserFailureClass {
   if (text.includes('shared library') || text.includes('libnss') || text.includes('libgbm') || text.includes('libatk') || text.includes('error while loading')) {
     return 'BROWSER_LINUX_DEPENDENCY_MISSING';
   }
-  if (text.includes('permission denied') || text.includes('eacces') || text.includes('sandbox') && text.includes('root')) {
+  if (text.includes('permission denied') || text.includes('eacces') || (text.includes('sandbox') && (text.includes('root') || text.includes('setuid') || text.includes('namespace')))) {
     return 'BROWSER_PERMISSION_DENIED';
   }
   return 'BROWSER_LAUNCH_FAILED';
@@ -64,7 +70,7 @@ export function markBrowserCapabilityUnavailable(error: unknown): BrowserCapabil
 
 export async function probeBrowserCapability(): Promise<BrowserCapabilitySnapshot> {
   try {
-    const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch(browserLaunchOptions());
     const version = browser.version();
     await browser.close();
     return markBrowserCapabilityReady(version);
