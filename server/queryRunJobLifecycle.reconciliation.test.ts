@@ -41,6 +41,10 @@ test('failed job state closes its active query run and releases both durable res
   const summary = await reconcileQueryRunJobLifecycleForQuery(client, 233);
   assert.deepEqual(summary, { retryOwnershipAligned: 0, terminalRunsClosed: 1 });
   assert.equal(calls.some(call => call.text.includes("SET status='FAILED'")), true);
-  assert.equal(calls.some(call => call.text.includes('UPDATE quota_reservations')), true);
+  const reservationRelease = calls.find(call => call.text.includes('UPDATE quota_reservations'));
+  assert.ok(reservationRelease);
+  assert.match(reservationRelease.text, /AUTONOMOUS_QUERY_PAGE/);
+  assert.match(reservationRelease.text, /operation_id LIKE \$1 \|\| ':%'/);
+  assert.match(reservationRelease.text, /SEARCH_YOUTUBE/);
   assert.equal(calls.some(call => call.text.includes('UPDATE query_library')), true);
 });
