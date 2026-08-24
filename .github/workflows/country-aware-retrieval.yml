@@ -8,6 +8,8 @@ on:
       - 'server/countryInference.ts'
       - 'server/countryInference.test.ts'
       - 'server/countryValidator.ts'
+      - 'server/historicalCountryBoundaryRecovery.test.ts'
+      - 'server/db/migrations/124_reconcile_historical_uncertain_country_rejections.sql'
       - 'server/youtube.ts'
       - '.github/workflows/country-aware-retrieval.yml'
 
@@ -25,7 +27,7 @@ jobs:
           cache: npm
       - run: npm install
       - name: Country-aware retrieval and country-boundary tests
-        run: node --import tsx --test server/countrySearchHints.test.ts server/countryInference.test.ts
+        run: node --import tsx --test server/countrySearchHints.test.ts server/countryInference.test.ts server/historicalCountryBoundaryRecovery.test.ts
       - name: Existing retrieval safety tests
         run: node --import tsx --test server/autonomousRetrievalSafety.test.ts server/queryPlanner.test.ts
       - name: Typecheck
