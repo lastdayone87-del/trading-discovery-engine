@@ -46,12 +46,22 @@ export function creatorLevelCountryEvidence(channelData: {
 /**
  * Compatibility adapter for existing pipeline callers. All inference and
  * precedence decisions live in the dedicated countryInference module.
+ *
+ * A pinned-country mismatch is a hard rejection only when creator-country
+ * attribution itself is confirmed. UNCERTAIN/LIKELY results remain unresolved:
+ * a best-current detected country is not sufficient evidence for exclusion.
  */
 export function applyTargetCountryBoundary(result: ValidationResult, targetCountryName: string): ValidationResult {
   const target = canonicalCountry(targetCountryName);
   const detected = result.detectedCountry ? canonicalCountry(result.detectedCountry) : null;
   const globalContext = !targetCountryName.trim() || ['GLOBAL', 'ALL', '*', 'WORLDWIDE'].includes(target.toLocaleUpperCase('en'));
-  if (globalContext || !detected || result.status === 'REJECTED' || detected === target) return result;
+  if (
+    globalContext ||
+    !detected ||
+    result.status === 'REJECTED' ||
+    detected === target ||
+    result.status !== 'CONFIRMED'
+  ) return result;
   const reason = `Creator country ${detected} does not match pinned discovery country ${target}.`;
   return {
     ...result,
