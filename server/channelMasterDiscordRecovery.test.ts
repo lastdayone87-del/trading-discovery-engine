@@ -23,11 +23,10 @@ test('Stored Channels is an unqualified persisted row count',()=>{
   assert.match(summary,/storedChannels:'ALL_STORED_CHANNELS'/);
 });
 
-test('operational retry exhaustion remains recoverable instead of FAILED_PERMANENT',()=>{
+test('terminal retry exhaustion preserves terminal scan state and clears retry-pending projection',()=>{
   const retryFailure=queue.slice(queue.indexOf("job.type === 'RETRY_COMMUNITY_ACQUISITION'"),queue.indexOf('const runId',queue.indexOf("job.type === 'RETRY_COMMUNITY_ACQUISITION'")));
-  assert.match(retryFailure,/scan_status='FAILED'/);
-  assert.match(retryFailure,/discord_validation_status='RETRY_PENDING'/);
-  assert.doesNotMatch(retryFailure,/FAILED_PERMANENT/);
+  assert.match(retryFailure,/projectTerminalCommunityRetryFailure\(channel,job\.attempts/);
+  assert.doesNotMatch(retryFailure,/channel\.discord_validation_status='RETRY_PENDING'/);
   assert.equal(nextChannelScanAttempts(6,false),7);
   assert.equal(nextChannelScanAttempts(7,true),0);
   assert.match(queue,/nextChannelScanAttempts\(channel\.scan_attempts/);

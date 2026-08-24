@@ -56,7 +56,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
+import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
@@ -615,7 +615,7 @@ export async function processNextSearchJob(
     if (job.type === 'RETRY_COMMUNITY_ACQUISITION' && terminal) {
       const channelId=String(job.payload?.channelId||'');
       const channel=channelId?await getChannelById(channelId):null;
-      if(channel){channel.scan_status='FAILED';channel.discord_validation_status='RETRY_PENDING';channel.scan_attempts=Math.max(channel.scan_attempts||0,job.attempts);channel.last_checked=new Date().toISOString();await upsertChannel(channel);}
+      if(channel)await upsertChannel(projectTerminalCommunityRetryFailure(channel,job.attempts,new Date().toISOString()));
     }
     const runId = String(job.payload?.queryRunId || '');
     if (runId) await failQueryRun(runId, err, terminal);

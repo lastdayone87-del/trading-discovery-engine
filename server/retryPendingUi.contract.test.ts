@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 
 const resultsTable=readFileSync(new URL('../src/components/ResultsTable.tsx',import.meta.url),'utf8');
 const db=readFileSync(new URL('./db.ts',import.meta.url),'utf8');
+const dbCore=readFileSync(new URL('./dbCore.ts',import.meta.url),'utf8');
 
 test('recoverable Discord validation distinguishes queued, budget-exhausted, terminal, and governed recovery states',()=>{
   assert.match(resultsTable,/Automatic retry/);
@@ -17,15 +18,15 @@ test('recoverable Discord validation distinguishes queued, budget-exhausted, ter
   assert.match(resultsTable,/discord_validation_status==='RETRY_PENDING'/);
   assert.doesNotMatch(resultsTable,/Validation retry pending/);
   assert.doesNotMatch(resultsTable,/Re-check Now required/);
-  assert.match(db,/community_retry_job_status/);
-  assert.match(db,/community_retry_job_attempts/);
-  assert.match(db,/community_retry_job_max_attempts/);
-  assert.match(db,/community_retry_job_run_after/);
-  assert.match(db,/community_retry_job_execution_count/);
-  assert.match(db,/community_retry_job_deferral_count/);
-  assert.match(db,/community_retry_job_last_execution_at/);
-  assert.match(db,/a\.error LIKE '%Community acquisition deferred:%'/);
-  assert.match(db,/job_attempts/);
+  assert.match(dbCore,/community_retry_job_status/);
+  assert.match(dbCore,/community_retry_job_attempts/);
+  assert.match(dbCore,/community_retry_job_max_attempts/);
+  assert.match(dbCore,/community_retry_job_run_after/);
+  assert.match(dbCore,/community_retry_job_execution_count/);
+  assert.match(dbCore,/community_retry_job_deferral_count/);
+  assert.match(dbCore,/community_retry_job_last_execution_at/);
+  assert.match(dbCore,/a\.error LIKE '%Community acquisition deferred:%'/);
+  assert.match(dbCore,/job_attempts/);
   assert.match(resultsTable,/Retry-window attempts/);
   assert.match(resultsTable,/Observed executions/);
   assert.match(resultsTable,/capacity deferrals/);
