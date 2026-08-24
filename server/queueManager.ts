@@ -1,3 +1,4 @@
+import { browserCapabilityIsUnavailable } from './browserCapability';
 import {
   getDb,
   enqueueJob,
@@ -182,7 +183,8 @@ export async function processNextSearchJob(
   }
   if (claimableTypes.length === 0) return false;
 
-  const job = await claimNextJob(workerId, claimableTypes);
+  const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
+  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns);
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');

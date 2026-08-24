@@ -15,6 +15,12 @@ test('optional external/social failure alone does not create a retry directive',
   assert.equal(communityAcquisitionRetryDirective([{required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'}]),undefined);
 });
 
+test('global browser runtime failure is separately classified and remains attempt-free',()=>{
+  const directive=communityAcquisitionRetryDirective([{required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'BROWSER_BINARY_MISSING'}]);
+  assert.equal(directive?.code,'BROWSER_RUNTIME_UNAVAILABLE');
+  assert.equal(isAttemptFreeCommunityFailure(Object.assign(new Error('browser unavailable'),{code:'BROWSER_RUNTIME_UNAVAILABLE',retryable:true})),true);
+});
+
 test('provider capacity errors are attempt-free while invalid observation remains meaningful',()=>{
   const cooldown=Object.assign(new Error('providers cooling'),{code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryable:true,retryAt:123_000});
   assert.equal(isAttemptFreeCommunityFailure(cooldown),true);

@@ -34,4 +34,7 @@ test('queue gates channel attempt increments and retry scheduling on the directi
   assert.match(queue,/if\(retryDirective\?\.attemptFree&&scheduleRetry\)await enqueueCommunityAcquisitionRetry/);
   assert.match(queue,/code:directive\.code,retryable:true,retryAt:directive\.retryAt/);
   assert.doesNotMatch(queue,/inspection\.acquisitionOutcomes\?\.some\(item=>item\.retryable\)&&scheduleRetry/);
+  assert.match(queue,/browserCapabilityIsUnavailable/);
+  assert.match(queue,/BROWSER_RUNTIME_UNAVAILABLE/);
+  assert.match(readFileSync(new URL('./dbCore.ts',import.meta.url),'utf8'),/excludedErrorPatterns/);
 });

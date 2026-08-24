@@ -17,6 +17,7 @@ export interface CommunityRetryDirective {
 
 const ATTEMPT_FREE_CODES = new Set([
   'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+  'BROWSER_RUNTIME_UNAVAILABLE',
   'YOUTUBE_PROVIDERS_COOLING_DOWN',
   'YOUTUBE_PROVIDER_POOL_EXHAUSTED',
   'YOUTUBE_RUNTIME_RATE_PRESSURE',
@@ -62,9 +63,10 @@ export function communityAcquisitionRetryDirective(
   const requiredFailures = observations.filter(item => item.required !== false && item.outcome === 'ACQUISITION_FAILED' && item.retryable);
   if (!requiredFailures.length) return undefined;
   const retryTimes = requiredFailures.map(item => Number(item.retryAt)).filter(value => Number.isFinite(value) && value > 0);
+  const browserRuntimeUnavailable = requiredFailures.some(item => item.failureClass === 'BROWSER_BINARY_MISSING' || item.failureClass === 'BROWSER_LINUX_DEPENDENCY_MISSING' || item.failureClass === 'BROWSER_PERMISSION_DENIED' || item.failureClass === 'BROWSER_LAUNCH_FAILED');
   return {
     attemptFree: true,
-    code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
+    code: browserRuntimeUnavailable ? 'BROWSER_RUNTIME_UNAVAILABLE' : COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryAt: retryTimes.length ? Math.min(...retryTimes) : undefined,
     reason: requiredFailures.map(item => item.failureClass || 'TRANSIENT_ACQUISITION_FAILURE').join(', '),
   };
