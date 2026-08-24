@@ -1,0 +1,248 @@
+name: Apply transient retry age fix
+
+on:
+  push:
+    branches:
+      - fix/transient-retry-age-anchor
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/transient-retry-age-anchor
+          fetch-depth: 0
+      - name: Apply traced retry lifecycle correction
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          db = Path('server/db.ts')
+          text = db.read_text()
+
+          old = """const MAX_TRANSIENT_RETRY_AGE_MS=Math.max(60_000,Number(process.env.MAX_TRANSIENT_RETRY_AGE_MS||6*60*60_000));
+export function isRetryableInfrastructureFailure(error:any):boolean{
+"""
+          new = """export function parseTransientRetryAgeMs(value:unknown,fallback=6*60*60_000):number{const parsed=Number(value);return Number.isFinite(parsed)&&parsed>=60_000?parsed:fallback;}
+const MAX_TRANSIENT_RETRY_AGE_MS=parseTransientRetryAgeMs(process.env.MAX_TRANSIENT_RETRY_AGE_MS);
+export function isRetryableInfrastructureFailure(error:any):boolean{
+"""
+          if text.count(old) != 1:
+              raise SystemExit('expected MAX_TRANSIENT_RETRY_AGE_MS anchor exactly once')
+          text = text.replace(old, new)
+
+          marker = """export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
+  if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
+  if(isRetryableInfrastructureFailure(error)){
+    if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
+    const retryAt=Number(error?.retryAt);
+    const retryAfterMs=Number(error?.retryAfterMs);
+    const exponentialMs=Math.min(15*60_000,30_000*Math.pow(2,Math.max(0,attempts-1)));
+    const scheduled=Number.isFinite(retryAt)?Math.max(now,retryAt):Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;
+    const providerCode=String(error?.code||'').toUpperCase();
+    const boundedCooldown=providerCode==='YOUTUBE_PROVIDERS_COOLING_DOWN'||providerCode==='YOUTUBE_PROVIDER_POOL_EXHAUSTED';
+    if(boundedCooldown&&attempts>=maxAttempts)return {disposition:'FAILED'};
+    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:scheduled};
+  }
+  return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
+}
+"""
+          addition = marker + """export function resolveTransientFailureAnchor(error:any,persistedFirstTransientFailureAt:unknown,now=Date.now()):number{
+  if(!isRetryableInfrastructureFailure(error))return now;
+  const persisted=persistedFirstTransientFailureAt instanceof Date?persistedFirstTransientFailureAt.getTime():new Date(String(persistedFirstTransientFailureAt||'')).getTime();
+  return Number.isFinite(persisted)?persisted:now;
+}
+"""
+          if text.count(marker) != 1:
+              raise SystemExit('expected decideJobFailure block exactly once')
+          text = text.replace(marker, addition)
+
+          pattern = re.compile(r"export async function failJob\(jobId:string,error:any\):Promise<JobFailureDisposition\|null>\{.*?return decision\.disposition;\}", re.S)
+          matches = pattern.findall(text)
+          if len(matches) != 1:
+              raise SystemExit(f'expected failJob exactly once, found {len(matches)}')
+          replacement = """export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,first_transient_failure_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,first_transient_failure_at}=res.rows[0]; const now=Date.now(); const retryableInfrastructure=isRetryableInfrastructureFailure(error); const firstFailureAt=resolveTransientFailureAnchor(error,first_transient_failure_at,now); const msg=String(error?.message||error).slice(0,2000); const decision=decideJobFailure(error,attempts,max_attempts,now,firstFailureAt);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,first_transient_failure_at=COALESCE(first_transient_failure_at,$4::timestamptz),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString(),transientAnchor]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,first_transient_failure_at=CASE WHEN $3::boolean THEN COALESCE(first_transient_failure_at,$4::timestamptz) ELSE first_transient_failure_at END,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,retryableInfrastructure,transientAnchor]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,first_transient_failure_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}"""
+          text = pattern.sub(replacement, text, count=1)
+          db.write_text(text)
+
+          test = Path('server/investigationWorkflow.test.ts')
+          t = test.read_text()
+          old_import = "import { decideJobFailure } from './db';"
+          new_import = "import { decideJobFailure, parseTransientRetryAgeMs, resolveTransientFailureAnchor } from './db';"
+          if t.count(old_import) != 1:
+              raise SystemExit('expected db test import exactly once')
+          t = t.replace(old_import, new_import)
+          tests = r'''
+
+test('transient retry age is anchored to the first transient failure rather than job creation',()=>{const now=Date.parse('2026-08-24T00:00:00Z'),first=Date.parse('2026-08-23T23:30:00Z');assert.equal(resolveTransientFailureAnchor({code:'ETIMEDOUT'},null,now),now);assert.equal(resolveTransientFailureAnchor({code:'ETIMEDOUT'},new Date(first).toISOString(),now),first);assert.equal(resolveTransientFailureAnchor({code:'VALIDATION_ERROR'},new Date(first).toISOString(),now),now);const dbSource=readFileSync(new URL('./db.ts',import.meta.url),'utf8');assert.match(dbSource,/SELECT attempts,max_attempts,first_transient_failure_at FROM jobs/);assert.doesNotMatch(dbSource,/decideJobFailure\(error,attempts,max_attempts,Date\.now\(\),new Date\(created_at\)\.getTime\(\)\)/);});
+test('transient retry age configuration rejects malformed and undersized values',()=>{assert.equal(parseTransientRetryAgeMs(undefined),6*60*60_000);assert.equal(parseTransientRetryAgeMs('not-a-number'),6*60*60_000);assert.equal(parseTransientRetryAgeMs('59999'),6*60*60_000);assert.equal(parseTransientRetryAgeMs('60000'),60000);assert.equal(parseTransientRetryAgeMs('7200000'),7200000);});
+test('migration 120 separates retry age from job creation provenance and only repairs provable first-attempt false terminals',()=>{const migration=readFileSync(new URL('./db/migrations/120_transient_retry_age_anchor.sql',import.meta.url),'utf8');assert.match(migration,/first_transient_failure_at TIMESTAMPTZ/);assert.match(migration,/OPERATIONALLY_BLOCKED_RETRY_REQUIRED:/);assert.match(migration,/COUNT\(\*\).*job_attempts/s);assert.match(migration,/attempt_rows = 1/);assert.match(migration,/first_transient_failure_at=NULL/);assert.doesNotMatch(migration,/created_at\s*=\s*now\(\)/);});
+'''
+          if "transient retry age is anchored to the first transient failure rather than job creation" in t:
+              raise SystemExit('tests already present unexpectedly')
+          test.write_text(t.rstrip() + tests + '\n')
+
+          migration = Path('server/db/migrations/120_transient_retry_age_anchor.sql')
+          if migration.exists():
+              raise SystemExit('migration 120 already exists')
+          migration.write_text(r'''-- Separate the retryable-infrastructure age budget from immutable job creation
+-- provenance. The runtime now starts this clock only when the job actually sees
+-- its first retryable provider/infrastructure failure.
+ALTER TABLE jobs
+  ADD COLUMN IF NOT EXISTS first_transient_failure_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS jobs_transient_retry_age_idx
+  ON jobs(first_transient_failure_at)
+  WHERE status IN ('PENDING','PROCESSING') AND first_transient_failure_at IS NOT NULL;
+
+-- Historical repair is intentionally causal and narrow. Under the old runtime,
+-- jobs.created_at was passed to decideJobFailure as if it were the first failure
+-- time. A job older than the retry-age window could therefore receive the
+-- OPERATIONALLY_BLOCKED_RETRY_REQUIRED terminal marker on its very first claim.
+-- Exactly one durable job_attempt row proves there was no earlier execution of
+-- that job, so these rows are safe to reopen. Anything with more than one
+-- attempt row is left untouched because the stored history cannot prove whether
+-- its transient retry window was genuinely exhausted.
+CREATE TEMP TABLE recover_first_attempt_transient_age_false_terminals ON COMMIT DROP AS
+WITH attempt_counts AS (
+  SELECT job_id, COUNT(*)::integer AS attempt_rows
+  FROM job_attempts
+  GROUP BY job_id
+)
+SELECT
+  j.id AS job_id,
+  j.payload->>'channelId' AS channel_id,
+  s.id AS step_id,
+  s.investigation_id,
+  COALESCE(a.attempt_rows,0) AS attempt_rows
+FROM jobs j
+JOIN channels c ON c.channel_id=j.payload->>'channelId'
+JOIN attempt_counts a ON a.job_id=j.id
+LEFT JOIN investigation_steps s ON s.job_id=j.id
+WHERE j.type='ENRICH_CHANNEL'
+  AND j.status='FAILED'
+  AND j.attempts=1
+  AND a.attempt_rows = 1
+  AND j.last_error LIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
+  AND c.scan_status='FAILED'
+  AND c.trading_status='UNCERTAIN'
+  AND c.country_status <> 'REJECTED';
+
+-- Reopen the exact resumable step when the failed job belongs to one. Recovery
+-- generation preserves immutable event identity for the new execution.
+UPDATE investigation_steps s
+SET state='PENDING',
+    attempt_count=0,
+    worker_id=NULL,
+    lease_expires_at=NULL,
+    started_at=NULL,
+    completed_at=NULL,
+    resulting_status=NULL,
+    output_checksum=NULL,
+    failure_class=NULL,
+    recovery_generation=recovery_generation+1,
+    updated_at=now()
+FROM recover_first_attempt_transient_age_false_terminals recover
+WHERE recover.step_id=s.id
+  AND s.state='FAILED';
+
+-- Reopen only the investigation that owns the exact recovered step. Preserve
+-- the configured investigation deadline policy while parsing malformed values
+-- safely, matching the runtime parser's fallback behavior.
+UPDATE investigations i
+SET state='ACTIVE',
+    current_step_id=recover.step_id,
+    completed_at=NULL,
+    deadline_at=now()+(
+      COALESCE(
+        (SELECT CASE
+           WHEN normalized_value <> '0'
+             AND length(normalized_value) BETWEEN 1 AND 10
+             AND (length(normalized_value) < 10 OR normalized_value <= '2147483647')
+             THEN normalized_value::INTEGER
+           ELSE NULL
+         END
+         FROM (
+           SELECT CASE
+             WHEN setting_value ~ '^[0-9]+$'
+               THEN COALESCE(NULLIF(regexp_replace(setting_value,'^0+','','g'),''),'0')
+             ELSE '0'
+           END AS normalized_value
+           FROM app_settings
+           WHERE setting_key='investigation_deadline_minutes'
+           LIMIT 1
+         ) setting
+        ),
+        30
+      )::text || ' minutes'
+    )::interval,
+    recovery_generation=GREATEST(i.recovery_generation,s.recovery_generation),
+    updated_at=now()
+FROM recover_first_attempt_transient_age_false_terminals recover
+JOIN investigation_steps s ON s.id=recover.step_id
+WHERE i.id=recover.investigation_id
+  AND i.state='OPERATIONALLY_BLOCKED';
+
+INSERT INTO investigation_events(
+  event_key,investigation_id,step_id,event_type,payload,policy_version
+)
+SELECT
+  'investigation:'||s.investigation_id::text||':step:'||s.id::text||':transient-age-anchor-recovered',
+  s.investigation_id,
+  s.id,
+  'INVESTIGATION_RECOVERED',
+  jsonb_build_object(
+    'jobId',s.job_id,
+    'reason','JOB_CREATED_AT_WAS_USED_AS_FIRST_TRANSIENT_FAILURE_AT',
+    'recoveryGeneration',s.recovery_generation
+  ),
+  s.policy_version
+FROM investigation_steps s
+JOIN recover_first_attempt_transient_age_false_terminals recover ON recover.step_id=s.id
+WHERE s.recovery_generation > 0
+ON CONFLICT(event_key) DO NOTHING;
+
+-- Restore only the operational projection. Semantic terminal decisions are
+-- excluded by the candidate selection above.
+UPDATE channels c
+SET scan_status='ENRICHMENT_PENDING',
+    last_checked=now(),
+    updated_at=now()
+FROM recover_first_attempt_transient_age_false_terminals recover
+WHERE c.channel_id=recover.channel_id
+  AND c.scan_status='FAILED'
+  AND c.trading_status='UNCERTAIN'
+  AND c.country_status <> 'REJECTED';
+
+-- Start a fresh transient-failure window on the next actual infrastructure
+-- failure. Do not rewrite created_at: it remains the job's creation provenance.
+UPDATE jobs j
+SET status='PENDING',
+    attempts=0,
+    run_after=now(),
+    locked_by=NULL,
+    locked_at=NULL,
+    last_error=NULL,
+    completed_at=NULL,
+    first_transient_failure_at=NULL,
+    updated_at=now()
+FROM recover_first_attempt_transient_age_false_terminals recover
+WHERE j.id=recover.job_id;
+''')
+
+          workflow = Path('.github/workflows/apply-transient-retry-age-fix.yml')
+          workflow.unlink()
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/db.ts server/investigationWorkflow.test.ts server/db/migrations/120_transient_retry_age_anchor.sql .github/workflows/apply-transient-retry-age-fix.yml
+          git commit -m "Fix transient retry age anchor"
+          git push origin HEAD:fix/transient-retry-age-anchor
