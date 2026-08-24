@@ -246,3 +246,5 @@ WHERE j.id=recover.job_id;
           git add server/db.ts server/investigationWorkflow.test.ts server/db/migrations/120_transient_retry_age_anchor.sql .github/workflows/apply-transient-retry-age-fix.yml
           git commit -m "Fix transient retry age anchor"
           git push origin HEAD:fix/transient-retry-age-anchor
+
+# trigger after workflow exists on the branch
