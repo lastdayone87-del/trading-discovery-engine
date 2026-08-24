@@ -5,6 +5,9 @@ on:
     paths:
       - 'server/countrySearchHints.ts'
       - 'server/countrySearchHints.test.ts'
+      - 'server/countryInference.ts'
+      - 'server/countryInference.test.ts'
+      - 'server/countryValidator.ts'
       - 'server/youtube.ts'
       - '.github/workflows/country-aware-retrieval.yml'
 
@@ -21,8 +24,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
-      - name: Country-aware retrieval tests
-        run: node --import tsx --test server/countrySearchHints.test.ts
+      - name: Country-aware retrieval and country-boundary tests
+        run: node --import tsx --test server/countrySearchHints.test.ts server/countryInference.test.ts
       - name: Existing retrieval safety tests
         run: node --import tsx --test server/autonomousRetrievalSafety.test.ts server/queryPlanner.test.ts
       - name: Typecheck

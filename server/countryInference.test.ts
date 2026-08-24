@@ -153,6 +153,19 @@ test('target-country boundary preserves unresolved country uncertainty', () => {
   assert.equal(bounded.detectedCountry, 'Germany');
 });
 
+test('target-country boundary preserves conflicting non-target uncertainty instead of rejecting it', () => {
+  const bounded = applyTargetCountryBoundary({
+    score: 49,
+    status: 'UNCERTAIN',
+    detectedCountry: 'United Kingdom',
+    decisionLogs: 'Conflicting CHANNEL_ABOUT_BIO evidence prevents a reliable country decision.',
+    evidence: []
+  }, 'Germany');
+  assert.equal(bounded.status, 'UNCERTAIN');
+  assert.equal(bounded.detectedCountry, 'United Kingdom');
+  assert.equal(bounded.rejectionReason, undefined);
+});
+
 test('target-country boundary bypasses intentional global discovery context', () => {
   const inferred = inferChannelCountry({ officialCountry: 'IT', discoveryCountry: 'GLOBAL' });
   const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'GLOBAL');
