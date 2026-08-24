@@ -775,7 +775,9 @@ export async function reconcileQueryRunJobLifecycleForQuery(client: any, queryId
     await client.query(`
       UPDATE quota_reservations
       SET status='RELEASED'
-      WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [String(row.query_run_id)]);
+      WHERE status='RESERVED'
+        AND ((operation_type='AUTONOMOUS_QUERY_PAGE' AND operation_id LIKE $1 || ':%')
+          OR (operation_type='SEARCH_YOUTUBE' AND operation_id=$1))`, [String(row.query_run_id)]);
   }
 
   if (terminalQueryIds.size) {
