@@ -13,8 +13,9 @@ export interface OperationalEnrichmentRecoveryDecision {
 
 /**
  * ENRICH_CHANNEL operational failures are machine-owned only. Recovery never
- * reopens a semantic or human terminal decision and waits for a durable
- * cooldown after the last failed projection.
+ * reopens a negative semantic/human terminal decision and waits for a durable
+ * cooldown after the last failed projection. A positive trading decision is
+ * preserved while the independent operational enrichment work is recovered.
  */
 export function shouldReactivateOperationalEnrichment(
   channel: RecoveryChannel,
@@ -23,7 +24,11 @@ export function shouldReactivateOperationalEnrichment(
   if (channel.scan_status !== 'FAILED' && channel.scan_status !== 'FAILED_PERMANENT') {
     return { reactivate: false, reasonCodes: ['SCAN_STATUS_NOT_RECOVERABLE_FAILURE'] };
   }
-  if (channel.country_status === 'REJECTED' || channel.trading_status !== 'UNCERTAIN') {
+  if (
+    channel.country_status === 'REJECTED' ||
+    channel.trading_status === 'NON_TRADING' ||
+    channel.trading_status === 'HUMAN_REJECTED'
+  ) {
     return { reactivate: false, reasonCodes: ['SEMANTIC_OR_HUMAN_DECISION_PRESERVED'] };
   }
   if (channel.discord_validation_status === 'COMPLETED') {
@@ -71,9 +76,10 @@ export async function reconcileOperationalEnrichmentRecovery(
     `SELECT c.channel_id
        FROM channels c
       WHERE c.scan_status IN('FAILED','FAILED_PERMANENT')
-        AND c.trading_status='UNCERTAIN'
-        AND c.discord_validation_status <> 'COMPLETED'
-        AND c.country_status <> 'REJECTED'
+        AND c.trading_status IS DISTINCT FROM 'NON_TRADING'
+        AND c.trading_status IS DISTINCT FROM 'HUMAN_REJECTED'
+        AND c.discord_validation_status IS DISTINCT FROM 'COMPLETED'
+        AND c.country_status IS DISTINCT FROM 'REJECTED'
         AND (c.last_checked IS NULL OR c.last_checked < now() - interval '24 hours')
         AND EXISTS (
           SELECT 1 FROM jobs failed_job
