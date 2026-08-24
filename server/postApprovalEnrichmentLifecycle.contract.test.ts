@@ -13,5 +13,5 @@ test('post-approval operational projection is terminal-only and preserves review
 
 test('existing community retry terminal projection remains a separate lifecycle path', () => {
   assert.match(queueManager, /if \(job\.type === 'RETRY_COMMUNITY_ACQUISITION' && terminal\)/);
-  assert.match(queueManager, /channel\.discord_validation_status='RETRY_PENDING'/);
+  assert.match(queueManager, /projectTerminalCommunityRetryFailure\(channel,job\.attempts/);
 });

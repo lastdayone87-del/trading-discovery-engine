@@ -72,6 +72,21 @@ export function shouldReactivateCommunityRecovery(
   };
 }
 
+export function projectTerminalCommunityRetryFailure(
+  channel: ChannelRecord,
+  attempts: number,
+  now = new Date().toISOString()
+): ChannelRecord {
+  const preservesSemanticCompletion = channel.discord_validation_status === 'COMPLETED' || channel.discord_validation_status === 'SUCCEEDED';
+  return {
+    ...channel,
+    scan_status: channel.scan_status === 'FAILED_PERMANENT' ? 'FAILED_PERMANENT' : 'FAILED',
+    discord_validation_status: preservesSemanticCompletion ? channel.discord_validation_status : 'FAILED_OPERATIONAL',
+    scan_attempts: Math.max(channel.scan_attempts || 0, attempts),
+    last_checked: now
+  };
+}
+
 export function reactivateCommunityRecovery(
   channel: ChannelRecord,
   reasonCodes: string[],

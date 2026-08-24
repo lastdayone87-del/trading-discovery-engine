@@ -137,10 +137,11 @@ test('automatic reconciliation reopens one governed retry window for an active c
   assert.equal(persisted[0].scan_status, 'ENRICHMENT_PENDING');
   assert.equal(persisted[0].discord_validation_status, 'RETRY_PENDING');
   assert.equal(persisted[0].trading_status, undefined);
-  assert.match(queries[0].sql, /activity_band IN\('ACTIVE','VERY_ACTIVE'\)/);
-  assert.match(queries[0].sql, /last_checked < now\(\) - interval '24 hours'/);
-  assert.match(queries[0].sql, /NOT EXISTS/);
-  assert.match(queries[0].sql, /status IN\('PENDING','PROCESSING'\)/);
+  const recoverySelection=queries.find(query=>query.sql.includes("activity_band IN('ACTIVE','VERY_ACTIVE')"))?.sql || '';
+  assert.match(recoverySelection, /activity_band IN\('ACTIVE','VERY_ACTIVE'\)/);
+  assert.match(recoverySelection, /last_checked < now\(\) - interval '24 hours'/);
+  assert.match(recoverySelection, /NOT EXISTS/);
+  assert.match(recoverySelection, /status IN\('PENDING','PROCESSING'\)/);
 });
 
 test('automatic reconciliation restores the prior failure projection when recovery-job reopening fails', async () => {
