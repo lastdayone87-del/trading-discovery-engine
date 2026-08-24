@@ -19,6 +19,8 @@ test('production fails closed and can never enable the development bypass',()=>{
 });
 test('route inventory is explicit and public surface contains only health',()=>{
  assert.deepEqual(routePolicyInventory.filter(x=>x.policy==='public').map(x=>x.pattern),['^\\/api\\/health$']);
+ const browserRoute=routePolicyInventory.find(x=>x.method==='GET'&&x.pattern==='^\\/api\\/browser-capability$');
+ assert.deepEqual(browserRoute?.policy,'operator');
 });
 test('governed review reason catalog is authorized for authenticated operators',()=>{
  const matchingRoutes=routePolicyInventory.filter(item=>item.method==='GET'&&new RegExp(item.pattern).test('/api/review-reasons'));
