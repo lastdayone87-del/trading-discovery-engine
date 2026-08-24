@@ -80,6 +80,7 @@ import {REVIEW_REASON_CATALOG,REVIEW_REASON_CATALOG_VERSION} from './server/revi
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
 import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
+import { browserCapabilitySnapshot, startBrowserCapabilityMonitor } from './server/browserCapability';
 import { assertProductionCountryArchitecture } from './server/productionCountryArchitecture';
 import { inspectExecutionTrace, recordExecutionStage, withExecutionTrace } from './server/executionTrace';
 import { getNomination, inspectNominationAttribution, listNominations } from './server/candidateAdmission/store';
@@ -249,6 +250,11 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     const state = readiness.snapshot();
     res.status(state.readiness === 'ready' ? 200 : 503).json(state);
+  });
+
+  app.get('/api/browser-capability', (_req, res) => {
+    const capability = browserCapabilitySnapshot();
+    res.status(capability.status === 'UNAVAILABLE' ? 503 : 200).json(capability);
   });
 
   // 1. Get all channels (returns active validated channels by default; include_rejected=true returns all)
@@ -752,6 +758,7 @@ async function startServer() {
     // left newly-created jobs PENDING forever and no provider call was reached.
     startSearchWorkers();
     startAutonomousDiscoveryScheduler();
+    startBrowserCapabilityMonitor();
     // Bind promptly for the platform, but do not advertise readiness or launch
     // database-backed maintenance until the configured PostgreSQL database has
     // been reached and fully migrated. Provider work remains outside readiness.

@@ -1,4 +1,5 @@
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
+import { classifyBrowserFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, type BrowserFailureClass } from './browserCapability';
 import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
   DEFAULT_RENDERED_MAX_SESSION_ROTATIONS,
@@ -24,6 +25,7 @@ export interface BrowserFallbackResult {
   clicks: number;
   complete: boolean;
   retryable: boolean;
+  failureClass?: BrowserFailureClass;
   detail: string;
 }
 
@@ -191,6 +193,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         });
 
         await crawler.run([seedUrl]);
+        markBrowserCapabilityReady();
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
@@ -207,12 +210,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,detail:`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
+        const failureClass=classifyBrowserFailure(error);
+        markBrowserCapabilityUnavailable(error);
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,detail:`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
       }
     });
   } catch (error:any) {
     const candidates=mergeDiscordCandidates(discovered);
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,detail:error?.message==='RENDERED_FALLBACK_SATURATED'?'Rendered acquisition deferred because the process-wide browser launch gate is saturated':`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
+    const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
+    if(!saturated)markBrowserCapabilityUnavailable(error);
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass:saturated?undefined:classifyBrowserFailure(error),detail:saturated?'Rendered acquisition deferred because the process-wide browser launch gate is saturated':`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
   }
 }
 
