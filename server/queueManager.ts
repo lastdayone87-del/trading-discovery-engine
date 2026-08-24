@@ -56,6 +56,7 @@ import { createManualSearchSession, getManualSearchSession, recordManualSearchPa
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
+import { reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
@@ -154,6 +155,7 @@ export async function processNextSearchJob(
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
   await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), enqueueCommunityAcquisitionRetry);
+  await reconcileOperationalEnrichmentRecovery(getDb, getChannelById, upsertChannel, enqueueOperationalEnrichmentRecoveryJob, 20, Date.now());
   triggerPhaseBObservationReconciliation();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
@@ -866,6 +868,12 @@ export async function inspectAndValidateChannel(
 export function communityAcquisitionRetryKey(channelId:string):string{return `community-acquisition-retry:${channelId}`;}
 async function enqueueCommunityAcquisitionRetry(channelId:string):Promise<void>{
   await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5});
+}
+
+export function operationalEnrichmentRecoveryKey(channelId:string):string{return `operational-enrichment-recovery:${channelId}`;}
+async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[]):Promise<void>{
+  const job=await enqueueJob('ENRICH_CHANNEL',{channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:1},recoveryReasonCodes:reasonCodes},{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:10,maxAttempts:4});
+  await (await getDb()).query(`UPDATE jobs SET first_transient_failure_at=NULL WHERE id=$1 AND status='PENDING'`,[job.id]);
 }
 
 /**
