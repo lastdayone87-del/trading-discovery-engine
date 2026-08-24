@@ -4,10 +4,18 @@ import {
   BROWSER_RUNTIME_UNAVAILABLE,
   browserCapabilityIsUnavailable,
   browserCapabilitySnapshot,
+  browserLaunchOptions,
   classifyBrowserFailure,
   markBrowserCapabilityReady,
   markBrowserCapabilityUnavailable,
 } from './browserCapability';
+
+test('browser launch options are safe for the runtime user and shared by the probe and crawler', () => {
+  const options = browserLaunchOptions();
+  assert.equal(options.headless, true);
+  if (process.getuid?.() === 0) assert.deepEqual(options.args, ['--no-sandbox', '--disable-setuid-sandbox']);
+  else assert.equal(options.args, undefined);
+});
 
 test('browser runtime failures are classified separately from ordinary site failures', () => {
   assert.equal(classifyBrowserFailure(new Error("Executable doesn't exist at /app/.cache/ms-playwright/chromium")), 'BROWSER_BINARY_MISSING');

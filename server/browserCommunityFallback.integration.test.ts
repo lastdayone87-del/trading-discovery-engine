@@ -62,6 +62,28 @@ test('non-trading creator never invokes rendered fallback after static website n
   assert.equal(result.foundInvite, null);
 });
 
+test('browser runtime launch failure remains globally classified and retryable', async () => {
+  const renderedFallback = async (): Promise<BrowserFallbackResult> => ({
+    foundInvite: null,
+    inspectedPages: 0,
+    scrolls: 0,
+    clicks: 0,
+    complete: false,
+    retryable: true,
+    failureClass: 'BROWSER_PERMISSION_DENIED',
+    detail: 'browser launch failed under the production runtime user',
+  });
+  const result = await runChannelInspection({
+    ...baseInput,
+    creatorLikelyTrading: true,
+    renderedFallback,
+  });
+  const observation = result.acquisitionOutcomes?.find(item => item.failureClass === 'BROWSER_PERMISSION_DENIED');
+  assert.ok(observation);
+  assert.equal(result.retryDirective?.code, 'BROWSER_RUNTIME_UNAVAILABLE');
+  assert.equal(result.retryDirective?.attemptFree, true);
+});
+
 test('rendered acquisition failure becomes required retryable uncertainty', async () => {
   const renderedFallback = async (): Promise<BrowserFallbackResult> => ({
     foundInvite: null,
