@@ -76,7 +76,8 @@ export async function reconcileOperationalEnrichmentRecovery(
     `SELECT c.channel_id
        FROM channels c
       WHERE c.scan_status IN('FAILED','FAILED_PERMANENT')
-        AND c.trading_status NOT IN('NON_TRADING','HUMAN_REJECTED')
+        AND c.trading_status IS DISTINCT FROM 'NON_TRADING'
+        AND c.trading_status IS DISTINCT FROM 'HUMAN_REJECTED'
         AND c.discord_validation_status IS DISTINCT FROM 'COMPLETED'
         AND c.country_status IS DISTINCT FROM 'REJECTED'
         AND (c.last_checked IS NULL OR c.last_checked < now() - interval '24 hours')
