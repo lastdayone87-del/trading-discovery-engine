@@ -16,6 +16,9 @@ export interface BrowserCapabilitySnapshot {
 
 export const BROWSER_RUNTIME_UNAVAILABLE = 'BROWSER_RUNTIME_UNAVAILABLE';
 
+// Keep install-time and runtime resolution identical in Railway/Nixpacks images.
+if (process.env.PLAYWRIGHT_BROWSERS_PATH !== '0') process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
+
 export function browserLaunchOptions(): { headless: true; args?: string[] } {
   return process.getuid?.() === 0
     ? { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
@@ -24,8 +27,14 @@ export function browserLaunchOptions(): { headless: true; args?: string[] } {
 
 let snapshot: BrowserCapabilitySnapshot = { status: 'UNKNOWN' };
 
-function errorText(error: unknown): string {
-  return String(error instanceof Error ? error.message : error || '').toLowerCase();
+function errorText(error: unknown, seen = new Set<unknown>()): string {
+  if (error && typeof error === 'object') {
+    if (seen.has(error)) return '';
+    seen.add(error);
+    const value = error as { message?: unknown; cause?: unknown };
+    return `${String(value.message || '')} ${errorText(value.cause, seen)}`.toLowerCase();
+  }
+  return String(error || '').toLowerCase();
 }
 
 export function classifyBrowserFailure(error: unknown): BrowserFailureClass {
