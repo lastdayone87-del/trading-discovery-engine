@@ -46,6 +46,14 @@ test('false-negative recovery grants attempt-free retries only to typed transien
 test('maintenance concurrency is bounded and starts after database readiness in server runtime', () => {
   assert.match(workers, /OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY/);
   assert.match(workers, /Math\.min\(5/);
-  assert.match(startup, /if \(isServerRuntime\(\)\) startOperationalMaintenanceWorkers\(\)/);
+  assert.match(startup, /if \(isServerRuntime\(\)\) \{[\s\S]*startOperationalMaintenanceWorkers\(\);/);
   assert.match(startup, /markDatabaseReady/);
+  assert.match(startup, /Operational maintenance consumers started after database readiness/);
+});
+
+test('community retry reconciliation exposes only sanitized positive-count telemetry', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /const reconciledCommunityRetryJobs = await reconcilePendingCommunityRetryJobs/);
+  assert.match(queue, /if \(reconciledCommunityRetryJobs > 0\)/);
+  assert.match(queue, /Reconciled \$\{reconciledCommunityRetryJobs\} pending community retry job/);
 });

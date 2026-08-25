@@ -157,7 +157,10 @@ export async function processNextSearchJob(
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
   await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, { attemptFree: true, code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, reason: retryReason || 'Recovery-triggered community retry', retryAt: undefined, retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' ? 'BROWSER_RUNTIME_UNAVAILABLE' : 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' }, 'RECOVERY'));
-  await reconcilePendingCommunityRetryJobs(getDb, 100);
+  const reconciledCommunityRetryJobs = await reconcilePendingCommunityRetryJobs(getDb, 100);
+  if (reconciledCommunityRetryJobs > 0) {
+    console.info(`[Queue Worker] Reconciled ${reconciledCommunityRetryJobs} pending community retry job(s).`);
+  }
   await projectProviderDeferredEnrichment(getDb, getChannelById, upsertChannel, 100);
   await reconcileOperationalEnrichmentRecovery(getDb, getChannelById, upsertChannel, enqueueOperationalEnrichmentRecoveryJob, 20, Date.now());
   triggerPhaseBObservationReconciliation();
