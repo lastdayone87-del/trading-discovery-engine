@@ -28,6 +28,11 @@ test('genuine required community acquisition failure remains attempt-free and pr
   assert.deepEqual(directive,{attemptFree:true,code:'BROWSER_RUNTIME_UNAVAILABLE',retryAt:20_000,reason:'BROWSER_RUNTIME_UNAVAILABLE',retryReason:'BROWSER_RUNTIME_UNAVAILABLE'});
 });
 
+test('non-browser community acquisition failure receives a community-owned retry reason',()=>{
+  const directive=communityAcquisitionRetryDirective([{surface:'LINKED_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'}]);
+  assert.equal(directive?.retryReason,'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
 test('optional external/social failure alone does not create a retry directive',()=>{
   assert.equal(communityAcquisitionRetryDirective([{required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'}]),undefined);
 });

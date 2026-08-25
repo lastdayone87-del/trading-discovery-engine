@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { evaluateCommunityRetryReconciliation, reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
+import { classifyLegacyCommunityRetryDisposition, evaluateCommunityRetryReconciliation, reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import type { ChannelRecord } from '../src/types';
 
 const root = process.cwd();
@@ -144,6 +144,41 @@ test('automatic reconciliation reopens one governed retry window for an active c
   assert.match(recoverySelection, /status IN\('PENDING','PROCESSING'\)/);
 });
 
+test('legacy upstream retry is reclassified and active community retry remains owned by community acquisition', () => {
+  const upstream = classifyLegacyCommunityRetryDisposition({
+    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+    inspectionTrail: [{ step: 'VIDEO_DESCRIPTIONS', status: 'SKIPPED' }],
+    hasCurrentCommunityRetryableFailure: false,
+    hasCurrentUpstreamRetryableFailure: true
+  });
+  assert.equal(upstream.disposition, 'UPSTREAM_RECLASSIFIED');
+  assert.equal(upstream.retryReason, 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE');
+
+  const community = classifyLegacyCommunityRetryDisposition({
+    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+    inspectionTrail: [{ step: 'LINKED_WEBSITES', status: 'ERROR' }],
+    hasCurrentCommunityRetryableFailure: true,
+    hasCurrentUpstreamRetryableFailure: false
+  });
+  assert.equal(community.disposition, 'ACTIVE_COMMUNITY_RETRY');
+  assert.equal(community.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+test('completed negative legacy retry is reclassified without deleting its audit job', () => {
+  const decision = classifyLegacyCommunityRetryDisposition({
+    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+    inspectionTrail: [
+      { step: 'CHANNEL_LINKS', status: 'NOT_FOUND' },
+      { step: 'LINKED_WEBSITES', status: 'NOT_FOUND' },
+      { step: 'SOCIAL_PROFILES', status: 'SKIPPED' }
+    ],
+    hasCurrentCommunityRetryableFailure: false,
+    hasCurrentUpstreamRetryableFailure: false
+  });
+  assert.equal(decision.disposition, 'COMPLETED_NEGATIVE');
+  assert.equal(decision.retryReason, 'NO_SURFACE');
+});
+
 test('no-surface pending retry is marked stale without deletion or completion', () => {
   const decision = evaluateCommunityRetryReconciliation({
     payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
@@ -267,5 +302,6 @@ test('production ingestion and manual recheck entry points invoke community reco
   assert.match(pipeSource, /shouldReactivateCommunityRecovery\(existing, candidate, isManualScan\)/);
   assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
   assert.match(queueSource, /reconcileCommunityAcquisitionRecovery\(getDb, getChannelById, upsertChannel, 20, Date\.now\(\),/);
+  assert.match(queueSource, /reconcileLegacyCommunityRetryOwnership\(getDb, 250\)/);
   assert.match(queueSource, /reconcilePendingCommunityRetryJobs\(getDb, 100\)/);
 });

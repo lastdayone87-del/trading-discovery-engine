@@ -57,7 +57,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
+import { reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, reconcileLegacyCommunityRetryOwnership, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
@@ -158,6 +158,10 @@ export async function processNextSearchJob(
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
   await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, { attemptFree: true, code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, reason: retryReason || 'Recovery-triggered community retry', retryAt: undefined, retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' ? 'BROWSER_RUNTIME_UNAVAILABLE' : 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' }, 'RECOVERY'));
+  const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership(getDb, 250);
+  if (legacyCommunityReconciliation.staleMarked > 0) {
+    console.info(`[Queue Worker] Reconciled ${legacyCommunityReconciliation.staleMarked} legacy community retry job(s): upstream=${legacyCommunityReconciliation.reclassifiedUpstream}, completedNegative=${legacyCommunityReconciliation.completedNegative}, activeCommunity=${legacyCommunityReconciliation.activeCommunity}.`);
+  }
   const reconciledCommunityRetryJobs = await reconcilePendingCommunityRetryJobs(getDb, 100);
   if (reconciledCommunityRetryJobs > 0) {
     console.info(`[Queue Worker] Reconciled ${reconciledCommunityRetryJobs} pending community retry job(s).`);
