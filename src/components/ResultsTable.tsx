@@ -341,6 +341,10 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     && c.community_retry_job_attempts != null
                     && c.community_retry_job_max_attempts != null
                     && c.community_retry_job_attempts >= c.community_retry_job_max_attempts;
+                  const retryReasonLabel = c.community_retry_job_retry_reason?.replaceAll('_', ' ') || 'LEGACY UNCLASSIFIED';
+                  const retryReconciliationLabel = c.community_retry_job_reconciliation_status === 'RECONCILIATION_REQUIRED'
+                    ? `${c.community_retry_job_reconciliation_code || 'STALE_RETRY'} · RECONCILIATION REQUIRED`
+                    : '';
                   return (
                   <tr key={c.channel_id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors">
                     
@@ -514,7 +518,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                       </div>
                       {c.discord_liveness_status&&c.discord_liveness_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Liveness: <b>{c.discord_liveness_status.replaceAll('_',' ')}</b></div>}
                       {c.discord_relevance_status&&c.discord_relevance_status!=='NOT_CHECKED'&&<div className="text-[10px] text-slate-500">Relevance: <b>{c.discord_relevance_status.replaceAll('_',' ')}</b></div>}
-                      {c.discord_validation_status==='RETRY_PENDING'&&<div className="text-[10px] font-semibold text-amber-600">{automaticRetryActive ? `Automatic retry ${c.community_retry_job_status === 'PROCESSING' ? 'in progress' : automaticRetryDue ? 'due now' : 'queued'}` : automaticRetryTerminal ? automaticRetryBudgetExhausted ? 'Automatic retry budget exhausted · governed recovery available' : 'Automatic retry stopped after terminal failure · governed recovery available' : 'No automatic retry queued · governed recovery available'}</div>}
+                      {c.discord_validation_status==='RETRY_PENDING'&&<div className="text-[10px] font-semibold text-amber-600">{automaticRetryActive ? `Automatic retry ${c.community_retry_job_status === 'PROCESSING' ? 'in progress' : automaticRetryDue ? 'due now' : 'queued'} · reason: ${retryReasonLabel}` : automaticRetryTerminal ? automaticRetryBudgetExhausted ? `Automatic retry budget exhausted · governed recovery available · reason: ${retryReasonLabel}` : `Automatic retry stopped after terminal failure · governed recovery available · reason: ${retryReasonLabel}` : `No automatic retry queued · reason: ${retryReasonLabel} · governed recovery available`}</div>}
+                      {c.discord_validation_status==='RETRY_PENDING'&&retryReconciliationLabel&&<div className="text-[10px] font-semibold text-rose-600">{retryReconciliationLabel}</div>}
                       {c.discord_validation_status==='RETRY_PENDING'&&c.community_retry_job_attempts!=null&&c.community_retry_job_max_attempts!=null&&<div className="text-[10px] text-slate-500">Retry-window attempts: {c.community_retry_job_attempts}/{c.community_retry_job_max_attempts}{c.community_retry_job_run_after&&c.community_retry_job_status==='PENDING'?` · ${automaticRetryDue?'due':'next'} ${new Date(c.community_retry_job_run_after).toLocaleString()}`:''}</div>}
                       {c.discord_validation_status==='RETRY_PENDING'&&c.community_retry_job_execution_count!=null&&<div className="text-[10px] text-slate-500">Observed executions: {c.community_retry_job_execution_count} · capacity deferrals: {c.community_retry_job_deferral_count||0}{c.community_retry_job_last_execution_status?` · last ${c.community_retry_job_last_execution_status.toLowerCase()}`:''}</div>}
                       {c.discord_liveness_status==='INVALID_OBSERVED'&&<div className="text-[10px] text-amber-600">Invalid observation awaiting confirmation</div>}

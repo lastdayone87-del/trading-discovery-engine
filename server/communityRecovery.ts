@@ -6,7 +6,58 @@ export interface CommunityRecoveryReactivationReason {
   reasonCodes: string[];
 }
 
-export type EnqueueCommunityRecoveryJob = (channelId: string) => Promise<void>;
+export type EnqueueCommunityRecoveryJob = (channelId: string, retryReason?: string) => Promise<void>;
+
+export interface CommunityRetryReconciliationInput {
+  payload?: Record<string, unknown>;
+  inspectionTrail?: Array<{ step?: string; status?: string; details?: string }>;
+  hasCurrentRequiredRetryableFailure: boolean;
+  observedAt: string;
+}
+
+export interface CommunityRetryReconciliationDecision {
+  retryReason: 'NO_SURFACE' | 'BROWSER_RUNTIME_UNAVAILABLE' | 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE';
+  reconciliationStatus: 'NONE' | 'RECONCILIATION_REQUIRED';
+  reconciliationCode?: 'STALE_RETRY';
+  reconciliationReason?: string;
+  reconciliationObservedAt?: string;
+  appendHistory: boolean;
+}
+
+export function evaluateCommunityRetryReconciliation(input: CommunityRetryReconciliationInput): CommunityRetryReconciliationDecision {
+  const payload = input.payload || {};
+  const trail = input.inspectionTrail || [];
+  const browserReason = String(payload.retryReason || '') === 'BROWSER_RUNTIME_UNAVAILABLE';
+  const noSurface = !input.hasCurrentRequiredRetryableFailure && trail.some(step =>
+    ['CHANNEL_LINKS', 'EXTERNAL_LINKS', 'VIDEO_DESCRIPTIONS', 'LINKED_WEBSITES', 'CUSTOM_DOMAINS', 'SOCIAL_PROFILES', 'SOCIAL_BIO'].includes(String(step.step))
+    && String(step.status) === 'SKIPPED'
+  );
+  const retryReason = browserReason
+    ? 'BROWSER_RUNTIME_UNAVAILABLE'
+    : noSurface
+    ? 'NO_SURFACE'
+    : 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE';
+  const previousStatus = String(payload.reconciliationStatus || 'NONE');
+  if (input.hasCurrentRequiredRetryableFailure) {
+    return {
+      retryReason,
+      reconciliationStatus: 'NONE',
+      reconciliationReason: undefined,
+      reconciliationObservedAt: undefined,
+      appendHistory: previousStatus === 'RECONCILIATION_REQUIRED'
+    };
+  }
+  return {
+    retryReason,
+    reconciliationStatus: 'RECONCILIATION_REQUIRED',
+    reconciliationCode: 'STALE_RETRY',
+    reconciliationReason: noSurface
+      ? 'Latest inspection has no crawlable surfaces and no required retryable acquisition failure.'
+      : 'Latest inspection has no required retryable acquisition failure in the current evidence window.',
+    reconciliationObservedAt: input.observedAt,
+    appendHistory: previousStatus !== 'RECONCILIATION_REQUIRED'
+  };
+}
 
 // High-activity recovery is intentionally more frequent than the 30-day
 // freshness trigger, but it must not reopen a terminal retry window on every
@@ -122,6 +173,59 @@ let lastCommunityRecoveryReconciliationAt = 0;
  * reopens only terminal enrichment jobs whose persisted error proves quota
  * capacity was the cause.
  */
+export async function reconcilePendingCommunityRetryJobs(getDb: () => Promise<any>, limit = 100, now = new Date().toISOString()): Promise<number> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT j.id,j.payload,j.created_at,c.last_checked,c.inspection_trail,
+            EXISTS(
+              SELECT 1 FROM external_acquisition_observations o
+               WHERE o.channel_id=c.channel_id
+                 AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
+                 AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
+                 AND o.outcome='ACQUISITION_FAILED'
+                 AND o.retryable=true
+                 AND COALESCE(o.provenance->>'required','false')='true'
+            ) AS has_current_required_retryable_failure
+       FROM jobs j
+       JOIN channels c ON c.channel_id=j.payload->>'channelId'
+      WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
+        AND j.status='PENDING'
+      ORDER BY j.created_at ASC
+      LIMIT $1`,
+    [Math.min(250, Math.max(1, limit))]
+  );
+  let updated = 0;
+  for (const row of result.rows || []) {
+    const payload = typeof row.payload === 'string' ? JSON.parse(row.payload || '{}') : (row.payload || {});
+    const decision = evaluateCommunityRetryReconciliation({
+      payload,
+      inspectionTrail: typeof row.inspection_trail === 'string' ? JSON.parse(row.inspection_trail || '[]') : (row.inspection_trail || []),
+      hasCurrentRequiredRetryableFailure: row.has_current_required_retryable_failure === true,
+      observedAt: now
+    });
+    const history = Array.isArray(payload.reconciliationHistory) ? payload.reconciliationHistory : [];
+    const nextPayload: Record<string, unknown> = {
+      ...payload,
+      retryReason: decision.retryReason,
+      retryCode: payload.retryCode || 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+      retrySource: payload.retrySource || 'LEGACY',
+      retryObservedAt: payload.retryObservedAt || new Date(row.created_at || now).toISOString(),
+      reconciliationStatus: decision.reconciliationStatus,
+      reconciliationCode: decision.reconciliationCode || null,
+      reconciliationReason: decision.reconciliationReason || null,
+      reconciliationObservedAt: decision.reconciliationObservedAt || null,
+      reconciliationHistory: decision.appendHistory
+        ? [...history, { status: decision.reconciliationStatus, reason: decision.reconciliationReason || 'Retry evidence reconciled.', observedAt: now }]
+        : history
+    };
+    const changed = JSON.stringify(nextPayload) !== JSON.stringify(payload);
+    if (!changed) continue;
+    await db.query(`UPDATE jobs SET payload=$2::jsonb,updated_at=now() WHERE id=$1 AND status='PENDING'`, [row.id, JSON.stringify(nextPayload)]);
+    updated++;
+  }
+  return updated;
+}
+
 export async function reconcileCommunityAcquisitionRecovery(
   getDb: () => Promise<any>,
   getChannelById: (id: string) => Promise<ChannelRecord | null>,
@@ -254,7 +358,7 @@ export async function reconcileCommunityAcquisitionRecovery(
           [row.capacity_retry_job_id]
         );
       }
-      if (enqueueRecoveryJob) await enqueueRecoveryJob(channelRecord.channel_id);
+      if (enqueueRecoveryJob) await enqueueRecoveryJob(channelRecord.channel_id, triggerCheck.reasonCodes.join(','));
     } catch (error) {
       await upsertChannel(channelRecord);
       throw error;

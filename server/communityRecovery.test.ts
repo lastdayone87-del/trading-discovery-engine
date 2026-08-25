@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
+import { evaluateCommunityRetryReconciliation, reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import type { ChannelRecord } from '../src/types';
 
 const root = process.cwd();
@@ -144,6 +144,87 @@ test('automatic reconciliation reopens one governed retry window for an active c
   assert.match(recoverySelection, /status IN\('PENDING','PROCESSING'\)/);
 });
 
+test('no-surface pending retry is marked stale without deletion or completion', () => {
+  const decision = evaluateCommunityRetryReconciliation({
+    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+    inspectionTrail: [
+      { step: 'EXTERNAL_LINKS', status: 'SKIPPED' },
+      { step: 'VIDEO_DESCRIPTIONS', status: 'SKIPPED' },
+      { step: 'CUSTOM_DOMAINS', status: 'SKIPPED' },
+      { step: 'SOCIAL_BIO', status: 'SKIPPED' }
+    ],
+    hasCurrentRequiredRetryableFailure: false,
+    observedAt: '2026-08-25T12:00:00.000Z'
+  });
+  assert.deepEqual(decision, {
+    retryReason: 'NO_SURFACE',
+    reconciliationStatus: 'RECONCILIATION_REQUIRED',
+    reconciliationCode: 'STALE_RETRY',
+    reconciliationReason: 'Latest inspection has no crawlable surfaces and no required retryable acquisition failure.',
+    reconciliationObservedAt: '2026-08-25T12:00:00.000Z',
+    appendHistory: true
+  });
+});
+
+test('pending stale retry is marked in durable payload without completion or deletion', async () => {
+  const queries: Array<{ sql: string; values: unknown[] }> = [];
+  const updated = await reconcilePendingCommunityRetryJobs(
+    async () => ({
+      query: async (sql: string, values: unknown[] = []) => {
+        queries.push({ sql, values });
+        if (sql.includes('SELECT j.id')) return {
+          rows: [{
+            id: 'retry-1',
+            payload: { channelId: 'UC_test_1' },
+            created_at: '2026-08-25T10:00:00.000Z',
+            last_checked: '2026-08-25T10:00:00.000Z',
+            inspection_trail: [
+              { step: 'EXTERNAL_LINKS', status: 'SKIPPED' },
+              { step: 'CUSTOM_DOMAINS', status: 'SKIPPED' }
+            ],
+            has_current_required_retryable_failure: false
+          }]
+        };
+        return { rows: [] };
+      }
+    }),
+    100,
+    '2026-08-25T12:00:00.000Z'
+  );
+  assert.equal(updated, 1);
+  const update = queries.find(item => item.sql.includes('UPDATE jobs SET payload'));
+  assert.ok(update);
+  const payload = JSON.parse(String(update?.values[1]));
+  assert.equal(payload.retryReason, 'NO_SURFACE');
+  assert.equal(payload.reconciliationStatus, 'RECONCILIATION_REQUIRED');
+  assert.equal(payload.reconciliationCode, 'STALE_RETRY');
+  assert.equal(payload.reconciliationHistory.length, 1);
+  assert.doesNotMatch(queries.map(item => item.sql).join('\n'), /DELETE FROM jobs|status='COMPLETED'/);
+});
+
+test('current browser-runtime failure remains attributable and not stale', () => {
+  const decision = evaluateCommunityRetryReconciliation({
+    payload: { retryReason: 'BROWSER_RUNTIME_UNAVAILABLE' },
+    inspectionTrail: [{ step: 'CUSTOM_DOMAINS', status: 'ERROR' }],
+    hasCurrentRequiredRetryableFailure: true,
+    observedAt: '2026-08-25T12:00:00.000Z'
+  });
+  assert.equal(decision.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
+  assert.equal(decision.reconciliationStatus, 'NONE');
+  assert.equal(decision.appendHistory, false);
+});
+
+test('current upstream acquisition failure remains active and not stale', () => {
+  const decision = evaluateCommunityRetryReconciliation({
+    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+    inspectionTrail: [{ step: 'CUSTOM_DOMAINS', status: 'ERROR' }],
+    hasCurrentRequiredRetryableFailure: true,
+    observedAt: '2026-08-25T12:00:00.000Z'
+  });
+  assert.equal(decision.retryReason, 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE');
+  assert.equal(decision.reconciliationStatus, 'NONE');
+});
+
 test('automatic reconciliation restores the prior failure projection when recovery-job reopening fails', async () => {
   const channel = Object.assign(mockChannel('FAILED', '2026-08-15T00:00:00Z'), { activity_band: 'ACTIVE', discord_validation_status: 'RETRY_PENDING' });
   const persisted: ChannelRecord[] = [];
@@ -168,5 +249,6 @@ test('production ingestion and manual recheck entry points invoke community reco
 
   assert.match(pipeSource, /shouldReactivateCommunityRecovery\(existing, candidate, isManualScan\)/);
   assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
-  assert.match(queueSource, /reconcileCommunityAcquisitionRecovery\(getDb, getChannelById, upsertChannel, 20, Date\.now\(\), enqueueCommunityAcquisitionRetry\)/);
+  assert.match(queueSource, /reconcileCommunityAcquisitionRecovery\(getDb, getChannelById, upsertChannel, 20, Date\.now\(\),/);
+  assert.match(queueSource, /reconcilePendingCommunityRetryJobs\(getDb, 100\)/);
 });

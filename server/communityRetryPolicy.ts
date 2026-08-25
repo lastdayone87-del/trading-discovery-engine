@@ -1,4 +1,16 @@
+import assert from 'node:assert/strict';
+
 export const COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE = 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE';
+
+export const COMMUNITY_RETRY_REASON = {
+  NO_SURFACE: 'NO_SURFACE',
+  BROWSER_RUNTIME_UNAVAILABLE: 'BROWSER_RUNTIME_UNAVAILABLE',
+  UPSTREAM_REQUIRED_ACQUISITION_FAILURE: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE'
+} as const;
+
+export type CommunityRetryReason = typeof COMMUNITY_RETRY_REASON[keyof typeof COMMUNITY_RETRY_REASON];
+export type CommunityRetryReconciliationStatus = 'NONE' | 'RECONCILIATION_REQUIRED';
+export type CommunityRetrySource = 'INSPECTION' | 'RECOVERY' | 'LEGACY';
 
 export interface CommunityRetryObservation {
   required?: boolean;
@@ -13,11 +25,31 @@ export interface CommunityRetryDirective {
   code: string;
   retryAt?: number;
   reason: string;
+  retryReason: CommunityRetryReason;
+}
+
+export interface CommunityRetryJobMetadata {
+  retryReason: CommunityRetryReason;
+  retryCode: string;
+  retrySource: CommunityRetrySource;
+  retryObservedAt: string;
+  reconciliationStatus: CommunityRetryReconciliationStatus;
+  reconciliationReason?: string;
+  reconciliationObservedAt?: string;
+  reconciliationHistory?: Array<{
+    status: CommunityRetryReconciliationStatus;
+    reason: string;
+    observedAt: string;
+  }>;
 }
 
 const ATTEMPT_FREE_CODES = new Set([
   'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
   'BROWSER_RUNTIME_UNAVAILABLE',
+  'BROWSER_BINARY_MISSING',
+  'BROWSER_LINUX_DEPENDENCY_MISSING',
+  'BROWSER_PERMISSION_DENIED',
+  'BROWSER_LAUNCH_FAILED',
   'YOUTUBE_PROVIDERS_COOLING_DOWN',
   'YOUTUBE_PROVIDER_POOL_EXHAUSTED',
   'YOUTUBE_RUNTIME_RATE_PRESSURE',
@@ -36,13 +68,41 @@ const ATTEMPT_FREE_CODES = new Set([
 ]);
 
 const ATTEMPT_FREE_CLASSES = new Set(['TIMEOUT', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED']);
+const BROWSER_RUNTIME_FAILURES = new Set([
+  'BROWSER_BINARY_MISSING',
+  'BROWSER_LINUX_DEPENDENCY_MISSING',
+  'BROWSER_PERMISSION_DENIED',
+  'BROWSER_LAUNCH_FAILED',
+  'BROWSER_RUNTIME_UNAVAILABLE'
+]);
 
-export function retryAtFromUnknown(error: any, now = Date.now()): number | undefined {
-  const direct = Number(error?.retryAt ?? error?.cause?.retryAt);
-  if (Number.isFinite(direct) && direct > 0) return direct;
-  const retryAfterMs = Number(error?.retryAfterMs ?? error?.cause?.retryAfterMs);
-  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return now + retryAfterMs;
-  return undefined;
+export function isBrowserRuntimeFailureClass(value: unknown): boolean {
+  return BROWSER_RUNTIME_FAILURES.has(String(value || '').toUpperCase());
+}
+
+export function retryReasonForFailureClass(failureClass: unknown): CommunityRetryReason {
+  return isBrowserRuntimeFailureClass(failureClass)
+    ? COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
+    : COMMUNITY_RETRY_REASON.UPSTREAM_REQUIRED_ACQUISITION_FAILURE;
+}
+
+export function retryReasonFromError(error: any): CommunityRetryReason {
+  return retryReasonForFailureClass(error?.code ?? error?.errorClass ?? error?.cause?.code ?? error?.cause?.errorClass);
+}
+
+export function buildCommunityRetryJobMetadata(args: {
+  code: string;
+  retryReason: CommunityRetryReason;
+  retrySource?: CommunityRetrySource;
+  observedAt?: string;
+}): CommunityRetryJobMetadata {
+  return {
+    retryReason: args.retryReason,
+    retryCode: args.code,
+    retrySource: args.retrySource || 'INSPECTION',
+    retryObservedAt: args.observedAt || new Date().toISOString(),
+    reconciliationStatus: 'NONE'
+  };
 }
 
 export function isAttemptFreeCommunityFailure(error: any): boolean {
@@ -57,21 +117,34 @@ export function isAttemptFreeCommunityFailure(error: any): boolean {
   );
 }
 
+export function retryAtFromUnknown(error: any, now = Date.now()): number | undefined {
+  const direct = Number(error?.retryAt ?? error?.cause?.retryAt);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  const retryAfterMs = Number(error?.retryAfterMs ?? error?.cause?.retryAfterMs);
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return now + retryAfterMs;
+  return undefined;
+}
+
 export function communityAcquisitionRetryDirective(
   observations: CommunityRetryObservation[],
 ): CommunityRetryDirective | undefined {
   const requiredFailures = observations.filter(item => item.required !== false && item.outcome === 'ACQUISITION_FAILED' && item.retryable);
   if (!requiredFailures.length) return undefined;
   const retryTimes = requiredFailures.map(item => Number(item.retryAt)).filter(value => Number.isFinite(value) && value > 0);
-  const browserRuntimeUnavailable = requiredFailures.some(item => item.failureClass === 'BROWSER_BINARY_MISSING' || item.failureClass === 'BROWSER_LINUX_DEPENDENCY_MISSING' || item.failureClass === 'BROWSER_PERMISSION_DENIED' || item.failureClass === 'BROWSER_LAUNCH_FAILED');
+  const browserRuntimeUnavailable = requiredFailures.some(item => isBrowserRuntimeFailureClass(item.failureClass));
   return {
     attemptFree: true,
     code: browserRuntimeUnavailable ? 'BROWSER_RUNTIME_UNAVAILABLE' : COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryAt: retryTimes.length ? Math.min(...retryTimes) : undefined,
     reason: requiredFailures.map(item => item.failureClass || 'TRANSIENT_ACQUISITION_FAILURE').join(', '),
+    retryReason: browserRuntimeUnavailable
+      ? COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
+      : COMMUNITY_RETRY_REASON.UPSTREAM_REQUIRED_ACQUISITION_FAILURE
   };
 }
 
 export function attemptFreeDiscordValidation(outcome: string, retryable: boolean): boolean {
   return retryable && outcome !== 'INVALID_OBSERVED';
 }
+
+assert.equal(COMMUNITY_RETRY_REASON.NO_SURFACE, 'NO_SURFACE');
