@@ -262,10 +262,11 @@ export async function reconcileLegacyCommunityRetryOwnership(
     if (decision.disposition === 'COMPLETED_NEGATIVE') {
       await db.query(
         `UPDATE channels
-            SET scan_status='COMPLETED',discord_status='NOT_FOUND',discord_validation_status='COMPLETED',updated_at=now()
+            SET scan_status='COMPLETED',discord_status='NOT_FOUND',discord_validation_status='COMPLETED',discord_resolution_status='NOT_ATTEMPTED',discord_liveness_status='NOT_CHECKED',discord_relevance_status='NOT_CHECKED',discord_discovery_status='NOT_DISCOVERED',updated_at=now()
           WHERE channel_id=$1
-            AND scan_status='FAILED'
-            AND discord_validation_status='RETRY_PENDING'`,
+            AND COALESCE(discord_candidate_locator,'')=''
+            AND (scan_status='FAILED' OR discord_validation_status='RETRY_PENDING' OR discord_validation_status='NOT_STARTED')
+            AND discord_status<>'FOUND'`,
         [row.channel_id]
       );
       summary.completedNegative++;

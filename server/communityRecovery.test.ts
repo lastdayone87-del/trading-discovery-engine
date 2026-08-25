@@ -218,6 +218,10 @@ test('legacy completed-negative retry is completed as audit history without stal
   assert.equal(summary.closedNonCommunity, 1);
   assert.equal(summary.completedNegative, 1);
   assert.match(queries.map(item => item.sql).join('\n'), /SET status='COMPLETED'/);
+  assert.match(queries.map(item => item.sql).join('\n'), /discord_status='NOT_FOUND',discord_validation_status='COMPLETED'/);
+  assert.match(queries.map(item => item.sql).join('\n'), /discord_resolution_status='NOT_ATTEMPTED'/);
+  assert.match(queries.map(item => item.sql).join('\n'), /discord_discovery_status='NOT_DISCOVERED'/);
+  assert.match(queries.map(item => item.sql).join('\n'), /COALESCE\(discord_candidate_locator,''\)=''/);
   assert.match(queries.map(item => item.sql).join('\n'), /UPDATE job_attempts/);
   assert.doesNotMatch(queries.map(item => item.sql).join('\n'), /RECONCILIATION_REQUIRED|STALE_RETRY/);
 });
