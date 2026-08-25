@@ -150,3 +150,12 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
     .sort((a, b) => a.index - b.index)
     .map(entry => entry.item);
 }
+
+/**
+ * Ownership boundary for the Discord inspection lifecycle. Upstream YouTube
+ * acquisition observations remain useful audit evidence, but they cannot turn
+ * a completed Discord/community negative into an operational Discord failure.
+ */
+export function isDiscordCommunityAcquisitionSurface(surface: string): boolean {
+  return new Set(['CHANNEL_EXTERNAL_LINKS', 'CREATOR_WEBSITES', 'SOCIAL_PROFILES']).has(surface);
+}
