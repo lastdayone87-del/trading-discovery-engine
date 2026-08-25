@@ -247,6 +247,7 @@ test('reconciliation query revisits legacy jobs until their evidence window is r
 test('reconciliation uses effective surface precedence so completed no-match coverage clears stale failure eligibility', () => {
   const source = read('server/communityRecovery.ts');
   assert.match(source, /SELECT DISTINCT ON \(o\.provenance->>'surface'/);
+  assert.doesNotMatch(source, /o\.surface/);
   assert.match(source, /o\.provenance->>'surface' AS surface/);
   assert.match(source, /rtrim\(COALESCE\(o\.requested_url/);
   assert.match(source, /WHEN 'INSPECTED_NO_MATCH' THEN 2/);
