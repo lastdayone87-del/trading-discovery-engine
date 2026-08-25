@@ -14,6 +14,7 @@ export type CommunityRetrySource = 'INSPECTION' | 'RECOVERY' | 'LEGACY';
 
 export interface CommunityRetryObservation {
   required?: boolean;
+  surface?: string;
   outcome: string;
   retryable: boolean;
   retryAt?: number;
@@ -125,10 +126,18 @@ export function retryAtFromUnknown(error: any, now = Date.now()): number | undef
   return undefined;
 }
 
+export function isCommunityRetryableObservation(item: CommunityRetryObservation): boolean {
+  return item.required !== false &&
+    item.outcome === 'ACQUISITION_FAILED' &&
+    item.retryable &&
+    item.surface !== 'YOUTUBE_ABOUT' &&
+    item.surface !== 'RECENT_VIDEO_DESCRIPTIONS';
+}
+
 export function communityAcquisitionRetryDirective(
   observations: CommunityRetryObservation[],
 ): CommunityRetryDirective | undefined {
-  const requiredFailures = observations.filter(item => item.required !== false && item.outcome === 'ACQUISITION_FAILED' && item.retryable);
+  const requiredFailures = observations.filter(isCommunityRetryableObservation);
   if (!requiredFailures.length) return undefined;
   const retryTimes = requiredFailures.map(item => Number(item.retryAt)).filter(value => Number.isFinite(value) && value > 0);
   const browserRuntimeUnavailable = requiredFailures.some(item => isBrowserRuntimeFailureClass(item.failureClass));

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {buildCommunityRetryJobMetadata,communityAcquisitionRetryDirective,isAttemptFreeCommunityFailure,retryAtFromUnknown,attemptFreeDiscordValidation,COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE} from './communityRetryPolicy';
+import {buildCommunityRetryJobMetadata,communityAcquisitionRetryDirective,isCommunityRetryableObservation,isAttemptFreeCommunityFailure,retryAtFromUnknown,attemptFreeDiscordValidation,COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE} from './communityRetryPolicy';
 
 test('new retry payload metadata is explicit and starts unreconciled',()=>{
   const metadata=buildCommunityRetryJobMetadata({code:'BROWSER_RUNTIME_UNAVAILABLE',retryReason:'BROWSER_RUNTIME_UNAVAILABLE',retrySource:'INSPECTION',observedAt:'2026-08-25T12:00:00.000Z'});
@@ -13,13 +13,19 @@ test('new retry payload metadata is explicit and starts unreconciled',()=>{
   });
 });
 
-test('required retryable acquisition failure is attempt-free and preserves earliest retry time',()=>{
+test('recent-video acquisition failure is excluded from Discord community retry ownership',()=>{
+  const observation={surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_API_FAILED',retryAt:20_000};
+  assert.equal(isCommunityRetryableObservation(observation),false);
+  assert.equal(communityAcquisitionRetryDirective([observation]),undefined);
+});
+
+test('genuine required community acquisition failure remains attempt-free and preserves retry time',()=>{
   const directive=communityAcquisitionRetryDirective([
-    {required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_API_FAILED',retryAt:20_000},
-    {required:true,outcome:'INSPECTED_NO_MATCH',retryable:false},
-    {required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'},
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'BROWSER_RUNTIME_UNAVAILABLE',retryAt:20_000},
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false},
+    {surface:'SOCIAL_PROFILES',required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'},
   ]);
-  assert.deepEqual(directive,{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,retryAt:20_000,reason:'RECENT_VIDEO_DESCRIPTION_API_FAILED',retryReason:'UPSTREAM_REQUIRED_ACQUISITION_FAILURE'});
+  assert.deepEqual(directive,{attemptFree:true,code:'BROWSER_RUNTIME_UNAVAILABLE',retryAt:20_000,reason:'BROWSER_RUNTIME_UNAVAILABLE',retryReason:'BROWSER_RUNTIME_UNAVAILABLE'});
 });
 
 test('optional external/social failure alone does not create a retry directive',()=>{
@@ -33,10 +39,16 @@ test('global browser runtime failure is separately classified and remains attemp
   assert.equal(isAttemptFreeCommunityFailure(Object.assign(new Error('browser unavailable'),{code:'BROWSER_RUNTIME_UNAVAILABLE',retryable:true})),true);
 });
 
-test('no required retryable acquisition failure produces no retry directive',()=>{
+test('YouTube About acquisition failure is not a community retry',()=>{
   assert.equal(communityAcquisitionRetryDirective([
-    {required:true,outcome:'INSPECTED_NO_MATCH',retryable:false},
-    {required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'}
+    {surface:'YOUTUBE_ABOUT',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'YOUTUBE_ABOUT_ACQUISITION_FAILED'}
+  ]),undefined);
+});
+
+test('no required retryable community acquisition failure produces no retry directive',()=>{
+  assert.equal(communityAcquisitionRetryDirective([
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false},
+    {surface:'SOCIAL_PROFILES',required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'}
   ]),undefined);
 });
 

@@ -16,8 +16,7 @@ test('recent-video provider cooldown is attempt-free and keeps acquisition uncer
     recentVideoDescriptionsLoader:async()=>{throw coolingError();},
   });
   assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');
-  assert.equal(result.retryDirective?.attemptFree,true);
-  assert.equal(result.retryDirective?.retryAt,2_000_000);
+  assert.equal(result.retryDirective,undefined);
   assert.equal(result.acquisitionOutcomes?.find(item=>item.surface==='RECENT_VIDEO_DESCRIPTIONS')?.retryAt,2_000_000);
   assert.equal(result.discordCandidates?.length,0);
 });
