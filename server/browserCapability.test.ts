@@ -4,6 +4,7 @@ import {
   BROWSER_RUNTIME_UNAVAILABLE,
   browserCapabilityIsUnavailable,
   browserCapabilitySnapshot,
+  isBrowserRuntimeFailure,
   browserLaunchOptions,
   classifyBrowserFailure,
   markBrowserCapabilityReady,
@@ -27,6 +28,12 @@ test('browser runtime failures are classified separately from ordinary site fail
   assert.equal(classifyBrowserFailure(new Error('error while loading shared libraries: libgbm.so.1')), 'BROWSER_LINUX_DEPENDENCY_MISSING');
   assert.equal(classifyBrowserFailure(Object.assign(new Error('permission denied'), { code: 'EACCES' })), 'BROWSER_PERMISSION_DENIED');
   assert.equal(classifyBrowserFailure(new Error('navigation timeout exceeded')), 'BROWSER_LAUNCH_FAILED');
+});
+
+test('navigation timeouts remain page-level failures and do not demote browser capability', () => {
+  assert.equal(isBrowserRuntimeFailure(new Error('Page.goto: Timeout 15000ms exceeded.')), false);
+  markBrowserCapabilityReady('Chromium 151.0.0');
+  assert.equal(browserCapabilityIsUnavailable(), false);
 });
 
 test('browser capability health is recoverable and never changes semantic provider controls', () => {

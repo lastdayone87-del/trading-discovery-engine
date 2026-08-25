@@ -1,9 +1,12 @@
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
-import { browserLaunchOptions, classifyBrowserFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, type BrowserFailureClass } from './browserCapability';
+import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, type BrowserFailureClass } from './browserCapability';
 import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
   DEFAULT_RENDERED_MAX_SESSION_ROTATIONS,
+  classifyRenderedCrawlerFailure,
+  renderedCrawlerHostBackoffMs,
   renderedCrawlerRetryPolicy,
+  isRenderedNavigationTimeout,
 } from './renderedCrawlerPolicy';
 
 export interface BrowserFallbackBudget {
@@ -16,6 +19,17 @@ export interface BrowserFallbackBudget {
   totalTimeoutMs: number;
 }
 
+export interface BrowserFallbackTelemetry {
+  requestsStarted: number;
+  requestsFinished: number;
+  requestsFailed: number;
+  navigationTimeouts: number;
+  blockedRequests: number;
+  rateLimitedRequests: number;
+  transientRequests: number;
+  hostBackoffsApplied: number;
+}
+
 export interface BrowserFallbackResult {
   foundInvite: string | null;
   foundLocation?: string;
@@ -26,6 +40,7 @@ export interface BrowserFallbackResult {
   complete: boolean;
   retryable: boolean;
   failureClass?: BrowserFailureClass;
+  telemetry?: BrowserFallbackTelemetry;
   detail: string;
 }
 
@@ -119,7 +134,28 @@ export const renderedFallbackGate = new RenderedFallbackGate(
 export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Partial<BrowserFallbackBudget> = {}): Promise<BrowserFallbackResult> {
   const limits = { ...DEFAULT_BROWSER_FALLBACK_BUDGET, ...budget };
   let inspectedPages = 0, scrolls = 0, clicks = 0;
+  const telemetry: BrowserFallbackTelemetry = {
+    requestsStarted: 0,
+    requestsFinished: 0,
+    requestsFailed: 0,
+    navigationTimeouts: 0,
+    blockedRequests: 0,
+    rateLimitedRequests: 0,
+    transientRequests: 0,
+    hostBackoffsApplied: 0,
+  };
+  const hostBackoffUntil = new Map<string, number>();
   const discovered:DiscordCandidate[]=[];
+  const hostKey = (rawUrl: string): string => {
+    try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\\./, '') || 'unknown'; }
+    catch { return 'unknown'; }
+  };
+  const waitForHostBackoff = async (rawUrl: string, remainingMs: number): Promise<void> => {
+    const waitMs = Math.min(remainingMs, Math.max(0, (hostBackoffUntil.get(hostKey(rawUrl)) || 0) - Date.now()));
+    if (waitMs <= 0) return;
+    telemetry.hostBackoffsApplied++;
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+  };
   const retain=(text:string,sourceUrl:string)=>{
     const candidates=extractDiscordCandidates(text,'CREATOR_WEBSITES',sourceUrl).filter(candidate=>candidate.nativeInviteCode);
     discovered.push(...candidates);
@@ -150,13 +186,28 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             });
           }],
           errorHandler: async ({ request, session }, error) => {
-            const policy = renderedCrawlerRetryPolicy(error, request.retryCount || 0);
+            telemetry.requestsFailed++;
+            const retryCount = request.retryCount || 0;
+            const policy = renderedCrawlerRetryPolicy(error, retryCount);
+            const failureClass = classifyRenderedCrawlerFailure(error);
+            if (isRenderedNavigationTimeout(error)) telemetry.navigationTimeouts++;
+            if (failureClass === 'BLOCKED') telemetry.blockedRequests++;
+            if (failureClass === 'RATE_LIMITED') telemetry.rateLimitedRequests++;
+            if (failureClass === 'TRANSIENT') telemetry.transientRequests++;
             if (policy.retireSession) session?.retire();
             const remainingMs = Math.max(0, limits.totalTimeoutMs - (Date.now() - startedAt));
+            const backoffMs = Math.min(remainingMs, renderedCrawlerHostBackoffMs(failureClass, retryCount));
+            const host = hostKey(request.url);
+            if (backoffMs > 0) hostBackoffUntil.set(host, Math.max(hostBackoffUntil.get(host) || 0, Date.now() + backoffMs));
             if (policy.delayMs > 0 && remainingMs > 0) await new Promise(resolve => setTimeout(resolve, Math.min(policy.delayMs, remainingMs)));
           },
-          async requestHandler({ page, enqueueLinks }) {
+          async requestHandler({ page, request, enqueueLinks }) {
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
+            const remainingMs = Math.max(0, limits.totalTimeoutMs - (Date.now() - startedAt));
+            await waitForHostBackoff(request.url, remainingMs);
+            if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
+            telemetry.requestsStarted++;
+            try {
             inspectedPages++;
             const inspect = async () => {
               const url=page.url(),html=await page.content();
@@ -189,12 +240,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>shouldEnqueueRenderedCommunityLink(req.url)?req:false});
             }
+            } finally {
+              telemetry.requestsFinished++;
+            }
           },
         });
 
         await crawler.run([seedUrl]);
         markBrowserCapabilityReady();
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
+        const incomplete=timedOut||telemetry.requestsFailed>0;
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
         return {
@@ -202,24 +257,26 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           foundLocation:first?.sourceUrl,
           candidates,
           inspectedPages,scrolls,clicks,
-          complete:!timedOut,
-          retryable:timedOut,
+          complete:!incomplete,
+          retryable:incomplete,
+          telemetry,
           detail:candidates.length
-            ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s)`
-            : timedOut?'Rendered acquisition budget expired before coverage completed':`Rendered acquisition completed across ${inspectedPages} page(s) without an invite`,
+            ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl`
+            : timedOut?'Rendered acquisition budget expired before coverage completed':telemetry.requestsFailed>0?`Rendered acquisition incomplete: ${telemetry.requestsFailed} request(s) failed within the bounded crawl`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite`,
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);
-        const failureClass=classifyBrowserFailure(error);
-        markBrowserCapabilityUnavailable(error);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,detail:`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
+        const failureClass=isBrowserRuntimeFailure(error)?classifyBrowserFailure(error):undefined;
+        if (failureClass) markBrowserCapabilityUnavailable(error);
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
       }
     });
   } catch (error:any) {
     const candidates=mergeDiscordCandidates(discovered);
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
-    if(!saturated)markBrowserCapabilityUnavailable(error);
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass:saturated?undefined:classifyBrowserFailure(error),detail:saturated?'Rendered acquisition deferred because the process-wide browser launch gate is saturated':`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
+    const failureClass=saturated||!isBrowserRuntimeFailure(error)?undefined:classifyBrowserFailure(error);
+    if (failureClass) markBrowserCapabilityUnavailable(error);
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:saturated?'Rendered acquisition deferred because the process-wide browser launch gate is saturated':`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
   }
 }
 
