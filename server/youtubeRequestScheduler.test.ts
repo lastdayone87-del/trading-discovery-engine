@@ -170,6 +170,8 @@ test('youtubeFetch records the actual provider failure before scheduler release 
   assert.ok(failureBranch.indexOf('youtubeProviderCooldown.failed') < failureBranch.indexOf('throw error'));
   const recorder = source.slice(source.indexOf('function recordProviderFailure'), source.indexOf('export function selectYouTubeDispatchProviderIndex'));
   assert.match(recorder, /providerFailureRecorded === true\) return/);
+  assert.match(recorder, /if \(isYouTubeRateLimited\(error\)\)[\s\S]*youtubeProviderCooldown\.failed\(dispatchedKey, 'RATE_LIMITED'\)[\s\S]*return/);
+  assert.doesNotMatch(recorder, /if \(isYouTubeRateLimited\(error\)\)[\s\S]*throw error/);
 });
 
 test('youtubeFetch preserves the already-recorded provider failure marker through ProviderCallError wrapping', () => {
