@@ -20,7 +20,7 @@ import {
   getExtractedVocabulary,
   setQueryCollection,
   purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
-  listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics
+  listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics, getCrawlerReliabilityMetrics
 } from './server/db';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
@@ -271,6 +271,7 @@ async function startServer() {
   app.get('/api/channels-revision',async(req,res)=>{try{res.json(await getChannelListingRevision(channelFilterFromRequest(req)));}catch(err:any){res.status(500).json({error:err.message});}});
   app.get('/api/dashboard/summary',async(_req,res)=>{try{res.json(await getDashboardOperationalSummary());}catch(err:any){res.status(500).json({error:err.message});}});
   app.get('/api/reconciliation/legacy-community-retries',async(req,res)=>{try{res.json(await getLegacyCommunityRetryDiagnostics(String(req.query.legacy_before||'2026-08-25T16:00:02.000Z')));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/diagnostics/crawler-reliability',async(req,res)=>{try{res.json(await getCrawlerReliabilityMetrics(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
 
   // Dedicated diagnostics view for rejected / excluded channels
   app.get('/api/channels/diagnostics/rejected', async (req, res) => {
