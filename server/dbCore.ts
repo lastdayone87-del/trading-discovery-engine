@@ -377,6 +377,93 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
   return {items:page.rows.map(rowToChannel),total:Number(summary.rows[0].total||0),revision:iso(summary.rows[0].revision)};
 }
 
+export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-25T16:00:02.000Z'):Promise<{legacyBefore:string;rows:Array<Record<string,unknown>>}> {
+  const db=await getDb();
+  const cutoff=new Date(legacyBefore);
+  if(!Number.isFinite(cutoff.getTime())) throw new Error('INVALID_LEGACY_CUTOFF');
+  const result=await db.query(`
+    WITH base AS (
+      SELECT j.status,j.created_at,
+             CASE
+               WHEN NULLIF(btrim(j.payload->>'retryLifecycleVersion'),'') IS NULL THEN 'MISSING'
+               WHEN btrim(j.payload->>'retryLifecycleVersion') ~ '^[0-9]+$'
+                 THEN CASE WHEN btrim(j.payload->>'retryLifecycleVersion')::numeric < 2 THEN 'INTEGER_LT_2' ELSE 'INTEGER_GE_2' END
+               ELSE 'NON_NUMERIC'
+             END AS lifecycle_version_class,
+             CASE j.payload->>'retrySource'
+               WHEN 'INSPECTION' THEN 'INSPECTION'
+               WHEN 'RECOVERY' THEN 'RECOVERY'
+               WHEN 'LEGACY' THEN 'LEGACY'
+               ELSE 'OTHER'
+             END AS retry_source_class,
+             CASE j.payload->>'retryReason'
+               WHEN 'NO_SURFACE' THEN 'NO_SURFACE'
+               WHEN 'BROWSER_RUNTIME_UNAVAILABLE' THEN 'BROWSER_RUNTIME_UNAVAILABLE'
+               WHEN 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' THEN 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE'
+               WHEN 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' THEN 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'
+               ELSE 'OTHER'
+             END AS retry_reason_class,
+             CASE COALESCE(j.payload->>'reconciliationStatus','NONE')
+               WHEN 'NONE' THEN 'NONE'
+               WHEN 'RECONCILIATION_REQUIRED' THEN 'RECONCILIATION_REQUIRED'
+               ELSE 'OTHER'
+             END AS reconciliation_status_class,
+             CASE
+               WHEN j.created_at < $1::timestamptz THEN 'BEFORE_CUTOFF'
+               ELSE 'AT_OR_AFTER_CUTOFF'
+             END AS created_at_class,
+             CASE
+               WHEN upper(COALESCE(j.last_error,'')) LIKE '%RECENT_VIDEO%'
+                 OR upper(COALESCE(j.last_error,'')) LIKE '%YOUTUBE%' THEN 'UPSTREAM_VIDEO'
+               WHEN upper(COALESCE(j.last_error,'')) LIKE '%BROWSER%'
+                 OR upper(COALESCE(j.last_error,'')) LIKE '%PLAYWRIGHT%' THEN 'BROWSER_RUNTIME'
+               WHEN upper(COALESCE(j.last_error,'')) LIKE '%CAPACITY%'
+                 OR upper(COALESCE(j.last_error,'')) LIKE '%COOLING DOWN%' THEN 'CAPACITY'
+               WHEN COALESCE(j.last_error,'')='' THEN 'NO_ERROR'
+               ELSE 'OTHER'
+             END AS error_class,
+             EXISTS(
+               SELECT 1 FROM (
+                 SELECT DISTINCT ON (o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')))
+                        o.surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                   FROM external_acquisition_observations o
+                  WHERE o.channel_id=j.payload->>'channelId'
+                    AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
+                    AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
+                  ORDER BY o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')),
+                           CASE o.outcome WHEN 'FOUND' THEN 3 WHEN 'INSPECTED_NO_MATCH' THEN 2 WHEN 'PARTIALLY_INSPECTED' THEN 1 ELSE 0 END DESC,
+                           o.observed_at DESC
+               ) effective
+              WHERE effective.required='true' AND effective.outcome='ACQUISITION_FAILED' AND effective.retryable=true
+                AND effective.surface IN('CHANNEL_LINKS','EXTERNAL_LINKS','LINKED_WEBSITES','CUSTOM_DOMAINS','SOCIAL_PROFILES','SOCIAL_BIO')
+             ) AS has_community_failure,
+             EXISTS(
+               SELECT 1 FROM (
+                 SELECT DISTINCT ON (o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')))
+                        o.surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                   FROM external_acquisition_observations o
+                  WHERE o.channel_id=j.payload->>'channelId'
+                    AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
+                    AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
+                  ORDER BY o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')),
+                           CASE o.outcome WHEN 'FOUND' THEN 3 WHEN 'INSPECTED_NO_MATCH' THEN 2 WHEN 'PARTIALLY_INSPECTED' THEN 1 ELSE 0 END DESC,
+                           o.observed_at DESC
+               ) effective
+              WHERE effective.required='true' AND effective.outcome='ACQUISITION_FAILED' AND effective.retryable=true
+                AND effective.surface IN('YOUTUBE_ABOUT','RECENT_VIDEO_DESCRIPTIONS')
+             ) AS has_upstream_failure
+        FROM jobs j JOIN channels c ON c.channel_id=j.payload->>'channelId'
+       WHERE j.type='RETRY_COMMUNITY_ACQUISITION' AND j.status='PENDING'
+    )
+    SELECT lifecycle_version_class,retry_source_class,retry_reason_class,reconciliation_status_class,created_at_class,error_class,
+           CASE WHEN has_community_failure THEN 'COMMUNITY' WHEN has_upstream_failure THEN 'UPSTREAM_VIDEO' ELSE 'NO_CURRENT_RETRYABLE_FAILURE' END AS current_owner_class,
+           COUNT(*)::int AS count
+      FROM base
+     GROUP BY lifecycle_version_class,retry_source_class,retry_reason_class,reconciliation_status_class,created_at_class,error_class,current_owner_class
+     ORDER BY lifecycle_version_class,retry_source_class,retry_reason_class,reconciliation_status_class,created_at_class,error_class,current_owner_class`,[cutoff.toISOString()]);
+  return {legacyBefore:cutoff.toISOString(),rows:result.rows};
+}
+
 export async function getChannelListingRevision(args:ChannelListingFilter):Promise<{total:number;revision:string|null}> {
   const db=await getDb(); const {where,values}=await channelListingWhere(db,args);
   const result=await db.query(`SELECT COUNT(*)::int total,MAX(updated_at) revision FROM channels WHERE ${where}`,values);
