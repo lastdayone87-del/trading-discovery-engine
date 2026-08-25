@@ -43,6 +43,14 @@ const GEMINI_VOCABULARY_OPERATION = 'vocabulary-extraction';
 const GEMINI_LOCK_POLL_MS = 100;
 const GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS = 1000;
 
+export const DEFAULT_GEMINI_ROUTE_ID = 'gemini-1';
+
+/** Resolve only machine-owned route identifiers; never expose or persist credentials. */
+export function resolveGeminiRouteId(value: unknown): string {
+  const candidate = String(value || '').trim();
+  return /^gemini-[1-9][0-9]*$/.test(candidate) ? candidate : DEFAULT_GEMINI_ROUTE_ID;
+}
+
 type GeminiCapacitySnapshot = {
   nowMs: number;
   lastGeminiAtMs?: number;
@@ -161,6 +169,7 @@ async function connectWithAbort(db:any,signal?:AbortSignal):Promise<any>{
 
 async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSignal,deadlineAtMs?:number):Promise<GeminiCapacityLease|undefined>{
   if(context.provider!=='gemini') return undefined;
+  const routeId = resolveGeminiRouteId(context.requestMetadata?.geminiRoute);
   let client:any;
   try{
     const { getDb }=await import('./db');
@@ -175,10 +184,10 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     }
     if(signal?.aborted)throw abortError();
     const [lastAny,lastRate,lastSemantic,lastVocabulary]=await Promise.all([
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' ORDER BY occurred_at DESC LIMIT 1`,[],signal,deadlineAtMs),
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`,[],signal,deadlineAtMs),
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION],signal,deadlineAtMs),
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION],signal,deadlineAtMs)
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND COALESCE(request_metadata->>'geminiRoute',$1)=$1 ORDER BY occurred_at DESC LIMIT 1`,[routeId],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'geminiRoute',$1)=$1 ORDER BY occurred_at DESC LIMIT 1`,[routeId],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,routeId],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,routeId],signal,deadlineAtMs)
     ]);
     const at=(row:any)=>row?.occurred_at?new Date(row.occurred_at).getTime():undefined;
     const decision=decideGeminiCapacity(context.operation,{nowMs:Date.now(),lastGeminiAtMs:at(lastAny.rows[0]),lastRateLimitAtMs:at(lastRate.rows[0]),lastSemanticAtMs:at(lastSemantic.rows[0]),lastVocabularyAtMs:at(lastVocabulary.rows[0])});

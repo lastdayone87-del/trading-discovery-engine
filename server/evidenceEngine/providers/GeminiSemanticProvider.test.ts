@@ -82,3 +82,33 @@ test('non-404 permanent failures do not invoke fallback model', async () => {
     restore();
   }
 });
+
+
+test('configured Gemini routes are ordered, non-empty, and deduplicated without exposing values',async()=>{
+  const {configuredGeminiRoutes}=await import('./GeminiSemanticProvider');
+  const routes=configuredGeminiRoutes({GEMINI_API_KEY:'a',GEMINI_API_KEY_2:'b',GEMINI_API_KEY_3:'a',GEMINI_API_KEY_4:'',GEMINI_API_KEY_5:'e',GEMINI_API_KEY_20:'z'});
+  assert.deepEqual(routes.map(route=>route.id),['gemini-1','gemini-2','gemini-5','gemini-20']);
+  assert.deepEqual(routes.map(route=>route.key),['a','b','e','z']);
+});
+
+test('retryable Gemini route failure advances to the next authorized route',async()=>{
+  const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
+  const calls:string[]=[];
+  const result=await runGeminiRouteFailover([{id:'gemini-1',key:'hidden-a'},{id:'gemini-2',key:'hidden-b'}],async route=>{
+    calls.push(route.id);
+    if(route.id==='gemini-1')throw new ProviderCallError('rate pressure','RATE_LIMIT',true,{status:429});
+    return {route:route.id};
+  });
+  assert.deepEqual(calls,['gemini-1','gemini-2']);
+  assert.deepEqual(result,{route:'gemini-2'});
+});
+
+test('non-retryable Gemini route failure does not spill into another route',async()=>{
+  const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
+  const calls:string[]=[];
+  await assert.rejects(runGeminiRouteFailover([{id:'gemini-1',key:'hidden-a'},{id:'gemini-2',key:'hidden-b'}],async route=>{
+    calls.push(route.id);
+    throw new ProviderCallError('invalid request','PERMANENT_INPUT',false,{status:400});
+  }), (error:any)=>error?.status===400);
+  assert.deepEqual(calls,['gemini-1']);
+});

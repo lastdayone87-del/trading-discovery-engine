@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { appendProviderCallEvent } from '../../db';
-import { executeProviderCall, ProviderCallError } from '../../providerResilience';
+import { executeProviderCall, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { documentRef } from '../canonicalEvidencePlane';
@@ -27,18 +27,56 @@ export interface SemanticModelClient {
   classify(prompt: string, model: string): Promise<unknown>;
 }
 
-let sdk: GoogleGenAI | undefined;
+export interface GeminiRoute { id: string; key: string; }
+
+/** Return only ordered, non-empty route slots; credentials never leave this process. */
+export function configuredGeminiRoutes(env: NodeJS.ProcessEnv = process.env): GeminiRoute[] {
+  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name));
+  names.sort((a, b) => {
+    const routeNumber = (name: string) => name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
+    return routeNumber(a) - routeNumber(b);
+  });
+  const seen = new Set<string>();
+  return names.flatMap(name => {
+    const key = String(env[name] || '').trim();
+    if (!key || seen.has(key)) return [];
+    seen.add(key);
+    const numeric = name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
+    return [{ id: resolveGeminiRouteId(`gemini-${numeric}`), key }];
+  });
+}
+
+export async function runGeminiRouteFailover<T>(routes: GeminiRoute[], call: (route: GeminiRoute) => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (const route of routes) {
+    try {
+      return await call(route);
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
+    }
+  }
+  throw lastError || new ProviderCallError('No configured Gemini route is available.','TRANSIENT',true,{providerReasons:['GEMINI_ROUTE_POOL_EXHAUSTED']});
+}
+
+const sdkByRoute = new Map<string, GoogleGenAI>();
 function defaultClient(): SemanticModelClient | undefined {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) return undefined;
-  sdk ||= new GoogleGenAI({ apiKey: key });
+  const routes = configuredGeminiRoutes();
+  if (!routes.length) return undefined;
+  const sdkFor = (route: GeminiRoute) => {
+    const existing = sdkByRoute.get(route.id);
+    if (existing) return existing;
+    const created = new GoogleGenAI({ apiKey: route.key });
+    sdkByRoute.set(route.id, created);
+    return created;
+  };
   return { classify: async (prompt, model) => {
-    const response = await executeProviderCall({
-      context: { provider: 'gemini', operation: 'multilingual-semantic-classification' },
+    const response = await runGeminiRouteFailover(routes, route => executeProviderCall({
+      context: { provider: 'gemini', operation: 'multilingual-semantic-classification', requestMetadata: { geminiRoute: route.id } },
       timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
       enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent,
-      call: (signal) => sdk!.models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
-    });
+      call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
+    }));
     return JSON.parse(response.text || '{}');
   }};
 }

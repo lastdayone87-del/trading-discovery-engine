@@ -13,6 +13,7 @@ interface Props {
 interface ProviderMetricRow {
   provider: string;
   operation: string;
+  route?: string | null;
   calls: number;
   successes: number;
   timeouts: number;
@@ -161,6 +162,7 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
     const providerRows = providerMetrics?.providers || [];
     const officialRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube' && isOfficialEnrichmentOperation(row.operation));
     const displayedRows = officialRows;
+    const geminiRows = providerRows.filter(row => row.provider.toLowerCase() === 'gemini');
 
     const sum = (rows: ProviderMetricRow[], key: keyof ProviderMetricRow) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
     const officialCalls = sum(officialRows, 'calls');
@@ -199,7 +201,8 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
       averageOfficialUnits,
       trend,
       delta,
-      displayedRows
+      displayedRows,
+      geminiRows
     };
   }, [providerMetrics, metricsUpdatedAt]);
 
@@ -349,6 +352,16 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
                 <div className="text-[10px] text-slate-500">Official provider-call telemetry for enrichment operations.</div>
               </div>
             </div>
+
+            {enrichmentHealth.geminiRows.length > 0 && (
+              <div className="border-t border-slate-200 dark:border-slate-800 overflow-x-auto">
+                <div className="px-4 py-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">Gemini route capacity and usage — redacted route IDs only</div>
+                <table className="w-full text-[11px] min-w-[680px]">
+                  <thead className="bg-slate-50 dark:bg-slate-800/50 text-slate-500 uppercase tracking-wider"><tr><th className="text-left px-3 py-2">Route</th><th className="text-left px-3 py-2">Operation</th><th className="text-right px-3 py-2">Calls</th><th className="text-right px-3 py-2">Success</th><th className="text-right px-3 py-2">Errors</th><th className="text-right px-3 py-2">Reserved</th><th className="text-right px-3 py-2">Actual</th></tr></thead>
+                  <tbody>{enrichmentHealth.geminiRows.map(row => <tr key={`gemini:${row.route || 'legacy'}:${row.operation}`} className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 font-mono">{row.route || 'legacy'}</td><td className="px-3 py-2 font-mono">{row.operation}</td><td className="px-3 py-2 text-right font-mono">{row.calls}</td><td className="px-3 py-2 text-right font-mono">{row.successes}</td><td className="px-3 py-2 text-right font-mono">{Number(row.errors || 0) + Number(row.timeouts || 0)}</td><td className="px-3 py-2 text-right font-mono">{row.reserved_cost}</td><td className="px-3 py-2 text-right font-mono">{row.actual_cost}</td></tr>)}</tbody>
+                </table>
+              </div>
+            )}
 
             {enrichmentHealth.displayedRows.length > 0 && (
               <div className="border-t border-slate-200 dark:border-slate-800 overflow-x-auto">

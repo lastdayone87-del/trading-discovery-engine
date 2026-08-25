@@ -1,5 +1,5 @@
-import test from 'node:test'; import assert from 'node:assert/strict';
-import { executeProviderCall, classifyProviderError, ProviderCallError, decideGeminiCapacity, type ProviderCallEvent } from './providerResilience';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { readFileSync } from 'node:fs';
+import { executeProviderCall, classifyProviderError, ProviderCallError, decideGeminiCapacity, resolveGeminiRouteId, type ProviderCallEvent } from './providerResilience';
 
 test('successful calls emit bounded, payload-free cost telemetry',async()=>{const events:ProviderCallEvent[]=[];const result=await executeProviderCall({context:{provider:'fake',operation:'read',actualCost:3,requestId:'r',runId:'run-1',jobId:'job-1',requestMetadata:{regionCode:'FR',relevanceLanguage:'fr'},attempt:2},timeoutMs:50,call:async()=>({secret:'not logged'}),emit:async e=>{events.push(e)}});assert.equal(result.secret,'not logged');assert.equal(events[0].status,'SUCCESS');assert.equal(events[0].actualCost,3);assert.equal(events[0].requestId,'r');assert.equal(events[0].runId,'run-1');assert.equal(events[0].jobId,'job-1');assert.deepEqual(events[0].requestMetadata,{regionCode:'FR',relevanceLanguage:'fr'});assert.equal(events[0].attempt,2);assert.equal(JSON.stringify(events).includes('not logged'),false)});
 test('deadline aborts a fake provider and produces a retryable typed timeout',async()=>{const events:ProviderCallEvent[]=[];await assert.rejects(executeProviderCall({context:{provider:'fake',operation:'hang'},timeoutMs:10,call:signal=>new Promise((_r,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')))),emit:async e=>{events.push(e)}}),(e:any)=>e instanceof ProviderCallError&&e.errorClass==='TIMEOUT'&&e.retryable);assert.equal(events[0].status,'TIMEOUT')});
@@ -20,3 +20,18 @@ test('semantic calls may wait briefly for global spacing',()=>{const now=1_000_0
 test('vocabulary defers long capacity waits instead of occupying a worker',()=>{const now=1_000_000;const decision=decideGeminiCapacity('vocabulary-extraction',{nowMs:now,lastVocabularyAtMs:now-5_000},{globalMinIntervalMs:6_000,semanticRateLimitCooldownMs:90_000,vocabularyRateLimitSuppressionMs:900_000,vocabularySemanticQuietMs:120_000,vocabularyMinIntervalMs:30_000,maxInlineWaitMs:8_000});assert.equal(decision.action,'DEFER');assert.equal(decision.reasonCode,'VOCABULARY_DEFERRED_CAPACITY_WAIT')});
 
 test('semantic calls run once cooldown and global spacing are clear',()=>{const now=1_000_000;const decision=decideGeminiCapacity('multilingual-semantic-classification',{nowMs:now,lastRateLimitAtMs:now-100_000,lastGeminiAtMs:now-10_000},{globalMinIntervalMs:6_000,semanticRateLimitCooldownMs:90_000,vocabularyRateLimitSuppressionMs:900_000,vocabularySemanticQuietMs:120_000,vocabularyMinIntervalMs:30_000,maxInlineWaitMs:8_000});assert.equal(decision.action,'RUN');assert.equal(decision.waitMs,0)});
+
+
+test('Gemini route identifiers are normalized to machine-owned slots',()=>{
+  assert.equal(resolveGeminiRouteId(undefined),'gemini-1');
+  assert.equal(resolveGeminiRouteId('gemini-4'),'gemini-4');
+  assert.equal(resolveGeminiRouteId('GEMINI_API_KEY_4'),'gemini-1');
+  assert.equal(resolveGeminiRouteId('gemini-0'),'gemini-1');
+  assert.equal(resolveGeminiRouteId('gemini-4;DROP'),'gemini-1');
+});
+
+test('Gemini capacity queries are route-scoped while legacy events remain on route 1',()=>{
+  const source=readFileSync('server/providerResilience.ts','utf8');
+  assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$1\)=\$1/);
+  assert.match(source,/COALESCE\(request_metadata->>'geminiRoute',\$2\)=\$2/);
+});
