@@ -216,6 +216,11 @@ export async function reconcileLegacyCommunityRetryOwnership(
             THEN btrim(j.payload->>'retryLifecycleVersion')::numeric
           ELSE 0
         END < 2
+        AND (
+          j.status='PENDING'
+          OR (c.discord_status<>'NOT_FOUND' AND c.discord_validation_status<>'COMPLETED')
+        )
+        AND COALESCE(j.payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'
       ORDER BY j.created_at ASC
       LIMIT $1`,
     [Math.min(250, Math.max(1, limit))]
