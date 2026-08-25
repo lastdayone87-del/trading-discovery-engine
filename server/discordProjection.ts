@@ -99,6 +99,11 @@ export function reconcileDiscordDiscoveryFromInspection(
 
   if (!hasStructured && !trailFound) return;
 
+  // A completed negative is authoritative when the inspection found no
+  // structured Discord candidate. Text-only trail details must not reopen it
+  // as a validation retry; a genuine candidate remains handled below.
+  if (!hasStructured && trailFound && channel.discord_status === 'NOT_FOUND' && channel.discord_discovery_status === 'NOT_DISCOVERED' && !channel.discord_candidate_locator) return;
+
   const isPureAbsence =
     channel.discord_status === 'NOT_FOUND' ||
     channel.discord_discovery_status === 'NOT_DISCOVERED' ||
