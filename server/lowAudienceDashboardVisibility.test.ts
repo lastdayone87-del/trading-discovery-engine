@@ -55,7 +55,7 @@ test('diagnostics and explicit rejected-corpus requests remain opt-in views', ()
 
 test('Channels Table API and UI preserve the default exclusion and explicit filter contract', () => {
   const server = fs.readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
-  const db = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+  const db = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const table = fs.readFileSync(new URL('../src/components/ResultsTable.tsx', import.meta.url), 'utf8');
   assert.match(server, /scanStatus:req\.query\.scan_status as string\|undefined/);
   assert.match(db, /SELECT \$\{columns\} FROM channels WHERE \$\{where\} ORDER BY first_seen DESC,channel_id LIMIT/);

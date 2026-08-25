@@ -85,3 +85,29 @@ test('worker invokes operational enrichment recovery before claiming the next jo
   assert.match(source, /recoveryReasonCodes/);
   assert.match(source, /UPDATE jobs SET first_transient_failure_at=NULL WHERE id=\$1 AND status='PENDING'/);
 });
+
+
+test('provider-deferred enrichment remains governed and reactivates after cooldown',()=>{
+  const channel=base({scan_status:'PROVIDER_DEFERRED'});
+  const decision=shouldReactivateOperationalEnrichment(channel,Date.parse('2026-08-24T00:00:00.000Z'));
+  assert.equal(decision.reactivate,true);
+  const updated=reactivateOperationalEnrichment(channel as any,decision.reasonCodes,'2026-08-24T00:00:00.000Z');
+  assert.equal(updated.scan_status,'ENRICHMENT_PENDING');
+  assert.equal(updated.trading_status,'UNCERTAIN');
+});
+
+test('provider-deferred projection is bounded and preserves semantic exclusions',()=>{
+  const source=readFileSync(new URL('./operationalEnrichmentRecovery.ts',import.meta.url),'utf8');
+  assert.match(source,/projectProviderDeferredEnrichment/);
+  assert.match(source,/failed_job\.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'/);
+  assert.match(source,/c\.trading_status IS DISTINCT FROM 'NON_TRADING'/);
+  assert.match(source,/c\.discord_validation_status IS DISTINCT FROM 'COMPLETED'/);
+  assert.match(source,/LIMIT \$1/);
+});
+
+
+test('queue worker projects provider-owned enrichment failures distinctly from ordinary failures',()=>{
+  const source=readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
+  assert.match(source,/isProviderDeferredEnrichmentError\(err\) \? 'PROVIDER_DEFERRED' : 'FAILED'/);
+  assert.match(source,/await projectProviderDeferredEnrichment\(getDb, getChannelById, upsertChannel, 100\)/);
+});

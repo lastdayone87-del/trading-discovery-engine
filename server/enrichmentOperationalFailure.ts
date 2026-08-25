@@ -36,6 +36,12 @@ export class OperationalEnrichmentProviderError extends ProviderCallError {
   }
 }
 
+/** Only this machine-owned error identity may project PROVIDER_DEFERRED. */
+export function isProviderDeferredEnrichmentError(error: unknown): boolean {
+  return error instanceof OperationalEnrichmentProviderError
+    || String((error as { name?: unknown } | null)?.name || '') === 'OperationalEnrichmentProviderError';
+}
+
 /**
  * Runtime provider degradation is only blocking when the remaining evidence is
  * not sufficient to make a governed decision. The evidence engine deliberately

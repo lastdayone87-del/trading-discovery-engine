@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders } from './enrichmentOperationalFailure';
+import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { decideJobFailure } from './db';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
@@ -93,4 +93,13 @@ test('fully observed genuine ambiguity can still reach human review when provide
   assert.equal(enrichmentOperationalFailure(report(false),true,false),null);
   const eligibility=evaluateReviewEligibilityV2({classificationStatus:'UNCERTAIN',investigationState:'UNRESOLVED',plausibleTradingHypothesis:true,evidenceSufficient:true,independentEvidence:true,countryAllowed:true,operationalFailure:false,providerDegraded:false,unsupportedLanguage:false,terminalDecision:false});
   assert.deepEqual(resolveUncertainLifecycle(true,eligibility),{scanStatus:'NEEDS_REVIEW',tradingStatus:'NEEDS_REVIEW',shouldEnqueue:false});
+});
+
+
+test('only machine-owned operational provider errors project PROVIDER_DEFERRED',()=>{
+  const error=enrichmentOperationalFailure(report(true,['PROVIDER_RATE_LIMIT']),true,false);
+  assert.ok(error);
+  assert.equal(isProviderDeferredEnrichmentError(error),true);
+  assert.equal(isProviderDeferredEnrichmentError(new Error('ordinary pipeline failure')),false);
+  assert.equal(isProviderDeferredEnrichmentError({name:'ProviderCallError',errorClass:'RATE_LIMIT',retryable:true}),false);
 });
