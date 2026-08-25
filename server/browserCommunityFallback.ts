@@ -30,6 +30,10 @@ export interface BrowserFallbackTelemetry {
   hostBackoffsApplied: number;
 }
 
+export function browserFallbackTelemetrySummary(telemetry: BrowserFallbackTelemetry): string {
+  return `telemetry{started:${telemetry.requestsStarted},finished:${telemetry.requestsFinished},failed:${telemetry.requestsFailed},navigationTimeouts:${telemetry.navigationTimeouts},blocked:${telemetry.blockedRequests},rateLimited:${telemetry.rateLimitedRequests},transient:${telemetry.transientRequests},hostBackoffs:${telemetry.hostBackoffsApplied}}`;
+}
+
 export interface BrowserFallbackResult {
   foundInvite: string | null;
   foundLocation?: string;
@@ -261,14 +265,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           retryable:incomplete,
           telemetry,
           detail:candidates.length
-            ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl`
-            : timedOut?'Rendered acquisition budget expired before coverage completed':telemetry.requestsFailed>0?`Rendered acquisition incomplete: ${telemetry.requestsFailed} request(s) failed within the bounded crawl`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite`,
+            ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
+            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.requestsFailed>0?`Rendered acquisition incomplete: ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);
         const failureClass=isBrowserRuntimeFailure(error)?classifyBrowserFailure(error):undefined;
         if (failureClass) markBrowserCapabilityUnavailable(error);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
       }
     });
   } catch (error:any) {
@@ -276,7 +280,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
     const failureClass=saturated||!isBrowserRuntimeFailure(error)?undefined:classifyBrowserFailure(error);
     if (failureClass) markBrowserCapabilityUnavailable(error);
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:saturated?'Rendered acquisition deferred because the process-wide browser launch gate is saturated':`Rendered acquisition unavailable or failed: ${String(error?.message||error)}`};
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
   }
 }
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, browserFallbackTelemetrySummary, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback } from './browserCommunityFallback';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
 test('browser fallback remains bounded while allowing useful retries', () => {
@@ -122,6 +122,10 @@ test('escalates incomplete trading-creator websites', () => {
 
 test('can escalate a fully static no-match because Discord may be JS-hidden', () => {
   assert.equal(shouldEscalateToRenderedFallback({ staticOutcome: 'INSPECTED_NO_MATCH', creatorLikelyTrading: true, surface: 'CREATOR_WEBSITES' }), true);
+});
+
+test('crawler telemetry summary is sanitized and bounded for durable inspection detail', () => {
+  assert.equal(browserFallbackTelemetrySummary({requestsStarted:2,requestsFinished:1,requestsFailed:1,navigationTimeouts:1,blockedRequests:0,rateLimitedRequests:0,transientRequests:1,hostBackoffsApplied:1}), 'telemetry{started:2,finished:1,failed:1,navigationTimeouts:1,blocked:0,rateLimited:0,transient:1,hostBackoffs:1}');
 });
 
 test('crawler exposes bounded failure telemetry and keeps partial results retryable', () => {
