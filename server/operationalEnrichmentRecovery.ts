@@ -21,7 +21,7 @@ export function shouldReactivateOperationalEnrichment(
   channel: RecoveryChannel,
   now = Date.now()
 ): OperationalEnrichmentRecoveryDecision {
-  if (channel.scan_status !== 'FAILED' && channel.scan_status !== 'FAILED_PERMANENT') {
+  if (channel.scan_status !== 'FAILED' && channel.scan_status !== 'FAILED_PERMANENT' && channel.scan_status !== 'PROVIDER_DEFERRED') {
     return { reactivate: false, reasonCodes: ['SCAN_STATUS_NOT_RECOVERABLE_FAILURE'] };
   }
   if (
@@ -59,6 +59,49 @@ export function reactivateOperationalEnrichment(
 
 let lastOperationalEnrichmentReconciliationAt = 0;
 
+/** Project only machine-owned, provider-blocked terminal rows for truthful dashboard state. */
+export async function projectProviderDeferredEnrichment(
+  getDb: () => Promise<any>,
+  getChannelById: (id: string) => Promise<ChannelRecord | null>,
+  upsertChannel: (channel: ChannelRecord) => Promise<void>,
+  limit = 100
+): Promise<number> {
+  const db = await getDb();
+  const rows = await db.query(
+    `SELECT c.channel_id
+       FROM channels c
+      WHERE c.scan_status IN('FAILED','FAILED_PERMANENT')
+        AND c.trading_status IS DISTINCT FROM 'NON_TRADING'
+        AND c.trading_status IS DISTINCT FROM 'HUMAN_REJECTED'
+        AND c.discord_validation_status IS DISTINCT FROM 'COMPLETED'
+        AND c.country_status IS DISTINCT FROM 'REJECTED'
+        AND EXISTS (
+          SELECT 1 FROM jobs failed_job
+           WHERE failed_job.type='ENRICH_CHANNEL'
+             AND failed_job.status='FAILED'
+             AND failed_job.last_error ILIKE 'OPERATIONALLY_BLOCKED_RETRY_REQUIRED:%'
+             AND failed_job.payload->>'channelId'=c.channel_id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM jobs active_job
+           WHERE active_job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+             AND active_job.status IN('PENDING','PROCESSING')
+             AND active_job.payload->>'channelId'=c.channel_id
+        )
+      ORDER BY c.last_checked ASC NULLS FIRST
+      LIMIT $1`,
+    [Math.min(100, Math.max(1, limit))]
+  );
+  let projected = 0;
+  for (const row of rows.rows) {
+    const channel = await getChannelById(row.channel_id);
+    if (!channel || channel.scan_status === 'PROVIDER_DEFERRED') continue;
+    await upsertChannel({ ...channel, scan_status: 'PROVIDER_DEFERRED' });
+    projected++;
+  }
+  return projected;
+}
+
 export type EnqueueOperationalEnrichmentRecovery = (channel: ChannelRecord, reasonCodes: string[]) => Promise<void>;
 
 export async function reconcileOperationalEnrichmentRecovery(
@@ -75,7 +118,7 @@ export async function reconcileOperationalEnrichmentRecovery(
   const rows = await db.query(
     `SELECT c.channel_id
        FROM channels c
-      WHERE c.scan_status IN('FAILED','FAILED_PERMANENT')
+      WHERE c.scan_status IN('FAILED','FAILED_PERMANENT','PROVIDER_DEFERRED')
         AND c.trading_status IS DISTINCT FROM 'NON_TRADING'
         AND c.trading_status IS DISTINCT FROM 'HUMAN_REJECTED'
         AND c.discord_validation_status IS DISTINCT FROM 'COMPLETED'

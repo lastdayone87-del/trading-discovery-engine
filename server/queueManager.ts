@@ -57,7 +57,8 @@ import { createManualSearchSession, getManualSearchSession, recordManualSearchPa
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
-import { reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
+import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
+import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
@@ -156,6 +157,7 @@ export async function processNextSearchJob(
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
   await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), enqueueCommunityAcquisitionRetry);
+  await projectProviderDeferredEnrichment(getDb, getChannelById, upsertChannel, 100);
   await reconcileOperationalEnrichmentRecovery(getDb, getChannelById, upsertChannel, enqueueOperationalEnrichmentRecoveryJob, 20, Date.now());
   triggerPhaseBObservationReconciliation();
   const qStatus = await getQueueStatus();
@@ -603,7 +605,7 @@ export async function processNextSearchJob(
       const channelId = String(job.payload?.channelId || '');
       const channel = channelId ? await getChannelById(channelId) : null;
       if (channel && channel.trading_status === 'UNCERTAIN') {
-        channel.scan_status = 'FAILED';
+        channel.scan_status = isProviderDeferredEnrichmentError(err) ? 'PROVIDER_DEFERRED' : 'FAILED';
         channel.trading_status = 'UNCERTAIN';
         channel.scan_attempts = job.attempts;
         channel.last_checked = new Date().toISOString();

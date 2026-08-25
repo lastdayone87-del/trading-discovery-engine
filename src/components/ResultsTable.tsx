@@ -295,6 +295,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
               <option value="LOCKED">LOCKED</option>
               <option value="ENRICHMENT_PENDING">ENRICHMENT PENDING</option>
               <option value="ENRICHING">ENRICHING</option>
+              <option value="PROVIDER_DEFERRED">PROVIDER DEFERRED (Waiting for provider recovery)</option>
               <option value="NEEDS_REVIEW">NEEDS REVIEW</option>
               <option value="FAILED">FAILED</option>
               <option value="FAILED_PERMANENT">FAILED_PERMANENT</option>
@@ -531,12 +532,15 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                           ? 'text-amber-600 dark:text-amber-400 animate-pulse'
                           : c.scan_status === 'NEEDS_REVIEW'
                           ? 'text-violet-600 dark:text-violet-400 font-bold'
+                          : c.scan_status === 'PROVIDER_DEFERRED'
+                          ? 'text-amber-600 dark:text-amber-400 font-bold'
                           : c.scan_status === 'FAILED_PERMANENT'
                           ? 'text-rose-600 dark:text-rose-400 font-bold'
                           : 'text-slate-500'
                       }`}>
-                        {c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? automaticRetryActive ? automaticRetryDue ? 'RETRY DUE' : 'RETRY QUEUED' : automaticRetryTerminal ? automaticRetryBudgetExhausted ? 'RETRY BUDGET EXHAUSTED' : 'RETRY TERMINAL' : 'RECOVERY AVAILABLE' : c.scan_status}
+                        {c.discord_validation_status === 'RETRY_PENDING' && c.scan_status === 'FAILED' ? automaticRetryActive ? automaticRetryDue ? 'RETRY DUE' : 'RETRY QUEUED' : automaticRetryTerminal ? automaticRetryBudgetExhausted ? 'RETRY BUDGET EXHAUSTED' : 'RETRY TERMINAL' : 'RECOVERY AVAILABLE' : c.scan_status === 'PROVIDER_DEFERRED' ? 'PROVIDER DEFERRED' : c.scan_status}
                       </span>
+                      {c.scan_status === 'PROVIDER_DEFERRED' && <span className="block text-[10px] text-amber-600 mt-0.5">Operationally blocked · awaiting provider recovery</span>}
                       {c.scan_attempts > 0 && (
                         <span className="block text-[10px] text-slate-400 mt-0.5">
                           Scan attempts: {c.scan_attempts}
