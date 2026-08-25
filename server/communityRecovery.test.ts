@@ -197,6 +197,7 @@ test('legacy completed-negative retry is completed as audit history without stal
         if (sql.includes('SELECT j.id')) return {
           rows: [{
             id: 'retry-1',
+            status: 'PENDING',
             payload: { channelId: 'UC_test_1', retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
             channel_id: 'UC_test_1',
             created_at: '2026-08-25T10:00:00.000Z',
