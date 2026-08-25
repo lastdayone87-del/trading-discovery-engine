@@ -92,13 +92,8 @@ test('confirmed invalid remains explicit and is not absence', () => {
 test('inspector uses structured crawl retention and avoids post-FOUND NOT_FOUND bookkeeping', () => {
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   assert.match(source, /candidateFromNativeInvite/);
-  assert.match(source, /Structured crawl result is authoritative/);
-  assert.match(source, /websiteFound/);
-  assert.match(source, /socialFound/);
-  assert.match(source, /if\(!websiteFound\)/);
-  assert.match(source, /if\(!socialFound\)/);
-  assert.match(source, /foundInStep2/);
-  assert.match(source, /foundInStep3/);
+  assert.match(source, /isDiscordCommunityAcquisitionSurface/);
+  assert.match(source, /effectiveAcquisitionOutcomes/);
 });
 
 test('queueManager treats structured candidates as discovery truth independent of foundInvite alone', () => {
@@ -231,6 +226,26 @@ test('complete inspection with zero candidates still yields legitimate NOT_FOUND
   assert.equal(channel.discord_status, 'NOT_FOUND');
   assert.equal(channel.discord_discovery_status, 'NOT_DISCOVERED');
   assert.equal(channel.discord_candidate_locator, null);
+});
+
+test('completed NOT_FOUND is not reopened by text-only Discord trail evidence', () => {
+  const channel: any = {
+    discord_status: 'NOT_FOUND',
+    discord_discovery_status: 'NOT_DISCOVERED',
+    discord_candidate_locator: null,
+    discord_validation_status: 'COMPLETED',
+    discord_liveness_status: 'NOT_CHECKED',
+    discord_resolution_status: 'NOT_ATTEMPTED'
+  };
+  reconcileDiscordDiscoveryFromInspection(channel, {
+    foundInvite: null,
+    discordCandidates: [],
+    steps: [{ status: 'FOUND', details: 'Discord link was considered but no structured candidate was retained' }]
+  }, { validationProjected: false });
+  assert.equal(channel.discord_status, 'NOT_FOUND');
+  assert.equal(channel.discord_discovery_status, 'NOT_DISCOVERED');
+  assert.equal(channel.discord_validation_status, 'COMPLETED');
+  assert.equal(channel.discord_resolution_status, 'NOT_ATTEMPTED');
 });
 
 test('existing validated ACTIVE candidate is not downgraded by error-path reconcile', () => {
