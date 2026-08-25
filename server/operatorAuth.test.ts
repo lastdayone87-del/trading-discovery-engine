@@ -29,3 +29,9 @@ test('governed review reason catalog is authorized for authenticated operators',
  assert.equal(route.policy,'operator');
  assert.equal(route.action,'administration.read');
 });
+
+test('crawler reliability telemetry is an explicit operator-only read route',()=>{
+ const route=routePolicyInventory.find(x=>x.method==='GET'&&x.pattern==='^\\/api\\/diagnostics\\/crawler-reliability$');
+ assert.deepEqual(route?.policy,'operator');
+ assert.deepEqual(route?.action,'diagnostics.crawler-reliability.read');
+});
