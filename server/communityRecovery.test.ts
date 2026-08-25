@@ -209,6 +209,16 @@ test('reconciliation query revisits legacy jobs until their evidence window is r
   assert.match(source, /j\.payload->>'retryObservedAt' > j\.payload->>'reconciliationObservedAt'/);
 });
 
+test('reconciliation uses effective surface precedence so completed no-match coverage clears stale failure eligibility', () => {
+  const source = read('server/communityRecovery.ts');
+  assert.match(source, /SELECT DISTINCT ON \(o\.surface/);
+  assert.match(source, /rtrim\(COALESCE\(o\.requested_url/);
+  assert.match(source, /WHEN 'INSPECTED_NO_MATCH' THEN 2/);
+  assert.match(source, /WHEN 'PARTIALLY_INSPECTED' THEN 1/);
+  assert.match(source, /AND effective\.outcome='ACQUISITION_FAILED'/);
+  assert.doesNotMatch(source, /DELETE FROM external_acquisition_observations/);
+});
+
 test('current browser-runtime failure remains attributable and not stale', () => {
   const decision = evaluateCommunityRetryReconciliation({
     payload: { retryReason: 'BROWSER_RUNTIME_UNAVAILABLE' },
