@@ -10,6 +10,14 @@ export interface BrowserCapabilitySnapshot {
   checkedAt?: string;
   browserVersion?: string;
   failureClass?: BrowserFailureClass;
+  probeStartedAt?: string;
+  probeFinishedAt?: string;
+  probeDurationMs?: number;
+  consecutiveFailures: number;
+  lastSuccessAt?: string;
+  lastFailureAt?: string;
+  attestation: 'CHROMIUM_LAUNCH_CLOSE';
+  probeInFlight?: boolean;
 }
 
 export const BROWSER_RUNTIME_UNAVAILABLE = 'BROWSER_RUNTIME_UNAVAILABLE';
@@ -23,7 +31,12 @@ export function browserLaunchOptions(): { headless: true; args?: string[] } {
     : { headless: true };
 }
 
-let snapshot: BrowserCapabilitySnapshot = { status: 'UNKNOWN' };
+let snapshot: BrowserCapabilitySnapshot = {
+  status: 'UNKNOWN',
+  consecutiveFailures: 0,
+  attestation: 'CHROMIUM_LAUNCH_CLOSE'
+};
+let activeProbe: Promise<BrowserCapabilitySnapshot> | undefined;
 
 function errorText(error: unknown, seen = new Set<unknown>()): string {
   if (error && typeof error === 'object') {
@@ -56,7 +69,7 @@ export function classifyBrowserFailure(error: unknown): BrowserFailureClass {
 }
 
 export function browserCapabilitySnapshot(): BrowserCapabilitySnapshot {
-  return { ...snapshot };
+  return { ...snapshot, probeInFlight: Boolean(activeProbe) };
 }
 
 export function browserCapabilityIsUnavailable(): boolean {
@@ -64,32 +77,62 @@ export function browserCapabilityIsUnavailable(): boolean {
 }
 
 export function markBrowserCapabilityReady(browserVersion?: string): BrowserCapabilitySnapshot {
+  const now = new Date().toISOString();
   snapshot = {
+    ...snapshot,
     status: 'READY',
-    checkedAt: new Date().toISOString(),
+    checkedAt: now,
     browserVersion: browserVersion || undefined,
+    failureClass: undefined,
+    consecutiveFailures: 0,
+    lastSuccessAt: now,
+    attestation: 'CHROMIUM_LAUNCH_CLOSE'
   };
   return browserCapabilitySnapshot();
 }
 
 export function markBrowserCapabilityUnavailable(error: unknown): BrowserCapabilitySnapshot {
+  const now = new Date().toISOString();
   snapshot = {
+    ...snapshot,
     status: 'UNAVAILABLE',
-    checkedAt: new Date().toISOString(),
+    checkedAt: now,
     failureClass: classifyBrowserFailure(error),
+    consecutiveFailures: snapshot.consecutiveFailures + 1,
+    lastFailureAt: now,
+    attestation: 'CHROMIUM_LAUNCH_CLOSE'
   };
   return browserCapabilitySnapshot();
 }
 
 export async function probeBrowserCapability(): Promise<BrowserCapabilitySnapshot> {
+  if (activeProbe) {
+    await activeProbe;
+    return { ...browserCapabilitySnapshot(), probeInFlight: false };
+  }
+  const startedAt = Date.now();
+  const startedIso = new Date(startedAt).toISOString();
+  snapshot = { ...snapshot, probeStartedAt: startedIso, probeInFlight: true };
+  activeProbe = (async () => {
+    try {
+      const { chromium } = await import('playwright');
+      const browser = await chromium.launch(browserLaunchOptions());
+      const version = browser.version();
+      await browser.close();
+      const result = markBrowserCapabilityReady(version);
+      snapshot = { ...result, probeFinishedAt: new Date().toISOString(), probeDurationMs: Date.now() - startedAt };
+      return browserCapabilitySnapshot();
+    } catch (error) {
+      const result = markBrowserCapabilityUnavailable(error);
+      snapshot = { ...result, probeFinishedAt: new Date().toISOString(), probeDurationMs: Date.now() - startedAt };
+      return browserCapabilitySnapshot();
+    }
+  })();
   try {
-    const { chromium } = await import('playwright');
-    const browser = await chromium.launch(browserLaunchOptions());
-    const version = browser.version();
-    await browser.close();
-    return markBrowserCapabilityReady(version);
-  } catch (error) {
-    return markBrowserCapabilityUnavailable(error);
+    await activeProbe;
+    return { ...browserCapabilitySnapshot(), probeInFlight: false };
+  } finally {
+    activeProbe = undefined;
   }
 }
 
