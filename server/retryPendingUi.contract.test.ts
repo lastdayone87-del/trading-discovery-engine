@@ -25,10 +25,17 @@ test('recoverable Discord validation distinguishes queued, budget-exhausted, ter
   assert.match(dbCore,/community_retry_job_execution_count/);
   assert.match(dbCore,/community_retry_job_deferral_count/);
   assert.match(dbCore,/community_retry_job_last_execution_at/);
+  assert.match(dbCore,/community_retry_job_retry_reason/);
+  assert.match(dbCore,/community_retry_job_reconciliation_status/);
+  assert.match(dbCore,/payload->>'retryReason'/);
+  assert.match(dbCore,/payload->>'reconciliationCode'/);
   assert.match(dbCore,/a\.error LIKE '%Community acquisition deferred:%'/);
   assert.match(dbCore,/job_attempts/);
   assert.match(resultsTable,/Retry-window attempts/);
   assert.match(resultsTable,/Observed executions/);
   assert.match(resultsTable,/capacity deferrals/);
   assert.match(resultsTable,/RETRY DUE/);
+  assert.match(resultsTable,/reason: \$\{retryReasonLabel\}/);
+  assert.match(resultsTable,/RECONCILIATION REQUIRED/);
+  assert.match(resultsTable,/LEGACY UNCLASSIFIED/);
 });

@@ -56,7 +56,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { reconcileCommunityAcquisitionRecovery, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
+import { reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
@@ -77,7 +77,7 @@ import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
-import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { processPendingStagedCandidates } from './candidateStaging';
 
@@ -156,7 +156,8 @@ export async function processNextSearchJob(
   await recoverStaleJobs();
   await recoverStaleInvestigationSteps();
   await reconcileOrphanInvestigations();
-  await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), enqueueCommunityAcquisitionRetry);
+  await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, { attemptFree: true, code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, reason: retryReason || 'Recovery-triggered community retry', retryAt: undefined, retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' ? 'BROWSER_RUNTIME_UNAVAILABLE' : 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' }, 'RECOVERY'));
+  await reconcilePendingCommunityRetryJobs(getDb, 100);
   await projectProviderDeferredEnrichment(getDb, getChannelById, upsertChannel, 100);
   await reconcileOperationalEnrichmentRecovery(getDb, getChannelById, upsertChannel, enqueueOperationalEnrichmentRecoveryJob, 20, Date.now());
   triggerPhaseBObservationReconciliation();
@@ -186,7 +187,7 @@ export async function processNextSearchJob(
   if (claimableTypes.length === 0) return false;
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
-  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns);
+  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED']);
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
@@ -811,8 +812,8 @@ export async function inspectAndValidateChannel(
       channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:attemptFree?Math.max(0,channel.scan_attempts):nextChannelScanAttempts(channel.scan_attempts,false);
       channel.last_checked=now;
       reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:true});
-      if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
-      retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined}:undefined;
+      retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined,retryReason:'UPSTREAM_REQUIRED_ACQUISITION_FAILURE'}:undefined;
+      if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
@@ -834,7 +835,7 @@ export async function inspectAndValidateChannel(
       // append-only checks remain authoritative until a new validation replaces
       // this compatibility projection.
       channel.last_checked=now;
-      if(retryDirective?.attemptFree&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id);
+      if(retryDirective?.attemptFree&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
     } else {
       // Nothing Found After All Steps
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
@@ -856,13 +857,13 @@ export async function inspectAndValidateChannel(
     // processing throws. This must run before catch persistence and retry.
     reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
     attemptFree=isAttemptFreeCommunityFailure(err);
-    retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err)}:undefined;
+    retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err),retryReason:retryReasonFromError(err)}:undefined;
     if(!attemptFree)channel.scan_attempts++;
     // Durable RETRY_COMMUNITY_ACQUISITION owns the retry budget. Keep channel
     // state retryable here so an internal scan counter cannot prematurely stop
     // a job that still has durable attempts remaining.
     channel.scan_status = 'FAILED';
-    if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
+    if(scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective).catch(error=>console.warn(`[CommunityAcquisition] retry scheduling failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
   } finally {
     await upsertChannel(channel);
   }
@@ -870,8 +871,16 @@ export async function inspectAndValidateChannel(
 }
 
 export function communityAcquisitionRetryKey(channelId:string):string{return `community-acquisition-retry:${channelId}`;}
-async function enqueueCommunityAcquisitionRetry(channelId:string):Promise<void>{
-  await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5});
+async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION'):Promise<void>{
+  const metadata=buildCommunityRetryJobMetadata({
+    code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
+    retryReason:directive?.retryReason||'UPSTREAM_REQUIRED_ACQUISITION_FAILURE',
+    retrySource:source
+  });
+  const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined});
+  // Preserve a pending job's original ownership and retry window while merging
+  // the latest attributable reason into its durable payload.
+  await (await getDb()).query(`UPDATE jobs SET payload=payload || $2::jsonb,updated_at=now() WHERE id=$1 AND status IN('PENDING','PROCESSING')`,[job.id,JSON.stringify(metadata)]);
 }
 
 export function operationalEnrichmentRecoveryKey(channelId:string):string{return `operational-enrichment-recovery:${channelId}`;}
