@@ -125,7 +125,7 @@ test('can escalate a fully static no-match because Discord may be JS-hidden', ()
 });
 
 test('crawler telemetry summary is sanitized and bounded for durable inspection detail', () => {
-  assert.equal(browserFallbackTelemetrySummary({requestsStarted:2,requestsFinished:1,requestsFailed:1,navigationTimeouts:1,blockedRequests:0,rateLimitedRequests:0,transientRequests:1,hostBackoffsApplied:1}), 'telemetry{started:2,finished:1,failed:1,navigationTimeouts:1,blocked:0,rateLimited:0,transient:1,hostBackoffs:1}');
+  assert.equal(browserFallbackTelemetrySummary({requestsStarted:2,requestsFinished:1,requestsFailed:1,navigationTimeouts:1,blockedRequests:0,rateLimitedRequests:0,transientRequests:1,hostBackoffsApplied:1,clicksStarted:3,clicksSucceeded:2,clicksFailed:1,clickFailureClasses:{BLOCKED:0,RATE_LIMITED:0,TRANSIENT:1,OTHER:0}}), 'telemetry{started:2,finished:1,failed:1,navigationTimeouts:1,blocked:0,rateLimited:0,transient:1,hostBackoffs:1,clicksStarted:3,clicksSucceeded:2,clicksFailed:1,clickFailureClasses:{"BLOCKED":0,"RATE_LIMITED":0,"TRANSIENT":1,"OTHER":0}}');
 });
 
 test('crawler exposes bounded failure telemetry and keeps partial results retryable', () => {
@@ -134,6 +134,8 @@ test('crawler exposes bounded failure telemetry and keeps partial results retrya
   assert.match(source, /telemetry\.navigationTimeouts/);
   assert.match(source, /hostBackoffUntil/);
   assert.match(source, /isBrowserRuntimeFailure/);
+  assert.match(source, /clicksFailed/);
+  assert.match(source, /clickFailureClasses/);
   assert.match(source, /complete:!incomplete/);
 });
 

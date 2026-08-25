@@ -36,6 +36,15 @@ test('navigation timeouts remain page-level failures and do not demote browser c
   assert.equal(browserCapabilityIsUnavailable(), false);
 });
 
+test('browser capability attestation metadata is bounded and does not expose launch errors', () => {
+  const failed = markBrowserCapabilityUnavailable(new Error('private launch detail must not be persisted'));
+  assert.equal(failed.status, 'UNAVAILABLE');
+  assert.equal(failed.consecutiveFailures >= 1, true);
+  assert.equal(failed.failureClass, 'BROWSER_LAUNCH_FAILED');
+  assert.equal('message' in failed, false);
+  assert.equal(failed.attestation, 'CHROMIUM_LAUNCH_CLOSE');
+});
+
 test('browser capability health is recoverable and never changes semantic provider controls', () => {
   const unavailable = markBrowserCapabilityUnavailable(new Error("Executable doesn't exist"));
   assert.equal(unavailable.status, 'UNAVAILABLE');
@@ -46,5 +55,9 @@ test('browser capability health is recoverable and never changes semantic provid
   assert.equal(ready.browserVersion, 'Chromium 140.0.0');
   assert.equal(browserCapabilityIsUnavailable(), false);
   assert.equal(BROWSER_RUNTIME_UNAVAILABLE, 'BROWSER_RUNTIME_UNAVAILABLE');
-  assert.equal(browserCapabilitySnapshot().status, 'READY');
+  const snapshot = browserCapabilitySnapshot();
+  assert.equal(snapshot.status, 'READY');
+  assert.equal(snapshot.consecutiveFailures, 0);
+  assert.equal(snapshot.attestation, 'CHROMIUM_LAUNCH_CLOSE');
+  assert.equal(snapshot.lastSuccessAt !== undefined, true);
 });

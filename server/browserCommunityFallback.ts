@@ -7,6 +7,7 @@ import {
   renderedCrawlerHostBackoffMs,
   renderedCrawlerRetryPolicy,
   isRenderedNavigationTimeout,
+  type RenderedCrawlerFailureClass,
 } from './renderedCrawlerPolicy';
 
 export interface BrowserFallbackBudget {
@@ -28,10 +29,14 @@ export interface BrowserFallbackTelemetry {
   rateLimitedRequests: number;
   transientRequests: number;
   hostBackoffsApplied: number;
+  clicksStarted: number;
+  clicksSucceeded: number;
+  clicksFailed: number;
+  clickFailureClasses: Record<RenderedCrawlerFailureClass, number>;
 }
 
 export function browserFallbackTelemetrySummary(telemetry: BrowserFallbackTelemetry): string {
-  return `telemetry{started:${telemetry.requestsStarted},finished:${telemetry.requestsFinished},failed:${telemetry.requestsFailed},navigationTimeouts:${telemetry.navigationTimeouts},blocked:${telemetry.blockedRequests},rateLimited:${telemetry.rateLimitedRequests},transient:${telemetry.transientRequests},hostBackoffs:${telemetry.hostBackoffsApplied}}`;
+  return `telemetry{started:${telemetry.requestsStarted},finished:${telemetry.requestsFinished},failed:${telemetry.requestsFailed},navigationTimeouts:${telemetry.navigationTimeouts},blocked:${telemetry.blockedRequests},rateLimited:${telemetry.rateLimitedRequests},transient:${telemetry.transientRequests},hostBackoffs:${telemetry.hostBackoffsApplied},clicksStarted:${telemetry.clicksStarted},clicksSucceeded:${telemetry.clicksSucceeded},clicksFailed:${telemetry.clicksFailed},clickFailureClasses:${JSON.stringify(telemetry.clickFailureClasses)}}`;
 }
 
 export interface BrowserFallbackResult {
@@ -147,6 +152,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     rateLimitedRequests: 0,
     transientRequests: 0,
     hostBackoffsApplied: 0,
+    clicksStarted: 0,
+    clicksSucceeded: 0,
+    clicksFailed: 0,
+    clickFailureClasses: { BLOCKED: 0, RATE_LIMITED: 0, TRANSIENT: 0, OTHER: 0 },
   };
   const hostBackoffUntil = new Map<string, number>();
   const discovered:DiscordCandidate[]=[];
@@ -238,7 +247,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               const locator=page.locator('a,button,[role="button"]').nth(control.index);
               const href=await locator.getAttribute('href').catch(()=>null);
               retain(`${control.text} ${href||''}`,page.url());
-              try { await locator.click({timeout:2_000}); clicks++; await page.waitForTimeout(400); await inspect(); } catch { /* optional interaction */ }
+              telemetry.clicksStarted++;
+              try {
+                await locator.click({timeout:2_000});
+                clicks++;
+                telemetry.clicksSucceeded++;
+                await page.waitForTimeout(400);
+                await inspect();
+              } catch (error) {
+                telemetry.clicksFailed++;
+                const failureClass = classifyRenderedCrawlerFailure(error);
+                telemetry.clickFailureClasses[failureClass]++;
+              }
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
