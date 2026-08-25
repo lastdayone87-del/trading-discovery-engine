@@ -35,6 +35,12 @@ function errorText(error: unknown, seen = new Set<unknown>()): string {
   return String(error || '').toLowerCase();
 }
 
+export function isBrowserRuntimeFailure(error: unknown): boolean {
+  const text = errorText(error);
+  if (/page\.goto|navigation|timed? ?out|net::err|response status/.test(text)) return false;
+  return /executable doesn't exist|browser executable|cannot find chromium|no executable|shared library|libnss|libgbm|libatk|eacces|permission denied|sandbox.*(root|setuid|namespace)|browsertype\.launch|failed to launch browser|browser process exited/.test(text);
+}
+
 export function classifyBrowserFailure(error: unknown): BrowserFailureClass {
   const text = errorText(error);
   if (text.includes('executable doesn\'t exist') || text.includes('browser executable') || text.includes('cannot find chromium') || text.includes('no executable')) {

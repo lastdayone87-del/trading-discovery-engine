@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { DEFAULT_BROWSER_FALLBACK_BUDGET, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback } from './browserCommunityFallback';
-import { classifyRenderedCrawlerFailure, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
+import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
 test('browser fallback remains bounded while allowing useful retries', () => {
   assert.ok(DEFAULT_BROWSER_FALLBACK_BUDGET.maxPages <= 6);
@@ -43,6 +44,14 @@ test('rendered retry policy backs off harder for 429 rate limits', () => {
   assert.ok(second.delayMs <= 8_000);
 });
 
+test('navigation timeout is a transient request failure, not a browser-runtime failure', () => {
+  const error = new Error('Page.goto: Timeout 15000ms exceeded.');
+  assert.equal(isRenderedNavigationTimeout(error), true);
+  assert.equal(classifyRenderedCrawlerFailure(error), 'TRANSIENT');
+  assert.equal(renderedCrawlerHostBackoffMs('TRANSIENT', 0), 500);
+  assert.equal(renderedCrawlerHostBackoffMs('TRANSIENT', 8), 4_000);
+});
+
 test('rendered retry policy keeps transient network retries without forced session churn', () => {
   const policy = renderedCrawlerRetryPolicy(new Error('Navigation timed out after 15000 ms'), 1);
   assert.equal(policy.failureClass, 'TRANSIENT');
@@ -80,6 +89,13 @@ test('rendered browser launches are process-wide bounded', async () => {
   assert.deepEqual(gate.snapshot(), { active: 0, pending: 0, concurrency: 1, maxPending: 2 });
 });
 
+test('rendered host backoff remains bounded by failure class and retry count', () => {
+  assert.equal(renderedCrawlerHostBackoffMs('RATE_LIMITED', 0), 1_000);
+  assert.equal(renderedCrawlerHostBackoffMs('RATE_LIMITED', 10), 8_000);
+  assert.equal(renderedCrawlerHostBackoffMs('BLOCKED', 10), 4_000);
+  assert.equal(renderedCrawlerHostBackoffMs('OTHER', 10), 250);
+});
+
 test('rendered browser gate rejects unbounded pending launches', async () => {
   const gate = new RenderedFallbackGate(1, 1);
   let release!: () => void;
@@ -106,6 +122,15 @@ test('escalates incomplete trading-creator websites', () => {
 
 test('can escalate a fully static no-match because Discord may be JS-hidden', () => {
   assert.equal(shouldEscalateToRenderedFallback({ staticOutcome: 'INSPECTED_NO_MATCH', creatorLikelyTrading: true, surface: 'CREATOR_WEBSITES' }), true);
+});
+
+test('crawler exposes bounded failure telemetry and keeps partial results retryable', () => {
+  const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.match(source, /telemetry\.requestsFailed/);
+  assert.match(source, /telemetry\.navigationTimeouts/);
+  assert.match(source, /hostBackoffUntil/);
+  assert.match(source, /isBrowserRuntimeFailure/);
+  assert.match(source, /complete:!incomplete/);
 });
 
 test('browser acquisition failure remains retryable rather than proving NOT_FOUND', async () => {
