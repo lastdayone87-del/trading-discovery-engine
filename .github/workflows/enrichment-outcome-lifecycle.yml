@@ -12,6 +12,10 @@ on:
       - 'server/enrichmentBacklogEvidence.test.ts'
       - 'server/operationalEnrichmentRecovery.ts'
       - 'server/operationalEnrichmentRecovery.test.ts'
+      - 'server/communityRecovery.ts'
+      - 'server/communityRecovery.test.ts'
+      - 'server/communityRetryPolicy.ts'
+      - 'server/communityRetryPolicy.test.ts'
       - 'server/restoreOfficialEnrichmentFlow.test.ts'
       - 'server/db/migrations/088_restore_official_enrichment_flow.sql'
       - '.github/workflows/enrichment-outcome-lifecycle.yml'
@@ -28,7 +32,7 @@ jobs:
           cache: npm
       - run: npm install
       - name: Enrichment outcome lifecycle tests
-        run: node --import tsx --test server/enrichmentOutcomeLifecycle.test.ts server/enrichmentBacklogEvidence.test.ts server/operationalEnrichmentRecovery.test.ts server/restoreOfficialEnrichmentFlow.test.ts server/autonomousRootFirewall.test.ts server/queryEvidenceIndependence.test.ts
+        run: node --import tsx --test server/enrichmentOutcomeLifecycle.test.ts server/enrichmentBacklogEvidence.test.ts server/operationalEnrichmentRecovery.test.ts server/communityRecovery.test.ts server/communityRetryPolicy.test.ts server/restoreOfficialEnrichmentFlow.test.ts server/autonomousRootFirewall.test.ts server/queryEvidenceIndependence.test.ts
       - name: TypeScript validation
         run: npm run lint
       - name: Production build

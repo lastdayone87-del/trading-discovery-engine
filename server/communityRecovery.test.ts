@@ -202,6 +202,13 @@ test('pending stale retry is marked in durable payload without completion or del
   assert.doesNotMatch(queries.map(item => item.sql).join('\n'), /DELETE FROM jobs|status='COMPLETED'/);
 });
 
+test('reconciliation query revisits legacy jobs until their evidence window is recorded', () => {
+  const source = read('server/communityRecovery.ts');
+  assert.match(source, /COALESCE\(j\.payload->>'reconciliationObservedAt',''\)=''/);
+  assert.match(source, /COALESCE\(j\.payload->>'retryObservedAt',''\)=''/);
+  assert.match(source, /j\.payload->>'retryObservedAt' > j\.payload->>'reconciliationObservedAt'/);
+});
+
 test('current browser-runtime failure remains attributable and not stale', () => {
   const decision = evaluateCommunityRetryReconciliation({
     payload: { retryReason: 'BROWSER_RUNTIME_UNAVAILABLE' },
