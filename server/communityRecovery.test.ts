@@ -232,8 +232,9 @@ test('legacy selector treats missing or malformed lifecycle versions as legacy a
   assert.match(source, /CASE[\s\S]*btrim\(COALESCE\(j\.payload->>'retryLifecycleVersion',''\)\) ~ '\^\[0-9\]\+\$'/);
   assert.match(source, /THEN btrim\(j\.payload->>'retryLifecycleVersion'\)::numeric/);
   assert.match(source, /ELSE 0[\s\S]*END < 2/);
-  assert.match(source, /j\.status='PENDING'/);
-  assert.doesNotMatch(source, /j\.status IN\('PENDING','COMPLETED'\)/);
+  assert.match(source, /j\.status IN\('PENDING','COMPLETED'\)/);
+  assert.match(source, /c\.discord_status='NOT_FOUND' AND c\.discord_validation_status='RETRY_PENDING'/);
+  assert.match(source, /c\.discord_status='UNCERTAIN' AND c\.scan_status='FAILED' AND c\.discord_validation_status='NOT_STARTED'/);
   assert.match(source, /COALESCE\(j\.payload->>'retryReason',''\) <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'/);
   assert.match(source, /SET status='COMPLETED'/);
   assert.doesNotMatch(source, /reconciliationStatus: 'RECONCILIATION_REQUIRED'/);
