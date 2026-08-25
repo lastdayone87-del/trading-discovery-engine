@@ -51,6 +51,28 @@ export function creatorLevelCountryEvidence(channelData: {
  * attribution itself is confirmed. UNCERTAIN/LIKELY results remain unresolved:
  * a best-current detected country is not sufficient evidence for exclusion.
  */
+export function mergeCountryValidationResults(initial: ValidationResult, live: ValidationResult): ValidationResult {
+  const initialEvidence = initial.evidence || [];
+  const liveEvidence = live.evidence || [];
+  const initialPriority = initialEvidence.length ? Math.min(...initialEvidence.map(item => item.priority)) : Number.POSITIVE_INFINITY;
+  const livePriority = liveEvidence.length ? Math.min(...liveEvidence.map(item => item.priority)) : Number.POSITIVE_INFINITY;
+
+  // A later live fetch may add stronger official evidence, but it may not
+  // replace an earlier creator-level conflict/decision with weaker indirect
+  // evidence. Equal-priority competing evidence remains unresolved.
+  if (initial.status === 'UNCERTAIN' && live.status === 'REJECTED' && livePriority > initialPriority) return initial;
+  if (initial.status === 'UNCERTAIN' && livePriority >= initialPriority) return initial;
+  if (initial.status !== 'UNCERTAIN' && livePriority > initialPriority) return initial;
+  if (initial.status === 'UNCERTAIN' && livePriority === initialPriority && live.detectedCountry !== initial.detectedCountry) return {
+    ...initial,
+    status: 'UNCERTAIN',
+    score: Math.min(49, Math.max(initial.score, live.score)),
+    decisionLogs: `${initial.decisionLogs}\nLive revalidation preserved uncertainty because evidence remained conflicting at the same priority.`,
+    evidence: [...initialEvidence, ...liveEvidence]
+  };
+  return live;
+}
+
 export function applyTargetCountryBoundary(result: ValidationResult, targetCountryName: string): ValidationResult {
   const target = canonicalCountry(targetCountryName);
   const detected = result.detectedCountry ? canonicalCountry(result.detectedCountry) : null;

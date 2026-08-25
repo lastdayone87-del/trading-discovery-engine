@@ -200,10 +200,15 @@ export function inferChannelCountry(input: CountryInferenceInput, exclusions: Ex
   const conflict = ranked.length > 1 && ranked[1][1] === topConfidence;
   const confidence = conflict ? Math.min(49, topConfidence) : topConfidence;
   const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCountry));
+  const exclusionAuthority = decisiveEvidence.every(item => item.detectedCountry === detectedCountry) &&
+    decisivePriority <= 3 && topConfidence >= 85 && !conflict;
 
-  if (excluded) {
-    const policy: CountryInferenceEvidence = { source: 'EXCLUSION_POLICY', priority: 0, detectedCountry, confidence: 100, reasoning: `${detectedCountry} is excluded by policy: ${excluded.reason}.` };
-    return { detectedCountry, status: 'REJECTED', confidence: 100, reasoning: policy.reasoning, evidence: [policy, ...evidence], decisiveEvidence: [policy], rejectionReason: policy.reasoning };
+  // Policy is evaluated after evidence authority has been established. It may
+  // reject a strong, unambiguous country attribution, but it must never raise
+  // a weak score or resolve a conflict on the policy's behalf.
+  if (excluded && exclusionAuthority) {
+    const policy: CountryInferenceEvidence = { source: 'EXCLUSION_POLICY', priority: 0, detectedCountry, confidence: topConfidence, reasoning: `${detectedCountry} is excluded by policy: ${excluded.reason}.` };
+    return { detectedCountry, status: 'REJECTED', confidence: topConfidence, reasoning: policy.reasoning, evidence: [policy, ...evidence], decisiveEvidence, rejectionReason: policy.reasoning };
   }
 
   const status: CountryStatus = conflict ? 'UNCERTAIN' : confidence >= 85 ? 'CONFIRMED' : confidence >= 60 ? 'LIKELY' : 'UNCERTAIN';

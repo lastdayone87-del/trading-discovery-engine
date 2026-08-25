@@ -124,3 +124,31 @@ test('parent creator text is not counted as Discord-native relevance evidence',a
 test('inspection retains candidates across surfaces instead of early-stopping on the first locator',async()=>{const result=await runChannelInspection({channelId:'multi',channelBio:'https://discord.gg/stale',videoDescriptions:['https://discord.gg/active','2','3','4','5']});const codes=result.discordCandidates?.map(candidate=>candidate.nativeInviteCode)||[];assert.ok(codes.includes('stale'));assert.ok(codes.includes('active'));assert.ok(result.steps.filter(step=>step.status==='FOUND').length>=2);});
 
 test('alternative redirect resolution preserves raw locator and resolved native code',async()=>{const redirected=response(200,'<html></html>','text/html');Object.defineProperty(redirected,'url',{value:'https://discord.gg/native-room'});const result=await runChannelInspection({channelId:'alternative',channelBio:'',channelLinks:['https://dsc.gg/vanity-room'],videoDescriptions:['1','2','3','4','5'],externalFetchImpl:async()=>redirected});const candidate=result.discordCandidates?.[0];assert.equal(candidate?.locatorType,'ALTERNATIVE_REDIRECT');assert.equal(candidate?.rawLocator,'https://dsc.gg/vanity-room');assert.equal(candidate?.nativeInviteCode,'native-room');assert.equal(candidate?.extractionConfidence,'RESOLVED');});
+
+
+test('recent-video acquisition failure stays upstream-owned and does not create a community retry',async()=>{
+  const result=await runChannelInspection({
+    channelId:'recent-video-upstream-failure',
+    channelName:'Video Failure',
+    channelBio:'No Discord invite',
+    videoDescriptions:[],
+    recentVideoDescriptionsLoader:async()=>{throw new Error('recent video provider unavailable');}
+  });
+  assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');
+  assert.equal(result.retryDirective,undefined);
+  assert.ok(result.acquisitionOutcomes?.some(item=>item.surface==='RECENT_VIDEO_DESCRIPTIONS'&&item.outcome==='ACQUISITION_FAILED'&&item.required));
+});
+
+test('live country terminal projection preserves the already executed inspection trail',()=>{
+  const queue=readFileSync('server/queueManager.ts','utf8');
+  assert.match(queue,/const liveCountry = mergeCountryValidationResults\(valRes, rawLiveCountry\)/);
+  assert.match(queue,/channel\.inspection_trail=\[countryStep, \.\.\.inspection\.steps, liveCountryStep\]/);
+  assert.doesNotMatch(queue,/channel\.discord_invite=null;\s*channel\.discord_status='NOT_FOUND'/);
+});
+
+test('country terminal projection does not invent a Discord result before inspection',()=>{
+  const queue=readFileSync('server/queueManager.ts','utf8');
+  const initialReject=queue.slice(queue.indexOf("if (valRes.status === 'REJECTED')"),queue.indexOf('// Update country status & decision trail'));
+  assert.doesNotMatch(initialReject,/discord_status\s*=/);
+  assert.doesNotMatch(initialReject,/discord_validation_status\s*=/);
+});

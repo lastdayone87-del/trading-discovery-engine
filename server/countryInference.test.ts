@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applyTargetCountryBoundary } from './countryValidator';
+import { applyTargetCountryBoundary, mergeCountryValidationResults } from './countryValidator';
 import { CountryInferenceInput, inferChannelCountry } from './countryInference';
 
 const asValidationResult = (result: ReturnType<typeof inferChannelCountry>) => ({
@@ -91,7 +91,9 @@ test('a detected excluded country returns a policy-auditable rejection', () => {
   );
   assert.equal(result.status, 'REJECTED');
   assert.equal(result.detectedCountry, 'India');
-  assert.equal(result.decisiveEvidence[0].source, 'EXCLUSION_POLICY');
+  assert.equal(result.decisiveEvidence[0].source, 'OFFICIAL_YOUTUBE_METADATA');
+  assert.equal(result.confidence, 100);
+  assert.ok(result.evidence.some(item => item.source === 'EXCLUSION_POLICY'));
   assert.match(result.rejectionReason || '', /Configured regional exclusion/);
 });
 
@@ -102,7 +104,57 @@ test('excluded-country policy applies to inferred bio evidence, not only officia
   );
   assert.equal(result.detectedCountry, 'Nigeria');
   assert.equal(result.status, 'REJECTED');
-  assert.equal(result.decisiveEvidence[0].source, 'EXCLUSION_POLICY');
+  assert.equal(result.confidence, 92);
+  assert.equal(result.decisiveEvidence[0].source, 'CHANNEL_ABOUT_BIO');
+  assert.ok(result.evidence.some(item => item.source === 'EXCLUSION_POLICY'));
+});
+
+test('weak indirect excluded-country evidence remains non-terminal at its original confidence', () => {
+  const result = inferChannelCountry(
+    { aboutBio: 'Trading the Ho Chi Minh Stock Exchange', discoveryCountry: 'United Kingdom' },
+    [{ country_name: 'Vietnam', reason: 'Configured regional exclusion' }]
+  );
+  assert.equal(result.detectedCountry, 'Vietnam');
+  assert.equal(result.status, 'LIKELY');
+  assert.equal(result.confidence, 78);
+  assert.equal(result.decisiveEvidence[0].source, 'EXCHANGE_REFERENCE');
+  assert.equal(result.evidence.some(item => item.source === 'EXCLUSION_POLICY'), false);
+});
+
+test('conflicting strong excluded and included country evidence remains uncertain', () => {
+  const result = inferChannelCountry(
+    { aboutBio: 'United Kingdom Vietnam', discoveryCountry: 'United Kingdom' },
+    [{ country_name: 'Vietnam', reason: 'Configured regional exclusion' }]
+  );
+  assert.equal(result.status, 'UNCERTAIN');
+  assert.equal(result.confidence, 49);
+  assert.equal(result.evidence.some(item => item.source === 'EXCLUSION_POLICY'), false);
+});
+
+test('weaker live excluded evidence cannot override an earlier stronger conflict', () => {
+  const initial = {
+    score: 49,
+    status: 'UNCERTAIN' as const,
+    detectedCountry: 'United Kingdom',
+    decisionLogs: 'Initial P2 evidence conflicted.',
+    evidence: [
+      { source: 'CHANNEL_ABOUT_BIO' as const, priority: 2, detectedCountry: 'United Kingdom', confidence: 92, reasoning: 'UK' },
+      { source: 'CHANNEL_ABOUT_BIO' as const, priority: 2, detectedCountry: 'Vietnam', confidence: 92, reasoning: 'Vietnam' }
+    ]
+  };
+  const live = {
+    score: 78,
+    status: 'LIKELY' as const,
+    detectedCountry: 'Vietnam',
+    decisionLogs: 'Indirect exchange evidence identifies Vietnam.',
+    evidence: [
+      { source: 'EXCHANGE_REFERENCE' as const, priority: 5, detectedCountry: 'Vietnam', confidence: 78, reasoning: 'Indirect' }
+    ]
+  };
+  const merged = mergeCountryValidationResults(initial, live);
+  assert.equal(merged.status, 'UNCERTAIN');
+  assert.equal(merged.score, 49);
+  assert.equal(merged.detectedCountry, 'United Kingdom');
 });
 
 test('returns ordered, structured evidence for every available signal tier', () => {
@@ -178,4 +230,57 @@ test('target-country boundary preserves an existing policy rejection', () => {
   const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
   assert.equal(bounded.status, 'REJECTED');
   assert.match(bounded.rejectionReason || '', /Configured regional exclusion/);
+});
+
+
+test('weaker live indirect evidence cannot override an earlier confirmed creator country', () => {
+  const initial = {
+    score: 92,
+    status: 'CONFIRMED' as const,
+    detectedCountry: 'United Kingdom',
+    decisionLogs: 'Creator About evidence identifies the United Kingdom.',
+    evidence: [
+      { source: 'CHANNEL_ABOUT_BIO' as const, priority: 2, detectedCountry: 'United Kingdom', confidence: 92, reasoning: 'UK About' }
+    ]
+  };
+  const live = {
+    score: 78,
+    status: 'LIKELY' as const,
+    detectedCountry: 'Vietnam',
+    decisionLogs: 'Indirect exchange evidence identifies Vietnam.',
+    evidence: [
+      { source: 'EXCHANGE_REFERENCE' as const, priority: 5, detectedCountry: 'Vietnam', confidence: 78, reasoning: 'Indirect exchange' }
+    ]
+  };
+  const merged = mergeCountryValidationResults(initial, live);
+  assert.equal(merged.status, 'CONFIRMED');
+  assert.equal(merged.score, 92);
+  assert.equal(merged.detectedCountry, 'United Kingdom');
+});
+
+test('stronger live official excluded evidence can establish a legitimate terminal rejection', () => {
+  const initial = {
+    score: 49,
+    status: 'UNCERTAIN' as const,
+    detectedCountry: 'United Kingdom',
+    decisionLogs: 'Initial evidence conflicted.',
+    evidence: [
+      { source: 'CHANNEL_ABOUT_BIO' as const, priority: 2, detectedCountry: 'United Kingdom', confidence: 92, reasoning: 'UK' },
+      { source: 'CHANNEL_ABOUT_BIO' as const, priority: 2, detectedCountry: 'Vietnam', confidence: 92, reasoning: 'Vietnam' }
+    ]
+  };
+  const live = {
+    score: 100,
+    status: 'REJECTED' as const,
+    detectedCountry: 'Vietnam',
+    decisionLogs: 'Official excluded country.',
+    evidence: [
+      { source: 'EXCLUSION_POLICY' as const, priority: 0, detectedCountry: 'Vietnam', confidence: 100, reasoning: 'Excluded' },
+      { source: 'OFFICIAL_YOUTUBE_METADATA' as const, priority: 1, detectedCountry: 'Vietnam', confidence: 100, reasoning: 'Official' }
+    ]
+  };
+  const merged = mergeCountryValidationResults(initial, live);
+  assert.equal(merged.status, 'REJECTED');
+  assert.equal(merged.score, 100);
+  assert.equal(merged.detectedCountry, 'Vietnam');
 });

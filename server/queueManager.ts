@@ -37,8 +37,9 @@ import {
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
-import { validateChannelCountry } from './countryValidator';
+import { mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
+import { isCommunityRetryableObservation } from './communityRetryPolicy';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
@@ -746,15 +747,37 @@ export async function inspectAndValidateChannel(
 
     // Live About-page hydration can reveal stronger country evidence than the
     // search snippet. Re-evaluate before persisting any discovered community.
-    const liveCountry = await validateChannelCountry({channelName:channel.channel_name,
+    const rawLiveCountry = await validateChannelCountry({channelName:channel.channel_name,
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
       metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, channel.country);
+    const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
+    const liveCountryStep: InspectionStep = {
+      step: 'COUNTRY_VALIDATION',
+      title: `Country Validation (${rawLiveCountry.detectedCountry || channel.country}) — Live About`,
+      status: rawLiveCountry.status === 'REJECTED' && liveCountry.status === 'REJECTED' ? 'REJECTED' : 'FOUND',
+      details: `${rawLiveCountry.decisionLogs}${liveCountry !== rawLiveCountry ? '\\nEffective decision: earlier stronger/conflicting evidence preserved.' : ''}`,
+      timestamp: now
+    };
     if (liveCountry.status === 'REJECTED') {
       channel.country_status='REJECTED'; channel.country=liveCountry.detectedCountry || channel.country;
-      channel.confidence_score=liveCountry.score; channel.discord_invite=null; channel.discord_status='NOT_FOUND';
-      channel.scan_status='COMPLETED'; channel.last_checked=now;
-      channel.inspection_trail=[countryStep,{step:'COUNTRY_VALIDATION',title:`Country Validation (${channel.country}) — Live About`,status:'REJECTED',details:liveCountry.decisionLogs,timestamp:now}];
+      channel.confidence_score=liveCountry.score; channel.scan_status='COMPLETED'; channel.last_checked=now;
+      // The live country decision is terminal, but the inspection already ran.
+      // Preserve its real steps and only project NOT_FOUND when the inspection
+      // actually completed without a candidate or an acquisition failure.
+      const hasInspectionFailure = inspection.acquisitionStatus === 'ACQUISITION_FAILED' || inspection.acquisitionStatus === 'PARTIALLY_INSPECTED';
+      const hasCandidate = Boolean(inspection.foundInvite || inspection.discordCandidates?.some(candidate => candidate.nativeInviteCode));
+      if (!hasInspectionFailure && !hasCandidate) {
+        channel.discord_status='NOT_FOUND';
+        channel.discord_validation_status='COMPLETED';
+        channel.discord_resolution_status='NOT_ATTEMPTED';
+        channel.discord_liveness_status='NOT_CHECKED';
+        channel.discord_relevance_status='NOT_CHECKED';
+        channel.discord_discovery_status='NOT_DISCOVERED';
+      } else if (hasCandidate) {
+        reconcileDiscordDiscoveryFromInspection(channel, inspection, {validationProjected:false});
+      }
+      channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
       return;
     }
     if (liveCountry.detectedCountry) { channel.country=liveCountry.detectedCountry; channel.country_status=liveCountry.status; channel.confidence_score=liveCountry.score; }
@@ -821,7 +844,7 @@ export async function inspectAndValidateChannel(
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
       const requiredAcquisitionFailures=(inspection.acquisitionOutcomes||[]).filter(item=>item.required&&item.outcome==='ACQUISITION_FAILED');
-      const hasRetryableAcquisitionFailure=requiredAcquisitionFailures.some(item=>item.retryable);
+      const hasRetryableAcquisitionFailure=requiredAcquisitionFailures.some(item=>isCommunityRetryableObservation(item));
       if(!alreadyValidatedSuccess){
         channel.discord_status='UNCERTAIN';
         channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';
