@@ -25,7 +25,10 @@ export function createReadinessState(): {
       // The core search/manual/enrichment workers start immediately at HTTP
       // bind. Operational retry/rescan jobs require the migrated schema, so
       // start their dedicated consumer once database readiness is confirmed.
-      if (isServerRuntime()) startOperationalMaintenanceWorkers();
+      if (isServerRuntime()) {
+        startOperationalMaintenanceWorkers();
+        console.info('[Queue Worker] Operational maintenance consumers started after database readiness.');
+      }
     }
   };
 }
