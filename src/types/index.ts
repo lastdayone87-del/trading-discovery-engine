@@ -156,7 +156,7 @@ export interface ChannelRecord {
   community_retry_job_deferral_count?: number;
   community_retry_job_last_execution_at?: string | null;
   community_retry_job_last_execution_status?: string;
-  community_retry_job_retry_reason?: 'NO_SURFACE' | 'BROWSER_RUNTIME_UNAVAILABLE' | 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' | string;
+  community_retry_job_retry_reason?: 'NO_SURFACE' | 'BROWSER_RUNTIME_UNAVAILABLE' | 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' | 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' | string;
   community_retry_job_retry_code?: string;
   community_retry_job_reconciliation_status?: 'NONE' | 'RECONCILIATION_REQUIRED';
   community_retry_job_reconciliation_code?: 'STALE_RETRY' | string;

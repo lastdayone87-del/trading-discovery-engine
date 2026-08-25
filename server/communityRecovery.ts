@@ -16,7 +16,7 @@ export interface CommunityRetryReconciliationInput {
 }
 
 export interface CommunityRetryReconciliationDecision {
-  retryReason: 'NO_SURFACE' | 'BROWSER_RUNTIME_UNAVAILABLE' | 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE';
+  retryReason: 'NO_SURFACE' | 'BROWSER_RUNTIME_UNAVAILABLE' | 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' | 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE';
   reconciliationStatus: 'NONE' | 'RECONCILIATION_REQUIRED';
   reconciliationCode?: 'STALE_RETRY';
   reconciliationReason?: string;
@@ -56,6 +56,72 @@ export function evaluateCommunityRetryReconciliation(input: CommunityRetryReconc
       : 'Latest inspection has no required retryable acquisition failure in the current evidence window.',
     reconciliationObservedAt: input.observedAt,
     appendHistory: previousStatus !== 'RECONCILIATION_REQUIRED'
+  };
+}
+
+const COMMUNITY_RETRY_SURFACES = new Set([
+  'CHANNEL_LINKS', 'CHANNEL_EXTERNAL_LINKS', 'EXTERNAL_LINKS', 'LINKED_WEBSITES', 'CUSTOM_DOMAINS',
+  'SOCIAL_PROFILES', 'SOCIAL_BIO'
+]);
+
+export type LegacyCommunityRetryDisposition =
+  | 'ACTIVE_COMMUNITY_RETRY'
+  | 'UPSTREAM_RECLASSIFIED'
+  | 'COMPLETED_NEGATIVE'
+  | 'NO_SURFACE_STALE'
+  | 'BROWSER_RUNTIME_STALE';
+
+export interface LegacyCommunityRetryDispositionInput {
+  payload?: Record<string, unknown>;
+  inspectionTrail?: Array<{ step?: string; status?: string }>;
+  hasCurrentCommunityRetryableFailure: boolean;
+  hasCurrentUpstreamRetryableFailure: boolean;
+}
+
+export interface LegacyCommunityRetryDispositionResult {
+  disposition: LegacyCommunityRetryDisposition;
+  retryReason: 'NO_SURFACE' | 'BROWSER_RUNTIME_UNAVAILABLE' | 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' | 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE';
+  reconciliationReason?: string;
+}
+
+export function classifyLegacyCommunityRetryDisposition(input: LegacyCommunityRetryDispositionInput): LegacyCommunityRetryDispositionResult {
+  const payload = input.payload || {};
+  const trail = input.inspectionTrail || [];
+  if (input.hasCurrentCommunityRetryableFailure) {
+    return {
+      disposition: 'ACTIVE_COMMUNITY_RETRY',
+      retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'
+    };
+  }
+  if (input.hasCurrentUpstreamRetryableFailure) {
+    return {
+      disposition: 'UPSTREAM_RECLASSIFIED',
+      retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE',
+      reconciliationReason: 'Legacy community retry reclassified: the current retryable failure belongs to upstream YouTube/recent-video acquisition.'
+    };
+  }
+  const hasInspectedCommunitySurface = trail.some(step =>
+    COMMUNITY_RETRY_SURFACES.has(String(step.step || '')) &&
+    ['FOUND', 'NOT_FOUND', 'SKIPPED', 'COMPLETED'].includes(String(step.status || ''))
+  );
+  if (hasInspectedCommunitySurface) {
+    return {
+      disposition: 'COMPLETED_NEGATIVE',
+      retryReason: 'NO_SURFACE',
+      reconciliationReason: 'Latest inspection completed without a Discord/community match or current retryable acquisition failure.'
+    };
+  }
+  if (String(payload.retryReason || '') === 'BROWSER_RUNTIME_UNAVAILABLE') {
+    return {
+      disposition: 'BROWSER_RUNTIME_STALE',
+      retryReason: 'BROWSER_RUNTIME_UNAVAILABLE',
+      reconciliationReason: 'Legacy browser-runtime retry is preserved for audit but has no current community retryable failure.'
+    };
+  }
+  return {
+    disposition: 'NO_SURFACE_STALE',
+    retryReason: 'NO_SURFACE',
+    reconciliationReason: 'No current required community retryable acquisition failure was found.'
   };
 }
 
@@ -199,6 +265,7 @@ export async function reconcilePendingCommunityRetryJobs(getDb: () => Promise<an
                WHERE effective.required='true'
                  AND effective.outcome='ACQUISITION_FAILED'
                  AND effective.retryable=true
+                 AND effective.surface NOT IN('YOUTUBE_ABOUT','RECENT_VIDEO_DESCRIPTIONS')
             ) AS has_current_required_retryable_failure
        FROM jobs j
        JOIN channels c ON c.channel_id=j.payload->>'channelId'
@@ -243,6 +310,115 @@ export async function reconcilePendingCommunityRetryJobs(getDb: () => Promise<an
     updated++;
   }
   return updated;
+}
+
+export async function reconcileLegacyCommunityRetryOwnership(
+  getDb: () => Promise<any>,
+  limit = 250,
+  now = new Date().toISOString()
+): Promise<{ examined: number; reclassifiedUpstream: number; completedNegative: number; staleMarked: number; activeCommunity: number }> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT j.id,j.payload,c.channel_id,c.scan_status,c.discord_status,c.discord_validation_status,c.inspection_trail,
+            EXISTS(
+              SELECT 1 FROM (
+                SELECT DISTINCT ON (o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')))
+                       o.surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                  FROM external_acquisition_observations o
+                 WHERE o.channel_id=c.channel_id
+                   AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
+                   AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
+                 ORDER BY o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')),
+                          CASE o.outcome WHEN 'FOUND' THEN 3 WHEN 'INSPECTED_NO_MATCH' THEN 2 WHEN 'PARTIALLY_INSPECTED' THEN 1 ELSE 0 END DESC,
+                          o.observed_at DESC
+              ) effective
+             WHERE effective.required='true'
+               AND effective.outcome='ACQUISITION_FAILED'
+               AND effective.retryable=true
+               AND effective.surface IN('CHANNEL_LINKS','EXTERNAL_LINKS','LINKED_WEBSITES','CUSTOM_DOMAINS','SOCIAL_PROFILES','SOCIAL_BIO')
+            ) AS has_current_community_retryable_failure,
+            EXISTS(
+              SELECT 1 FROM (
+                SELECT DISTINCT ON (o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')))
+                       o.surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                  FROM external_acquisition_observations o
+                 WHERE o.channel_id=c.channel_id
+                   AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
+                   AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
+                 ORDER BY o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')),
+                          CASE o.outcome WHEN 'FOUND' THEN 3 WHEN 'INSPECTED_NO_MATCH' THEN 2 WHEN 'PARTIALLY_INSPECTED' THEN 1 ELSE 0 END DESC,
+                          o.observed_at DESC
+              ) effective
+             WHERE effective.required='true'
+               AND effective.outcome='ACQUISITION_FAILED'
+               AND effective.retryable=true
+               AND effective.surface IN('YOUTUBE_ABOUT','RECENT_VIDEO_DESCRIPTIONS')
+            ) AS has_current_upstream_retryable_failure
+       FROM jobs j
+       JOIN channels c ON c.channel_id=j.payload->>'channelId'
+      WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
+        AND j.status='PENDING'
+        AND COALESCE(j.payload->>'reconciliationStatus','NONE') <> 'RECONCILIATION_REQUIRED'
+        AND COALESCE(j.payload->>'retrySource','LEGACY')='LEGACY'
+        AND (
+          j.payload->>'retryReason' IS NULL
+          OR j.payload->>'retryReason' IN('NO_SURFACE','BROWSER_RUNTIME_UNAVAILABLE','UPSTREAM_REQUIRED_ACQUISITION_FAILURE')
+        )
+      ORDER BY j.created_at ASC
+      LIMIT $1`,
+    [Math.min(250, Math.max(1, limit))]
+  );
+  const summary = { examined: result.rows?.length || 0, reclassifiedUpstream: 0, completedNegative: 0, staleMarked: 0, activeCommunity: 0 };
+  for (const row of result.rows || []) {
+    const payload = typeof row.payload === 'string' ? JSON.parse(row.payload || '{}') : (row.payload || {});
+    const trail = typeof row.inspection_trail === 'string' ? JSON.parse(row.inspection_trail || '[]') : (row.inspection_trail || []);
+    const decision = classifyLegacyCommunityRetryDisposition({
+      payload,
+      inspectionTrail: trail,
+      hasCurrentCommunityRetryableFailure: row.has_current_community_retryable_failure === true,
+      hasCurrentUpstreamRetryableFailure: row.has_current_upstream_retryable_failure === true
+    });
+    const history = Array.isArray(payload.reconciliationHistory) ? payload.reconciliationHistory : [];
+    const nextPayload: Record<string, unknown> = {
+      ...payload,
+      retryReason: decision.retryReason,
+      retrySource: payload.retrySource || 'LEGACY',
+      reconciliationStatus: decision.disposition === 'ACTIVE_COMMUNITY_RETRY' ? 'NONE' : 'RECONCILIATION_REQUIRED',
+      reconciliationCode: decision.disposition === 'ACTIVE_COMMUNITY_RETRY' ? null : 'STALE_RETRY',
+      reconciliationReason: decision.reconciliationReason || null,
+      reconciliationObservedAt: decision.disposition === 'ACTIVE_COMMUNITY_RETRY' ? null : now,
+      reconciliationHistory: decision.disposition === 'ACTIVE_COMMUNITY_RETRY'
+        ? history
+        : [...history, { status: 'RECONCILIATION_REQUIRED', reason: decision.reconciliationReason || 'Legacy retry ownership reconciled.', observedAt: now }]
+    };
+    await db.query(`UPDATE jobs SET payload=$2::jsonb,updated_at=now() WHERE id=$1 AND status='PENDING'`, [row.id, JSON.stringify(nextPayload)]);
+    if (decision.disposition === 'ACTIVE_COMMUNITY_RETRY') {
+      summary.activeCommunity++;
+      continue;
+    }
+    summary.staleMarked++;
+    if (decision.disposition === 'UPSTREAM_RECLASSIFIED') summary.reclassifiedUpstream++;
+    if (decision.disposition === 'COMPLETED_NEGATIVE') {
+      await db.query(
+        `UPDATE channels
+            SET scan_status='COMPLETED',discord_status='NOT_FOUND',discord_validation_status='COMPLETED',updated_at=now()
+          WHERE channel_id=$1
+            AND scan_status='FAILED'
+            AND discord_validation_status='RETRY_PENDING'`,
+        [row.channel_id]
+      );
+      summary.completedNegative++;
+    } else if (decision.disposition === 'UPSTREAM_RECLASSIFIED' || decision.disposition === 'BROWSER_RUNTIME_STALE') {
+      await db.query(
+        `UPDATE channels
+            SET discord_status='UNCERTAIN',discord_validation_status='NOT_STARTED',updated_at=now()
+          WHERE channel_id=$1
+            AND discord_validation_status='RETRY_PENDING'`,
+        [row.channel_id]
+      );
+    }
+  }
+  return summary;
 }
 
 export async function reconcileCommunityAcquisitionRecovery(
