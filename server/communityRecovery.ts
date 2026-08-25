@@ -359,11 +359,7 @@ export async function reconcileLegacyCommunityRetryOwnership(
       WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
         AND j.status='PENDING'
         AND COALESCE(j.payload->>'reconciliationStatus','NONE') <> 'RECONCILIATION_REQUIRED'
-        AND COALESCE(j.payload->>'retrySource','LEGACY')='LEGACY'
-        AND (
-          j.payload->>'retryReason' IS NULL
-          OR j.payload->>'retryReason' IN('NO_SURFACE','BROWSER_RUNTIME_UNAVAILABLE','UPSTREAM_REQUIRED_ACQUISITION_FAILURE')
-        )
+        AND COALESCE((j.payload->>'retryLifecycleVersion')::int,0) < 2
       ORDER BY j.created_at ASC
       LIMIT $1`,
     [Math.min(250, Math.max(1, limit))]
