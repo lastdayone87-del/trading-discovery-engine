@@ -172,7 +172,7 @@ export async function reconcileLegacyCommunityRetryOwnership(
 ): Promise<{ examined: number; completedNegative: number; closedNonCommunity: number; activeCommunity: number }> {
   const db = await getDb();
   const result = await db.query(
-    `SELECT j.id,j.payload,c.channel_id,c.scan_status,c.discord_status,c.discord_validation_status,c.inspection_trail,
+    `SELECT j.id,j.status,j.payload,c.channel_id,c.scan_status,c.discord_status,c.discord_validation_status,c.inspection_trail,
             EXISTS(
               SELECT 1 FROM (
                 SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
@@ -210,7 +210,7 @@ export async function reconcileLegacyCommunityRetryOwnership(
        FROM jobs j
        JOIN channels c ON c.channel_id=j.payload->>'channelId'
       WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
-        AND j.status='PENDING'
+        AND j.status IN('PENDING','COMPLETED')
         AND CASE
           WHEN btrim(COALESCE(j.payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$'
             THEN btrim(j.payload->>'retryLifecycleVersion')::numeric
@@ -242,22 +242,26 @@ export async function reconcileLegacyCommunityRetryOwnership(
       reconciliationObservedAt: null
     };
     if (decision.disposition === 'ACTIVE_COMMUNITY_RETRY') {
-      await db.query(`UPDATE jobs SET payload=$2::jsonb,updated_at=now() WHERE id=$1 AND status='PENDING'`, [row.id, JSON.stringify(nextPayload)]);
+      if (row.status === 'PENDING') {
+        await db.query(`UPDATE jobs SET payload=$2::jsonb,updated_at=now() WHERE id=$1 AND status='PENDING'`, [row.id, JSON.stringify(nextPayload)]);
+      }
       summary.activeCommunity++;
       continue;
     }
-    await db.query(
-      `UPDATE jobs
-          SET status='COMPLETED',completed_at=COALESCE(completed_at,now()),locked_by=NULL,locked_at=NULL,payload=$2::jsonb,updated_at=now()
-        WHERE id=$1 AND status='PENDING'`,
-      [row.id, JSON.stringify(nextPayload)]
-    );
-    await db.query(
-      `UPDATE job_attempts
-          SET status='COMPLETED',finished_at=COALESCE(finished_at,now())
-        WHERE job_id=$1 AND finished_at IS NULL`,
-      [row.id]
-    );
+    if (row.status === 'PENDING') {
+      await db.query(
+        `UPDATE jobs
+            SET status='COMPLETED',completed_at=COALESCE(completed_at,now()),locked_by=NULL,locked_at=NULL,payload=$2::jsonb,updated_at=now()
+          WHERE id=$1 AND status='PENDING'`,
+        [row.id, JSON.stringify(nextPayload)]
+      );
+      await db.query(
+        `UPDATE job_attempts
+            SET status='COMPLETED',finished_at=COALESCE(finished_at,now())
+          WHERE job_id=$1 AND finished_at IS NULL`,
+        [row.id]
+      );
+    }
     summary.closedNonCommunity++;
     if (decision.disposition === 'COMPLETED_NEGATIVE') {
       await db.query(
