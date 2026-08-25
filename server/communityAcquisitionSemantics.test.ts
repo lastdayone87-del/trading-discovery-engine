@@ -5,6 +5,8 @@ import {crawlExternalLinks,runChannelInspection} from './inspector';
 import {communityAcquisitionRetryKey} from './queueManager';
 import {ProviderCallError} from './providerResilience';
 import {readFileSync} from 'node:fs';
+import {effectiveAcquisitionOutcomes} from './communitySurfacePolicy';
+import {communityAcquisitionRetryDirective} from './communityRetryPolicy';
 
 const noEvent=async()=>undefined;
 const response=(status:number,body='{}',contentType='application/json')=>new Response(body,{status,headers:{'content-type':contentType}});
@@ -40,6 +42,19 @@ test('malformed Discord success payload remains retryable uncertainty',async()=>
 
 test('ambiguous successful Discord lookup remains semantic uncertainty after a completed provider call',async()=>{const result=await validateDiscordInvite('community',{maxAttempts:1,emitProviderEvent:noEvent,fetchImpl:async()=>response(200,JSON.stringify({code:'community',guild:{name:'Community'}}))});assert.equal(result.status,'UNCERTAIN');assert.equal(result.operationalOutcome,'SUCCEEDED');assert.equal(result.retryable,false);});
 test('successful trading Discord validation retains active semantics',async()=>{const result=await validateDiscordInvite('futures-room',{maxAttempts:1,emitProviderEvent:noEvent,fetchImpl:async()=>response(200,JSON.stringify({code:'futures-room',approximate_member_count:100,guild:{name:'Futures Trading Room'}}))});assert.equal(result.status,'ACTIVE');assert.equal(result.operationalOutcome,'SUCCEEDED');assert.equal(result.inviteUrl,'https://discord.gg/futures-room');});
+test('later successful no-match supersedes an earlier raw acquisition failure for retry eligibility',()=>{
+  const observations=[
+    {requestedUrl:'youtube-api:channel:effective:recent-video-descriptions',surface:'RECENT_VIDEO_DESCRIPTIONS' as const,required:true,outcome:'ACQUISITION_FAILED' as const,retryable:true,detail:'temporary failure',observedAt:'2026-08-25T10:00:00.000Z'},
+    {requestedUrl:'youtube-api:channel:effective:recent-video-descriptions',surface:'RECENT_VIDEO_DESCRIPTIONS' as const,required:true,outcome:'INSPECTED_NO_MATCH' as const,retryable:false,detail:'acquired and inspected without invite',observedAt:'2026-08-25T10:01:00.000Z'}
+  ];
+  const effective=effectiveAcquisitionOutcomes(observations);
+  assert.equal(effective.length,1);
+  assert.equal(effective[0].outcome,'INSPECTED_NO_MATCH');
+  assert.equal(communityAcquisitionRetryDirective(effective),undefined);
+  const inspector=readFileSync('server/inspector.ts','utf8');
+  assert.match(inspector,/retryDirective:communityAcquisitionRetryDirective\(required\)/);
+});
+
 test('failed YouTube About acquisition is retryable rather than NOT_FOUND',async()=>{const result=await runChannelInspection({channelId:'c1',channelBio:'',youtubeUrl:'https://youtube.test/c1',forceLiveFetch:true,videoDescriptions:['one','two','three','four','five'],liveChannelDataLoader:async()=>null});assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');assert.equal(result.acquisitionOutcomes?.[0].failureClass,'YOUTUBE_ABOUT_ACQUISITION_FAILED');});
 test('community retry identity is stable and channel-scoped',()=>{assert.equal(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-1'));assert.notEqual(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-2'));});
 
