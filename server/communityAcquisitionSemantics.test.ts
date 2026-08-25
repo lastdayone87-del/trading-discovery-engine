@@ -55,6 +55,14 @@ test('later successful no-match supersedes an earlier raw acquisition failure fo
   assert.match(inspector,/retryDirective:communityAcquisitionRetryDirective\(required\)/);
 });
 
+test('fully inspected no-invite acquisition is completed negative and emits no retry',async()=>{
+  const result=await runChannelInspection({channelId:'completed-negative',channelName:'No Match Channel',channelBio:'No community invite here',channelLinks:['https://example.test/no-community'],videoDescriptions:['one','two','three','four','five'],externalFetchImpl:async()=>response(200,'<html><body>No Discord invite</body></html>','text/html')});
+  assert.equal(result.foundInvite,null);
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective,undefined);
+  assert.ok(result.steps.some(step=>step.step==='EXTERNAL_LINKS'&&step.status==='NOT_FOUND'));
+});
+
 test('failed YouTube About acquisition is retryable rather than NOT_FOUND',async()=>{const result=await runChannelInspection({channelId:'c1',channelBio:'',youtubeUrl:'https://youtube.test/c1',forceLiveFetch:true,videoDescriptions:['one','two','three','four','five'],liveChannelDataLoader:async()=>null});assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');assert.equal(result.acquisitionOutcomes?.[0].failureClass,'YOUTUBE_ABOUT_ACQUISITION_FAILED');});
 test('community retry identity is stable and channel-scoped',()=>{assert.equal(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-1'));assert.notEqual(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-2'));});
 

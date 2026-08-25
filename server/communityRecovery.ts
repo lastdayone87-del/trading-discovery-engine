@@ -178,13 +178,27 @@ export async function reconcilePendingCommunityRetryJobs(getDb: () => Promise<an
   const result = await db.query(
     `SELECT j.id,j.payload,j.created_at,c.last_checked,c.inspection_trail,
             EXISTS(
-              SELECT 1 FROM external_acquisition_observations o
-               WHERE o.channel_id=c.channel_id
-                 AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
-                 AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
-                 AND o.outcome='ACQUISITION_FAILED'
-                 AND o.retryable=true
-                 AND COALESCE(o.provenance->>'required','false')='true'
+              SELECT 1
+                FROM (
+                  SELECT DISTINCT ON (o.surface, lower(rtrim(COALESCE(o.requested_url,''),'/')))
+                         o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                    FROM external_acquisition_observations o
+                   WHERE o.channel_id=c.channel_id
+                     AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
+                     AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
+                   ORDER BY o.surface,
+                            lower(rtrim(COALESCE(o.requested_url,''),'/')),
+                            CASE o.outcome
+                              WHEN 'FOUND' THEN 3
+                              WHEN 'INSPECTED_NO_MATCH' THEN 2
+                              WHEN 'PARTIALLY_INSPECTED' THEN 1
+                              ELSE 0
+                            END DESC,
+                            o.observed_at DESC
+                ) effective
+               WHERE effective.required='true'
+                 AND effective.outcome='ACQUISITION_FAILED'
+                 AND effective.retryable=true
             ) AS has_current_required_retryable_failure
        FROM jobs j
        JOIN channels c ON c.channel_id=j.payload->>'channelId'
