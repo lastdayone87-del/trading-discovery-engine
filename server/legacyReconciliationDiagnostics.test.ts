@@ -19,6 +19,8 @@ test('legacy reconciliation diagnostic is protected, read-only, and aggregate-on
   assert.match(diagnostic, /CASE\s+WHEN NULLIF\(btrim\(j\.payload->>'retryLifecycleVersion'/);
   assert.match(diagnostic, /WHEN btrim\(j\.payload->>'retryLifecycleVersion'\) ~ '\^\[0-9\]\+\$'/);
   assert.doesNotMatch(diagnostic, /\(j\.payload->>'retryLifecycleVersion'\)::int/);
+  assert.doesNotMatch(diagnostic, /o\.surface/);
+  assert.match(diagnostic, /o\.provenance->>'surface' AS surface/);
   assert.match(diagnostic, /WHEN 'INSPECTION' THEN 'INSPECTION'/);
   assert.match(diagnostic, /WHEN 'RECOVERY' THEN 'RECOVERY'/);
   assert.match(diagnostic, /WHEN 'LEGACY' THEN 'LEGACY'/);

@@ -424,13 +424,13 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
              END AS error_class,
              EXISTS(
                SELECT 1 FROM (
-                 SELECT DISTINCT ON (o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                        o.surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                 SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
+                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
                    FROM external_acquisition_observations o
                   WHERE o.channel_id=j.payload->>'channelId'
                     AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
                     AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
-                  ORDER BY o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')),
+                  ORDER BY o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')),
                            CASE o.outcome WHEN 'FOUND' THEN 3 WHEN 'INSPECTED_NO_MATCH' THEN 2 WHEN 'PARTIALLY_INSPECTED' THEN 1 ELSE 0 END DESC,
                            o.observed_at DESC
                ) effective
@@ -439,13 +439,13 @@ export async function getLegacyCommunityRetryDiagnostics(legacyBefore='2026-08-2
              ) AS has_community_failure,
              EXISTS(
                SELECT 1 FROM (
-                 SELECT DISTINCT ON (o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')))
-                        o.surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
+                 SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
+                        o.provenance->>'surface' AS surface,o.outcome,o.retryable,COALESCE(o.provenance->>'required','false') AS required
                    FROM external_acquisition_observations o
                   WHERE o.channel_id=j.payload->>'channelId'
                     AND o.observed_at >= COALESCE(c.last_checked,now()) - interval '5 minutes'
                     AND o.observed_at <= COALESCE(c.last_checked,now()) + interval '5 minutes'
-                  ORDER BY o.surface,lower(rtrim(COALESCE(o.requested_url,''),'/')),
+                  ORDER BY o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')),
                            CASE o.outcome WHEN 'FOUND' THEN 3 WHEN 'INSPECTED_NO_MATCH' THEN 2 WHEN 'PARTIALLY_INSPECTED' THEN 1 ELSE 0 END DESC,
                            o.observed_at DESC
                ) effective
