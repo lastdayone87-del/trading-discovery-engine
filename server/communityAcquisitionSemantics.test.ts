@@ -52,7 +52,8 @@ test('later successful no-match supersedes an earlier raw acquisition failure fo
   assert.equal(effective[0].outcome,'INSPECTED_NO_MATCH');
   assert.equal(communityAcquisitionRetryDirective(effective),undefined);
   const inspector=readFileSync('server/inspector.ts','utf8');
-  assert.match(inspector,/retryDirective:communityAcquisitionRetryDirective\(required\)/);
+  assert.match(inspector,/communityRequired=required\.filter\(item=>isDiscordCommunityAcquisitionSurface\(item\.surface\)\)/);
+  assert.match(inspector,/retryDirective:communityAcquisitionRetryDirective\(communityRequired\)/);
 });
 
 test('fully inspected no-invite acquisition is completed negative and emits no retry',async()=>{
@@ -63,7 +64,7 @@ test('fully inspected no-invite acquisition is completed negative and emits no r
   assert.ok(result.steps.some(step=>step.step==='EXTERNAL_LINKS'&&step.status==='NOT_FOUND'));
 });
 
-test('failed YouTube About acquisition is retryable rather than NOT_FOUND',async()=>{const result=await runChannelInspection({channelId:'c1',channelBio:'',youtubeUrl:'https://youtube.test/c1',forceLiveFetch:true,videoDescriptions:['one','two','three','four','five'],liveChannelDataLoader:async()=>null});assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');assert.equal(result.acquisitionOutcomes?.[0].failureClass,'YOUTUBE_ABOUT_ACQUISITION_FAILED');});
+test('failed YouTube About acquisition does not change a Discord negative or create a community retry',async()=>{const result=await runChannelInspection({channelId:'c1',channelBio:'',youtubeUrl:'https://youtube.test/c1',forceLiveFetch:true,videoDescriptions:['one','two','three','four','five'],liveChannelDataLoader:async()=>null});assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');assert.equal(result.retryDirective,undefined);assert.equal(result.acquisitionOutcomes?.[0].failureClass,'YOUTUBE_ABOUT_ACQUISITION_FAILED');});
 test('community retry identity is stable and channel-scoped',()=>{assert.equal(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-1'));assert.notEqual(communityAcquisitionRetryKey('creator-1'),communityAcquisitionRetryKey('creator-2'));});
 
 test('failed website acquisition is not confirmed NOT_FOUND',async()=>{
@@ -126,7 +127,7 @@ test('inspection retains candidates across surfaces instead of early-stopping on
 test('alternative redirect resolution preserves raw locator and resolved native code',async()=>{const redirected=response(200,'<html></html>','text/html');Object.defineProperty(redirected,'url',{value:'https://discord.gg/native-room'});const result=await runChannelInspection({channelId:'alternative',channelBio:'',channelLinks:['https://dsc.gg/vanity-room'],videoDescriptions:['1','2','3','4','5'],externalFetchImpl:async()=>redirected});const candidate=result.discordCandidates?.[0];assert.equal(candidate?.locatorType,'ALTERNATIVE_REDIRECT');assert.equal(candidate?.rawLocator,'https://dsc.gg/vanity-room');assert.equal(candidate?.nativeInviteCode,'native-room');assert.equal(candidate?.extractionConfidence,'RESOLVED');});
 
 
-test('recent-video acquisition failure stays upstream-owned and does not create a community retry',async()=>{
+test('recent-video acquisition failure does not become a Discord/community retry',async()=>{
   const result=await runChannelInspection({
     channelId:'recent-video-upstream-failure',
     channelName:'Video Failure',
@@ -134,7 +135,7 @@ test('recent-video acquisition failure stays upstream-owned and does not create 
     videoDescriptions:[],
     recentVideoDescriptionsLoader:async()=>{throw new Error('recent video provider unavailable');}
   });
-  assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
   assert.equal(result.retryDirective,undefined);
   assert.ok(result.acquisitionOutcomes?.some(item=>item.surface==='RECENT_VIDEO_DESCRIPTIONS'&&item.outcome==='ACQUISITION_FAILED'&&item.required));
 });

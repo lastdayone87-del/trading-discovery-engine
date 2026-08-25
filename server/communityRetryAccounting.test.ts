@@ -6,7 +6,7 @@ import {isAttemptFreeCommunityFailure,retryAtFromUnknown} from './communityRetry
 
 const coolingError=()=>Object.assign(new Error('Every configured YouTube provider is cooling down'),{code:'YOUTUBE_PROVIDERS_COOLING_DOWN',retryable:true,retryAt:2_000_000});
 
-test('recent-video provider cooldown is attempt-free and keeps acquisition uncertain',async()=>{
+test('recent-video provider cooldown is attempt-free and cannot change a Discord negative',async()=>{
   const result=await runChannelInspection({
     channelId:'cooling-example',
     channelBio:'Trading creator with no community link',
@@ -15,7 +15,7 @@ test('recent-video provider cooldown is attempt-free and keeps acquisition uncer
     creatorLikelyTrading:true,
     recentVideoDescriptionsLoader:async()=>{throw coolingError();},
   });
-  assert.equal(result.acquisitionStatus,'ACQUISITION_FAILED');
+  assert.equal(result.acquisitionStatus,'INSPECTED_NO_MATCH');
   assert.equal(result.retryDirective,undefined);
   assert.equal(result.acquisitionOutcomes?.find(item=>item.surface==='RECENT_VIDEO_DESCRIPTIONS')?.retryAt,2_000_000);
   assert.equal(result.discordCandidates?.length,0);

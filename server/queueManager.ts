@@ -57,7 +57,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, reconcileLegacyCommunityRetryOwnership, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
+import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
@@ -159,12 +159,8 @@ export async function processNextSearchJob(
   await reconcileOrphanInvestigations();
   await reconcileCommunityAcquisitionRecovery(getDb, getChannelById, upsertChannel, 20, Date.now(), (channelId, retryReason) => enqueueCommunityAcquisitionRetry(channelId, { attemptFree: true, code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, reason: retryReason || 'Recovery-triggered community retry', retryAt: undefined, retryReason: retryReason === 'BROWSER_RUNTIME_UNAVAILABLE' ? 'BROWSER_RUNTIME_UNAVAILABLE' : 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' }, 'RECOVERY'));
   const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership(getDb, 250);
-  if (legacyCommunityReconciliation.staleMarked > 0) {
-    console.info(`[Queue Worker] Reconciled ${legacyCommunityReconciliation.staleMarked} legacy community retry job(s): upstream=${legacyCommunityReconciliation.reclassifiedUpstream}, completedNegative=${legacyCommunityReconciliation.completedNegative}, activeCommunity=${legacyCommunityReconciliation.activeCommunity}.`);
-  }
-  const reconciledCommunityRetryJobs = await reconcilePendingCommunityRetryJobs(getDb, 100);
-  if (reconciledCommunityRetryJobs > 0) {
-    console.info(`[Queue Worker] Reconciled ${reconciledCommunityRetryJobs} pending community retry job(s).`);
+  if (legacyCommunityReconciliation.closedNonCommunity > 0 || legacyCommunityReconciliation.activeCommunity > 0) {
+    console.info(`[Queue Worker] Restored ${legacyCommunityReconciliation.closedNonCommunity} legacy non-community job(s) to completed history; activeCommunity=${legacyCommunityReconciliation.activeCommunity}.`);
   }
   await projectProviderDeferredEnrichment(getDb, getChannelById, upsertChannel, 100);
   await reconcileOperationalEnrichmentRecovery(getDb, getChannelById, upsertChannel, enqueueOperationalEnrichmentRecoveryJob, 20, Date.now());

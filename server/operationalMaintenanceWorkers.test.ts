@@ -51,9 +51,9 @@ test('maintenance concurrency is bounded and starts after database readiness in 
   assert.match(startup, /Operational maintenance consumers started after database readiness/);
 });
 
-test('community retry reconciliation exposes only sanitized positive-count telemetry', () => {
+test('legacy community reconciliation restores completed history without a stale-retry worker pass', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(queue, /const reconciledCommunityRetryJobs = await reconcilePendingCommunityRetryJobs/);
-  assert.match(queue, /if \(reconciledCommunityRetryJobs > 0\)/);
-  assert.match(queue, /Reconciled \$\{reconciledCommunityRetryJobs\} pending community retry job/);
+  assert.match(queue, /const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership/);
+  assert.match(queue, /Restored \$\{legacyCommunityReconciliation\.closedNonCommunity\} legacy non-community job/);
+  assert.doesNotMatch(queue, /reconcilePendingCommunityRetryJobs/);
 });

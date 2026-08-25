@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { classifyLegacyCommunityRetryDisposition, evaluateCommunityRetryReconciliation, reconcileCommunityAcquisitionRecovery, reconcilePendingCommunityRetryJobs, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
+import { classifyLegacyCommunityRetryDisposition, reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership, shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import type { ChannelRecord } from '../src/types';
 
 const root = process.cwd();
@@ -144,15 +144,15 @@ test('automatic reconciliation reopens one governed retry window for an active c
   assert.match(recoverySelection, /status IN\('PENDING','PROCESSING'\)/);
 });
 
-test('legacy upstream retry is reclassified and active community retry remains owned by community acquisition', () => {
+test('legacy upstream retry closes as historical completed negative while genuine community failure remains retry-owned', () => {
   const upstream = classifyLegacyCommunityRetryDisposition({
     payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
     inspectionTrail: [{ step: 'VIDEO_DESCRIPTIONS', status: 'SKIPPED' }],
     hasCurrentCommunityRetryableFailure: false,
     hasCurrentUpstreamRetryableFailure: true
   });
-  assert.equal(upstream.disposition, 'UPSTREAM_RECLASSIFIED');
-  assert.equal(upstream.retryReason, 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE');
+  assert.equal(upstream.disposition, 'COMPLETED_NEGATIVE');
+  assert.equal(upstream.retryReason, 'NO_SURFACE');
 
   const community = classifyLegacyCommunityRetryDisposition({
     payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
@@ -162,6 +162,15 @@ test('legacy upstream retry is reclassified and active community retry remains o
   });
   assert.equal(community.disposition, 'ACTIVE_COMMUNITY_RETRY');
   assert.equal(community.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+
+  const browser = classifyLegacyCommunityRetryDisposition({
+    payload: { retryReason: 'BROWSER_RUNTIME_UNAVAILABLE' },
+    inspectionTrail: [{ step: 'VIDEO_DESCRIPTIONS', status: 'ERROR' }],
+    hasCurrentCommunityRetryableFailure: false,
+    hasCurrentUpstreamRetryableFailure: false
+  });
+  assert.equal(browser.disposition, 'ACTIVE_COMMUNITY_RETRY');
+  assert.equal(browser.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
 });
 
 test('completed negative legacy retry is reclassified without deleting its audit job', () => {
@@ -179,45 +188,25 @@ test('completed negative legacy retry is reclassified without deleting its audit
   assert.equal(decision.retryReason, 'NO_SURFACE');
 });
 
-test('no-surface pending retry is marked stale without deletion or completion', () => {
-  const decision = evaluateCommunityRetryReconciliation({
-    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
-    inspectionTrail: [
-      { step: 'EXTERNAL_LINKS', status: 'SKIPPED' },
-      { step: 'VIDEO_DESCRIPTIONS', status: 'SKIPPED' },
-      { step: 'CUSTOM_DOMAINS', status: 'SKIPPED' },
-      { step: 'SOCIAL_BIO', status: 'SKIPPED' }
-    ],
-    hasCurrentRequiredRetryableFailure: false,
-    observedAt: '2026-08-25T12:00:00.000Z'
-  });
-  assert.deepEqual(decision, {
-    retryReason: 'NO_SURFACE',
-    reconciliationStatus: 'RECONCILIATION_REQUIRED',
-    reconciliationCode: 'STALE_RETRY',
-    reconciliationReason: 'Latest inspection has no crawlable surfaces and no required retryable acquisition failure.',
-    reconciliationObservedAt: '2026-08-25T12:00:00.000Z',
-    appendHistory: true
-  });
-});
-
-test('pending stale retry is marked in durable payload without completion or deletion', async () => {
+test('legacy completed-negative retry is completed as audit history without stale lifecycle markers', async () => {
   const queries: Array<{ sql: string; values: unknown[] }> = [];
-  const updated = await reconcilePendingCommunityRetryJobs(
+  const summary = await reconcileLegacyCommunityRetryOwnership(
     async () => ({
       query: async (sql: string, values: unknown[] = []) => {
         queries.push({ sql, values });
         if (sql.includes('SELECT j.id')) return {
           rows: [{
             id: 'retry-1',
-            payload: { channelId: 'UC_test_1' },
+            payload: { channelId: 'UC_test_1', retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+            channel_id: 'UC_test_1',
             created_at: '2026-08-25T10:00:00.000Z',
-            last_checked: '2026-08-25T10:00:00.000Z',
             inspection_trail: [
-              { step: 'EXTERNAL_LINKS', status: 'SKIPPED' },
-              { step: 'CUSTOM_DOMAINS', status: 'SKIPPED' }
+              { step: 'CHANNEL_EXTERNAL_LINKS', status: 'NOT_FOUND' },
+              { step: 'CREATOR_WEBSITES', status: 'SKIPPED' },
+              { step: 'SOCIAL_PROFILES', status: 'SKIPPED' }
             ],
-            has_current_required_retryable_failure: false
+            has_current_community_retryable_failure: false,
+            has_current_upstream_retryable_failure: true
           }]
         };
         return { rows: [] };
@@ -226,22 +215,20 @@ test('pending stale retry is marked in durable payload without completion or del
     100,
     '2026-08-25T12:00:00.000Z'
   );
-  assert.equal(updated, 1);
-  const update = queries.find(item => item.sql.includes('UPDATE jobs SET payload'));
-  assert.ok(update);
-  const payload = JSON.parse(String(update?.values[1]));
-  assert.equal(payload.retryReason, 'NO_SURFACE');
-  assert.equal(payload.reconciliationStatus, 'RECONCILIATION_REQUIRED');
-  assert.equal(payload.reconciliationCode, 'STALE_RETRY');
-  assert.equal(payload.reconciliationHistory.length, 1);
-  assert.doesNotMatch(queries.map(item => item.sql).join('\n'), /DELETE FROM jobs|status='COMPLETED'/);
+  assert.equal(summary.closedNonCommunity, 1);
+  assert.equal(summary.completedNegative, 1);
+  assert.match(queries.map(item => item.sql).join('\n'), /SET status='COMPLETED'/);
+  assert.match(queries.map(item => item.sql).join('\n'), /UPDATE job_attempts/);
+  assert.doesNotMatch(queries.map(item => item.sql).join('\n'), /RECONCILIATION_REQUIRED|STALE_RETRY/);
 });
 
-test('reconciliation query revisits legacy jobs until their evidence window is recorded', () => {
+test('legacy selector treats missing or malformed lifecycle versions as legacy and only explicitly current versioned jobs are excluded', () => {
   const source = read('server/communityRecovery.ts');
-  assert.match(source, /COALESCE\(j\.payload->>'reconciliationObservedAt',''\)=''/);
-  assert.match(source, /COALESCE\(j\.payload->>'retryObservedAt',''\)=''/);
-  assert.match(source, /j\.payload->>'retryObservedAt' > j\.payload->>'reconciliationObservedAt'/);
+  assert.match(source, /CASE[\s\S]*btrim\(COALESCE\(j\.payload->>'retryLifecycleVersion',''\)\) ~ '\^\[0-9\]\+\$'/);
+  assert.match(source, /THEN btrim\(j\.payload->>'retryLifecycleVersion'\)::numeric/);
+  assert.match(source, /ELSE 0[\s\S]*END < 2/);
+  assert.match(source, /SET status='COMPLETED'/);
+  assert.doesNotMatch(source, /reconciliationStatus: 'RECONCILIATION_REQUIRED'/);
 });
 
 test('reconciliation uses effective surface precedence so completed no-match coverage clears stale failure eligibility', () => {
@@ -253,31 +240,11 @@ test('reconciliation uses effective surface precedence so completed no-match cov
   assert.match(source, /WHEN 'INSPECTED_NO_MATCH' THEN 2/);
   assert.match(source, /WHEN 'PARTIALLY_INSPECTED' THEN 1/);
   assert.match(source, /AND effective\.outcome='ACQUISITION_FAILED'/);
+  assert.match(source, /effective\.surface IN\('CHANNEL_EXTERNAL_LINKS','CREATOR_WEBSITES','SOCIAL_PROFILES'/);
   assert.doesNotMatch(source, /DELETE FROM external_acquisition_observations/);
 });
 
-test('current browser-runtime failure remains attributable and not stale', () => {
-  const decision = evaluateCommunityRetryReconciliation({
-    payload: { retryReason: 'BROWSER_RUNTIME_UNAVAILABLE' },
-    inspectionTrail: [{ step: 'CUSTOM_DOMAINS', status: 'ERROR' }],
-    hasCurrentRequiredRetryableFailure: true,
-    observedAt: '2026-08-25T12:00:00.000Z'
-  });
-  assert.equal(decision.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
-  assert.equal(decision.reconciliationStatus, 'NONE');
-  assert.equal(decision.appendHistory, false);
-});
 
-test('current upstream acquisition failure remains active and not stale', () => {
-  const decision = evaluateCommunityRetryReconciliation({
-    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
-    inspectionTrail: [{ step: 'CUSTOM_DOMAINS', status: 'ERROR' }],
-    hasCurrentRequiredRetryableFailure: true,
-    observedAt: '2026-08-25T12:00:00.000Z'
-  });
-  assert.equal(decision.retryReason, 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE');
-  assert.equal(decision.reconciliationStatus, 'NONE');
-});
 
 test('automatic reconciliation restores the prior failure projection when recovery-job reopening fails', async () => {
   const channel = Object.assign(mockChannel('FAILED', '2026-08-15T00:00:00Z'), { activity_band: 'ACTIVE', discord_validation_status: 'RETRY_PENDING' });
@@ -305,5 +272,5 @@ test('production ingestion and manual recheck entry points invoke community reco
   assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
   assert.match(queueSource, /reconcileCommunityAcquisitionRecovery\(getDb, getChannelById, upsertChannel, 20, Date\.now\(\),/);
   assert.match(queueSource, /reconcileLegacyCommunityRetryOwnership\(getDb, 250\)/);
-  assert.match(queueSource, /reconcilePendingCommunityRetryJobs\(getDb, 100\)/);
+  assert.doesNotMatch(queueSource, /reconcilePendingCommunityRetryJobs\(getDb, 100\)/);
 });
