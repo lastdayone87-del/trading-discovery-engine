@@ -178,12 +178,12 @@ function throwIfAllProvidersCoolingDown(keys: string[]): void {
 
 function recordProviderFailure(key: string, error: unknown): void {
   const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;
-  // Runtime rate pressure is shared by the outbound runtime. Once the scheduler
-  // has exhausted its bounded same-operation retries, do not continue walking
-  // the API-key pool: propagate the retryable pressure result to the durable job.
+  // A rate-limited key is retired for this acquisition, while the bounded
+  // outer provider loop may continue with another eligible key. If the whole
+  // pool is unavailable, the caller surfaces the governed all-provider cooldown.
   if (isYouTubeRateLimited(error)) {
     if ((error as any)?.providerFailureRecorded !== true) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');
-    throw error;
+    return;
   }
   if ((error as any)?.providerFailureRecorded === true) return;
   if (isQuotaExceeded(error)) youtubeProviderCooldown.failed(dispatchedKey, 'DAILY_QUOTA_EXHAUSTED');
