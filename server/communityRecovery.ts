@@ -190,6 +190,11 @@ export async function reconcilePendingCommunityRetryJobs(getDb: () => Promise<an
        JOIN channels c ON c.channel_id=j.payload->>'channelId'
       WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
         AND j.status='PENDING'
+        AND (
+          COALESCE(j.payload->>'reconciliationObservedAt','')=''
+          OR COALESCE(j.payload->>'retryObservedAt','')=''
+          OR j.payload->>'retryObservedAt' > j.payload->>'reconciliationObservedAt'
+        )
       ORDER BY j.created_at ASC
       LIMIT $1`,
     [Math.min(250, Math.max(1, limit))]
