@@ -31,6 +31,7 @@ export interface CommunityRetryDirective {
 }
 
 export interface CommunityRetryJobMetadata {
+  retryLifecycleVersion: 2;
   retryReason: CommunityRetryReason;
   retryCode: string;
   retrySource: CommunityRetrySource;
@@ -99,6 +100,7 @@ export function buildCommunityRetryJobMetadata(args: {
   observedAt?: string;
 }): CommunityRetryJobMetadata {
   return {
+    retryLifecycleVersion: 2,
     retryReason: args.retryReason,
     retryCode: args.code,
     retrySource: args.retrySource || 'INSPECTION',

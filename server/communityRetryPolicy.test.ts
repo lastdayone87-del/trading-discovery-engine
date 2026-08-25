@@ -5,6 +5,7 @@ import {buildCommunityRetryJobMetadata,communityAcquisitionRetryDirective,isComm
 test('new retry payload metadata is explicit and starts unreconciled',()=>{
   const metadata=buildCommunityRetryJobMetadata({code:'BROWSER_RUNTIME_UNAVAILABLE',retryReason:'BROWSER_RUNTIME_UNAVAILABLE',retrySource:'INSPECTION',observedAt:'2026-08-25T12:00:00.000Z'});
   assert.deepEqual(metadata,{
+    retryLifecycleVersion:2,
     retryReason:'BROWSER_RUNTIME_UNAVAILABLE',
     retryCode:'BROWSER_RUNTIME_UNAVAILABLE',
     retrySource:'INSPECTION',
@@ -63,4 +64,9 @@ test('provider capacity errors are attempt-free while invalid observation remain
   assert.equal(retryAtFromUnknown(cooldown),123_000);
   assert.equal(attemptFreeDiscordValidation('RATE_LIMITED',true),true);
   assert.equal(attemptFreeDiscordValidation('INVALID_OBSERVED',true),false);
+});
+
+test('new community retry metadata carries the current lifecycle version',()=>{
+  const metadata=buildCommunityRetryJobMetadata({code:'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',retrySource:'INSPECTION',observedAt:'2026-08-25T12:00:00.000Z'});
+  assert.equal(metadata.retryLifecycleVersion,2);
 });
