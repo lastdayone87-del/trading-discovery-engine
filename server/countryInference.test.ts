@@ -178,7 +178,7 @@ test('returns ordered, structured evidence for every available signal tier', () 
 });
 
 
-test('target-country boundary rejects a strongly attributed non-target creator', () => {
+test('target-country boundary retains a strongly attributed non-excluded creator for normal processing', () => {
   const inferred = inferChannelCountry({
     aboutBio: 'Trader italiano based in Milano covering Borsa Italiana and FTSE MIB',
     discoveryCountry: 'Germany'
@@ -186,8 +186,10 @@ test('target-country boundary rejects a strongly attributed non-target creator',
   assert.equal(inferred.detectedCountry, 'Italy');
   assert.equal(inferred.status, 'CONFIRMED');
   const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
-  assert.equal(bounded.status, 'REJECTED');
-  assert.match(bounded.rejectionReason || '', /does not match pinned discovery country Germany/);
+  assert.equal(bounded.status, 'CONFIRMED');
+  assert.equal(bounded.detectedCountry, 'Italy');
+  assert.equal(bounded.rejectionReason, undefined);
+  assert.match(bounded.decisionLogs, /Target Country Boundary: RETAINED/);
 });
 
 test('target-country boundary preserves a matching strong country decision', () => {

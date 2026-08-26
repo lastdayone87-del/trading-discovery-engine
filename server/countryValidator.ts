@@ -84,12 +84,10 @@ export function applyTargetCountryBoundary(result: ValidationResult, targetCount
     detected === target ||
     result.status !== 'CONFIRMED'
   ) return result;
-  const reason = `Creator country ${detected} does not match pinned discovery country ${target}.`;
+  const reason = `Creator country ${detected} differs from pinned discovery country ${target}; retained for normal processing because the creator country is not itself excluded.`;
   return {
     ...result,
-    status: 'REJECTED',
-    rejectionReason: reason,
-    decisionLogs: `${result.decisionLogs}\nTarget Country Boundary: REJECTED — ${reason}`
+    decisionLogs: `${result.decisionLogs}\nTarget Country Boundary: RETAINED — ${reason}`
   };
 }
 
