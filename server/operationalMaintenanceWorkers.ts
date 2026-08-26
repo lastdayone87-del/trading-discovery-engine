@@ -33,16 +33,66 @@ export async function isRecoveryAdmissionOpen(): Promise<boolean> {
 
 let started = false;
 
+type CommunityRetryWorkerHealth = {
+  started: boolean;
+  startedAt: string | null;
+  lastTickAt: string | null;
+  ticks: number;
+  claimed: number;
+  noWork: number;
+  errors: number;
+  lastOutcome: 'CLAIMED' | 'NO_DUE_JOB' | 'ERROR' | null;
+  lastErrorClass: 'DATABASE' | 'CLAIM' | 'DISPATCH' | 'UNKNOWN' | null;
+};
+
+const communityRetryHealth: CommunityRetryWorkerHealth = {
+  started: false,
+  startedAt: null,
+  lastTickAt: null,
+  ticks: 0,
+  claimed: 0,
+  noWork: 0,
+  errors: 0,
+  lastOutcome: null,
+  lastErrorClass: null
+};
+
+function classifyWorkerError(error: unknown): CommunityRetryWorkerHealth['lastErrorClass'] {
+  const message = String((error as { message?: unknown })?.message || error).toLowerCase();
+  if (message.includes('database') || message.includes('connection') || message.includes('transaction')) return 'DATABASE';
+  if (message.includes('claim') || message.includes('job')) return 'CLAIM';
+  if (message.includes('dispatch') || message.includes('acquisition')) return 'DISPATCH';
+  return 'UNKNOWN';
+}
+
+export function getCommunityRetryWorkerHealth(): CommunityRetryWorkerHealth {
+  return { ...communityRetryHealth };
+}
+
 function schedule(next: () => void, delayMs: number): void {
   const timer = setTimeout(next, delayMs);
   timer.unref?.();
 }
 
 function startCommunityRetryWorker(workerId: string): void {
+  communityRetryHealth.started = true;
+  communityRetryHealth.startedAt ??= new Date().toISOString();
   const tick = async () => {
+    communityRetryHealth.ticks += 1;
+    communityRetryHealth.lastTickAt = new Date().toISOString();
     try {
-      await processNextSearchJob(COMMUNITY_RETRY_TYPES, workerId);
+      const claimed = await processNextSearchJob(COMMUNITY_RETRY_TYPES, workerId);
+      if (claimed) {
+        communityRetryHealth.claimed += 1;
+        communityRetryHealth.lastOutcome = 'CLAIMED';
+      } else {
+        communityRetryHealth.noWork += 1;
+        communityRetryHealth.lastOutcome = 'NO_DUE_JOB';
+      }
     } catch (error) {
+      communityRetryHealth.errors += 1;
+      communityRetryHealth.lastOutcome = 'ERROR';
+      communityRetryHealth.lastErrorClass = classifyWorkerError(error);
       console.error(`[Queue Worker:${workerId}] Community retry tick failed:`, error);
     } finally {
       schedule(tick, 1000);

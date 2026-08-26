@@ -82,6 +82,7 @@ import {REVIEW_REASON_CATALOG,REVIEW_REASON_CATALOG_VERSION} from './server/revi
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
 import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
+import { getCommunityRetryWorkerHealth } from './server/operationalMaintenanceWorkers';
 import { browserCapabilitySnapshot, startBrowserCapabilityMonitor } from './server/browserCapability';
 import { assertProductionCountryArchitecture } from './server/productionCountryArchitecture';
 import { inspectExecutionTrace, recordExecutionStage, withExecutionTrace } from './server/executionTrace';
@@ -512,7 +513,7 @@ async function startServer() {
     try {
       const queues = await getQueueStatus();
       const quota = await getQuota();
-      res.json({ queues, quota });
+      res.json({ queues, quota, maintenance: { communityRetry: getCommunityRetryWorkerHealth() } });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
