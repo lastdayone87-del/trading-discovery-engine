@@ -9,6 +9,10 @@ test('crawler reliability exposes aggregate outcome and failure-class breakdown'
   assert.match(source, /failure_class/);
   assert.match(source, /provenance->>'required'/);
   assert.match(source, /GROUP BY surface,required,outcome,retryable,failure_class/);
+  assert.match(source, /requests_failed/);
+  assert.match(source, /navigation_timeouts/);
+  assert.match(source, /blocked_requests/);
+  assert.match(source, /budget_exhausted/);
 });
 
 test('crawler reliability diagnostic does not select raw acquisition fields', () => {
