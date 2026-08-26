@@ -26,6 +26,10 @@ test('execution-lineage implementation is aggregate-only and reuses durable reco
   assert.match(source, /FROM channel_sightings/);
   assert.match(source, /FROM discovery_nominations/);
   assert.match(source, /FROM channel_admission_decisions/);
+  assert.match(source, /continuation_jobs/);
+  assert.match(source, /payload->>'pageNumber'/);
+  assert.match(source, /\^\[2-9\]\[0-9\]\?\$/);
+  assert.match(source, /FROM jobs WHERE type='SEARCH_YOUTUBE'/);
   assert.doesNotMatch(source, /INSERT INTO|UPDATE |DELETE FROM|TRUNCATE /i);
   assert.doesNotMatch(source, /SELECT\s+[^`\n]*\bquery\b\s*,/i);
 });
