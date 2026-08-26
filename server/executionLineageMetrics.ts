@@ -14,7 +14,7 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
   const windowHours = normalizeExecutionLineageWindowHours(hours);
   const db = await getDb();
   const params = [windowHours];
-  const [runSummary, runBreakdown, providerOutcomes, pageSummary, pageBreakdown, sightingBreakdown, nominationBreakdown, admissionBreakdown, completeness, currentStates, continuationJobs] = await Promise.all([
+  const [runSummary, runBreakdown, providerOutcomes, pageSummary, pageBreakdown, sightingBreakdown, nominationBreakdown, admissionBreakdown, completeness, currentStates, continuationJobs, paginationControls] = await Promise.all([
     db.query(`SELECT COUNT(*)::int AS total_runs,
       COUNT(*) FILTER (WHERE status='COMPLETED')::int AS completed_runs,
       COUNT(*) FILTER (WHERE status='FAILED')::int AS failed_runs,
@@ -101,7 +101,8 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
       COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1 AND NULLIF(payload->>'queryRunId','') IS NOT NULL)::int AS continuation_with_query_run_id,
       MIN(created_at) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1) AS earliest_continuation_created_at,
       MAX(created_at) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1) AS latest_continuation_created_at
-      FROM jobs WHERE type='SEARCH_YOUTUBE' AND created_at >= now() - ($1::int * interval '1 hour')`, params)
+      FROM jobs WHERE type='SEARCH_YOUTUBE' AND created_at >= now() - ($1::int * interval '1 hour')`, params),
+    db.query(`SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('autonomous_pagination_enabled','autonomous_pagination_max_pages','autonomous_pagination_max_low_yield_pages') ORDER BY setting_key`, [])
   ]);
   const first = (result: any) => result.rows[0] || {};
   return {
@@ -110,6 +111,6 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
     pageSummary: first(pageSummary), pageBreakdown: pageBreakdown.rows,
     sightingBreakdown: sightingBreakdown.rows, nominationBreakdown: nominationBreakdown.rows,
     admissionBreakdown: admissionBreakdown.rows, completeness: first(completeness), currentChannelStates: currentStates.rows,
-    continuationJobs: first(continuationJobs)
+    continuationJobs: first(continuationJobs), paginationControls: paginationControls.rows.map((row: any) => ({ settingKey: row.setting_key, settingValue: row.setting_value }))
   };
 }
