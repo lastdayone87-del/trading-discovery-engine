@@ -29,7 +29,7 @@ import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNati
 import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
-import { classifyProviderCapacityFailure } from './providerCapacityDiagnostics';
+import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 
 const { Pool } = pg;
@@ -1813,6 +1813,7 @@ export async function completeQueryRun(runId: string, metrics: {
   averageQualityScore?: number;
   performanceScore?: number;
   newCollection?: 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED';
+  providerRunOutcome?: ProviderRunOutcome;
 }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
@@ -1954,7 +1955,30 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const message = String((error as any)?.message || error).slice(0, 2000);
   const capacity = classifyProviderCapacityFailure(error);
   const capacityMetadata = capacity ? { providerCapacityReason: capacity.reason, providerCapacityRetryable: capacity.retryable, ...(capacity.retryAt ? { providerCapacityRetryAt: capacity.retryAt } : {}) } : {};
-  const capacityJson = JSON.stringify(capacityMetadata);
+  const runProvider = await db.query(`SELECT provider_key FROM query_runs WHERE id=$1`, [runId]);
+  const isYouTubeRun = runProvider.rows[0]?.provider_key === 'youtube-search';
+  const providerCounts = isYouTubeRun
+    ? await db.query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [runId])
+    : { rows: [{}] } as { rows: Array<Record<string, unknown>> };
+  const counts = providerCounts.rows[0] || {};
+  const hasProviderOutcome = isYouTubeRun && (Boolean(capacity) || Number(counts.attempted || 0) > 0);
+  const providerRunOutcome = hasProviderOutcome ? classifyProviderRunOutcome({
+    rawResults: 0,
+    providerRequestsAttempted: Number(counts.attempted || 0),
+    providerRequestsSucceeded: Number(counts.succeeded || 0),
+    providerRequestsFailed: Number(counts.failed || 0),
+    providerRateLimited: Number(counts.rate_limited || 0),
+    capacityDeferred: Boolean(capacity),
+    terminalFailure: terminal
+  }) : undefined;
+  const outcomeMetadata = providerRunOutcome ? {
+    providerRunOutcome,
+    providerAttempted: Number(counts.attempted || 0),
+    providerSucceeded: Number(counts.succeeded || 0),
+    providerFailed: Number(counts.failed || 0),
+    providerRateLimited: Number(counts.rate_limited || 0)
+  } : {};
+  const capacityJson = JSON.stringify({ ...capacityMetadata, ...outcomeMetadata });
   if (!terminal) {
     await db.query(`UPDATE query_runs SET status='RETRYING',error=$2,performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
        WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED')`, [runId, message, capacityJson]);
@@ -1962,7 +1986,7 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   }
   const code=String((error as any)?.code||'').toUpperCase();
   const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':capacity ? 'PROVIDER_CAPACITY' : 'PROVIDER_FAILURE';
-  const failureMetadata = JSON.stringify({ failureKind, ...capacityMetadata });
+  const failureMetadata = JSON.stringify({ failureKind, ...capacityMetadata, ...outcomeMetadata });
   const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
     provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') ELSE provider_requests_attempted END,
     provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
