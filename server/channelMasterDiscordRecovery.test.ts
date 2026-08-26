@@ -4,19 +4,20 @@ import {readFileSync} from 'node:fs';
 import {nextChannelScanAttempts} from './queueManager';
 
 const db=readFileSync('server/db.ts','utf8');
+const dbCore=readFileSync('server/dbCore.ts','utf8');
 const queue=readFileSync('server/queueManager.ts','utf8');
 const migration=readFileSync('server/db/migrations/110_discord_candidates.sql','utf8');
 const ui=readFileSync('src/components/ResultsTable.tsx','utf8');
 
 test('master listing retains rows but excludes low-audience skips unless explicitly selected',()=>{
-  assert.match(db,/const clauses=\[args\.diagnosticsOnly\?[\s\S]+:'TRUE'\]/);
-  assert.match(db,/scope:args\.diagnosticsOnly\?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'/);
-  assert.match(db,/const explicitlyViewingLowAudience=args\.scanStatus==='SKIPPED_LOW_AUDIENCE'/);
-  assert.match(db,/!explicitlyViewingLowAudience\)clauses\.push\(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT \$\{KNOWN_LOW_AUDIENCE_SQL\}`\)/);
+  assert.match(dbCore,/const clauses=\[args\.diagnosticsOnly\?[\s\S]+:'TRUE'\]/);
+  assert.match(dbCore,/scope:args\.diagnosticsOnly\?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'/);
+  assert.match(dbCore,/const explicitlyViewingLowAudience=args\.scanStatus==='SKIPPED_LOW_AUDIENCE'/);
+  assert.match(dbCore,/!explicitlyViewingLowAudience\)clauses\.push\(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT \$\{KNOWN_LOW_AUDIENCE_SQL\}`\)/);
 });
 
 test('Stored Channels is an unqualified persisted row count',()=>{
-  const summary=db.slice(db.indexOf('export async function getDashboardOperationalSummary'),db.indexOf('export async function getChannelById'));
+  const summary=dbCore.slice(dbCore.indexOf('export async function getDashboardOperationalSummary'),dbCore.indexOf('export async function getChannelById'));
   assert.match(summary,/COUNT\(\*\)::int stored_channels/);
   assert.match(summary,/FROM channels`/);
   assert.doesNotMatch(summary,/FROM channels WHERE/);
@@ -37,9 +38,20 @@ test('candidate authority is durable, normalized unique, selected, and returned 
   assert.match(migration,/PRIMARY KEY\(channel_id,candidate_id\)/);
   assert.match(migration,/UNIQUE\(channel_id,normalized_locator\)/);
   assert.match(migration,/attempt_count INTEGER/);
-  assert.match(db,/jsonb_agg\(to_jsonb\(dc\)/);
+  assert.match(dbCore,/jsonb_agg\(to_jsonb\(dc\)/);
   assert.match(queue,/persistDiscordCandidates/);
   assert.match(queue,/selectDiscordCandidate/);
   assert.match(ui,/candidate\.failure_reason/);
   assert.match(ui,/candidate\.retryable\?'Retryable':'Terminal'/);
+});
+
+test('dashboard retained candidates are validated active invites, while audit inventory remains persisted separately',()=>{
+  const listing=dbCore.slice(dbCore.indexOf('export async function listChannelsPage'),dbCore.indexOf('export async function listChannelsPage')+1800);
+  assert.match(listing,/FROM discord_candidates dc WHERE dc\.channel_id=channels\.channel_id AND dc\.candidate_status='VALIDATED' AND dc\.validation_status='COMPLETED' AND dc\.liveness_status='ACTIVE'/);
+  assert.match(dbCore,/export async function persistDiscordCandidates/);
+  assert.match(dbCore,/INSERT INTO discord_candidates\(channel_id,candidate_id,raw_locator/);
+  assert.match(ui,/c\.discord_candidates\?\.length/);
+  assert.match(ui,/c\.discord_candidate_locator && !c\.discord_invite && c\.discord_liveness_status === 'ACTIVE'/);
+  assert.match(ui,/Validated candidate:/);
+  assert.doesNotMatch(ui,/Candidate retained:/);
 });
