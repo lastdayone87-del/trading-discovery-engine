@@ -55,7 +55,9 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
       COALESCE(SUM(distinct_creator_count),0)::bigint AS distinct_creators,
       COALESCE(SUM(new_creators),0)::bigint AS new_creators,
       COALESCE(SUM(duplicate_ratio),0)::float AS duplicate_ratio_sum,
-      COALESCE(SUM(quota_units),0)::bigint AS quota_units
+      COALESCE(SUM(quota_units),0)::bigint AS quota_units,
+      MIN(created_at) AS earliest_page_observation,
+      MAX(created_at) AS latest_page_observation
       FROM autonomous_query_page_observations WHERE created_at >= now() - ($1::int * interval '1 hour')`, params),
     db.query(`SELECT page_number, COUNT(*)::int AS page_count, COUNT(*) FILTER (WHERE next_page_token IS NOT NULL)::int AS with_continuation,
       COUNT(*) FILTER (WHERE should_continue)::int AS marked_continue, COUNT(*) FILTER (WHERE stopping_reason IS NOT NULL)::int AS stopped,
