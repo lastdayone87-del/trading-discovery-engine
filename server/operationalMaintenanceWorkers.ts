@@ -9,12 +9,14 @@ import {
   heartbeatJob
 } from './db';
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
+import { COUNTRY_BOUNDARY_RECOVERY_JOB } from './countryBoundaryRecovery';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
 const COMMUNITY_RETRY_TYPES: ClaimableOverride = ['RETRY_COMMUNITY_ACQUISITION'];
 const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORCE_REVIEW_RESCAN'];
 const FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN';
+const COUNTRY_BOUNDARY_RECOVERY_TYPES: ClaimableOverride = [COUNTRY_BOUNDARY_RECOVERY_JOB];
 const QUOTA_BACKOFF_MS = 30_000;
 const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
   0,
@@ -194,6 +196,66 @@ function startFalseNegativeRecoveryWorker(workerId: string): void {
   void tick();
 }
 
+function startCountryBoundaryRecoveryWorker(workerId: string): void {
+  const tick = async () => {
+    const operationId = `${workerId}:${Date.now()}`;
+    let reserved = false;
+    let claimedJobId: string | undefined;
+    let heartbeat: NodeJS.Timeout | undefined;
+    let nextDelayMs = 1000;
+    try {
+      if (!await isRecoveryAdmissionOpen()) {
+        nextDelayMs = QUOTA_BACKOFF_MS;
+        return;
+      }
+      reserved = await reserveOfficialRecheckQuota('OPERATIONAL_RECHECK', operationId);
+      if (!reserved) {
+        nextDelayMs = QUOTA_BACKOFF_MS;
+        return;
+      }
+      const job = await claimNextJob(workerId, COUNTRY_BOUNDARY_RECOVERY_TYPES);
+      if (!job) {
+        await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, false);
+        reserved = false;
+        return;
+      }
+      claimedJobId = job.id;
+      heartbeat = setInterval(() => {
+        heartbeatJob(job.id, workerId).catch(error => console.error(`[Queue Worker:${workerId}] Country-boundary recovery heartbeat failed:`, error));
+      }, 60_000);
+      heartbeat.unref?.();
+      const channelId = String(job.payload?.channelId || '');
+      if (!channelId) throw new Error('Country-boundary recovery job is missing channelId.');
+      const result = await triggerManualRecheck(channelId, true, true);
+      if (!result.success) {
+        const typedTransient = result.retryable === true
+          && ['TIMEOUT', 'CANCELLED', 'RATE_LIMIT', 'TRANSIENT', 'CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass || ''));
+        throw Object.assign(new Error(result.message), {
+          code: result.code,
+          retryable: typedTransient,
+          errorClass: typedTransient ? result.errorClass : undefined,
+          retryAt: typedTransient ? result.retryAt : undefined,
+          retryAfterMs: typedTransient ? result.retryAfterMs : undefined
+        });
+      }
+      await completeJob(job.id);
+      claimedJobId = undefined;
+      await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, true);
+      reserved = false;
+    } catch (error) {
+      if (claimedJobId) await failJob(claimedJobId, error).catch(() => undefined);
+      if (reserved) await finishQuotaReservation('OPERATIONAL_RECHECK', operationId, false).catch(() => undefined);
+      reserved = false;
+      nextDelayMs = QUOTA_BACKOFF_MS;
+      console.error(`[Queue Worker:${workerId}] Country-boundary recovery tick failed:`, error);
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      schedule(tick, nextDelayMs);
+    }
+  };
+  void tick();
+}
+
 /** Dedicated consumers for operational jobs outside the three core pools. */
 export function startOperationalMaintenanceWorkers(): void {
   if (started) return;
@@ -203,6 +265,7 @@ export function startOperationalMaintenanceWorkers(): void {
   for (let index = 0; index < concurrency; index++) {
     startCommunityRetryWorker(`community_retry_${process.pid}_${index}`);
     startOfficialRecheckWorker(`official_recheck_${process.pid}_${index}`);
+    startCountryBoundaryRecoveryWorker(`country_boundary_recovery_${process.pid}_${index}`);
   }
   // Recovery is intentionally single-consumer and low-volume regardless of the
   // generic maintenance concurrency setting.
@@ -210,5 +273,5 @@ export function startOperationalMaintenanceWorkers(): void {
 }
 
 export function getOperationalMaintenanceJobTypesForTests(): string[] {
-  return [...COMMUNITY_RETRY_TYPES, ...OFFICIAL_RECHECK_TYPES, FALSE_NEGATIVE_RECOVERY_JOB];
+  return [...COMMUNITY_RETRY_TYPES, ...OFFICIAL_RECHECK_TYPES, FALSE_NEGATIVE_RECOVERY_JOB, ...COUNTRY_BOUNDARY_RECOVERY_TYPES];
 }
