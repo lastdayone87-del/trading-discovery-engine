@@ -83,6 +83,7 @@ import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsVali
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
 import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
 import { getCommunityRetryWorkerHealth } from './server/operationalMaintenanceWorkers';
+import { dryRunCountryBoundaryCohort, enqueueCountryBoundaryCohort, COUNTRY_BOUNDARY_RECOVERY_VERSION } from './server/countryBoundaryRecovery';
 import { browserCapabilitySnapshot, startBrowserCapabilityMonitor } from './server/browserCapability';
 import { assertProductionCountryArchitecture } from './server/productionCountryArchitecture';
 import { inspectExecutionTrace, recordExecutionStage, withExecutionTrace } from './server/executionTrace';
@@ -274,6 +275,7 @@ async function startServer() {
   app.get('/api/channels-revision',async(req,res)=>{try{res.json(await getChannelListingRevision(channelFilterFromRequest(req)));}catch(err:any){res.status(500).json({error:err.message});}});
   app.get('/api/dashboard/summary',async(_req,res)=>{try{res.json(await getDashboardOperationalSummary());}catch(err:any){res.status(500).json({error:err.message});}});
   app.get('/api/reconciliation/legacy-community-retries',async(req,res)=>{try{res.json(await getLegacyCommunityRetryDiagnostics(String(req.query.legacy_before||'2026-08-25T16:00:02.000Z')));}catch(err:any){sendOperationError(res,err);}});
+  app.post('/api/reconciliation/nonexcluded-boundary-cohort',async(req,res)=>{try{const execute=req.body?.execute===true||req.query.execute==='true';if(!execute)return res.json(await dryRunCountryBoundaryCohort());if(req.body?.confirmation!==COUNTRY_BOUNDARY_RECOVERY_VERSION)return res.status(400).json({error:'Explicit correction-version confirmation required.',code:'COHORT_CONFIRMATION_REQUIRED'});res.json(await enqueueCountryBoundaryCohort());}catch(err){sendOperationError(res,err);}});
   app.get('/api/diagnostics/crawler-reliability',async(req,res)=>{try{res.json(await getCrawlerReliabilityMetrics(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/diagnostics/execution-lineage',async(req,res)=>{try{res.json(await getExecutionLineageMetrics(Number(req.query.hours||168)));}catch(err:any){sendOperationError(res,err);}});
 
