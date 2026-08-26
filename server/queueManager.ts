@@ -79,6 +79,7 @@ import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
+import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { processPendingStagedCandidates } from './candidateStaging';
 
@@ -382,13 +383,15 @@ export async function processNextSearchJob(
     let providerRateLimited = 0;
     let providerPagesRetrieved = 0;
     let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null; providerCostUsd?: number; providerRequestId?: string } | null = null;
+    let allocatedProvider: ProviderAllocation = YOUTUBE_SEARCH_PROVIDER;
+    let braveProvider = false;
     if (queryRunId) {
-      const allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
+      allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
       const lineage=await (await getDb()).query(`SELECT provider_allocation_snapshot FROM query_runs WHERE id=$1`,[queryRunId]);
       if(!lineage.rowCount)throw new Error('PHASE9_PROVIDER_LINEAGE_MISSING');
       const dbProvider=providerSnapshot(lineage.rows[0].provider_allocation_snapshot);
       if(dbProvider.providerKey!==allocatedProvider.providerKey||dbProvider.retrievalSurface!==allocatedProvider.retrievalSurface||dbProvider.capability!==allocatedProvider.capability||dbProvider.costDomain!==allocatedProvider.costDomain||dbProvider.continuationOwner!==allocatedProvider.continuationOwner)throw new Error('PHASE9_PROVIDER_LINEAGE_MISMATCH');
-      const braveProvider=allocatedProvider.costDomain==='BRAVE_SEARCH_API';
+      braveProvider=allocatedProvider.costDomain==='BRAVE_SEARCH_API';
       let providerRequestId: string | null = null;
       if(braveProvider){
         providerRequestId=`${autonomousOperationId}:provider-request`;
@@ -541,6 +544,31 @@ export async function processNextSearchJob(
         providerRateLimited = Number(totals.provider_rate_limited || providerRateLimited);
         providerPagesRetrieved = Number(totals.provider_pages_retrieved || providerPagesRetrieved);
       }
+      let providerRunOutcome: ProviderRunOutcome | undefined;
+      if (allocatedProvider.providerKey !== 'brave-search' && queryRunId) {
+        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [queryRunId]);
+        const counts = providerCounts.rows[0] || {};
+        providerRequestsAttempted = Number(counts.attempted || 0);
+        providerRequestsSucceeded = Number(counts.succeeded || 0);
+        providerRequestsFailed = Number(counts.failed || 0);
+        providerRateLimited = Number(counts.rate_limited || 0);
+        providerPagesRetrieved = providerRequestsSucceeded;
+        providerRunOutcome = classifyProviderRunOutcome({
+          rawResults: finalMetrics.rawResults,
+          providerRequestsAttempted,
+          providerRequestsSucceeded,
+          providerRequestsFailed,
+          providerRateLimited
+        });
+      } else if (allocatedProvider.providerKey === 'brave-search') {
+        providerRunOutcome = classifyProviderRunOutcome({
+          rawResults: finalMetrics.rawResults,
+          providerRequestsAttempted,
+          providerRequestsSucceeded,
+          providerRequestsFailed,
+          providerRateLimited
+        });
+      }
       const quotaConsumed=providerCostUsd>0?0:pageNumber*100;
       const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
       await completeQueryRun(queryRunId, {
@@ -555,6 +583,7 @@ export async function processNextSearchJob(
         providerRequestsFailed,
         providerRateLimited,
         providerPagesRetrieved,
+        providerRunOutcome,
         averageQualityScore: finalMetrics.averageQualityScore,
         performanceScore: performance.performanceScore,
         newCollection: performance.newCollection
@@ -565,7 +594,7 @@ export async function processNextSearchJob(
         channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
         quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
         cycle_quality_score: performance.performanceScore,
-        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via YOUTUBE_DATA_API.`, `Funnel: ${JSON.stringify(metrics)}`]
+        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via YOUTUBE_DATA_API.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(metrics)}`]
       });
 
       // Post-run idempotent recomputation of derived evidence aggregate

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyProviderCapacityFailure } from './providerCapacityDiagnostics';
+import { classifyProviderCapacityFailure, classifyProviderRunOutcome } from './providerCapacityDiagnostics';
 
 test('classifies all-key cooldown without exposing provider payloads', () => {
   assert.deepEqual(classifyProviderCapacityFailure({ code: 'YOUTUBE_PROVIDERS_COOLING_DOWN', retryAt: 1_800_000_000_000 }), {
@@ -24,4 +24,19 @@ test('classifies runtime pressure, quota allocation, cooldown, and concurrency s
 test('does not classify unrelated provider failures as capacity', () => {
   assert.equal(classifyProviderCapacityFailure({ code: 'YOUTUBE_HTTP_403' }), undefined);
   assert.equal(classifyProviderCapacityFailure({ code: 'INVALID_QUERY' }), undefined);
+});
+
+test('distinguishes successful non-empty and authoritative empty results', () => {
+  assert.equal(classifyProviderRunOutcome({ rawResults: 4, providerRequestsAttempted: 1, providerRequestsSucceeded: 1, providerRequestsFailed: 0, providerRateLimited: 0 }), 'SUCCESS_NON_EMPTY');
+  assert.equal(classifyProviderRunOutcome({ rawResults: 0, providerRequestsAttempted: 1, providerRequestsSucceeded: 1, providerRequestsFailed: 0, providerRateLimited: 0 }), 'SUCCESS_EMPTY');
+});
+
+test('distinguishes recovered fallback from all-provider failure', () => {
+  assert.equal(classifyProviderRunOutcome({ rawResults: 0, providerRequestsAttempted: 2, providerRequestsSucceeded: 1, providerRequestsFailed: 1, providerRateLimited: 0 }), 'RECOVERED_AFTER_PROVIDER_FAILURE');
+  assert.equal(classifyProviderRunOutcome({ rawResults: 0, providerRequestsAttempted: 2, providerRequestsSucceeded: 0, providerRequestsFailed: 1, providerRateLimited: 1, terminalFailure: true }), 'FAILED_ALL_PROVIDERS');
+});
+
+test('keeps capacity deferral and post-response failure distinct', () => {
+  assert.equal(classifyProviderRunOutcome({ rawResults: 0, providerRequestsAttempted: 0, providerRequestsSucceeded: 0, providerRequestsFailed: 0, providerRateLimited: 0, capacityDeferred: true }), 'DEFERRED_PROVIDER_CAPACITY');
+  assert.equal(classifyProviderRunOutcome({ rawResults: 0, providerRequestsAttempted: 1, providerRequestsSucceeded: 1, providerRequestsFailed: 0, providerRateLimited: 0, terminalFailure: true }), 'FAILED_AFTER_PROVIDER_RESPONSE');
 });
