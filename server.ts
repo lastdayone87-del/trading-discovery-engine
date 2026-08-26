@@ -21,7 +21,9 @@ import {
   setQueryCollection,
   purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
   listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics, getCrawlerReliabilityMetrics
+
 } from './server/db';
+import { getExecutionLineageMetrics } from './server/executionLineageMetrics';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
 import { inspectCoverageLifecycle, recordLifecycleEvent } from './server/coverageLifecycle';
@@ -272,6 +274,7 @@ async function startServer() {
   app.get('/api/dashboard/summary',async(_req,res)=>{try{res.json(await getDashboardOperationalSummary());}catch(err:any){res.status(500).json({error:err.message});}});
   app.get('/api/reconciliation/legacy-community-retries',async(req,res)=>{try{res.json(await getLegacyCommunityRetryDiagnostics(String(req.query.legacy_before||'2026-08-25T16:00:02.000Z')));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/diagnostics/crawler-reliability',async(req,res)=>{try{res.json(await getCrawlerReliabilityMetrics(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/diagnostics/execution-lineage',async(req,res)=>{try{res.json(await getExecutionLineageMetrics(Number(req.query.hours||168)));}catch(err:any){sendOperationError(res,err);}});
 
   // Dedicated diagnostics view for rejected / excluded channels
   app.get('/api/channels/diagnostics/rejected', async (req, res) => {
