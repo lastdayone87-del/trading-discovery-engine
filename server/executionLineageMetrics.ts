@@ -14,7 +14,7 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
   const windowHours = normalizeExecutionLineageWindowHours(hours);
   const db = await getDb();
   const params = [windowHours];
-  const [runSummary, runBreakdown, providerOutcomes, pageSummary, pageBreakdown, sightingBreakdown, nominationBreakdown, admissionBreakdown, completeness, currentStates] = await Promise.all([
+  const [runSummary, runBreakdown, providerOutcomes, pageSummary, pageBreakdown, sightingBreakdown, nominationBreakdown, admissionBreakdown, completeness, currentStates, continuationJobs] = await Promise.all([
     db.query(`SELECT COUNT(*)::int AS total_runs,
       COUNT(*) FILTER (WHERE status='COMPLETED')::int AS completed_runs,
       COUNT(*) FILTER (WHERE status='FAILED')::int AS failed_runs,
@@ -90,7 +90,18 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
     db.query(`SELECT COALESCE(country_status,'UNSPECIFIED') AS country_status, COALESCE(trading_status,'UNSPECIFIED') AS trading_status,
       COALESCE(scan_status,'UNSPECIFIED') AS scan_status, COALESCE(discord_status,'UNSPECIFIED') AS discord_status,
       COUNT(*)::int AS channels
-      FROM channels GROUP BY country_status,trading_status,scan_status,discord_status ORDER BY country_status,trading_status,scan_status,discord_status`, [])
+      FROM channels GROUP BY country_status,trading_status,scan_status,discord_status ORDER BY country_status,trading_status,scan_status,discord_status`, []),
+    db.query(`SELECT COUNT(*)::int AS search_youtube_jobs,
+      COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1)::int AS continuation_jobs,
+      COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1 AND status='PENDING')::int AS continuation_pending,
+      COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1 AND status='PROCESSING')::int AS continuation_processing,
+      COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1 AND status='COMPLETED')::int AS continuation_completed,
+      COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1 AND status='FAILED')::int AS continuation_failed,
+      COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1 AND status NOT IN ('PENDING','PROCESSING','COMPLETED','FAILED'))::int AS continuation_other,
+      COUNT(*) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1 AND NULLIF(payload->>'queryRunId','') IS NOT NULL)::int AS continuation_with_query_run_id,
+      MIN(created_at) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1) AS earliest_continuation_created_at,
+      MAX(created_at) FILTER (WHERE CASE WHEN COALESCE(payload->>'pageNumber','') ~ '^[2-9][0-9]?$' THEN (payload->>'pageNumber')::int ELSE 1 END > 1) AS latest_continuation_created_at
+      FROM jobs WHERE type='SEARCH_YOUTUBE' AND created_at >= now() - ($1::int * interval '1 hour')`, params)
   ]);
   const first = (result: any) => result.rows[0] || {};
   return {
@@ -98,6 +109,7 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
     runSummary: first(runSummary), runBreakdown: runBreakdown.rows, providerOutcomes: providerOutcomes.rows,
     pageSummary: first(pageSummary), pageBreakdown: pageBreakdown.rows,
     sightingBreakdown: sightingBreakdown.rows, nominationBreakdown: nominationBreakdown.rows,
-    admissionBreakdown: admissionBreakdown.rows, completeness: first(completeness), currentChannelStates: currentStates.rows
+    admissionBreakdown: admissionBreakdown.rows, completeness: first(completeness), currentChannelStates: currentStates.rows,
+    continuationJobs: first(continuationJobs)
   };
 }
