@@ -43,7 +43,7 @@ type CommunityRetryWorkerHealth = {
   claimed: number;
   noWork: number;
   errors: number;
-  lastOutcome: 'CLAIMED' | 'NO_DUE_JOB' | 'ERROR' | null;
+  lastOutcome: 'CLAIMED' | 'NO_DUE_JOB' | 'DUE_BUT_BROWSER_UNAVAILABLE' | 'DUE_BUT_RECONCILIATION_BLOCKED' | 'DUE_BUT_LEASED' | 'DUE_BUT_CLAIM_RACE' | 'ERROR' | null;
   lastErrorClass: 'DATABASE' | 'CLAIM' | 'DISPATCH' | 'UNKNOWN' | null;
 };
 
@@ -89,7 +89,12 @@ function startCommunityRetryWorker(workerId: string): void {
         communityRetryHealth.lastOutcome = 'CLAIMED';
       } else {
         communityRetryHealth.noWork += 1;
-        communityRetryHealth.lastOutcome = 'NO_DUE_JOB';
+        const admission = (await getQueueStatus()).communityRetry;
+        if (admission.dueBrowserBlocked > 0) communityRetryHealth.lastOutcome = 'DUE_BUT_BROWSER_UNAVAILABLE';
+        else if (admission.dueReconciliationBlocked > 0) communityRetryHealth.lastOutcome = 'DUE_BUT_RECONCILIATION_BLOCKED';
+        else if (admission.dueClaimable > 0) communityRetryHealth.lastOutcome = 'DUE_BUT_CLAIM_RACE';
+        else if (admission.processing > 0) communityRetryHealth.lastOutcome = 'DUE_BUT_LEASED';
+        else communityRetryHealth.lastOutcome = 'NO_DUE_JOB';
       }
     } catch (error) {
       communityRetryHealth.errors += 1;

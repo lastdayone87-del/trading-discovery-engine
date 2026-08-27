@@ -13,6 +13,7 @@ import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
+import { browserCapabilityIsUnavailable } from './browserCapability';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
@@ -559,9 +560,22 @@ export async function getQueueStatus(): Promise<QueueStatus> {
   const paused:Record<string,boolean>={}; controls.rows.forEach(r=>paused[r.queue_name]=!!r.is_paused);
   const typeCount=(types:string[])=>depths.rows.filter(r=>types.includes(r.type)).reduce((a,r)=>a+r.count,0);
   const pending=await db.query(`SELECT id,type,status,priority,run_after,created_at,last_error FROM jobs WHERE status IN ('PENDING','PROCESSING') ORDER BY priority DESC,created_at ASC LIMIT 100`);
+  const retryDiagnostics=await db.query(`SELECT
+    COUNT(*) FILTER (WHERE status='PENDING' AND run_after<=now())::int AS due_pending,
+    COUNT(*) FILTER (WHERE status='PENDING' AND run_after<=now() AND COALESCE(last_error,'') LIKE '%BROWSER_RUNTIME_UNAVAILABLE%')::int AS due_browser_blocked,
+    COUNT(*) FILTER (WHERE status='PENDING' AND run_after<=now() AND COALESCE(payload->>'reconciliationStatus','NONE')='RECONCILIATION_REQUIRED')::int AS due_reconciliation_blocked,
+    COUNT(*) FILTER (WHERE status='PROCESSING')::int AS processing,
+    COUNT(*) FILTER (WHERE status='PROCESSING' AND locked_at < now()-interval '15 minutes')::int AS stale_processing,
+    MIN(run_after) FILTER (WHERE status='PENDING' AND run_after<=now()) AS oldest_due_at,
+    MIN(locked_at) FILTER (WHERE status='PROCESSING') AS oldest_processing_at
+    FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND status IN ('PENDING','PROCESSING')`);
+  const retry=retryDiagnostics.rows[0]||{};
+  const duePending=Number(retry.due_pending||0);
+  const dueBrowserBlocked=browserCapabilityIsUnavailable()?Number(retry.due_browser_blocked||0):0;
+  const dueReconciliationBlocked=Number(retry.due_reconciliation_blocked||0);
   const now=Date.now();
-  const pendingWork=pending.rows.map(r=>({id:r.id,type:r.type,status:r.status,priority:r.priority||0,ageMs:Math.max(0,now-new Date(r.created_at).getTime()),waitingReason:r.status==='PROCESSING'?'waiting_for_worker':new Date(r.run_after).getTime()>now?(String(r.last_error||'').match(/rate.?limit|429/i)?'waiting_for_youtube_rate_limit':String(r.last_error||'').match(/quota|provider.*cool/i)?'waiting_for_quota':'retry_at'):'waiting_for_worker',retryAt:r.status==='PENDING'&&new Date(r.run_after).getTime()>now?iso(r.run_after):null,lastProviderError:r.last_error||null}));
-  return { searchJobs:{depth:typeCount(['SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE']),isPaused:!!paused.search_jobs}, channelProcessing:{depth:typeCount(['PROCESS_CHANNEL','ENRICH_CHANNEL']),isPaused:!!paused.channel_processing}, discordValidation:{depth:typeCount(['INSPECT_DISCORD']),isPaused:!!paused.discord_validation},pendingWork };
+  const pendingWork=pending.rows.map(r=>({id:r.id,type:r.type,status:r.status,priority:r.priority||0,ageMs:Math.max(0,now-new Date(r.created_at).getTime()),waitingReason:r.status==='PROCESSING'?'waiting_for_worker':String(r.last_error||'').match(/BROWSER_RUNTIME_UNAVAILABLE/i)?'waiting_for_browser_runtime':new Date(r.run_after).getTime()>now?(String(r.last_error||'').match(/rate.?limit|429/i)?'waiting_for_youtube_rate_limit':String(r.last_error||'').match(/quota|provider.*cool/i)?'waiting_for_quota':'retry_at'):'waiting_for_worker',retryAt:r.status==='PENDING'&&new Date(r.run_after).getTime()>now?iso(r.run_after):null,lastProviderError:r.last_error||null}));
+  return { searchJobs:{depth:typeCount(['SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE']),isPaused:!!paused.search_jobs}, channelProcessing:{depth:typeCount(['PROCESS_CHANNEL','ENRICH_CHANNEL']),isPaused:!!paused.channel_processing}, discordValidation:{depth:typeCount(['INSPECT_DISCORD']),isPaused:!!paused.discord_validation}, communityRetry:{duePending,dueBrowserBlocked,dueReconciliationBlocked,dueClaimable:Math.max(0,duePending-dueBrowserBlocked-dueReconciliationBlocked),processing:Number(retry.processing||0),staleProcessing:Number(retry.stale_processing||0),oldestDueAt:iso(retry.oldest_due_at),oldestProcessingAt:iso(retry.oldest_processing_at)},pendingWork };
 }
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{const db=await getDb(); await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);}
 
