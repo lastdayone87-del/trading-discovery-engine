@@ -43,8 +43,9 @@ export interface BrowserCapabilitySnapshot {
 
 export const BROWSER_RUNTIME_UNAVAILABLE = 'BROWSER_RUNTIME_UNAVAILABLE';
 
-// Keep install-time and runtime resolution identical in Railway/Nixpacks images.
-if (process.env.PLAYWRIGHT_BROWSERS_PATH !== '0') process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
+// Honor the runtime image's configured browser path. Railway's pinned Playwright image
+// uses /ms-playwright; local/Nixpacks setups may explicitly use PLAYWRIGHT_BROWSERS_PATH=0.
+// Do not overwrite either choice before importing Playwright.
 
 export function browserLaunchOptions(): { headless: true; args?: string[]; timeout: number } {
   const configuredTimeout = Number(process.env.BROWSER_LAUNCH_TIMEOUT_MS);
