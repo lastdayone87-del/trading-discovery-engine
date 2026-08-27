@@ -14,9 +14,10 @@ import {
   withBrowserRuntimeLease,
 } from './browserCapability';
 
-test('browser path is fixed before the Playwright import is evaluated', () => {
+test('browser path configuration is preserved before the Playwright import is evaluated', () => {
   const source = fs.readFileSync(new URL('./browserCapability.ts', import.meta.url), 'utf8');
-  assert.ok(source.indexOf("process.env.PLAYWRIGHT_BROWSERS_PATH = '0'") < source.indexOf("await import('playwright')"));
+  assert.match(source, /Honor the runtime image's configured browser path/);
+  assert.doesNotMatch(source, /process\.env\.PLAYWRIGHT_BROWSERS_PATH = '0'/);
 });
 
 test('production runtime pins the Playwright image and runs the app as the crawler user', () => {
