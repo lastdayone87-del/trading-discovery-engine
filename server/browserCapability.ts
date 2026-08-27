@@ -1,9 +1,23 @@
+import { constants as fsConstants } from 'node:fs';
+import { access, stat } from 'node:fs/promises';
+
 export type BrowserCapabilityStatus = 'UNKNOWN' | 'READY' | 'UNAVAILABLE';
 export type BrowserFailureClass =
   | 'BROWSER_BINARY_MISSING'
   | 'BROWSER_LINUX_DEPENDENCY_MISSING'
   | 'BROWSER_PERMISSION_DENIED'
   | 'BROWSER_LAUNCH_FAILED';
+
+export interface BrowserExecutableProbe {
+  pathClass: 'PLAYWRIGHT_LOCAL_BROWSER' | 'PLAYWRIGHT_MANAGED_BROWSER';
+  exists: boolean;
+  mode?: string;
+  ownerUid?: number;
+  ownerGid?: number;
+  readableByProcess?: boolean;
+  executableByProcess?: boolean;
+  probeErrorCode?: 'EACCES' | 'EPERM' | 'ENOENT' | 'UNKNOWN';
+}
 
 export interface BrowserCapabilitySnapshot {
   status: BrowserCapabilityStatus;
@@ -18,6 +32,10 @@ export interface BrowserCapabilitySnapshot {
   lastFailureAt?: string;
   attestation: 'CHROMIUM_LAUNCH_CLOSE';
   probeInFlight?: boolean;
+  runtimeUid?: number;
+  runtimeGid?: number;
+  executableProbe?: BrowserExecutableProbe;
+  launchErrorCode?: 'EACCES' | 'EPERM' | 'ENOENT' | 'UNKNOWN';
 }
 
 export const BROWSER_RUNTIME_UNAVAILABLE = 'BROWSER_RUNTIME_UNAVAILABLE';
@@ -37,6 +55,34 @@ let snapshot: BrowserCapabilitySnapshot = {
   attestation: 'CHROMIUM_LAUNCH_CLOSE'
 };
 let activeProbe: Promise<BrowserCapabilitySnapshot> | undefined;
+
+type BrowserCapabilityDiagnostics = Pick<BrowserCapabilitySnapshot, 'runtimeUid' | 'runtimeGid' | 'executableProbe' | 'launchErrorCode'>;
+
+function safeErrorCode(error: unknown): BrowserCapabilitySnapshot['launchErrorCode'] {
+  const value = error && typeof error === 'object' ? error as { code?: unknown; cause?: unknown } : undefined;
+  const code = String(value?.code || (value?.cause && typeof value.cause === 'object' ? (value.cause as { code?: unknown }).code : '') || '').toUpperCase();
+  return code === 'EACCES' || code === 'EPERM' || code === 'ENOENT' ? code : 'UNKNOWN';
+}
+
+export async function inspectBrowserExecutable(executablePath: string): Promise<BrowserExecutableProbe> {
+  const probe: BrowserExecutableProbe = {
+    pathClass: process.env.PLAYWRIGHT_BROWSERS_PATH === '0' ? 'PLAYWRIGHT_LOCAL_BROWSER' : 'PLAYWRIGHT_MANAGED_BROWSER',
+    exists: false,
+  };
+  try {
+    const details = await stat(executablePath);
+    probe.exists = details.isFile();
+    probe.mode = (details.mode & 0o777).toString(8).padStart(3, '0');
+    probe.ownerUid = details.uid;
+    probe.ownerGid = details.gid;
+  } catch (error) {
+    probe.probeErrorCode = safeErrorCode(error) || 'UNKNOWN';
+    return probe;
+  }
+  try { await access(executablePath, fsConstants.R_OK); probe.readableByProcess = true; } catch { probe.readableByProcess = false; }
+  try { await access(executablePath, fsConstants.X_OK); probe.executableByProcess = true; } catch { probe.executableByProcess = false; }
+  return probe;
+}
 
 function errorText(error: unknown, seen = new Set<unknown>()): string {
   if (error && typeof error === 'object') {
@@ -76,7 +122,7 @@ export function browserCapabilityIsUnavailable(): boolean {
   return snapshot.status === 'UNAVAILABLE';
 }
 
-export function markBrowserCapabilityReady(browserVersion?: string): BrowserCapabilitySnapshot {
+export function markBrowserCapabilityReady(browserVersion?: string, diagnostics: BrowserCapabilityDiagnostics = {}): BrowserCapabilitySnapshot {
   const now = new Date().toISOString();
   snapshot = {
     ...snapshot,
@@ -86,12 +132,14 @@ export function markBrowserCapabilityReady(browserVersion?: string): BrowserCapa
     failureClass: undefined,
     consecutiveFailures: 0,
     lastSuccessAt: now,
-    attestation: 'CHROMIUM_LAUNCH_CLOSE'
+    attestation: 'CHROMIUM_LAUNCH_CLOSE',
+    ...diagnostics,
+    launchErrorCode: undefined,
   };
   return browserCapabilitySnapshot();
 }
 
-export function markBrowserCapabilityUnavailable(error: unknown): BrowserCapabilitySnapshot {
+export function markBrowserCapabilityUnavailable(error: unknown, diagnostics: BrowserCapabilityDiagnostics = {}): BrowserCapabilitySnapshot {
   const now = new Date().toISOString();
   snapshot = {
     ...snapshot,
@@ -100,7 +148,9 @@ export function markBrowserCapabilityUnavailable(error: unknown): BrowserCapabil
     failureClass: classifyBrowserFailure(error),
     consecutiveFailures: snapshot.consecutiveFailures + 1,
     lastFailureAt: now,
-    attestation: 'CHROMIUM_LAUNCH_CLOSE'
+    attestation: 'CHROMIUM_LAUNCH_CLOSE',
+    ...diagnostics,
+    launchErrorCode: diagnostics.launchErrorCode || safeErrorCode(error),
   };
   return browserCapabilitySnapshot();
 }
@@ -112,18 +162,22 @@ export async function probeBrowserCapability(): Promise<BrowserCapabilitySnapsho
   }
   const startedAt = Date.now();
   const startedIso = new Date(startedAt).toISOString();
-  snapshot = { ...snapshot, probeStartedAt: startedIso, probeInFlight: true };
+  const runtimeUid = process.getuid?.();
+  const runtimeGid = process.getgid?.();
+  let executableProbe: BrowserExecutableProbe | undefined;
+  snapshot = { ...snapshot, probeStartedAt: startedIso, probeInFlight: true, runtimeUid, runtimeGid };
   activeProbe = (async () => {
     try {
       const { chromium } = await import('playwright');
+      executableProbe = await inspectBrowserExecutable(chromium.executablePath());
       const browser = await chromium.launch(browserLaunchOptions());
       const version = browser.version();
       await browser.close();
-      const result = markBrowserCapabilityReady(version);
+      const result = markBrowserCapabilityReady(version, { runtimeUid, runtimeGid, executableProbe });
       snapshot = { ...result, probeFinishedAt: new Date().toISOString(), probeDurationMs: Date.now() - startedAt };
       return browserCapabilitySnapshot();
     } catch (error) {
-      const result = markBrowserCapabilityUnavailable(error);
+      const result = markBrowserCapabilityUnavailable(error, { runtimeUid, runtimeGid, executableProbe, launchErrorCode: safeErrorCode(error) });
       snapshot = { ...result, probeFinishedAt: new Date().toISOString(), probeDurationMs: Date.now() - startedAt };
       return browserCapabilitySnapshot();
     }
