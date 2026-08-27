@@ -38,13 +38,31 @@ export function nextPacificQuotaResetAt(quotaDay: string): Date | null {
   return new Date(candidate);
 }
 
-/** Normalize only the reset presentation; per-key quota values come from the durable backend projection. */
+/** Normalize only dashboard presentation; durable queue and quota values come from the backend projection. */
 export function normalizeQueueStatusForDashboard(payload: any): any {
-  if (!payload || typeof payload !== 'object' || !payload.quota || typeof payload.quota !== 'object') return payload;
-  const quota = { ...payload.quota };
-  const nextReset = nextPacificQuotaResetAt(quota.lastReset);
-  if (nextReset) quota.lastReset = `next ${nextReset.toLocaleString()}`;
-  return { ...payload, quota };
+  if (!payload || typeof payload !== 'object') return payload;
+  const quota = payload.quota && typeof payload.quota === 'object' ? { ...payload.quota } : payload.quota;
+  if (quota && typeof quota === 'object') {
+    const nextReset = nextPacificQuotaResetAt(quota.lastReset);
+    if (nextReset) quota.lastReset = `next ${nextReset.toLocaleString()}`;
+  }
+  const queues = payload.queues && typeof payload.queues === 'object'
+    ? {
+        ...payload.queues,
+        communityRetry: {
+          duePending: 0,
+          dueBrowserBlocked: 0,
+          dueReconciliationBlocked: 0,
+          dueClaimable: 0,
+          processing: 0,
+          staleProcessing: 0,
+          oldestDueAt: null,
+          oldestProcessingAt: null,
+          ...(payload.queues.communityRetry && typeof payload.queues.communityRetry === 'object' ? payload.queues.communityRetry : {})
+        }
+      }
+    : payload.queues;
+  return { ...payload, ...(quota && typeof quota === 'object' ? { quota } : {}), ...(queues && typeof queues === 'object' ? { queues } : {}) };
 }
 
 function isQueueStatusRequest(input: RequestInfo | URL): boolean {

@@ -690,6 +690,16 @@ export async function getQueueStatus(): Promise<QueueStatus> {
     searchJobs: { depth: searchDepth, isPaused: !!pausedMap['search_jobs'] },
     channelProcessing: { depth: channelProcessingDepth, isPaused: !!pausedMap['channel_processing'] },
     discordValidation: { depth: discordValidationDepth, isPaused: !!pausedMap['discord_validation'] },
+    communityRetry: {
+      duePending: 0,
+      dueBrowserBlocked: 0,
+      dueReconciliationBlocked: 0,
+      dueClaimable: 0,
+      processing: 0,
+      staleProcessing: 0,
+      oldestDueAt: null,
+      oldestProcessingAt: null
+    },
     pendingWork: []
   };
 }

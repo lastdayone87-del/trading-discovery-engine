@@ -405,6 +405,27 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
         </> : <div className="p-4 text-xs text-slate-500">Loading backlog diagnosis…</div>}
       </section>
 
+      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800">
+          <div className="flex items-center gap-2"><Cpu className="w-4 h-4 text-indigo-600 dark:text-indigo-400" /><h3 className="text-sm font-bold">Community Retry Admission</h3></div>
+          <p className="text-[11px] text-slate-500 mt-1">Aggregate read-only explanation of due retry rows; admission safeguards and retry limits are unchanged.</p>
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-px bg-slate-200 dark:bg-slate-800">
+          {[
+            ['Due pending', queueStatus.communityRetry.duePending],
+            ['Browser blocked', queueStatus.communityRetry.dueBrowserBlocked],
+            ['Claimable', queueStatus.communityRetry.dueClaimable],
+            ['Processing', queueStatus.communityRetry.processing],
+            ['Stale processing', queueStatus.communityRetry.staleProcessing],
+          ].map(([label, value]) => <div key={String(label)} className="bg-white dark:bg-slate-900 p-3"><div className="text-[9px] uppercase tracking-wider font-bold text-slate-500">{label}</div><div className="mt-1 text-xl font-extrabold font-mono">{value}</div></div>)}
+        </div>
+        <div className="px-4 py-3 text-[10px] text-slate-500 dark:text-slate-400 flex flex-wrap gap-x-5 gap-y-1">
+          <span>Oldest due: <span className="font-mono">{queueStatus.communityRetry.oldestDueAt ? new Date(queueStatus.communityRetry.oldestDueAt).toLocaleString() : '—'}</span></span>
+          <span>Oldest processing: <span className="font-mono">{queueStatus.communityRetry.oldestProcessingAt ? new Date(queueStatus.communityRetry.oldestProcessingAt).toLocaleString() : '—'}</span></span>
+          <span>Reconciliation blocked: <span className="font-mono">{queueStatus.communityRetry.dueReconciliationBlocked}</span></span>
+        </div>
+      </section>
+
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {queues.map(q => (
           <div key={q.key} className={`p-4 rounded-xl border transition-all ${q.data.isPaused ? 'border-amber-200 bg-amber-50/30 dark:border-amber-900/40 dark:bg-amber-950/10' : 'border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 shadow-xs'}`}>

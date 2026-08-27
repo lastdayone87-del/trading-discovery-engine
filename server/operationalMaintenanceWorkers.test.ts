@@ -11,6 +11,22 @@ test('community retry has a continuously started dedicated consumer', () => {
   assert.match(workers, /startCommunityRetryWorker/);
 });
 
+test('community retry distinguishes due admission blockers from a genuinely empty queue', () => {
+  assert.match(workers, /DUE_BUT_BROWSER_UNAVAILABLE/);
+  assert.match(workers, /DUE_BUT_RECONCILIATION_BLOCKED/);
+  assert.match(workers, /DUE_BUT_CLAIM_RACE/);
+  assert.match(workers, /DUE_BUT_LEASED/);
+  assert.match(workers, /communityRetry/);
+});
+
+test('queue status exposes browser-blocked and claimable due retry counts', () => {
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  assert.match(dbCore, /due_browser_blocked/);
+  assert.match(dbCore, /due_reconciliation_blocked/);
+  assert.match(dbCore, /dueClaimable/);
+  assert.match(dbCore, /waiting_for_browser_runtime/);
+});
+
 test('ordinary official rescans use the shared ENRICHMENT worst-case reservation', () => {
   assert.match(workers, /'POST_APPROVAL_ENRICH'/);
   assert.match(workers, /'FORCE_REVIEW_RESCAN'/);

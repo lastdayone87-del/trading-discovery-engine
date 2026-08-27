@@ -277,10 +277,22 @@ export interface ExcludedCountry {
   reason: string;
 }
 
+export interface CommunityRetryAdmissionDiagnostics {
+  duePending: number;
+  dueBrowserBlocked: number;
+  dueReconciliationBlocked: number;
+  dueClaimable: number;
+  processing: number;
+  staleProcessing: number;
+  oldestDueAt: string | null;
+  oldestProcessingAt: string | null;
+}
+
 export interface QueueStatus {
   searchJobs: { depth: number; isPaused: boolean };
   channelProcessing: { depth: number; isPaused: boolean };
   discordValidation: { depth: number; isPaused: boolean };
+  communityRetry: CommunityRetryAdmissionDiagnostics;
   pendingWork: Array<{ id: string; type: string; waitingReason: string; retryAt: string | null; priority: number; ageMs: number; lastProviderError: string | null }>;
 }
 
