@@ -4,6 +4,7 @@ import {
   BROWSER_RUNTIME_UNAVAILABLE,
   browserCapabilityIsUnavailable,
   browserCapabilitySnapshot,
+  inspectBrowserExecutable,
   isBrowserRuntimeFailure,
   browserLaunchOptions,
   classifyBrowserFailure,
@@ -36,12 +37,23 @@ test('navigation timeouts remain page-level failures and do not demote browser c
   assert.equal(browserCapabilityIsUnavailable(), false);
 });
 
+test('browser executable diagnostics expose only safe permission metadata', async () => {
+  const probe = await inspectBrowserExecutable(process.execPath);
+  assert.equal(probe.exists, true);
+  assert.equal(probe.readableByProcess, true);
+  assert.equal(probe.executableByProcess, true);
+  assert.match(probe.mode || '', /^0?[0-7]{3,4}$/);
+  assert.equal('path' in probe, false);
+});
+
 test('browser capability attestation metadata is bounded and does not expose launch errors', () => {
   const failed = markBrowserCapabilityUnavailable(new Error('private launch detail must not be persisted'));
   assert.equal(failed.status, 'UNAVAILABLE');
   assert.equal(failed.consecutiveFailures >= 1, true);
   assert.equal(failed.failureClass, 'BROWSER_LAUNCH_FAILED');
   assert.equal('message' in failed, false);
+  assert.equal('cause' in failed, false);
+  assert.equal('path' in (failed.executableProbe || {}), false);
   assert.equal(failed.attestation, 'CHROMIUM_LAUNCH_CLOSE');
 });
 
