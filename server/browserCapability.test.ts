@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'; import test from 'node:test'; import fs from 'node:fs';
+import { readFileSync } from 'node:fs';
 
 import {
   BROWSER_RUNTIME_UNAVAILABLE,
@@ -10,6 +11,7 @@ import {
   classifyBrowserFailure,
   markBrowserCapabilityReady,
   markBrowserCapabilityUnavailable,
+  withBrowserRuntimeLease,
 } from './browserCapability';
 
 test('browser path is fixed before the Playwright import is evaluated', () => {
@@ -17,11 +19,44 @@ test('browser path is fixed before the Playwright import is evaluated', () => {
   assert.ok(source.indexOf("process.env.PLAYWRIGHT_BROWSERS_PATH = '0'") < source.indexOf("await import('playwright')"));
 });
 
+test('production runtime pins the Playwright image and runs the app as the crawler user', () => {
+  const dockerfile = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  assert.match(dockerfile, /^FROM mcr\.microsoft\.com\/playwright:v1\.62\.1-noble/m);
+  assert.match(dockerfile, /PLAYWRIGHT_BROWSERS_PATH=\/ms-playwright/);
+  assert.match(dockerfile, /PLAYWRIGHT_SKIP_BROWSER_GC=1/);
+  assert.match(dockerfile, /RUN chown -R pwuser:pwuser \/app/);
+  assert.match(dockerfile, /USER pwuser/);
+  assert.match(dockerfile, /npm run migrate && npm run start/);
+});
+
 test('browser launch options are safe for the runtime user and shared by the probe and crawler', () => {
   const options = browserLaunchOptions();
   assert.equal(options.headless, true);
-  if (process.getuid?.() === 0) assert.deepEqual(options.args, ['--no-sandbox', '--disable-setuid-sandbox']);
+  assert.equal(options.timeout >= 5_000 && options.timeout <= 30_000, true);
+  if (process.getuid?.() === 0) assert.deepEqual(options.args, ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']);
   else assert.equal(options.args, undefined);
+});
+
+test('browser runtime lease serializes probe and crawler operations', async () => {
+  const events: string[] = [];
+  const first = withBrowserRuntimeLease(async () => {
+    events.push('first:start');
+    await new Promise(resolve => setTimeout(resolve, 5));
+    events.push('first:end');
+  });
+  const second = withBrowserRuntimeLease(async () => {
+    events.push('second:start');
+    events.push('second:end');
+  });
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ['first:start', 'first:end', 'second:start', 'second:end']);
+});
+
+test('browser monitor schedules bounded recovery checks after each completed probe', () => {
+  const source = fs.readFileSync(new URL('./browserCapability.ts', import.meta.url), 'utf8');
+  assert.match(source, /const nextIntervalMs = result\.status === 'READY' \? healthyIntervalMs : degradedIntervalMs/);
+  assert.match(source, /timer = setTimeout\(\(\) => \{ void check\(\); \}, nextIntervalMs\)/);
+  assert.doesNotMatch(source, /const timer = setInterval/);
 });
 
 test('browser runtime failures are classified separately from ordinary site failures', () => {

@@ -2,6 +2,9 @@ import { constants as fsConstants } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 
 export type BrowserCapabilityStatus = 'UNKNOWN' | 'READY' | 'UNAVAILABLE';
+const DEFAULT_BROWSER_LAUNCH_TIMEOUT_MS = 15_000;
+const MIN_BROWSER_LAUNCH_TIMEOUT_MS = 5_000;
+const MAX_BROWSER_LAUNCH_TIMEOUT_MS = 30_000;
 export type BrowserFailureClass =
   | 'BROWSER_BINARY_MISSING'
   | 'BROWSER_LINUX_DEPENDENCY_MISSING'
@@ -43,10 +46,14 @@ export const BROWSER_RUNTIME_UNAVAILABLE = 'BROWSER_RUNTIME_UNAVAILABLE';
 // Keep install-time and runtime resolution identical in Railway/Nixpacks images.
 if (process.env.PLAYWRIGHT_BROWSERS_PATH !== '0') process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
 
-export function browserLaunchOptions(): { headless: true; args?: string[] } {
+export function browserLaunchOptions(): { headless: true; args?: string[]; timeout: number } {
+  const configuredTimeout = Number(process.env.BROWSER_LAUNCH_TIMEOUT_MS);
+  const timeout = Number.isFinite(configuredTimeout)
+    ? Math.min(MAX_BROWSER_LAUNCH_TIMEOUT_MS, Math.max(MIN_BROWSER_LAUNCH_TIMEOUT_MS, Math.floor(configuredTimeout)))
+    : DEFAULT_BROWSER_LAUNCH_TIMEOUT_MS;
   return process.getuid?.() === 0
-    ? { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-    : { headless: true };
+    ? { headless: true, timeout, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }
+    : { headless: true, timeout };
 }
 
 let snapshot: BrowserCapabilitySnapshot = {
@@ -55,6 +62,20 @@ let snapshot: BrowserCapabilitySnapshot = {
   attestation: 'CHROMIUM_LAUNCH_CLOSE'
 };
 let activeProbe: Promise<BrowserCapabilitySnapshot> | undefined;
+let browserRuntimeLeaseTail: Promise<void> = Promise.resolve();
+
+/** Serialize attestation and real crawler browser launches in one process. */
+export async function withBrowserRuntimeLease<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = browserRuntimeLeaseTail;
+  let release!: () => void;
+  browserRuntimeLeaseTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
 
 type BrowserCapabilityDiagnostics = Pick<BrowserCapabilitySnapshot, 'runtimeUid' | 'runtimeGid' | 'executableProbe' | 'launchErrorCode'>;
 
@@ -119,7 +140,7 @@ export function browserCapabilitySnapshot(): BrowserCapabilitySnapshot {
 }
 
 export function browserCapabilityIsUnavailable(): boolean {
-  return snapshot.status === 'UNAVAILABLE';
+  return snapshot.status !== 'READY';
 }
 
 export function markBrowserCapabilityReady(browserVersion?: string, diagnostics: BrowserCapabilityDiagnostics = {}): BrowserCapabilitySnapshot {
@@ -170,9 +191,14 @@ export async function probeBrowserCapability(): Promise<BrowserCapabilitySnapsho
     try {
       const { chromium } = await import('playwright');
       executableProbe = await inspectBrowserExecutable(chromium.executablePath());
-      const browser = await chromium.launch(browserLaunchOptions());
-      const version = browser.version();
-      await browser.close();
+      const version = await withBrowserRuntimeLease(async () => {
+        const browser = await chromium.launch(browserLaunchOptions());
+        try {
+          return browser.version();
+        } finally {
+          await browser.close();
+        }
+      });
       const result = markBrowserCapabilityReady(version, { runtimeUid, runtimeGid, executableProbe });
       snapshot = { ...result, probeFinishedAt: new Date().toISOString(), probeDurationMs: Date.now() - startedAt };
       return browserCapabilitySnapshot();
@@ -192,17 +218,20 @@ export async function probeBrowserCapability(): Promise<BrowserCapabilitySnapsho
 
 export function startBrowserCapabilityMonitor(intervalMs = 60_000): () => void {
   let stopped = false;
-  const check = async () => {
+  let timer: NodeJS.Timeout | undefined;
+  const healthyIntervalMs = Math.max(30_000, intervalMs);
+  const degradedIntervalMs = Math.max(30_000, Math.min(healthyIntervalMs, 30_000));
+  const check = async (): Promise<void> => {
     if (stopped) return;
-    await probeBrowserCapability();
+    const result = await probeBrowserCapability();
+    if (stopped) return;
+    const nextIntervalMs = result.status === 'READY' ? healthyIntervalMs : degradedIntervalMs;
+    timer = setTimeout(() => { void check(); }, nextIntervalMs);
+    timer.unref?.();
   };
   void check();
-  const timer = setInterval(() => {
-    void check();
-  }, Math.max(30_000, intervalMs));
-  timer.unref?.();
   return () => {
     stopped = true;
-    clearInterval(timer);
+    if (timer) clearTimeout(timer);
   };
 }

@@ -48,7 +48,7 @@
     "@google/genai": "^2.4.0",
     "cheerio": "^1.2.0",
     "crawlee": "^3.17.0",
-    "playwright": "^1.62.0",
+    "playwright": "1.62.1",
     "youtube-search-api": "^1.2.2",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
