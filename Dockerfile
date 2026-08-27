@@ -15,4 +15,4 @@ RUN chown -R pwuser:pwuser /app
 
 USER pwuser
 
-CMD ["sh", "-c", "npm run migrate && npm run start"]
+CMD ["npm", "run", "start"]

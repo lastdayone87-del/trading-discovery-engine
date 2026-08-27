@@ -26,7 +26,8 @@ test('production runtime pins the Playwright image and runs the app as the crawl
   assert.match(dockerfile, /PLAYWRIGHT_SKIP_BROWSER_GC=1/);
   assert.match(dockerfile, /RUN chown -R pwuser:pwuser \/app/);
   assert.match(dockerfile, /USER pwuser/);
-  assert.match(dockerfile, /npm run migrate && npm run start/);
+  assert.match(dockerfile, /CMD \["npm", "run", "start"\]/);
+  assert.doesNotMatch(dockerfile, /npm run migrate && npm run start/);
 });
 
 test('browser launch options are safe for the runtime user and shared by the probe and crawler', () => {
