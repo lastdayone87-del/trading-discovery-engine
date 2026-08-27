@@ -58,11 +58,11 @@ test('claim tracing cannot participate in or roll back the durable job claim',()
   assert.match(claim,/Claim trace unavailable; discovery claim remains committed/);
 });
 
-test('migration versions are unique and Railway runs them before application startup',()=>{
+test('migration versions are unique and application startup owns database initialization',()=>{
   const migrationNames=fs.readdirSync(new URL('./db/migrations/',import.meta.url)).filter(name=>name.endsWith('.sql'));
   const versions=migrationNames.map(name=>name.split('_')[0]);
   assert.equal(new Set(versions).size,versions.length);
   assert.ok(migrationNames.includes('034_discovery_execution_trace.sql'));
   const railway=JSON.parse(fs.readFileSync(new URL('../railway.json',import.meta.url),'utf8'));
-  assert.equal(railway.deploy.startCommand,'npm run migrate && npm run start');
+  assert.equal(railway.deploy.startCommand,'npm run start');
 });
