@@ -13,6 +13,12 @@ COPY . ./
 RUN npm run build
 RUN chown -R pwuser:pwuser /app
 
+USER root
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y tini \
+    && rm -rf /var/lib/apt/lists/*
+
 USER pwuser
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["npm", "run", "start"]
