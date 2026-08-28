@@ -4,6 +4,7 @@ import { validateChannelCountry } from './countryValidator';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
 import { inspectAndValidateChannel } from './queueManager';
+import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData, shouldAttemptPublicAboutCountryFallback } from './youtubePublicAbout';
 import {
   getChannelById,
   upsertChannel,
@@ -223,6 +224,33 @@ export async function processChannelThroughPipeline(
     countryVal = await validateChannelCountry({ channelName:candidate.channelName, description:candidate.description,
       videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus }, targetCountry);
   }
+
+  // Gate 1 evidence-only fallback: if the Data API metadata path is unavailable,
+  // country remains uncertain, and the candidate still lacks usable About text,
+  // retrieve the public channel page without an API key and re-run the same
+  // country validator. This does not alter exclusion policy or uncertainty rules.
+  if (shouldAttemptPublicAboutCountryFallback({
+    countryStatus: countryVal.status,
+    countryMetadataStatus: candidate.countryMetadataStatus,
+    description: candidate.description,
+  })) {
+    try {
+      const liveAbout = await fetchLiveYouTubeChannelData(candidate.youtubeUrl);
+      if (applyPublicAboutToCandidate(candidate, liveAbout)) {
+        countryVal = await validateChannelCountry({
+          channelName: candidate.channelName,
+          description: candidate.description,
+          videoTitles: candidate.videoTitles,
+          locationTag: candidate.locationTag,
+          externalLinks: candidate.channelLinks,
+          metadataStatus: candidate.countryMetadataStatus,
+        }, targetCountry);
+      }
+    } catch (error) {
+      console.warn(`[Unified Ingestion Pipeline - Gate 1] Public About fallback failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
+    }
+  }
+
   const resolvedCountry = countryVal.detectedCountry || targetCountry;
 
   const countryValidationStep = {
