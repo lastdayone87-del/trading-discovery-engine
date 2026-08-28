@@ -53,6 +53,12 @@ export async function runGeminiRouteFailover<T>(routes: GeminiRoute[], call: (ro
       return await call(route);
     } catch (error) {
       lastError = error;
+      // Gemini rate limits are project-level, not API-key-level. Failing over to
+      // another key after a 429 can therefore multiply the burst and make the
+      // provider pressure worse. Let providerResilience persist the 429 and
+      // enforce the shared cooldown instead. Failover remains useful for other
+      // retryable failures such as transient transport errors.
+      if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') throw error;
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
     }
   }
