@@ -146,7 +146,7 @@ export function browserCapabilitySnapshot(): BrowserCapabilitySnapshot {
 }
 
 export function browserCapabilityIsUnavailable(): boolean {
-  return snapshot.status !== 'READY';
+  return snapshot.status === 'UNAVAILABLE';
 }
 
 export function markBrowserCapabilityReady(browserVersion?: string, diagnostics: BrowserCapabilityDiagnostics = {}): BrowserCapabilitySnapshot {
