@@ -31,6 +31,7 @@
     "phasee:evaluate-query-feedback": "tsx scripts/phaseEEvaluateQueryFeedback.ts",
     "creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts",
     "phase4:replay": "tsx scripts/phase4Replay.ts",
+    "semantic:benchmark": "tsx scripts/semanticProviderBenchmark.ts",
     "phase5:verify": "npm test && npm run lint && npm run build",
     "phase6:verify": "npm test && npm run lint && npm run build",
     "phase7:verify": "npm test && npm run lint && npm run build",
@@ -52,8 +53,8 @@
     "youtube-search-api": "^1.2.2",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
+    "autoprefixer": "^10.4.21",
     "clsx": "^2.1.1",
-    "date-fns": "^4.1.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
@@ -62,7 +63,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "sql.js": "^1.13.0",
-    "tailwind-merge": "^3.5.0",
+    "tailwindcss": "^4.1.14",
     "vite": "^6.2.0"
   },
   "devDependencies": {
@@ -71,9 +72,6 @@
     "@types/pg": "^8.15.5",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
-    "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
