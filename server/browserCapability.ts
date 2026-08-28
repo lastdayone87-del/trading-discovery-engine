@@ -47,14 +47,19 @@ export const BROWSER_RUNTIME_UNAVAILABLE = 'BROWSER_RUNTIME_UNAVAILABLE';
 // uses /ms-playwright; local/Nixpacks setups may explicitly use PLAYWRIGHT_BROWSERS_PATH=0.
 // Do not overwrite either choice before importing Playwright.
 
-export function browserLaunchOptions(): { headless: true; args?: string[]; timeout: number } {
+export function browserLaunchOptions(): { headless: true; args: string[]; timeout: number } {
   const configuredTimeout = Number(process.env.BROWSER_LAUNCH_TIMEOUT_MS);
   const timeout = Number.isFinite(configuredTimeout)
     ? Math.min(MAX_BROWSER_LAUNCH_TIMEOUT_MS, Math.max(MIN_BROWSER_LAUNCH_TIMEOUT_MS, Math.floor(configuredTimeout)))
     : DEFAULT_BROWSER_LAUNCH_TIMEOUT_MS;
-  return process.getuid?.() === 0
-    ? { headless: true, timeout, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }
-    : { headless: true, timeout };
+  // Railway containers can expose a small /dev/shm. Keep the capability attestation
+  // on the same resilient Chromium launch path used by the crawler instead of allowing
+  // the health probe to fail solely because Chromium's shared-memory segment is full.
+  const args = ['--disable-dev-shm-usage'];
+  if (process.getuid?.() === 0) {
+    args.push('--no-sandbox', '--disable-setuid-sandbox');
+  }
+  return { headless: true, timeout, args };
 }
 
 let snapshot: BrowserCapabilitySnapshot = {
