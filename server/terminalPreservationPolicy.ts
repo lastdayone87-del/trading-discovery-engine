@@ -35,6 +35,12 @@ export function machineNonTradingRediscoveryEligible(existing: ChannelRecord, no
  * merely earns the channel another chance to collect fresh independent creator
  * evidence if the current retrieval-admission policy still finds a plausible
  * trading hypothesis.
+ *
+ * IMPORTANT: an existing row whose country is still UNCERTAIN is not a
+ * country-terminal decision. It must be allowed back through Gate 1 so fresh
+ * first-party channel evidence (including the About/bio) can be resolved before
+ * the row is preserved. Otherwise a previously admitted excluded-country
+ * creator can remain permanently hidden behind a stale UNCERTAIN country state.
  */
 export function shouldPreserveExistingChannel(
   existing: ChannelRecord,
@@ -51,6 +57,13 @@ export function shouldPreserveExistingChannel(
       existing.trading_status === 'HUMAN_REJECTED' ||
       existing.scan_status === 'SKIPPED_EXCLUDED';
     if (hardTerminal) return true;
+
+    // Country uncertainty is explicitly non-terminal. Re-run Gate 1 so the
+    // current creator evidence can resolve the country and apply exclusions.
+    // This check intentionally comes before the trading-status preservation
+    // rules below: a TRADING_CONFIRMED row with UNCERTAIN country must not
+    // bypass country policy.
+    if (existing.country_status === 'UNCERTAIN') return false;
 
     const machineNonTrading = existing.trading_status === 'NON_TRADING' || existing.scan_status === 'SKIPPED_NON_TRADING';
     if (machineNonTrading) {
