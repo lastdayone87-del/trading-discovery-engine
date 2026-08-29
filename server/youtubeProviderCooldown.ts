@@ -33,3 +33,12 @@ export class YouTubeProviderCooldown{
 export class YouTubeProvidersCoolingDownError extends Error{readonly code='YOUTUBE_PROVIDERS_COOLING_DOWN';readonly retryable=true;readonly errorClass='RATE_LIMIT';readonly retryAfterMs:number;constructor(public readonly retryAt:number){super(`Every configured YouTube provider is cooling down; retry is scheduled for ${new Date(retryAt).toISOString()}.`);this.name='YouTubeProvidersCoolingDownError';this.retryAfterMs=Math.max(0,retryAt-Date.now());}}
 const nonNegativeNumber=(value:string|undefined,fallback:number):number=>{const parsed=Number(value);return Number.isFinite(parsed)&&parsed>=0?parsed:fallback;};
 export const youtubeProviderCooldown=new YouTubeProviderCooldown({initialRateLimitCooldownMs:nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_BACKOFF_MS,5_000),maxRateLimitCooldownMs:nonNegativeNumber(process.env.YOUTUBE_RATE_LIMIT_MAX_BACKOFF_MS,5*60_000),suspendedProviderCooldownMs:nonNegativeNumber(process.env.YOUTUBE_SUSPENDED_PROVIDER_COOLDOWN_MS,24*60*60_000),runtimeRateLimitPauseMs:nonNegativeNumber(process.env.YOUTUBE_RUNTIME_RATE_LIMIT_PAUSE_MS,1_000)});
+
+export function isQuotaExceeded(error: unknown): boolean {
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    if (current.quotaExceeded === true || /quotaExceeded|dailyLimitExceeded|CONSUMER_SUSPENDED/i.test(String(current.message ?? ''))) return true;
+    if (current.providerReasons?.some((reason: unknown) => /consumer[_-]?suspended/i.test(String(reason)))) return true;
+  }
+  return false;
+}
