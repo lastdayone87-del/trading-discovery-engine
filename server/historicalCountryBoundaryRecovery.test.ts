@@ -28,6 +28,13 @@ test('historical country recovery restores machine ownership for eligible rows',
   assert.match(migration, /LEGACY_TARGET_COUNTRY_BOUNDARY_FALSE_REJECTION/);
   assert.match(migration, /active_job\.status IN \('PENDING','PROCESSING'\)/);
   assert.match(migration, /ON CONFLICT\(idempotency_key\) DO NOTHING/);
+  assert.match(migration, /'enrichmentStage',\s*0/);
+});
+
+test('recovered ENRICH_CHANNEL job does not bypass metadata acquisition', () => {
+  const stage0Index = migration.indexOf("'enrichmentStage',0");
+  const jobInsertIndex = migration.indexOf("INSERT INTO jobs");
+  assert.ok(stage0Index > jobInsertIndex, 'Recovery job payload explicitly sets candidate.enrichmentStage = 0 to enforce fresh metadata fetch');
 });
 
 test('historical country recovery writes an idempotent durable ledger', () => {
