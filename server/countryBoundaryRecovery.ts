@@ -1,7 +1,7 @@
-import { getAllChannels, getExcludedCountries, getDb, enqueueJob, upsertChannel, getChannelById } from './db';
+import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb, enqueueJob, upsertChannel, getChannelById } from './db';
 import { canonicalCountry, inferChannelCountry } from './countryInference';
 import { creatorLevelCountryEvidence } from './countryValidator';
-import type { ChannelRecord } from '../src/types';
+import type { ChannelRecord, CountryVocabulary } from '../src/types';
 
 export const COUNTRY_BOUNDARY_RECOVERY_VERSION = 'country-boundary-nonexcluded-v3';
 export const COUNTRY_BOUNDARY_RECOVERY_JOB = 'COUNTRY_BOUNDARY_REPROCESS';
@@ -51,7 +51,8 @@ export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, excludedC
  */
 export function classifyReconciliationState(
   channel: ChannelRecord,
-  excludedCountries: Array<{ country_name: string }>
+  excludedCountries: Array<{ country_name: string }>,
+  vocabularies: CountryVocabulary[] = []
 ): {
   state: ReconciliationState;
   detectedCountry: string | null;
@@ -68,7 +69,8 @@ export function classifyReconciliationState(
     };
   }
 
-  // Re-evaluate creator-level evidence explicitly excluding discovery search target location tag
+  // Re-evaluate creator-level evidence using standard production extraction path.
+  // Explicitly exclude channel.country location tag to prevent search target contamination.
   const creatorEvidence = creatorLevelCountryEvidence({
     channelName: channel.channel_name,
     description: (channel.inspection_trail || [])
@@ -80,7 +82,7 @@ export function classifyReconciliationState(
     metadataStatus: channel.country_metadata_status
   });
 
-  const inference = inferChannelCountry(creatorEvidence, excludedCountries);
+  const inference = inferChannelCountry(creatorEvidence, excludedCountries, vocabularies);
 
   if (inference.status === 'REJECTED') {
     return {
@@ -131,11 +133,15 @@ export type CountryBoundaryDryRun = {
 };
 
 async function loadCohort(): Promise<CohortRow[]> {
-  const [channels, excludedCountries] = await Promise.all([getAllChannels(), getExcludedCountries()]);
+  const [channels, excludedCountries, vocabularies] = await Promise.all([
+    getAllChannels(),
+    getExcludedCountries(),
+    getCountryVocabularies()
+  ]);
   return channels
     .filter(channel => isNonExcludedBoundaryCandidate(channel, excludedCountries))
     .map(channel => {
-      const reconciliation = classifyReconciliationState(channel, excludedCountries);
+      const reconciliation = classifyReconciliationState(channel, excludedCountries, vocabularies);
       return {
         ...channel,
         reconciliation,
@@ -224,7 +230,11 @@ export async function processCountryBoundaryReprocessJob(
   const channel = await getChannelById(channelId);
   if (!channel) return { channelId, recovered: false, reconciliationState: 'INSUFFICIENT_EVIDENCE', newCountryStatus: 'MISSING' };
 
-  const [excludedCountries, db] = await Promise.all([getExcludedCountries(), getDb()]);
+  const [excludedCountries, vocabularies, db] = await Promise.all([
+    getExcludedCountries(),
+    getCountryVocabularies(),
+    getDb()
+  ]);
   const now = new Date().toISOString();
   const eventKey = `recovery:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:${channelId}`;
 
@@ -234,7 +244,7 @@ export async function processCountryBoundaryReprocessJob(
     return { channelId, recovered: channel.country_status !== 'REJECTED', reconciliationState: 'RECOVERABLE_NON_EXCLUDED', newCountryStatus: channel.country_status };
   }
 
-  const classification = classifyReconciliationState(channel, excludedCountries);
+  const classification = classifyReconciliationState(channel, excludedCountries, vocabularies);
 
   if (classification.state === 'RETAIN_EXCLUDED' || classification.state === 'LEGITIMATE_REJECTION') {
     // Record auditable retention event for retained rejections
