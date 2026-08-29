@@ -32,12 +32,13 @@ export function hasPinnedBoundaryRejection(channel: ChannelRecord): boolean {
  */
 export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, excludedCountries: Array<{ country_name: string }>): boolean {
   const excluded = new Set(excludedCountries.map(item => canonicalCountry(item.country_name).toLocaleLowerCase('en')));
-  const isExcluded = excluded.has(canonicalCountry(channel.country || '').toLocaleLowerCase('en'));
+  const isStoredCountryExcluded = excluded.has(canonicalCountry(channel.country || '').toLocaleLowerCase('en'));
 
-  // A candidate must either be currently REJECTED or have a target-boundary rejection recorded in trail,
-  // AND its stored country must NOT be in current excluded_countries (unless we re-evaluate creator evidence).
+  // A candidate must be currently REJECTED or carry a recorded target boundary rejection in its trail.
+  // Crucially, if the stored country is currently in excluded_countries, it is NOT an automatic candidate
+  // unless we explicitly re-evaluate creator evidence.
   return (channel.country_status === 'REJECTED' || hasPinnedBoundaryRejection(channel))
-    && (!isExcluded || hasPinnedBoundaryRejection(channel));
+    && !isStoredCountryExcluded;
 }
 
 /**
