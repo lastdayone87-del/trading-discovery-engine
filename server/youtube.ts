@@ -406,8 +406,8 @@ export function isConsumerSuspended(error: unknown): boolean {
     if (current.quotaExceeded === true) return false;
     const is403 = current.status === 403 || /\b403\b/i.test(String(current.message ?? ''));
     const isPermissionDenied = /^PERMISSION_DENIED$/i.test(String(current.status ?? '')) || /\bPERMISSION_DENIED\b/i.test(String(current.message ?? ''));
-    const hasSuspendedReason = current.providerReasons?.some((reason: unknown) => /^consumerSuspended$/i.test(String(reason)))
-      || /\bconsumerSuspended\b/i.test(String(current.message ?? ''));
+    const hasSuspendedReason = current.providerReasons?.some((reason: unknown) => /^consumer_?suspended$/i.test(String(reason)))
+      || /\bconsumer_?suspended\b/i.test(String(current.message ?? ''));
     if ((is403 || isPermissionDenied) && hasSuspendedReason) return true;
   }
   return false;
