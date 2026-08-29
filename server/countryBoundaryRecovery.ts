@@ -114,26 +114,32 @@ export async function processCountryBoundaryReprocessJob(job: { payload: { chann
   const [excludedCountries] = await Promise.all([getExcludedCountries()]);
   const now = new Date().toISOString();
 
-  // Re-evaluate country validation against current policy
-  const valRes = await validateChannelCountry(
-    {
-      channelName: channel.channel_name,
-      description: channel.inspection_trail?.map(t => t.details || '').join(' ') || channel.channel_name,
-      videoTitles: [channel.channel_name],
-      locationTag: channel.country,
-      externalLinks: channel.discord_invite ? [channel.discord_invite] : []
-    },
-    channel.country
-  );
+  // Re-evaluate creator-level country evidence directly from creator text & links.
+  // DO NOT pass locationTag: channel.country, because channel.country may be the
+  // stale target search country rather than the actual creator-declared country.
+  const creatorEvidence = creatorLevelCountryEvidence({
+    channelName: channel.channel_name,
+    description: (channel.inspection_trail || []).map(t => t.details || '').join(' ') || channel.channel_name,
+    videoTitles: [channel.channel_name],
+    externalLinks: channel.discord_invite ? [channel.discord_invite] : [],
+    metadataStatus: channel.country_metadata_status
+  });
 
-  if (valRes.status === 'REJECTED') {
-    // Creator country IS genuinely excluded under current policy. Retain rejection.
+  // Run inferChannelCountry directly using creator-level evidence against excludedCountries
+  const inference = inferChannelCountry(creatorEvidence, excludedCountries);
+
+  if (inference.status === 'REJECTED') {
+    // Creator country IS genuinely excluded under current policy (e.g., India or Nigeria). Retain rejection.
     return { channelId, recovered: false, newCountryStatus: 'REJECTED' };
   }
 
-  // Creator country is NOT excluded. Clear stale rejection and restore machine-owned state.
-  channel.country_status = valRes.status === 'CONFIRMED' ? 'CONFIRMED' : 'UNCERTAIN';
-  channel.confidence_score = valRes.score;
+  // If creator-level country evidence was non-existent or ambiguous, inferChannelCountry returns status === 'UNCERTAIN'.
+  // Non-excluded inferred country or uncertain country is safely recovered from the hard target-boundary REJECTED state.
+  channel.country_status = inference.status === 'CONFIRMED' ? 'CONFIRMED' : 'UNCERTAIN';
+  channel.confidence_score = inference.confidence;
+  if (inference.detectedCountry) {
+    channel.country = inference.detectedCountry;
+  }
   channel.scan_status = 'PENDING';
   channel.last_checked = now;
   channel.inspection_trail = [
@@ -142,7 +148,7 @@ export async function processCountryBoundaryReprocessJob(job: { payload: { chann
       step: 'COUNTRY_VALIDATION',
       title: 'Historical Country Boundary Reconciliation',
       status: 'FOUND',
-      details: `Reconciled stale target-country boundary rejection under policy ${COUNTRY_BOUNDARY_RECOVERY_VERSION}. Detected country '${valRes.detectedCountry || channel.country}' is not excluded. Restored to normal processing.`,
+      details: `Reconciled stale target-country boundary rejection under policy ${COUNTRY_BOUNDARY_RECOVERY_VERSION}. Creator country '${inference.detectedCountry || 'Uncertain'}' is not excluded. Restored to normal processing.`,
       timestamp: now
     }
   ];
@@ -164,7 +170,7 @@ export async function processCountryBoundaryReprocessJob(job: { payload: { chann
       channel.country_status,
       'COMPLETED',
       'PENDING',
-      valRes.decisionLogs,
+      inference.reasoning,
       COUNTRY_BOUNDARY_RECOVERY_VERSION
     ]
   );
