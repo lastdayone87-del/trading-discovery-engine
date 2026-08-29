@@ -461,7 +461,7 @@ export async function processNextSearchJob(
           country,
           targetCountry: country,
           detectedCountry: outcome.channelRecord?.country || raw.locationTag || null,
-          rejectionReason: outcome.countryStatus === 'REJECTED' ? (outcome.channelRecord?.inspection_trail?.find(t => t.step === 'COUNTRY_VALIDATION')?.details || undefined) : undefined,
+          rejectionReason: outcome.countryStatus === 'REJECTED' ? (outcome.rejectionReason || outcome.channelRecord?.inspection_trail?.find(t => t.step === 'COUNTRY_VALIDATION')?.details || undefined) : undefined,
           retrievalLane,
           searchOrdering
         }
@@ -678,6 +678,8 @@ export interface ProcessDiscoveredChannelOutcome {
   wasKnown: boolean;
   persisted: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
+  detectedCountry?: string | null;
+  rejectionReason?: string;
   tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
   discordStatus: DiscordStatus;
   discordInvite: string | null;

@@ -43,6 +43,8 @@ export interface IngestionPipelineOutcome {
   wasKnown: boolean;
   persisted: boolean;
   countryStatus: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
+  detectedCountry?: string | null;
+  rejectionReason?: string;
   tradingStatus: 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN' | 'NEEDS_REVIEW' | 'HUMAN_REJECTED';
   discordStatus: DiscordStatus;
   discordInvite: string | null;
@@ -285,6 +287,8 @@ export async function processChannelThroughPipeline(
       wasKnown: !!existing,
       persisted: false,
       countryStatus: 'REJECTED',
+      detectedCountry: countryVal.detectedCountry || resolvedCountry,
+      rejectionReason: countryVal.rejectionReason,
       tradingStatus: 'UNCERTAIN',
       discordStatus: 'NOT_FOUND',
       discordInvite: null,
