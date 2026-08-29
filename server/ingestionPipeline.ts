@@ -268,7 +268,8 @@ export async function processChannelThroughPipeline(
     console.warn(JSON.stringify({
       event: 'excluded_channel_blocked',
       channelId: candidate.channelId,
-      targetCountry: resolvedCountry,
+      targetCountry,
+      detectedCountry: countryVal.detectedCountry || resolvedCountry,
       reason: countryVal.rejectionReason,
       context: 'ingestion_gate',
       timestamp: now

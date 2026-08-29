@@ -234,6 +234,63 @@ test('target-country boundary preserves an existing policy rejection', () => {
   assert.match(bounded.rejectionReason || '', /Configured regional exclusion/);
 });
 
+test('target Canada + detected Germany => NOT rejected', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'DE', discoveryCountry: 'Canada' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Canada');
+  assert.notEqual(bounded.status, 'REJECTED');
+  assert.equal(bounded.detectedCountry, 'Germany');
+});
+
+test('target Canada + detected Switzerland => NOT rejected', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'CH', discoveryCountry: 'Canada' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Canada');
+  assert.notEqual(bounded.status, 'REJECTED');
+  assert.equal(bounded.detectedCountry, 'Switzerland');
+});
+
+test('target Germany + detected Canada => NOT rejected', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'CA', discoveryCountry: 'Germany' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
+  assert.notEqual(bounded.status, 'REJECTED');
+  assert.equal(bounded.detectedCountry, 'Canada');
+});
+
+test('target Switzerland + detected New Zealand => NOT rejected', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'NZ', discoveryCountry: 'Switzerland' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Switzerland');
+  assert.notEqual(bounded.status, 'REJECTED');
+  assert.equal(bounded.detectedCountry, 'New Zealand');
+});
+
+test('target Canada + detected India => REJECTED because India is in excluded_countries', () => {
+  const exclusions = [{ country_name: 'India', reason: 'Configured regional exclusion' }];
+  const inferred = inferChannelCountry({ officialCountry: 'IN', discoveryCountry: 'Canada' }, exclusions);
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Canada');
+  assert.equal(bounded.status, 'REJECTED');
+  assert.equal(bounded.detectedCountry, 'India');
+  assert.match(bounded.rejectionReason || '', /India is excluded by policy/);
+});
+
+test('target Germany + detected Nigeria => REJECTED because Nigeria is in excluded_countries', () => {
+  const exclusions = [{ country_name: 'Nigeria', reason: 'African Region Exclusion' }];
+  const inferred = inferChannelCountry({ officialCountry: 'NG', discoveryCountry: 'Germany' }, exclusions);
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
+  assert.equal(bounded.status, 'REJECTED');
+  assert.equal(bounded.detectedCountry, 'Nigeria');
+  assert.match(bounded.rejectionReason || '', /Nigeria is excluded by policy/);
+});
+
+test('global / no-target mode continues to work correctly', () => {
+  const inferred = inferChannelCountry({ officialCountry: 'CA', discoveryCountry: 'GLOBAL' });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'GLOBAL');
+  assert.notEqual(bounded.status, 'REJECTED');
+  assert.equal(bounded.detectedCountry, 'Canada');
+
+  const emptyTarget = applyTargetCountryBoundary(asValidationResult(inferred), '');
+  assert.notEqual(emptyTarget.status, 'REJECTED');
+  assert.equal(emptyTarget.detectedCountry, 'Canada');
+});
+
 
 test('weaker live indirect evidence cannot override an earlier confirmed creator country', () => {
   const initial = {

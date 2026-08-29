@@ -74,17 +74,19 @@ export function mergeCountryValidationResults(initial: ValidationResult, live: V
 }
 
 export function applyTargetCountryBoundary(result: ValidationResult, targetCountryName: string): ValidationResult {
+  // Hard invariant: a target-country mismatch can NEVER change a non-rejected
+  // country result into REJECTED. Rejection occurs ONLY if the detected creator
+  // country is explicitly present in excluded_countries (which produces
+  // result.status === 'REJECTED' before this boundary function is called).
+  if (result.status === 'REJECTED') return result;
+
   const target = canonicalCountry(targetCountryName);
   const detected = result.detectedCountry ? canonicalCountry(result.detectedCountry) : null;
   const globalContext = !targetCountryName.trim() || ['GLOBAL', 'ALL', '*', 'WORLDWIDE'].includes(target.toLocaleUpperCase('en'));
-  if (
-    globalContext ||
-    !detected ||
-    result.status === 'REJECTED' ||
-    detected === target ||
-    result.status !== 'CONFIRMED'
-  ) return result;
-  const reason = `Creator country ${detected} differs from pinned discovery country ${target}; retained for normal processing because the creator country is not itself excluded.`;
+
+  if (globalContext || !detected || detected === target) return result;
+
+  const reason = `Creator country ${detected} differs from pinned discovery country ${target}; retained for normal processing because creator country ${detected} is not itself excluded.`;
   return {
     ...result,
     decisionLogs: `${result.decisionLogs}\nTarget Country Boundary: RETAINED — ${reason}`

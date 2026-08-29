@@ -455,7 +455,16 @@ export async function processNextSearchJob(
       sightings.push({
         channelId: outcome.channelId, resultRank: index + 1, searchLane: retrievalLane, wasKnown: outcome.wasKnown, persisted: outcome.persisted,
         countryOutcome: outcome.countryStatus, tradingOutcome: outcome.tradingStatus, funnelOutcome,
-        metadata: { channelName: outcome.channelName, source, country, retrievalLane, searchOrdering }
+        metadata: {
+          channelName: outcome.channelName,
+          source,
+          country,
+          targetCountry: country,
+          detectedCountry: outcome.channelRecord?.country || raw.locationTag || null,
+          rejectionReason: outcome.countryStatus === 'REJECTED' ? (outcome.channelRecord?.inspection_trail?.find(t => t.step === 'COUNTRY_VALIDATION')?.details || undefined) : undefined,
+          retrievalLane,
+          searchOrdering
+        }
       });
     }
     if (queryRunId && queryId) {
