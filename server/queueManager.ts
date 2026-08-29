@@ -460,7 +460,7 @@ export async function processNextSearchJob(
           source,
           country,
           targetCountry: country,
-          detectedCountry: outcome.channelRecord?.country || raw.locationTag || null,
+          detectedCountry: outcome.detectedCountry || outcome.channelRecord?.country || raw.locationTag || null,
           rejectionReason: outcome.countryStatus === 'REJECTED' ? (outcome.rejectionReason || outcome.channelRecord?.inspection_trail?.find(t => t.step === 'COUNTRY_VALIDATION')?.details || undefined) : undefined,
           retrievalLane,
           searchOrdering
