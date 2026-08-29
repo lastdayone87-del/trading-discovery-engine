@@ -181,6 +181,10 @@ function recordProviderFailure(key: string, error: unknown): void {
   // A rate-limited key is retired for this acquisition, while the bounded
   // outer provider loop may continue with another eligible key. If the whole
   // pool is unavailable, the caller surfaces the governed all-provider cooldown.
+  if (isConsumerSuspended(error)) {
+    if ((error as any)?.providerFailureRecorded !== true) youtubeProviderCooldown.failed(dispatchedKey, 'CONSUMER_SUSPENDED');
+    return;
+  }
   if (isYouTubeRateLimited(error)) {
     if ((error as any)?.providerFailureRecorded !== true) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');
     return;
@@ -289,9 +293,11 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
           const error=await youtubeHttpError(response,trace);
           trace('after HTTP-error-body-read at server/youtube.ts:135');
           if(dispatchedProviderKey){
+            const consumerSuspended=isConsumerSuspended(error);
             const runtimeRateLimited=isYouTubeRateLimited(error);
             if(!runtimeRateLimited)failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
-            if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');
+            if(consumerSuspended)youtubeProviderCooldown.failed(dispatchedProviderKey,'CONSUMER_SUSPENDED');
+            else if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');
             else if(runtimeRateLimited)youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');
             if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
           }
@@ -387,8 +393,22 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
 export function isYouTubeRateLimited(error: unknown): boolean {
   let current: any = error;
   for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
-    if (current.quotaExceeded === true) return false;
+    if (current.quotaExceeded === true || isConsumerSuspended(current)) return false;
     if (current.status === 429 || current.providerReasons?.some((reason: unknown) => /^rateLimitExceeded$/i.test(String(reason)))) return true;
+  }
+  return false;
+}
+
+/** Detects YouTube API key suspension (HTTP 403 PERMISSION_DENIED / consumerSuspended). */
+export function isConsumerSuspended(error: unknown): boolean {
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    if (current.quotaExceeded === true) return false;
+    const is403 = current.status === 403 || /\b403\b/i.test(String(current.message ?? ''));
+    const isPermissionDenied = /^PERMISSION_DENIED$/i.test(String(current.status ?? '')) || /\bPERMISSION_DENIED\b/i.test(String(current.message ?? ''));
+    const hasSuspendedReason = current.providerReasons?.some((reason: unknown) => /^consumer_?suspended$/i.test(String(reason)))
+      || /\bconsumer_?suspended\b/i.test(String(current.message ?? ''));
+    if ((is403 || isPermissionDenied) && hasSuspendedReason) return true;
   }
   return false;
 }
