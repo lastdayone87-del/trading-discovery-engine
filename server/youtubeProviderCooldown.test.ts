@@ -117,3 +117,40 @@ test('all-provider cooldown error is explicitly retryable and typed as rate limi
   assert.equal(error.retryAt, retryAt);
   assert.ok(error.retryAfterMs >= 0);
 });
+
+test('CONSUMER_SUSPENDED failure places provider into suspended state and excludes it throughout configured quarantine', () => {
+  let now = 1_000_000;
+  const suspendedMs = 24 * 60 * 60_000; // 24 hours
+  const providers = new YouTubeProviderCooldown({
+    initialRateLimitCooldownMs: 5_000,
+    maxRateLimitCooldownMs: 300_000,
+    suspendedProviderCooldownMs: suspendedMs,
+    now: () => now,
+  });
+
+  const retryAt = providers.failed('project-suspended', 'CONSUMER_SUSPENDED');
+  assert.equal(retryAt, now + suspendedMs);
+  assert.equal(providers.eligible('project-suspended'), false);
+  assert.equal(providers.eligible('project-healthy'), true);
+  assert.deepEqual(providers.status('project-suspended'), {
+    status: 'Suspended',
+    retryAt: now + suspendedMs,
+  });
+
+  // Advance time partially (e.g. 1 hour) - should still be suspended and ineligible
+  now += 3600_000;
+  assert.equal(providers.eligible('project-suspended'), false);
+
+  // Unrelated success on healthy provider must not clear suspended status
+  providers.succeeded('project-healthy');
+  assert.equal(providers.eligible('project-suspended'), false);
+  assert.equal(providers.status('project-suspended').status, 'Suspended');
+
+  // Advance time past quarantine window - provider becomes eligible again
+  now += suspendedMs;
+  assert.equal(providers.eligible('project-suspended'), true);
+  assert.deepEqual(providers.status('project-suspended'), {
+    status: 'Active',
+    retryAt: null,
+  });
+});
