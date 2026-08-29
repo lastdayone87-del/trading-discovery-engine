@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import type { RawChannelInput } from '../server/evidenceEngine/types.js';
+import { documentRef } from '../server/evidenceEngine/canonicalEvidencePlane.js';
 
 type GroundTruth = 'TRADING_CONFIRMED' | 'NON_TRADING' | 'UNCERTAIN';
 type Case = { id:string; input:RawChannelInput; ground_truth:GroundTruth; gemini?:{label?:string;confidence?:number;status?:GroundTruth;model?:string} };
@@ -11,7 +12,7 @@ const OUT=process.env.SEMANTIC_BENCHMARK_OUT||'benchmark/results/groq-semantic.j
 const TAXONOMY=['ACTIVE_TRADING','INVESTING_EDUCATION','FINANCIAL_NEWS','PERSONAL_FINANCE','HYPE','UNRELATED','AMBIGUOUS'];
 const PROMPT_VERSION='priority2-multilingual-structured-1';
 function fieldDocuments(input:RawChannelInput){
- if(input.evidence_corpus?.length)return input.evidence_corpus.filter(d=>!['activity_metadata','search_match_context','country','language'].includes(d.field)).slice(0,40).map(d=>({ref:d.ref,text:d.text}));
+ if(input.evidence_corpus?.length)return input.evidence_corpus.filter(d=>!['activity_metadata','search_match_context','country','language'].includes(d.field)).slice(0,40).map(d=>({ref:documentRef(d),text:d.text}));
  return [{ref:{field:'channel_title'},text:input.channel_name},{ref:{field:'channel_bio'},text:input.description},...(input.videos||(input.video_titles||[]).map((title,index)=>({title,description:input.video_descriptions?.[index]}))).slice(0,12).flatMap((video,index)=>[{ref:{field:'video_title',index},text:video.title},{ref:{field:'video_description',index},text:video.description||''}]),...(input.playlists||[]).slice(0,6).flatMap((p,index)=>[{ref:{field:'playlist_name',index},text:p.name},{ref:{field:'playlist_description',index},text:p.description||''}]),...(input.transcript_excerpts||[]).slice(0,4).map((e,index)=>({ref:{field:'transcript_excerpt',index},text:e.text}))].filter(d=>d.text?.trim()).map(d=>({...d,text:d.text.slice(0,1200)}));
 }
 function buildPrompt(input:RawChannelInput){return JSON.stringify({task:'CANDIDATE',promptVersion:PROMPT_VERSION,closedTaxonomy:TAXONOMY,instructions:['Infer meaning across languages, scripts, transliteration, loanwords, and code-switching.','Classify creator focus, not isolated keywords. Cite only supplied field references.','Set supportedLanguage=false and label=AMBIGUOUS when meaning cannot be reliably interpreted.','Distinguish active trading, investing education, financial news, personal finance, hype, and unrelated content.','Return JSON with label, confidence 0..100, supportedLanguage, reasonCodes, explanation, concepts, languages, citations.'],declaredCountry:input.country||null,declaredLanguageHints:input.detected_languages||[],documents:fieldDocuments(input)});}
