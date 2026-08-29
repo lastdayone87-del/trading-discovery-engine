@@ -72,6 +72,7 @@ import { processStructuredProviderJob } from './persistentResearchPhase5';
 import { recordExternalNominations } from './persistentResearchController';
 import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWorker';
+import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
@@ -227,6 +228,11 @@ export async function processNextSearchJob(
     if(job.type==='PERSISTENT_RESEARCH_EXTERNAL_PROVIDER'){await processStructuredProviderJob(job,recordExternalNominations);return true;}
     if(job.type==='RESOLVE_STAGED_CANDIDATE'){
       await processPendingStagedCandidates();
+      await completeJob(job.id);
+      return true;
+    }
+    if(job.type==='COUNTRY_BOUNDARY_REPROCESS'){
+      await processCountryBoundaryReprocessJob(job);
       await completeJob(job.id);
       return true;
     }

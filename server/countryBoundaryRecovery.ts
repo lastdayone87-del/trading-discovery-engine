@@ -1,8 +1,9 @@
-import { getAllChannels, getExcludedCountries, getDb, enqueueJob } from './db';
-import { canonicalCountry } from './countryInference';
+import { getAllChannels, getExcludedCountries, getDb, enqueueJob, upsertChannel, getChannelById } from './db';
+import { canonicalCountry, inferChannelCountry } from './countryInference';
+import { validateChannelCountry, creatorLevelCountryEvidence } from './countryValidator';
 import type { ChannelRecord } from '../src/types';
 
-export const COUNTRY_BOUNDARY_RECOVERY_VERSION = 'country-boundary-nonexcluded-v1';
+export const COUNTRY_BOUNDARY_RECOVERY_VERSION = 'country-boundary-nonexcluded-v2';
 export const COUNTRY_BOUNDARY_RECOVERY_JOB = 'COUNTRY_BOUNDARY_REPROCESS';
 
 const DISCORD_INSPECTION_STEPS = /BIO|EXTERNAL[_ ]LINKS|VIDEO[_ ]DESCRIPTIONS|CUSTOM[_ ]DOMAINS|SOCIAL[_ ]BIO|LINKED[_ ]WEBSITES|CHANNEL[_ ]LINKS|DISCORD/i;
@@ -19,12 +20,18 @@ export function hasPinnedBoundaryRejection(channel: ChannelRecord): boolean {
   return /Target Country Boundary: REJECTED/i.test(trailText(channel));
 }
 
+/**
+ * Generic predicate identifying channels rejected under the legacy target-country boundary bug.
+ * A channel is a recovery candidate if:
+ * 1. Its country_status is currently 'REJECTED'.
+ * 2. Its stored country (or detected country) is NOT in the current excluded_countries list.
+ * 3. It was rejected by the target-country boundary rule (recorded in inspection_trail).
+ */
 export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, excludedCountries: Array<{ country_name: string }>): boolean {
   const excluded = new Set(excludedCountries.map(item => canonicalCountry(item.country_name).toLocaleLowerCase('en')));
   return channel.country_status === 'REJECTED'
     && !excluded.has(canonicalCountry(channel.country || '').toLocaleLowerCase('en'))
-    && hasPinnedBoundaryRejection(channel)
-    && !hasDiscordInspectionStep(channel);
+    && hasPinnedBoundaryRejection(channel);
 }
 
 export function countryBoundaryRecoveryKey(channelId: string): string {
@@ -93,4 +100,74 @@ export async function enqueueCountryBoundaryCohort(): Promise<CountryBoundaryDry
     else enqueuedCount += 1;
   }
   return { ...aggregateCohort(rows), enqueuedCount, alreadyPresentCount };
+}
+
+/**
+ * Generic, idempotent worker task that processes a single channel recovery job.
+ * Re-evaluates country validation using current excluded_countries policy.
+ */
+export async function processCountryBoundaryReprocessJob(job: { payload: { channelId: string } }): Promise<{ channelId: string; recovered: boolean; newCountryStatus: string }> {
+  const channelId = String(job.payload.channelId || '');
+  const channel = await getChannelById(channelId);
+  if (!channel) return { channelId, recovered: false, newCountryStatus: 'MISSING' };
+
+  const [excludedCountries] = await Promise.all([getExcludedCountries()]);
+  const now = new Date().toISOString();
+
+  // Re-evaluate country validation against current policy
+  const valRes = await validateChannelCountry(
+    {
+      channelName: channel.channel_name,
+      description: channel.inspection_trail?.map(t => t.details || '').join(' ') || channel.channel_name,
+      videoTitles: [channel.channel_name],
+      locationTag: channel.country,
+      externalLinks: channel.discord_invite ? [channel.discord_invite] : []
+    },
+    channel.country
+  );
+
+  if (valRes.status === 'REJECTED') {
+    // Creator country IS genuinely excluded under current policy. Retain rejection.
+    return { channelId, recovered: false, newCountryStatus: 'REJECTED' };
+  }
+
+  // Creator country is NOT excluded. Clear stale rejection and restore machine-owned state.
+  channel.country_status = valRes.status === 'CONFIRMED' ? 'CONFIRMED' : 'UNCERTAIN';
+  channel.confidence_score = valRes.score;
+  channel.scan_status = 'PENDING';
+  channel.last_checked = now;
+  channel.inspection_trail = [
+    ...(channel.inspection_trail || []),
+    {
+      step: 'COUNTRY_VALIDATION',
+      title: 'Historical Country Boundary Reconciliation',
+      status: 'FOUND',
+      details: `Reconciled stale target-country boundary rejection under policy ${COUNTRY_BOUNDARY_RECOVERY_VERSION}. Detected country '${valRes.detectedCountry || channel.country}' is not excluded. Restored to normal processing.`,
+      timestamp: now
+    }
+  ];
+
+  await upsertChannel(channel);
+
+  // Record auditable recovery event
+  const db = await getDb();
+  await db.query(
+    `INSERT INTO historical_country_boundary_recovery_events(
+      event_key, channel_id, prior_country_status, restored_country_status,
+      prior_scan_status, resulting_scan_status, evidence_details, policy_version
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    ON CONFLICT (event_key) DO NOTHING`,
+    [
+      `recovery:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:${channelId}`,
+      channelId,
+      'REJECTED',
+      channel.country_status,
+      'COMPLETED',
+      'PENDING',
+      valRes.decisionLogs,
+      COUNTRY_BOUNDARY_RECOVERY_VERSION
+    ]
+  );
+
+  return { channelId, recovered: true, newCountryStatus: channel.country_status };
 }
