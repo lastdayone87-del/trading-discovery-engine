@@ -32,8 +32,12 @@ export function hasPinnedBoundaryRejection(channel: ChannelRecord): boolean {
  */
 export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, excludedCountries: Array<{ country_name: string }>): boolean {
   const excluded = new Set(excludedCountries.map(item => canonicalCountry(item.country_name).toLocaleLowerCase('en')));
+  const isExcluded = excluded.has(canonicalCountry(channel.country || '').toLocaleLowerCase('en'));
+
+  // A candidate must either be currently REJECTED or have a target-boundary rejection recorded in trail,
+  // AND its stored country must NOT be in current excluded_countries (unless we re-evaluate creator evidence).
   return (channel.country_status === 'REJECTED' || hasPinnedBoundaryRejection(channel))
-    && (!excluded.has(canonicalCountry(channel.country || '').toLocaleLowerCase('en')) || hasPinnedBoundaryRejection(channel));
+    && (!isExcluded || hasPinnedBoundaryRejection(channel));
 }
 
 /**
@@ -296,25 +300,51 @@ export async function processCountryBoundaryReprocessJob(
     }
   ];
 
-  // Perform atomic updates: write channel update and audit log event
-  await upsertChannel(channel);
-  await db.query(
-    `INSERT INTO historical_country_boundary_recovery_events(
-      event_key, channel_id, prior_country_status, restored_country_status,
-      prior_scan_status, resulting_scan_status, evidence_details, policy_version
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    ON CONFLICT (event_key) DO NOTHING`,
-    [
-      eventKey,
-      channelId,
-      priorCountryStatus,
-      channel.country_status,
-      priorScanStatus,
-      'PENDING',
-      classification.reasoning,
-      COUNTRY_BOUNDARY_RECOVERY_VERSION
-    ]
-  );
+  // Perform atomic transaction for state transition & recovery event ledger
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock recovery event row if existing to guarantee idempotency across workers
+    const lockCheck = await client.query(
+      'SELECT 1 FROM historical_country_boundary_recovery_events WHERE event_key=$1 FOR UPDATE',
+      [eventKey]
+    );
+    if (lockCheck.rowCount) {
+      await client.query('ROLLBACK');
+      return { channelId, recovered: true, reconciliationState: classification.state, newCountryStatus: channel.country_status };
+    }
+
+    await client.query(
+      `UPDATE channels SET country_status=$1, country=$2, confidence_score=$3, scan_status=$4, last_checked=$5, inspection_trail=$6 WHERE channel_id=$7`,
+      [channel.country_status, channel.country, channel.confidence_score, channel.scan_status, channel.last_checked, JSON.stringify(channel.inspection_trail), channelId]
+    );
+
+    await client.query(
+      `INSERT INTO historical_country_boundary_recovery_events(
+        event_key, channel_id, prior_country_status, restored_country_status,
+        prior_scan_status, resulting_scan_status, evidence_details, policy_version
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (event_key) DO NOTHING`,
+      [
+        eventKey,
+        channelId,
+        priorCountryStatus,
+        channel.country_status,
+        priorScanStatus,
+        'PENDING',
+        classification.reasoning,
+        COUNTRY_BOUNDARY_RECOVERY_VERSION
+      ]
+    );
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 
   return { channelId, recovered: true, reconciliationState: classification.state, newCountryStatus: channel.country_status };
 }

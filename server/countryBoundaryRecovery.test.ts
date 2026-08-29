@@ -58,3 +58,73 @@ test('cohort worker keeps quota reservation before claim and bounded backoff on 
   assert.match(cohortSource, /maxAttempts: 4/);
   assert.match(cohortSource, /preventReopen: true/);
 });
+
+test('TEST C: Reconciliation classification - RECOVERABLE_NON_EXCLUDED', async () => {
+  const { classifyReconciliationState } = await import('./countryBoundaryRecovery');
+  const channel = candidate({
+    country: 'Germany',
+    country_status: 'REJECTED',
+    channel_name: 'Börsenblick Deutschland',
+    inspection_trail: [
+      { step: 'COUNTRY_VALIDATION', details: 'Target Country Boundary: REJECTED — creator country differs from pinned discovery country Canada.' },
+      { step: 'BIO', details: 'Börsenanalyse und Handelsstrategie in Deutschland' }
+    ]
+  });
+
+  const res = classifyReconciliationState(channel, [{ country_name: 'India' }]);
+  assert.equal(res.state, 'RECOVERABLE_NON_EXCLUDED');
+  assert.equal(res.detectedCountry, 'Germany');
+});
+
+test('TEST D: Reconciliation classification - RETAIN_EXCLUDED', async () => {
+  const { classifyReconciliationState } = await import('./countryBoundaryRecovery');
+  const channel = candidate({
+    country: 'India',
+    country_status: 'REJECTED',
+    channel_name: 'Nifty Trader Mumbai',
+    inspection_trail: [
+      { step: 'COUNTRY_VALIDATION', details: 'Target Country Boundary: REJECTED' },
+      { step: 'BIO', details: 'Indian trader in Mumbai covering Nifty 50 and Zerodha' }
+    ]
+  });
+
+  const res = classifyReconciliationState(channel, [{ country_name: 'India' }]);
+  assert.equal(res.state, 'RETAIN_EXCLUDED');
+  assert.equal(res.detectedCountry, 'India');
+});
+
+test('TEST E: Reconciliation classification - INSUFFICIENT_EVIDENCE', async () => {
+  const { classifyReconciliationState } = await import('./countryBoundaryRecovery');
+  const channel = candidate({
+    country: 'Germany',
+    country_status: 'REJECTED',
+    channel_name: 'Generic Channel Name',
+    inspection_trail: [
+      { step: 'COUNTRY_VALIDATION', details: 'Target Country Boundary: REJECTED' }
+    ]
+  });
+
+  const res = classifyReconciliationState(channel, [{ country_name: 'India' }]);
+  assert.equal(res.state, 'INSUFFICIENT_EVIDENCE');
+});
+
+test('TEST F: Reconciliation classification - LEGITIMATE_REJECTION', async () => {
+  const { classifyReconciliationState } = await import('./countryBoundaryRecovery');
+  const channel = candidate({
+    country: 'India',
+    country_status: 'REJECTED',
+    channel_name: 'Nifty Scalper',
+    inspection_trail: [
+      { step: 'COUNTRY_VALIDATION', details: 'India is excluded by policy: South Asian Exclusion' }
+    ]
+  });
+
+  const res = classifyReconciliationState(channel, [{ country_name: 'India' }]);
+  assert.equal(res.state, 'LEGITIMATE_REJECTION');
+});
+
+test('TEST G: Dashboard projection SQL filters out excluded countries and non-rejected status correctly', async () => {
+  const { OPERATOR_VISIBLE_CHANNEL_SQL } = await import('./dbCore');
+  assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /country_status <> 'REJECTED'/);
+  assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /NOT EXISTS[\s\S]+FROM excluded_countries/);
+});
