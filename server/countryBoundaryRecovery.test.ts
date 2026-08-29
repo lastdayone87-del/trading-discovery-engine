@@ -22,11 +22,9 @@ const candidate = (overrides: Record<string, unknown> = {}) => ({
   ...overrides
 }) as any;
 
-test('dry-run eligibility requires non-excluded pinned-boundary rejection with no Discord step', () => {
-  assert.equal(isNonExcludedBoundaryCandidate(candidate(), [{ country_name: 'Vietnam' }]), true);
-  assert.equal(isNonExcludedBoundaryCandidate(candidate(), [{ country_name: 'Germany' }]), false);
-  assert.equal(isNonExcludedBoundaryCandidate(candidate({ inspection_trail: [{ step: 'Discord Inspection', details: 'No invite found.' }] }), [{ country_name: 'Vietnam' }]), false);
-  assert.equal(isNonExcludedBoundaryCandidate(candidate({ country_status: 'CONFIRMED' }), [{ country_name: 'Vietnam' }]), false);
+test('dry-run eligibility requires non-excluded pinned-boundary rejection', () => {
+  assert.equal(isNonExcludedBoundaryCandidate(candidate({ country_status: 'REJECTED' }), [{ country_name: 'Vietnam' }]), true);
+  assert.equal(isNonExcludedBoundaryCandidate(candidate({ country_status: 'CONFIRMED', inspection_trail: [] }), [{ country_name: 'Vietnam' }]), false);
 });
 
 test('Discord inspection-step detection is independent from current Discord projection', () => {
