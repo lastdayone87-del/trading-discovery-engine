@@ -748,7 +748,7 @@ export async function inspectAndValidateChannel(
         externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : []),
         metadataStatus: rawDetails?.countryMetadataStatus || channel.country_metadata_status
       },
-      channel.country
+      rawDetails?.locationTag || null
     );
 
     const countryStep: InspectionStep = {
@@ -800,7 +800,7 @@ export async function inspectAndValidateChannel(
     const rawLiveCountry = await validateChannelCountry({channelName:channel.channel_name,
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
-      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, channel.country || '');
+      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, rawDetails?.locationTag || null);
     const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
     const liveCountryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
@@ -986,7 +986,7 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
           videoTitles: [channel.channel_name],
           externalLinks: channel.discord_invite ? [channel.discord_invite] : []
         },
-        channel.country
+        null
       );
 
       if (valRes.status === 'REJECTED') {
