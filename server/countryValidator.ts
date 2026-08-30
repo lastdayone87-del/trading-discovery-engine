@@ -55,6 +55,27 @@ export function creatorLevelCountryEvidence(channelData: {
 }
 
 /**
+ * Reconstructs creator evidence from stored channel records without treating
+ * inspection trail prose, channel names, or search query titles as About text or location tags.
+ */
+export function retainedCreatorEvidenceInput(channel: {
+  channel_name?: string;
+  country_metadata_status?: CountryMetadataStatus;
+  discord_invite?: string | null;
+  inspection_trail?: Array<{ step?: string; details?: string }>;
+}) {
+  const externalLinks: string[] = channel.discord_invite ? [channel.discord_invite] : [];
+  return creatorLevelCountryEvidence({
+    channelName: '',
+    description: '',
+    locationTag: undefined,
+    videoTitles: [],
+    externalLinks,
+    metadataStatus: channel.country_metadata_status
+  });
+}
+
+/**
  * Compatibility adapter for existing pipeline callers. All inference and
  * precedence decisions live in the dedicated countryInference module.
  *

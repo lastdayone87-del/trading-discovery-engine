@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assessChannelCountry, inferChannelCountry } from '../server/countryInference';
-import { validateChannelCountry, applyTargetCountryBoundary } from '../server/countryValidator';
+import { validateChannelCountry, applyTargetCountryBoundary, retainedCreatorEvidenceInput } from '../server/countryValidator';
 import { INITIAL_EXCLUDED_COUNTRIES, INITIAL_COUNTRY_VOCABULARIES } from '../src/data/initial_countries';
 
 const EXCLUDED = INITIAL_EXCLUDED_COUNTRIES;
@@ -250,4 +250,23 @@ test('Target Mismatch Regression: discoveryCountry = Nigeria, creatorCountry = C
   assert.equal(assessment.detectedCreatorCountry, 'Canada');
   assert.equal(assessment.countryStatus, 'CONFIRMED');
   assert.equal(assessment.gateDisposition, 'ALLOW_NORMAL');
+});
+
+test('retainedCreatorEvidenceInput excludes fabricated channel text, inspection trail prose, and video titles', () => {
+  const input = retainedCreatorEvidenceInput({
+    channel_name: 'Nigeria Forex Scalper Pro',
+    country_metadata_status: 'AVAILABLE_NOT_DECLARED',
+    inspection_trail: [
+      { step: 'BIO', details: 'Forex trading in Nigeria and Lagos stock exchange.' }
+    ]
+  });
+
+  const assessment = assessChannelCountry({
+    ...input,
+    discoveryCountry: 'United Kingdom'
+  }, EXCLUDED, VOCABS);
+
+  assert.equal(assessment.detectedCreatorCountry, null);
+  assert.equal(assessment.countryStatus, 'UNCERTAIN');
+  assert.equal(assessment.gateDisposition, 'CONTINUE_CRAWLING');
 });
