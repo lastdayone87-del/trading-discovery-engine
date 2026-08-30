@@ -48,14 +48,14 @@ test('E: AVAILABLE_NOT_DECLARED with usable description does not attempt fallbac
   );
 });
 
-test('F: AVAILABLE_NOT_DECLARED with empty description does NOT attempt fallback (narrowed to UNAVAILABLE only)', () => {
+test('AVAILABLE_NOT_DECLARED with empty description attempts bounded About fallback', () => {
   assert.equal(
     shouldAttemptPublicAboutCountryFallback({
       countryStatus: 'UNCERTAIN',
       countryMetadataStatus: 'AVAILABLE_NOT_DECLARED',
       description: ''
     }),
-    false
+    true
   );
 });
 
@@ -107,6 +107,8 @@ test('G/A/C/E: literal Philippines in About produces CHANNEL_ABOUT_BIO and REJEC
     PH_EXCLUSIONS
   );
   assert.equal(result.detectedCountry, 'Philippines');
+  assert.equal(result.detectedCreatorCountry, 'Philippines');
+  assert.equal(result.discoveryCountry, 'United Kingdom');
   assert.equal(result.status, 'REJECTED');
   const about = result.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO');
   assert.ok(about);
@@ -114,7 +116,7 @@ test('G/A/C/E: literal Philippines in About produces CHANNEL_ABOUT_BIO and REJEC
   assert.ok(result.evidence.some(item => item.source === 'DISCOVERY_CONTEXT' && item.priority === 10));
 });
 
-test('B: About without country signals remains UNCERTAIN on discovery context', () => {
+test('B: About without country signals remains UNCERTAIN on discovery context with null creator country', () => {
   const result = inferChannelCountry(
     {
       ...aboutEvidence(
@@ -126,7 +128,9 @@ test('B: About without country signals remains UNCERTAIN on discovery context', 
     PH_EXCLUSIONS
   );
   assert.equal(result.status, 'UNCERTAIN');
-  assert.equal(result.detectedCountry, 'United Kingdom');
+  assert.equal(result.detectedCreatorCountry, null);
+  assert.equal(result.detectedCountry, null);
+  assert.equal(result.discoveryCountry, 'United Kingdom');
 });
 
 test('D: failed public About fetch is soft-fail (no description applied)', async () => {

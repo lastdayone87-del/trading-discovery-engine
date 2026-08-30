@@ -36,10 +36,10 @@ export function shouldAttemptPublicAboutCountryFallback(input: {
   countryMetadataStatus?: PublicAboutMetadataStatus | string | null;
   description?: string | null;
 }): boolean {
-  // Smallest safe Gate 1 trigger: only when Data API country metadata failed,
+  // Gate 1 trigger: when Data API country metadata failed or returned no declared country (AVAILABLE_NOT_DECLARED),
   // country attribution is still unresolved, and we still lack usable About text.
   if (input.countryStatus !== 'UNCERTAIN') return false;
-  if (input.countryMetadataStatus !== 'UNAVAILABLE') return false;
+  if (input.countryMetadataStatus !== 'UNAVAILABLE' && input.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED') return false;
   return isChannelDescriptionInsufficient(input.description);
 }
 

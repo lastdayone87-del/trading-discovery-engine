@@ -215,6 +215,7 @@ export async function processChannelThroughPipeline(
     },
     targetCountry
   );
+
   // Country uncertainty and subscriber availability are both cheap official
   // channel-metadata concerns. If either is unresolved, hydrate them together
   // with one channels.list request before semantic AI, enrichment, or Discord.
@@ -227,10 +228,8 @@ export async function processChannelThroughPipeline(
       videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus }, targetCountry);
   }
 
-  // Gate 1 evidence-only fallback: if the Data API metadata path is unavailable,
-  // country remains uncertain, and the candidate still lacks usable About text,
-  // retrieve the public channel page without an API key and re-run the same
-  // country validator. This does not alter exclusion policy or uncertainty rules.
+  // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
+  // retrieve the public channel page without an API key and re-run the country validator.
   if (shouldAttemptPublicAboutCountryFallback({
     countryStatus: countryVal.status,
     countryMetadataStatus: candidate.countryMetadataStatus,
@@ -253,11 +252,14 @@ export async function processChannelThroughPipeline(
     }
   }
 
-  const resolvedCountry = countryVal.detectedCountry || targetCountry;
+  // ABSOLUTE INVARIANT:
+  // creatorCountry represents creator-level evidence ONLY. It is null if no creator evidence exists.
+  // targetCountry is retrieval context and NEVER populates creatorCountry or channels.country.
+  const creatorCountry = countryVal.detectedCreatorCountry || null;
 
   const countryValidationStep = {
     step: 'COUNTRY_VALIDATION' as const,
-    title: `Country Validation (${resolvedCountry})`,
+    title: `Country Validation (${creatorCountry || 'Unknown'})`,
     status: countryVal.status === 'REJECTED' ? ('REJECTED' as const) : ('FOUND' as const),
     details: countryVal.decisionLogs,
     timestamp: now
@@ -271,7 +273,7 @@ export async function processChannelThroughPipeline(
       event: 'excluded_channel_blocked',
       channelId: candidate.channelId,
       targetCountry,
-      detectedCountry: countryVal.detectedCountry || resolvedCountry,
+      detectedCountry: creatorCountry,
       reason: countryVal.rejectionReason,
       context: 'ingestion_gate',
       timestamp: now
@@ -287,7 +289,7 @@ export async function processChannelThroughPipeline(
       wasKnown: !!existing,
       persisted: false,
       countryStatus: 'REJECTED',
-      detectedCountry: countryVal.detectedCountry || resolvedCountry,
+      detectedCountry: creatorCountry,
       rejectionReason: countryVal.rejectionReason,
       tradingStatus: 'UNCERTAIN',
       discordStatus: 'NOT_FOUND',
@@ -304,7 +306,7 @@ export async function processChannelThroughPipeline(
       channel_id: candidate.channelId,
       channel_name: candidate.channelName,
       youtube_url: candidate.youtubeUrl,
-      country: resolvedCountry,
+      country: creatorCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
       discord_status: 'NOT_FOUND',
@@ -353,7 +355,7 @@ export async function processChannelThroughPipeline(
   const structuredExternalLinks=(candidate.externalLinkDetails||(candidate.channelLinks||[]).map(url=>({url}))).map(detail=>{let familyId='source_family_id' in detail&&typeof detail.source_family_id==='string'?detail.source_family_id:undefined;if(!familyId)try{familyId=sourceFamilyIdentity({provider:'external-link',canonicalUrl:detail.url}).familyId;}catch{familyId=sourceFamilyIdentity({provider:'external-link',artifactId:entityChecksum(detail.url)}).familyId;}return {...detail,source_family_id:familyId};});
   void observeYouTubeChannelEntity({channelId:candidate.channelId,channelName:candidate.channelName,youtubeUrl:candidate.youtubeUrl,observedAt:now,videos:structuredVideos,externalUrls:structuredExternalLinks.map(detail=>detail.url)}).catch(error=>console.warn(`[EntityResolution] Channel observation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
   const classifierInput:RawChannelInput={
-    channel_id:candidate.channelId,channel_name:candidate.channelName,description:candidate.description||'',country:resolvedCountry,
+    channel_id:candidate.channelId,channel_name:candidate.channelName,description:candidate.description||'',country:creatorCountry || targetCountry,
     channel_entity_id:channelEntityId,channel_source_family_id:channelSourceFamilyId,
     location_tag:candidate.locationTag,external_links:candidate.channelLinks||[],external_link_details:structuredExternalLinks,
     videos:structuredVideos,
@@ -396,7 +398,7 @@ export async function processChannelThroughPipeline(
       const governedReports=shadow.evidence.map(item=>item.source).filter((source,index,all)=>all.indexOf(source)===index).map(provider=>({provider,availability:'AVAILABLE' as const,evidenceCount:shadow.evidence.filter(item=>item.source===provider).length,outcome:'EXECUTED_WITH_EVIDENCE' as const,reasonCodes:['GOVERNED_PRODUCTION_EVIDENCE_TRANSPORTED']}));
       const collection:EvidenceCollectionReport={...productionClassification.decision.evidenceCollection,providers:[...productionClassification.decision.evidenceCollection.providers,...governedReports]};
       const stages=evaluateClassificationStages(productionClassification.input,evidence,collection);
-      const governedDecision=new ConfigurableWeightedStrategy().evaluateDecision(evidence,{globalInstruments:[],globalPlatformsPropFirms:[],globalAdvancedConcepts:[],globalNegativeTerms:[]},resolvedCountry,collection,stages);
+      const governedDecision=new ConfigurableWeightedStrategy().evaluateDecision(evidence,{globalInstruments:[],globalPlatformsPropFirms:[],globalAdvancedConcepts:[],globalNegativeTerms:[]},creatorCountry || targetCountry,collection,stages);
       tradingVal={...tradingVal,status:governedDecision.status,confidenceScore:governedDecision.confidenceScore,category:governedDecision.category,breakdown:{...tradingVal.breakdown,reasoning:[...(tradingVal.breakdown.reasoning||[]),...governedDecision.mathematicalJustification.split(' | '),'GOVERNED ROLLOUT: evidence traversed the production staged classifier; no decision bypass was used.']}};
     }
   } catch(error) { console.warn(`[AdaptiveClassifier] Shadow evaluation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error); }
@@ -410,7 +412,7 @@ export async function processChannelThroughPipeline(
       channel_id: candidate.channelId,
       channel_name: candidate.channelName,
       youtube_url: candidate.youtubeUrl,
-      country: resolvedCountry,
+      country: creatorCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
       discord_status: 'NON_TRADING',
@@ -430,7 +432,7 @@ export async function processChannelThroughPipeline(
     };
 
     nonTradingChannel.country_status = countryVal.status;
-    nonTradingChannel.country = resolvedCountry;
+    nonTradingChannel.country = creatorCountry;
     nonTradingChannel.confidence_score = countryVal.score;
     nonTradingChannel.trading_status = 'NON_TRADING';
     nonTradingChannel.trading_confidence_score = tradingVal.confidenceScore;
@@ -475,7 +477,7 @@ export async function processChannelThroughPipeline(
       console.log(`[Unified Ingestion Pipeline - Gate 2] Routing '${candidate.channelName}' to human review after enrichment: no independent trading hypothesis and no safe terminal classifier decision.`);
       const withheldChannel: ChannelRecord = existing || {
         channel_id:candidate.channelId, channel_name:candidate.channelName, youtube_url:candidate.youtubeUrl,
-        country:resolvedCountry, country_status:countryVal.status, confidence_score:countryVal.score,
+        country:creatorCountry, country_status:countryVal.status, confidence_score:countryVal.score,
         discord_status:'UNCERTAIN', discord_invite:null, scan_status:'NEEDS_REVIEW', scan_attempts:0,
         discovery_source:source, first_seen:now, last_checked:now, inspection_trail:[countryValidationStep],
         subscriber_count:candidate.subscriberCount,
@@ -483,7 +485,7 @@ export async function processChannelThroughPipeline(
         trading_status:'NEEDS_REVIEW', trading_confidence_score:tradingVal.confidenceScore,
         trading_category:tradingVal.category, trading_relevance_breakdown:tradingVal.breakdown
       };
-      withheldChannel.country=resolvedCountry; withheldChannel.country_status=countryVal.status; withheldChannel.confidence_score=countryVal.score;
+      withheldChannel.country=creatorCountry; withheldChannel.country_status=countryVal.status; withheldChannel.confidence_score=countryVal.score;
       withheldChannel.trading_status='NEEDS_REVIEW'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
       withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
       withheldChannel.scan_status='NEEDS_REVIEW'; withheldChannel.discord_status='UNCERTAIN'; withheldChannel.discord_invite=null; withheldChannel.last_checked=now;
@@ -517,7 +519,7 @@ export async function processChannelThroughPipeline(
       channel_id: candidate.channelId,
       channel_name: candidate.channelName,
       youtube_url: candidate.youtubeUrl,
-      country: resolvedCountry,
+      country: creatorCountry,
       country_status: countryVal.status,
       confidence_score: countryVal.score,
       discord_status: 'UNCERTAIN',
@@ -537,7 +539,7 @@ export async function processChannelThroughPipeline(
     };
 
     uncertainChannel.country_status = countryVal.status;
-    uncertainChannel.country = resolvedCountry;
+    uncertainChannel.country = creatorCountry;
     uncertainChannel.confidence_score = countryVal.score;
     uncertainChannel.trading_status = finalUncertainStatus;
     uncertainChannel.trading_confidence_score = tradingVal.confidenceScore;
@@ -554,7 +556,7 @@ export async function processChannelThroughPipeline(
 
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
-      const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry: resolvedCountry, source, candidate, enrichmentStage:nextStage, evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
+      const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
       const workflowAssignment=await assignRelease5Serving('INVESTIGATION_WORKFLOW',candidate.channelId).catch(()=>({assigned:false,mode:'OFF'})),legacyWorkflowEnabled=await getAppSetting('investigation_workflow_enabled','false')==='true';
       if(workflowAssignment.assigned||legacyWorkflowEnabled){
         try{await scheduleInvestigationStep({investigationId:candidate.investigationId,channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,actionType:appliedAction,jobType:'ENRICH_CHANNEL',jobPayload:payload,priority,maxAttempts:4,idempotencyKey:`investigation-step:${candidate.channelId}:${classificationDiagnosticId||now}:${appliedAction}`,policyVersion:INVESTIGATION_POLICY_VERSION,utilityContractVersion:'utility-constraints-v1',deadlineMinutes:Number(await getAppSetting('investigation_deadline_minutes','30'))||30});}
@@ -585,7 +587,7 @@ export async function processChannelThroughPipeline(
     channel_id: candidate.channelId,
     channel_name: candidate.channelName,
     youtube_url: candidate.youtubeUrl,
-    country: resolvedCountry,
+    country: creatorCountry,
     country_status: countryVal.status,
     confidence_score: countryVal.score,
     discord_status: 'PENDING',
@@ -605,7 +607,7 @@ export async function processChannelThroughPipeline(
   };
 
   activeChannel.country_status = countryVal.status;
-  activeChannel.country = resolvedCountry;
+  activeChannel.country = creatorCountry;
   activeChannel.confidence_score = countryVal.score;
   activeChannel.trading_status = tradingVal.status;
   activeChannel.trading_confidence_score = tradingVal.confidenceScore;

@@ -44,6 +44,8 @@ for (const example of multilingualCases) {
   test(`infers ${example.country} from realistic ${example.language} evidence before discovery context`, () => {
     const result = inferChannelCountry(example.input);
     assert.equal(result.detectedCountry, example.country);
+    assert.equal(result.detectedCreatorCountry, example.country);
+    assert.equal(result.discoveryCountry, example.input.discoveryCountry);
     assert.notEqual(result.decisiveEvidence[0].source, 'DISCOVERY_CONTEXT');
     assert.ok(['CONFIRMED', 'LIKELY', 'UNCERTAIN'].includes(result.status));
   });
@@ -91,12 +93,15 @@ test('phone evidence outranks address, native language, and discovery context', 
   assert.equal(result.decisiveEvidence[0].source, 'PHONE_NUMBER');
 });
 
-test('discovery context alone remains uncertain and low confidence', () => {
+test('discovery context alone yields null creator country and CONTINUE_CRAWLING disposition', () => {
   const result = inferChannelCountry({ discoveryCountry: 'France' });
-  assert.equal(result.detectedCountry, 'France');
+  assert.equal(result.discoveryCountry, 'France');
+  assert.equal(result.detectedCreatorCountry, null);
+  assert.equal(result.detectedCountry, null);
   assert.equal(result.status, 'UNCERTAIN');
-  assert.equal(result.confidence, 25);
-  assert.equal(result.decisiveEvidence[0].source, 'DISCOVERY_CONTEXT');
+  assert.equal(result.gateDisposition, 'CONTINUE_CRAWLING');
+  assert.equal(result.confidence, 0);
+  assert.equal(result.decisiveEvidence.length, 0);
 });
 
 test('a detected excluded country returns a policy-auditable rejection', () => {
@@ -215,11 +220,11 @@ test('target-country boundary preserves a matching strong country decision', () 
   assert.equal(bounded.rejectionReason, undefined);
 });
 
-test('target-country boundary preserves unresolved country uncertainty', () => {
+test('target-country boundary preserves unresolved country uncertainty when creator country is unknown', () => {
   const inferred = inferChannelCountry({ channelName: 'Trading Channel', discoveryCountry: 'Germany' });
   const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'Germany');
   assert.equal(bounded.status, 'UNCERTAIN');
-  assert.equal(bounded.detectedCountry, 'Germany');
+  assert.equal(bounded.detectedCountry, null);
 });
 
 test('target-country boundary preserves conflicting non-target uncertainty instead of rejecting it', () => {

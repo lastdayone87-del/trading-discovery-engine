@@ -127,7 +127,7 @@ export interface ChannelRecord {
   channel_id: string;
   channel_name: string;
   youtube_url: string;
-  country: string;
+  country: string | null;
   country_status: CountryStatus;
   confidence_score: number;
   discord_status: DiscordStatus;

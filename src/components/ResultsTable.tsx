@@ -424,7 +424,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                     {/* Country & Score */}
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-2">
-                        <span className="font-semibold text-slate-800 dark:text-slate-200">{c.country}</span>
+                        <span className="font-semibold text-slate-800 dark:text-slate-200">{c.country || 'Unknown'}</span>
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
                           c.country_status === 'CONFIRMED'
                             ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'

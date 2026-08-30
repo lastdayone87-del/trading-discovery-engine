@@ -1,4 +1,4 @@
-import type { CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
+import type { CountryMetadataStatus, CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
 import { normalizeCountryName } from './countryExclusionRules';
 
 export type CountryEvidenceSource =
@@ -13,6 +13,18 @@ export type CountryEvidenceSource =
   | 'NATIVE_LANGUAGE'
   | 'DISCOVERY_CONTEXT'
   | 'EXCLUSION_POLICY';
+
+export type CountryEvidenceAvailability =
+  | 'NOT_REQUESTED'
+  | 'AVAILABLE_DECLARED'
+  | 'AVAILABLE_NOT_DECLARED'
+  | 'UNAVAILABLE';
+
+export type GateDisposition =
+  | 'ALLOW_NORMAL'
+  | 'CONTINUE_CRAWLING'
+  | 'NEEDS_REVIEW'
+  | 'REJECT_EXCLUDED';
 
 export interface CountryInferenceEvidence {
   source: CountryEvidenceSource;
@@ -31,17 +43,39 @@ export interface CountryInferenceInput {
   verifiedSocialLinks?: string[];
   videoTitles?: string[];
   discoveryCountry?: string;
+  metadataStatus?: CountryMetadataStatus;
 }
 
-export interface CountryInferenceResult {
-  detectedCountry: string | null;
-  status: CountryStatus;
+export interface CountryAssessment {
+  discoveryCountry: string | null;
+  detectedCreatorCountry: string | null;
+  countryEvidence: CountryInferenceEvidence[];
+  countryStatus: CountryStatus;
+  evidenceAvailability: CountryEvidenceAvailability;
+  gateDisposition: GateDisposition;
   confidence: number;
   reasoning: string;
-  evidence: CountryInferenceEvidence[];
   decisiveEvidence: CountryInferenceEvidence[];
   rejectionReason?: string;
 }
+
+export interface CountryInferenceResult extends CountryAssessment {
+  detectedCountry: string | null; // Backwards compatibility alias for detectedCreatorCountry
+  status: CountryStatus; // Backwards compatibility alias for countryStatus
+  evidence: CountryInferenceEvidence[]; // Backwards compatibility alias for countryEvidence
+}
+
+const CREATOR_EVIDENCE_SOURCES: Set<CountryEvidenceSource> = new Set([
+  'OFFICIAL_YOUTUBE_METADATA',
+  'CHANNEL_ABOUT_BIO',
+  'OFFICIAL_WEBSITE_DOMAIN',
+  'VERIFIED_SOCIAL_LINK',
+  'EXCHANGE_REFERENCE',
+  'BROKER_REFERENCE',
+  'PHONE_NUMBER',
+  'PHYSICAL_ADDRESS',
+  'NATIVE_LANGUAGE'
+]);
 
 const COUNTRY_ALIASES: Record<string, string> = {
   us: 'United States', usa: 'United States', 'united states of america': 'United States',
@@ -131,8 +165,19 @@ function hostname(link: string): string {
   try { return new URL(link).hostname.toLowerCase().replace(/^www\./, ''); } catch { return ''; }
 }
 
-export function inferChannelCountry(input: CountryInferenceInput, exclusions: ExcludedCountry[] = [], vocabularies: CountryVocabulary[] = []): CountryInferenceResult {
+/**
+ * Perform country assessment separating discovery context from creator-level evidence.
+ * Structurally guarantees DISCOVERY_CONTEXT can NEVER populate detectedCreatorCountry or trigger REJECTED.
+ */
+export function assessChannelCountry(
+  input: CountryInferenceInput,
+  exclusions: ExcludedCountry[] = [],
+  vocabularies: CountryVocabulary[] = []
+): CountryAssessment {
   const evidence: CountryInferenceEvidence[] = [];
+  const discoveryCountry = input.discoveryCountry?.trim() ? canonicalCountry(input.discoveryCountry) : null;
+  const evidenceAvailability: CountryEvidenceAvailability = input.metadataStatus || 'NOT_REQUESTED';
+
   const official = input.officialCountry?.trim();
   if (official) {
     const country = canonicalCountry(official);
@@ -141,6 +186,20 @@ export function inferChannelCountry(input: CountryInferenceInput, exclusions: Ex
 
   const bioText = `${input.channelName || ''} ${input.aboutBio || ''}`.toLocaleLowerCase('en');
   addTextEvidence(evidence, 'CHANNEL_ABOUT_BIO', 2, 92, bioText, 'bio', 'Channel About/Bio location');
+
+  for (const item of exclusions) {
+    const name = item.country_name.toLocaleLowerCase('en');
+    if (name.length >= 4 && bioText.includes(name) && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
+      evidence.push({
+        source: 'CHANNEL_ABOUT_BIO',
+        priority: 2,
+        detectedCountry: canonicalCountry(item.country_name),
+        confidence: 92,
+        matchedValue: item.country_name,
+        reasoning: `Channel About/Bio location: '${item.country_name}' indicates ${canonicalCountry(item.country_name)}.`
+      });
+    }
+  }
 
   for (const link of input.officialWebsiteLinks || []) {
     const host = hostname(link);
@@ -184,36 +243,99 @@ export function inferChannelCountry(input: CountryInferenceInput, exclusions: Ex
     }
   }
 
-  if (input.discoveryCountry?.trim()) {
-    const country = canonicalCountry(input.discoveryCountry);
-    evidence.push({ source: 'DISCOVERY_CONTEXT', priority: 10, detectedCountry: country, confidence: 25, matchedValue: input.discoveryCountry, reasoning: `Discovery context suggests ${country}; no stronger attribution is implied.` });
+  // Provenance logging ONLY: DISCOVERY_CONTEXT is recorded in evidence list for traceability
+  if (discoveryCountry) {
+    evidence.push({
+      source: 'DISCOVERY_CONTEXT',
+      priority: 10,
+      detectedCountry: discoveryCountry,
+      confidence: 25,
+      matchedValue: input.discoveryCountry,
+      reasoning: `Discovery context suggests ${discoveryCountry}; no creator-level attribution is implied.`
+    });
   }
 
-  if (evidence.length === 0) return { detectedCountry: null, status: 'UNCERTAIN', confidence: 0, reasoning: 'No country evidence was available.', evidence, decisiveEvidence: [] };
+  // STRICT CREATOR EVIDENCE ALLOWLIST:
+  // Filter evidence down exclusively to sources allowed to attribute creator domicile.
+  const creatorEvidence = evidence.filter(item => CREATOR_EVIDENCE_SOURCES.has(item.source));
 
-  const decisivePriority = Math.min(...evidence.map(item => item.priority));
-  const decisiveEvidence = evidence.filter(item => item.priority === decisivePriority);
+  if (creatorEvidence.length === 0) {
+    return {
+      discoveryCountry,
+      detectedCreatorCountry: null,
+      countryEvidence: evidence,
+      countryStatus: 'UNCERTAIN',
+      evidenceAvailability,
+      gateDisposition: 'CONTINUE_CRAWLING',
+      confidence: 0,
+      reasoning: 'No creator-level country evidence was available.',
+      decisiveEvidence: []
+    };
+  }
+
+  const decisivePriority = Math.min(...creatorEvidence.map(item => item.priority));
+  const decisiveEvidence = creatorEvidence.filter(item => item.priority === decisivePriority);
   const countryScores = new Map<string, number>();
   decisiveEvidence.forEach(item => countryScores.set(item.detectedCountry, Math.max(countryScores.get(item.detectedCountry) || 0, item.confidence)));
   const ranked = [...countryScores.entries()].sort((a, b) => b[1] - a[1]);
-  const [detectedCountry, topConfidence] = ranked[0];
+  const [detectedCreatorCountry, topConfidence] = ranked[0];
   const conflict = ranked.length > 1 && ranked[1][1] === topConfidence;
   const confidence = conflict ? Math.min(49, topConfidence) : topConfidence;
-  const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCountry));
-  const exclusionAuthority = decisiveEvidence.every(item => item.detectedCountry === detectedCountry) &&
+  const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCreatorCountry));
+  const exclusionAuthority = decisiveEvidence.every(item => item.detectedCountry === detectedCreatorCountry) &&
     decisivePriority <= 3 && topConfidence >= 85 && !conflict;
 
-  // Policy is evaluated after evidence authority has been established. It may
-  // reject a strong, unambiguous country attribution, but it must never raise
-  // a weak score or resolve a conflict on the policy's behalf.
   if (excluded && exclusionAuthority) {
-    const policy: CountryInferenceEvidence = { source: 'EXCLUSION_POLICY', priority: 0, detectedCountry, confidence: topConfidence, reasoning: `${detectedCountry} is excluded by policy: ${excluded.reason}.` };
-    return { detectedCountry, status: 'REJECTED', confidence: topConfidence, reasoning: policy.reasoning, evidence: [policy, ...evidence], decisiveEvidence, rejectionReason: policy.reasoning };
+    const policy: CountryInferenceEvidence = {
+      source: 'EXCLUSION_POLICY',
+      priority: 0,
+      detectedCountry: detectedCreatorCountry,
+      confidence: topConfidence,
+      reasoning: `${detectedCreatorCountry} is excluded by policy: ${excluded.reason}.`
+    };
+    return {
+      discoveryCountry,
+      detectedCreatorCountry,
+      countryEvidence: [policy, ...evidence],
+      countryStatus: 'REJECTED',
+      evidenceAvailability,
+      gateDisposition: 'REJECT_EXCLUDED',
+      confidence: topConfidence,
+      reasoning: policy.reasoning,
+      decisiveEvidence,
+      rejectionReason: policy.reasoning
+    };
   }
 
-  const status: CountryStatus = conflict ? 'UNCERTAIN' : confidence >= 85 ? 'CONFIRMED' : confidence >= 60 ? 'LIKELY' : 'UNCERTAIN';
+  const countryStatus: CountryStatus = conflict ? 'UNCERTAIN' : confidence >= 85 ? 'CONFIRMED' : confidence >= 60 ? 'LIKELY' : 'UNCERTAIN';
+  const gateDisposition: GateDisposition = countryStatus === 'CONFIRMED' || countryStatus === 'LIKELY' ? 'ALLOW_NORMAL' : 'CONTINUE_CRAWLING';
   const reasoning = conflict
     ? `Conflicting ${decisiveEvidence[0].source} evidence prevents a reliable country decision.`
-    : `${decisiveEvidence[0].source} is the highest-priority available source and identifies ${detectedCountry}.`;
-  return { detectedCountry, status, confidence, reasoning, evidence: evidence.sort((a, b) => a.priority - b.priority), decisiveEvidence };
+    : `${decisiveEvidence[0].source} is the highest-priority available source and identifies ${detectedCreatorCountry}.`;
+
+  return {
+    discoveryCountry,
+    detectedCreatorCountry,
+    countryEvidence: evidence.sort((a, b) => a.priority - b.priority),
+    countryStatus,
+    evidenceAvailability,
+    gateDisposition,
+    confidence,
+    reasoning,
+    decisiveEvidence
+  };
+}
+
+export function inferChannelCountry(
+  input: CountryInferenceInput,
+  exclusions: ExcludedCountry[] = [],
+  vocabularies: CountryVocabulary[] = []
+): CountryInferenceResult {
+  const assessment = assessChannelCountry(input, exclusions, vocabularies);
+  return {
+    ...assessment,
+    detectedCountry: assessment.detectedCreatorCountry,
+    status: assessment.countryStatus,
+    evidence: assessment.countryEvidence
+  };
 }
