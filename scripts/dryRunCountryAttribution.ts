@@ -1,4 +1,4 @@
-import { getAllChannels, getExcludedCountries, getCountryVocabularies } from '../server/db';
+import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb } from '../server/db';
 import { creatorLevelCountryEvidence } from '../server/countryValidator';
 import { assessChannelCountry, GateDisposition } from '../server/countryInference';
 import type { CountryStatus } from '../src/types';
@@ -11,6 +11,7 @@ export interface DryRunReport {
   creatorCountryCounts: Record<string, number>;
   discoveryCountryCounts: Record<string, number>;
   unknownCreatorCount: number;
+  unavailableDiscoveryContextCount: number;
   sampleClassifications: Array<{
     channelId: string;
     channelName: string;
@@ -24,11 +25,30 @@ export interface DryRunReport {
 }
 
 export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
+  // DB connection failures MUST be fatal — do NOT swallow errors with .catch(() => [])
+  const db = await getDb();
   const [channels, excludedCountries, vocabularies] = await Promise.all([
-    getAllChannels().catch(() => []),
-    getExcludedCountries().catch(() => []),
-    getCountryVocabularies().catch(() => [])
+    getAllChannels(),
+    getExcludedCountries(),
+    getCountryVocabularies()
   ]);
+
+  // Load actual persisted retrieval/sighting provenance (targetCountry from channel_sightings or nominations)
+  const sightingsRes = await db.query(`
+    SELECT DISTINCT ON (channel_id)
+      channel_id,
+      metadata->>'targetCountry' AS target_country
+    FROM channel_sightings
+    WHERE metadata->>'targetCountry' IS NOT NULL
+    ORDER BY channel_id, observed_at DESC
+  `).catch(() => ({ rows: [] as Array<{ channel_id: string; target_country: string }> }));
+
+  const discoveryCountryMap = new Map<string, string>();
+  for (const row of sightingsRes.rows) {
+    if (row.target_country) {
+      discoveryCountryMap.set(row.channel_id, row.target_country);
+    }
+  }
 
   const dispositionBreakdown: Record<GateDisposition, number> = {
     ALLOW_NORMAL: 0,
@@ -47,9 +67,15 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
   const creatorCountryCounts: Record<string, number> = {};
   const discoveryCountryCounts: Record<string, number> = {};
   let unknownCreatorCount = 0;
+  let unavailableDiscoveryContextCount = 0;
   const sampleClassifications: DryRunReport['sampleClassifications'] = [];
 
   for (const channel of channels) {
+    const discoveryCountry = discoveryCountryMap.get(channel.channel_id) || null;
+    if (!discoveryCountry) {
+      unavailableDiscoveryContextCount++;
+    }
+
     const creatorEvidence = creatorLevelCountryEvidence({
       channelName: channel.channel_name,
       description: (channel.inspection_trail || [])
@@ -63,14 +89,14 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
 
     const assessment = assessChannelCountry({
       ...creatorEvidence,
-      discoveryCountry: channel.country || undefined
+      discoveryCountry: discoveryCountry || undefined
     }, excludedCountries, vocabularies);
 
     dispositionBreakdown[assessment.gateDisposition] = (dispositionBreakdown[assessment.gateDisposition] || 0) + 1;
     statusBreakdown[assessment.countryStatus] = (statusBreakdown[assessment.countryStatus] || 0) + 1;
 
-    if (assessment.discoveryCountry) {
-      discoveryCountryCounts[assessment.discoveryCountry] = (discoveryCountryCounts[assessment.discoveryCountry] || 0) + 1;
+    if (discoveryCountry) {
+      discoveryCountryCounts[discoveryCountry] = (discoveryCountryCounts[discoveryCountry] || 0) + 1;
     }
 
     if (assessment.detectedCreatorCountry) {
@@ -83,7 +109,7 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
       sampleClassifications.push({
         channelId: channel.channel_id,
         channelName: channel.channel_name,
-        discoveryCountry: assessment.discoveryCountry,
+        discoveryCountry,
         detectedCreatorCountry: assessment.detectedCreatorCountry,
         countryStatus: assessment.countryStatus,
         gateDisposition: assessment.gateDisposition,
@@ -100,6 +126,7 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
     creatorCountryCounts,
     discoveryCountryCounts,
     unknownCreatorCount,
+    unavailableDiscoveryContextCount,
     sampleClassifications,
     databaseMutationsExecuted: 0
   };
