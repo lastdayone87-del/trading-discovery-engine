@@ -183,12 +183,22 @@ test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', async 
   const db = await getDb();
   assert.ok(db, 'Database must be initialized and available for critical sighting-only recovery test');
 
-  const excluded = await getExcludedCountries();
+      const excluded = await getExcludedCountries();
   assert.ok(excluded && excluded.length > 0, 'Database policy must contain at least one excluded country');
-  const excludedCountryName = excluded[0].country_name;
-
   const vocabularies = await getCountryVocabularies();
   assert.ok(vocabularies && vocabularies.length > 0, 'Database policy must contain country vocabularies');
+  const { creatorLevelCountryEvidence } = await import('./countryValidator');
+  const { inferChannelCountry } = await import('./countryInference');
+  const excludedCountryName = excluded.find(item => {
+    const evidence = creatorLevelCountryEvidence({
+      channelName: item.country_name,
+      description: `${item.country_name} trader`,
+      videoTitles: [`${item.country_name} market`],
+      externalLinks: []
+    });
+    return inferChannelCountry(evidence, [item], vocabularies).status === 'REJECTED';
+  })?.country_name;
+  assert.ok(excludedCountryName, 'An excluded country recognized by the current creator-country policy is required');
   const excludedSet = new Set(excluded.map(e => e.country_name.toLowerCase()));
 
   const nonExcludedVocab = vocabularies.find(v => !excludedSet.has(v.country.toLowerCase()) && v.local_market_phrases?.length > 0);
@@ -198,19 +208,36 @@ test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', async 
   const testChannelIdNonExcluded = `test-sighting-only-nonexcluded-${Date.now()}`;
   const testChannelIdExcluded = `test-sighting-only-excluded-${Date.now()}`;
 
+  let fixtureQueryId: number | null = null;
+  let fixtureQueryRunId: string | null = null;
   try {
+    const queryRes = await db.query(
+      `INSERT INTO query_library(query, country, collection, intent, normalized_query)
+       VALUES ('isolated country-boundary recovery fixture', $1, 'TEST', 'TEST', 'isolated country-boundary recovery fixture')
+       RETURNING id`,
+      [nonExcludedCountryName]
+    );
+    fixtureQueryId = queryRes.rows[0].id;
+    const queryRunRes = await db.query(
+      `INSERT INTO query_runs(query_id, country, source, selection_strategy, selection_reason, provider_key, retrieval_surface, provider_capability, cost_domain, provider_allocation_snapshot)
+       VALUES ($1, $2, 'test', 'TEST', 'isolated country-boundary recovery fixture', 'youtube-search', 'TEST', 'SEARCH', 'TEST', '{}'::jsonb)
+       RETURNING id`,
+      [fixtureQueryId, nonExcludedCountryName]
+    );
+    fixtureQueryRunId = queryRunRes.rows[0].id;
+
     // A: Insert historical COUNTRY_REJECTED sighting with persisted=false and NO channels row (Non-excluded creator)
     await db.query(
-      `INSERT INTO channel_sightings(channel_id, query_id, funnel_outcome, country_outcome, persisted, metadata, observed_at)
-       VALUES ($1, 'q-test-1', 'COUNTRY_REJECTED', 'REJECTED', false, jsonb_build_object('channelName', 'Trader Channel', 'country', $2, 'source', 'test'), now())`,
-      [testChannelIdNonExcluded, nonExcludedCountryName]
+      `INSERT INTO channel_sightings(query_run_id, query_id, channel_id, result_rank, search_lane, page_number, was_known, persisted, country_outcome, trading_outcome, funnel_outcome, metadata, observed_at)
+       VALUES ($1, $2, $3, 1, 'CHANNEL', 1, false, false, 'REJECTED', 'UNCERTAIN', 'COUNTRY_REJECTED', jsonb_build_object('channelName', 'Trader Channel', 'country', $4::text, 'creatorCountryEvidence', $4::text, 'source', 'test'), now())`,
+      [fixtureQueryRunId, fixtureQueryId, testChannelIdNonExcluded, nonExcludedCountryName]
     );
 
     // Insert historical COUNTRY_REJECTED sighting with persisted=false and NO channels row (Excluded creator)
     await db.query(
-      `INSERT INTO channel_sightings(channel_id, query_id, funnel_outcome, country_outcome, persisted, metadata, observed_at)
-       VALUES ($1, 'q-test-2', 'COUNTRY_REJECTED', 'REJECTED', false, jsonb_build_object('channelName', 'Trader Channel', 'country', $2, 'source', 'test'), now())`,
-      [testChannelIdExcluded, excludedCountryName]
+      `INSERT INTO channel_sightings(query_run_id, query_id, channel_id, result_rank, search_lane, page_number, was_known, persisted, country_outcome, trading_outcome, funnel_outcome, metadata, observed_at)
+       VALUES ($1, $2, $3, 2, 'CHANNEL', 1, false, false, 'REJECTED', 'UNCERTAIN', 'COUNTRY_REJECTED', jsonb_build_object('channelName', 'Trader Channel', 'country', $4::text, 'creatorCountryEvidence', $4::text, 'source', 'test'), now())`,
+      [fixtureQueryRunId, fixtureQueryId, testChannelIdExcluded, excludedCountryName]
     );
 
     // Verify initial state: NO channels row exists for either sighting candidate
@@ -275,5 +302,7 @@ test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', async 
     await db.query(`DELETE FROM historical_country_boundary_recovery_events WHERE channel_id IN ($1, $2)`, [testChannelIdNonExcluded, testChannelIdExcluded]);
     await db.query(`DELETE FROM channels WHERE channel_id IN ($1, $2)`, [testChannelIdNonExcluded, testChannelIdExcluded]);
     await db.query(`DELETE FROM channel_sightings WHERE channel_id IN ($1, $2)`, [testChannelIdNonExcluded, testChannelIdExcluded]);
+    if (fixtureQueryRunId) await db.query('DELETE FROM query_runs WHERE id=$1', [fixtureQueryRunId]);
+    if (fixtureQueryId) await db.query('DELETE FROM query_library WHERE id=$1', [fixtureQueryId]);
   }
 });

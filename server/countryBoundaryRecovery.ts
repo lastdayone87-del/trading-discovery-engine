@@ -177,15 +177,23 @@ export async function loadCohort(): Promise<CohortRow[]> {
           COALESCE(c.scan_status, 'COMPLETED') AS scan_status,
           COALESCE(c.scan_attempts, 0) AS scan_attempts,
           COALESCE(c.discovery_source, (s.metadata->>'source')::text, 'recovery') AS discovery_source,
-          COALESCE(c.first_seen, s.observed_at::text, now()::text) AS first_seen,
-          COALESCE(c.last_checked, s.observed_at::text, now()::text) AS last_checked,
-          COALESCE(c.inspection_trail, jsonb_build_array(jsonb_build_object(
-            'step', 'COUNTRY_VALIDATION',
-            'title', 'Historical Sighting Boundary Rejection',
-            'status', 'REJECTED',
-            'details', 'Target Country Boundary: REJECTED — historical sighting recorded country_outcome REJECTED',
-            'timestamp', s.observed_at
-          ))) AS inspection_trail,
+          COALESCE(c.first_seen::text, s.observed_at::text, now()::text) AS first_seen,
+          COALESCE(c.last_checked::text, s.observed_at::text, now()::text) AS last_checked,
+          COALESCE(c.inspection_trail, jsonb_build_array(
+            jsonb_build_object(
+              'step', 'COUNTRY_VALIDATION',
+              'title', 'Historical Sighting Boundary Rejection',
+              'status', 'REJECTED',
+              'details', 'Target Country Boundary: REJECTED — historical sighting recorded country_outcome REJECTED',
+              'timestamp', s.observed_at
+            ),
+            jsonb_build_object(
+              'step', 'BIO',
+              'title', 'Historical Creator Evidence',
+              'status', 'FOUND',
+              'details', COALESCE(s.metadata->>'creatorCountryEvidence', '')
+            )
+          )) AS inspection_trail,
           c.subscriber_count,
           c.channel_thumbnail_url,
           COALESCE(c.trading_status, 'UNCERTAIN') AS trading_status
@@ -321,13 +329,21 @@ export async function processCountryBoundaryReprocessJob(
         COALESCE((s.metadata->>'source')::text, 'recovery') AS discovery_source,
         s.observed_at::text AS first_seen,
         s.observed_at::text AS last_checked,
-        jsonb_build_array(jsonb_build_object(
-          'step', 'COUNTRY_VALIDATION',
-          'title', 'Historical Sighting Boundary Rejection',
-          'status', 'REJECTED',
-          'details', 'Target Country Boundary: REJECTED — historical sighting recorded country_outcome REJECTED',
-          'timestamp', s.observed_at
-        )) AS inspection_trail,
+        jsonb_build_array(
+          jsonb_build_object(
+            'step', 'COUNTRY_VALIDATION',
+            'title', 'Historical Sighting Boundary Rejection',
+            'status', 'REJECTED',
+            'details', 'Target Country Boundary: REJECTED — historical sighting recorded country_outcome REJECTED',
+            'timestamp', s.observed_at
+          ),
+          jsonb_build_object(
+            'step', 'BIO',
+            'title', 'Historical Creator Evidence',
+            'status', 'FOUND',
+            'details', COALESCE(s.metadata->>'creatorCountryEvidence', '')
+          )
+        ) AS inspection_trail,
         'UNCERTAIN' AS trading_status
       FROM channel_sightings s
       WHERE s.channel_id = $1 AND (s.country_outcome = 'REJECTED' OR s.funnel_outcome = 'COUNTRY_REJECTED')
