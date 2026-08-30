@@ -52,6 +52,48 @@ test('Integration: Persistence boundary proves creator_country = null when detec
   }
 });
 
+test('Integration: Pipeline halts immediately on REJECT_EXCLUDED', async () => {
+  const candidate = {
+    channelId: 'test_pipeline_reject_excluded',
+    channelName: 'FX Trader Nigeria',
+    youtubeUrl: 'https://youtube.com/channel/test_pipeline_reject_excluded',
+    description: 'Professional forex trader based in Nigeria.',
+    videoTitles: ['EURUSD Scalping Strategy'],
+    countryMetadataStatus: 'AVAILABLE_DECLARED' as const
+  };
+
+  if (process.env.DATABASE_URL) {
+    const outcome = await processChannelThroughPipeline(candidate, 'United Kingdom', 'automated_query', false);
+    assert.equal(outcome.countryStatus, 'REJECTED');
+    assert.equal(outcome.detectedCountry, 'Nigeria');
+    assert.equal(outcome.tradingStatus, 'UNCERTAIN');
+    assert.equal(outcome.discordStatus, 'NOT_FOUND');
+    assert.equal(outcome.discordInvite, null);
+  }
+});
+
+test('Integration: Pipeline routes conflicting evidence directly to NEEDS_REVIEW', async () => {
+  const candidate = {
+    channelId: 'test_pipeline_needs_review',
+    channelName: 'Conflicting Trader UK Nigeria',
+    youtubeUrl: 'https://youtube.com/channel/test_pipeline_needs_review',
+    description: 'Trader based in United Kingdom and Nigeria.',
+    videoTitles: ['Weekly Forex Outlook'],
+    countryMetadataStatus: 'AVAILABLE_DECLARED' as const
+  };
+
+  if (process.env.DATABASE_URL) {
+    const outcome = await processChannelThroughPipeline(candidate, 'Canada', 'automated_query', false);
+    assert.equal(outcome.countryStatus, 'UNCERTAIN');
+    assert.equal(outcome.tradingStatus, 'NEEDS_REVIEW');
+    assert.equal(outcome.discordStatus, 'UNCERTAIN');
+    if (outcome.channelRecord) {
+      assert.equal(outcome.channelRecord.scan_status, 'NEEDS_REVIEW');
+      assert.equal(outcome.channelRecord.trading_status, 'NEEDS_REVIEW');
+    }
+  }
+});
+
 test('Read Model Projection: Dashboard exposes creatorCountry: null and discoveryCountry: Canada', () => {
   const mockChannel: ChannelRecord = {
     channel_id: 'ch_dashboard_test',
