@@ -35,13 +35,29 @@ export function shouldAttemptPublicAboutCountryFallback(input: {
   countryStatus: PublicAboutCountryStatus | string;
   countryMetadataStatus?: PublicAboutMetadataStatus | string | null;
   description?: string | null;
-  publicAboutAttempted?: boolean | null;
+  publicAboutStatus?: string | null;
+  publicAboutAttempts?: number | null;
+  publicAboutAttempted?: boolean;
+  maxAttempts?: number;
 }): boolean {
-  // Gate 1 trigger: when Data API country metadata failed or returned no declared country (AVAILABLE_NOT_DECLARED),
-  // country attribution is still unresolved, we still lack usable About text, and public About has not already been attempted.
-  if (input.publicAboutAttempted) return false;
+  if (input.publicAboutAttempted === true) return false;
+  const status = input.publicAboutStatus || 'NOT_ATTEMPTED';
+  const attempts = Number(input.publicAboutAttempts || 0);
+  const maxAttempts = input.maxAttempts ?? 2;
+
+  // Explicit state machine check:
+  // 1. If public About page was already successfully fetched or returned no bio (ATTEMPTED_SUCCEEDED / ATTEMPTED_EMPTY), do NOT re-fetch.
+  if (status === 'ATTEMPTED_SUCCEEDED' || status === 'ATTEMPTED_EMPTY') return false;
+  // 2. If public About page fetch failed and reached max attempts, do NOT re-fetch.
+  if (status === 'ATTEMPTED_FAILED' && attempts >= maxAttempts) return false;
+
+  // 3. Country attribution must be unresolved (UNCERTAIN).
   if (input.countryStatus !== 'UNCERTAIN') return false;
+
+  // 4. Data API metadata must be UNAVAILABLE or AVAILABLE_NOT_DECLARED.
   if (input.countryMetadataStatus !== 'UNAVAILABLE' && input.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED') return false;
+
+  // 5. Must still lack usable About text.
   return isChannelDescriptionInsufficient(input.description);
 }
 

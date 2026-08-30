@@ -230,21 +230,30 @@ export async function processChannelThroughPipeline(
 
   // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
   // retrieve the public channel page without an API key and re-run the country validator.
+  const publicAboutStatus = (candidate as any).publicAboutStatus || existing?.public_about_status || 'NOT_ATTEMPTED';
+  const publicAboutAttempts = Number((candidate as any).publicAboutAttempts ?? existing?.public_about_attempts ?? 0);
   const publicAboutAttempted = Boolean(
     (candidate as any).publicAboutAttempted ||
+    publicAboutStatus === 'ATTEMPTED_SUCCEEDED' ||
+    publicAboutStatus === 'ATTEMPTED_EMPTY' ||
     existing?.inspection_trail?.some(s => s.details?.includes('Public About') || s.title?.includes('Live About'))
   );
   if (shouldAttemptPublicAboutCountryFallback({
     countryStatus: countryVal.status,
     countryMetadataStatus: candidate.countryMetadataStatus,
     description: candidate.description,
+    publicAboutStatus,
+    publicAboutAttempts,
     publicAboutAttempted
   })) {
     (candidate as any).publicAboutAttempted = true;
+    (candidate as any).publicAboutAttempts = publicAboutAttempts + 1;
+    (candidate as any).publicAboutCheckedAt = now;
     candidate.countryMetadataCheckedAt = now;
     try {
       const liveAbout = await fetchLiveYouTubeChannelData(candidate.youtubeUrl);
       if (applyPublicAboutToCandidate(candidate, liveAbout)) {
+        (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
         countryVal = await validateChannelCountry({
           channelName: candidate.channelName,
           description: candidate.description,
@@ -253,8 +262,11 @@ export async function processChannelThroughPipeline(
           externalLinks: candidate.channelLinks,
           metadataStatus: candidate.countryMetadataStatus,
         }, targetCountry);
+      } else {
+        (candidate as any).publicAboutStatus = liveAbout ? 'ATTEMPTED_EMPTY' : 'ATTEMPTED_FAILED';
       }
     } catch (error) {
+      (candidate as any).publicAboutStatus = 'ATTEMPTED_FAILED';
       console.warn(`[Unified Ingestion Pipeline - Gate 1] Public About fallback failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
     }
   }
@@ -709,6 +721,9 @@ export async function processChannelThroughPipeline(
 function applyCandidateObservability(channel: ChannelRecord, candidate: IngestionCandidate): void {
   channel.country_metadata_status = candidate.countryMetadataStatus || channel.country_metadata_status || 'NOT_REQUESTED';
   channel.country_metadata_checked_at = candidate.countryMetadataCheckedAt || channel.country_metadata_checked_at || null;
+  channel.public_about_status = (candidate as any).publicAboutStatus || channel.public_about_status || 'NOT_ATTEMPTED';
+  channel.public_about_checked_at = (candidate as any).publicAboutCheckedAt || channel.public_about_checked_at || null;
+  channel.public_about_attempts = (candidate as any).publicAboutAttempts ?? channel.public_about_attempts ?? 0;
   channel.latest_upload_at = candidate.latestUploadAt || channel.latest_upload_at || null;
   channel.uploads_last_30_days = candidate.uploadsLast30Days ?? channel.uploads_last_30_days ?? 0;
   channel.uploads_last_90_days = candidate.uploadsLast90Days ?? channel.uploads_last_90_days ?? 0;
