@@ -117,9 +117,12 @@ test('About Fallback Durability & Idempotency: About attempted suppresses duplic
   assert.equal(suppressed, false, 'About fallback must be suppressed when public About was already attempted');
 });
 
-test('About Fallback Durability & Idempotency: Job retry/reconstruction with inspection trail suppresses duplicate fetches', () => {
+test('About Fallback Durability & Idempotency: Job retry/reconstruction with explicit state suppresses duplicate fetches', () => {
   const existingChannel: Partial<ChannelRecord> = {
     channel_id: 'ch_retry_about_test',
+    public_about_status: 'ATTEMPTED_EMPTY',
+    public_about_checked_at: new Date().toISOString(),
+    public_about_attempts: 1,
     country_metadata_checked_at: new Date().toISOString(),
     inspection_trail: [
       {
@@ -132,11 +135,18 @@ test('About Fallback Durability & Idempotency: Job retry/reconstruction with ins
     ]
   };
 
-  const publicAboutAttempted = Boolean(
-    existingChannel.inspection_trail?.some(s => s.details?.includes('Public About') || s.title?.includes('Live About'))
-  );
+  const publicAboutStatus = existingChannel.public_about_status || 'NOT_ATTEMPTED';
+  const publicAboutAttempts = Number(existingChannel.public_about_attempts || 0);
 
-  assert.equal(publicAboutAttempted, true, 'Reconstructed job must identify prior About attempt from inspection trail');
+  const shouldFallback = shouldAttemptPublicAboutCountryFallback({
+    countryStatus: 'UNCERTAIN',
+    countryMetadataStatus: 'AVAILABLE_NOT_DECLARED',
+    description: '',
+    publicAboutStatus,
+    publicAboutAttempts
+  });
+
+  assert.equal(shouldFallback, false, 'Reconstructed job with public_about_status ATTEMPTED_EMPTY must suppress duplicate About fallback fetches');
 });
 
 test('About Fallback Durability & Idempotency: Successful About bio populating description prevents re-fetching', () => {
