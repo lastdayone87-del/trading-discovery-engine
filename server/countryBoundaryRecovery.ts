@@ -280,14 +280,57 @@ export async function processCountryBoundaryReprocessJob(
   job: { payload: { channelId: string } }
 ): Promise<{ channelId: string; recovered: boolean; reconciliationState: ReconciliationState; newCountryStatus: string }> {
   const channelId = String(job.payload.channelId || '');
-  const channel = await getChannelById(channelId);
-  if (!channel) return { channelId, recovered: false, reconciliationState: 'INSUFFICIENT_EVIDENCE', newCountryStatus: 'MISSING' };
+  let channel = await getChannelById(channelId);
 
   const [excludedCountries, vocabularies, db] = await Promise.all([
     getExcludedCountries(),
     getCountryVocabularies(),
     getDb()
   ]);
+
+  // If no channel record exists in `channels` table, check `channel_sightings` for historical sighting evidence
+  let isSightingOnlyCandidate = false;
+  if (!channel && db) {
+    const sightingRes = await db.query(`
+      SELECT DISTINCT ON (s.channel_id)
+        s.channel_id,
+        COALESCE(s.metadata->>'channelName', s.channel_id) AS channel_name,
+        'https://youtube.com/channel/' || s.channel_id AS youtube_url,
+        COALESCE(s.metadata->>'country', 'UNKNOWN') AS country,
+        'REJECTED' AS country_status,
+        0 AS confidence_score,
+        'NOT_FOUND' AS discord_status,
+        NULL AS discord_invite,
+        'COMPLETED' AS scan_status,
+        0 AS scan_attempts,
+        COALESCE((s.metadata->>'source')::text, 'recovery') AS discovery_source,
+        s.observed_at::text AS first_seen,
+        s.observed_at::text AS last_checked,
+        jsonb_build_array(jsonb_build_object(
+          'step', 'COUNTRY_VALIDATION',
+          'title', 'Historical Sighting Boundary Rejection',
+          'status', 'REJECTED',
+          'details', 'Target Country Boundary: REJECTED — historical sighting recorded country_outcome REJECTED',
+          'timestamp', s.observed_at
+        )) AS inspection_trail,
+        'UNCERTAIN' AS trading_status
+      FROM channel_sightings s
+      WHERE s.channel_id = $1 AND (s.country_outcome = 'REJECTED' OR s.funnel_outcome = 'COUNTRY_REJECTED')
+      ORDER BY s.channel_id, s.observed_at DESC
+    `, [channelId]);
+
+    if (sightingRes.rowCount) {
+      const row = sightingRes.rows[0];
+      channel = {
+        ...row,
+        inspection_trail: typeof row.inspection_trail === 'string' ? JSON.parse(row.inspection_trail) : row.inspection_trail
+      };
+      isSightingOnlyCandidate = true;
+    }
+  }
+
+  if (!channel) return { channelId, recovered: false, reconciliationState: 'INSUFFICIENT_EVIDENCE', newCountryStatus: 'MISSING' };
+
   const now = new Date().toISOString();
   const eventKey = `recovery:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:${channelId}`;
 
@@ -379,10 +422,30 @@ export async function processCountryBoundaryReprocessJob(
       return { channelId, recovered: true, reconciliationState: classification.state, newCountryStatus: channel.country_status };
     }
 
-    await client.query(
-      `UPDATE channels SET country_status=$1, country=$2, confidence_score=$3, scan_status=$4, last_checked=$5, inspection_trail=$6 WHERE channel_id=$7`,
-      [channel.country_status, channel.country, channel.confidence_score, channel.scan_status, channel.last_checked, JSON.stringify(channel.inspection_trail), channelId]
-    );
+    if (isSightingOnlyCandidate) {
+      // Materialize sighting-only candidate into channels table safely
+      await client.query(
+        `INSERT INTO channels (
+          channel_id, channel_name, youtube_url, country, country_status, confidence_score,
+          discord_status, scan_status, scan_attempts, discovery_source, first_seen, last_checked,
+          inspection_trail, trading_status, country_metadata_status, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+        ON CONFLICT (channel_id) DO UPDATE SET
+          country_status=excluded.country_status, country=excluded.country, confidence_score=excluded.confidence_score,
+          scan_status=excluded.scan_status, last_checked=excluded.last_checked, inspection_trail=excluded.inspection_trail, updated_at=now()`,
+        [
+          channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status,
+          channel.confidence_score, channel.discord_status, channel.scan_status, channel.scan_attempts,
+          channel.discovery_source, channel.first_seen, channel.last_checked, JSON.stringify(channel.inspection_trail),
+          channel.trading_status, 'NOT_REQUESTED'
+        ]
+      );
+    } else {
+      await client.query(
+        `UPDATE channels SET country_status=$1, country=$2, confidence_score=$3, scan_status=$4, last_checked=$5, inspection_trail=$6 WHERE channel_id=$7`,
+        [channel.country_status, channel.country, channel.confidence_score, channel.scan_status, channel.last_checked, JSON.stringify(channel.inspection_trail), channelId]
+      );
+    }
 
     await client.query(
       `INSERT INTO historical_country_boundary_recovery_events(
