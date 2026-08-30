@@ -328,7 +328,7 @@ export function assessChannelCountry(
   }
 
   const countryStatus: CountryStatus = conflict ? 'UNCERTAIN' : confidence >= 85 ? 'CONFIRMED' : confidence >= 60 ? 'LIKELY' : 'UNCERTAIN';
-  const gateDisposition: GateDisposition = countryStatus === 'CONFIRMED' || countryStatus === 'LIKELY' ? 'ALLOW_NORMAL' : 'CONTINUE_CRAWLING';
+  const gateDisposition: GateDisposition = conflict ? 'NEEDS_REVIEW' : countryStatus === 'CONFIRMED' || countryStatus === 'LIKELY' ? 'ALLOW_NORMAL' : 'CONTINUE_CRAWLING';
   const reasoning = conflict
     ? `Conflicting ${decisiveEvidence[0].source} evidence prevents a reliable country decision.`
     : `${decisiveEvidence[0].source} is the highest-priority available source and identifies ${detectedCreatorCountry}.`;

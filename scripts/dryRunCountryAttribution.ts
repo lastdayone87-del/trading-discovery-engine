@@ -41,7 +41,7 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
     FROM channel_sightings
     WHERE metadata->>'targetCountry' IS NOT NULL
     ORDER BY channel_id, observed_at DESC
-  `).catch(() => ({ rows: [] as Array<{ channel_id: string; target_country: string }> }));
+  `);
 
   const discoveryCountryMap = new Map<string, string>();
   for (const row of sightingsRes.rows) {
