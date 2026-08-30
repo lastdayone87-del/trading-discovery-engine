@@ -154,7 +154,14 @@ test('TEST G: Dashboard projection SQL filters out excluded countries and non-re
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /NOT EXISTS[\s\S]+FROM excluded_countries/);
 });
 
-test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', async () => {
+const postgresUrl = process.env.COUNTRY_BOUNDARY_POSTGRES_URL || process.env.PHASE4_POSTGRES_URL || process.env.DATABASE_URL;
+
+test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', {
+  skip: postgresUrl ? false : 'COUNTRY_BOUNDARY_POSTGRES_URL or DATABASE_URL environment variable is required to execute PostgreSQL database integration tests'
+}, async () => {
+  if (postgresUrl) {
+    process.env.DATABASE_URL = postgresUrl;
+  }
   const { loadCohort, processCountryBoundaryReprocessJob } = await import('./countryBoundaryRecovery');
   const { getDb, getExcludedCountries, getCountryVocabularies, getChannelById } = await import('./db');
 
