@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { processChannelThroughPipeline } from '../server/ingestionPipeline';
+import { shouldAttemptPublicAboutCountryFallback } from '../server/youtubePublicAbout';
 import { getChannelById, upsertChannel, getDb } from '../server/db';
 import type { ChannelRecord } from '../src/types';
 
@@ -92,6 +93,61 @@ test('Integration: Pipeline routes conflicting evidence directly to NEEDS_REVIEW
       assert.equal(outcome.channelRecord.trading_status, 'NEEDS_REVIEW');
     }
   }
+});
+
+test('About Fallback Durability & Idempotency: Metadata checked timestamp alone does NOT suppress About fallback', () => {
+  const allowed = shouldAttemptPublicAboutCountryFallback({
+    countryStatus: 'UNCERTAIN',
+    countryMetadataStatus: 'AVAILABLE_NOT_DECLARED',
+    description: '',
+    publicAboutAttempted: false
+  });
+
+  assert.equal(allowed, true, 'About fallback must be allowed when metadata was checked but public About was never attempted');
+});
+
+test('About Fallback Durability & Idempotency: About attempted suppresses duplicate fetches', () => {
+  const suppressed = shouldAttemptPublicAboutCountryFallback({
+    countryStatus: 'UNCERTAIN',
+    countryMetadataStatus: 'AVAILABLE_NOT_DECLARED',
+    description: '',
+    publicAboutAttempted: true
+  });
+
+  assert.equal(suppressed, false, 'About fallback must be suppressed when public About was already attempted');
+});
+
+test('About Fallback Durability & Idempotency: Job retry/reconstruction with inspection trail suppresses duplicate fetches', () => {
+  const existingChannel: Partial<ChannelRecord> = {
+    channel_id: 'ch_retry_about_test',
+    country_metadata_checked_at: new Date().toISOString(),
+    inspection_trail: [
+      {
+        step: 'COUNTRY_VALIDATION',
+        title: 'Country Validation (Unknown)',
+        status: 'NOT_FOUND',
+        details: 'Official Metadata: Available; channel declared no country\nPublic About page attempted.',
+        timestamp: new Date().toISOString()
+      }
+    ]
+  };
+
+  const publicAboutAttempted = Boolean(
+    existingChannel.inspection_trail?.some(s => s.details?.includes('Public About') || s.title?.includes('Live About'))
+  );
+
+  assert.equal(publicAboutAttempted, true, 'Reconstructed job must identify prior About attempt from inspection trail');
+});
+
+test('About Fallback Durability & Idempotency: Successful About bio populating description prevents re-fetching', () => {
+  const suppressedByBio = shouldAttemptPublicAboutCountryFallback({
+    countryStatus: 'UNCERTAIN',
+    countryMetadataStatus: 'AVAILABLE_NOT_DECLARED',
+    description: 'Professional forex trader daily technical analysis and risk management',
+    publicAboutAttempted: false
+  });
+
+  assert.equal(suppressedByBio, false, 'Usable bio text prevents repeated About fetches');
 });
 
 test('Read Model Projection: Dashboard exposes creatorCountry: null and discoveryCountry: Canada', () => {

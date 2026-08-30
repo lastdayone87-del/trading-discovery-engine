@@ -230,7 +230,10 @@ export async function processChannelThroughPipeline(
 
   // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
   // retrieve the public channel page without an API key and re-run the country validator.
-  const publicAboutAttempted = Boolean((candidate as any).publicAboutAttempted || existing?.country_metadata_checked_at);
+  const publicAboutAttempted = Boolean(
+    (candidate as any).publicAboutAttempted ||
+    existing?.inspection_trail?.some(s => s.details?.includes('Public About') || s.title?.includes('Live About'))
+  );
   if (shouldAttemptPublicAboutCountryFallback({
     countryStatus: countryVal.status,
     countryMetadataStatus: candidate.countryMetadataStatus,
@@ -269,7 +272,7 @@ export async function processChannelThroughPipeline(
       : (countryVal.status === 'CONFIRMED' || countryVal.status === 'LIKELY')
       ? ('FOUND' as const)
       : ('NOT_FOUND' as const),
-    details: countryVal.decisionLogs,
+    details: `${countryVal.decisionLogs}${(candidate as any).publicAboutAttempted ? '\nPublic About page attempted.' : ''}`,
     timestamp: now
   };
 
