@@ -29,16 +29,11 @@ export function hasPinnedBoundaryRejection(channel: ChannelRecord): boolean {
 /**
  * Generic predicate identifying candidates for historical country boundary reconciliation.
  * Inspects channels whose country_status = 'REJECTED' or whose trail records target boundary rejection.
+ * Candidates are loaded unconditionally for re-evaluation without pre-filtering against excluded_countries,
+ * allowing classifyReconciliationState to evaluate active exclusion policy dynamically.
  */
-export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, excludedCountries: Array<{ country_name: string }>): boolean {
-  const excluded = new Set(excludedCountries.map(item => canonicalCountry(item.country_name).toLocaleLowerCase('en')));
-  const isStoredCountryExcluded = excluded.has(canonicalCountry(channel.country || '').toLocaleLowerCase('en'));
-
-  // A candidate must be currently REJECTED or carry a recorded target boundary rejection in its trail.
-  // Crucially, if the stored country is currently in excluded_countries, it is NOT an automatic candidate
-  // unless we explicitly re-evaluate creator evidence.
-  return (channel.country_status === 'REJECTED' || hasPinnedBoundaryRejection(channel))
-    && !isStoredCountryExcluded;
+export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, _excludedCountries?: Array<{ country_name: string }>): boolean {
+  return channel.country_status === 'REJECTED' || hasPinnedBoundaryRejection(channel);
 }
 
 /**
@@ -51,7 +46,7 @@ export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, excludedC
  */
 export function classifyReconciliationState(
   channel: ChannelRecord,
-  excludedCountries: Array<{ country_name: string }>,
+  excludedCountries: Array<{ country_name: string; reason?: string }>,
   vocabularies: CountryVocabulary[] = []
 ): {
   state: ReconciliationState;
@@ -82,7 +77,8 @@ export function classifyReconciliationState(
     metadataStatus: channel.country_metadata_status
   });
 
-  const inference = inferChannelCountry(creatorEvidence, excludedCountries, vocabularies);
+  const formattedExclusions = excludedCountries.map(e => ({ country_name: e.country_name, reason: e.reason || 'Excluded by policy' }));
+  const inference = inferChannelCountry(creatorEvidence, formattedExclusions, vocabularies);
 
   if (inference.status === 'REJECTED') {
     return {
@@ -132,7 +128,7 @@ export type CountryBoundaryDryRun = {
   byCountry: Array<{ country: string; count: number }>;
 };
 
-async function loadCohort(): Promise<CohortRow[]> {
+export async function loadCohort(): Promise<CohortRow[]> {
   const [channels, excludedCountries, vocabularies, db] = await Promise.all([
     getAllChannels(),
     getExcludedCountries(),

@@ -128,3 +128,53 @@ test('TEST G: Dashboard projection SQL filters out excluded countries and non-re
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /country_status <> 'REJECTED'/);
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /NOT EXISTS[\s\S]+FROM excluded_countries/);
 });
+
+test('TEST H: loadCohort discovers unpersisted historical channel_sightings without channels row', async () => {
+  const { loadCohort } = await import('./countryBoundaryRecovery');
+  const { getDb } = await import('./db');
+
+  let db: any;
+  try {
+    db = await getDb();
+  } catch {
+    // Skip DB-dependent test if database unavailable
+    return;
+  }
+
+  const testChannelIdNonExcluded = `test-sighting-only-ca-${Date.now()}`;
+  const testChannelIdExcluded = `test-sighting-only-in-${Date.now()}`;
+
+  try {
+    // Insert sighting-only row for non-excluded country (Canada)
+    await db.query(
+      `INSERT INTO channel_sightings(channel_id, query_id, funnel_outcome, country_outcome, metadata, observed_at)
+       VALUES ($1, 'q-test-1', 'COUNTRY_REJECTED', 'REJECTED', jsonb_build_object('channelName', 'Börsenblick Canada', 'country', 'Canada', 'source', 'test'), now())`,
+      [testChannelIdNonExcluded]
+    );
+
+    // Insert sighting-only row for excluded country (India)
+    await db.query(
+      `INSERT INTO channel_sightings(channel_id, query_id, funnel_outcome, country_outcome, metadata, observed_at)
+       VALUES ($1, 'q-test-2', 'COUNTRY_REJECTED', 'REJECTED', jsonb_build_object('channelName', 'Nifty Trader Mumbai', 'country', 'India', 'source', 'test'), now())`,
+      [testChannelIdExcluded]
+    );
+
+    // Ensure India is in excluded_countries for test
+    await db.query(`INSERT INTO excluded_countries(country_name, reason) VALUES ('India', 'South Asian Exclusion') ON CONFLICT DO NOTHING`);
+
+    // Dynamically access loadCohort
+    const cohort = await (loadCohort as any)();
+
+    const candidateNonExcluded = cohort.find((c: any) => c.channel_id === testChannelIdNonExcluded);
+    assert.ok(candidateNonExcluded, 'Non-excluded sighting-only candidate should be discovered by loadCohort');
+    assert.equal(candidateNonExcluded.reconciliation.state, 'RECOVERABLE_NON_EXCLUDED');
+    assert.equal(candidateNonExcluded.executionEligible, true);
+
+    const candidateExcluded = cohort.find((c: any) => c.channel_id === testChannelIdExcluded);
+    assert.ok(candidateExcluded, 'Excluded sighting-only candidate should be discovered by loadCohort');
+    assert.equal(candidateExcluded.reconciliation.state, 'RETAIN_EXCLUDED');
+    assert.equal(candidateExcluded.executionEligible, false);
+  } finally {
+    await db.query(`DELETE FROM channel_sightings WHERE channel_id IN ($1, $2)`, [testChannelIdNonExcluded, testChannelIdExcluded]);
+  }
+});
