@@ -158,26 +158,20 @@ test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', async 
   const { loadCohort, processCountryBoundaryReprocessJob } = await import('./countryBoundaryRecovery');
   const { getDb, getExcludedCountries, getCountryVocabularies, getChannelById } = await import('./db');
 
-  if (!process.env.DATABASE_URL) {
-    // Skip DB-dependent integration test when DATABASE_URL is not set in local runner environment
-    return;
-  }
-
   const db = await getDb();
   assert.ok(db, 'Database must be initialized and available for critical sighting-only recovery test');
 
   const excluded = await getExcludedCountries();
-  assert.ok(excluded.length > 0, 'Database policy must contain at least one excluded country');
+  assert.ok(excluded && excluded.length > 0, 'Database policy must contain at least one excluded country');
   const excludedCountryName = excluded[0].country_name;
 
   const vocabularies = await getCountryVocabularies();
+  assert.ok(vocabularies && vocabularies.length > 0, 'Database policy must contain country vocabularies');
   const excludedSet = new Set(excluded.map(e => e.country_name.toLowerCase()));
-  const nonExcludedVocab = vocabularies.find(v => !excludedSet.has(v.country.toLowerCase()) && v.local_market_phrases?.length > 0) || {
-    country: 'NonExcludedCountry',
-    local_market_phrases: ['market_term_1', 'market_term_2']
-  };
+
+  const nonExcludedVocab = vocabularies.find(v => !excludedSet.has(v.country.toLowerCase()) && v.local_market_phrases?.length > 0);
+  assert.ok(nonExcludedVocab, 'A valid non-excluded country with vocabularies must exist in current policy');
   const nonExcludedCountryName = nonExcludedVocab.country;
-  const nonExcludedBioTerm = nonExcludedVocab.local_market_phrases[0] || 'trading';
 
   const testChannelIdNonExcluded = `test-sighting-only-nonexcluded-${Date.now()}`;
   const testChannelIdExcluded = `test-sighting-only-excluded-${Date.now()}`;
