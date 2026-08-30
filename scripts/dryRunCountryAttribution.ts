@@ -25,6 +25,7 @@ export interface DryRunReport {
 }
 
 export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
+  // DB connection failures MUST be fatal — do NOT swallow errors with .catch(() => [])
   const db = await getDb();
   const [channels, excludedCountries, vocabularies] = await Promise.all([
     getAllChannels(),
@@ -32,6 +33,7 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
     getCountryVocabularies()
   ]);
 
+  // Load actual persisted retrieval/sighting provenance (targetCountry from channel_sightings or nominations)
   const sightingsRes = await db.query(`
     SELECT DISTINCT ON (channel_id)
       channel_id,
@@ -70,7 +72,9 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
 
   for (const channel of channels) {
     const discoveryCountry = discoveryCountryMap.get(channel.channel_id) || null;
-    if (!discoveryCountry) unavailableDiscoveryContextCount++;
+    if (!discoveryCountry) {
+      unavailableDiscoveryContextCount++;
+    }
 
     const creatorEvidence = creatorLevelCountryEvidence({
       channelName: channel.channel_name,
@@ -88,12 +92,18 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
       discoveryCountry: discoveryCountry || undefined
     }, excludedCountries, vocabularies);
 
-    dispositionBreakdown[assessment.gateDisposition]++;
-    statusBreakdown[assessment.countryStatus]++;
+    dispositionBreakdown[assessment.gateDisposition] = (dispositionBreakdown[assessment.gateDisposition] || 0) + 1;
+    statusBreakdown[assessment.countryStatus] = (statusBreakdown[assessment.countryStatus] || 0) + 1;
 
-    if (discoveryCountry) discoveryCountryCounts[discoveryCountry] = (discoveryCountryCounts[discoveryCountry] || 0) + 1;
-    if (assessment.detectedCreatorCountry) creatorCountryCounts[assessment.detectedCreatorCountry] = (creatorCountryCounts[assessment.detectedCreatorCountry] || 0) + 1;
-    else unknownCreatorCount++;
+    if (discoveryCountry) {
+      discoveryCountryCounts[discoveryCountry] = (discoveryCountryCounts[discoveryCountry] || 0) + 1;
+    }
+
+    if (assessment.detectedCreatorCountry) {
+      creatorCountryCounts[assessment.detectedCreatorCountry] = (creatorCountryCounts[assessment.detectedCreatorCountry] || 0) + 1;
+    } else {
+      unknownCreatorCount++;
+    }
 
     if (sampleClassifications.length < 10) {
       sampleClassifications.push({
@@ -122,6 +132,7 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
   };
 }
 
+// Execute dry-run if invoked directly
 if (process.argv[1]?.endsWith('dryRunCountryAttribution.ts') || process.argv[1]?.endsWith('dryRunCountryAttribution.js')) {
   runCountryAttributionDryRun()
     .then(report => {
