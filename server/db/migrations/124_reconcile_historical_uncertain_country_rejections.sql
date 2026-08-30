@@ -109,6 +109,8 @@ ON CONFLICT(event_key) DO NOTHING;
 
 -- Re-enable the ordinary enrichment owner only for recovered rows that are not
 -- low-audience and do not already have active enrichment/community ownership.
+-- Set candidate enrichmentStage to 0 so candidateAlreadyEnriched evaluates to false,
+-- ensuring normal fresh metadata acquisition via fetchYouTubeChannelEnrichment().
 INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key)
 SELECT
   'ENRICH_CHANNEL',
@@ -128,7 +130,7 @@ SELECT
       'channelLinks',jsonb_build_array(),
       'subscriberCount',recover.subscriber_count,
       'channelThumbnailUrl',recover.channel_thumbnail_url,
-      'enrichmentStage',1
+      'enrichmentStage',0
     ),
     'recoveryReasonCodes',jsonb_build_array('LEGACY_TARGET_COUNTRY_BOUNDARY_FALSE_REJECTION')
   ),

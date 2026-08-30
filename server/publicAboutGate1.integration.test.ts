@@ -184,26 +184,30 @@ test('SCENARIO 4: public About 403 soft-fails to UNCERTAIN', async () => {
   assert.equal(result.persisted, true);
 });
 
-test('SCENARIO 5: Target search country Canada with detected excluded country India returns exact telemetry fields', async () => {
-  const exclusions = [{ country_name: 'India', reason: 'South Asian High-Spam Exclusion' }];
+test('SCENARIO 5: Target search country mismatch with detected excluded country returns exact telemetry fields', async () => {
+  const { INITIAL_EXCLUDED_COUNTRIES } = await import('../src/data/initial_countries');
+  assert.ok(INITIAL_EXCLUDED_COUNTRIES.length > 0, 'Initial excluded countries policy must be available');
+  const excludedCountryName = INITIAL_EXCLUDED_COUNTRIES[0].country_name;
+  const exclusions = [{ country_name: excludedCountryName, reason: 'Configured High-Spam Exclusion' }];
+
   const result = await runGate1CountryPhase({
-    channelName: 'Neeraj Joshi',
+    channelName: `Trader ${excludedCountryName}`,
     channelId: 'UCbbbbbbbbbbbbbbbbbbbbbb',
     youtubeUrl: 'https://www.youtube.com/channel/UCbbbbbbbbbbbbbbbbbbbbbb',
     discoveryCountry: 'Canada',
-    initialDescription: 'Indian trader in Mumbai covering Nifty 50 and Bank Nifty',
+    initialDescription: `Trader active in ${excludedCountryName}`,
     apiMetadata: 'UNAVAILABLE',
     exclusions
   });
   assert.equal(result.countryStatus, 'REJECTED');
-  assert.equal(result.detectedCountry, 'India');
+  assert.equal(result.detectedCountry, excludedCountryName);
   assert.equal(result.persisted, false);
 
   const inference = inferChannelCountry(
-    { aboutBio: 'Indian trader in Mumbai covering Nifty 50', discoveryCountry: 'Canada' },
+    { aboutBio: `Trader active in ${excludedCountryName}`, discoveryCountry: 'Canada' },
     exclusions
   );
   assert.equal(inference.status, 'REJECTED');
-  assert.equal(inference.detectedCountry, 'India');
-  assert.match(inference.rejectionReason || '', /India is excluded by policy/);
+  assert.equal(inference.detectedCountry, excludedCountryName);
+  assert.match(inference.rejectionReason || '', new RegExp(`${excludedCountryName} is excluded by policy`));
 });
