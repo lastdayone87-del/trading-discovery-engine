@@ -753,8 +753,12 @@ export async function inspectAndValidateChannel(
 
     const countryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
-      title: `Country Validation (${channel.country})`,
-      status: valRes.status === 'REJECTED' ? 'REJECTED' : 'FOUND',
+      title: `Country Validation (${channel.country || 'Unknown'})`,
+      status: valRes.status === 'REJECTED'
+        ? 'REJECTED'
+        : (valRes.status === 'CONFIRMED' || valRes.status === 'LIKELY')
+        ? 'FOUND'
+        : 'NOT_FOUND',
       details: valRes.decisionLogs,
       timestamp: now
     };
@@ -801,7 +805,11 @@ export async function inspectAndValidateChannel(
     const liveCountryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
       title: `Country Validation (${rawLiveCountry.detectedCreatorCountry || 'Unknown'}) — Live About`,
-      status: rawLiveCountry.status === 'REJECTED' && liveCountry.status === 'REJECTED' ? 'REJECTED' : 'FOUND',
+      status: rawLiveCountry.status === 'REJECTED' && liveCountry.status === 'REJECTED'
+        ? 'REJECTED'
+        : (liveCountry.status === 'CONFIRMED' || liveCountry.status === 'LIKELY')
+        ? 'FOUND'
+        : 'NOT_FOUND',
       details: `${rawLiveCountry.decisionLogs}${liveCountry !== rawLiveCountry ? '\\nEffective decision: earlier stronger/conflicting evidence preserved.' : ''}`,
       timestamp: now
     };

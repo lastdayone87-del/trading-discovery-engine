@@ -383,7 +383,7 @@ export async function selectNextQueryForCountry(
     // Filter scoredQueries for candidates whose mapped canonical neighborhood key matches targetKey
     const matches = scoredQueries.filter(q => {
       const qDims: DiscoveryNeighborhoodDimensions = {
-        country: country || target.country,
+        country: target.country || country,
         language: target.language,
         queryIntent: q.intent || target.queryIntent,
         primaryTermFamily: q.primary_term || q.query,
@@ -403,7 +403,7 @@ export async function selectNextQueryForCountry(
       const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION');
       const matchingGenerated = generated.find(gen => {
         const genDims: DiscoveryNeighborhoodDimensions = {
-          country: country || target.country,
+          country: target.country || country,
           language: target.language,
           queryIntent: gen.intent || target.queryIntent,
           primaryTermFamily: gen.primary_term || gen.query,

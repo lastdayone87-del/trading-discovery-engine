@@ -230,11 +230,15 @@ export async function processChannelThroughPipeline(
 
   // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
   // retrieve the public channel page without an API key and re-run the country validator.
+  const publicAboutAttempted = Boolean((candidate as any).publicAboutAttempted || existing?.country_metadata_checked_at);
   if (shouldAttemptPublicAboutCountryFallback({
     countryStatus: countryVal.status,
     countryMetadataStatus: candidate.countryMetadataStatus,
     description: candidate.description,
+    publicAboutAttempted
   })) {
+    (candidate as any).publicAboutAttempted = true;
+    candidate.countryMetadataCheckedAt = now;
     try {
       const liveAbout = await fetchLiveYouTubeChannelData(candidate.youtubeUrl);
       if (applyPublicAboutToCandidate(candidate, liveAbout)) {
@@ -260,12 +264,16 @@ export async function processChannelThroughPipeline(
   const countryValidationStep = {
     step: 'COUNTRY_VALIDATION' as const,
     title: `Country Validation (${creatorCountry || 'Unknown'})`,
-    status: countryVal.status === 'REJECTED' ? ('REJECTED' as const) : ('FOUND' as const),
+    status: countryVal.status === 'REJECTED'
+      ? ('REJECTED' as const)
+      : (countryVal.status === 'CONFIRMED' || countryVal.status === 'LIKELY')
+      ? ('FOUND' as const)
+      : ('NOT_FOUND' as const),
     details: countryVal.decisionLogs,
     timestamp: now
   };
 
-  if (countryVal.status === 'REJECTED') {
+  if (countryVal.gateDisposition === 'REJECT_EXCLUDED' || countryVal.status === 'REJECTED') {
     console.log(
       `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`
     );
@@ -295,6 +303,50 @@ export async function processChannelThroughPipeline(
       discordStatus: 'NOT_FOUND',
       discordInvite: null,
       channelRecord: undefined
+    };
+  }
+
+  if (countryVal.gateDisposition === 'NEEDS_REVIEW') {
+    console.log(`[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' routed to NEEDS_REVIEW by country gate disposition.`);
+    const reviewChannel: ChannelRecord = existing || {
+      channel_id: candidate.channelId,
+      channel_name: candidate.channelName,
+      youtube_url: candidate.youtubeUrl,
+      country: creatorCountry,
+      country_status: countryVal.status,
+      confidence_score: countryVal.score,
+      discord_status: 'UNCERTAIN',
+      discord_invite: null,
+      scan_status: 'NEEDS_REVIEW',
+      scan_attempts: 0,
+      discovery_source: source,
+      first_seen: now,
+      last_checked: now,
+      inspection_trail: [countryValidationStep],
+      subscriber_count: candidate.subscriberCount,
+      channel_thumbnail_url: candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
+      trading_status: 'NEEDS_REVIEW'
+    };
+    reviewChannel.country_status = countryVal.status;
+    reviewChannel.country = creatorCountry;
+    reviewChannel.confidence_score = countryVal.score;
+    reviewChannel.trading_status = 'NEEDS_REVIEW';
+    reviewChannel.scan_status = 'NEEDS_REVIEW';
+    reviewChannel.last_checked = now;
+    applyCandidateObservability(reviewChannel, candidate);
+    await upsertChannel(reviewChannel);
+
+    return {
+      channelId: candidate.channelId,
+      channelName: candidate.channelName,
+      isNew: !existing,
+      wasKnown: !!existing,
+      persisted: true,
+      countryStatus: countryVal.status,
+      tradingStatus: 'NEEDS_REVIEW',
+      discordStatus: 'UNCERTAIN',
+      discordInvite: null,
+      channelRecord: reviewChannel
     };
   }
 

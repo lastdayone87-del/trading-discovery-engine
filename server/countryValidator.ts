@@ -79,6 +79,8 @@ export function mergeCountryValidationResults(initial: ValidationResult, live: V
   if (initial.status === 'UNCERTAIN' && livePriority === initialPriority && liveCreator !== initialCreator) return {
     ...initial,
     status: 'UNCERTAIN',
+    detectedCountry: null,
+    detectedCreatorCountry: null,
     score: Math.min(49, Math.max(initial.score, live.score)),
     decisionLogs: `${initial.decisionLogs}\nLive revalidation preserved uncertainty because evidence remained conflicting at the same priority.`,
     evidence: [...initialEvidence, ...liveEvidence]
@@ -86,17 +88,18 @@ export function mergeCountryValidationResults(initial: ValidationResult, live: V
   return live;
 }
 
-export function applyTargetCountryBoundary(result: ValidationResult, targetCountryName: string): ValidationResult {
+export function applyTargetCountryBoundary(result: ValidationResult, targetCountryName?: string | null): ValidationResult {
   // Hard invariant: a target-country mismatch can NEVER change a non-rejected
   // country result into REJECTED. Rejection occurs ONLY if the detected creator
   // country is explicitly present in excluded_countries (which produces
   // result.status === 'REJECTED' before this boundary function is called).
   if (result.status === 'REJECTED') return result;
 
-  const target = canonicalCountry(targetCountryName);
+  const cleanTargetName = targetCountryName || '';
+  const target = canonicalCountry(cleanTargetName);
   const rawCreator = result.detectedCreatorCountry ?? result.detectedCountry;
   const detected = rawCreator ? canonicalCountry(rawCreator) : null;
-  const globalContext = !targetCountryName.trim() || ['GLOBAL', 'ALL', '*', 'WORLDWIDE'].includes(target.toLocaleUpperCase('en'));
+  const globalContext = !cleanTargetName.trim() || ['GLOBAL', 'ALL', '*', 'WORLDWIDE'].includes(target.toLocaleUpperCase('en'));
 
   if (globalContext || !detected || detected === target) return result;
 
@@ -117,7 +120,7 @@ export async function validateChannelCountry(
     socialBios?: string[];
     metadataStatus?: CountryMetadataStatus;
   },
-  targetCountryName: string
+  targetCountryName?: string | null
 ): Promise<ValidationResult> {
   const [excludedCountries, vocabularies] = await Promise.all([
     getExcludedCountries(),

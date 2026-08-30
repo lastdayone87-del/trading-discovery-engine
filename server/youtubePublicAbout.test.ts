@@ -59,6 +59,18 @@ test('AVAILABLE_NOT_DECLARED with empty description attempts bounded About fallb
   );
 });
 
+test('publicAboutAttempted = true prevents repeated About fallback attempts', () => {
+  assert.equal(
+    shouldAttemptPublicAboutCountryFallback({
+      countryStatus: 'UNCERTAIN',
+      countryMetadataStatus: 'AVAILABLE_NOT_DECLARED',
+      description: '',
+      publicAboutAttempted: true
+    }),
+    false
+  );
+});
+
 test('A/D condition: UNAVAILABLE + UNCERTAIN + empty description attempts fallback', () => {
   assert.equal(
     shouldAttemptPublicAboutCountryFallback({
