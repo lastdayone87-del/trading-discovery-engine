@@ -110,6 +110,21 @@ export function countryBoundaryRecoveryKey(channelId: string): string {
   return `country-boundary-reprocess:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:${channelId}`;
 }
 
+/** Reconstruct the durable classification recorded by a prior recovery event. */
+export function reconciliationStateFromRecoveryEvent(event: {
+  restored_country_status?: string | null;
+  evidence_details?: string | null;
+}): ReconciliationState {
+  const details = String(event.evidence_details || '');
+  if (/RETAIN_EXCLUDED/.test(details)) return 'RETAIN_EXCLUDED';
+  if (/LEGITIMATE_REJECTION/.test(details)) return 'LEGITIMATE_REJECTION';
+  if (/INSUFFICIENT_EVIDENCE/.test(details)) return 'INSUFFICIENT_EVIDENCE';
+  if (event.restored_country_status && event.restored_country_status !== 'REJECTED') {
+    return 'RECOVERABLE_NON_EXCLUDED';
+  }
+  return 'INSUFFICIENT_EVIDENCE';
+}
+
 type CohortRow = ChannelRecord & {
   executionEligible: boolean;
   reconciliation: ReturnType<typeof classifyReconciliationState>;
@@ -334,10 +349,19 @@ export async function processCountryBoundaryReprocessJob(
   const now = new Date().toISOString();
   const eventKey = `recovery:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:${channelId}`;
 
-  // Idempotency check: if this recovery event was already committed, do not mutate state again
-  const priorEvent = await db.query('SELECT 1 FROM historical_country_boundary_recovery_events WHERE event_key=$1', [eventKey]);
+  // Idempotency check: do not mutate again, but return the durable prior classification.
+  const priorEvent = await db.query(
+    'SELECT restored_country_status, evidence_details FROM historical_country_boundary_recovery_events WHERE event_key=$1',
+    [eventKey]
+  );
   if (priorEvent.rowCount) {
-    return { channelId, recovered: channel.country_status !== 'REJECTED', reconciliationState: 'RECOVERABLE_NON_EXCLUDED', newCountryStatus: channel.country_status };
+    const reconciliationState = reconciliationStateFromRecoveryEvent(priorEvent.rows[0]);
+    return {
+      channelId,
+      recovered: reconciliationState === 'RECOVERABLE_NON_EXCLUDED',
+      reconciliationState,
+      newCountryStatus: channel.country_status
+    };
   }
 
   const classification = classifyReconciliationState(channel, excludedCountries, vocabularies);
@@ -414,12 +438,18 @@ export async function processCountryBoundaryReprocessJob(
 
     // Lock recovery event row if existing to guarantee idempotency across workers
     const lockCheck = await client.query(
-      'SELECT 1 FROM historical_country_boundary_recovery_events WHERE event_key=$1 FOR UPDATE',
+      'SELECT restored_country_status, evidence_details FROM historical_country_boundary_recovery_events WHERE event_key=$1 FOR UPDATE',
       [eventKey]
     );
     if (lockCheck.rowCount) {
+      const reconciliationState = reconciliationStateFromRecoveryEvent(lockCheck.rows[0]);
       await client.query('ROLLBACK');
-      return { channelId, recovered: true, reconciliationState: classification.state, newCountryStatus: channel.country_status };
+      return {
+        channelId,
+        recovered: reconciliationState === 'RECOVERABLE_NON_EXCLUDED',
+        reconciliationState,
+        newCountryStatus: channel.country_status
+      };
     }
 
     if (isSightingOnlyCandidate) {

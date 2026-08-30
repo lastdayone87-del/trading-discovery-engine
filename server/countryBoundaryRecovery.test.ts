@@ -6,7 +6,8 @@ import {
   COUNTRY_BOUNDARY_RECOVERY_VERSION,
   countryBoundaryRecoveryKey,
   hasDiscordInspectionStep,
-  isNonExcludedBoundaryCandidate
+  isNonExcludedBoundaryCandidate,
+  reconciliationStateFromRecoveryEvent
 } from './countryBoundaryRecovery';
 
 const workerSource = readFileSync(new URL('./operationalMaintenanceWorkers.ts', import.meta.url), 'utf8');
@@ -36,6 +37,21 @@ test('cohort idempotency key is stable and correction-version scoped', () => {
   const key = countryBoundaryRecoveryKey('channel-123');
   assert.equal(key, `country-boundary-reprocess:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:channel-123`);
   assert.match(key, new RegExp(`^country-boundary-reprocess:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:`));
+});
+
+test('repeat recovery returns the durable prior classification', () => {
+  assert.equal(reconciliationStateFromRecoveryEvent({
+    restored_country_status: 'REJECTED',
+    evidence_details: 'Retained as REJECTED (RETAIN_EXCLUDED): current policy excludes the creator.'
+  }), 'RETAIN_EXCLUDED');
+  assert.equal(reconciliationStateFromRecoveryEvent({
+    restored_country_status: 'REJECTED',
+    evidence_details: 'Untouched (INSUFFICIENT_EVIDENCE): no creator evidence.'
+  }), 'INSUFFICIENT_EVIDENCE');
+  assert.equal(reconciliationStateFromRecoveryEvent({
+    restored_country_status: 'UNCERTAIN',
+    evidence_details: 'Creator country confirmed and is not in excluded_countries.'
+  }), 'RECOVERABLE_NON_EXCLUDED');
 });
 
 test('cohort scheduler is operator-protected, confirmation-gated, and worker uses normal recheck pipeline', () => {
@@ -154,14 +170,13 @@ test('TEST G: Dashboard projection SQL filters out excluded countries and non-re
   assert.match(OPERATOR_VISIBLE_CHANNEL_SQL, /NOT EXISTS[\s\S]+FROM excluded_countries/);
 });
 
-const postgresUrl = process.env.COUNTRY_BOUNDARY_POSTGRES_URL || process.env.PHASE4_POSTGRES_URL || process.env.DATABASE_URL;
+const postgresUrl = process.env.COUNTRY_BOUNDARY_TEST_DATABASE_URL;
 
-test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', {
-  skip: postgresUrl ? false : 'COUNTRY_BOUNDARY_POSTGRES_URL or DATABASE_URL environment variable is required to execute PostgreSQL database integration tests'
-}, async () => {
-  if (postgresUrl) {
-    process.env.DATABASE_URL = postgresUrl;
+test('TEST H: End-to-End Sighting-Only Cohort Discovery & Recovery Path', async () => {
+  if (!postgresUrl) {
+    throw new Error('COUNTRY_BOUNDARY_TEST_DATABASE_URL is required; critical sighting-only recovery coverage must not be skipped.');
   }
+  process.env.DATABASE_URL = postgresUrl;
   const { loadCohort, processCountryBoundaryReprocessJob } = await import('./countryBoundaryRecovery');
   const { getDb, getExcludedCountries, getCountryVocabularies, getChannelById } = await import('./db');
 

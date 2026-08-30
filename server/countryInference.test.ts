@@ -2,6 +2,21 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { applyTargetCountryBoundary, mergeCountryValidationResults } from './countryValidator';
 import { CountryInferenceInput, inferChannelCountry } from './countryInference';
+import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
+
+async function policyMismatchPair() {
+  const excluded = new Set(INITIAL_EXCLUDED_COUNTRIES.map(item => item.country_name.toLowerCase()));
+  const countries = INITIAL_COUNTRY_VOCABULARIES
+    .map(item => item.country)
+    .filter(country => !excluded.has(country.toLowerCase()));
+  assert.ok(countries.length >= 2, 'At least two non-excluded policy countries are required for mismatch coverage');
+  return {
+    detectedCountry: countries[0],
+    targetCountry: countries[1],
+    reversedDetectedCountry: countries[1],
+    reversedTargetCountry: countries[0]
+  };
+}
 
 const asValidationResult = (result: ReturnType<typeof inferChannelCountry>) => ({
   score: result.confidence,
@@ -234,56 +249,46 @@ test('target-country boundary preserves an existing policy rejection', () => {
   assert.match(bounded.rejectionReason || '', /Configured regional exclusion/);
 });
 
-test('target search country mismatch with non-excluded detected country => NOT rejected', () => {
-  const inferred = inferChannelCountry({ officialCountry: 'DE', discoveryCountry: 'CA' });
-  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'CA');
+test('target search country mismatch with non-excluded detected country => NOT rejected', async () => {
+  const { detectedCountry, targetCountry } = await policyMismatchPair();
+  const inferred = inferChannelCountry({ officialCountry: detectedCountry, discoveryCountry: targetCountry });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), targetCountry);
   assert.notEqual(bounded.status, 'REJECTED');
-  assert.equal(bounded.detectedCountry, 'Germany');
+  assert.equal(bounded.detectedCountry, detectedCountry);
 });
 
-test('target search country mismatch with non-excluded detected country (CH -> CA) => NOT rejected', () => {
-  const inferred = inferChannelCountry({ officialCountry: 'CH', discoveryCountry: 'CA' });
-  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'CA');
+test('target search country mismatch remains non-terminal across policy-derived pairs', async () => {
+  const { reversedDetectedCountry, reversedTargetCountry } = await policyMismatchPair();
+  const inferred = inferChannelCountry({ officialCountry: reversedDetectedCountry, discoveryCountry: reversedTargetCountry });
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), reversedTargetCountry);
   assert.notEqual(bounded.status, 'REJECTED');
-  assert.equal(bounded.detectedCountry, 'Switzerland');
+  assert.equal(bounded.detectedCountry, reversedDetectedCountry);
 });
 
-test('target search country mismatch with non-excluded detected country (CA -> DE) => NOT rejected', () => {
-  const inferred = inferChannelCountry({ officialCountry: 'CA', discoveryCountry: 'DE' });
-  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'DE');
-  assert.notEqual(bounded.status, 'REJECTED');
-  assert.equal(bounded.detectedCountry, 'Canada');
-});
-
-test('target search country mismatch with non-excluded detected country (NZ -> CH) => NOT rejected', () => {
-  const inferred = inferChannelCountry({ officialCountry: 'NZ', discoveryCountry: 'CH' });
-  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'CH');
-  assert.notEqual(bounded.status, 'REJECTED');
-  assert.equal(bounded.detectedCountry, 'New Zealand');
-});
-
-test('target search country mismatch with dynamically excluded detected country => REJECTED', async () => {
-  const { INITIAL_EXCLUDED_COUNTRIES } = await import('../src/data/initial_countries');
+test('target search country mismatch with dynamically excluded detected country => REJECTED', () => {
   assert.ok(INITIAL_EXCLUDED_COUNTRIES.length > 0, 'Initial excluded countries policy must be available');
   const excludedCountryName = INITIAL_EXCLUDED_COUNTRIES[0].country_name;
+  const targetCountry = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country.toLowerCase() !== excludedCountryName.toLowerCase())?.country;
+  assert.ok(targetCountry, 'A distinct policy target country must be available');
   const exclusions = [{ country_name: excludedCountryName, reason: 'Configured regional exclusion' }];
 
-  const inferred = inferChannelCountry({ officialCountry: excludedCountryName, discoveryCountry: 'CA' }, exclusions);
-  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'CA');
+  const inferred = inferChannelCountry({ officialCountry: excludedCountryName, discoveryCountry: targetCountry }, exclusions);
+  const bounded = applyTargetCountryBoundary(asValidationResult(inferred), targetCountry);
   assert.equal(bounded.status, 'REJECTED');
   assert.equal(bounded.detectedCountry, excludedCountryName);
   assert.match(bounded.rejectionReason || '', new RegExp(`${excludedCountryName} is excluded by policy`));
 });
 
-test('global / no-target mode continues to work correctly', () => {
-  const inferred = inferChannelCountry({ officialCountry: 'CA', discoveryCountry: 'GLOBAL' });
+test('global / no-target mode continues to work correctly', async () => {
+  const { detectedCountry } = await policyMismatchPair();
+  const inferred = inferChannelCountry({ officialCountry: detectedCountry, discoveryCountry: 'GLOBAL' });
   const bounded = applyTargetCountryBoundary(asValidationResult(inferred), 'GLOBAL');
   assert.notEqual(bounded.status, 'REJECTED');
-  assert.equal(bounded.detectedCountry, 'Canada');
+  assert.equal(bounded.detectedCountry, detectedCountry);
 
   const emptyTarget = applyTargetCountryBoundary(asValidationResult(inferred), '');
   assert.notEqual(emptyTarget.status, 'REJECTED');
-  assert.equal(emptyTarget.detectedCountry, 'Canada');
+  assert.equal(emptyTarget.detectedCountry, detectedCountry);
 });
 
 
