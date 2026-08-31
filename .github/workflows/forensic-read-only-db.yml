@@ -1,0 +1,47 @@
+name: Read-only Production Forensic DB Investigation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forensic-read-only:
+    name: Query production PostgreSQL read-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.RAILWAY_FORENSIC_DATABASE_URL }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify database secret exists without revealing it
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "RAILWAY_FORENSIC_DATABASE_URL is not configured as a GitHub Actions repository/environment secret."
+            exit 1
+          fi
+          echo "Database secret is present."
+
+      - name: Run strictly read-only forensic query
+        run: node scripts/forensicReadOnlyDbInvestigation.js
+
+      - name: Upload forensic report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: production-forensic-db-report
+          path: forensic-output/
+          if-no-files-found: warn
+          retention-days: 7
