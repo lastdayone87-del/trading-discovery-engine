@@ -109,6 +109,55 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
   return {action:waitMs>0?'WAIT':'RUN',waitMs};
 }
 
+/**
+ * Returns the timestamp (ms since epoch) at which the Gemini semantic provider
+ * cooldown will expire, based on the last RATE_LIMITED event persisted in
+ * provider_call_events. Returns undefined if no rate limit has been recorded
+ * or if the cooldown has already elapsed.
+ *
+ * This is the single authoritative source of Gemini semantic cooldown state.
+ * It queries the same provider_call_events table used by acquireGeminiCapacity,
+ * so there are no independent clocks or parallel rate limiters.
+ */
+export async function getGeminiSemanticCooldownExpiry(nowMs: number = Date.now()): Promise<number | undefined> {
+  const config = geminiCapacityConfig();
+  try {
+    const { getDb } = await import('./db');
+    const db = await getDb();
+    const res = await db.query(
+      `SELECT occurred_at FROM provider_call_events
+       WHERE provider='gemini' AND status='RATE_LIMITED'
+       ORDER BY occurred_at DESC LIMIT 1`
+    );
+    if (!res.rows[0]?.occurred_at) return undefined;
+    const lastRateLimitMs = new Date(res.rows[0].occurred_at).getTime();
+    const elapsed = nowMs - lastRateLimitMs;
+    if (elapsed >= config.semanticRateLimitCooldownMs) return undefined;
+    return lastRateLimitMs + config.semanticRateLimitCooldownMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Returns true when the Gemini semantic provider is in an active cooldown
+ * that would cause a semantic classification call to DEFER.
+ *
+ * Uses the same authoritative provider_call_events state as acquireGeminiCapacity.
+ */
+export async function isGeminiSemanticCooldownActive(nowMs: number = Date.now()): Promise<boolean> {
+  const expiry = await getGeminiSemanticCooldownExpiry(nowMs);
+  return expiry !== undefined && expiry > nowMs;
+}
+
+/**
+ * Returns the authoritative Gemini semantic cooldown duration in milliseconds.
+ * Used by retry scheduling to ensure run_after respects the provider cooldown.
+ */
+export function geminiSemanticCooldownMs(): number {
+  return geminiCapacityConfig().semanticRateLimitCooldownMs;
+}
+
 function abortError():Error{const error=new Error('aborted');error.name='AbortError';return error;}
 
 function waitForCapacity(ms:number,signal?:AbortSignal):Promise<void>{
