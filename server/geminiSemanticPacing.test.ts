@@ -1,9 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { decideJobFailure, failJob } from './db';
-import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds, resolveGeminiRouteId, isGeminiSemanticCooldownActive } from './providerResilience';
+import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds, resolveGeminiRouteId, isGeminiSemanticCooldownActive, geminiCapacityDeferralError } from './providerResilience';
 import { parseTransientRetryAgeMs } from './db';
 import { configuredGeminiRoutes, GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
+import { enrichmentOperationalFailure, OperationalEnrichmentProviderError } from './enrichmentOperationalFailure';
 import type { RawChannelInput } from './evidenceEngine/types';
 
 describe('Gemini semantic pacing regression', () => {
@@ -532,6 +533,92 @@ describe('Gemini semantic pacing regression', () => {
       if (failJobMatch) {
         assert.ok(!failJobMatch[0].includes('SELECT occurred_at FROM provider_call_events'), 'dbCore.failJob must not contain inline cooldown SQL query');
       }
+    });
+  });
+
+  describe('Production wrapping path: Gemini deferral → enrichmentOperationalFailure → cooldown-aware retry', () => {
+    it('SEMANTIC_DEFERRED_RATE_PRESSURE survives wrapping and triggers cooldown scheduling', () => {
+      // Step 1: Gemini capacity deferral produces this error (actual production source)
+      const geminiError = geminiCapacityDeferralError('multilingual-semantic-classification', 'SEMANTIC_DEFERRED_RATE_PRESSURE');
+      assert.equal(geminiError.errorClass, 'TRANSIENT');
+      assert.deepEqual(geminiError.providerReasons, ['SEMANTIC_DEFERRED_RATE_PRESSURE']);
+
+      // Step 2: safeProviderFailureReasonCodes in EvidenceBasedTradingEngine adds prefix
+      // (simulates evidenceEngine/index.ts catch block logic)
+      const wrappedReasonCodes = ['PROVIDER_TRANSIENT_FAILURE', ...geminiError.providerReasons!];
+
+      // Step 3: enrichmentOperationalFailure wraps into OperationalEnrichmentProviderError
+      const operationalError = enrichmentOperationalFailure({
+        degraded: true,
+        providers: [{
+          provider: 'gemini_semantic',
+          availability: 'FAILED',
+          reasonCodes: wrappedReasonCodes
+        }]
+      } as any, true);
+
+      assert.ok(operationalError, 'must produce OperationalEnrichmentProviderError');
+      assert.ok(operationalError instanceof OperationalEnrichmentProviderError);
+
+      // Step 4: Verify SEMANTIC_DEFERRED_RATE_PRESSURE survived the wrapping
+      assert.ok(
+        operationalError!.providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE'),
+        `SEMANTIC_DEFERRED_RATE_PRESSURE must survive enrichmentOperationalFailure wrapping, got: ${JSON.stringify(operationalError!.providerReasons)}`
+      );
+
+      // Step 5: decideJobFailure recognizes it and schedules past cooldown
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(operationalError!, 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(
+        result.runAfter! >= cooldownExpiry,
+        `runAfter (${result.runAfter}) must be >= cooldown expiry (${cooldownExpiry}) when SEMANTIC_DEFERRED_RATE_PRESSURE survives wrapping`
+      );
+    });
+
+    it('GEMINI_CAPACITY_DEFERRED survives wrapping and triggers cooldown scheduling', () => {
+      const geminiError = geminiCapacityDeferralError('multilingual-semantic-classification');
+      assert.deepEqual(geminiError.providerReasons, ['GEMINI_CAPACITY_DEFERRED']);
+
+      const wrappedReasonCodes = ['PROVIDER_TRANSIENT_FAILURE', ...geminiError.providerReasons!];
+      const operationalError = enrichmentOperationalFailure({
+        degraded: true,
+        providers: [{
+          provider: 'gemini_semantic',
+          availability: 'FAILED',
+          reasonCodes: wrappedReasonCodes
+        }]
+      } as any, true);
+
+      assert.ok(operationalError);
+      assert.ok(operationalError!.providerReasons.includes('GEMINI_CAPACITY_DEFERRED'));
+
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(operationalError!, 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! >= cooldownExpiry);
+    });
+
+    it('wrapping path without Gemini reason codes does not trigger cooldown', () => {
+      const wrappedReasonCodes = ['PROVIDER_TIMEOUT'];
+      const operationalError = enrichmentOperationalFailure({
+        degraded: true,
+        providers: [{
+          provider: 'gemini_semantic',
+          availability: 'FAILED',
+          reasonCodes: wrappedReasonCodes
+        }]
+      } as any, true);
+
+      assert.ok(operationalError);
+      assert.ok(!operationalError!.providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE'));
+      assert.ok(!operationalError!.providerReasons.includes('GEMINI_CAPACITY_DEFERRED'));
+
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(operationalError!, 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      // Should NOT be delayed to cooldown — just standard exponential backoff
+      assert.ok(result.runAfter! < cooldownExpiry, 'non-Gemini operational error must not be delayed to cooldown');
     });
   });
 
