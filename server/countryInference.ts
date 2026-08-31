@@ -1,4 +1,4 @@
-import type { CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
+import type { CountryMetadataStatus, CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
 import { normalizeCountryName } from './countryExclusionRules';
 
 export type CountryEvidenceSource =
@@ -13,6 +13,18 @@ export type CountryEvidenceSource =
   | 'NATIVE_LANGUAGE'
   | 'DISCOVERY_CONTEXT'
   | 'EXCLUSION_POLICY';
+
+export type CountryEvidenceAvailability =
+  | 'NOT_REQUESTED'
+  | 'AVAILABLE_DECLARED'
+  | 'AVAILABLE_NOT_DECLARED'
+  | 'UNAVAILABLE';
+
+export type GateDisposition =
+  | 'ALLOW_NORMAL'
+  | 'CONTINUE_CRAWLING'
+  | 'NEEDS_REVIEW'
+  | 'REJECT_EXCLUDED';
 
 export interface CountryInferenceEvidence {
   source: CountryEvidenceSource;
@@ -31,17 +43,39 @@ export interface CountryInferenceInput {
   verifiedSocialLinks?: string[];
   videoTitles?: string[];
   discoveryCountry?: string;
+  metadataStatus?: CountryMetadataStatus;
 }
 
-export interface CountryInferenceResult {
-  detectedCountry: string | null;
-  status: CountryStatus;
+export interface CountryAssessment {
+  discoveryCountry: string | null;
+  detectedCreatorCountry: string | null;
+  countryEvidence: CountryInferenceEvidence[];
+  countryStatus: CountryStatus;
+  evidenceAvailability: CountryEvidenceAvailability;
+  gateDisposition: GateDisposition;
   confidence: number;
   reasoning: string;
-  evidence: CountryInferenceEvidence[];
   decisiveEvidence: CountryInferenceEvidence[];
   rejectionReason?: string;
 }
+
+export interface CountryInferenceResult extends CountryAssessment {
+  detectedCountry: string | null; // Backwards compatibility alias for detectedCreatorCountry
+  status: CountryStatus; // Backwards compatibility alias for countryStatus
+  evidence: CountryInferenceEvidence[]; // Backwards compatibility alias for countryEvidence
+}
+
+const CREATOR_EVIDENCE_SOURCES: Set<CountryEvidenceSource> = new Set([
+  'OFFICIAL_YOUTUBE_METADATA',
+  'CHANNEL_ABOUT_BIO',
+  'OFFICIAL_WEBSITE_DOMAIN',
+  'VERIFIED_SOCIAL_LINK',
+  'EXCHANGE_REFERENCE',
+  'BROKER_REFERENCE',
+  'PHONE_NUMBER',
+  'PHYSICAL_ADDRESS',
+  'NATIVE_LANGUAGE'
+]);
 
 const COUNTRY_ALIASES: Record<string, string> = {
   us: 'United States', usa: 'United States', 'united states of america': 'United States',
@@ -86,18 +120,34 @@ const COUNTRY_SIGNALS: Record<string, {
   Luxembourg: { bio: ['luxembourg', 'lëtzebuerg'], tlds: ['.lu'], social: ['luxembourg'], exchanges: ['luxembourg stock exchange', 'luxx'], brokers: ['bgl bnp paribas'], phones: ['+352'], addresses: ['luxembourg'], language: ['bourse de luxembourg', 'luxemburger börse'] },
   Ireland: { bio: ['ireland', 'irish trader', 'éire'], tlds: ['.ie'], social: ['ireland', 'dublin'], exchanges: ['euronext dublin', 'iseq 20'], brokers: ['davy select', 'goodbody'], phones: ['+353'], addresses: ['dublin', 'cork'], language: ['trádáil scaireanna'] },
   'United Arab Emirates': { bio: ['united arab emirates', 'الإمارات', 'dubai trader'], tlds: ['.ae'], social: ['dubai', 'uae'], exchanges: ['dubai financial market', 'abu dhabi securities exchange', 'dfm'], brokers: ['sarwa', 'adss'], phones: ['+971'], addresses: ['دبي', 'أبوظبي', 'dubai', 'abu dhabi'], language: ['تداول', 'السوق', 'الأسهم', 'تحليل فني', 'استثمار'] },
-  Nigeria: { bio: ['nigeria', 'nigerian trader', 'naija'], tlds: ['.ng', '.com.ng'], social: ['nigeria', 'lagos'], exchanges: ['nigerian exchange', 'ngx'], brokers: ['meristem', 'cardinalstone'], phones: ['+234'], addresses: ['lagos', 'abuja'], language: ['naira', 'forex nigeria'] },
-  Pakistan: { bio: ['pakistan', 'pakistani trader'], tlds: ['.pk', '.com.pk'], social: ['pakistan', 'karachi'], exchanges: ['pakistan stock exchange', 'psx'], brokers: ['k trade', 'arif habib'], phones: ['+92'], addresses: ['karachi', 'lahore', 'islamabad'], language: ['اردو ٹریڈنگ', 'پاکستان اسٹاک'] },
-  Bangladesh: { bio: ['bangladesh', 'bangladeshi trader'], tlds: ['.bd', '.com.bd'], social: ['bangladesh', 'dhaka'], exchanges: ['dhaka stock exchange', 'dse bd'], brokers: ['lanka bangla securities'], phones: ['+880'], addresses: ['dhaka', 'chittagong'], language: ['শেয়ার বাজার', 'ট্রেডিং'] },
-  Nepal: { bio: ['nepal', 'nepali trader'], tlds: ['.np', '.com.np'], social: ['nepal', 'kathmandu'], exchanges: ['nepal stock exchange', 'nepse'], brokers: [], phones: ['+977'], addresses: ['kathmandu', 'pokhara'], language: ['शेयर बजार', 'नेप्से'] },
-  Kenya: { bio: ['kenya', 'kenyan trader'], tlds: ['.ke', '.co.ke'], social: ['kenya', 'nairobi'], exchanges: ['nairobi securities exchange', 'nse kenya'], brokers: ['dyer and blair'], phones: ['+254'], addresses: ['nairobi', 'mombasa'], language: ['kenya stocks', 'soko la hisa'] },
-  'South Africa': { bio: ['south africa', 'south african trader'], tlds: ['.za', '.co.za'], social: ['southafrica', 'johannesburg'], exchanges: ['johannesburg stock exchange', 'jse'], brokers: ['easyequities'], phones: ['+27'], addresses: ['johannesburg', 'cape town', 'durban'], language: ['rand', 'aandelemark'] },
-  Ghana: { bio: ['ghana', 'ghanaian trader'], tlds: ['.gh', '.com.gh'], social: ['ghana', 'accra'], exchanges: ['ghana stock exchange', 'gse ghana'], brokers: [], phones: ['+233'], addresses: ['accra', 'kumasi'], language: ['ghana stocks', 'cedi'] },
-  Egypt: { bio: ['egypt', 'egyptian trader', 'متداول مصري'], tlds: ['.eg', '.com.eg'], social: ['egypt', 'cairo'], exchanges: ['egyptian exchange', 'egx'], brokers: ['mubasher'], phones: ['+20'], addresses: ['cairo', 'القاهرة', 'alexandria'], language: ['البورصة المصرية', 'الأسهم المصرية'] },
-  Morocco: { bio: ['morocco', 'moroccan trader', 'متداول مغربي'], tlds: ['.ma', '.co.ma'], social: ['morocco', 'casablanca'], exchanges: ['casablanca stock exchange', 'casablanca bourse'], brokers: [], phones: ['+212'], addresses: ['casablanca', 'rabat'], language: ['بورصة الدار البيضاء', 'الأسهم المغربية'] },
-  Philippines: { bio: ['philippines', 'filipino trader'], tlds: ['.ph', '.com.ph'], social: ['philippines', 'manila'], exchanges: ['philippine stock exchange', 'psei'], brokers: ['col financial'], phones: ['+63'], addresses: ['manila', 'cebu'], language: ['pamilihan ng stock', 'trading pilipinas'] },
-  Vietnam: { bio: ['vietnam', 'vietnamese trader'], tlds: ['.vn', '.com.vn'], social: ['vietnam', 'hanoi'], exchanges: ['ho chi minh stock exchange', 'hose'], brokers: ['ssi securities'], phones: ['+84'], addresses: ['hanoi', 'ho chi minh'], language: ['chứng khoán', 'phân tích kỹ thuật'] },
-  Indonesia: { bio: ['indonesia', 'indonesian trader'], tlds: ['.id', '.co.id'], social: ['indonesia', 'jakarta'], exchanges: ['indonesia stock exchange', 'idx'], brokers: ['ajaib', 'mirae asset sekuritas'], phones: ['+62'], addresses: ['jakarta', 'surabaya'], language: ['pasar saham', 'analisis teknikal'] }
+  Nigeria: { bio: ['nigeria', 'nigerian trader', 'based in nigeria', 'trader in nigeria', 'naija trader', 'naija'], tlds: ['.ng', '.com.ng'], social: ['nigeria', 'lagos'], exchanges: ['nigerian exchange', 'ngx'], brokers: ['meristem', 'cardinalstone'], phones: ['+234'], addresses: ['lagos', 'abuja'], language: ['naira', 'forex nigeria'] },
+  Pakistan: { bio: ['pakistan', 'pakistani trader', 'based in pakistan', 'trader in pakistan'], tlds: ['.pk', '.com.pk'], social: ['pakistan', 'karachi'], exchanges: ['pakistan stock exchange', 'psx'], brokers: ['k trade', 'arif habib'], phones: ['+92'], addresses: ['karachi', 'lahore', 'islamabad'], language: ['اردو ٹریڈنگ', 'پاکستان اسٹاک'] },
+  Bangladesh: { bio: ['bangladesh', 'bangladeshi trader', 'based in bangladesh', 'trader in bangladesh'], tlds: ['.bd', '.com.bd'], social: ['bangladesh', 'dhaka'], exchanges: ['dhaka stock exchange', 'dse bd'], brokers: ['lanka bangla securities'], phones: ['+880'], addresses: ['dhaka', 'chittagong'], language: ['শেয়ার বাজার', 'ট্রেডিং'] },
+  Nepal: { bio: ['nepal', 'nepali trader', 'based in nepal'], tlds: ['.np', '.com.np'], social: ['nepal', 'kathmandu'], exchanges: ['nepal stock exchange', 'nepse'], brokers: [], phones: ['+977'], addresses: ['kathmandu', 'pokhara'], language: ['शेयर बजार', 'नेप्से'] },
+  Kenya: { bio: ['kenya', 'kenyan trader', 'based in kenya'], tlds: ['.ke', '.co.ke'], social: ['kenya', 'nairobi'], exchanges: ['nairobi securities exchange', 'nse kenya'], brokers: ['dyer and blair'], phones: ['+254'], addresses: ['nairobi', 'mombasa'], language: ['kenya stocks', 'soko la hisa'] },
+  'South Africa': { bio: ['south africa', 'south african trader', 'based in south africa'], tlds: ['.za', '.co.za'], social: ['southafrica', 'johannesburg'], exchanges: ['johannesburg stock exchange', 'jse'], brokers: ['easyequities'], phones: ['+27'], addresses: ['johannesburg', 'cape town', 'durban'], language: ['rand', 'aandelemark'] },
+  Ghana: { bio: ['ghana', 'ghanaian trader', 'based in ghana'], tlds: ['.gh', '.com.gh'], social: ['ghana', 'accra'], exchanges: ['ghana stock exchange', 'gse ghana'], brokers: [], phones: ['+233'], addresses: ['accra', 'kumasi'], language: ['ghana stocks', 'cedi'] },
+  Egypt: { bio: ['egypt', 'egyptian trader', 'based in egypt', 'متداول مصري'], tlds: ['.eg', '.com.eg'], social: ['egypt', 'cairo'], exchanges: ['egyptian exchange', 'egx'], brokers: ['mubasher'], phones: ['+20'], addresses: ['cairo', 'القاهرة', 'alexandria'], language: ['البورصة المصرية', 'الأسهم المصرية'] },
+  Morocco: { bio: ['morocco', 'moroccan trader', 'based in morocco', 'متداول مغربي'], tlds: ['.ma', '.co.ma'], social: ['morocco', 'casablanca'], exchanges: ['casablanca stock exchange', 'casablanca bourse'], brokers: [], phones: ['+212'], addresses: ['casablanca', 'rabat'], language: ['بورصة الدار البيضاء', 'الأسهم المغربية'] },
+  Philippines: { bio: ['philippines', 'filipino trader', 'based in philippines'], tlds: ['.ph', '.com.ph'], social: ['philippines', 'manila'], exchanges: ['philippine stock exchange', 'psei'], brokers: ['col financial'], phones: ['+63'], addresses: ['manila', 'cebu'], language: ['pamilihan ng stock', 'trading pilipinas'] },
+  Vietnam: { bio: ['vietnam', 'vietnamese trader', 'based in vietnam'], tlds: ['.vn', '.com.vn'], social: ['vietnam', 'hanoi'], exchanges: ['ho chi minh stock exchange', 'hose'], brokers: ['ssi securities'], phones: ['+84'], addresses: ['hanoi', 'ho chi minh'], language: ['chứng khoán', 'phân tích kỹ thuật'] },
+  Indonesia: { bio: ['indonesia', 'indonesian trader', 'based in indonesia'], tlds: ['.id', '.co.id'], social: ['indonesia', 'jakarta'], exchanges: ['indonesia stock exchange', 'idx'], brokers: ['ajaib', 'mirae asset sekuritas'], phones: ['+62'], addresses: ['jakarta', 'surabaya'], language: ['pasar saham', 'analisis teknikal'] },
+  Algeria: { bio: ['algeria', 'algerian trader', 'based in algeria'], tlds: ['.dz'], social: ['algeria'], exchanges: [], brokers: [], phones: ['+213'], addresses: ['algiers'], language: [] },
+  Tunisia: { bio: ['tunisia', 'tunisian trader', 'based in tunisia'], tlds: ['.tn'], social: ['tunisia'], exchanges: [], brokers: [], phones: ['+216'], addresses: ['tunis'], language: [] },
+  Ethiopia: { bio: ['ethiopia', 'ethiopian trader', 'based in ethiopia'], tlds: ['.et'], social: ['ethiopia'], exchanges: [], brokers: [], phones: ['+251'], addresses: ['addis ababa'], language: [] },
+  Tanzania: { bio: ['tanzania', 'tanzanian trader', 'based in tanzania'], tlds: ['.tz'], social: ['tanzania'], exchanges: [], brokers: [], phones: ['+255'], addresses: ['dar es salaam'], language: [] },
+  Uganda: { bio: ['uganda', 'ugandan trader', 'based in uganda'], tlds: ['.ug'], social: ['uganda'], exchanges: [], brokers: [], phones: ['+256'], addresses: ['kampala'], language: [] },
+  Senegal: { bio: ['senegal', 'senegalese trader', 'based in senegal'], tlds: ['.sn'], social: ['senegal'], exchanges: [], brokers: [], phones: ['+221'], addresses: ['dakar'], language: [] },
+  Cameroon: { bio: ['cameroon', 'cameroonian trader', 'based in cameroon'], tlds: ['.cm'], social: ['cameroon'], exchanges: [], brokers: [], phones: ['+237'], addresses: ['yaounde', 'douala'], language: [] },
+  Zimbabwe: { bio: ['zimbabwe', 'zimbabwean trader', 'based in zimbabwe'], tlds: ['.zw'], social: ['zimbabwe'], exchanges: [], brokers: [], phones: ['+263'], addresses: ['harare'], language: [] },
+  Zambia: { bio: ['zambia', 'zambian trader', 'based in zambia'], tlds: ['.zm'], social: ['zambia'], exchanges: [], brokers: [], phones: ['+260'], addresses: ['lusaka'], language: [] },
+  Rwanda: { bio: ['rwanda', 'rwandan trader', 'based in rwanda'], tlds: ['.rw'], social: ['rwanda'], exchanges: [], brokers: [], phones: ['+250'], addresses: ['kigali'], language: [] },
+  'Ivory Coast': { bio: ['ivory coast', "côte d'ivoire", 'based in ivory coast'], tlds: ['.ci'], social: ['ivorycoast'], exchanges: [], brokers: [], phones: ['+225'], addresses: ['abidjan'], language: [] },
+  Mozambique: { bio: ['mozambique', 'mozambican trader', 'based in mozambique'], tlds: ['.mz'], social: ['mozambique'], exchanges: [], brokers: [], phones: ['+258'], addresses: ['maputo'], language: [] },
+  Madagascar: { bio: ['madagascar', 'malagasy trader', 'based in madagascar'], tlds: ['.mg'], social: ['madagascar'], exchanges: [], brokers: [], phones: ['+261'], addresses: ['antananarivo'], language: [] },
+  Sudan: { bio: ['sudan', 'sudanese trader', 'based in sudan'], tlds: ['.sd'], social: ['sudan'], exchanges: [], brokers: [], phones: ['+249'], addresses: ['khartoum'], language: [] },
+  Angola: { bio: ['angola', 'angolan trader', 'based in angola'], tlds: ['.ao'], social: ['angola'], exchanges: [], brokers: [], phones: ['+244'], addresses: ['luanda'], language: [] },
+  'Sri Lanka': { bio: ['sri lanka', 'sri lankan trader', 'based in sri lanka'], tlds: ['.lk'], social: ['srilanka'], exchanges: ['colombo stock exchange'], brokers: [], phones: ['+94'], addresses: ['colombo'], language: [] }
 };
 
 const SOCIAL_HOSTS = ['instagram.com', 'x.com', 'twitter.com', 'facebook.com', 'linkedin.com', 'tiktok.com'];
@@ -131,8 +181,19 @@ function hostname(link: string): string {
   try { return new URL(link).hostname.toLowerCase().replace(/^www\./, ''); } catch { return ''; }
 }
 
-export function inferChannelCountry(input: CountryInferenceInput, exclusions: ExcludedCountry[] = [], vocabularies: CountryVocabulary[] = []): CountryInferenceResult {
+/**
+ * Perform country assessment separating discovery context from creator-level evidence.
+ * Structurally guarantees DISCOVERY_CONTEXT can NEVER populate detectedCreatorCountry or trigger REJECTED.
+ */
+export function assessChannelCountry(
+  input: CountryInferenceInput,
+  exclusions: ExcludedCountry[] = [],
+  vocabularies: CountryVocabulary[] = []
+): CountryAssessment {
   const evidence: CountryInferenceEvidence[] = [];
+  const discoveryCountry = input.discoveryCountry?.trim() ? canonicalCountry(input.discoveryCountry) : null;
+  const evidenceAvailability: CountryEvidenceAvailability = input.metadataStatus || 'NOT_REQUESTED';
+
   const official = input.officialCountry?.trim();
   if (official) {
     const country = canonicalCountry(official);
@@ -141,6 +202,24 @@ export function inferChannelCountry(input: CountryInferenceInput, exclusions: Ex
 
   const bioText = `${input.channelName || ''} ${input.aboutBio || ''}`.toLocaleLowerCase('en');
   addTextEvidence(evidence, 'CHANNEL_ABOUT_BIO', 2, 92, bioText, 'bio', 'Channel About/Bio location');
+
+  // Match explicit domicile phrases (e.g. "based in Nigeria", "located in Kenya", "trader from Ghana")
+  for (const item of exclusions) {
+    const name = item.country_name.toLocaleLowerCase('en');
+    if (name.length < 3) continue;
+    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|trader from|from|trader in)\\s+${name}\\b|\\b${name}\\s+(?:based|trader|forex trader|crypto trader)\\b`, 'i');
+    const match = bioText.match(domicileRegex);
+    if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
+      evidence.push({
+        source: 'CHANNEL_ABOUT_BIO',
+        priority: 2,
+        detectedCountry: canonicalCountry(item.country_name),
+        confidence: 92,
+        matchedValue: match[0],
+        reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonicalCountry(item.country_name)}.`
+      });
+    }
+  }
 
   for (const link of input.officialWebsiteLinks || []) {
     const host = hostname(link);
@@ -184,36 +263,99 @@ export function inferChannelCountry(input: CountryInferenceInput, exclusions: Ex
     }
   }
 
-  if (input.discoveryCountry?.trim()) {
-    const country = canonicalCountry(input.discoveryCountry);
-    evidence.push({ source: 'DISCOVERY_CONTEXT', priority: 10, detectedCountry: country, confidence: 25, matchedValue: input.discoveryCountry, reasoning: `Discovery context suggests ${country}; no stronger attribution is implied.` });
+  // Provenance logging ONLY: DISCOVERY_CONTEXT is recorded in evidence list for traceability
+  if (discoveryCountry) {
+    evidence.push({
+      source: 'DISCOVERY_CONTEXT',
+      priority: 10,
+      detectedCountry: discoveryCountry,
+      confidence: 25,
+      matchedValue: input.discoveryCountry,
+      reasoning: `Discovery context suggests ${discoveryCountry}; no creator-level attribution is implied.`
+    });
   }
 
-  if (evidence.length === 0) return { detectedCountry: null, status: 'UNCERTAIN', confidence: 0, reasoning: 'No country evidence was available.', evidence, decisiveEvidence: [] };
+  // STRICT CREATOR EVIDENCE ALLOWLIST:
+  // Filter evidence down exclusively to sources allowed to attribute creator domicile.
+  const creatorEvidence = evidence.filter(item => CREATOR_EVIDENCE_SOURCES.has(item.source));
 
-  const decisivePriority = Math.min(...evidence.map(item => item.priority));
-  const decisiveEvidence = evidence.filter(item => item.priority === decisivePriority);
+  if (creatorEvidence.length === 0) {
+    return {
+      discoveryCountry,
+      detectedCreatorCountry: null,
+      countryEvidence: evidence,
+      countryStatus: 'UNCERTAIN',
+      evidenceAvailability,
+      gateDisposition: 'CONTINUE_CRAWLING',
+      confidence: 0,
+      reasoning: 'No creator-level country evidence was available.',
+      decisiveEvidence: []
+    };
+  }
+
+  const decisivePriority = Math.min(...creatorEvidence.map(item => item.priority));
+  const decisiveEvidence = creatorEvidence.filter(item => item.priority === decisivePriority);
   const countryScores = new Map<string, number>();
   decisiveEvidence.forEach(item => countryScores.set(item.detectedCountry, Math.max(countryScores.get(item.detectedCountry) || 0, item.confidence)));
   const ranked = [...countryScores.entries()].sort((a, b) => b[1] - a[1]);
-  const [detectedCountry, topConfidence] = ranked[0];
+  const [detectedCreatorCountry, topConfidence] = ranked[0];
   const conflict = ranked.length > 1 && ranked[1][1] === topConfidence;
   const confidence = conflict ? Math.min(49, topConfidence) : topConfidence;
-  const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCountry));
-  const exclusionAuthority = decisiveEvidence.every(item => item.detectedCountry === detectedCountry) &&
+  const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCreatorCountry));
+  const exclusionAuthority = decisiveEvidence.every(item => item.detectedCountry === detectedCreatorCountry) &&
     decisivePriority <= 3 && topConfidence >= 85 && !conflict;
 
-  // Policy is evaluated after evidence authority has been established. It may
-  // reject a strong, unambiguous country attribution, but it must never raise
-  // a weak score or resolve a conflict on the policy's behalf.
   if (excluded && exclusionAuthority) {
-    const policy: CountryInferenceEvidence = { source: 'EXCLUSION_POLICY', priority: 0, detectedCountry, confidence: topConfidence, reasoning: `${detectedCountry} is excluded by policy: ${excluded.reason}.` };
-    return { detectedCountry, status: 'REJECTED', confidence: topConfidence, reasoning: policy.reasoning, evidence: [policy, ...evidence], decisiveEvidence, rejectionReason: policy.reasoning };
+    const policy: CountryInferenceEvidence = {
+      source: 'EXCLUSION_POLICY',
+      priority: 0,
+      detectedCountry: detectedCreatorCountry,
+      confidence: topConfidence,
+      reasoning: `${detectedCreatorCountry} is excluded by policy: ${excluded.reason}.`
+    };
+    return {
+      discoveryCountry,
+      detectedCreatorCountry,
+      countryEvidence: [policy, ...evidence],
+      countryStatus: 'REJECTED',
+      evidenceAvailability,
+      gateDisposition: 'REJECT_EXCLUDED',
+      confidence: topConfidence,
+      reasoning: policy.reasoning,
+      decisiveEvidence,
+      rejectionReason: policy.reasoning
+    };
   }
 
-  const status: CountryStatus = conflict ? 'UNCERTAIN' : confidence >= 85 ? 'CONFIRMED' : confidence >= 60 ? 'LIKELY' : 'UNCERTAIN';
+  const countryStatus: CountryStatus = conflict ? 'UNCERTAIN' : confidence >= 85 ? 'CONFIRMED' : confidence >= 60 ? 'LIKELY' : 'UNCERTAIN';
+  const gateDisposition: GateDisposition = conflict ? 'NEEDS_REVIEW' : countryStatus === 'CONFIRMED' || countryStatus === 'LIKELY' ? 'ALLOW_NORMAL' : 'CONTINUE_CRAWLING';
   const reasoning = conflict
     ? `Conflicting ${decisiveEvidence[0].source} evidence prevents a reliable country decision.`
-    : `${decisiveEvidence[0].source} is the highest-priority available source and identifies ${detectedCountry}.`;
-  return { detectedCountry, status, confidence, reasoning, evidence: evidence.sort((a, b) => a.priority - b.priority), decisiveEvidence };
+    : `${decisiveEvidence[0].source} is the highest-priority available source and identifies ${detectedCreatorCountry}.`;
+
+  return {
+    discoveryCountry,
+    detectedCreatorCountry,
+    countryEvidence: evidence.sort((a, b) => a.priority - b.priority),
+    countryStatus,
+    evidenceAvailability,
+    gateDisposition,
+    confidence,
+    reasoning,
+    decisiveEvidence
+  };
+}
+
+export function inferChannelCountry(
+  input: CountryInferenceInput,
+  exclusions: ExcludedCountry[] = [],
+  vocabularies: CountryVocabulary[] = []
+): CountryInferenceResult {
+  const assessment = assessChannelCountry(input, exclusions, vocabularies);
+  return {
+    ...assessment,
+    detectedCountry: assessment.detectedCreatorCountry,
+    status: assessment.countryStatus,
+    evidence: assessment.countryEvidence
+  };
 }

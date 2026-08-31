@@ -26,7 +26,7 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
               </h3>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Channel: <span className="font-semibold text-slate-700 dark:text-slate-300">{channel.channel_name}</span> ({channel.country})
+              Channel: <span className="font-semibold text-slate-700 dark:text-slate-300">{channel.channel_name}</span> (Creator Country: {channel.country || 'Unknown'})
             </p>
           </div>
           <button

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 
-const db = readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
 
 test('YouTube quota day follows America/Los_Angeles rather than UTC', () => {
   assert.equal(getYouTubeQuotaDay(new Date('2026-08-14T05:30:00Z')), '2026-08-13');

@@ -748,13 +748,17 @@ export async function inspectAndValidateChannel(
         externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : []),
         metadataStatus: rawDetails?.countryMetadataStatus || channel.country_metadata_status
       },
-      channel.country
+      rawDetails?.locationTag || null
     );
 
     const countryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
-      title: `Country Validation (${channel.country})`,
-      status: valRes.status === 'REJECTED' ? 'REJECTED' : 'FOUND',
+      title: `Country Validation (${channel.country || 'Unknown'})`,
+      status: valRes.status === 'REJECTED'
+        ? 'REJECTED'
+        : (valRes.status === 'CONFIRMED' || valRes.status === 'LIKELY')
+        ? 'FOUND'
+        : 'NOT_FOUND',
       details: valRes.decisionLogs,
       timestamp: now
     };
@@ -774,7 +778,7 @@ export async function inspectAndValidateChannel(
     // Update country status & decision trail
     channel.country_status = valRes.status;
     channel.confidence_score = valRes.score;
-    if (valRes.detectedCountry) channel.country = valRes.detectedCountry;
+    if (valRes.detectedCreatorCountry !== undefined) channel.country = valRes.detectedCreatorCountry || null;
 
     // 2. Step-by-step Channel Inspection Engine for Discord Invites (force live YouTube scrape on manual scan)
     inspection = await runChannelInspection({
@@ -796,18 +800,21 @@ export async function inspectAndValidateChannel(
     const rawLiveCountry = await validateChannelCountry({channelName:channel.channel_name,
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
-      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, channel.country);
+      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, rawDetails?.locationTag || null);
     const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
     const liveCountryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
-      title: `Country Validation (${rawLiveCountry.detectedCountry || channel.country}) — Live About`,
-      status: rawLiveCountry.status === 'REJECTED' && liveCountry.status === 'REJECTED' ? 'REJECTED' : 'FOUND',
+      title: `Country Validation (${rawLiveCountry.detectedCreatorCountry || 'Unknown'}) — Live About`,
+      status: rawLiveCountry.status === 'REJECTED' && liveCountry.status === 'REJECTED'
+        ? 'REJECTED'
+        : (liveCountry.status === 'CONFIRMED' || liveCountry.status === 'LIKELY')
+        ? 'FOUND'
+        : 'NOT_FOUND',
       details: `${rawLiveCountry.decisionLogs}${liveCountry !== rawLiveCountry ? '\\nEffective decision: earlier stronger/conflicting evidence preserved.' : ''}`,
       timestamp: now
     };
     if (liveCountry.status === 'REJECTED') {
-      channel.country_status='REJECTED'; channel.country=liveCountry.detectedCountry || channel.country;
-      channel.confidence_score=liveCountry.score; channel.scan_status='COMPLETED'; channel.last_checked=now;
+      channel.country_status='REJECTED'; channel.country=liveCountry.detectedCreatorCountry || null;
       // The live country decision is terminal, but the inspection already ran.
       // Preserve its real steps and only project NOT_FOUND when the inspection
       // actually completed without a candidate or an acquisition failure.
@@ -826,7 +833,7 @@ export async function inspectAndValidateChannel(
       channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
       return;
     }
-    if (liveCountry.detectedCountry) { channel.country=liveCountry.detectedCountry; channel.country_status=liveCountry.status; channel.confidence_score=liveCountry.score; }
+    if (liveCountry.detectedCreatorCountry !== undefined) { channel.country=liveCountry.detectedCreatorCountry || null; channel.country_status=liveCountry.status; channel.confidence_score=liveCountry.score; }
 
     // Combine Country Validation step as Step 1 with Discord Inspection steps
     channel.inspection_trail = [countryStep, ...inspection.steps];
@@ -979,7 +986,7 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
           videoTitles: [channel.channel_name],
           externalLinks: channel.discord_invite ? [channel.discord_invite] : []
         },
-        channel.country
+        null
       );
 
       if (valRes.status === 'REJECTED') {

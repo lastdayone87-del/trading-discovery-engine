@@ -1,5 +1,5 @@
 import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb } from '../server/db';
-import { creatorLevelCountryEvidence } from '../server/countryValidator';
+import { retainedCreatorEvidenceInput } from '../server/countryValidator';
 import { assessChannelCountry, GateDisposition } from '../server/countryInference';
 import type { CountryStatus } from '../src/types';
 
@@ -76,16 +76,7 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
       unavailableDiscoveryContextCount++;
     }
 
-    const creatorEvidence = creatorLevelCountryEvidence({
-      channelName: channel.channel_name,
-      description: (channel.inspection_trail || [])
-        .filter(t => t.step !== 'COUNTRY_VALIDATION')
-        .map(t => t.details || '')
-        .join(' ') || channel.channel_name,
-      videoTitles: [channel.channel_name],
-      externalLinks: channel.discord_invite ? [channel.discord_invite] : [],
-      metadataStatus: channel.country_metadata_status
-    });
+    const creatorEvidence = retainedCreatorEvidenceInput(channel);
 
     const assessment = assessChannelCountry({
       ...creatorEvidence,

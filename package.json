@@ -9,7 +9,7 @@
     "start": "node --require ./server/secretSafeLogging.cjs dist/server.cjs",
     "clean": "rm -rf dist server.cjs",
     "lint": "tsc --noEmit",
-    "test": "find server -name '*.test.ts' -exec node --import tsx --test {} +",
+    "test": "find server tests -name '*.test.ts' -exec node --import tsx --test {} +",
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",

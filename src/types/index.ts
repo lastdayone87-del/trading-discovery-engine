@@ -1,5 +1,6 @@
 export type CountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
 export type CountryMetadataStatus = 'AVAILABLE_DECLARED' | 'AVAILABLE_NOT_DECLARED' | 'UNAVAILABLE' | 'NOT_REQUESTED';
+export type PublicAboutStatus = 'NOT_ATTEMPTED' | 'ATTEMPTED_SUCCEEDED' | 'ATTEMPTED_FAILED' | 'ATTEMPTED_EMPTY';
 export type ChannelActivityBand = 'VERY_ACTIVE' | 'ACTIVE' | 'OCCASIONAL' | 'DORMANT' | 'UNKNOWN';
 export interface DashboardOperationalSummary {
   storedChannels: number;
@@ -127,7 +128,7 @@ export interface ChannelRecord {
   channel_id: string;
   channel_name: string;
   youtube_url: string;
-  country: string;
+  country: string | null;
   country_status: CountryStatus;
   confidence_score: number;
   discord_status: DiscordStatus;
@@ -177,6 +178,9 @@ export interface ChannelRecord {
   trading_relevance_breakdown?: TradingRelevanceBreakdown;
   country_metadata_status?: CountryMetadataStatus;
   country_metadata_checked_at?: string | null;
+  public_about_status?: PublicAboutStatus;
+  public_about_checked_at?: string | null;
+  public_about_attempts?: number;
   latest_upload_at?: string | null;
   uploads_last_30_days?: number;
   uploads_last_90_days?: number;
