@@ -35,7 +35,7 @@ jobs:
           echo "Database secret is present."
 
       - name: Run strictly read-only forensic query
-        run: node scripts/forensicReadOnlyDbInvestigationV2.js
+        run: node scripts/forensicReadOnlyDbInvestigationV2.cjs
 
       - name: Upload forensic report
         if: always()
