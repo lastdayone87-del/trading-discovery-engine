@@ -1,7 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { decideJobFailure, failJob } from './db';
-import { decideGeminiCapacity } from './providerResilience';
+import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds } from './providerResilience';
+import { parseTransientRetryAgeMs } from './db';
 import { GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
 import type { RawChannelInput } from './evidenceEngine/types';
 
@@ -382,6 +383,171 @@ describe('Gemini semantic pacing regression', () => {
       const result = decideJobFailure(unrelatedError, 1, 4, now, now, cooldownExpiry);
       assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
       assert.ok(result.runAfter! - now < 120_000, 'unrelated error must not be affected by Gemini cooldown');
+    });
+  });
+
+  describe('Retry-age validation (parseTransientRetryAgeMs)', () => {
+    const SIX_HOURS = 6 * 60 * 60_000;
+
+    it('missing value uses 6-hour fallback', () => {
+      assert.equal(parseTransientRetryAgeMs(undefined), SIX_HOURS);
+      assert.equal(parseTransientRetryAgeMs(null), SIX_HOURS);
+      assert.equal(parseTransientRetryAgeMs(''), SIX_HOURS);
+    });
+
+    it('malformed string uses 6-hour fallback', () => {
+      assert.equal(parseTransientRetryAgeMs('not-a-number'), SIX_HOURS);
+      assert.equal(parseTransientRetryAgeMs('abc123'), SIX_HOURS);
+    });
+
+    it('"0" uses 6-hour fallback (below 60,000 minimum)', () => {
+      assert.equal(parseTransientRetryAgeMs('0'), SIX_HOURS);
+    });
+
+    it('negative value uses 6-hour fallback', () => {
+      assert.equal(parseTransientRetryAgeMs('-1'), SIX_HOURS);
+      assert.equal(parseTransientRetryAgeMs('-100000'), SIX_HOURS);
+    });
+
+    it('value below 60,000 uses 6-hour fallback', () => {
+      assert.equal(parseTransientRetryAgeMs('59999'), SIX_HOURS);
+      assert.equal(parseTransientRetryAgeMs('1'), SIX_HOURS);
+    });
+
+    it('valid value at exactly 60,000 is accepted', () => {
+      assert.equal(parseTransientRetryAgeMs('60000'), 60_000);
+    });
+
+    it('valid large value is accepted', () => {
+      assert.equal(parseTransientRetryAgeMs('7200000'), 7_200_000);
+    });
+  });
+
+  describe('Zero-cooldown bug (geminiSemanticCooldownMs)', () => {
+    it('valid "0" remains 0 (not coerced to 90,000)', () => {
+      const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      try { process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = '0'; } catch {}
+      assert.equal(geminiSemanticCooldownMs(), 0, 'explicit "0" must remain 0');
+      if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
+      else delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+    });
+
+    it('missing env var uses 90,000 default', () => {
+      const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      try { delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS; } catch {}
+      assert.equal(geminiSemanticCooldownMs(), 90_000, 'missing var must use 90,000 default');
+      if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
+    });
+
+    it('valid positive value is respected', () => {
+      const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      try { process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = '120000'; } catch {}
+      assert.equal(geminiSemanticCooldownMs(), 120_000, 'positive value must be respected');
+      if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
+      else delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+    });
+
+    it('invalid/non-finite string uses 90,000 default', () => {
+      const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      try { process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = 'not-a-number'; } catch {}
+      assert.equal(geminiSemanticCooldownMs(), 90_000, 'invalid string must use 90,000 default');
+      if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
+      else delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+    });
+
+    it('negative value uses 90,000 default', () => {
+      const saved = process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+      try { process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = '-5000'; } catch {}
+      assert.equal(geminiSemanticCooldownMs(), 90_000, 'negative value must use 90,000 default');
+      if (saved !== undefined) process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS = saved;
+      else delete process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;
+    });
+  });
+
+  describe('Route-aware cooldown scope (all-routes-unavailable)', () => {
+    it('decideGeminiCapacity defers semantic when rate-limited (route-level)', () => {
+      const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+        nowMs: now,
+        lastRateLimitAtMs: now - 30_000,
+        lastGeminiAtMs: now - 10_000
+      }, defaultConfig);
+      assert.equal(decision.action, 'DEFER');
+      assert.equal(decision.reasonCode, 'SEMANTIC_DEFERRED_RATE_PRESSURE');
+    });
+
+    it('decideGeminiCapacity runs when cooldown has fully elapsed', () => {
+      const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+        nowMs: now,
+        lastRateLimitAtMs: now - 100_000,
+        lastGeminiAtMs: now - 10_000
+      }, defaultConfig);
+      assert.equal(decision.action, 'RUN');
+    });
+
+    it('Multiple workers see identical capacity decision (shared cooldown)', () => {
+      const snapshot = { nowMs: now, lastRateLimitAtMs: now - 30_000, lastGeminiAtMs: now - 10_000 };
+      const w1 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
+      const w2 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
+      const w3 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
+      assert.equal(w1.action, w2.action);
+      assert.equal(w2.action, w3.action);
+    });
+
+    it('decideJobFailure defers when all routes rate-limited', () => {
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! >= cooldownExpiry);
+    });
+
+    it('decideJobFailure respects max transient retry age even during cooldown', () => {
+      const maxAge = 6 * 60 * 60_000;
+      const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, now - maxAge - 1000);
+      assert.equal(result.disposition, 'FAILED');
+      assert.equal(result.operationallyBlocked, true);
+    });
+
+    it('decideJobFailure uses exponential backoff when it exceeds cooldown', () => {
+      const cooldownExpiry = now + 10_000;
+      const result = decideJobFailure(geminiSemanticDeferError(), 5, 10, now, now, cooldownExpiry);
+      assert.ok(result.runAfter! > cooldownExpiry);
+    });
+  });
+
+  describe('configuredGeminiRouteIds reads env correctly', () => {
+    it('returns empty array when no GEMINI_API_KEY set', () => {
+      const saved: Record<string, string|undefined> = {};
+      for (const key of Object.keys(process.env)) {
+        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(key)) {
+          saved[key] = process.env[key];
+          delete (process.env as any)[key];
+        }
+      }
+      const routes = configuredGeminiRouteIds();
+      assert.deepEqual(routes, [], 'no keys configured means no routes');
+      for (const [key, val] of Object.entries(saved)) {
+        if (val !== undefined) (process.env as any)[key] = val;
+      }
+    });
+
+    it('returns route IDs for configured keys', () => {
+      const saved: Record<string, string|undefined> = {};
+      for (const key of Object.keys(process.env)) {
+        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(key)) {
+          saved[key] = process.env[key];
+          delete (process.env as any)[key];
+        }
+      }
+      (process.env as any).GEMINI_API_KEY = 'test-key-1';
+      (process.env as any).GEMINI_API_KEY_2 = 'test-key-2';
+      const routes = configuredGeminiRouteIds();
+      assert.equal(routes.length, 2, 'two keys means two routes');
+      assert.ok(routes.includes('gemini-1'));
+      assert.ok(routes.includes('gemini-2'));
+      for (const [key, val] of Object.entries(saved)) {
+        if (val !== undefined) (process.env as any)[key] = val;
+        else delete (process.env as any)[key];
+      }
     });
   });
 });

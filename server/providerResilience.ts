@@ -45,6 +45,23 @@ const GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS = 1000;
 
 export const DEFAULT_GEMINI_ROUTE_ID = 'gemini-1';
 
+/** Return configured Gemini route IDs from environment (no credentials exposed). */
+export function configuredGeminiRouteIds(env: NodeJS.ProcessEnv = process.env): string[] {
+  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name));
+  names.sort((a, b) => {
+    const routeNumber = (name: string) => name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
+    return routeNumber(a) - routeNumber(b);
+  });
+  const seen = new Set<string>();
+  return names.flatMap(name => {
+    const key = String(env[name] || '').trim();
+    if (!key || seen.has(key)) return [];
+    seen.add(key);
+    const numeric = name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
+    return [resolveGeminiRouteId(`gemini-${numeric}`)];
+  });
+}
+
 /** Resolve only machine-owned route identifiers; never expose or persist credentials. */
 export function resolveGeminiRouteId(value: unknown): string {
   const candidate = String(value || '').trim();
@@ -115,25 +132,52 @@ export function decideGeminiCapacity(operation:string, snapshot:GeminiCapacitySn
  * provider_call_events. Returns undefined if no rate limit has been recorded
  * or if the cooldown has already elapsed.
  *
+ * When configuredRouteIds is provided, checks that ALL configured routes
+ * are rate-limited (returns undefined if any route is available).
+ * When not provided, uses global scope (any route's rate limit blocks).
+ *
  * This is the single authoritative source of Gemini semantic cooldown state.
  * It queries the same provider_call_events table used by acquireGeminiCapacity,
  * so there are no independent clocks or parallel rate limiters.
  */
-export async function getGeminiSemanticCooldownExpiry(nowMs: number = Date.now()): Promise<number | undefined> {
+export async function getGeminiSemanticCooldownExpiry(nowMs: number = Date.now(), configuredRouteIds?: string[]): Promise<number | undefined> {
   const config = geminiCapacityConfig();
   try {
     const { getDb } = await import('./db');
     const db = await getDb();
-    const res = await db.query(
-      `SELECT occurred_at FROM provider_call_events
-       WHERE provider='gemini' AND status='RATE_LIMITED'
-       ORDER BY occurred_at DESC LIMIT 1`
-    );
-    if (!res.rows[0]?.occurred_at) return undefined;
-    const lastRateLimitMs = new Date(res.rows[0].occurred_at).getTime();
-    const elapsed = nowMs - lastRateLimitMs;
-    if (elapsed >= config.semanticRateLimitCooldownMs) return undefined;
-    return lastRateLimitMs + config.semanticRateLimitCooldownMs;
+    if (configuredRouteIds && configuredRouteIds.length > 0) {
+      const cutoff = new Date(nowMs - config.semanticRateLimitCooldownMs).toISOString();
+      const res = await db.query(
+        `SELECT COALESCE(request_metadata->>'geminiRoute','gemini-1') as route, MAX(occurred_at) as last_rate_limit
+         FROM provider_call_events
+         WHERE provider='gemini' AND status='RATE_LIMITED' AND occurred_at >= $1
+         GROUP BY route`, [cutoff]
+      );
+      const routeLatestExpiry = new Map<string, number>();
+      for (const row of res.rows) {
+        const route = String(row.route);
+        const lastAt = new Date(row.last_rate_limit).getTime();
+        routeLatestExpiry.set(route, lastAt + config.semanticRateLimitCooldownMs);
+      }
+      let latestExpiry = 0;
+      for (const routeId of configuredRouteIds) {
+        const expiry = routeLatestExpiry.get(routeId);
+        if (expiry === undefined || expiry <= nowMs) return undefined;
+        if (expiry > latestExpiry) latestExpiry = expiry;
+      }
+      return latestExpiry;
+    } else {
+      const res = await db.query(
+        `SELECT occurred_at FROM provider_call_events
+         WHERE provider='gemini' AND status='RATE_LIMITED'
+         ORDER BY occurred_at DESC LIMIT 1`
+      );
+      if (!res.rows[0]?.occurred_at) return undefined;
+      const lastRateLimitMs = new Date(res.rows[0].occurred_at).getTime();
+      const elapsed = nowMs - lastRateLimitMs;
+      if (elapsed >= config.semanticRateLimitCooldownMs) return undefined;
+      return lastRateLimitMs + config.semanticRateLimitCooldownMs;
+    }
   } catch {
     return undefined;
   }
@@ -143,10 +187,16 @@ export async function getGeminiSemanticCooldownExpiry(nowMs: number = Date.now()
  * Returns true when the Gemini semantic provider is in an active cooldown
  * that would cause a semantic classification call to DEFER.
  *
+ * Route-aware: returns true only when ALL configured routes are rate-limited.
+ * If any configured route is available, returns false so ENRICH_CHANNEL work
+ * can proceed through the healthy route.
+ *
  * Uses the same authoritative provider_call_events state as acquireGeminiCapacity.
  */
-export async function isGeminiSemanticCooldownActive(nowMs: number = Date.now()): Promise<boolean> {
-  const expiry = await getGeminiSemanticCooldownExpiry(nowMs);
+export async function isGeminiSemanticCooldownActive(nowMs: number = Date.now(), configuredRouteIds?: string[]): Promise<boolean> {
+  const routes = configuredRouteIds ?? configuredGeminiRouteIds();
+  if (routes.length === 0) return false;
+  const expiry = await getGeminiSemanticCooldownExpiry(nowMs, routes);
   return expiry !== undefined && expiry > nowMs;
 }
 

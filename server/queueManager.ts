@@ -177,10 +177,9 @@ export async function processNextSearchJob(
   // for enrichment_stage >= 1). When Gemini is rate-limited, every claimed
   // ENRICH_CHANNEL job immediately defers via SEMANTIC_DEFERRED_RATE_PRESSURE,
   // creating a ~1Hz DEFER storm. This gate pauses ENRICH_CHANNEL claims
-  // during the cooldown period, which is the correct narrowest-safe approach
-  // because there is no subset of ENRICH_CHANNEL jobs that can bypass Gemini.
-  // POST_APPROVAL_ENRICH and FORCE_REVIEW_RESCAN are separate low-volume
-  // user-triggered types not affected by this gate.
+  // during the cooldown period, but only when ALL configured Gemini routes
+  // are rate-limited. If any route is available, ENRICH_CHANNEL work can
+  // proceed through the healthy route.
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
     const geminiActive = await isGeminiSemanticCooldownActive();
     if (!geminiActive) claimableTypes.push('ENRICH_CHANNEL');
