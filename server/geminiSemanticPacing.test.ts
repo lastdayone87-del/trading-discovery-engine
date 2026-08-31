@@ -2,6 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { decideJobFailure } from './dbCore';
 import { decideGeminiCapacity } from './providerResilience';
+import { GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
+import type { RawChannelInput } from './evidenceEngine/types';
 
 describe('Gemini semantic pacing regression', () => {
   const now = 1_000_000_000;
@@ -208,6 +210,72 @@ describe('Gemini semantic pacing regression', () => {
     }, defaultConfig);
     assert.equal(decision.action, 'RUN');
     assert.equal(decision.waitMs, 0);
+  });
+
+  describe('Architectural invariant: ENRICH_CHANNEL always requires Gemini', () => {
+    const mockClient = { classify: async () => ({}) };
+    function baseCandidate(): RawChannelInput {
+      return {
+        channel_name: 'Test Channel',
+        description: 'Trading education channel about crypto and forex markets',
+        video_titles: ['How I Trade Forex', 'Day Trading Strategy'],
+        video_descriptions: ['Full strategy breakdown', 'Beginner guide to trading'],
+        external_links: ['https://example.com'],
+        country: 'US',
+        enrichment_stage: 1
+      };
+    }
+
+    it('GeminiSemanticProvider is AVAILABLE for enrichment_stage 1 (initial ENRICH_CHANNEL)', () => {
+      const provider = new GeminiSemanticProvider(mockClient);
+      const input = baseCandidate();
+      const result = provider.availability(input);
+      assert.equal(result.availability, 'AVAILABLE', `Expected AVAILABLE, got ${result.availability}: ${result.reason || ''}`);
+    });
+
+    it('GeminiSemanticProvider is AVAILABLE for enrichment_stage 2 (follow-up ENRICH_CHANNEL)', () => {
+      const provider = new GeminiSemanticProvider(mockClient);
+      const input = { ...baseCandidate(), enrichment_stage: 2 };
+      const result = provider.availability(input);
+      assert.equal(result.availability, 'AVAILABLE', `Expected AVAILABLE, got ${result.availability}: ${result.reason || ''}`);
+    });
+
+    it('GeminiSemanticProvider is AVAILABLE for enrichment_stage 3 (final ENRICH_CHANNEL)', () => {
+      const provider = new GeminiSemanticProvider(mockClient);
+      const input = { ...baseCandidate(), enrichment_stage: 3 };
+      const result = provider.availability(input);
+      assert.equal(result.availability, 'AVAILABLE', `Expected AVAILABLE, got ${result.availability}: ${result.reason || ''}`);
+    });
+
+    it('GeminiSemanticProvider is NOT_APPLICABLE only for retrieval-only candidates (enrichment_stage 0 with search_match_context)', () => {
+      const provider = new GeminiSemanticProvider(mockClient);
+      const input: RawChannelInput = {
+        channel_name: 'Sparse Channel',
+        description: '',
+        video_titles: [],
+        video_descriptions: [],
+        external_links: [],
+        enrichment_stage: 0,
+        search_match_context: { type: 'VIDEO', provider_native_id: 'test', title: 'test', description: 'test', published_at: '2025-01-01', locator: 'test' }
+      };
+      const result = provider.availability(input);
+      assert.equal(result.availability, 'NOT_APPLICABLE', 'Retrieval-only with no creator context should be NOT_APPLICABLE');
+    });
+
+    it('GeminiSemanticProvider is AVAILABLE when enrichment_stage 0 but has creator-level context', () => {
+      const provider = new GeminiSemanticProvider(mockClient);
+      const input: RawChannelInput = {
+        channel_name: 'Context Channel',
+        description: 'A channel about trading',
+        video_titles: ['Trading Basics'],
+        video_descriptions: ['Learn to trade'],
+        external_links: [],
+        enrichment_stage: 0,
+        search_match_context: { type: 'VIDEO', provider_native_id: 'test', title: 'test', description: 'test', published_at: '2025-01-01', locator: 'test' }
+      };
+      const result = provider.availability(input);
+      assert.equal(result.availability, 'AVAILABLE', 'enrichment_stage 0 with description should be AVAILABLE');
+    });
   });
 });
 
