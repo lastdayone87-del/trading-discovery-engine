@@ -14,8 +14,8 @@ const TARGET_REASONS = [
   'UPSTREAM_REQUIRED_ACQUISITION_FAILURE',
 ];
 
-const JOB_BATCH = Math.max(1, Number(process.env.FORENSIC_JOB_BATCH || 10));
-const OBS_LIMIT = Math.max(1, Number(process.env.FORENSIC_OBS_LIMIT || 80));
+const JOB_BATCH = Math.max(1, Number(process.env.FORENSIC_JOB_BATCH || 5));
+const OBS_LIMIT = Math.max(1, Number(process.env.FORENSIC_OBS_LIMIT || 50));
 const MAX_CHANNELS = Math.max(1, Number(process.env.FORENSIC_MAX_CHANNELS || 500));
 
 function parseJson(v) {
@@ -49,6 +49,16 @@ async function q(client, label, sql, params = []) {
   }
 }
 
+async function trySet(client, sql) {
+  try {
+    await client.query(sql);
+    return true;
+  } catch (e) {
+    console.error(`[forensic] optional SET skipped: ${e.message}`);
+    return false;
+  }
+}
+
 function surfaceOf(prov) {
   return String(parseJson(prov)?.surface || '').toUpperCase();
 }
@@ -71,16 +81,16 @@ function classifyChannel(item) {
   const reasons = item.projected_reasons || [];
   const hasUpstream = reasons.includes('UPSTREAM_REQUIRED_ACQUISITION_FAILURE');
   const hasCommunity = reasons.includes('COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
-  const q = item.qualifying_failures || [];
-  const communityQ = q.filter((o) => isCommunitySurface(surfaceOf(o.provenance)));
-  const upstreamQ = q.filter((o) => isYoutubeSurface(surfaceOf(o.provenance)));
-  const browserQ = q.filter((o) => {
+  const qf = item.qualifying_failures || [];
+  const communityQ = qf.filter((o) => isCommunitySurface(surfaceOf(o.provenance)));
+  const upstreamQ = qf.filter((o) => isYoutubeSurface(surfaceOf(o.provenance)));
+  const browserQ = qf.filter((o) => {
     const fc = String(o.failure_class || '').toUpperCase();
     return /BROWSER|RUNTIME|NAVIGATION|TIMEOUT|PLAYWRIGHT|CRAWLER/.test(fc + ' ' + String(o.detail || ''));
   });
 
   const step4Partial = item.step4_status === 'PARTIAL' || item.budget_expired;
-  const noQualifying = q.length === 0;
+  const noQualifying = qf.length === 0;
 
   if (item.later_success_after_failure) return 'STALE/DURABLE RETRY METADATA';
   if (noQualifying && step4Partial) return 'UNATTEMPTED/BUDGET-LIMITED — NO QUALIFYING FAILURE';
@@ -93,7 +103,7 @@ function classifyChannel(item) {
   }
   if (hasCommunity && communityQ.length > 0) return 'LEGITIMATE COMMUNITY FAILURE';
   if (hasUpstream && upstreamQ.length > 0) return 'LEGITIMATE UPSTREAM FAILURE';
-  if (q.length > 0) return 'LEGITIMATE COMMUNITY FAILURE';
+  if (qf.length > 0) return 'LEGITIMATE COMMUNITY FAILURE';
   return 'INCONCLUSIVE';
 }
 
@@ -114,24 +124,17 @@ async function main() {
   };
 
   try {
-    // Session knobs: prefer less temp spill; hard-cap temp files so we do not worsen disk.
     await client.query('BEGIN TRANSACTION READ ONLY');
-    await client.query("SET LOCAL statement_timeout = '30s'");
-    await client.query("SET LOCAL lock_timeout = '2s'");
-    await client.query("SET LOCAL work_mem = '256kB'");
-    await client.query("SET LOCAL temp_buffers = '128kB'");
-    try {
-      await client.query("SET LOCAL temp_file_limit = '8MB'");
-    } catch (_) {
-      // optional on some hosts
-    }
+    await trySet(client, "SET LOCAL statement_timeout = '30s'");
+    await trySet(client, "SET LOCAL lock_timeout = '2s'");
+    await trySet(client, "SET LOCAL work_mem = '1MB'");
+    // temp_buffers minimum is 100 * 8kB on this server — skip aggressive lowering
+    await trySet(client, "SET LOCAL temp_file_limit = '16MB'");
 
-    // 1) Minimal connectivity probe (no temp expected)
     progress.phase = 'probe';
     await q(client, 'probe_select_1', 'SELECT 1 AS ok');
     progress.minimal_query_ok = true;
 
-    // 2) Index existence probe (tiny catalog reads)
     progress.phase = 'catalog';
     const idx = await q(
       client,
@@ -142,67 +145,67 @@ async function main() {
        LIMIT 40`
     );
 
-    // 3) Keyset scan jobs for target reasons — one reason at a time, small LIMIT, no ORDER BY on large expressions if possible.
-    // Use the partial expression index idx_jobs_retry_community_channel_created when available.
+    // Prefer equality on single reason to better use partial index path; union in Node.
     progress.phase = 'scan_jobs';
     const jobsByChannel = new Map();
-    let lastCreated = null;
-    let lastId = null;
-    let safetyLoops = 0;
 
-    while (jobsByChannel.size < MAX_CHANNELS && safetyLoops < 200) {
-      safetyLoops += 1;
-      // Keyset pagination on (created_at, id) — indexed-friendly for type filter + small batches.
-      let sql;
-      let params;
-      if (lastId == null) {
-        sql = `
-          SELECT id::text AS job_id, status, attempts, max_attempts,
-                 run_after, created_at, updated_at, last_error,
-                 payload->>'channelId' AS channel_id,
-                 payload->>'retryReason' AS retry_reason,
-                 payload->>'retryCode' AS retry_code,
-                 payload->>'retrySource' AS retry_source,
-                 payload->>'observedAt' AS retry_observed_at,
-                 payload->>'observationAt' AS observation_at
-          FROM jobs
-          WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
-            AND payload->>'retryReason' = ANY($1::text[])
-          ORDER BY created_at ASC, id ASC
-          LIMIT $2`;
-        params = [TARGET_REASONS, JOB_BATCH];
-      } else {
-        sql = `
-          SELECT id::text AS job_id, status, attempts, max_attempts,
-                 run_after, created_at, updated_at, last_error,
-                 payload->>'channelId' AS channel_id,
-                 payload->>'retryReason' AS retry_reason,
-                 payload->>'retryCode' AS retry_code,
-                 payload->>'retrySource' AS retry_source,
-                 payload->>'observedAt' AS retry_observed_at,
-                 payload->>'observationAt' AS observation_at
-          FROM jobs
-          WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
-            AND payload->>'retryReason' = ANY($1::text[])
-            AND (created_at, id) > ($2::timestamptz, $3::uuid)
-          ORDER BY created_at ASC, id ASC
-          LIMIT $4`;
-        params = [TARGET_REASONS, lastCreated, lastId, JOB_BATCH];
+    for (const reason of TARGET_REASONS) {
+      let lastCreated = null;
+      let lastId = null;
+      let safetyLoops = 0;
+      while (safetyLoops < 400) {
+        safetyLoops += 1;
+        let sql;
+        let params;
+        if (lastId == null) {
+          sql = `
+            SELECT id::text AS job_id, status, attempts, max_attempts,
+                   run_after, created_at, updated_at, last_error,
+                   payload->>'channelId' AS channel_id,
+                   payload->>'retryReason' AS retry_reason,
+                   payload->>'retryCode' AS retry_code,
+                   payload->>'retrySource' AS retry_source,
+                   payload->>'observedAt' AS retry_observed_at,
+                   payload->>'observationAt' AS observation_at
+            FROM jobs
+            WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
+              AND payload->>'retryReason' = $1
+            ORDER BY created_at ASC, id ASC
+            LIMIT $2`;
+          params = [reason, JOB_BATCH];
+        } else {
+          sql = `
+            SELECT id::text AS job_id, status, attempts, max_attempts,
+                   run_after, created_at, updated_at, last_error,
+                   payload->>'channelId' AS channel_id,
+                   payload->>'retryReason' AS retry_reason,
+                   payload->>'retryCode' AS retry_code,
+                   payload->>'retrySource' AS retry_source,
+                   payload->>'observedAt' AS retry_observed_at,
+                   payload->>'observationAt' AS observation_at
+            FROM jobs
+            WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
+              AND payload->>'retryReason' = $1
+              AND (created_at, id) > ($2::timestamptz, $3::uuid)
+            ORDER BY created_at ASC, id ASC
+            LIMIT $4`;
+          params = [reason, lastCreated, lastId, JOB_BATCH];
+        }
+
+        const batch = await q(client, `jobs_${reason.slice(0, 12)}_${safetyLoops}`, sql, params);
+        progress.jobs_scanned += batch.rowCount;
+        if (batch.rowCount === 0) break;
+
+        for (const row of batch.rows) {
+          if (!row.channel_id) continue;
+          if (!jobsByChannel.has(row.channel_id)) jobsByChannel.set(row.channel_id, []);
+          jobsByChannel.get(row.channel_id).push(row);
+          lastCreated = row.created_at;
+          lastId = row.job_id;
+        }
+        if (batch.rowCount < JOB_BATCH) break;
+        if (jobsByChannel.size >= MAX_CHANNELS) break;
       }
-
-      const batch = await q(client, `jobs_batch_${safetyLoops}`, sql, params);
-      progress.jobs_scanned += batch.rowCount;
-      if (batch.rowCount === 0) break;
-
-      for (const row of batch.rows) {
-        if (!row.channel_id) continue;
-        if (!jobsByChannel.has(row.channel_id)) jobsByChannel.set(row.channel_id, []);
-        jobsByChannel.get(row.channel_id).push(row);
-        lastCreated = row.created_at;
-        lastId = row.job_id;
-      }
-
-      if (batch.rowCount < JOB_BATCH) break;
     }
 
     const channelIds = [...jobsByChannel.keys()].slice(0, MAX_CHANNELS);
@@ -215,7 +218,6 @@ async function main() {
       const channelId = channelIds[i];
       const retryJobs = jobsByChannel.get(channelId) || [];
 
-      // Single-row channel lookup by PK/unique channel_id
       const chRes = await q(
         client,
         `channel_${i}`,
@@ -229,7 +231,6 @@ async function main() {
       );
       const channel = chRes.rows[0] || null;
 
-      // Observations for this channel only — index (channel_id, observed_at DESC)
       const obsRes = await q(
         client,
         `obs_${i}`,
@@ -261,7 +262,6 @@ async function main() {
       const step4Status = /PARTIAL/i.test(step4Text) ? 'PARTIAL' : null;
       const budgetExpired = /budget expired|Rendered acquisition budget/i.test(step4Text);
 
-      // Per-URL attempted vs failed from observations only (never treat missing as failed)
       const urlsAttempted = [...new Set(obs.map((o) => o.requested_url).filter(Boolean))];
       const urlsFailed = [
         ...new Set(
@@ -272,7 +272,7 @@ async function main() {
         ),
       ];
 
-      const latestQualifying = qualifying[0] || null; // already observed_at DESC
+      const latestQualifying = qualifying[0] || null;
       const laterSuccess =
         !!latestQualifying &&
         obs.some(
@@ -281,7 +281,6 @@ async function main() {
             (o.outcome === 'FOUND' || o.outcome === 'INSPECTED_NO_MATCH')
         );
 
-      // Optional: latest job attempt counts without heavy join — skip if table missing
       let jobAttemptSummary = null;
       try {
         const jid = retryJobs[0]?.job_id;
@@ -408,11 +407,10 @@ async function main() {
       safety: {
         transaction: 'READ ONLY',
         statement_timeout: '30s',
-        work_mem: '256kB',
-        temp_file_limit: '8MB',
+        work_mem: '1MB',
         writes_performed: false,
         production_mutations: false,
-        strategy: 'keyset job scan + per-channel indexed lookups; correlation in Node',
+        strategy: 'per-reason keyset job scan + per-channel indexed lookups; correlation in Node',
       },
       progress,
       indexes_seen: idx.rows.map((r) => r.indexname),
