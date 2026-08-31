@@ -24,11 +24,11 @@ test('operational enrichment retry preserves failed provider and governed reason
   assert.ok(error instanceof OperationalEnrichmentProviderError);
   assert.equal(error.errorClass, 'TRANSIENT');
   assert.equal(error.retryable, true);
-  assert.deepEqual(error.providerReasons, ['PROVIDER_RATE_LIMIT']);
+  assert.deepEqual(error.providerReasons, ['PROVIDER_RATE_LIMIT', 'SEMANTIC_DEFERRED_RATE_PRESSURE']);
   assert.deepEqual(error.providerFailures, [
-    { provider: 'gemini_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT'] }
+    { provider: 'gemini_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT', 'SEMANTIC_DEFERRED_RATE_PRESSURE'] }
   ]);
-  assert.match(error.message, /gemini_semantic\[PROVIDER_RATE_LIMIT\]/);
+  assert.match(error.message, /gemini_semantic\[PROVIDER_RATE_LIMIT\|SEMANTIC_DEFERRED_RATE_PRESSURE\]/);
 });
 
 test('non-operational provider degradation is not converted into infrastructure retry', () => {

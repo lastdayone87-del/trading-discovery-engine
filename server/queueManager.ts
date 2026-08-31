@@ -74,6 +74,7 @@ import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWorker';
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
+import { isGeminiSemanticCooldownActive } from './providerResilience';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
@@ -171,7 +172,18 @@ export async function processNextSearchJob(
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) claimableTypes.push('ENRICH_CHANNEL');
+  // ENRICH_CHANNEL: every such job runs the full evidence pipeline, which
+  // always includes GeminiSemanticProvider (availability() returns AVAILABLE
+  // for enrichment_stage >= 1). When Gemini is rate-limited, every claimed
+  // ENRICH_CHANNEL job immediately defers via SEMANTIC_DEFERRED_RATE_PRESSURE,
+  // creating a ~1Hz DEFER storm. This gate pauses ENRICH_CHANNEL claims
+  // during the cooldown period, but only when ALL configured Gemini routes
+  // are rate-limited. If any route is available, ENRICH_CHANNEL work can
+  // proceed through the healthy route.
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
+    const geminiActive = await isGeminiSemanticCooldownActive();
+    if (!geminiActive) claimableTypes.push('ENRICH_CHANNEL');
+  }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');

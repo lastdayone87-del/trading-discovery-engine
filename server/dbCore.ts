@@ -718,7 +718,19 @@ export async function completeJob(jobId:string):Promise<void>{const db=await get
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','PROVIDER_COOLDOWN','PROVIDER_CONCURRENCY_CAP_EXCEEDED','BRAVE_API_RATE_LIMIT_429','BRAVE_API_TIMEOUT','BRAVE_API_NETWORK_FAILURE','BRAVE_API_HTTP_500','BRAVE_API_HTTP_502','BRAVE_API_HTTP_503','BRAVE_API_HTTP_504']);
 const TRANSIENT_HTTP_STATUS=new Set([408,425,429,500,502,503,504]);
-const MAX_TRANSIENT_RETRY_AGE_MS=Math.max(60_000,Number(process.env.MAX_TRANSIENT_RETRY_AGE_MS||6*60*60_000));
+const MAX_TRANSIENT_RETRY_AGE_MS=(()=>{const raw=process.env.MAX_TRANSIENT_RETRY_AGE_MS;if(raw===undefined||raw===null||raw==='')return 6*60*60_000;const parsed=Number(raw);return Number.isFinite(parsed)&&parsed>=60_000?parsed:6*60*60_000;})();
+export function geminiSemanticCooldownMs():number{const raw=process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;if(raw===undefined||raw===null||raw==='')return 90_000;const parsed=Number(raw);return Number.isFinite(parsed)&&parsed>=0?parsed:90_000;}
+export async function resolveGeminiSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{
+  const cooldownMs=geminiSemanticCooldownMs();
+  try{
+    const db=await getDb();
+    const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`);
+    if(!res.rows[0]?.occurred_at)return undefined;
+    const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
+    if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;
+    return lastRateLimitMs+cooldownMs;
+  }catch{return undefined;}
+}
 export function isRetryableInfrastructureFailure(error:any):boolean{
   const code=String(error?.code||error?.cause?.code||'').toUpperCase();
   const status=Number(error?.status||error?.statusCode||error?.response?.status);
@@ -730,22 +742,27 @@ export function isRetryableInfrastructureFailure(error:any):boolean{
   if(error?.retryable===true&&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(errorClass))return true;
   return false;
 }
-export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
+export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now,geminiSemanticCooldownExpiryMs?:number):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
   if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
   if(isRetryableInfrastructureFailure(error)){
     if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
     const retryAt=Number(error?.retryAt);
     const retryAfterMs=Number(error?.retryAfterMs);
     const exponentialMs=Math.min(15*60_000,30_000*Math.pow(2,Math.max(0,attempts-1)));
-    const scheduled=Number.isFinite(retryAt)?Math.max(now,retryAt):Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;
+    let scheduled=Number.isFinite(retryAt)?Math.max(now,retryAt):Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;
     const providerCode=String(error?.code||'').toUpperCase();
     const boundedCooldown=providerCode==='YOUTUBE_PROVIDERS_COOLING_DOWN'||providerCode==='YOUTUBE_PROVIDER_POOL_EXHAUSTED';
     if(boundedCooldown&&attempts>=maxAttempts)return {disposition:'FAILED'};
+    const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
+    const isGeminiSemanticDefer=providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED');
+    if(isGeminiSemanticDefer&&typeof geminiSemanticCooldownExpiryMs==='number'&&Number.isFinite(geminiSemanticCooldownExpiryMs)&&geminiSemanticCooldownExpiryMs>now){
+      scheduled=Math.max(scheduled,geminiSemanticCooldownExpiryMs);
+    }
     return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:scheduled};
   }
   return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
 }
-export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime());const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
+export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval RETURNING id`,[String(staleAfterMinutes)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[res.rows.map(row=>row.id)]); await client.query('COMMIT'); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 export async function heartbeatJob(jobId:string,workerId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET locked_at=now(),updated_at=now() WHERE id=$1 AND status='PROCESSING' AND locked_by=$2`,[jobId,workerId]);}
 
