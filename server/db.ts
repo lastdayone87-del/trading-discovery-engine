@@ -3,7 +3,7 @@
 // and independently testable without changing the rest of the database surface.
 export * from './dbCore';
 
-import { getDb, isRetryableInfrastructureFailure } from './dbCore';
+import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs } from './dbCore';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -13,22 +13,6 @@ export function parseTransientRetryAgeMs(value:unknown,fallback=6*60*60_000):num
 }
 
 const MAX_TRANSIENT_RETRY_AGE_MS=parseTransientRetryAgeMs(process.env.MAX_TRANSIENT_RETRY_AGE_MS);
-
-export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
-  if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
-  if(isRetryableInfrastructureFailure(error)){
-    if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
-    const retryAt=Number(error?.retryAt);
-    const retryAfterMs=Number(error?.retryAfterMs);
-    const exponentialMs=Math.min(15*60_000,30_000*Math.pow(2,Math.max(0,attempts-1)));
-    const scheduled=Number.isFinite(retryAt)?Math.max(now,retryAt):Number.isFinite(retryAfterMs)&&retryAfterMs>0?now+retryAfterMs:now+exponentialMs;
-    const providerCode=String(error?.code||'').toUpperCase();
-    const boundedCooldown=providerCode==='YOUTUBE_PROVIDERS_COOLING_DOWN'||providerCode==='YOUTUBE_PROVIDER_POOL_EXHAUSTED';
-    if(boundedCooldown&&attempts>=maxAttempts)return {disposition:'FAILED'};
-    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:scheduled};
-  }
-  return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
-}
 
 export function resolveTransientFailureAnchor(error:any,persistedFirstTransientFailureAt:unknown,now=Date.now()):number{
   if(!isRetryableInfrastructureFailure(error))return now;
@@ -47,7 +31,17 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   const retryableInfrastructure=isRetryableInfrastructureFailure(error);
   const firstFailureAt=resolveTransientFailureAnchor(error,first_transient_failure_at,now);
   const msg=String(error?.message||error).slice(0,2000);
-  const decision=decideJobFailure(error,attempts,max_attempts,now,firstFailureAt);
+
+  // Query the authoritative Gemini semantic cooldown from provider_call_events.
+  // This uses the same global scope as acquireGeminiCapacity / getGeminiSemanticCooldownExpiry
+  // because Gemini rate limits are project-level, not API-key-level.
+  let geminiSemanticCooldownExpiryMs: number|undefined=undefined;
+  const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
+  if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){
+    geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(now);
+  }
+
+  const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs);
   const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 

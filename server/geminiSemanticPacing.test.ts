@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { decideJobFailure } from './dbCore';
+import { decideJobFailure, failJob } from './db';
 import { decideGeminiCapacity } from './providerResilience';
 import { GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
 import type { RawChannelInput } from './evidenceEngine/types';
@@ -275,6 +275,113 @@ describe('Gemini semantic pacing regression', () => {
       };
       const result = provider.availability(input);
       assert.equal(result.availability, 'AVAILABLE', 'enrichment_stage 0 with description should be AVAILABLE');
+    });
+  });
+
+  describe('Production failJob path exercises Gemini cooldown', () => {
+    it('decideJobFailure is the same function whether imported from db or dbCore', async () => {
+      const { decideJobFailure: fromDb } = await import('./db');
+      const { decideJobFailure: fromDbCore } = await import('./dbCore');
+      assert.equal(fromDb, fromDbCore, 'db.ts must re-export dbCore.ts decideJobFailure, not shadow it');
+    });
+
+    it('Gemini semantic defer schedules past cooldown via db exports', () => {
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! >= cooldownExpiry, `runAfter (${result.runAfter}) must be >= cooldown expiry (${cooldownExpiry})`);
+    });
+
+    it('OperationalEnrichmentProviderError with Gemini rate pressure schedules past cooldown via db exports', () => {
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(operationalEnrichmentDeferError(), 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! >= cooldownExpiry, `runAfter (${result.runAfter}) must be >= cooldown expiry (${cooldownExpiry})`);
+    });
+  });
+
+  describe('Route-aware cooldown scope', () => {
+    it('decideGeminiCapacity defers semantic when any route is rate-limited (global scope)', () => {
+      // Route A was rate-limited 30s ago; route B has no events.
+      // Since rate limits are project-level, both routes share the cooldown.
+      const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+        nowMs: now,
+        lastRateLimitAtMs: now - 30_000, // route A rate limit
+        lastGeminiAtMs: now - 10_000
+      }, defaultConfig);
+      assert.equal(decision.action, 'DEFER', 'must defer when any route has active rate limit');
+      assert.equal(decision.reasonCode, 'SEMANTIC_DEFERRED_RATE_PRESSURE');
+    });
+
+    it('decideGeminiCapacity runs when cooldown has fully elapsed across all routes', () => {
+      const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+        nowMs: now,
+        lastRateLimitAtMs: now - 100_000, // cooldown elapsed (90s)
+        lastGeminiAtMs: now - 10_000
+      }, defaultConfig);
+      assert.equal(decision.action, 'RUN');
+    });
+
+    it('Multiple workers see identical capacity decision (shared cooldown state)', () => {
+      const snapshot = { nowMs: now, lastRateLimitAtMs: now - 30_000, lastGeminiAtMs: now - 10_000 };
+      const worker1 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
+      const worker2 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
+      const worker3 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
+      assert.equal(worker1.action, worker2.action, 'workers 1 and 2 must agree');
+      assert.equal(worker2.action, worker3.action, 'workers 2 and 3 must agree');
+    });
+  });
+
+  describe('All-routes-unavailable pacing', () => {
+    it('decideJobFailure defers ENRICH_CHANNEL retry when all routes are rate-limited', () => {
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! >= cooldownExpiry, `runAfter must be >= cooldown expiry when all routes unavailable`);
+      assert.ok(result.runAfter! - now >= ninetySeconds, `must not retry before cooldown elapses`);
+    });
+
+    it('decideJobFailure respects max transient retry age even during cooldown', () => {
+      const maxTransientRetryAge = 6 * 60 * 60_000;
+      const firstFailureAt = now - maxTransientRetryAge - 1000;
+      const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, firstFailureAt);
+      assert.equal(result.disposition, 'FAILED', 'max transient retry age must override cooldown');
+      assert.equal(result.operationallyBlocked, true);
+    });
+
+    it('decideJobFailure uses exponential backoff when it exceeds cooldown', () => {
+      // With attempt 5, exponential backoff = min(15min, 30s * 2^4) = min(15min, 480s) = 480s
+      const cooldownExpiry = now + 10_000; // only 10s cooldown
+      const result = decideJobFailure(geminiSemanticDeferError(), 5, 10, now, now, cooldownExpiry);
+      assert.ok(result.runAfter! > cooldownExpiry, 'exponential backoff must take precedence when longer');
+    });
+  });
+
+  describe('Existing retry behavior preserved', () => {
+    it('non-Gemini transient errors ignore cooldown parameter', () => {
+      const genericError = { message: 'Network timeout', retryable: true, errorClass: 'TRANSIENT' };
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(genericError, 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! < cooldownExpiry, 'non-Gemini error must NOT be delayed to cooldown');
+    });
+
+    it('INVESTIGATION_DEADLINE_EXCEEDED is always terminal', () => {
+      const result = decideJobFailure({ code: 'INVESTIGATION_DEADLINE_EXCEEDED', message: 'Late' }, 1, 4, now, now);
+      assert.equal(result.disposition, 'FAILED');
+    });
+
+    it('attempt count is not burned for retryable infrastructure failures', () => {
+      const result = decideJobFailure(geminiSemanticDeferError(), 3, 4, now, now, now);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+    });
+
+    it('unrelated non-ENRICH_CHANNEL failures are unaffected by cooldown', () => {
+      const unrelatedError = { message: 'YouTube quota', code: 'YOUTUBE_PROVIDERS_COOLING_DOWN', retryable: true };
+      const cooldownExpiry = now + ninetySeconds;
+      const result = decideJobFailure(unrelatedError, 1, 4, now, now, cooldownExpiry);
+      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+      assert.ok(result.runAfter! - now < 120_000, 'unrelated error must not be affected by Gemini cooldown');
     });
   });
 });

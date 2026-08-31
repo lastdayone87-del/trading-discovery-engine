@@ -719,6 +719,8 @@ export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED'
 const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','PROVIDER_COOLDOWN','PROVIDER_CONCURRENCY_CAP_EXCEEDED','BRAVE_API_RATE_LIMIT_429','BRAVE_API_TIMEOUT','BRAVE_API_NETWORK_FAILURE','BRAVE_API_HTTP_500','BRAVE_API_HTTP_502','BRAVE_API_HTTP_503','BRAVE_API_HTTP_504']);
 const TRANSIENT_HTTP_STATUS=new Set([408,425,429,500,502,503,504]);
 const MAX_TRANSIENT_RETRY_AGE_MS=Math.max(60_000,Number(process.env.MAX_TRANSIENT_RETRY_AGE_MS||6*60*60_000));
+export function geminiSemanticCooldownMs():number{return Number(process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS)||90_000;}
+export async function resolveGeminiSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{try{const db=await getDb();const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`);if(!res.rows[0]?.occurred_at)return undefined;const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();const cooldownMs=geminiSemanticCooldownMs();if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;return lastRateLimitMs+cooldownMs;}catch{return undefined;}}
 export function isRetryableInfrastructureFailure(error:any):boolean{
   const code=String(error?.code||error?.cause?.code||'').toUpperCase();
   const status=Number(error?.status||error?.statusCode||error?.response?.status);
