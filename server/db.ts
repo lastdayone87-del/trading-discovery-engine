@@ -4,7 +4,6 @@
 export * from './dbCore';
 
 import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs } from './dbCore';
-import { configuredGeminiRouteIds } from './providerResilience';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -34,12 +33,12 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   const msg=String(error?.message||error).slice(0,2000);
 
   // Query the authoritative Gemini semantic cooldown from provider_call_events.
-  // Route-aware: only blocks when ALL configured routes are rate-limited.
-  // If any configured route is available, the job can proceed through it.
+  // Gemini rate limits are project-level: a single RATE_LIMITED event on any
+  // route triggers a shared cooldown that blocks all semantic operations.
   let geminiSemanticCooldownExpiryMs: number|undefined=undefined;
   const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
   if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){
-    geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(now,configuredGeminiRouteIds());
+    geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(now);
   }
 
   const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs);

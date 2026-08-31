@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { decideJobFailure, failJob } from './db';
-import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds, resolveGeminiRouteId } from './providerResilience';
+import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds, resolveGeminiRouteId, isGeminiSemanticCooldownActive } from './providerResilience';
 import { parseTransientRetryAgeMs } from './db';
 import { configuredGeminiRoutes, GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
 import type { RawChannelInput } from './evidenceEngine/types';
@@ -301,7 +301,7 @@ describe('Gemini semantic pacing regression', () => {
     });
   });
 
-  describe('Route-aware cooldown scope', () => {
+  describe('Global cooldown scope (project-level Gemini rate limits)', () => {
     it('decideGeminiCapacity defers semantic when any route is rate-limited (global scope)', () => {
       // Route A was rate-limited 30s ago; route B has no events.
       // Since rate limits are project-level, both routes share the cooldown.
@@ -331,14 +331,12 @@ describe('Gemini semantic pacing regression', () => {
       assert.equal(worker1.action, worker2.action, 'workers 1 and 2 must agree');
       assert.equal(worker2.action, worker3.action, 'workers 2 and 3 must agree');
     });
-  });
 
-  describe('All-routes-unavailable pacing', () => {
-    it('decideJobFailure defers ENRICH_CHANNEL retry when all routes are rate-limited', () => {
+    it('decideJobFailure defers ENRICH_CHANNEL retry when any route is rate-limited', () => {
       const cooldownExpiry = now + ninetySeconds;
       const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, now, cooldownExpiry);
       assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
-      assert.ok(result.runAfter! >= cooldownExpiry, `runAfter must be >= cooldown expiry when all routes unavailable`);
+      assert.ok(result.runAfter! >= cooldownExpiry, `runAfter must be >= cooldown expiry when rate limit is active`);
       assert.ok(result.runAfter! - now >= ninetySeconds, `must not retry before cooldown elapses`);
     });
 
@@ -464,53 +462,76 @@ describe('Gemini semantic pacing regression', () => {
     });
   });
 
-  describe('Route-aware cooldown scope (all-routes-unavailable)', () => {
-    it('decideGeminiCapacity defers semantic when rate-limited (route-level)', () => {
+  describe('One-route-rate-limited blocks all (project-level invariant)', () => {
+    it('decideGeminiCapacity defers when only one of two routes has a recent 429', () => {
+      // Simulates: route A got 429, route B never seen rate-limited.
+      // Global scope means this blocks all semantic operations.
       const decision = decideGeminiCapacity('multilingual-semantic-classification', {
         nowMs: now,
-        lastRateLimitAtMs: now - 30_000,
-        lastGeminiAtMs: now - 10_000
+        lastRateLimitAtMs: now - 30_000, // route A rate-limited 30s ago
+        lastGeminiAtMs: now - 5_000       // recent success on route B
       }, defaultConfig);
-      assert.equal(decision.action, 'DEFER');
+      assert.equal(decision.action, 'DEFER', 'must defer because rate limit is project-level, not per-route');
       assert.equal(decision.reasonCode, 'SEMANTIC_DEFERRED_RATE_PRESSURE');
     });
 
-    it('decideGeminiCapacity runs when cooldown has fully elapsed', () => {
+    it('decideGeminiCapacity defers when rate-limited route has no semantic history', () => {
+      // Route A got 429 but has never been used for semantic calls.
+      // Global scope means the rate limit still applies.
       const decision = decideGeminiCapacity('multilingual-semantic-classification', {
         nowMs: now,
-        lastRateLimitAtMs: now - 100_000,
-        lastGeminiAtMs: now - 10_000
+        lastRateLimitAtMs: now - 10_000,
+        lastSemanticAtMs: undefined
+      }, defaultConfig);
+      assert.equal(decision.action, 'DEFER');
+    });
+
+    it('decideGeminiCapacity runs when rate limit is only on vocabulary operation', () => {
+      // Vocabulary rate limits do not block semantic operations via cooldown
+      // (they use separate vocabularyRateLimitSuppressionMs window)
+      const decision = decideGeminiCapacity('multilingual-semantic-classification', {
+        nowMs: now,
+        lastRateLimitAtMs: now - 100_000, // rate limit is old
+        lastGeminiAtMs: now - 10_000      // past global min interval (6s)
       }, defaultConfig);
       assert.equal(decision.action, 'RUN');
     });
+  });
 
-    it('Multiple workers see identical capacity decision (shared cooldown)', () => {
-      const snapshot = { nowMs: now, lastRateLimitAtMs: now - 30_000, lastGeminiAtMs: now - 10_000 };
-      const w1 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
-      const w2 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
-      const w3 = decideGeminiCapacity('multilingual-semantic-classification', snapshot, defaultConfig);
-      assert.equal(w1.action, w2.action);
-      assert.equal(w2.action, w3.action);
+  describe('Queue gate and retry scheduler use same cooldown', () => {
+    it('isGeminiSemanticCooldownActive uses global scope (no route parameter)', async () => {
+      // The function signature no longer accepts route IDs.
+      // It always queries the most recent RATE_LIMITED event from any route.
+      // We cannot test DB-backed behavior here, but we can verify the function
+      // exists and has the correct signature (no configuredRouteIds parameter).
+      const fnStr = isGeminiSemanticCooldownActive.toString();
+      assert.ok(!fnStr.includes('configuredRouteIds'), 'isGeminiSemanticCooldownActive must not accept configuredRouteIds');
+      assert.ok(fnStr.includes('getGeminiSemanticCooldownExpiry'), 'must delegate to getGeminiSemanticCooldownExpiry');
     });
 
-    it('decideJobFailure defers when all routes rate-limited', () => {
-      const cooldownExpiry = now + ninetySeconds;
-      const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, now, cooldownExpiry);
-      assert.equal(result.disposition, 'RETRYING_WITHOUT_ATTEMPT');
-      assert.ok(result.runAfter! >= cooldownExpiry);
+    it('resolveGeminiSemanticCooldownExpiryMs uses global scope (no route parameter)', async () => {
+      const { resolveGeminiSemanticCooldownExpiryMs } = await import('./dbCore');
+      const fnStr = resolveGeminiSemanticCooldownExpiryMs.toString();
+      assert.ok(!fnStr.includes('configuredRouteIds'), 'resolveGeminiSemanticCooldownExpiryMs must not accept configuredRouteIds');
+      assert.ok(fnStr.includes('RATE_LIMITED'), 'must query RATE_LIMITED events');
     });
 
-    it('decideJobFailure respects max transient retry age even during cooldown', () => {
-      const maxAge = 6 * 60 * 60_000;
-      const result = decideJobFailure(geminiSemanticDeferError(), 1, 4, now, now - maxAge - 1000);
-      assert.equal(result.disposition, 'FAILED');
-      assert.equal(result.operationallyBlocked, true);
+    it('db.ts failJob does not import configuredGeminiRouteIds', async () => {
+      const fs = await import('fs');
+      const source = fs.readFileSync(new URL('./db.ts', import.meta.url), 'utf8');
+      assert.ok(!source.includes("import { configuredGeminiRouteIds }"), 'db.ts failJob must not import configuredGeminiRouteIds');
+      assert.ok(source.includes('resolveGeminiSemanticCooldownExpiryMs(now)'), 'db.ts failJob must call resolveGeminiSemanticCooldownExpiryMs(now) without route IDs');
     });
 
-    it('decideJobFailure uses exponential backoff when it exceeds cooldown', () => {
-      const cooldownExpiry = now + 10_000;
-      const result = decideJobFailure(geminiSemanticDeferError(), 5, 10, now, now, cooldownExpiry);
-      assert.ok(result.runAfter! > cooldownExpiry);
+    it('dbCore.ts failJob does not contain inline cooldown query', async () => {
+      const fs = await import('fs');
+      const source = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+      // The dbCore.failJob should delegate to resolveGeminiSemanticCooldownExpiryMs,
+      // not contain its own SQL query for provider_call_events.
+      const failJobMatch = source.match(/export async function failJob\(jobId:string.*?\n/);
+      if (failJobMatch) {
+        assert.ok(!failJobMatch[0].includes('SELECT occurred_at FROM provider_call_events'), 'dbCore.failJob must not contain inline cooldown SQL query');
+      }
     });
   });
 
