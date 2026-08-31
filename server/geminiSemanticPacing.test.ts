@@ -1,9 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { decideJobFailure, failJob } from './db';
-import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds } from './providerResilience';
+import { decideGeminiCapacity, geminiSemanticCooldownMs, configuredGeminiRouteIds, resolveGeminiRouteId } from './providerResilience';
 import { parseTransientRetryAgeMs } from './db';
-import { GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
+import { configuredGeminiRoutes, GeminiSemanticProvider } from './evidenceEngine/providers/GeminiSemanticProvider';
 import type { RawChannelInput } from './evidenceEngine/types';
 
 describe('Gemini semantic pacing regression', () => {
@@ -548,6 +548,94 @@ describe('Gemini semantic pacing regression', () => {
         if (val !== undefined) (process.env as any)[key] = val;
         else delete (process.env as any)[key];
       }
+    });
+  });
+
+  describe('Route-set invariant: configuredGeminiRouteIds matches configuredGeminiRoutes', () => {
+    function withCleanGeminiEnv(fn: () => void) {
+      const saved: Record<string, string|undefined> = {};
+      for (const key of Object.keys(process.env)) {
+        if (key === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(key)) {
+          saved[key] = process.env[key];
+          delete (process.env as any)[key];
+        }
+      }
+      try { fn(); } finally {
+        for (const [key, val] of Object.entries(saved)) {
+          if (val !== undefined) (process.env as any)[key] = val;
+          else delete (process.env as any)[key];
+        }
+      }
+    }
+
+    it('single key: route IDs match', () => {
+      withCleanGeminiEnv(() => {
+        (process.env as any).GEMINI_API_KEY = 'key-a';
+        const full = configuredGeminiRoutes();
+        const ids = configuredGeminiRouteIds();
+        assert.equal(full.length, ids.length, 'route count must match');
+        for (let i = 0; i < full.length; i++) {
+          assert.equal(full[i].id, ids[i], `route[${i}].id must match ids[${i}]`);
+        }
+      });
+    });
+
+    it('multiple keys: route IDs match in same order', () => {
+      withCleanGeminiEnv(() => {
+        (process.env as any).GEMINI_API_KEY = 'key-a';
+        (process.env as any).GEMINI_API_KEY_2 = 'key-b';
+        (process.env as any).GEMINI_API_KEY_3 = 'key-c';
+        const full = configuredGeminiRoutes();
+        const ids = configuredGeminiRouteIds();
+        assert.equal(full.length, 3, 'three keys means three routes');
+        assert.equal(ids.length, 3, 'three keys means three route IDs');
+        assert.deepEqual(ids, full.map(r => r.id), 'IDs must be identical projection of full routes');
+      });
+    });
+
+    it('duplicate key deduplication: both functions produce same result', () => {
+      withCleanGeminiEnv(() => {
+        (process.env as any).GEMINI_API_KEY = 'same-key';
+        (process.env as any).GEMINI_API_KEY_2 = 'same-key';
+        const full = configuredGeminiRoutes();
+        const ids = configuredGeminiRouteIds();
+        assert.equal(full.length, 1, 'duplicate key deduplicated in full');
+        assert.equal(ids.length, 1, 'duplicate key deduplicated in IDs');
+        assert.equal(full[0].id, ids[0], 'single remaining route ID must match');
+      });
+    });
+
+    it('empty key filtered: both functions produce same result', () => {
+      withCleanGeminiEnv(() => {
+        (process.env as any).GEMINI_API_KEY = '';
+        (process.env as any).GEMINI_API_KEY_2 = 'valid-key';
+        const full = configuredGeminiRoutes();
+        const ids = configuredGeminiRouteIds();
+        assert.equal(full.length, 1, 'empty key filtered in full');
+        assert.equal(ids.length, 1, 'empty key filtered in IDs');
+        assert.equal(full[0].id, ids[0], 'remaining route ID must match');
+      });
+    });
+
+    it('no keys: both functions return empty', () => {
+      withCleanGeminiEnv(() => {
+        const full = configuredGeminiRoutes();
+        const ids = configuredGeminiRouteIds();
+        assert.deepEqual(full, [], 'no keys returns empty full');
+        assert.deepEqual(ids, [], 'no keys returns empty IDs');
+      });
+    });
+
+    it('route IDs are valid machine-owned identifiers via resolveGeminiRouteId', () => {
+      withCleanGeminiEnv(() => {
+        (process.env as any).GEMINI_API_KEY = 'key-a';
+        (process.env as any).GEMINI_API_KEY_2 = 'key-b';
+        const ids = configuredGeminiRouteIds();
+        for (const id of ids) {
+          assert.equal(id, resolveGeminiRouteId(id), `route ID ${id} must pass resolveGeminiRouteId validation`);
+          assert.ok(/^gemini-[1-9][0-9]*$/.test(id), `route ID ${id} must match machine-owned pattern`);
+        }
+      });
     });
   });
 });
