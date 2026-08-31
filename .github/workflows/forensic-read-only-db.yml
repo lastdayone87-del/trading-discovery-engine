@@ -10,9 +10,13 @@ jobs:
   forensic-read-only:
     name: Query production PostgreSQL read-only
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
     env:
       DATABASE_URL: ${{ secrets.RAILWAY_FORENSIC_DATABASE_URL }}
+      FORENSIC_JOB_BATCH: "5"
+      FORENSIC_OBS_LIMIT: "80"
+      # No practical population cap — process all matching retry jobs/channels
+      FORENSIC_MAX_CHANNELS: "100000"
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -34,14 +38,14 @@ jobs:
           fi
           echo "Database secret is present."
 
-      - name: Run strictly read-only forensic query
+      - name: Run strictly read-only forensic query (full population)
         run: node scripts/forensicReadOnlyDbInvestigationV2.cjs
 
       - name: Upload forensic report
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: production-forensic-db-report
+          name: production-forensic-db-report-full
           path: forensic-output/
           if-no-files-found: warn
           retention-days: 7
