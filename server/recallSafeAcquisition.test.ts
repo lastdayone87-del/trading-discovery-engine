@@ -7,7 +7,7 @@ import {
   isDotlessHostnameUrl,
   isKnownBrokerOrExchangeHost,
   isMessagingPreviewUrl,
-  isStaticOnlyAuxiliaryCandidate,
+  isAuxiliaryTriageCandidate,
   rankCommunitySurfaces,
 } from './communitySurfacePolicy';
 import { retryReasonForFailureClass, retryReasonFromError, surfaceAwareRetryReason } from './communityRetryPolicy';
@@ -129,12 +129,12 @@ test('ranking preserves messaging, dotless, broker, and affiliate candidates', (
   assert.deepEqual(new Set(ranked.map((item) => item.url)), new Set(inputs.map((item) => item.url)));
   assert.ok(isMessagingPreviewUrl('https://t.me/previewchannel'));
   assert.ok(isDotlessHostnameUrl('https://g/'));
-  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://broker.test/referral/creator' }));
-  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://www.binance.com/activity/referral-entry/CPA' }));
-  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://t.me/previewchannel' }));
-  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://g/' }));
-  assert.equal(isStaticOnlyAuxiliaryCandidate({ url: 'https://creator.example.com' }), false);
-  assert.equal(isStaticOnlyAuxiliaryCandidate({ url: 'https://linktr.ee/creator' }), false);
+  assert.ok(isAuxiliaryTriageCandidate({ url: 'https://broker.test/referral/creator' }));
+  assert.ok(isAuxiliaryTriageCandidate({ url: 'https://www.binance.com/activity/referral-entry/CPA' }));
+  assert.ok(isAuxiliaryTriageCandidate({ url: 'https://t.me/previewchannel' }));
+  assert.ok(isAuxiliaryTriageCandidate({ url: 'https://g/' }));
+  assert.equal(isAuxiliaryTriageCandidate({ url: 'https://creator.example.com' }), false);
+  assert.equal(isAuxiliaryTriageCandidate({ url: 'https://linktr.ee/creator' }), false);
   assert.equal(hasMessagingBridgeEvidence('Join our discord server'), true);
   assert.equal(hasMessagingBridgeEvidence('Daily market recap, no community mention'), false);
 });
@@ -147,10 +147,10 @@ test('unrelated hostnames are never classified as broker or exchange domains', a
     scoreCommunitySurface({ url: 'https://notbinance.com/', contextMatches: false, source: 'CHANNEL_LINKS' }) >
       scoreCommunitySurface({ url: 'https://www.binance.com/', contextMatches: false, source: 'CHANNEL_LINKS' }),
   );
-  assert.equal(isStaticOnlyAuxiliaryCandidate({ url: 'https://notbinance.com/' }), false);
-  assert.equal(isStaticOnlyAuxiliaryCandidate({ url: 'https://binance.com.evil.com/' }), false);
-  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://www.binance.com/' }));
-  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://mabanque.fortuneo.fr/offers' }));
+  assert.equal(isAuxiliaryTriageCandidate({ url: 'https://notbinance.com/' }), false);
+  assert.equal(isAuxiliaryTriageCandidate({ url: 'https://binance.com.evil.com/' }), false);
+  assert.ok(isAuxiliaryTriageCandidate({ url: 'https://www.binance.com/' }));
+  assert.ok(isAuxiliaryTriageCandidate({ url: 'https://mabanque.fortuneo.fr/offers' }));
 });
 
 test('broker matcher uses exact hostname and safe subdomain semantics', () => {
@@ -296,7 +296,10 @@ test('exhausted crawl budget produces PARTIALLY_INSPECTED at channel level', asy
   assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
 });
 
-test('dotless hosts are quarantined to static-only handling without rendered waste', async () => {
+test('dotless single-label hosts are attempted, labeled narrowly, and stay policy-eligible', async () => {
+  // Quarantine means "malformed/non-public single-label host, attempted
+  // statically first and labeled" — never "not allowed to be rendered".
+  // Forensic basis (PR #434 §7A): zero historical FOUND for dotless seeds.
   let renderedCalls = 0;
   const result = await runChannelInspection({
     channelId: 'dotless-channel',
@@ -314,13 +317,45 @@ test('dotless hosts are quarantined to static-only handling without rendered was
       return emptyRendered(seedUrl);
     },
   });
-  assert.equal(renderedCalls, 0);
+  // Statically attempted and recorded (never silently dropped).
   assert.ok(
     (result.acquisitionOutcomes || []).some(
       (item) => item.requestedUrl === 'https://g/' && item.outcome === 'ACQUISITION_FAILED' && item.required === false,
     ),
   );
+  // Eligible per existing policy: static non-FOUND + trading → rendered attempted.
+  assert.equal(renderedCalls, 1);
   assert.equal(result.retryDirective, undefined);
+});
+
+test('a legitimate creator URL containing an affiliate pattern stays crawl-eligible', async () => {
+  // A creator website that happens to contain `/referral/` must not become
+  // ineligible merely because of the affiliate pattern: triage may demote it,
+  // but eligibility follows the existing policy.
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'creator-referral-channel',
+    channelName: 'Creator Referral Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://creator.example.com/referral/vip'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: noInviteHtml as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return emptyRendered(seedUrl);
+    },
+  });
+  assert.equal(renderedCalls, 1);
+  assert.ok(
+    (result.acquisitionOutcomes || []).some(
+      (item) =>
+        item.requestedUrl === 'https://creator.example.com/referral/vip' &&
+        item.outcome === 'INSPECTED_NO_MATCH' &&
+        item.required === false,
+    ),
+    'expected the static observation to be recorded without blocking escalation',
+  );
 });
 
 test('broker and affiliate-pattern URLs are attempted statically, never hard-excluded', async () => {

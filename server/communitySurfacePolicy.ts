@@ -180,9 +180,11 @@ export function isDiscordCommunityAcquisitionSurface(surface: string): boolean {
 }
 
 /**
- * Recall-safe acquisition tiers (PR #434 §7A). These never discard a candidate;
- * they only decide static-only vs conditional-rendered handling and the
- * `required` flag. Ranking (`rankCommunitySurfaces`) still only reorders.
+ * Recall-safe acquisition tiers (PR #434 §7A). These never discard a candidate
+ * and never decide eligibility: every discovered URL remains eligible for the
+ * normal acquisition path. They only inform attempt ordering (static-first),
+ * cheap-evidence triage, and operability labels. Ranking
+ * (`rankCommunitySurfaces`) still only reorders.
  */
 export function isMessagingPreviewUrl(raw: string): boolean {
   return MESSAGING_PREVIEW_HOSTS.has(hostOf(raw));
@@ -210,14 +212,16 @@ export function isKnownBrokerOrExchangeHost(host: string): boolean {
 }
 
 /**
- * Auxiliary candidates are statically attempted with `required:false` and zero
- * default Playwright launches. This includes messaging previews, dotless/
- * quarantined hosts, and broker/affiliate-pattern destinations. Broker and
- * affiliate URLs are demoted, never hard-excluded: the in-repo golden set
- * proves `https://broker.test/referral/creator` carries a FOUND Discord
- * candidate, so exclusion would violate Z = 0.
+ * Auxiliary triage signal (PR #434; triage-only, never a crawl gate).
+ * Messaging-preview, dotless, and broker/affiliate-pattern candidates are
+ * attempted statically first and demoted in ranking, but classification here
+ * never decides eligibility: every candidate remains fully eligible for deeper
+ * acquisition under the existing policy. In particular, a legitimate creator
+ * URL containing `/referral/` must never become ineligible merely because of
+ * the affiliate pattern (in-repo golden `https://broker.test/referral/creator`
+ * carries a FOUND candidate, so exclusion would violate Z = 0).
  */
-export function isStaticOnlyAuxiliaryCandidate(candidate: { url: string }): boolean {
+export function isAuxiliaryTriageCandidate(candidate: { url: string }): boolean {
   const host = hostOf(candidate.url);
   if (!host) return true;
   if (MESSAGING_PREVIEW_HOSTS.has(host)) return true;
