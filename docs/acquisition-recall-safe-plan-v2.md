@@ -238,6 +238,191 @@ WHERE j.created_at=(SELECT MAX(created_at) FROM jobs
 If any proposed rule excludes a production `FOUND` URL → `Z>0` → STOP, report URL + surface + excluding rule +
 correction.
 
+## 7A. Production verification results (read-only, 2026-09-03, PLAN-ONLY update for PR #434)
+
+> No implementation, no production writes, no queue/concurrency changes, no deploys.
+> Methods were read-only: source reads, `node --import tsx -e` pure-function probes,
+> `node --import tsx --test` local suites, and read-only filesystem/env checks.
+> Implementation gate verdict is at the end of this section.
+
+### 7A.1 Production access actually available from this terminal
+
+- `DATABASE_URL`: **absent** (`python3 -c "DATABASE_URL in os.environ" => False`). No `.env` file exists
+  (only `.env.example`, which documents `DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/DATABASE"`).
+  `server/dbCore.ts:85-101` throws without `DATABASE_URL` and disables the SQL.js fallback, so `getDb()`
+  cannot connect from here. **No production read query was possible; none was attempted beyond this check.**
+- CLIs: `railway` not installed, `psql`/`pg_isready` not installed, `rg` not installed. No Railway-injected
+  Postgres vars in `env` (only generic container vars). GitHub `gh auth status` is logged in, but no production
+  forensic dump exists in issues (#228, #214 unrelated) or PRs (#433 is the prior plan doc, not data).
+- Local `data/test.db`, `data/trading_engine.db`, `data/trading_engine.backup.db`: all report
+  `database disk image is malformed` on read-only open. `about_channel.html` (1.6 MB) is a single saved YouTube
+  page, not a golden dataset. `server/fixtures/youtube-channel-sections/` contains only
+  `empty-sections.json` / `multiple-channels.json`. No `external_acquisition_observations` / `jobs` dump,
+  CSV, or JSONL with production FOUND URLs exists anywhere in-repo (searched `server/`, `tests/`, `docs/`,
+  `scripts/`, root; only synthetic test codes found).
+- Prior counts (704 / 100614 / 681 / 537 / 696 / 530) appear only in PR #433's markdown on branch
+  `docs/community-acquisition-forensics-and-plan`. No reproducing query, script output, or artifact exists
+  in-repo. They are therefore **unverified claims**, not a golden dataset, and were NOT used as evidence here.
+- Consequence: the **production** FOUND golden set could not be established from this terminal because
+  read-only production access does not already exist here. What is established below is the complete
+  **verifiable in-repo FOUND golden set** (synthetic, explicitly labeled, no fabrication), plus executable
+  read-only production queries that must run where access exists before any exclusion rule ships.
+  Any rule whose production `Z` remains unknown is marked `NOT IMPLEMENTATION-READY`; the implementation gate
+  for those rules stays closed.
+
+### 7A.2 Verifiable in-repo FOUND golden set (synthetic, read-only, no fabrication)
+
+Built from `server/discordDiscoveryRecall.test.ts`, `server/communityAcquisitionSemantics.test.ts`,
+`server/discordMultiCandidateOwnership.test.ts`, `server/discoveryDepthRegression.test.ts`,
+`server/browserCommunityFallback.test.ts`, `server/discordDiscoveryRetention.test.ts`,
+`server/inspectionRetentionReviewRouting.test.ts`, executed locally:
+`discordDiscoveryRecall + communitySurfacePolicy + browserCommunityFallback` = 27/27 pass;
+`communityAcquisitionSemantics + communityRetryPolicy + communityRecovery` = 52/52 pass.
+`grep -rhoE discord.gg/dsc.gg` across `server/ + tests/` = **40 unique synthetic invite strings**
+(e.g. `about-room`, `recent-room`, `dynamic-room`, `social-room`, `native-room`, `partner-room`,
+`creator-room`, `RealTradingRoom`, `8i7rSxaaW6`, `bioCode99`, `vidCode77`; full list in verification logs,
+all test codes, zero production invites). The **acquisition-relevant golden subset** (seed URL actually
+crawled/inspected with `foundInvite != null`, or direct Step 1-3 FOUND) is 11 entries:
+
+| # | Seed / source text (must remain reachable) | FOUND code(s) | Surface | Category | Test evidence |
+|---|---|---|---|---|---|
+| G1 | `https://creator.example/` | `dynamic-room` via `https://linktr.ee/trading-community` | `CREATOR_WEBSITES` (static) | Creator-owned / channel-provided website | `discordDiscoveryRecall.test.ts:116-134` |
+| G2 | `https://linktr.ee/trading-community` (dynamic target) | `dynamic-room` | `CREATOR_WEBSITES` (static anchor + data-url) | Link hub | Same test, `<div data-url="https://linktr.ee/trading-community">` + `<a href="https://discord.gg/dynamic-room">` |
+| G3 | `https://instagram.com/exampletrader` | `social-room` (rendered) | `SOCIAL_PROFILES` (static no-match → rendered FOUND) | Social / channel-provided | `discordDiscoveryRecall.test.ts:72-100` |
+| G4 | `https://creator.test` | `creator-room` + `partner-room` | `CREATOR_WEBSITES` (static) | Creator-owned | `discordMultiCandidateOwnership.test.ts:13-20` |
+| G5 | `https://broker.test/referral/creator` (source URL carrying `https://discord.gg/partner`) | `partner` | `CREATOR_WEBSITES` | Broker-pattern URL — **proves broker/affiliate-pattern URLs cannot be excluded** | `discordMultiCandidateOwnership.test.ts:32-33` |
+| G6 | `https://dsc.gg/vanity-room` | `native-room` (resolved) | `CHANNEL_EXTERNAL_LINKS` (alternative redirect) | Channel-provided / vanity | `communityAcquisitionSemantics.test.ts:127` |
+| G7 | `https://linktr.ee/example` (inside video description) | seed must remain attempted (hub) | `CREATOR_WEBSITES` seed from `RECENT_VIDEO_DESCRIPTIONS` | Video-desc hub | `discordDiscoveryRecall.test.ts:59` (`... https://discord.gg/recent-room https://linktr.ee/example`) |
+| G8 | `https://beacons.ai/trader` | seed must remain attempted (hub) | `CREATOR_WEBSITES` | Link hub | `communitySurfacePolicy.test.ts:22` + ranking |
+| D1 | Bio `... join https://discord.gg/about-room` | `about-room` | `YOUTUBE_ABOUT` (Step 1, direct, no Step 4 crawl) | Bio / About | `discordDiscoveryRecall.test.ts:34`, `communityAcquisitionSemantics.test.ts:105` |
+| D2 | Video desc `... https://discord.gg/recent-room` | `recent-room` | `RECENT_VIDEO_DESCRIPTIONS` (Step 3, direct) | Video description (direct) | `discordDiscoveryRecall.test.ts:59`, `communityAcquisitionSemantics.test.ts:99` |
+| D3 | Channel link `https://discord.gg/link-room` | `link-room` | `CHANNEL_EXTERNAL_LINKS` (Step 2, direct) | Channel-provided link | `communityAcquisitionSemantics.test.ts:106` |
+
+Live pure-function probes (this session) confirm all 8 Step-4 seeds extract (`extractEmbeddedUrls`) and
+normalize today: creator/link-hub/beacons/instagram/creator.test/broker.test/`t.me`/`wa.me`/`https://g/`/`dsc.gg`
+all admitted (`kind WEBSITE`, except instagram `SOCIAL`); direct `https://discord.gg/about-room` normalizes to
+`null` **by design** (handled in Steps 1-3, still FOUND — null here is not exclusion).
+
+Requested breakdowns (verifiable in-repo; production equivalents still require §7 queries):
+
+- **Total historical FOUND URLs**: production total = **unknown from this terminal** (no access, see §7A.1).
+  Verifiable in-repo total = **11 acquisition golden entries** (8 Step-4 seeds + 3 direct), drawn from 40 unique
+  synthetic invite strings. Nothing was invented; all codes above are literal test strings.
+- **FOUND by surface**: `YOUTUBE_ABOUT` ≥1 (`about-room`), `RECENT_VIDEO_DESCRIPTIONS` ≥1 (`recent-room`),
+  `CHANNEL_EXTERNAL_LINKS` ≥2 (`link-room`, `native-room` via `dsc.gg`), `CREATOR_WEBSITES` ≥5
+  (`dynamic-room` ×2 paths, `creator-room`, `partner-room`, `partner` via broker URL), `SOCIAL_PROFILES` ≥1
+  (`social-room` via rendered). `DISCORD_VALIDATION` has no acquisition FOUND (validation-only codes excluded).
+- **Video-description FOUND**: direct `recent-room` (Step 3 regex) plus hub seed `linktr.ee/example` co-occurring
+  in the same newest-authoritative description (`recentVideoDescriptionsLoader` test). Multi-surface retention
+  (`stale` + `active`, `same-room` in bio + video) proves descriptions are additive, never truncated beyond newest 5.
+  Video-desc eligibility must stay.
+- **Creator-owned / channel-provided / link-hub FOUND**: `creator.example/` + `creator.test` (creator-owned),
+  `instagram.com/exampletrader` + `dsc.gg/vanity-room` (channel-provided), `linktr.ee/*` + `beacons.ai/*`
+  (link hubs, static anchor + `data-href`/`data-url` paths, incl. protocol-relative `//linktr.ee/trader&club`
+  decoding test). All must remain attempted.
+- **Telegram/WhatsApp FOUND dependencies**: **0 in-repo** (`t.me` appears only in
+  `browserCommunityFallback.test.ts:17-26` permalink-eligibility assertions, zero `foundInvite`; `whatsapp`/`wa.me`
+  appear nowhere in tests). Production dependence = **unknown** (requires messaging query in §7). Therefore no
+  hard-blacklist evidence exists; see revised policy below.
+- **Malformed / dotless / truncated FOUND**: **0 in-repo** (`https://g/` appears nowhere in `server/*.test.ts`;
+  truncation test only covers long `discord.gg` codes, which are retained not truncated). Production presence =
+  **unknown** (requires dotless query in §7). Therefore no hard-reject evidence exists; quarantine only.
+
+### 7A.3 X / Y / Z per proposed rule (X = still attempted, Y = NOT_ATTEMPTED, Z = wrongly excluded; gate Z = 0)
+
+Evaluated by executing the actual functions (`normalizeExternalUrl`, `extractEmbeddedUrls`,
+`scoreCommunitySurface`/`rankCommunitySurfaces`, `shouldEscalateToRenderedFallback`,
+`isTelegramPostPermalink`/`shouldEnqueueRenderedCommunityLink`) against the §7A.2 golden set.
+`Z` has two columns: in-repo (proven here) and production (unknown unless stated).
+
+| Rule | X (in-repo 11) | Y | Z in-repo | Z prod | Verdict |
+|---|---|---|---|---|---|
+| Rank-only ordering (current `rankCommunitySurfaces`, no discard) | 11 | 0 | **0** (20→20 length preserved; `ranking is prioritization only` test passes) | 0 by construction (no discard) | **SAFE** |
+| Direct-discord `normalize=>null` (Steps 1-3 handle, Step 4 skips) | 11 (3 direct FOUND via Steps 1-3, 8 seeds via Step 4) | 0 | **0** | 0 by design | **SAFE** |
+| Existing asset-ext extraction filter (`png/jpg/...` in `extractExternalUrlsFromText`) | 11 (no golden seed has asset ext) | 0 | **0** | Unknown (needs asset-among-FOUND query) | **SAFE only as-is**; any extension of the list needs prod proof |
+| Dot-rule hard-reject (`hostname must contain dot`, prior `isValidPublicWebUrl`) | 11 (all golden hosts have dots; only `https://g/` lacks one and it is not FOUND in-repo) | 0 in-repo | **0 in-repo** | **UNKNOWN** | **NOT IMPLEMENTATION-READY as hard-reject**. Ship **quarantine** instead (cheap static attempt, 0 Playwright for dotless, `INACCESSIBLE required:false`, log): quarantine X=11 Y=0 Z=0 in-repo and recall-safe by construction |
+| `Slice websiteUrls to ≤4` (prior plan) | 4 of 8 seeds in 20-URL probe | 4 | **4 — GATE FAIL** | Fail | **REJECTED. DO NOT SHIP.** Affected: `https://instagram.com/exampletrader` (social-room), `https://creator.test` (creator/partner-room), `https://broker.test/referral/creator` (partner), `https://dsc.gg/vanity-room` (native-room) — all FOUND, all outside top-4 (`top4 = linktr.ee/example, linktr.ee/trading-community, beacons.ai/trader, creator.example/`). Cause: hub/channel-source boost outranks social/broker/affiliate-demoted URLs. Correction: no slice; priority + tiered depth + continuation (Phase A revised) |
+| Broker-host exclusion / affiliate-pattern exclusion | ≤10 | ≥1 | **≥1 — GATE FAIL** (`broker.test/referral/creator → partner` matches affiliate pattern `/referral/` → score -45; `binance.com/.../CPA` scores -110 but same class) | Fail | **REJECTED. DO NOT SHIP.** Affected: `https://broker.test/referral/creator` (FOUND `partner`). Correction: demote (score) but still attempt static-only, `required:false`, 0 Playwright |
+| Messaging hard-blacklist (exclude `t.me/wa.me/chat.whatsapp.com`) | 11 (no messaging FOUND in-repo) | 0 in-repo | **0 in-repo** | **UNKNOWN** | **NOT IMPLEMENTATION-READY. DO NOT SHIP as blacklist.** Ship lightweight-static + evidence escalation instead (below) |
+| Messaging lightweight-static + evidence escalation (revised §7A.4) | 11 | 0 | **0** (still attempts every messaging seed statically; rendered only on evidence) | Unknown but recall-safe by construction (attempt preserved) | **PREFERRED** (pending prod messaging query for tuning, not for safety) |
+| Rendered restriction to high tiers + evidence (social/hub/creator still escalate; low-tier/aux static-only, 0 Playwright) | 11 (`INSPECTED_NO_MATCH/PARTIAL/ACQUISITION_FAILED → escalate=true` for trading creators preserved for `CREATOR_WEBSITES/SOCIAL_PROFILES`; `FOUND → false` avoids waste; instagram no-match still escalates to `social-room`) | 0 | **0** | Unknown (needs rendered-among-FOUND query) | **SAFE subject to keeping social + hub + creator + contextMatch in high tier**; low-tier static-only must keep `required:false` so failures cannot poison Step 4 |
+| `budgetExhausted → PARTIALLY_INSPECTED`, `INACCESSIBLE`/`NOT_ATTEMPTED` states, `required:true` only for primary surfaces, per-URL try/catch + continue | 11 (no discard) | 0 (only newly logged, never newly skipped) | **0** | 0 by construction | **SAFE** |
+| Stale-projection guard, surface-aware reason, dashboard truth matrix | n/a (no URL discard) | 0 | **0** | 0 | **SAFE** (no recall impact) |
+
+Implementation gate: **Z = 0 required. `Slice ≤4`, broker/affiliate exclusion FAIL even in-repo — removed from the
+plan and must not ship.** Dot hard-reject and messaging blacklist have in-repo Z = 0 but production Z = UNKNOWN —
+they are **not approved**; the quarantine / lightweight alternatives above are the plan of record. No rule with
+production-unknown Z may become a hard-reject/blacklist without running §7 queries where access exists and
+documenting Z = 0 with the affected-URL list (empty) attached.
+
+### 7A.4 Revised Telegram / WhatsApp policy (evidence-bound, no blind blacklist)
+
+1. **No default expensive rendered crawling for messaging.** `t.me/*`, `telegram.me/*`, `wa.me/*`,
+   `chat.whatsapp.com/*` (plus `telegram.dog` mirrors, pending golden check) classify as `MESSAGING_PREVIEW`,
+   never `WEBSITE`. Default path is **lightweight static only**: fetch the public preview
+   (`https://t.me/s/{channel}` preferred, fallback `https://t.me/{channel}`; WhatsApp invite preview URL),
+   5-10s timeout, Cheerio parse of bio/description/pinned text + anchors, `extractDiscordCandidates` statically.
+   **Zero Playwright launches on this path.** Rationale: in-repo evidence shows messaging seeds admitted as
+   `WEBSITE` today and escalated (waste proven); zero in-repo FOUND via messaging means a blacklist would have
+   in-repo Z = 0 but production Z unknown, so the recall-safe choice under uncertainty is static-attempt, not discard.
+2. **Lightweight/static inspection where appropriate.** Static success with `discord.gg/discord.com/invite/dsc.gg`
+   → `FOUND` (no escalation needed). Static clean with no signals → `INSPECTED_NO_MATCH required:false`
+   (cannot poison Step 4, cannot create retry). Static inaccessible (DNS/timeout/non-HTML) → `INACCESSIBLE
+   required:false`. All seeds logged with preview URL for audit.
+3. **No blind hard-blacklist.** Explicitly forbidden unless the production messaging-among-FOUND query returns zero
+   rows **and** the empty affected-URL list is attached to this plan as an approved exception. That evidence does
+   not exist today (production query not runnable from here), so blacklisting is not part of the plan.
+4. **Escalation path retained on evidence.** Escalate a messaging seed to the bounded rendered fallback (same 60s
+   budget accounting as other seeds) **iff** static preview contains bridge evidence: literal `discord` keyword,
+   `discord.gg` obfuscation, `join/community/chat/vip/members` co-located with an outbound bridge widget/link,
+   or a same-host community-link control matching `COMMUNITY_HINTS`. Telegram post permalinks (`t.me/.../123`,
+   `t.me/s/.../123`) remain excluded as *child* crawl targets (`isTelegramPostPermalink` /
+   `shouldEnqueueRenderedCommunityLink` behavior preserved) but an explicitly supplied permalink seed is still
+   statically attempted, never silently dropped (`NOT_ATTEMPTED` logged only if a worker deadline forces abort).
+5. **Why recall is preserved.** Every messaging seed is still attempted (statically); any server-rendered Discord
+   invite in the preview is captured without Playwright; JS-hidden invites still have the evidence-gated rendered
+   path. In-repo Z = 0; production tuning (evidence keywords, mirror list) requires the messaging query in §7
+   but safety does not depend on it.
+
+### 7A.5 What must run where production access exists (read-only, before any hard-reject)
+
+```sql
+-- 1. FOUND by surface (establishes X baseline)
+SELECT COALESCE(provenance->>'surface','UNKNOWN') AS surface, COUNT(*) AS found_obs,
+       COUNT(DISTINCT requested_url) AS found_urls
+FROM external_acquisition_observations WHERE outcome='FOUND' GROUP BY 1 ORDER BY 1;
+-- 2. Video-desc FOUND (protects §3)
+SELECT requested_url, provenance, observed_at FROM external_acquisition_observations
+WHERE outcome='FOUND' AND provenance->>'surface'='RECENT_VIDEO_DESCRIPTIONS' ORDER BY observed_at DESC LIMIT 500;
+-- 3. Hub / creator / channel-provided FOUND
+SELECT requested_url, provenance FROM external_acquisition_observations WHERE outcome='FOUND'
+AND (requested_url ILIKE '%linktr.ee%' OR requested_url ILIKE '%beacons.ai%' OR requested_url ILIKE '%bio.link%'
+ OR requested_url ILIKE '%solo.to%' OR requested_url ILIKE '%whop.com%' OR requested_url ILIKE '%skool.com%')
+ORDER BY requested_url LIMIT 500;
+-- 4. Messaging dependence (gates blacklist; expected unknown until run)
+SELECT requested_url, final_url, provenance, observed_at FROM external_acquisition_observations
+WHERE outcome='FOUND' AND (requested_url ILIKE '%t.me%' OR requested_url ILIKE '%telegram%'
+OR requested_url ILIKE '%whatsapp%' OR requested_url ILIKE '%wa.me%') LIMIT 500;
+-- 5. Dotless / malformed among FOUND (gates dot-rule)
+SELECT requested_url, provenance FROM external_acquisition_observations
+WHERE outcome='FOUND' AND requested_url ~ '^https?://[^./]+/?($|\\?)' LIMIT 500;
+-- 6. Asset / broker / affiliate among FOUND (gates quality filters)
+SELECT requested_url, provenance FROM external_acquisition_observations WHERE outcome='FOUND'
+AND (requested_url ~* '\\.(png|jpg|jpeg|gif|webp|svg|css|js|wasm|ico|woff2?|ttf|eot|mp4|mp3|pdf|zip)(\\?|$)'
+OR requested_url ILIKE '%binance%' OR requested_url ILIKE '%coinbase%' OR requested_url ILIKE '%kraken%'
+OR requested_url ILIKE '%bybit%' OR requested_url ILIKE '%etoro%' OR requested_url ~* '/(ref(erral)?|affiliate|promo|coupon)(/|\\?|$)') LIMIT 500;
+-- 7. Staleness sample (Problems B/C context)
+SELECT c.channel_id, c.scan_status, c.discord_validation_status, j.status AS job_status,
+       j.payload->>'retryReason' AS retry_reason, j.created_at
+FROM channels c JOIN jobs j ON j.payload->>'channelId'=c.channel_id AND j.type='RETRY_COMMUNITY_ACQUISITION'
+WHERE j.created_at=(SELECT MAX(created_at) FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION'
+AND payload->>'channelId'=c.channel_id) ORDER BY j.created_at DESC LIMIT 1000;
+```
+
+Attach result tables + `Z` recomputation to this section before approving any hard-reject. Until then the
+quarantine / lightweight / no-slice policies above are the plan of record, and the implementation gate for
+exclusion rules remains closed — which is the recall-safe outcome the user required.
+
 ## 8. Stale retry metadata root cause
 
 Authoritative source should be `channels.scan_status + discord_validation_status + live PENDING job`, not durable
@@ -356,6 +541,8 @@ no runtime redesign); `server/crawlerTelemetry.ts` (budget semantics); `server/c
 ---
 
 ## Appendix — verification performed (read-only)
+
+Initial investigation plus 2026-09-03 production-verification update (both read-only, no prod writes):
 
 - `server/inspector.ts:12-193`, `server/crawlerExtraction.ts:1-63`, `server/communitySurfacePolicy.ts:1-161`,
   `server/communityRetryPolicy.ts:1-162`, `server/browserCommunityFallback.ts:1-316`,
