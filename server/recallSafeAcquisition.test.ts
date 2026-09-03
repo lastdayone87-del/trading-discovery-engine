@@ -10,7 +10,7 @@ import {
   rankCommunitySurfaces,
 } from './communitySurfacePolicy';
 import { retryReasonForFailureClass, retryReasonFromError, surfaceAwareRetryReason } from './communityRetryPolicy';
-import { rowToChannel } from './dbCore';
+import { isActiveCommunityRetry, rowToChannel } from './dbCore';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const response = (status: number, body = '{}', contentType = 'application/json') =>
@@ -138,6 +138,20 @@ test('ranking preserves messaging, dotless, broker, and affiliate candidates', (
   assert.equal(hasMessagingBridgeEvidence('Daily market recap, no community mention'), false);
 });
 
+test('unrelated hostnames are never classified as broker or exchange domains', async () => {
+  const { scoreCommunitySurface } = await import('./communitySurfacePolicy');
+  // Exact/subdomain matching only: notbinance.com must not inherit the
+  // binance.com broker penalty, and spoofed registrable domains must not match.
+  assert.ok(
+    scoreCommunitySurface({ url: 'https://notbinance.com/', contextMatches: false, source: 'CHANNEL_LINKS' }) >
+      scoreCommunitySurface({ url: 'https://www.binance.com/', contextMatches: false, source: 'CHANNEL_LINKS' }),
+  );
+  assert.equal(isStaticOnlyAuxiliaryCandidate({ url: 'https://notbinance.com/' }), false);
+  assert.equal(isStaticOnlyAuxiliaryCandidate({ url: 'https://binance.com.evil.com/' }), false);
+  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://www.binance.com/' }));
+  assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://mabanque.fortuneo.fr/offers' }));
+});
+
 // C. Messaging static-first + dotless quarantine + broker demote-only (PR #434 items 3-6).
 
 test('messaging previews resolve statically with zero default rendered launches', async () => {
@@ -211,6 +225,55 @@ test('messaging bridge evidence escalates to the bounded rendered fallback', asy
   assert.equal(result.foundInvite, 'bridge-room');
 });
 
+test('messaging bridge evidence escalates even when the creator is not classified as trading', async () => {
+  // Creator classification must never silently suppress a legitimate
+  // messaging discovery path: bridge evidence alone justifies escalation.
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'msg-bridge-unclassified',
+    channelName: 'Unclassified Messaging Channel',
+    channelBio: 'Market notes',
+    channelLinks: ['https://t.me/bridgedchannel'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input) =>
+      String(input).includes('t.me') ? html('Join our discord server! Invite widget loading...') : noInviteHtml()) as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return {
+        foundInvite: 'bridge-room',
+        foundLocation: seedUrl,
+        inspectedPages: 1,
+        scrolls: 0,
+        clicks: 0,
+        complete: true,
+        retryable: false,
+        detail: 'Discord invite discovered from rendered messaging preview',
+      };
+    },
+  });
+  assert.equal(renderedCalls, 1);
+  assert.equal(result.foundInvite, 'bridge-room');
+});
+
+test('exhausted crawl budget produces PARTIALLY_INSPECTED at channel level', async () => {
+  const rootLinks = Array.from({ length: 12 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
+  const result = await runChannelInspection({
+    channelId: 'UCbudget00000000000000001',
+    channelName: 'Budget Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://budget.test/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input) =>
+      String(input) === 'https://budget.test/' ? html(rootLinks) : html('Subpage without invite')) as typeof fetch,
+    renderedFallback: emptyRendered,
+  });
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+  assert.equal(result.retryDirective, undefined);
+  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
+});
+
 test('dotless hosts are quarantined to static-only handling without rendered waste', async () => {
   let renderedCalls = 0;
   const result = await runChannelInspection({
@@ -254,7 +317,32 @@ test('broker and affiliate-pattern URLs are attempted statically, never hard-exc
     },
   });
   assert.equal(result.foundInvite, 'partner-room');
-  assert.equal(renderedCalls, 0);
+  assert.equal(renderedCalls, 1);
+});
+
+test('a legitimate website with no static Discord evidence remains eligible for deeper acquisition', async () => {
+  // Static-first is triage, not a gate: no static evidence must not prevent
+  // rendered crawling when the existing policy would otherwise crawl the site.
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'eligible-website',
+    channelName: 'Eligible Website Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://broker.test/referral/guide'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: noInviteHtml as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return emptyRendered(seedUrl);
+    },
+  });
+  assert.equal(renderedCalls, 1);
+  assert.ok(
+    (result.acquisitionOutcomes || []).some(
+      (item) => item.requestedUrl === 'https://broker.test/referral/guide' && item.outcome === 'INSPECTED_NO_MATCH',
+    ),
+  );
 });
 
 test('messaging preview helper extracts statically and reports bridge evidence', async () => {
@@ -310,9 +398,9 @@ test('queue retry overrides attribute community surfaces as community-owned', ()
   assert.doesNotMatch(queue, /retryReason:directive\?\.retryReason\|\|'UPSTREAM_REQUIRED_ACQUISITION_FAILURE'/);
 });
 
-// E. Stale retry projection guard (PR #434 item 8).
+// E. Stale retry projection: history preserved, active state separate (PR #434 item 8, review fixes 5-6).
 
-test('completed historical retry jobs no longer project as active retry state', () => {
+test('historical completed retry metadata remains available while active retry state is false', () => {
   const stale = rowToChannel({
     channel_id: 'UCstale00000000000000001',
     scan_status: 'COMPLETED',
@@ -322,9 +410,11 @@ test('completed historical retry jobs no longer project as active retry state', 
     community_retry_job_max_attempts: 5,
     community_retry_job_retry_reason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
   });
-  assert.equal(stale.community_retry_job_status, undefined);
-  assert.equal(stale.community_retry_job_attempts, undefined);
-  assert.equal(stale.community_retry_job_retry_reason, undefined);
+  // History is preserved (never erased), but nothing active is projected.
+  assert.equal(stale.community_retry_job_status, 'COMPLETED');
+  assert.equal(stale.community_retry_job_attempts, 1);
+  assert.equal(stale.community_retry_job_retry_reason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  assert.equal(isActiveCommunityRetry(stale), false);
 
   const failedHistory = rowToChannel({
     channel_id: 'UCstale00000000000000002',
@@ -334,10 +424,11 @@ test('completed historical retry jobs no longer project as active retry state', 
     community_retry_job_attempts: 5,
     community_retry_job_max_attempts: 5,
   });
-  assert.equal(failedHistory.community_retry_job_status, undefined);
+  assert.equal(failedHistory.community_retry_job_status, 'FAILED');
+  assert.equal(isActiveCommunityRetry(failedHistory), false);
 });
 
-test('genuinely active retries keep their projected state', () => {
+test('genuinely active retries remain visible, including recovery-state retries', () => {
   const active = rowToChannel({
     channel_id: 'UCactive0000000000000001',
     scan_status: 'FAILED',
@@ -350,6 +441,28 @@ test('genuinely active retries keep their projected state', () => {
   assert.equal(active.community_retry_job_status, 'PENDING');
   assert.equal(active.community_retry_job_attempts, 2);
   assert.equal(active.community_retry_job_retry_reason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  assert.equal(isActiveCommunityRetry(active), true);
+
+  // Governed recovery reactivates channels to ENRICHMENT_PENDING + RETRY_PENDING
+  // with a fresh PENDING job: hiding it would suppress a genuinely active
+  // recovery retry, so it must project as active.
+  const recovering = rowToChannel({
+    channel_id: 'UCrecovering00000000000001',
+    scan_status: 'ENRICHMENT_PENDING',
+    discord_validation_status: 'RETRY_PENDING',
+    community_retry_job_status: 'PENDING',
+    community_retry_job_attempts: 0,
+    community_retry_job_max_attempts: 5,
+  });
+  assert.equal(isActiveCommunityRetry(recovering), true);
+  assert.equal(
+    isActiveCommunityRetry({
+      scan_status: 'COMPLETED',
+      discord_validation_status: 'RETRY_PENDING',
+      community_retry_job_status: 'PENDING',
+    }),
+    false,
+  );
 });
 
 // F. Dashboard acquisition-state truth (PR #434 item 9).
@@ -359,7 +472,8 @@ test('dashboard copy distinguishes incomplete, not-yet-inspected, and clean stat
   assert.match(table, /Website acquisition incomplete/);
   assert.match(table, /Not yet inspected/);
   assert.match(table, /Clean inspection · no community found/);
-  assert.match(table, /\(c\.scan_status==='FAILED'\|\|c\.scan_status==='FAILED_PERMANENT'\) && c\.discord_validation_status==='RETRY_PENDING'&&\(automaticRetryActive\|\|automaticRetryTerminal\)/);
+  assert.match(table, /\(c\.scan_status==='FAILED'\|\|c\.scan_status==='FAILED_PERMANENT'\|\|c\.scan_status==='ENRICHMENT_PENDING'\)/);
+  assert.match(table, /\(automaticRetryActive\|\|automaticRetryTerminal\)/);
 });
 
 // G. Video-description discovery remains enabled (recall invariant).

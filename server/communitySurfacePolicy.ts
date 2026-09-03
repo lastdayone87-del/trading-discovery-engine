@@ -37,16 +37,21 @@ const COMMUNITY_PLATFORM_HOSTS = new Set([
   'www.patreon.com',
 ]);
 
-const COMMON_BROKER_OR_EXCHANGE_HOSTS = [
-  'binance.com',
-  'degiro.',
+const BROKER_EXACT_HOSTS = new Set([
   'refer.ig.com',
-  'fortuneo.fr',
-  'coinbase.com',
-  'kraken.com',
-  'bybit.com',
-  'etoro.com',
-];
+]);
+
+// Broker/exchange identity is matched per hostname label, never by substring:
+// `notbinance.com` (label `notbinance`) must NOT match `binance.com`.
+const BROKER_HOST_LABELS = new Set([
+  'binance',
+  'degiro',
+  'coinbase',
+  'kraken',
+  'bybit',
+  'etoro',
+  'fortuneo',
+]);
 
 export const MESSAGING_PREVIEW_HOSTS = new Set([
   't.me',
@@ -99,7 +104,7 @@ export function scoreCommunitySurface(candidate: CommunitySurfaceCandidate): num
   // campaign destinations. This is deliberately a modest boost because domain
   // ownership is not known with certainty at this stage.
   const isKnownHubOrPlatform = LINK_HUB_HOSTS.has(host) || COMMUNITY_PLATFORM_HOSTS.has(host);
-  const isKnownBrokerOrExchange = COMMON_BROKER_OR_EXCHANGE_HOSTS.some(fragment => host.includes(fragment));
+  const isKnownBrokerOrExchange = isKnownBrokerOrExchangeHost(host);
   if (host && !isKnownHubOrPlatform && !isKnownBrokerOrExchange) score += 20;
 
   if (AFFILIATE_HINT.test(url)) score -= 75;
@@ -193,7 +198,15 @@ export function isDotlessHostnameUrl(raw: string): boolean {
 }
 
 function isKnownBrokerOrExchangeHost(host: string): boolean {
-  return COMMON_BROKER_OR_EXCHANGE_HOSTS.some(fragment => host.includes(fragment));
+  const lower = host.toLowerCase();
+  if (BROKER_EXACT_HOSTS.has(lower)) return true;
+  // Exact hostname or safe subdomain matching on the registrable domain only:
+  // `binance.com` and `www.binance.com` match, while `notbinance.com`
+  // (distinct label) and `binance.com.evil.com` (different registrable domain)
+  // do not. A miss here only fails open toward primary handling, which is the
+  // recall-safe direction since this signal is triage-only.
+  const labels = lower.split('.');
+  return labels.length >= 2 && BROKER_HOST_LABELS.has(labels[labels.length - 2]);
 }
 
 /**

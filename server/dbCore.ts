@@ -281,32 +281,38 @@ export function rowToChannel(row: any): ChannelRecord {
     community_retry_job_reconciliation_code: row.community_retry_job_reconciliation_code || undefined,
     community_retry_job_reconciliation_reason: row.community_retry_job_reconciliation_reason || undefined,
   };
-  // Active-retry projection guard (PR #434 item 8): a historical COMPLETED or
-  // FAILED retry job must never masquerade as current failure. Retry fields
-  // are projected only when ALL hold: scan FAILED/FAILED_PERMANENT, validation
-  // RETRY_PENDING, and the latest retry job PENDING/PROCESSING. Otherwise the
-  // durable payload is hidden and the channel renders by its own statuses.
-  const activeRetryProjected =
-    (channel.scan_status === 'FAILED' || channel.scan_status === 'FAILED_PERMANENT') &&
-    channel.discord_validation_status === 'RETRY_PENDING' &&
-    (channel.community_retry_job_status === 'PENDING' || channel.community_retry_job_status === 'PROCESSING');
-  if (!activeRetryProjected) {
-    channel.community_retry_job_status = undefined;
-    channel.community_retry_job_attempts = undefined;
-    channel.community_retry_job_max_attempts = undefined;
-    channel.community_retry_job_run_after = undefined;
-    channel.community_retry_job_error = undefined;
-    channel.community_retry_job_execution_count = undefined;
-    channel.community_retry_job_deferral_count = undefined;
-    channel.community_retry_job_last_execution_at = undefined;
-    channel.community_retry_job_last_execution_status = undefined;
-    channel.community_retry_job_retry_reason = undefined;
-    channel.community_retry_job_retry_code = undefined;
-    channel.community_retry_job_reconciliation_status = undefined;
-    channel.community_retry_job_reconciliation_code = undefined;
-    channel.community_retry_job_reconciliation_reason = undefined;
-  }
+  // Retry projection (PR #434 items 8-9, review fix 5-6): the durable retry
+  // payload is historical evidence and is always preserved here — terminal or
+  // completed retry information must remain available. Whether an *active*
+  // retry banner/state is projected is determined separately via
+  // isActiveCommunityRetry (scan FAILED/FAILED_PERMANENT or legitimate
+  // intermediate ENRICHMENT_PENDING recovery state, AND validation
+  // RETRY_PENDING, AND latest job PENDING/PROCESSING), so historical
+  // COMPLETED/FAILED jobs can never masquerade as active.
   return channel;
+}
+
+/**
+ * Separately determines whether an active retry should be projected for a
+ * channel (PR #434 item 8, review fixes 5-6). History in `rowToChannel` output
+ * is preserved regardless; callers and UI use this to decide active banners.
+ * ENRICHMENT_PENDING is included because governed recovery explicitly
+ * reactivates channels to ENRICHMENT_PENDING + RETRY_PENDING while a fresh
+ * PENDING recovery retry owns the retry window (see
+ * `reactivateCommunityRecovery`); hiding it would suppress a genuinely active
+ * recovery retry.
+ */
+export function isActiveCommunityRetry(channel: {
+  scan_status?: unknown;
+  discord_validation_status?: unknown;
+  community_retry_job_status?: unknown;
+}): boolean {
+  const scan = String(channel.scan_status || '');
+  return (
+    (scan === 'FAILED' || scan === 'FAILED_PERMANENT' || scan === 'ENRICHMENT_PENDING') &&
+    channel.discord_validation_status === 'RETRY_PENDING' &&
+    (channel.community_retry_job_status === 'PENDING' || channel.community_retry_job_status === 'PROCESSING')
+  );
 }
 
 export async function getAllChannels(): Promise<ChannelRecord[]> {
