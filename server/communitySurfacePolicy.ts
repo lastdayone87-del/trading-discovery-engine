@@ -197,7 +197,7 @@ export function isDotlessHostnameUrl(raw: string): boolean {
   }
 }
 
-function isKnownBrokerOrExchangeHost(host: string): boolean {
+export function isKnownBrokerOrExchangeHost(host: string): boolean {
   const lower = host.toLowerCase();
   if (BROKER_EXACT_HOSTS.has(lower)) return true;
   // Exact hostname or safe subdomain matching on the registrable domain only:

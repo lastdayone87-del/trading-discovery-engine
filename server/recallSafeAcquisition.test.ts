@@ -5,6 +5,7 @@ import { crawlExternalLinks, crawlMessagingPreview, normalizeExternalUrl, runCha
 import {
   hasMessagingBridgeEvidence,
   isDotlessHostnameUrl,
+  isKnownBrokerOrExchangeHost,
   isMessagingPreviewUrl,
   isStaticOnlyAuxiliaryCandidate,
   rankCommunitySurfaces,
@@ -150,6 +151,27 @@ test('unrelated hostnames are never classified as broker or exchange domains', a
   assert.equal(isStaticOnlyAuxiliaryCandidate({ url: 'https://binance.com.evil.com/' }), false);
   assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://www.binance.com/' }));
   assert.ok(isStaticOnlyAuxiliaryCandidate({ url: 'https://mabanque.fortuneo.fr/offers' }));
+});
+
+test('broker matcher uses exact hostname and safe subdomain semantics', () => {
+  assert.equal(isKnownBrokerOrExchangeHost('binance.com'), true);
+  assert.equal(isKnownBrokerOrExchangeHost('www.binance.com'), true);
+  assert.equal(isKnownBrokerOrExchangeHost('api.binance.com'), true);
+  assert.equal(isKnownBrokerOrExchangeHost('notbinance.com'), false);
+  assert.equal(isKnownBrokerOrExchangeHost('binance.com.evil.test'), false);
+  assert.equal(isKnownBrokerOrExchangeHost('mabanque.fortuneo.fr'), true);
+  assert.equal(isKnownBrokerOrExchangeHost('refer.ig.com'), true);
+  assert.equal(isKnownBrokerOrExchangeHost('creator.example.com'), false);
+});
+
+test('dotless quarantine applies only to exact single-label hostnames and never broadens', () => {
+  // Forensic basis (PR #434 §7A): zero historical FOUND observations for
+  // dotless seeds. The predicate stays exact: single-label only.
+  assert.equal(isDotlessHostnameUrl('https://g/'), true);
+  assert.equal(isDotlessHostnameUrl('https://g.co/'), false);
+  assert.equal(isDotlessHostnameUrl('https://example.com/'), false);
+  assert.equal(isDotlessHostnameUrl('https://192.168.0.1/'), false);
+  assert.equal(isDotlessHostnameUrl('not-a-url'), false);
 });
 
 // C. Messaging static-first + dotless quarantine + broker demote-only (PR #434 items 3-6).
@@ -342,6 +364,42 @@ test('a legitimate website with no static Discord evidence remains eligible for 
     (result.acquisitionOutcomes || []).some(
       (item) => item.requestedUrl === 'https://broker.test/referral/guide' && item.outcome === 'INSPECTED_NO_MATCH',
     ),
+  );
+});
+
+test('a plain legitimate discovered website is crawled even with zero static evidence', async () => {
+  // Central invariant: if the engine discovers a legitimate website, crawl it.
+  // Static inspection may order/triage acquisition but must never become
+  // permission to skip the site: a clean static pass stays eligible for the
+  // normal rendered path whenever the existing policy calls for it.
+  let renderedCalls = 0;
+  const seenStatic: string[] = [];
+  const result = await runChannelInspection({
+    channelId: 'plain-legit-site',
+    channelName: 'Plain Legit Site Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://creator.example.com/guide'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async (input) => {
+      seenStatic.push(String(input));
+      return noInviteHtml();
+    }) as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return emptyRendered(seedUrl);
+    },
+  });
+  assert.ok(seenStatic.some((url) => url.includes('creator.example.com/guide')));
+  assert.equal(renderedCalls, 1);
+  assert.ok(
+    (result.acquisitionOutcomes || []).some(
+      (item) =>
+        item.requestedUrl === 'https://creator.example.com/guide' &&
+        item.outcome === 'INSPECTED_NO_MATCH' &&
+        item.required === false,
+    ),
+    'expected the static observation to be recorded without blocking escalation',
   );
 });
 
