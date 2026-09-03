@@ -48,6 +48,20 @@ const COMMON_BROKER_OR_EXCHANGE_HOSTS = [
   'etoro.com',
 ];
 
+export const MESSAGING_PREVIEW_HOSTS = new Set([
+  't.me',
+  'www.t.me',
+  'telegram.me',
+  'www.telegram.me',
+  'telegram.dog',
+  'www.telegram.dog',
+  'wa.me',
+  'www.wa.me',
+  'whatsapp.com',
+  'www.whatsapp.com',
+  'chat.whatsapp.com',
+]);
+
 const COMMUNITY_HINT = /(?:discord|community|join|members?|membership|group|private|vip|trading[-_ ]?(?:room|floor)|chat|links?)/i;
 const AFFILIATE_HINT = /(?:\/|[?&_-])(?:ref(?:erral)?|affiliate|partner|parrainage|cpa|campaign|promo|coupon)(?:\/|=|[?&_-]|$)/i;
 
@@ -158,4 +172,54 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
  */
 export function isDiscordCommunityAcquisitionSurface(surface: string): boolean {
   return new Set(['CHANNEL_EXTERNAL_LINKS', 'CREATOR_WEBSITES', 'SOCIAL_PROFILES']).has(surface);
+}
+
+/**
+ * Recall-safe acquisition tiers (PR #434 §7A). These never discard a candidate;
+ * they only decide static-only vs conditional-rendered handling and the
+ * `required` flag. Ranking (`rankCommunitySurfaces`) still only reorders.
+ */
+export function isMessagingPreviewUrl(raw: string): boolean {
+  return MESSAGING_PREVIEW_HOSTS.has(hostOf(raw));
+}
+
+export function isDotlessHostnameUrl(raw: string): boolean {
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host.length > 0 && !host.includes('.');
+  } catch {
+    return false;
+  }
+}
+
+function isKnownBrokerOrExchangeHost(host: string): boolean {
+  return COMMON_BROKER_OR_EXCHANGE_HOSTS.some(fragment => host.includes(fragment));
+}
+
+/**
+ * Auxiliary candidates are statically attempted with `required:false` and zero
+ * default Playwright launches. This includes messaging previews, dotless/
+ * quarantined hosts, and broker/affiliate-pattern destinations. Broker and
+ * affiliate URLs are demoted, never hard-excluded: the in-repo golden set
+ * proves `https://broker.test/referral/creator` carries a FOUND Discord
+ * candidate, so exclusion would violate Z = 0.
+ */
+export function isStaticOnlyAuxiliaryCandidate(candidate: { url: string }): boolean {
+  const host = hostOf(candidate.url);
+  if (!host) return true;
+  if (MESSAGING_PREVIEW_HOSTS.has(host)) return true;
+  if (!host.includes('.')) return true;
+  if (isKnownBrokerOrExchangeHost(host)) return true;
+  if (AFFILIATE_HINT.test(candidate.url)) return true;
+  return false;
+}
+
+/**
+ * Bridge evidence that justifies escalating a messaging preview to the bounded
+ * rendered fallback even though messaging never receives default rendered
+ * crawling. Deliberately broad (`discord` mention without an extractable
+ * invite suggests JS-hidden content); absence means static-only completion.
+ */
+export function hasMessagingBridgeEvidence(html: string): boolean {
+  return /discord/i.test(String(html || ''));
 }

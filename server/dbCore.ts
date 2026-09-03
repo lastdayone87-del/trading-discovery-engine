@@ -224,8 +224,8 @@ async function getDbNoInit(): Promise<InstanceType<typeof Pool>> {
   return pool;
 }
 
-function rowToChannel(row: any): ChannelRecord {
-  return {
+export function rowToChannel(row: any): ChannelRecord {
+  const channel: ChannelRecord = {
     channel_id: row.channel_id,
     channel_name: row.channel_name,
     youtube_url: row.youtube_url,
@@ -281,6 +281,32 @@ function rowToChannel(row: any): ChannelRecord {
     community_retry_job_reconciliation_code: row.community_retry_job_reconciliation_code || undefined,
     community_retry_job_reconciliation_reason: row.community_retry_job_reconciliation_reason || undefined,
   };
+  // Active-retry projection guard (PR #434 item 8): a historical COMPLETED or
+  // FAILED retry job must never masquerade as current failure. Retry fields
+  // are projected only when ALL hold: scan FAILED/FAILED_PERMANENT, validation
+  // RETRY_PENDING, and the latest retry job PENDING/PROCESSING. Otherwise the
+  // durable payload is hidden and the channel renders by its own statuses.
+  const activeRetryProjected =
+    (channel.scan_status === 'FAILED' || channel.scan_status === 'FAILED_PERMANENT') &&
+    channel.discord_validation_status === 'RETRY_PENDING' &&
+    (channel.community_retry_job_status === 'PENDING' || channel.community_retry_job_status === 'PROCESSING');
+  if (!activeRetryProjected) {
+    channel.community_retry_job_status = undefined;
+    channel.community_retry_job_attempts = undefined;
+    channel.community_retry_job_max_attempts = undefined;
+    channel.community_retry_job_run_after = undefined;
+    channel.community_retry_job_error = undefined;
+    channel.community_retry_job_execution_count = undefined;
+    channel.community_retry_job_deferral_count = undefined;
+    channel.community_retry_job_last_execution_at = undefined;
+    channel.community_retry_job_last_execution_status = undefined;
+    channel.community_retry_job_retry_reason = undefined;
+    channel.community_retry_job_retry_code = undefined;
+    channel.community_retry_job_reconciliation_status = undefined;
+    channel.community_retry_job_reconciliation_code = undefined;
+    channel.community_retry_job_reconciliation_reason = undefined;
+  }
+  return channel;
 }
 
 export async function getAllChannels(): Promise<ChannelRecord[]> {
