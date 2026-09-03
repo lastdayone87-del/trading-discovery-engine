@@ -224,8 +224,8 @@ async function getDbNoInit(): Promise<InstanceType<typeof Pool>> {
   return pool;
 }
 
-function rowToChannel(row: any): ChannelRecord {
-  return {
+export function rowToChannel(row: any): ChannelRecord {
+  const channel: ChannelRecord = {
     channel_id: row.channel_id,
     channel_name: row.channel_name,
     youtube_url: row.youtube_url,
@@ -281,6 +281,38 @@ function rowToChannel(row: any): ChannelRecord {
     community_retry_job_reconciliation_code: row.community_retry_job_reconciliation_code || undefined,
     community_retry_job_reconciliation_reason: row.community_retry_job_reconciliation_reason || undefined,
   };
+  // Retry projection (PR #434 items 8-9, review fix 5-6): the durable retry
+  // payload is historical evidence and is always preserved here — terminal or
+  // completed retry information must remain available. Whether an *active*
+  // retry banner/state is projected is determined separately via
+  // isActiveCommunityRetry (scan FAILED/FAILED_PERMANENT or legitimate
+  // intermediate ENRICHMENT_PENDING recovery state, AND validation
+  // RETRY_PENDING, AND latest job PENDING/PROCESSING), so historical
+  // COMPLETED/FAILED jobs can never masquerade as active.
+  return channel;
+}
+
+/**
+ * Separately determines whether an active retry should be projected for a
+ * channel (PR #434 item 8, review fixes 5-6). History in `rowToChannel` output
+ * is preserved regardless; callers and UI use this to decide active banners.
+ * ENRICHMENT_PENDING is included because governed recovery explicitly
+ * reactivates channels to ENRICHMENT_PENDING + RETRY_PENDING while a fresh
+ * PENDING recovery retry owns the retry window (see
+ * `reactivateCommunityRecovery`); hiding it would suppress a genuinely active
+ * recovery retry.
+ */
+export function isActiveCommunityRetry(channel: {
+  scan_status?: unknown;
+  discord_validation_status?: unknown;
+  community_retry_job_status?: unknown;
+}): boolean {
+  const scan = String(channel.scan_status || '');
+  return (
+    (scan === 'FAILED' || scan === 'FAILED_PERMANENT' || scan === 'ENRICHMENT_PENDING') &&
+    channel.discord_validation_status === 'RETRY_PENDING' &&
+    (channel.community_retry_job_status === 'PENDING' || channel.community_retry_job_status === 'PROCESSING')
+  );
 }
 
 export async function getAllChannels(): Promise<ChannelRecord[]> {

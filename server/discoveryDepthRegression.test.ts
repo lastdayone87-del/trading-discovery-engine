@@ -168,8 +168,18 @@ test('website crawler remains bounded to eight prioritized follow-up pages', asy
 
   const result = await crawlExternalLinks(['https://bounded.test/'], [], undefined, fakeFetch);
   assert.equal(result.foundInvite, null);
-  assert.equal(result.outcome, 'INSPECTED_NO_MATCH');
+  // Recall-safe budget semantics (PR #434 items 1-2): the crawl stays bounded
+  // (root + 8 follow-ups) but the exhausted budget is recorded as
+  // PARTIALLY_INSPECTED with budgetExhausted telemetry — never misrepresented
+  // as a fully inspected no-match.
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
   assert.equal(calls.length, 9, 'one root page plus at most eight prioritized follow-up pages may be fetched');
+  assert.ok(
+    result.observations.some(
+      (item) => item.outcome === 'PARTIALLY_INSPECTED' && item.telemetry?.budgetExhausted === true,
+    ),
+    'expected the budget-exhausted seed to carry PARTIALLY_INSPECTED with budgetExhausted telemetry',
+  );
 });
 
 test('mixed website acquisition success and failure is projected as PARTIAL rather than full ERROR', async () => {

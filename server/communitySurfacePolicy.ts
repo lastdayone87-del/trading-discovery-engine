@@ -37,16 +37,35 @@ const COMMUNITY_PLATFORM_HOSTS = new Set([
   'www.patreon.com',
 ]);
 
-const COMMON_BROKER_OR_EXCHANGE_HOSTS = [
-  'binance.com',
-  'degiro.',
+const BROKER_EXACT_HOSTS = new Set([
   'refer.ig.com',
-  'fortuneo.fr',
-  'coinbase.com',
-  'kraken.com',
-  'bybit.com',
-  'etoro.com',
-];
+]);
+
+// Broker/exchange identity is matched per hostname label, never by substring:
+// `notbinance.com` (label `notbinance`) must NOT match `binance.com`.
+const BROKER_HOST_LABELS = new Set([
+  'binance',
+  'degiro',
+  'coinbase',
+  'kraken',
+  'bybit',
+  'etoro',
+  'fortuneo',
+]);
+
+export const MESSAGING_PREVIEW_HOSTS = new Set([
+  't.me',
+  'www.t.me',
+  'telegram.me',
+  'www.telegram.me',
+  'telegram.dog',
+  'www.telegram.dog',
+  'wa.me',
+  'www.wa.me',
+  'whatsapp.com',
+  'www.whatsapp.com',
+  'chat.whatsapp.com',
+]);
 
 const COMMUNITY_HINT = /(?:discord|community|join|members?|membership|group|private|vip|trading[-_ ]?(?:room|floor)|chat|links?)/i;
 const AFFILIATE_HINT = /(?:\/|[?&_-])(?:ref(?:erral)?|affiliate|partner|parrainage|cpa|campaign|promo|coupon)(?:\/|=|[?&_-]|$)/i;
@@ -85,7 +104,7 @@ export function scoreCommunitySurface(candidate: CommunitySurfaceCandidate): num
   // campaign destinations. This is deliberately a modest boost because domain
   // ownership is not known with certainty at this stage.
   const isKnownHubOrPlatform = LINK_HUB_HOSTS.has(host) || COMMUNITY_PLATFORM_HOSTS.has(host);
-  const isKnownBrokerOrExchange = COMMON_BROKER_OR_EXCHANGE_HOSTS.some(fragment => host.includes(fragment));
+  const isKnownBrokerOrExchange = isKnownBrokerOrExchangeHost(host);
   if (host && !isKnownHubOrPlatform && !isKnownBrokerOrExchange) score += 20;
 
   if (AFFILIATE_HINT.test(url)) score -= 75;
@@ -158,4 +177,66 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
  */
 export function isDiscordCommunityAcquisitionSurface(surface: string): boolean {
   return new Set(['CHANNEL_EXTERNAL_LINKS', 'CREATOR_WEBSITES', 'SOCIAL_PROFILES']).has(surface);
+}
+
+/**
+ * Recall-safe acquisition tiers (PR #434 §7A). These never discard a candidate
+ * and never decide eligibility: every discovered URL remains eligible for the
+ * normal acquisition path. They only inform attempt ordering (static-first),
+ * cheap-evidence triage, and operability labels. Ranking
+ * (`rankCommunitySurfaces`) still only reorders.
+ */
+export function isMessagingPreviewUrl(raw: string): boolean {
+  return MESSAGING_PREVIEW_HOSTS.has(hostOf(raw));
+}
+
+export function isDotlessHostnameUrl(raw: string): boolean {
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host.length > 0 && !host.includes('.');
+  } catch {
+    return false;
+  }
+}
+
+export function isKnownBrokerOrExchangeHost(host: string): boolean {
+  const lower = host.toLowerCase();
+  if (BROKER_EXACT_HOSTS.has(lower)) return true;
+  // Exact hostname or safe subdomain matching on the registrable domain only:
+  // `binance.com` and `www.binance.com` match, while `notbinance.com`
+  // (distinct label) and `binance.com.evil.com` (different registrable domain)
+  // do not. A miss here only fails open toward primary handling, which is the
+  // recall-safe direction since this signal is triage-only.
+  const labels = lower.split('.');
+  return labels.length >= 2 && BROKER_HOST_LABELS.has(labels[labels.length - 2]);
+}
+
+/**
+ * Auxiliary triage signal (PR #434; triage-only, never a crawl gate).
+ * Messaging-preview, dotless, and broker/affiliate-pattern candidates are
+ * attempted statically first and demoted in ranking, but classification here
+ * never decides eligibility: every candidate remains fully eligible for deeper
+ * acquisition under the existing policy. In particular, a legitimate creator
+ * URL containing `/referral/` must never become ineligible merely because of
+ * the affiliate pattern (in-repo golden `https://broker.test/referral/creator`
+ * carries a FOUND candidate, so exclusion would violate Z = 0).
+ */
+export function isAuxiliaryTriageCandidate(candidate: { url: string }): boolean {
+  const host = hostOf(candidate.url);
+  if (!host) return true;
+  if (MESSAGING_PREVIEW_HOSTS.has(host)) return true;
+  if (!host.includes('.')) return true;
+  if (isKnownBrokerOrExchangeHost(host)) return true;
+  if (AFFILIATE_HINT.test(candidate.url)) return true;
+  return false;
+}
+
+/**
+ * Bridge evidence that justifies escalating a messaging preview to the bounded
+ * rendered fallback even though messaging never receives default rendered
+ * crawling. Deliberately broad (`discord` mention without an extractable
+ * invite suggests JS-hidden content); absence means static-only completion.
+ */
+export function hasMessagingBridgeEvidence(html: string): boolean {
+  return /discord/i.test(String(html || ''));
 }

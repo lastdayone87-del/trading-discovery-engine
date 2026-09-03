@@ -83,14 +83,43 @@ export function isBrowserRuntimeFailureClass(value: unknown): boolean {
   return BROWSER_RUNTIME_FAILURES.has(String(value || '').toUpperCase());
 }
 
-export function retryReasonForFailureClass(failureClass: unknown): CommunityRetryReason {
-  return isBrowserRuntimeFailureClass(failureClass)
-    ? COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
-    : COMMUNITY_RETRY_REASON.UPSTREAM_REQUIRED_ACQUISITION_FAILURE;
+const UPSTREAM_ACQUISITION_SURFACES = new Set([
+  'YOUTUBE_ABOUT',
+  'RECENT_VIDEO_DESCRIPTIONS',
+]);
+
+/**
+ * Surface-aware retry attribution (PR #434 item 7). Browser/runtime crashes
+ * are operationally distinct; YouTube About / recent-video-description
+ * acquisition failures are upstream YouTube failures; everything else —
+ * creator websites, social profiles, channel external links, Discord
+ * validation — is a community-owned acquisition failure. The `surface`
+ * parameter is optional for backward compatibility: an unknown surface
+ * classifies non-browser failures as COMMUNITY (the retryable acquisition
+ * surface set is community-owned by default; upstream must be proven by
+ * surface, never assumed by default).
+ */
+export function surfaceAwareRetryReason(surface: unknown, failureClass: unknown): CommunityRetryReason {
+  if (isBrowserRuntimeFailureClass(failureClass)) {
+    return COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE;
+  }
+  if (UPSTREAM_ACQUISITION_SURFACES.has(String(surface || ''))) {
+    return COMMUNITY_RETRY_REASON.UPSTREAM_REQUIRED_ACQUISITION_FAILURE;
+  }
+  return COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE;
 }
 
-export function retryReasonFromError(error: any): CommunityRetryReason {
-  return retryReasonForFailureClass(error?.code ?? error?.errorClass ?? error?.cause?.code ?? error?.cause?.errorClass);
+export function retryReasonForFailureClass(failureClass: unknown, surface?: unknown): CommunityRetryReason {
+  if (surface === undefined) {
+    return isBrowserRuntimeFailureClass(failureClass)
+      ? COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
+      : COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE;
+  }
+  return surfaceAwareRetryReason(surface, failureClass);
+}
+
+export function retryReasonFromError(error: any, surface?: unknown): CommunityRetryReason {
+  return retryReasonForFailureClass(error?.code ?? error?.errorClass ?? error?.cause?.code ?? error?.cause?.errorClass, surface);
 }
 
 export function buildCommunityRetryJobMetadata(args: {
