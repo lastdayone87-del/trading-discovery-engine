@@ -114,6 +114,105 @@ test('exhausted static child budget is recorded as partial, never as clean', asy
   assert.equal(final?.telemetry?.budgetExhausted, true);
 });
 
+// Finding 1 (Devin review): navigation truncation must dedupe before bounding.
+
+test('duplicate navigation URLs never consume the queue bound while uniques are dropped', async () => {
+  const calls: string[] = [];
+  const anchors = [
+    ...Array.from({ length: 6 }, () => '<a href="/a">community a</a>'),
+    ...Array.from({ length: 6 }, () => '<a href="/b">community b</a>'),
+    ...Array.from({ length: 3 }, () => '<a href="/c">community c</a>'),
+  ].join('');
+  const result = await crawlExternalLinks(['https://dedup.test/'], [], undefined, async (input) => {
+    calls.push(String(input));
+    return String(input) === 'https://dedup.test/' ? html(anchors) : html('Subpage without invite');
+  });
+  for (const suffix of ['/a', '/b', '/c']) {
+    assert.ok(
+      calls.some((url) => url === `https://dedup.test${suffix}`),
+      `expected unique eligible target ${suffix} to be fetched despite duplicates`,
+    );
+  }
+  // All uniques fit after dedupe, so nothing is truncated and nothing is
+  // falsely reported as budget-exhausted.
+  assert.equal(result.outcome, 'INSPECTED_NO_MATCH');
+});
+
+// Finding 2 (Devin review): depth-bound omission must mark partial, never clean.
+
+test('eligible links left unfetched by the depth bound mark the seed partial, never clean', async () => {
+  const calls: string[] = [];
+  const result = await crawlExternalLinks(['https://deep.test/'], [], undefined, async (input) => {
+    const url = String(input);
+    calls.push(url);
+    if (url === 'https://deep.test/') return html('<a href="/level1">community hub</a>');
+    if (url === 'https://deep.test/level1') return html('<a href="/level2">community deeper</a>');
+    if (url === 'https://deep.test/level2') return html('<a href="/level3">community deepest</a>');
+    throw new Error(`must not fetch beyond the depth bound: ${url}`);
+  });
+  assert.ok(!calls.some((url) => url.includes('/level3')), 'depth bound must hold');
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
+  assert.ok(
+    result.observations.some((item) => item.outcome === 'PARTIALLY_INSPECTED' && item.telemetry?.budgetExhausted === true),
+    'expected the depth-truncated seed to carry PARTIALLY_INSPECTED with budgetExhausted telemetry',
+  );
+});
+
+// Finding 3 (Devin review): failed messaging previews feed incomplete acquisition.
+
+test('a failed messaging preview contributes to incomplete acquisition with community retry', async () => {
+  const result = await runChannelInspection({
+    channelId: 'UCmsgfail0000000000000001',
+    channelName: 'Failing Messaging Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://t.me/downchannel'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input) =>
+      String(input).includes('t.me') ? response(503, '', 'text/html') : noInviteHtml()) as typeof fetch,
+    renderedFallback: emptyRendered,
+  });
+  // required:false must never launder a failed messaging acquisition into a
+  // clean inspection.
+  assert.equal(result.acquisitionStatus, 'ACQUISITION_FAILED');
+  assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  assert.ok(
+    (result.acquisitionOutcomes || []).some(
+      (item) =>
+        item.requestedUrl === 'https://t.me/downchannel' &&
+        item.outcome === 'ACQUISITION_FAILED' &&
+        item.required === true,
+    ),
+  );
+});
+
+test('messaging failure plus clean sites yields partial coverage, not a clean inspection', async () => {
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'UCmsgmixed000000000000001',
+    channelName: 'Mixed Messaging Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://t.me/downchannel', 'https://clean.example.com'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async (input) => {
+      const url = String(input);
+      if (url.includes('t.me')) return response(503, '', 'text/html');
+      return noInviteHtml();
+    }) as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return emptyRendered(seedUrl);
+    },
+  });
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+  assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
+  // The messaging failure never blocks the subsequent clean candidate, which
+  // remains eligible for the normal rendered path.
+  assert.equal(renderedCalls, 1);
+});
+
 // B. Ranking reorders without discarding (PR #434 items 1, 6).
 
 test('ranking preserves messaging, dotless, broker, and affiliate candidates', () => {
