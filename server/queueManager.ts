@@ -991,17 +991,23 @@ export function communityAcquisitionRetryKey(channelId:string):string{return `co
 /**
  * Operator-triggered bounded relationship-canary run. Validates the cohort
  * payload (bounds enforced) and enqueues exactly one durable job, idempotent
- * per cohort per UTC day. The worker re-checks enabled/kill-switch at
- * execution time, so disabling the canary stops even queued runs.
+ * per cohort per UTC day. preventReopen:true (existing queue control) means a
+ * repeat request never resets a COMPLETED/FAILED run back to PENDING: daily
+ * idempotency without reopen loops. The worker re-checks enabled/kill-switch
+ * at execution time, so disabling the canary stops even queued runs.
  */
-export async function enqueueRelationshipCanaryRun(input: unknown): Promise<{ jobId: string; cohortId: string }> {
+export async function enqueueRelationshipCanaryRun(
+  input: unknown,
+  deps?: { enqueueJob?: typeof enqueueJob },
+): Promise<{ jobId: string; cohortId: string }> {
   const { validateRelationshipCanaryPayload, RELATIONSHIP_CANARY_JOB_TYPE } = await import('./relationshipCanary');
   const payload = validateRelationshipCanaryPayload(input);
   const day = new Date().toISOString().slice(0, 10);
-  const job = await enqueueJob(
+  const enqueue = deps?.enqueueJob || enqueueJob;
+  const job = await enqueue(
     RELATIONSHIP_CANARY_JOB_TYPE,
     { ...payload },
-    { idempotencyKey: `relationship-canary:${payload.cohortId}:${day}`, priority: 5, maxAttempts: 2 },
+    { idempotencyKey: `relationship-canary:${payload.cohortId}:${day}`, priority: 5, maxAttempts: 2, preventReopen: true },
   );
   return { jobId: job.id, cohortId: payload.cohortId };
 }

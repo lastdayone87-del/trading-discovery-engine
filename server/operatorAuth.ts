@@ -25,6 +25,7 @@ const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; acti
   { method:'GET', pattern:/^\/api\/evidence-graph$/, policy:'operator', action:'evidence.read' },
   { method:'POST', pattern:/^\/api\/acquisition-adapters\/playlist\/proposals$/, policy:'operator', action:'acquisition.propose' },
   { method:'POST', pattern:/^\/api\/acquisition-adapters\/playlist\/(control|actions\/[^/]+\/enqueue)$/, policy:'admin', action:'acquisition.control' },
+  { method:'POST', pattern:/^\/api\/relationship-canary\/run$/, policy:'admin', action:'relationship-canary.run' },
   { method:'GET', pattern:/^\/api\/corpus(?:\/documents\/[^/]+)?$/, policy:'operator', action:'corpus.read' },
   { method:'GET', pattern:/^\/api\/candidate-assertions$/, policy:'operator', action:'candidate.assertions.read' },
   { method:'GET', pattern:/^\/api\/(discovery-nominations(?:\/[^/]+)?|channels\/[^/]+\/nominations|discovery-attribution\/(queries|paths)|candidate-admission\/baseline|admission\/(decisions|channels\/[^/]+|metrics)|evidence-(documents|assertions|coverage)|creator-focus\/shadow|investigations\/gap-plans|dashboard\/corpora|review-eligibility\/v2|release5\/rollout)$/, policy:'operator', action:'decision-plane.read' },

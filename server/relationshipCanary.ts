@@ -94,6 +94,30 @@ export function isRelationshipCanaryLive(settings: { enabled: boolean; killSwitc
   return settings.enabled === true && settings.killSwitch !== true;
 }
 
+/** Pure seed normalization: identical seeds expand exactly once. */
+export function dedupeRelationshipSeeds(seeds: RelationshipCanarySeed[]): RelationshipCanarySeed[] {
+  const seen = new Set<string>();
+  return seeds.filter(seed => {
+    const key = `${seed.kind}:${seed.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/**
+ * Pure canary quota allowance in provider units. The shared reservation layer
+ * treats allocation percentages as scheduling preferences, not hard
+ * partitions, so the canary enforces its own configured share on top:
+ * allowance = floor(dailyBudget * percent / 100), clamped to [0, 100%].
+ * A 0% configuration therefore allows zero spend.
+ */
+export function relationshipCanaryQuotaAllowance(dailyBudget: number, percent: number): number {
+  const budget = Number.isFinite(dailyBudget) && dailyBudget > 0 ? Math.floor(dailyBudget) : 0;
+  const share = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : 0;
+  return Math.floor((budget * share) / 100);
+}
+
 export async function readRelationshipCanarySettings(): Promise<RelationshipCanarySettings> {
   const [enabled, killSwitch, quotaPercent] = await Promise.all([
     getAppSetting('relationship_canary_enabled', 'false'),
@@ -146,12 +170,16 @@ export function planRelationshipExpansion(input: {
   const maxDepth2Parents = Math.max(0, Math.min(RELATIONSHIP_CANARY_MAX_DEPTH2_PARENTS, input.maxDepth2Parents ?? RELATIONSHIP_CANARY_MAX_DEPTH2_PARENTS));
   const plan: RelationshipExpansionTarget[] = [];
   const seen = new Set<string>();
-  const seedIds = new Set(input.seeds.map(seed => `${seed.kind}:${seed.id}`));
+  // Authoritative identity is the raw channel ID: a channel seed and a
+  // featured edge to the same channel must not expand twice under different
+  // key representations. Playlist seeds address playlists, never channels.
+  const seedChannelIds = new Set(
+    input.seeds.filter(seed => seed.kind === 'channel').map(seed => seed.id),
+  );
   for (const channelId of input.depth1ChannelIds) {
     if (plan.length >= maxDepth2Parents) break;
-    const key = `featured:${channelId}`;
-    if (seen.has(key) || seedIds.has(key)) continue;
-    seen.add(key);
+    if (seen.has(channelId) || seedChannelIds.has(channelId)) continue;
+    seen.add(channelId);
     if (input.maxDepth < 2) break;
     plan.push({
       kind: 'featured',
@@ -188,6 +216,10 @@ export interface RelationshipCanaryDeps {
   ingest?: (raw: DiscoveredChannelRaw, country: string, source: 'automated_query') => Promise<unknown>;
   reserveQuota?: (operationId: string, units: number) => Promise<boolean>;
   finishQuota?: (operationId: string, consumed: boolean) => Promise<void>;
+  /** Test/operator override for already-reserved canary units across runs (production sums quota_reservations). */
+  readReservedUnits?: () => Promise<number>;
+  /** Test override for the shared daily budget (production reads provider config). */
+  dailyBudget?: number;
   /** Test/operator override for the enabled/kill-switch settings (production reads app settings). */
   settings?: RelationshipCanarySettings;
   log?: (message: string) => void;
@@ -204,6 +236,19 @@ async function defaultReserveQuota(operationId: string, units: number): Promise<
     dailyBudget,
     allocationPercent: settings.quotaPercent,
   });
+}
+
+/**
+ * Already-reserved canary units across runs/cohorts (20-minute reservation
+ * window). Lets concurrent canary runs share one configured allocation
+ * instead of each spending a full share.
+ */
+async function defaultReadReservedUnits(): Promise<number> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT COALESCE(SUM(units),0)::int AS reserved FROM quota_reservations WHERE operation_type='RELATIONSHIP_CANARY' AND status='RESERVED'`,
+  );
+  return Number(res.rows[0]?.reserved || 0);
 }
 
 /**
@@ -247,7 +292,34 @@ export async function processRelationshipCanaryJob(
   const nominate = deps.nominate || (async (input) => recordNomination({ ...input, queryGenerationMode: 'RELATIONSHIP_CANARY' } as never));
   const reserve = deps.reserveQuota || defaultReserveQuota;
   const finish = deps.finishQuota || (async (operationId: string, consumed: boolean) => { await finishQuotaReservation('RELATIONSHIP_CANARY', operationId, consumed); });
+  const readReserved = deps.readReservedUnits || defaultReadReservedUnits;
+  // Channel-ID-normalized visited set: seeds pre-registered so a seed reached
+  // again as a depth-1 discovery is not re-admitted under a different key
+  // representation. Provenance per nomination is unaffected.
   const visited = new Set<string>();
+  // Expansion identity is tracked separately from admission: a channel that
+  // was already expanded (seed fetch or depth-2 fetch) is never fetched
+  // again, while admission dedupe stays purely channel-ID based.
+  const expandedTargets = new Set<string>();
+  const seeds = dedupeRelationshipSeeds(payload.seeds);
+  for (const seed of seeds) {
+    if (seed.kind === 'channel') {
+      visited.add(seed.id);
+      expandedTargets.add(seed.id);
+    }
+  }
+  // Real canary allocation: configured percent of the shared daily budget,
+  // minus units already reserved by other canary runs. tryReserveQuota still
+  // guards the global budget on every fetch; this bounds the canary's share.
+  const dailyBudget = deps.dailyBudget ?? getDailyYouTubeQuotaBudget();
+  const allowance = relationshipCanaryQuotaAllowance(dailyBudget, settings.quotaPercent);
+  let reservedBaseline = 0;
+  try {
+    reservedBaseline = Math.max(0, Math.trunc(await readReserved()) || 0);
+  } catch {
+    reservedBaseline = 0;
+  }
+  const withinAllowance = (cost: number): boolean => summary.quotaUnits + reservedBaseline + cost <= allowance;
   const depth1: Array<{ channelId: string; seedId: string }> = [];
   const seedOf: Record<string, string> = {};
   let channelsAccepted = 0;
@@ -298,6 +370,11 @@ export async function processRelationshipCanaryJob(
 
   const expandFeatured = async (sourceChannelId: string, provenance: Omit<RelationshipProvenance, 'kind'> & { kind: 'featured' }): Promise<string[]> => {
     const operationId = `relationship-canary:${payload.cohortId}:${provenance.depth}:${sourceChannelId}`;
+    if (!withinAllowance(FEATURED_CHANNEL_PROVIDER_COST)) {
+      summary.status = 'QUOTA_EXHAUSTED';
+      quotaExhausted = true;
+      return [];
+    }
     if (!await reserve(operationId, FEATURED_CHANNEL_PROVIDER_COST)) {
       summary.status = 'QUOTA_EXHAUSTED';
       quotaExhausted = true;
@@ -314,8 +391,12 @@ export async function processRelationshipCanaryJob(
     }
   };
 
-  // Depth 1: seeds.
-  for (const seed of payload.seeds) {
+  // Depth 1: seeds. Channel/traversal limits bound actual provider work, not
+  // just admission: once channel capacity is exhausted, remaining seeds are
+  // not fetched at all.
+  const capacityRemains = (): boolean => channelsAccepted < payload.maxChannels;
+  for (const seed of seeds) {
+    if (!capacityRemains()) break;
     summary.seedsAttempted++;
     try {
       if (seed.kind === 'channel') {
@@ -347,6 +428,11 @@ export async function processRelationshipCanaryJob(
         }
       } else {
         const operationId = `relationship-canary:${payload.cohortId}:playlist:${seed.id}`;
+        if (!withinAllowance(PLAYLIST_PROVIDER_COST)) {
+          summary.status = 'QUOTA_EXHAUSTED';
+          quotaExhausted = true;
+          continue;
+        }
         if (!await reserve(operationId, PLAYLIST_PROVIDER_COST)) {
           summary.status = 'QUOTA_EXHAUSTED';
           quotaExhausted = true;
@@ -395,15 +481,21 @@ export async function processRelationshipCanaryJob(
   // Depth 2: featured expansion of capped depth-1 parents (never deeper).
   if (payload.maxDepth >= 2 && !quotaExhausted) {
     const plan = planRelationshipExpansion({
-      seeds: payload.seeds.map(seed => ({ kind: seed.kind, id: seed.id })),
+      seeds: seeds.map(seed => ({ kind: seed.kind, id: seed.id })),
       maxDepth: payload.maxDepth,
       maxFanout: payload.maxFanout,
       depth1ChannelIds: depth1.map(entry => entry.channelId),
       seedOf,
     });
     for (const target of plan) {
-      if (visited.has(`featured:${target.targetId}`)) continue;
-      visited.add(`featured:${target.targetId}`);
+      // Expansion identity is channel-ID based and independent of admission:
+      // seeds and already-expanded channels are never fetched twice, while
+      // every admitted candidate keeps its own full provenance.
+      if (expandedTargets.has(target.targetId)) continue;
+      expandedTargets.add(target.targetId);
+      // No admissible capacity left: stop traversal before spending fetches
+      // whose results could not be admitted.
+      if (!capacityRemains()) break;
       summary.depth2Fetches++;
       try {
         const ids = await expandFeatured(target.targetId, {
@@ -484,6 +576,8 @@ export interface RelationshipCohortMetrics {
    * proxy (manual sampling required before yield claims).
    */
   zeroKeywordConfirms: number;
+  /** Cohort channels with no explicit keyword baseline (never counted either way). */
+  unknownBaselineChannels: number;
   rejectedOrUncertain: number;
   /**
    * True duplication rate: the proportion of nominations that are duplicates
@@ -496,11 +590,11 @@ export interface RelationshipCohortMetrics {
 }
 
 /**
- *Aggregate one canary cohort. "Relationship-only confirms" (confirmed
- * creators with zero non-cohort nominations) is the experiment's primary
- * would-keyword-have-found-it proxy: the keyword path never nominated them.
- * Coincidental keyword text on the retrieval document is not separately
- * measured here; confirm it by manual sampling before claiming yield.
+ * Aggregate one canary cohort. Overlap with the keyword-first funnel is
+ * measured ONLY through the observational keyword baseline (recorded per
+ * nomination by the existing keyword predicate): other relationship cohorts
+ * or adapter paths are still relationship discovery, never keyword proof.
+ * A missing/null/malformed baseline is UNKNOWN — never a definitive result.
  */
 export function aggregateRelationshipCohort(
   cohortId: string,
@@ -516,23 +610,36 @@ export function aggregateRelationshipCohort(
     byKind[row.kind || 'unknown'] = (byKind[row.kind || 'unknown'] || 0) + 1;
     byDepth[String(row.depth ?? 'unknown')] = (byDepth[String(row.depth ?? 'unknown')] || 0) + 1;
   }
-  // Any nomination WITHOUT this cohort marker counts as keyword-path (or
-  // otherwise non-relationship) evidence for overlap measurement.
-  const keywordNominated = new Set(
+  // Nomination-source overlap (provenance dimension only): confirmed creators
+  // with zero nominations outside this cohort. This is NOT keyword proof —
+  // another relationship cohort is still relationship discovery.
+  const externallyNominated = new Set(
     nominations.filter(row => row.cohortId !== cohortId).map(row => row.channelId),
   );
   const cohortChannels = channels.filter(row => channelIds.has(row.channelId));
   const confirmed = cohortChannels.filter(row => row.tradingStatus === 'TRADING_CONFIRMED');
-  const relationshipOnlyConfirms = confirmed.filter(row => !keywordNominated.has(row.channelId)).length;
-  const keywordOverlapConfirms = confirmed.length - relationshipOnlyConfirms;
-  const baselineByChannel = new Map<string, 'WOULD_ADMIT' | 'WOULD_WITHHOLD'>();
+  const relationshipOnlyConfirms = confirmed.filter(row => !externallyNominated.has(row.channelId)).length;
+  // Keyword baseline per channel, from explicit observations only. Conservative
+  // toward the baseline: any WOULD_ADMIT means the old funnel might have found
+  // it. Missing/null/malformed baselines are UNKNOWN, never WOULD_WITHHOLD.
+  const baselineByChannel = new Map<string, 'WOULD_ADMIT' | 'WOULD_WITHHOLD' | 'UNKNOWN'>();
   for (const row of cohort) {
-    // Conservative toward the baseline: any WOULD_ADMIT observation means the
-    // old funnel might have found this channel.
+    const current = baselineByChannel.get(row.channelId);
+    if (current === 'WOULD_ADMIT') continue;
     if (row.keywordBaseline === 'WOULD_ADMIT') baselineByChannel.set(row.channelId, 'WOULD_ADMIT');
-    else if (!baselineByChannel.has(row.channelId)) baselineByChannel.set(row.channelId, 'WOULD_WITHHOLD');
+    else if (row.keywordBaseline === 'WOULD_WITHHOLD') baselineByChannel.set(row.channelId, current || 'WOULD_WITHHOLD');
+    else if (!baselineByChannel.has(row.channelId)) baselineByChannel.set(row.channelId, 'UNKNOWN');
   }
-  const zeroKeywordConfirms = confirmed.filter(row => baselineByChannel.get(row.channelId) !== 'WOULD_ADMIT').length;
+  // Keyword overlap is authoritative ONLY from explicit WOULD_ADMIT baselines.
+  const keywordOverlapConfirms = confirmed.filter(
+    row => baselineByChannel.get(row.channelId) === 'WOULD_ADMIT',
+  ).length;
+  // Zero-keyword confirms require an explicit WOULD_WITHHOLD baseline AND
+  // downstream confirmation. Unknown baselines are counted separately below.
+  const zeroKeywordConfirms = confirmed.filter(
+    row => baselineByChannel.get(row.channelId) === 'WOULD_WITHHOLD',
+  ).length;
+  const unknownBaselineChannels = [...channelIds].filter(id => (baselineByChannel.get(id) || 'UNKNOWN') === 'UNKNOWN').length;
   const rejectedOrUncertain = cohortChannels.filter(
     row => row.tradingStatus === 'NON_TRADING' || row.tradingStatus === 'UNCERTAIN' || row.tradingStatus === 'NEEDS_REVIEW',
   ).length;
@@ -546,6 +653,7 @@ export function aggregateRelationshipCohort(
     relationshipOnlyConfirms,
     keywordOverlapConfirms,
     zeroKeywordConfirms,
+    unknownBaselineChannels,
     rejectedOrUncertain,
     duplicationRate: cohort.length ? (cohort.length - channelIds.size) / cohort.length : 0,
     quotaUnits,

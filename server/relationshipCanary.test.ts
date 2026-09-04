@@ -184,6 +184,7 @@ test('worker ingests duplicate channels once across seeds', async () => {
     async () => {},
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
+      dailyBudget: 10000,
       fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: dup }] }),
       nominate: async () => ({ id: 'n1' }),
       ingest: async (raw) => { ingested.push(raw.channelId); },
@@ -205,6 +206,7 @@ test('seed failure is isolated; siblings proceed and job completes with record',
     async () => {},
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
+      dailyBudget: 10000,
       fetchFeaturedChannels: async (sourceChannelId: string) => {
         if (sourceChannelId === UC('badseed')) throw new Error('provider boom');
         return { observations: [{ featuredChannelId: good }] };
@@ -229,6 +231,7 @@ test('quota exhaustion halts expansion gracefully', async () => {
     async () => {},
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
+      dailyBudget: 10000,
       fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
       reserveQuota: async () => false,
       finishQuota: async () => {},
@@ -266,6 +269,7 @@ test('cohort metrics aggregate relationship vs keyword evidence', () => {
   assert.equal(metrics.relationshipOnlyConfirms, 1);
   assert.equal(metrics.keywordOverlapConfirms, 1);
   assert.equal(metrics.zeroKeywordConfirms, 1);
+  assert.equal(metrics.unknownBaselineChannels, 0);
   assert.equal(metrics.rejectedOrUncertain, 1);
   assert.equal(metrics.duplicationRate, 0.25);
   assert.equal(metrics.quotaUnits, 12);
@@ -329,6 +333,7 @@ test('worker persists keyword baseline per nomination without branching on it', 
     async () => {},
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
+      dailyBudget: 10000,
       fetchPlaylistChannels: async () => [{ channelId: UC('plchan'), channelName: 'Quiet Kitchen', description: 'soup', videoTitles: ['soup sunday'] }],
       nominate: async (input) => { seen.push(input.rawObservation); return { id: 'n1' }; },
       ingest: async () => {},
@@ -341,4 +346,246 @@ test('worker persists keyword baseline per nomination without branching on it', 
   assert.equal(seen[0].keywordBaseline, 'WOULD_WITHHOLD');
   assert.equal(seen[0].cohortId, 'c');
   assert.equal(seen[0].relationshipDepth, 1);
+});
+
+// F4: another relationship cohort is still relationship discovery — never
+// keyword overlap. Only explicit WOULD_ADMIT baselines count as overlap.
+test('other-cohort nominations do not contaminate keyword overlap', () => {
+  const metrics = aggregateRelationshipCohort(
+    'c1',
+    [
+      { channelId: UC('solo'), sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind: 'featured', depth: 1, keywordBaseline: 'WOULD_WITHHOLD' },
+      { channelId: UC('solo'), sourceType: 'FEATURED_CHANNEL', cohortId: 'c2', kind: 'featured', depth: 1, keywordBaseline: 'WOULD_WITHHOLD' },
+      { channelId: UC('admt'), sourceType: 'PLAYLIST', cohortId: 'c1', kind: 'playlist', depth: 1, keywordBaseline: 'WOULD_ADMIT' },
+    ],
+    [
+      { channelId: UC('solo'), tradingStatus: 'TRADING_CONFIRMED' },
+      { channelId: UC('admt'), tradingStatus: 'TRADING_CONFIRMED' },
+    ],
+    0,
+  );
+  assert.equal(metrics.confirmed, 2);
+  assert.equal(metrics.relationshipOnlyConfirms, 1);
+  assert.equal(metrics.keywordOverlapConfirms, 1);
+  assert.equal(metrics.zeroKeywordConfirms, 1);
+  assert.equal(metrics.unknownBaselineChannels, 0);
+});
+
+// F5: missing/null/malformed baselines are UNKNOWN — never definitive.
+test('unknown baselines are exposed separately and never confirm either way', () => {
+  const metrics = aggregateRelationshipCohort(
+    'c1',
+    [
+      { channelId: UC('m1'), sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind: 'featured', depth: 1 },
+      { channelId: UC('m2'), sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind: 'featured', depth: 1, keywordBaseline: null },
+      { channelId: UC('m3'), sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind: 'featured', depth: 1, keywordBaseline: 'MAYBE' as never },
+      { channelId: UC('m4'), sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind: 'featured', depth: 1, keywordBaseline: 'WOULD_WITHHOLD' },
+    ],
+    [
+      { channelId: UC('m1'), tradingStatus: 'TRADING_CONFIRMED' },
+      { channelId: UC('m2'), tradingStatus: 'TRADING_CONFIRMED' },
+      { channelId: UC('m3'), tradingStatus: 'TRADING_CONFIRMED' },
+      { channelId: UC('m4'), tradingStatus: 'TRADING_CONFIRMED' },
+    ],
+    0,
+  );
+  assert.equal(metrics.confirmed, 4);
+  assert.equal(metrics.zeroKeywordConfirms, 1);
+  assert.equal(metrics.keywordOverlapConfirms, 0);
+  assert.equal(metrics.unknownBaselineChannels, 3);
+});
+
+// F3: channel cap bounds traversal work, not just admission.
+test('maxChannels stops provider traversal at the boundary', async () => {
+  let fetches = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 1 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 10000,
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [{ featuredChannelId: UC('c1') }, { featuredChannelId: UC('c2') }] }; },
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => {},
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      readReservedUnits: async () => 0,
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 1);
+  assert.equal(summary.nominations, 1);
+  assert.equal(summary.depth2Fetches, 0);
+});
+
+// F6: identical seeds expand once; seeds reached as discoveries are not re-expanded.
+test('duplicate seeds and seed-as-discovery expand exactly once', async () => {
+  let fetches = 0;
+  const seen: string[] = [];
+  const seed = UC('seedx');
+  await processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }, { kind: 'channel', id: seed }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 10000,
+      fetchFeaturedChannels: async (sourceChannelId: string) => {
+        fetches++;
+        seen.push(sourceChannelId);
+        // Echo the seed itself plus one new channel: both must be deduped.
+        return { observations: [{ featuredChannelId: seed }, { featuredChannelId: UC('newchan') }] };
+      },
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => {},
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      readReservedUnits: async () => 0,
+      log: () => {},
+    },
+  );
+  assert.deepEqual(seen, [seed, UC('newchan')]);
+  assert.equal(fetches, 2);
+});
+
+test('seed identity normalizes across relationship-key representations', () => {
+  const seed = UC('seedx');
+  const plan = planRelationshipExpansion({
+    seeds: [{ kind: 'channel', id: seed }],
+    maxDepth: 2,
+    maxFanout: 10,
+    depth1ChannelIds: [seed, UC('other')],
+    seedOf: { [seed]: seed, [UC('other')]: seed },
+  });
+  assert.deepEqual(plan.map(item => item.targetId), [UC('other')]);
+});
+
+// F7: quota allowance math.
+test('quota allowance is a real bounded share of the daily budget', async () => {
+  const { relationshipCanaryQuotaAllowance } = await import('./relationshipCanary');
+  assert.equal(relationshipCanaryQuotaAllowance(1000, 0), 0);
+  assert.equal(relationshipCanaryQuotaAllowance(1000, 1), 10);
+  assert.equal(relationshipCanaryQuotaAllowance(2000, 10), 200);
+  assert.equal(relationshipCanaryQuotaAllowance(2000, 100), 2000);
+  assert.equal(relationshipCanaryQuotaAllowance(0, 10), 0);
+});
+
+// F7: zero-percent canary performs zero provider spend.
+test('zero quota allowance halts before any fetch', async () => {
+  let fetches = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 0 },
+      dailyBudget: 10000,
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      readReservedUnits: async () => 0,
+      log: () => {},
+    },
+  );
+  assert.equal(summary.status, 'QUOTA_EXHAUSTED');
+  assert.equal(fetches, 0);
+  assert.equal(summary.nominations, 0);
+});
+
+// F7: concurrent cohorts share one allocation via reserved baseline.
+test('reserved baseline from other cohorts counts against the allocation', async () => {
+  let fetches = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
+      dailyBudget: 10000,
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      readReservedUnits: async () => 999999,
+      log: () => {},
+    },
+  );
+  assert.equal(summary.status, 'QUOTA_EXHAUSTED');
+  assert.equal(fetches, 0);
+});
+
+// F1: endpoint authorization policy (inventory + middleware behavior).
+test('relationship-canary run endpoint is registered admin-only', async () => {
+  const { routePolicyInventory, operatorAuthorization } = await import('./operatorAuth');
+  const entry = routePolicyInventory.find(
+    item => item.method === 'POST' && new RegExp(item.pattern).test('/api/relationship-canary/run'),
+  );
+  assert.ok(entry, 'route policy entry must exist or middleware rejects with ROUTE_POLICY_MISSING');
+  assert.equal(entry?.policy, 'admin');
+
+  const run = (
+    role: 'admin' | 'operator' | undefined,
+    path = '/api/relationship-canary/run',
+    method = 'POST',
+  ): Promise<{ next: boolean; status?: number; code?: string }> => new Promise(resolve => {
+    const handler = operatorAuthorization(async () => {}, {
+      NODE_ENV: 'test',
+      ADMIN_API_TOKEN: 'admin-token',
+      OPERATOR_API_TOKEN: 'operator-token',
+    } as NodeJS.ProcessEnv);
+    const token = role === 'admin' ? 'admin-token' : role === 'operator' ? 'operator-token' : undefined;
+    const req = {
+      method, path, baseUrl: '', query: {},
+      header: (name: string) => (name.toLowerCase() === 'authorization' && token ? `Bearer ${token}` : undefined),
+    };
+    let status = 0;
+    let code = '';
+    const res = {
+      status: (code_: number) => { status = code_; return res; },
+      json: (body: Record<string, unknown>) => { code = String(body.code || ''); resolve({ next: false, status, code }); },
+      setHeader: () => {},
+      once: () => {},
+    };
+    handler(req as never, res as never, () => resolve({ next: true }));
+  });
+
+  assert.deepEqual(await run('admin'), { next: true });
+  const denied = await run('operator');
+  assert.equal(denied.next, false);
+  assert.equal(denied.status, 403);
+  const anonymous = await run(undefined);
+  assert.equal(anonymous.next, false);
+  assert.equal(anonymous.status, 401);
+  const missing = await run('admin', '/api/definitely-not-a-route');
+  assert.equal(missing.next, false);
+  assert.equal(missing.status, 404);
+  assert.equal(missing.code, 'ROUTE_POLICY_MISSING');
+  // Unrelated routes keep existing behavior (operator read still passes).
+  assert.deepEqual(await run('operator', '/api/browser-capability', 'GET'), { next: true });
+});
+
+// F2: daily idempotency never reopens terminal runs (narrow preventReopen use).
+test('canary enqueue is idempotent per cohort/day and never reopens runs', async () => {
+  const { enqueueRelationshipCanaryRun } = await import('./queueManager');
+  const calls: Array<{ type: string; payload: unknown; opts: Record<string, unknown> }> = [];
+  const enqueueJob = (async (type: string, payload: unknown, opts: Record<string, unknown>) => {
+    calls.push({ type, payload, opts });
+    return { id: `job-${calls.length}` };
+  }) as never;
+  const input = { cohortId: 'c9', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 50 };
+  const first = await enqueueRelationshipCanaryRun(input, { enqueueJob });
+  assert.equal(first.cohortId, 'c9');
+  assert.equal(calls.length, 1);
+  // Narrowly scoped reopen guard: completed/failed rows are returned as-is,
+  // never reset to PENDING (existing enqueueJob preventReopen semantics).
+  assert.equal(calls[0].opts.preventReopen, true);
+  assert.equal(calls[0].type, 'RELATIONSHIP_CANARY_EXPANSION');
+  // Idempotency key is cohort+day scoped: same cohort/day shares it, anything
+  // else is independent.
+  const keyOf = (opts: Record<string, unknown>) => String(opts.idempotencyKey || '');
+  const second = await enqueueRelationshipCanaryRun(input, { enqueueJob });
+  assert.equal(keyOf(calls[1].opts), keyOf(calls[0].opts));
+  assert.equal(second.cohortId, 'c9');
+  const other = await enqueueRelationshipCanaryRun({ ...input, cohortId: 'c10' }, { enqueueJob });
+  assert.notEqual(keyOf(calls[2].opts), keyOf(calls[0].opts));
+  assert.equal(other.cohortId, 'c10');
+  // Invalid payloads never reach the queue.
+  await assert.rejects(enqueueRelationshipCanaryRun({ cohortId: '', targetCountry: 'US', seeds: [] }, { enqueueJob }), /COHORT|SEEDS/);
+  assert.equal(calls.length, 3);
 });
