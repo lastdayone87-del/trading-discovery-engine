@@ -136,7 +136,9 @@ test('crawler exposes bounded failure telemetry and keeps partial results retrya
   assert.match(source, /isBrowserRuntimeFailure/);
   assert.match(source, /clicksFailed/);
   assert.match(source, /clickFailureClasses/);
-  assert.match(source, /complete:!incomplete/);
+  assert.match(source, /complete:completion\.complete/);
+  assert.match(source, /resolveRenderedCompletionState/);
+  assert.match(source, /NO_PAGE_PROCESSED/);
 });
 
 test('browser acquisition failure remains retryable rather than proving NOT_FOUND', async () => {
