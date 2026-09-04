@@ -3,8 +3,17 @@ import test from 'node:test';
 import {
   resolveRenderedCompletionState,
   wasRenderedResultProcessed,
+  isPureTargetBlockOutcome,
   type BrowserFallbackTelemetry,
 } from './browserCommunityFallback';
+import { classifyRenderedCrawlerFailure } from './renderedCrawlerPolicy';
+import { readFileSync } from 'node:fs';
+
+test('rendered success path applies the pure-target-block retry rule', () => {
+  const source = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.match(source, /isPureTargetBlockOutcome\(\{timedOut,telemetry\}\)/);
+  assert.match(source, /retryable:completion\.retryable && !pureTargetBlock/);
+});
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import { normalizeExternalUrl, runChannelInspection } from './inspector';
 
@@ -309,6 +318,128 @@ test('static budget exhaustion with later successful rendered completion reports
   assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
   assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
   assert.equal(result.retryDirective, undefined);
+});
+
+// Failure classification: Playwright network signals map to TRANSIENT, while
+// ambiguous signals stay OTHER/retryable (fail-open protects recall).
+test('playwright network errors classify as transient, ambiguous signals stay other', () => {
+  assert.equal(classifyRenderedCrawlerFailure(new Error('page.goto: net::ERR_EMPTY_RESPONSE at https://x.test')), 'TRANSIENT');
+  assert.equal(classifyRenderedCrawlerFailure(new Error('page.goto: net::ERR_HTTP2_PROTOCOL_ERROR at https://x.test')), 'TRANSIENT');
+  assert.equal(classifyRenderedCrawlerFailure(new Error('page.goto: net::ERR_CONNECTION_REFUSED at https://x.test')), 'TRANSIENT');
+  assert.equal(classifyRenderedCrawlerFailure(new Error('page.goto: Timeout 15000ms exceeded.')), 'TRANSIENT');
+  assert.equal(classifyRenderedCrawlerFailure(new Error('Request blocked - received 403 status code.')), 'BLOCKED');
+  // Certificate and abort signals are ambiguous without raw-error retention:
+  // they stay OTHER (retryable) rather than assuming a permanent block.
+  assert.equal(classifyRenderedCrawlerFailure(new Error('page.goto: net::ERR_CERT_COMMON_NAME_INVALID at https://x.test')), 'OTHER');
+  assert.equal(classifyRenderedCrawlerFailure(new Error('page.goto: net::ERR_ABORTED at https://x.test')), 'OTHER');
+});
+
+test('pure target blocks are terminal while mixed or ambiguous failures stay retryable', () => {
+  const blocked = { ...zeroTelemetry(), requestsFailed: 3, blockedRequests: 3 };
+  assert.equal(isPureTargetBlockOutcome({ timedOut: false, telemetry: blocked }), true);
+  assert.equal(
+    isPureTargetBlockOutcome({ timedOut: false, telemetry: { ...blocked, transientRequests: 1 } }),
+    false,
+  );
+  assert.equal(
+    isPureTargetBlockOutcome({ timedOut: false, telemetry: { ...blocked, navigationTimeouts: 1 } }),
+    false,
+  );
+  assert.equal(isPureTargetBlockOutcome({ timedOut: true, telemetry: blocked }), false);
+  assert.equal(isPureTargetBlockOutcome({ timedOut: false, telemetry: zeroTelemetry() }), false);
+});
+
+test('pure target block records failure without scheduling another bounded render', async () => {
+  const blockedTelemetry = (): BrowserFallbackTelemetry => ({
+    ...zeroTelemetry(),
+    requestsStarted: 2,
+    requestsFinished: 0,
+    requestsFailed: 2,
+    blockedRequests: 2,
+  });
+  // The stub returns exactly what the fixed fallback produces for pure-block
+  // telemetry (complete:false, retryable:false); unit tests below pin the
+  // predicate itself inside browserCommunityFallback.
+  const result = await runChannelInspection({
+    channelId: 'UCblocked000000000000000001',
+    channelName: 'Blocked Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://blocked.example.com'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => response(403, '', 'text/html')) as typeof fetch,
+    renderedFallback: async (seedUrl) => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 0,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: false,
+      telemetry: blockedTelemetry(),
+      detail: 'all requests blocked by target',
+    }),
+  });
+  const renderedObs = (result.acquisitionOutcomes || []).find(
+    (item) => item.requestedUrl === 'https://blocked.example.com/' && item.required === true,
+  );
+  assert.ok(renderedObs);
+  assert.equal(renderedObs?.outcome, 'ACQUISITION_FAILED');
+  assert.equal(renderedObs?.retryable, false);
+  assert.equal(result.retryDirective, undefined);
+  assert.equal(result.acquisitionStatus, 'ACQUISITION_FAILED');
+});
+
+test('mixed block and transient failures preserve retryability', async () => {
+  const result = await runChannelInspection({
+    channelId: 'UCmixedfail0000000000000001',
+    channelName: 'Mixed Failure Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://flaky.example.com'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => response(500, '', 'text/html')) as typeof fetch,
+    renderedFallback: async (seedUrl) => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 0,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFailed: 2, blockedRequests: 1, transientRequests: 1 },
+      detail: 'mixed block and transient failures',
+    }),
+  });
+  const renderedObs = (result.acquisitionOutcomes || []).find(
+    (item) => item.requestedUrl === 'https://flaky.example.com/' && item.required === true,
+  );
+  assert.equal(renderedObs?.outcome, 'ACQUISITION_FAILED');
+  assert.equal(renderedObs?.retryable, true);
+  assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+test('a rejecting rendered fallback never blocks subsequent URLs', async () => {
+  const renderedCalls: string[] = [];
+  const result = await runChannelInspection({
+    channelId: 'UCrejectfirst00000000000001',
+    channelName: 'Reject First Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://reject.example.com', 'https://after.example.com'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: noInviteHtml as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls.push(seedUrl);
+      if (seedUrl.includes('reject.example.com')) throw new Error('browser crashed mid-seed');
+      return processedStub()(seedUrl);
+    },
+  });
+  assert.deepEqual(new Set(renderedCalls), new Set(['https://reject.example.com/', 'https://after.example.com/']));
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+  assert.ok(result.retryDirective);
 });
 
 // 7. Duplicate URLs collapse without losing the unique target.

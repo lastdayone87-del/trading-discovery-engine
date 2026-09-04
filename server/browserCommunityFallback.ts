@@ -109,6 +109,29 @@ export function wasRenderedResultProcessed(
   return (Number(result.inspectedPages) || 0) > 0 || (Number(result.telemetry?.requestsStarted) || 0) > 0;
 }
 
+/**
+ * Pure target-block detection for retry policy. When every failed request was
+ * an explicit target-side block (401/403/captcha/bot-protection, no transient,
+ * rate-limit, or navigation-timeout evidence, and our own time budget did not
+ * expire), retrying cannot help: the target refuses us. Record the failure and
+ * move on without scheduling another bounded render against the block.
+ * Anything mixed or ambiguous stays retryable — recall safety requires the
+ * retry when the failure could be ours or transient.
+ */
+export function isPureTargetBlockOutcome(input: {
+  timedOut: boolean;
+  telemetry: Pick<BrowserFallbackTelemetry, 'requestsFailed' | 'blockedRequests' | 'transientRequests' | 'rateLimitedRequests' | 'navigationTimeouts'>;
+}): boolean {
+  return (
+    !input.timedOut &&
+    input.telemetry.requestsFailed > 0 &&
+    input.telemetry.blockedRequests >= input.telemetry.requestsFailed &&
+    input.telemetry.transientRequests === 0 &&
+    input.telemetry.rateLimitedRequests === 0 &&
+    input.telemetry.navigationTimeouts === 0
+  );
+}
+
 export function resolveRenderedCompletionState(input: {
   inspectedPages: number;
   timedOut: boolean;
@@ -302,6 +325,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
+        const pureTargetBlock=isPureTargetBlockOutcome({timedOut,telemetry});
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
         return {
@@ -310,7 +334,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           candidates,
           inspectedPages,scrolls,clicks,
           complete:completion.complete,
-          retryable:completion.retryable,
+          retryable:completion.retryable && !pureTargetBlock,
           failureClass:completion.failureClass,
           telemetry,
           detail:candidates.length

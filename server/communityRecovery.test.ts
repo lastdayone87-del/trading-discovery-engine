@@ -148,7 +148,7 @@ test('legacy upstream retry closes as historical completed negative while genuin
   const upstream = classifyLegacyCommunityRetryDisposition({
     payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
     inspectionTrail: [{ step: 'VIDEO_DESCRIPTIONS', status: 'SKIPPED' }],
-    hasCurrentCommunityRetryableFailure: false,
+    hasCurrentCommunityFailure: false,
     hasCurrentUpstreamRetryableFailure: true
   });
   assert.equal(upstream.disposition, 'COMPLETED_NEGATIVE');
@@ -157,7 +157,7 @@ test('legacy upstream retry closes as historical completed negative while genuin
   const community = classifyLegacyCommunityRetryDisposition({
     payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
     inspectionTrail: [{ step: 'LINKED_WEBSITES', status: 'ERROR' }],
-    hasCurrentCommunityRetryableFailure: true,
+    hasCurrentCommunityFailure: true,
     hasCurrentUpstreamRetryableFailure: false
   });
   assert.equal(community.disposition, 'ACTIVE_COMMUNITY_RETRY');
@@ -166,11 +166,26 @@ test('legacy upstream retry closes as historical completed negative while genuin
   const browser = classifyLegacyCommunityRetryDisposition({
     payload: { retryReason: 'BROWSER_RUNTIME_UNAVAILABLE' },
     inspectionTrail: [{ step: 'VIDEO_DESCRIPTIONS', status: 'ERROR' }],
-    hasCurrentCommunityRetryableFailure: false,
+    hasCurrentCommunityFailure: false,
     hasCurrentUpstreamRetryableFailure: false
   });
   assert.equal(browser.disposition, 'ACTIVE_COMMUNITY_RETRY');
   assert.equal(browser.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
+});
+
+test('non-retryable required community failure still preserves retry ownership (never a false completed negative)', () => {
+  // A terminal acquisition failure (pure target block, unsupported preview
+  // content) proves coverage is incomplete. The legacy reconciler must keep
+  // the retry owned rather than projecting COMPLETED_NEGATIVE over it — an
+  // inaccessible site is not a confirmed absence.
+  const decision = classifyLegacyCommunityRetryDisposition({
+    payload: { retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+    inspectionTrail: [{ step: 'CUSTOM_DOMAINS', status: 'ERROR' }],
+    hasCurrentCommunityFailure: true,
+    hasCurrentUpstreamRetryableFailure: false
+  });
+  assert.equal(decision.disposition, 'ACTIVE_COMMUNITY_RETRY');
+  assert.equal(decision.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
 });
 
 test('completed negative legacy retry is reclassified without deleting its audit job', () => {
@@ -181,7 +196,7 @@ test('completed negative legacy retry is reclassified without deleting its audit
       { step: 'LINKED_WEBSITES', status: 'NOT_FOUND' },
       { step: 'SOCIAL_PROFILES', status: 'SKIPPED' }
     ],
-    hasCurrentCommunityRetryableFailure: false,
+    hasCurrentCommunityFailure: false,
     hasCurrentUpstreamRetryableFailure: false
   });
   assert.equal(decision.disposition, 'COMPLETED_NEGATIVE');
@@ -206,7 +221,7 @@ test('legacy completed-negative retry is completed as audit history without stal
               { step: 'CREATOR_WEBSITES', status: 'SKIPPED' },
               { step: 'SOCIAL_PROFILES', status: 'SKIPPED' }
             ],
-            has_current_community_retryable_failure: false,
+            has_current_community_failure: false,
             has_current_upstream_retryable_failure: true
           }]
         };

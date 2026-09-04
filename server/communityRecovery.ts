@@ -20,7 +20,7 @@ export type LegacyCommunityRetryDisposition =
 export interface LegacyCommunityRetryDispositionInput {
   payload?: Record<string, unknown>;
   inspectionTrail?: Array<{ step?: string; status?: string }>;
-  hasCurrentCommunityRetryableFailure: boolean;
+  hasCurrentCommunityFailure: boolean;
   hasCurrentUpstreamRetryableFailure: boolean;
 }
 
@@ -31,7 +31,11 @@ export interface LegacyCommunityRetryDispositionResult {
 }
 export function classifyLegacyCommunityRetryDisposition(input: LegacyCommunityRetryDispositionInput): LegacyCommunityRetryDispositionResult {
   const trail = input.inspectionTrail || [];
-  if (input.hasCurrentCommunityRetryableFailure) {
+  // Any current required community acquisition failure — retryable or
+  // terminal (e.g. pure target block, unsupported preview content) — proves
+  // acquisition is genuinely incomplete, so the legacy retry stays owned and
+  // no historical completed-negative may be projected over it.
+  if (input.hasCurrentCommunityFailure) {
     return {
       disposition: 'ACTIVE_COMMUNITY_RETRY',
       retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'
@@ -55,8 +59,8 @@ export function classifyLegacyCommunityRetryDisposition(input: LegacyCommunityRe
     disposition: 'COMPLETED_NEGATIVE',
     retryReason: 'NO_SURFACE',
     reconciliationReason: hasInspectedCommunitySurface
-      ? 'Latest inspection completed without a Discord/community match or current retryable acquisition failure.'
-      : 'No current Discord/community retryable acquisition failure was found; restore the historical completed negative.'
+      ? 'Latest inspection completed without a Discord/community match or current community acquisition failure.'
+      : 'No current Discord/community acquisition failure was found; restore the historical completed negative.'
   };
 }
 
@@ -187,9 +191,8 @@ export async function reconcileLegacyCommunityRetryOwnership(
               ) effective
              WHERE effective.required='true'
                AND effective.outcome='ACQUISITION_FAILED'
-               AND effective.retryable=true
                AND effective.surface IN('CHANNEL_EXTERNAL_LINKS','CREATOR_WEBSITES','SOCIAL_PROFILES','CHANNEL_LINKS','EXTERNAL_LINKS','LINKED_WEBSITES','CUSTOM_DOMAINS','SOCIAL_BIO')
-            ) AS has_current_community_retryable_failure,
+            ) AS has_current_community_failure,
             EXISTS(
               SELECT 1 FROM (
                 SELECT DISTINCT ON (o.provenance->>'surface',lower(rtrim(COALESCE(o.requested_url,''),'/')))
@@ -238,7 +241,7 @@ export async function reconcileLegacyCommunityRetryOwnership(
     const decision = classifyLegacyCommunityRetryDisposition({
       payload,
       inspectionTrail: trail,
-      hasCurrentCommunityRetryableFailure: row.has_current_community_retryable_failure === true,
+      hasCurrentCommunityFailure: row.has_current_community_failure === true,
       hasCurrentUpstreamRetryableFailure: row.has_current_upstream_retryable_failure === true
     });
     const nextPayload: Record<string, unknown> = {

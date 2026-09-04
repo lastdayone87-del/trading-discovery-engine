@@ -348,3 +348,63 @@ test('stronger live official excluded evidence can establish a legitimate termin
   assert.equal(merged.score, 100);
   assert.equal(merged.detectedCountry, 'Vietnam');
 });
+
+test('Czech self-declared bio attributes Czechia and records matched context', () => {
+  const result = inferChannelCountry({
+    aboutBio: 'Jsem trader z Prahy, Česká republika. Call +420 123 456 789. Obchoduji akcie.',
+    discoveryCountry: 'CZ'
+  });
+  assert.equal(result.detectedCountry, 'Czechia');
+  assert.equal(result.status, 'CONFIRMED');
+  assert.equal(result.discoveryCountry, 'Czechia');
+  assert.equal(result.decisiveEvidence[0].source, 'CHANNEL_ABOUT_BIO');
+  assert.ok(!result.evidence.some(item => item.detectedCountry === 'South Africa'));
+  const bioEvidence = result.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO');
+  assert.ok(bioEvidence?.matchedContext && bioEvidence.matchedContext.length > 0);
+});
+
+test('Czech "Jsem" never becomes South Africa exchange evidence', () => {
+  const result = inferChannelCountry({
+    aboutBio: 'Jsem trader z Prahy. Obchoduji na burze a sleduji PX index.',
+    videoTitles: ['Moje výsledky']
+  });
+  assert.ok(!result.evidence.some(item => item.detectedCountry === 'South Africa'));
+  assert.equal(result.detectedCountry, 'Czechia');
+});
+
+test('conflicting South Africa and Czechia bio evidence stays uncertain instead of rejecting', () => {
+  const result = inferChannelCountry(
+    { aboutBio: 'Trader based in Prague, Czechia. Previously from South Africa, trading JSE stocks.' },
+    [{ country_name: 'South Africa', reason: 'African Region Exclusion' }]
+  );
+  assert.equal(result.status, 'UNCERTAIN');
+  assert.equal(result.gateDisposition, 'NEEDS_REVIEW');
+  assert.ok(!result.evidence.some(item => item.source === 'EXCLUSION_POLICY'));
+});
+
+test('ordinary English words never become exchange evidence', () => {
+  const result = inferChannelCountry({
+    aboutBio: 'Beware false gurus and pulse hype from someone else; those calls are noise. Smith reviews markets.'
+  });
+  assert.ok(!result.evidence.some(item => item.source === 'EXCHANGE_REFERENCE'));
+  assert.ok(!result.evidence.some(item => item.detectedCountry === 'South Africa'));
+  assert.ok(!result.evidence.some(item => item.detectedCountry === 'United Kingdom'));
+  assert.ok(!result.evidence.some(item => item.detectedCountry === 'Vietnam'));
+});
+
+test('standalone JSE and LSE acronyms still match their exchanges', () => {
+  const jse = inferChannelCountry({ aboutBio: 'Trading JSE stocks and gold.' });
+  assert.ok(jse.evidence.some(item => item.source === 'EXCHANGE_REFERENCE' && item.detectedCountry === 'South Africa'));
+  const lse = inferChannelCountry({ aboutBio: 'Covering LSE opens every morning.' });
+  assert.ok(lse.evidence.some(item => item.source === 'EXCHANGE_REFERENCE' && item.detectedCountry === 'United Kingdom'));
+});
+
+test('genuine South Africa domicile declaration still rejects under exclusion policy', () => {
+  const result = inferChannelCountry(
+    { aboutBio: 'Trader based in South Africa, Johannesburg.' },
+    [{ country_name: 'South Africa', reason: 'African Region Exclusion' }]
+  );
+  assert.equal(result.status, 'REJECTED');
+  assert.equal(result.detectedCountry, 'South Africa');
+  assert.equal(result.gateDisposition, 'REJECT_EXCLUDED');
+});

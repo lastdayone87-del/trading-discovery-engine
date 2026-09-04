@@ -33,6 +33,7 @@ export interface CountryInferenceEvidence {
   confidence: number;
   reasoning: string;
   matchedValue?: string;
+  matchedContext?: string;
 }
 
 export interface CountryInferenceInput {
@@ -87,7 +88,7 @@ const COUNTRY_ALIASES: Record<string, string> = {
   eg:'Egypt', ma:'Morocco', ph:'Philippines', vn:'Vietnam', id:'Indonesia'
   ,dz:'Algeria', tn:'Tunisia', et:'Ethiopia', tz:'Tanzania', ug:'Uganda', sn:'Senegal', cm:'Cameroon',
   zw:'Zimbabwe', zm:'Zambia', rw:'Rwanda', ci:'Ivory Coast', mz:'Mozambique', mg:'Madagascar', sd:'Sudan',
-  ao:'Angola', lk:'Sri Lanka'
+  ao:'Angola', lk:'Sri Lanka', cz:'Czechia', czech:'Czechia', 'czech republic':'Czechia'
 };
 
 const COUNTRY_SIGNALS: Record<string, {
@@ -119,6 +120,7 @@ const COUNTRY_SIGNALS: Record<string, {
   Belgium: { bio: ['belgium', 'belgië', 'belgique'], tlds: ['.be'], social: ['belgium', 'brussels'], exchanges: ['euronext brussels', 'bel 20'], brokers: ['bolero', 'keytrade'], phones: ['+32'], addresses: ['brussels', 'bruxelles', 'antwerp'], language: ['beursanalyse belgië', 'analyse boursière belge'] },
   Luxembourg: { bio: ['luxembourg', 'lëtzebuerg'], tlds: ['.lu'], social: ['luxembourg'], exchanges: ['luxembourg stock exchange', 'luxx'], brokers: ['bgl bnp paribas'], phones: ['+352'], addresses: ['luxembourg'], language: ['bourse de luxembourg', 'luxemburger börse'] },
   Ireland: { bio: ['ireland', 'irish trader', 'éire'], tlds: ['.ie'], social: ['ireland', 'dublin'], exchanges: ['euronext dublin', 'iseq 20'], brokers: ['davy select', 'goodbody'], phones: ['+353'], addresses: ['dublin', 'cork'], language: ['trádáil scaireanna'] },
+  Czechia: { bio: ['czechia', 'czech republic', 'česká republika', 'ceska republika', 'czech trader', 'based in prague'], tlds: ['.cz'], social: ['czechia', 'praha'], exchanges: ['prague stock exchange', 'px index'], brokers: ['fio banka', 'xtb'], phones: ['+420'], addresses: ['praha', 'prague', 'brno'], language: ['akcie', 'obchodování', 'burza cenných papírů', 'technická analýza'] },
   'United Arab Emirates': { bio: ['united arab emirates', 'الإمارات', 'dubai trader'], tlds: ['.ae'], social: ['dubai', 'uae'], exchanges: ['dubai financial market', 'abu dhabi securities exchange', 'dfm'], brokers: ['sarwa', 'adss'], phones: ['+971'], addresses: ['دبي', 'أبوظبي', 'dubai', 'abu dhabi'], language: ['تداول', 'السوق', 'الأسهم', 'تحليل فني', 'استثمار'] },
   Nigeria: { bio: ['nigeria', 'nigerian trader', 'based in nigeria', 'trader in nigeria', 'naija trader', 'naija'], tlds: ['.ng', '.com.ng'], social: ['nigeria', 'lagos'], exchanges: ['nigerian exchange', 'ngx'], brokers: ['meristem', 'cardinalstone'], phones: ['+234'], addresses: ['lagos', 'abuja'], language: ['naira', 'forex nigeria'] },
   Pakistan: { bio: ['pakistan', 'pakistani trader', 'based in pakistan', 'trader in pakistan'], tlds: ['.pk', '.com.pk'], social: ['pakistan', 'karachi'], exchanges: ['pakistan stock exchange', 'psx'], brokers: ['k trade', 'arif habib'], phones: ['+92'], addresses: ['karachi', 'lahore', 'islamabad'], language: ['اردو ٹریڈنگ', 'پاکستان اسٹاک'] },
@@ -167,13 +169,31 @@ export function countryIsoAlias(value: string): string | null {
 }
 
 function includesSignal(text: string, signals: string[]): string | null {
-  return signals.find(signal => text.includes(signal.toLocaleLowerCase('en'))) || null;
+  return signals.find(signal => {
+    const lower = signal.toLocaleLowerCase('en');
+    // Short acronyms (e.g. jse/lse/tsx/smi/hose) must match on token
+    // boundaries: raw substring matching turns ordinary words into false
+    // country evidence ('jsem' Czech "I am" is not the Johannesburg exchange;
+    // 'false'/'pulse'/'else' is not the London exchange; 'those' is not the
+    // Ho Chi Minh exchange; 'smith' is not the Swiss Market Index). Longer
+    // phrases keep substring behavior.
+    if (/^[a-z]{2,4}$/.test(lower)) {
+      return new RegExp(`(?<![\\p{L}\\p{N}_])${lower}(?![\\p{L}\\p{N}_])`, 'iu').test(text);
+    }
+    return text.includes(lower);
+  }) || null;
+}
+
+function matchWindow(text: string, match: string, radius = 80): string {
+  const index = text.toLocaleLowerCase('en').indexOf(match.toLocaleLowerCase('en'));
+  if (index < 0) return '';
+  return text.slice(Math.max(0, index - radius), index + match.length + radius).replace(/\s+/g, ' ').trim();
 }
 
 function addTextEvidence(evidence: CountryInferenceEvidence[], source: CountryEvidenceSource, priority: number, confidence: number, text: string, key: keyof typeof COUNTRY_SIGNALS[string], reason: string): void {
   for (const [country, signals] of Object.entries(COUNTRY_SIGNALS)) {
     const match = includesSignal(text, signals[key]);
-    if (match) evidence.push({ source, priority, detectedCountry: country, confidence, matchedValue: match, reasoning: `${reason}: '${match}' indicates ${country}.` });
+    if (match) evidence.push({ source, priority, detectedCountry: country, confidence, matchedValue: match, matchedContext: matchWindow(text, match), reasoning: `${reason}: '${match}' indicates ${country}.` });
   }
 }
 
@@ -216,6 +236,7 @@ export function assessChannelCountry(
         detectedCountry: canonicalCountry(item.country_name),
         confidence: 92,
         matchedValue: match[0],
+        matchedContext: matchWindow(bioText, match[0]),
         reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonicalCountry(item.country_name)}.`
       });
     }

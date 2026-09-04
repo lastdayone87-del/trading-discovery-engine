@@ -24,7 +24,14 @@ export function classifyRenderedCrawlerFailure(error: unknown): RenderedCrawlerF
   const status = Number((error as any)?.statusCode || (error as any)?.status || (error as any)?.response?.status);
   if (status === 429 || /\b429\b|too many requests|rate.?limit/.test(message)) return 'RATE_LIMITED';
   if ([401, 403].includes(status) || /\b403\b|\b401\b|request blocked|access denied|forbidden|captcha|bot protection|cloudflare/.test(message)) return 'BLOCKED';
-  if ([408, 425, 500, 502, 503, 504].includes(status) || /timeout|timed out|econnreset|econnrefused|eai_again|enotfound|network|navigation.*failed|browser.*closed|target.*closed/.test(message)) return 'TRANSIENT';
+  // Transient network/server signals, including Playwright `net::ERR_*` forms
+  // that never match the Node-style tokens (empty responses, HTTP/2 and
+  // connection failures are target/transit flakiness, not blocks). Unknown
+  // signals (certificate errors, aborted/download navigations, unrecognized
+  // provider errors) deliberately stay OTHER/retryable: when the failure is
+  // ambiguous, recall safety requires keeping the retry, never assuming a
+  // permanent block.
+  if ([408, 425, 500, 502, 503, 504].includes(status) || /timeout|timed out|econnreset|econnrefused|eai_again|enotfound|network|navigation.*failed|browser.*closed|target.*closed|err_empty_response|err_http2_|err_connection_(closed|reset|refused)/.test(message)) return 'TRANSIENT';
   return 'OTHER';
 }
 
