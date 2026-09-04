@@ -128,11 +128,11 @@ export function wasRenderedResultProcessed(
 }
 
 /**
- * Per-crawl request lifecycle tracker (shared state for the Crawlee
- * errorHandler/requestHandler wiring below and for completion accounting).
- * A failed attempt that later succeeds on the same request URL is recovered,
- * not terminal; only URLs that never succeed after their attempts stay
- * unresolved. Click outcomes never touch this state.
+ * Order-aware lifecycle dispositions: the LAST terminal event for a request
+ * URL wins. A later failure revokes an earlier success (the page's later
+ * processing stage failed terminally), and a later full success resolves an
+ * earlier failure (retry recovery). This is what keeps a permanently failed
+ * child incomplete while letting genuinely recovered retries complete.
  */
 export interface RenderedRequestTracker {
   failedRequestUrls: Set<string>;
@@ -143,18 +143,28 @@ export function createRenderedRequestTracker(): RenderedRequestTracker {
   return { failedRequestUrls: new Set<string>(), succeededRequestUrls: new Set<string>() };
 }
 
-/** Crawlee errorHandler path: record a failed attempt for the request URL. */
+/**
+ * Crawlee errorHandler path: record a failed attempt for the request URL,
+ * revoking any earlier success for the same URL (a later terminal failure
+ * must not be erased by an earlier success mark).
+ */
 export function markRenderedRequestFailed(tracker: RenderedRequestTracker, url: string): void {
-  if (url) tracker.failedRequestUrls.add(url);
+  if (!url) return;
+  tracker.failedRequestUrls.add(url);
+  tracker.succeededRequestUrls.delete(url);
 }
 
 /**
- * Crawlee requestHandler path: record successful page processing for the
- * request URL. Call only after page evidence was actually retained
- * (initial/scroll inspection), never for click handling.
+ * Crawlee requestHandler path: record fully successful page processing for
+ * the request URL, resolving any earlier failure (retry recovery). Call only
+ * after the request's page-processing lifecycle completed (initial/scroll
+ * inspection, control enumeration, link enqueueing) — never for click
+ * handling, never after a merely started request.
  */
 export function markRenderedRequestSucceeded(tracker: RenderedRequestTracker, url: string): void {
-  if (url) tracker.succeededRequestUrls.add(url);
+  if (!url) return;
+  tracker.succeededRequestUrls.add(url);
+  tracker.failedRequestUrls.delete(url);
 }
 
 /** Terminal unresolved failures for completion accounting. */
@@ -342,16 +352,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             telemetry.requestsStarted++;
             try {
-            inspectedPages++;
             const inspect = async () => {
               const url=page.url(),html=await page.content();
               retain(`${url}\n${html}`,url);
             };
+            // Page evidence counts only after the required extraction actually
+            // succeeds: a throw here leaves zero processed evidence (finding:
+            // failed extraction must never claim a page).
             await inspect();
-            // Page evidence retained: the request is successfully processed
-            // regardless of any earlier failed attempt (retry recovery) and
-            // regardless of later click outcomes (clicks never participate).
-            markRenderedRequestSucceeded(requestTracker, request.url);
+            inspectedPages++;
 
             for (let i = 0; i < limits.maxScrollsPerPage; i++) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -389,6 +398,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>shouldEnqueueRenderedCommunityLink(req.url)?req:false});
             }
+            // Success is recorded only after the request's full page-processing
+            // lifecycle completes (load, scroll traversal, control enumeration,
+            // link enqueueing). A later terminal failure propagates before this
+            // mark, so an earlier success can never erase it; a later full
+            // success resolves an earlier failure (retry recovery). Click
+            // handling owns no marks: clicks never affect terminal accounting.
+            markRenderedRequestSucceeded(requestTracker, request.url);
             } finally {
               telemetry.requestsFinished++;
             }

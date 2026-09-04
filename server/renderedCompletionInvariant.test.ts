@@ -573,3 +573,42 @@ test('lifecycle click outcomes never affect terminal accounting or completion', 
   assert.equal(state.complete, true);
   assert.equal(state.retryable, false);
 });
+
+// Later terminal failure revokes earlier success: last disposition wins.
+test('lifecycle later terminal failure revokes earlier page success', () => {
+  const tracker = createRenderedRequestTracker();
+  markRenderedRequestSucceeded(tracker, 'https://creator.example/child');
+  markRenderedRequestFailed(tracker, 'https://creator.example/child');
+  assert.equal(renderedUnresolvedFailureCount(tracker), 1);
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 1,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 1, requestsFinished: 0, requestsFailed: 1, unresolvedFailedRequests: renderedUnresolvedFailureCount(tracker) },
+  });
+  assert.equal(state.complete, false);
+  assert.equal(state.retryable, true);
+});
+
+// Full lifecycle: fail → success → fail ends unresolved (never clean).
+test('lifecycle fail-success-fail sequence stays unresolved', () => {
+  const tracker = createRenderedRequestTracker();
+  markRenderedRequestFailed(tracker, 'https://creator.example/child');
+  markRenderedRequestSucceeded(tracker, 'https://creator.example/child');
+  assert.equal(renderedUnresolvedFailureCount(tracker), 0);
+  markRenderedRequestFailed(tracker, 'https://creator.example/child');
+  assert.equal(renderedUnresolvedFailureCount(tracker), 1);
+});
+
+// Failed initial extraction claims no page: zero pages + terminal failure.
+test('lifecycle failed extraction yields NO_PAGE_PROCESSED, never partial', () => {
+  const tracker = createRenderedRequestTracker();
+  markRenderedRequestFailed(tracker, 'https://creator.example/');
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 0,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 1, requestsFailed: 1, unresolvedFailedRequests: renderedUnresolvedFailureCount(tracker) },
+  });
+  assert.equal(state.complete, false);
+  assert.equal(state.retryable, true);
+  assert.equal(state.failureClass, 'NO_PAGE_PROCESSED');
+});
