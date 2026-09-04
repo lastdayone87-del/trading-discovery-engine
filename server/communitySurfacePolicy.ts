@@ -194,13 +194,45 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
       (entry) => entry.item.outcome !== 'INSPECTED_NO_MATCH' || hasProcessedEvidence(entry),
     );
     const finalists = evidenced.length > 0 ? evidenced : eligible;
-    return finalists.reduce((best, entry) => {
+    const winner = finalists.reduce((best, entry) => {
       const precedence = OUTCOME_PRECEDENCE[entry.item.outcome];
       const bestPrecedence = OUTCOME_PRECEDENCE[best.item.outcome];
       return precedence > bestPrecedence || (precedence === bestPrecedence && entry.index > best.index)
         ? entry
         : best;
     });
+    // A required fallback failure that processed zero evidence (e.g. gate
+    // saturation, zero-page result, unadmitted seed) must not blindly erase
+    // statically inspected evidence for the same URL: the static pages were
+    // Discord-scanned and remain usable. Collapse to a retryable
+    // PARTIALLY_INSPECTED instead — partial, retry-owned, never "unavailable".
+    if (
+      winner.item.outcome === 'ACQUISITION_FAILED' &&
+      (winner.item as { required?: unknown }).required === true &&
+      !hasProcessedEvidence(winner)
+    ) {
+      const evidencedFallback = pool.find(
+        (entry) =>
+          (entry.item.outcome === 'INSPECTED_NO_MATCH' ||
+            entry.item.outcome === 'PARTIALLY_INSPECTED') &&
+          hasProcessedEvidence(entry),
+      );
+      if (evidencedFallback) {
+        return {
+          item: {
+            ...evidencedFallback.item,
+            outcome: 'PARTIALLY_INSPECTED',
+            required: true,
+            retryable: true,
+            failureClass:
+              (winner.item as { failureClass?: unknown }).failureClass ||
+              'RENDERED_FALLBACK_NO_EVIDENCE',
+          } as T,
+          index: evidencedFallback.index,
+        };
+      }
+    }
+    return winner;
   };
 
   return [...groups.values()]

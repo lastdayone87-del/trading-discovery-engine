@@ -159,11 +159,25 @@ export function retryAtFromUnknown(error: any, now = Date.now()): number | undef
 }
 
 export function isCommunityRetryableObservation(item: CommunityRetryObservation): boolean {
+  // Both failed and partially-inspected required community observations own
+  // retries: partial coverage is recoverable/inconclusive, never a terminal
+  // negative. YouTube About / recent-video-description surfaces stay upstream.
   return item.required !== false &&
-    item.outcome === 'ACQUISITION_FAILED' &&
+    (item.outcome === 'ACQUISITION_FAILED' || item.outcome === 'PARTIALLY_INSPECTED') &&
     item.retryable &&
     item.surface !== 'YOUTUBE_ABOUT' &&
     item.surface !== 'RECENT_VIDEO_DESCRIPTIONS';
+}
+
+/**
+ * Shared validation-lifecycle boundary: whether required community
+ * acquisition observations own a retry (RETRY_PENDING path). All callers must
+ * use this predicate instead of duplicating outcome checks, so FAILED and
+ * retryable PARTIALLY_INSPECTED stay consistent across directive building and
+ * validation-state projection.
+ */
+export function hasRetryableCommunityAcquisitionFailure(observations: CommunityRetryObservation[]): boolean {
+  return observations.some(item => item.required && isCommunityRetryableObservation(item));
 }
 
 export function communityAcquisitionRetryDirective(

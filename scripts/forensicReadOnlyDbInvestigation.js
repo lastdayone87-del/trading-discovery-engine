@@ -15,12 +15,12 @@ function qident(value) {
 
 function redact(value) {
   if (typeof value !== 'string') return value;
-  return value.replace(/(postgres(?:ql)?:\\/\\/[^:]+:)[^@]+(@)/gi, '$1[REDACTED]$2');
+  return value.replace(/(postgres(?:ql)?:\/\/[^:]+:)[^@]+(@)/gi, '$1[REDACTED]$2');
 }
 
 function json(value) {
   return JSON.stringify(value, (_key, v) => {
-    if (typeof v === 'string' && /^postgres(?:ql)?:\\/\\//i.test(v)) return redact(v);
+    if (typeof v === 'string' && /^postgres(?:ql)?:\/\//i.test(v)) return redact(v);
     return v;
   });
 }

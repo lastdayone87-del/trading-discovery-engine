@@ -141,3 +141,42 @@ test('a genuinely unresolved URL remains failed even when another URL was inspec
   assert.ok(observations.some(item => item.outcome === 'INSPECTED_NO_MATCH'));
   assert.ok(observations.some(item => item.outcome === 'ACQUISITION_FAILED'));
 });
+
+test('evidence-less required fallback failure does not erase evidenced static clean', () => {
+  const effective = effectiveAcquisitionOutcomes([
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'INSPECTED_NO_MATCH', required: false, retryable: false, telemetry: { pagesInspected: 2, requestsStarted: 2, redirectsFollowed: 0 } },
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', required: true, retryable: true, failureClass: 'NO_PAGE_PROCESSED', telemetry: { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 } },
+  ] as never);
+  assert.equal(effective.length, 1);
+  assert.equal(effective[0].outcome, 'PARTIALLY_INSPECTED');
+  assert.equal((effective[0] as { required?: boolean }).required, true);
+  assert.equal((effective[0] as { retryable?: boolean }).retryable, true);
+});
+
+test('required failure with real evidence still stands over static clean', () => {
+  const effective = effectiveAcquisitionOutcomes([
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'INSPECTED_NO_MATCH', required: false, retryable: false, telemetry: { pagesInspected: 2, requestsStarted: 2, redirectsFollowed: 0 } },
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', required: true, retryable: true, failureClass: 'RENDERED_BUDGET_EXPIRED', telemetry: { pagesInspected: 0, requestsStarted: 3, redirectsFollowed: 0 } },
+  ] as never);
+  assert.equal(effective.length, 1);
+  // requestsStarted evidence exists but zero pages: no usable page evidence,
+  // so the required failure stands (retry-owned) rather than collapasing clean.
+  assert.equal(effective[0].outcome, 'ACQUISITION_FAILED');
+});
+
+test('distinct candidate URLs collapse independently (no cross-URL contamination)', () => {
+  const effective = effectiveAcquisitionOutcomes([
+    { requestedUrl: 'https://a.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'INSPECTED_NO_MATCH', required: false, retryable: false, telemetry: { pagesInspected: 1, requestsStarted: 1, redirectsFollowed: 0 } },
+    { requestedUrl: 'https://b.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', required: true, retryable: true, telemetry: { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 } },
+  ] as never);
+  assert.equal(effective.length, 2);
+});
+
+test('FOUND always survives collapse regardless of required failures', () => {
+  const effective = effectiveAcquisitionOutcomes([
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'ACQUISITION_FAILED', required: true, retryable: true, telemetry: { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 } },
+    { requestedUrl: 'https://creator.example.com/', surface: 'CREATOR_WEBSITES', outcome: 'FOUND', required: false, retryable: false, telemetry: { pagesInspected: 1, requestsStarted: 1, redirectsFollowed: 0 } },
+  ] as never);
+  assert.equal(effective.length, 1);
+  assert.equal(effective[0].outcome, 'FOUND');
+});

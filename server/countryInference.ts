@@ -33,12 +33,33 @@ export interface CountryInferenceEvidence {
   confidence: number;
   reasoning: string;
   matchedValue?: string;
+  matchedContext?: string;
+  /**
+   * Provenance boundary: the exact creator-level input field that produced
+   * this evidence. P2 CHANNEL_ABOUT_BIO evidence must only ever carry
+   * 'channelName' | 'description' | 'socialBios'. Exchange references,
+   * discovery context, video metadata, website content, and crawler trail
+   * prose must never appear here.
+   */
+  sourceField?: string;
 }
 
 export interface CountryInferenceInput {
   officialCountry?: string;
   channelName?: string;
   aboutBio?: string;
+  /**
+   * Creator social-profile biography texts. Matched as P2 creator-country
+   * evidence with sourceField 'socialBios', independently from channelName
+   * and description so every P2 item is auditable to its exact field.
+   * NOTE: currently unpopulated by production ingestion/revalidation — no
+   * existing source provides social-profile biography prose (channel links
+   * are URLs, not bios; fetching them would be a new acquisition system).
+   * The typed provenance boundary is ready for future wiring; until then
+   * P2 rests on channelName + description only. Never substitute trail
+   * prose, video metadata, or discovery context here.
+   */
+  socialBios?: string[];
   officialWebsiteLinks?: string[];
   verifiedSocialLinks?: string[];
   videoTitles?: string[];
@@ -87,7 +108,7 @@ const COUNTRY_ALIASES: Record<string, string> = {
   eg:'Egypt', ma:'Morocco', ph:'Philippines', vn:'Vietnam', id:'Indonesia'
   ,dz:'Algeria', tn:'Tunisia', et:'Ethiopia', tz:'Tanzania', ug:'Uganda', sn:'Senegal', cm:'Cameroon',
   zw:'Zimbabwe', zm:'Zambia', rw:'Rwanda', ci:'Ivory Coast', mz:'Mozambique', mg:'Madagascar', sd:'Sudan',
-  ao:'Angola', lk:'Sri Lanka'
+  ao:'Angola', lk:'Sri Lanka', cz:'Czechia', czech:'Czechia', 'czech republic':'Czechia'
 };
 
 const COUNTRY_SIGNALS: Record<string, {
@@ -119,6 +140,7 @@ const COUNTRY_SIGNALS: Record<string, {
   Belgium: { bio: ['belgium', 'belgië', 'belgique'], tlds: ['.be'], social: ['belgium', 'brussels'], exchanges: ['euronext brussels', 'bel 20'], brokers: ['bolero', 'keytrade'], phones: ['+32'], addresses: ['brussels', 'bruxelles', 'antwerp'], language: ['beursanalyse belgië', 'analyse boursière belge'] },
   Luxembourg: { bio: ['luxembourg', 'lëtzebuerg'], tlds: ['.lu'], social: ['luxembourg'], exchanges: ['luxembourg stock exchange', 'luxx'], brokers: ['bgl bnp paribas'], phones: ['+352'], addresses: ['luxembourg'], language: ['bourse de luxembourg', 'luxemburger börse'] },
   Ireland: { bio: ['ireland', 'irish trader', 'éire'], tlds: ['.ie'], social: ['ireland', 'dublin'], exchanges: ['euronext dublin', 'iseq 20'], brokers: ['davy select', 'goodbody'], phones: ['+353'], addresses: ['dublin', 'cork'], language: ['trádáil scaireanna'] },
+  Czechia: { bio: ['czechia', 'czech republic', 'česká republika', 'ceska republika', 'czech trader', 'based in prague'], tlds: ['.cz'], social: ['czechia', 'praha'], exchanges: ['prague stock exchange', 'px index'], brokers: ['fio banka', 'xtb'], phones: ['+420'], addresses: ['praha', 'prague', 'brno'], language: ['akcie', 'obchodování', 'burza cenných papírů', 'technická analýza'] },
   'United Arab Emirates': { bio: ['united arab emirates', 'الإمارات', 'dubai trader'], tlds: ['.ae'], social: ['dubai', 'uae'], exchanges: ['dubai financial market', 'abu dhabi securities exchange', 'dfm'], brokers: ['sarwa', 'adss'], phones: ['+971'], addresses: ['دبي', 'أبوظبي', 'dubai', 'abu dhabi'], language: ['تداول', 'السوق', 'الأسهم', 'تحليل فني', 'استثمار'] },
   Nigeria: { bio: ['nigeria', 'nigerian trader', 'based in nigeria', 'trader in nigeria', 'naija trader', 'naija'], tlds: ['.ng', '.com.ng'], social: ['nigeria', 'lagos'], exchanges: ['nigerian exchange', 'ngx'], brokers: ['meristem', 'cardinalstone'], phones: ['+234'], addresses: ['lagos', 'abuja'], language: ['naira', 'forex nigeria'] },
   Pakistan: { bio: ['pakistan', 'pakistani trader', 'based in pakistan', 'trader in pakistan'], tlds: ['.pk', '.com.pk'], social: ['pakistan', 'karachi'], exchanges: ['pakistan stock exchange', 'psx'], brokers: ['k trade', 'arif habib'], phones: ['+92'], addresses: ['karachi', 'lahore', 'islamabad'], language: ['اردو ٹریڈنگ', 'پاکستان اسٹاک'] },
@@ -167,13 +189,31 @@ export function countryIsoAlias(value: string): string | null {
 }
 
 function includesSignal(text: string, signals: string[]): string | null {
-  return signals.find(signal => text.includes(signal.toLocaleLowerCase('en'))) || null;
+  return signals.find(signal => {
+    const lower = signal.toLocaleLowerCase('en');
+    // Short acronyms (e.g. jse/lse/tsx/smi/hose) must match on token
+    // boundaries. Raw substring matching turns ordinary words into false
+    // creator-country evidence ('jsem', Czech for "I am", is not the
+    // Johannesburg exchange; 'false'/'pulse'/'else' is not the London
+    // exchange; 'those' is not the Ho Chi Minh exchange; 'smith' is not the
+    // Swiss Market Index). Longer phrases keep substring behavior.
+    if (/^[a-z]{2,4}$/.test(lower)) {
+      return new RegExp(`(?<![\\p{L}\\p{N}_])${lower}(?![\\p{L}\\p{N}_])`, 'iu').test(text);
+    }
+    return text.includes(lower);
+  }) || null;
 }
 
-function addTextEvidence(evidence: CountryInferenceEvidence[], source: CountryEvidenceSource, priority: number, confidence: number, text: string, key: keyof typeof COUNTRY_SIGNALS[string], reason: string): void {
+function matchWindow(text: string, match: string, radius = 80): string {
+  const index = text.toLocaleLowerCase('en').indexOf(match.toLocaleLowerCase('en'));
+  if (index < 0) return '';
+  return text.slice(Math.max(0, index - radius), index + match.length + radius).replace(/\s+/g, ' ').trim();
+}
+
+function addTextEvidence(evidence: CountryInferenceEvidence[], source: CountryEvidenceSource, priority: number, confidence: number, text: string, key: keyof typeof COUNTRY_SIGNALS[string], reason: string, sourceField?: string): void {
   for (const [country, signals] of Object.entries(COUNTRY_SIGNALS)) {
     const match = includesSignal(text, signals[key]);
-    if (match) evidence.push({ source, priority, detectedCountry: country, confidence, matchedValue: match, reasoning: `${reason}: '${match}' indicates ${country}.` });
+    if (match) evidence.push({ source, priority, detectedCountry: country, confidence, matchedValue: match, matchedContext: matchWindow(text, match), ...(sourceField ? { sourceField } : {}), reasoning: `${reason}: '${match}' indicates ${country}.` });
   }
 }
 
@@ -197,27 +237,45 @@ export function assessChannelCountry(
   const official = input.officialCountry?.trim();
   if (official) {
     const country = canonicalCountry(official);
-    evidence.push({ source: 'OFFICIAL_YOUTUBE_METADATA', priority: 1, detectedCountry: country, confidence: 100, matchedValue: official, reasoning: `YouTube's official channel country field identifies ${country}.` });
+    evidence.push({ source: 'OFFICIAL_YOUTUBE_METADATA', priority: 1, detectedCountry: country, confidence: 100, matchedValue: official, sourceField: 'locationTag', reasoning: `YouTube's official channel country field identifies ${country}.` });
   }
 
-  const bioText = `${input.channelName || ''} ${input.aboutBio || ''}`.toLocaleLowerCase('en');
-  addTextEvidence(evidence, 'CHANNEL_ABOUT_BIO', 2, 92, bioText, 'bio', 'Channel About/Bio location');
+  // P2 provenance boundary: creator-country bio evidence is matched per
+  // legitimate creator-level field — channelName, description (aboutBio),
+  // socialBios[] — and every item records which field produced it. Exchange
+  // references, discovery context, video metadata, website content, and
+  // crawler trail prose are never P2 inputs, so they cannot become
+  // creator-country proof no matter what country names they mention.
+  const bioFields: Array<{ sourceField: 'channelName' | 'description' | 'socialBios'; text: string }> = [
+    { sourceField: 'channelName', text: (input.channelName || '').toLocaleLowerCase('en') },
+    { sourceField: 'description', text: (input.aboutBio || '').toLocaleLowerCase('en') },
+    ...((input.socialBios || []).map(bio => ({ sourceField: 'socialBios' as const, text: bio.toLocaleLowerCase('en') }))),
+  ];
+  for (const field of bioFields) {
+    if (!field.text.trim()) continue;
+    addTextEvidence(evidence, 'CHANNEL_ABOUT_BIO', 2, 92, field.text, 'bio', 'Channel About/Bio location', field.sourceField);
+  }
 
   // Match explicit domicile phrases (e.g. "based in Nigeria", "located in Kenya", "trader from Ghana")
   for (const item of exclusions) {
     const name = item.country_name.toLocaleLowerCase('en');
     if (name.length < 3) continue;
     const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|trader from|from|trader in)\\s+${name}\\b|\\b${name}\\s+(?:based|trader|forex trader|crypto trader)\\b`, 'i');
-    const match = bioText.match(domicileRegex);
-    if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
-      evidence.push({
-        source: 'CHANNEL_ABOUT_BIO',
-        priority: 2,
-        detectedCountry: canonicalCountry(item.country_name),
-        confidence: 92,
-        matchedValue: match[0],
-        reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonicalCountry(item.country_name)}.`
-      });
+    for (const field of bioFields) {
+      if (!field.text.trim()) continue;
+      const match = field.text.match(domicileRegex);
+      if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
+        evidence.push({
+          source: 'CHANNEL_ABOUT_BIO',
+          priority: 2,
+          detectedCountry: canonicalCountry(item.country_name),
+          confidence: 92,
+          matchedValue: match[0],
+          matchedContext: matchWindow(field.text, match[0]),
+          sourceField: field.sourceField,
+          reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonicalCountry(item.country_name)}.`
+        });
+      }
     }
   }
 
@@ -226,21 +284,26 @@ export function assessChannelCountry(
     if (!host || SOCIAL_HOSTS.some(social => host === social || host.endsWith(`.${social}`))) continue;
     for (const [country, signals] of Object.entries(COUNTRY_SIGNALS)) {
       const match = signals.tlds.find(tld => host.endsWith(tld));
-      if (match) evidence.push({ source: 'OFFICIAL_WEBSITE_DOMAIN', priority: 3, detectedCountry: country, confidence: 90, matchedValue: host, reasoning: `Official website hostname '${host}' uses the ${match} country domain for ${country}.` });
+      if (match) evidence.push({ source: 'OFFICIAL_WEBSITE_DOMAIN', priority: 3, detectedCountry: country, confidence: 90, matchedValue: host, sourceField: 'officialWebsiteLinks', reasoning: `Official website hostname '${host}' uses the ${match} country domain for ${country}.` });
     }
   }
 
   for (const link of input.verifiedSocialLinks || []) {
     const host = hostname(link);
     if (!SOCIAL_HOSTS.some(social => host === social || host.endsWith(`.${social}`))) continue;
-    addTextEvidence(evidence, 'VERIFIED_SOCIAL_LINK', 4, 82, link.toLocaleLowerCase('en'), 'social', `Verified social profile ${host}`);
+    addTextEvidence(evidence, 'VERIFIED_SOCIAL_LINK', 4, 82, link.toLocaleLowerCase('en'), 'social', `Verified social profile ${host}`, 'verifiedSocialLinks');
   }
 
-  const content = `${input.aboutBio || ''} ${(input.videoTitles || []).join(' ')}`.toLocaleLowerCase('en');
-  addTextEvidence(evidence, 'EXCHANGE_REFERENCE', 5, 78, content, 'exchanges', 'Regional exchange reference');
-  addTextEvidence(evidence, 'BROKER_REFERENCE', 6, 72, content, 'brokers', 'Regional broker reference');
-  addTextEvidence(evidence, 'PHONE_NUMBER', 7, 68, content, 'phones', 'International phone prefix');
-  addTextEvidence(evidence, 'PHYSICAL_ADDRESS', 8, 64, content, 'addresses', 'Physical address or city');
+  // Indirect signals scan the full creator text (description, social bios,
+  // video titles). They can never become P2 creator-country proof — that
+  // boundary is enforced by source allowlisting at selection time — but their
+  // coverage must not shrink when social bios travel in a separate field.
+  const content = `${input.aboutBio || ''} ${(input.socialBios || []).join(' ')} ${(input.videoTitles || []).join(' ')}`.toLocaleLowerCase('en');
+  const contentField = 'aboutBio/socialBios/videoTitles';
+  addTextEvidence(evidence, 'EXCHANGE_REFERENCE', 5, 78, content, 'exchanges', 'Regional exchange reference', contentField);
+  addTextEvidence(evidence, 'BROKER_REFERENCE', 6, 72, content, 'brokers', 'Regional broker reference', contentField);
+  addTextEvidence(evidence, 'PHONE_NUMBER', 7, 68, content, 'phones', 'International phone prefix', contentField);
+  addTextEvidence(evidence, 'PHYSICAL_ADDRESS', 8, 64, content, 'addresses', 'Physical address or city', contentField);
 
   for (const [country, signals] of Object.entries(COUNTRY_SIGNALS)) {
     const matches = signals.language.filter(signal => content.includes(signal.toLocaleLowerCase('en')));
@@ -251,6 +314,8 @@ export function assessChannelCountry(
         detectedCountry: country,
         confidence: Math.min(58, 48 + matches.length * 2),
         matchedValue: matches.slice(0, 3).join(', '),
+        matchedContext: matchWindow(content, matches[0]),
+        sourceField: contentField,
         reasoning: `Multiple native-language market terms indicate ${country}: ${matches.slice(0, 3).join(', ')}.`
       });
     }
@@ -259,7 +324,7 @@ export function assessChannelCountry(
     const terms = [...(vocab.native_trading_terminology || []), ...(vocab.local_market_phrases || [])].map(term => term.toLocaleLowerCase('en')).filter(term => term.length >= 4);
     const matches = terms.filter(term => content.includes(term));
     if (matches.length >= 2 && !evidence.some(item => item.source === 'NATIVE_LANGUAGE' && normalizeCountryName(item.detectedCountry) === normalizeCountryName(vocab.country))) {
-      evidence.push({ source: 'NATIVE_LANGUAGE', priority: 9, detectedCountry: vocab.country, confidence: 52, matchedValue: matches.slice(0, 3).join(', '), reasoning: `Multiple curated native market terms indicate ${vocab.country}: ${matches.slice(0, 3).join(', ')}.` });
+      evidence.push({ source: 'NATIVE_LANGUAGE', priority: 9, detectedCountry: vocab.country, confidence: 52, matchedValue: matches.slice(0, 3).join(', '), matchedContext: matchWindow(content, matches[0]), sourceField: contentField, reasoning: `Multiple curated native market terms indicate ${vocab.country}: ${matches.slice(0, 3).join(', ')}.` });
     }
   }
 
@@ -271,6 +336,7 @@ export function assessChannelCountry(
       detectedCountry: discoveryCountry,
       confidence: 25,
       matchedValue: input.discoveryCountry,
+      sourceField: 'discoveryCountry',
       reasoning: `Discovery context suggests ${discoveryCountry}; no creator-level attribution is implied.`
     });
   }

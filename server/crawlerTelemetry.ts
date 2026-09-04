@@ -40,6 +40,7 @@ export function renderedCrawlerTelemetry(input: {
   inspectedPages: number;
   clicks: number;
   complete: boolean;
+  timedOut?: boolean;
   telemetry?: Partial<CrawlerTelemetry>;
 }): CrawlerTelemetry {
   return {
@@ -47,7 +48,10 @@ export function renderedCrawlerTelemetry(input: {
     ...input.telemetry,
     pagesInspected: input.inspectedPages,
     clicksSucceeded: input.clicks,
-    budgetExhausted: input.telemetry?.budgetExhausted === true || !input.complete,
+    // budgetExhausted must describe the actual budget/time state, never serve
+    // as a generic "incomplete" label: blocked, zero-page, saturation, and
+    // transient failures are incomplete without exhausting any budget.
+    budgetExhausted: input.telemetry?.budgetExhausted === true || input.timedOut === true,
     mode: 'RENDERED',
   };
 }

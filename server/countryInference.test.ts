@@ -348,3 +348,135 @@ test('stronger live official excluded evidence can establish a legitimate termin
   assert.equal(merged.score, 100);
   assert.equal(merged.detectedCountry, 'Vietnam');
 });
+
+test('P2 evidence records exact sourceField, matchedValue, and matchedContext', () => {
+  const result = inferChannelCountry({ channelName: 'Daily Trades', aboutBio: 'Trader based in Prague, Czechia.' });
+  const bio = result.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO' && item.detectedCountry === 'Czechia');
+  assert.ok(bio);
+  assert.equal(bio?.sourceField, 'description');
+  assert.ok(bio?.matchedValue && bio.matchedValue.length > 0);
+  assert.ok(bio?.matchedContext && bio.matchedContext.includes(bio.matchedValue));
+});
+
+test('channelName and socialBios produce independently attributed P2 evidence', () => {
+  const fromName = inferChannelCountry({ channelName: 'Vietnam Trading', aboutBio: 'Daily market analysis in English.' });
+  assert.equal(fromName.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO')?.sourceField, 'channelName');
+  const fromSocial = inferChannelCountry(
+    { channelName: 'Daily Trades', aboutBio: 'Daily market analysis in English.', socialBios: ['Ghana forex trader'] },
+    [{ country_name: 'Ghana', reason: 'test exclusion' }],
+  );
+  assert.equal(fromSocial.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO' && item.detectedCountry === 'Ghana')?.sourceField, 'socialBios');
+});
+
+test('exchange acronyms never collide with ordinary words (jsem/lse/those/smith)', () => {
+  const result = inferChannelCountry({
+    channelName: 'Honest Reviews',
+    aboutBio: 'Beware false gurus and pulse hype from someone else; those calls are noise. Smith reviews markets. Jsem rád, že sleduji.',
+    videoTitles: [],
+  });
+  assert.ok(!result.evidence.some(item => item.detectedCountry === 'South Africa'));
+  assert.ok(!result.evidence.some(item => item.source === 'EXCHANGE_REFERENCE' && item.detectedCountry === 'United Kingdom'));
+  assert.ok(!result.evidence.some(item => item.source === 'EXCHANGE_REFERENCE' && item.detectedCountry === 'Vietnam'));
+  assert.ok(!result.evidence.some(item => item.source === 'EXCHANGE_REFERENCE' && item.detectedCountry === 'Switzerland'));
+});
+
+test('standalone exchange acronyms still match on token boundaries', () => {
+  const jse = inferChannelCountry({ aboutBio: 'Trading JSE stocks and gold.' });
+  assert.ok(jse.evidence.some(item => item.source === 'EXCHANGE_REFERENCE' && item.detectedCountry === 'South Africa' && item.matchedValue === 'jse'));
+  const hose = inferChannelCountry({ aboutBio: 'Covering HOSE opens every morning.' });
+  assert.ok(hose.evidence.some(item => item.source === 'EXCHANGE_REFERENCE' && item.detectedCountry === 'Vietnam'));
+});
+
+test('exchange-only evidence can never reject (needs P2-or-better authority)', () => {
+  const result = inferChannelCountry(
+    { aboutBio: 'Trading the Ho Chi Minh Stock Exchange hose market.' },
+    [{ country_name: 'Vietnam', reason: 'test exclusion' }],
+  );
+  assert.notEqual(result.status, 'REJECTED');
+  assert.ok(!result.evidence.some(item => item.source === 'EXCLUSION_POLICY'));
+});
+
+test('conflicting P2 creator evidence stays uncertain instead of rejecting', () => {
+  const result = inferChannelCountry(
+    { aboutBio: 'Trader based in Prague, Czechia. Previously from South Africa, trading JSE stocks.' },
+    [{ country_name: 'South Africa', reason: 'African Region Exclusion' }],
+  );
+  assert.equal(result.status, 'UNCERTAIN');
+  assert.equal(result.gateDisposition, 'NEEDS_REVIEW');
+  assert.ok(!result.evidence.some(item => item.source === 'EXCLUSION_POLICY'));
+});
+
+test('English bio with no country and HOSE exchange mention is not P2 Vietnam', () => {
+  const result = inferChannelCountry(
+    { channelName: 'Trading Channel', aboutBio: 'Daily market analysis and trade ideas in English. Trading the Ho Chi Minh Stock Exchange hose market.' },
+    [{ country_name: 'Vietnam', reason: 'test exclusion' }],
+  );
+  assert.ok(!result.evidence.some(item => item.source === 'CHANNEL_ABOUT_BIO' && item.detectedCountry === 'Vietnam'));
+  assert.notEqual(result.status, 'REJECTED');
+});
+
+test('empty bio yields UNCERTAIN with no creator country, never rejection', () => {
+  const result = inferChannelCountry(
+    { channelName: 'Trading Channel', aboutBio: '' },
+    [{ country_name: 'Vietnam', reason: 'test exclusion' }],
+  );
+  assert.equal(result.detectedCountry, null);
+  assert.equal(result.status, 'UNCERTAIN');
+  assert.equal(result.gateDisposition, 'CONTINUE_CRAWLING');
+});
+
+test('genuine Czech self-declaration attributes Czechia with provenance', () => {
+  const result = inferChannelCountry({ aboutBio: 'Jsem trader z Prahy, Česká republika. Call +420 123 456 789.' });
+  assert.equal(result.detectedCountry, 'Czechia');
+  const bio = result.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO' && item.detectedCountry === 'Czechia');
+  assert.equal(bio?.sourceField, 'description');
+  assert.ok(!result.evidence.some(item => item.detectedCountry === 'South Africa'));
+});
+
+test('genuine excluded-country declaration still rejects with authority', () => {
+  const result = inferChannelCountry(
+    { aboutBio: 'Trader based in South Africa, Johannesburg.' },
+    [{ country_name: 'South Africa', reason: 'African Region Exclusion' }],
+  );
+  assert.equal(result.status, 'REJECTED');
+  assert.equal(result.gateDisposition, 'REJECT_EXCLUDED');
+});
+
+test('socialBios travel as their own provenance field and default to empty', async () => {
+  const { creatorLevelCountryEvidence } = await import('./countryValidator');
+  const empty = creatorLevelCountryEvidence({ channelName: 'Daily Trades', description: 'Daily analysis.' });
+  assert.deepEqual(empty.socialBios, []);
+  const wired = creatorLevelCountryEvidence({ channelName: 'Daily Trades', description: 'Daily analysis.', socialBios: ['Ghana forex trader'] });
+  assert.deepEqual(wired.socialBios, ['Ghana forex trader']);
+  // Production ingestion/revalidation never supply social biography prose
+  // today (links are URLs, not bios): inference still attributes correctly
+  // when the field is populated, and stays silent when it is absent.
+  const inferred = inferChannelCountry({ channelName: 'Daily Trades', aboutBio: 'Daily analysis.', socialBios: wired.socialBios });
+  assert.equal(inferred.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO' && item.detectedCountry === 'Ghana')?.sourceField, 'socialBios');
+});
+
+test('durable audit lines preserve field, value, context, and rule provenance', async () => {
+  const { formatCountryEvidenceLine } = await import('./countryValidator');
+  const line = formatCountryEvidenceLine({
+    source: 'CHANNEL_ABOUT_BIO',
+    priority: 2,
+    detectedCountry: 'Vietnam',
+    confidence: 92,
+    reasoning: `Channel About/Bio location: 'vietnam' indicates Vietnam.`,
+    matchedValue: 'vietnam',
+    matchedContext: 'trading the markets vietnam forex community',
+    sourceField: 'description',
+  });
+  assert.match(line, /\[P2\] CHANNEL_ABOUT_BIO: Vietnam \(92\/100\)/);
+  assert.match(line, /\[field: description/);
+  assert.match(line, /context: "trading the markets vietnam forex community"/);
+  assert.match(line, /indicates Vietnam/);
+  const bare = formatCountryEvidenceLine({
+    source: 'EXCLUSION_POLICY',
+    priority: 0,
+    detectedCountry: 'Vietnam',
+    confidence: 92,
+    reasoning: 'Excluded by policy.',
+  });
+  assert.ok(!bare.includes('[field:'));
+});

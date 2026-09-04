@@ -28,6 +28,13 @@ export interface BrowserFallbackTelemetry {
   blockedRequests: number;
   rateLimitedRequests: number;
   transientRequests: number;
+  /**
+   * Failed request targets with no later success (terminal unresolved
+   * failures). A failed attempt that later succeeds on retry is recovered,
+   * not terminal: only unresolved failures can invalidate coverage. Tracked
+   * per request URL by the crawler (failed URLs minus succeeded URLs).
+   */
+  unresolvedFailedRequests: number;
   hostBackoffsApplied: number;
   clicksStarted: number;
   clicksSucceeded: number;
@@ -48,6 +55,13 @@ export interface BrowserFallbackResult {
   clicks: number;
   complete: boolean;
   retryable: boolean;
+  /**
+   * True when the per-seed time budget expired before coverage completed.
+   * Threaded separately from failure classes so budget expiration stays
+   * semantically distinct from target blocking, zero-page results, and
+   * transient/network failures in telemetry and outcome classification.
+   */
+  timedOut?: boolean;
   failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED';
   telemetry?: BrowserFallbackTelemetry;
   detail: string;
@@ -106,7 +120,73 @@ export function wasRenderedResultProcessed(
   result: { inspectedPages?: unknown; telemetry?: { requestsStarted?: unknown } | undefined } | null | undefined,
 ): boolean {
   if (!result || typeof result !== 'object') return false;
-  return (Number(result.inspectedPages) || 0) > 0 || (Number(result.telemetry?.requestsStarted) || 0) > 0;
+  // Processing requires actual successfully inspected page evidence. A
+  // request merely starting (admitted but never inspected, e.g. deadline
+  // before admission or pre-handler rejection) is zero-page evidence and must
+  // not count as processed.
+  return (Number(result.inspectedPages) || 0) > 0;
+}
+
+/**
+ * Order-aware lifecycle dispositions: the LAST terminal event for a request
+ * URL wins. A later failure revokes an earlier success (the page's later
+ * processing stage failed terminally), and a later full success resolves an
+ * earlier failure (retry recovery). This is what keeps a permanently failed
+ * child incomplete while letting genuinely recovered retries complete.
+ */
+export interface RenderedRequestTracker {
+  failedRequestUrls: Set<string>;
+  succeededRequestUrls: Set<string>;
+}
+
+export function createRenderedRequestTracker(): RenderedRequestTracker {
+  return { failedRequestUrls: new Set<string>(), succeededRequestUrls: new Set<string>() };
+}
+
+/**
+ * Crawlee errorHandler path: record a failed attempt for the request URL,
+ * revoking any earlier success for the same URL (a later terminal failure
+ * must not be erased by an earlier success mark).
+ */
+export function markRenderedRequestFailed(tracker: RenderedRequestTracker, url: string): void {
+  if (!url) return;
+  tracker.failedRequestUrls.add(url);
+  tracker.succeededRequestUrls.delete(url);
+}
+
+/**
+ * Crawlee requestHandler path: record fully successful page processing for
+ * the request URL, resolving any earlier failure (retry recovery). Call only
+ * after the request's page-processing lifecycle completed (initial/scroll
+ * inspection, control enumeration, link enqueueing) — never for click
+ * handling, never after a merely started request.
+ */
+export function markRenderedRequestSucceeded(tracker: RenderedRequestTracker, url: string): void {
+  if (!url) return;
+  tracker.succeededRequestUrls.add(url);
+  tracker.failedRequestUrls.delete(url);
+}
+
+/** Terminal unresolved failures for completion accounting. */
+export function renderedUnresolvedFailureCount(tracker: RenderedRequestTracker): number {
+  return terminalUnresolvedFailures(tracker.failedRequestUrls, tracker.succeededRequestUrls);
+}
+
+/**
+ * Pure terminal-failure accounting: failed request URLs minus URLs with a
+ * later success. Deduplicated; click outcomes never participate (callers must
+ * only supply request lifecycle URLs).
+ */
+export function terminalUnresolvedFailures(
+  failedRequestUrls: Iterable<string>,
+  succeededRequestUrls: Iterable<string>,
+): number {
+  const succeeded = new Set(succeededRequestUrls);
+  let unresolved = 0;
+  for (const url of new Set(failedRequestUrls)) {
+    if (!succeeded.has(url)) unresolved++;
+  }
+  return unresolved;
 }
 
 export function resolveRenderedCompletionState(input: {
@@ -114,8 +194,26 @@ export function resolveRenderedCompletionState(input: {
   timedOut: boolean;
   telemetry: BrowserFallbackTelemetry;
 }): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
-  const processed = input.inspectedPages > 0 || (input.telemetry?.requestsStarted || 0) > 0;
-  const incomplete = !processed || input.timedOut || (input.telemetry?.requestsFailed || 0) > 0;
+  // Processed means actual successfully inspected page evidence — a request
+  // merely starting (admitted but never inspected) is zero-page evidence.
+  const processed = input.inspectedPages > 0;
+  // Completion considers terminal unresolved failures, not raw attempts: a
+  // failed attempt that later succeeds (retry recovery) is resolved and never
+  // invalidates coverage, while a request that permanently fails after its
+  // retry budget keeps the acquisition incomplete even when sibling pages
+  // succeeded (the failed child may hold the Discord evidence sought).
+  // Timeouts still fail even with pages (expired budget leaves coverage
+  // genuinely unknown; reported as partial downstream when pages exist).
+  // Click outcomes never participate: clicks are opportunistic traversal,
+  // not acquisition evidence.
+  const terminalFailures = input.telemetry?.unresolvedFailedRequests || 0;
+  // Failures with zero inspected pages also stay incomplete: page evidence is
+  // what the Discord search consumes, so failed attempts that never yielded a
+  // page cannot count as coverage (in production these are always terminal,
+  // since a recovered request processes its page; the clause keeps partial
+  // telemetry from resolving clean).
+  const failedWithNoPages = (input.telemetry?.requestsFailed || 0) > 0 && input.inspectedPages === 0;
+  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages;
   return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
@@ -178,12 +276,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     blockedRequests: 0,
     rateLimitedRequests: 0,
     transientRequests: 0,
+    unresolvedFailedRequests: 0,
     hostBackoffsApplied: 0,
     clicksStarted: 0,
     clicksSucceeded: 0,
     clicksFailed: 0,
     clickFailureClasses: { BLOCKED: 0, RATE_LIMITED: 0, TRANSIENT: 0, OTHER: 0 },
   };
+  // Terminal-vs-recovered accounting shared with completion logic below.
+  // Failed attempts and page-processing successes are recorded per request
+  // URL; a later success resolves an earlier failure (retry recovery).
+  const requestTracker = createRenderedRequestTracker();
   const hostBackoffUntil = new Map<string, number>();
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
@@ -227,6 +330,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           }],
           errorHandler: async ({ request, session }, error) => {
             telemetry.requestsFailed++;
+            markRenderedRequestFailed(requestTracker, request.url);
             const retryCount = request.retryCount || 0;
             const policy = renderedCrawlerRetryPolicy(error, retryCount);
             const failureClass = classifyRenderedCrawlerFailure(error);
@@ -248,12 +352,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             telemetry.requestsStarted++;
             try {
-            inspectedPages++;
             const inspect = async () => {
               const url=page.url(),html=await page.content();
               retain(`${url}\n${html}`,url);
             };
+            // Page evidence counts only after the required extraction actually
+            // succeeds: a throw here leaves zero processed evidence (finding:
+            // failed extraction must never claim a page).
             await inspect();
+            inspectedPages++;
 
             for (let i = 0; i < limits.maxScrollsPerPage; i++) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -280,7 +387,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 clicks++;
                 telemetry.clicksSucceeded++;
                 await page.waitForTimeout(400);
-                await inspect();
+            await inspect();
               } catch (error) {
                 telemetry.clicksFailed++;
                 const failureClass = classifyRenderedCrawlerFailure(error);
@@ -291,6 +398,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
               await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>shouldEnqueueRenderedCommunityLink(req.url)?req:false});
             }
+            // Success is recorded only after the request's full page-processing
+            // lifecycle completes (load, scroll traversal, control enumeration,
+            // link enqueueing). A later terminal failure propagates before this
+            // mark, so an earlier success can never erase it; a later full
+            // success resolves an earlier failure (retry recovery). Click
+            // handling owns no marks: clicks never affect terminal accounting.
+            markRenderedRequestSucceeded(requestTracker, request.url);
             } finally {
               telemetry.requestsFinished++;
             }
@@ -300,6 +414,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
         markBrowserCapabilityReady();
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
+        telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const candidates=mergeDiscordCandidates(discovered);
@@ -311,17 +426,18 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           inspectedPages,scrolls,clicks,
           complete:completion.complete,
           retryable:completion.retryable,
+          timedOut,
           failureClass:completion.failureClass,
           telemetry,
           detail:candidates.length
             ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
-            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.requestsFailed>0?`Rendered acquisition incomplete: ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
+            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);
         const failureClass=isBrowserRuntimeFailure(error)?classifyBrowserFailure(error):undefined;
         if (failureClass) markBrowserCapabilityUnavailable(error);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
       }
     });
   } catch (error:any) {
@@ -329,7 +445,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
     const failureClass=saturated||!isBrowserRuntimeFailure(error)?undefined:classifyBrowserFailure(error);
     if (failureClass) markBrowserCapabilityUnavailable(error);
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
   }
 }
 

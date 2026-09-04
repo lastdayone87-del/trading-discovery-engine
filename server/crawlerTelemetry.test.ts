@@ -22,7 +22,7 @@ test('static telemetry records redirect/page/budget measurements without changin
   });
 });
 
-test('rendered telemetry preserves bounded click/request counters and marks incomplete coverage', () => {
+test('rendered telemetry preserves bounded click/request counters without mislabeling budget', () => {
   const telemetry = renderedCrawlerTelemetry({
     inspectedPages: 6,
     clicks: 2,
@@ -42,10 +42,21 @@ test('rendered telemetry preserves bounded click/request counters and marks inco
   assert.equal(telemetry.pagesInspected, 6);
   assert.equal(telemetry.clicksSucceeded, 2);
   assert.equal(telemetry.clicksFailed, 2);
-  assert.equal(telemetry.budgetExhausted, true);
+  // Incomplete without budget expiry must not claim budget exhaustion:
+  // blocked/transient failures are incomplete for non-budget reasons.
+  assert.equal(telemetry.budgetExhausted, false);
   assert.equal(telemetry.navigationTimeouts, 1);
   assert.equal(telemetry.blockedRequests, 1);
   assert.equal(telemetry.hostBackoffsApplied, 3);
+});
+
+test('rendered telemetry marks budget exhaustion only on real budget expiry', () => {
+  const timedOut = renderedCrawlerTelemetry({ inspectedPages: 3, clicks: 0, complete: false, timedOut: true, telemetry: { requestsStarted: 3 } });
+  assert.equal(timedOut.budgetExhausted, true);
+  const clean = renderedCrawlerTelemetry({ inspectedPages: 3, clicks: 0, complete: true, telemetry: { requestsStarted: 3 } });
+  assert.equal(clean.budgetExhausted, false);
+  const zeroPage = renderedCrawlerTelemetry({ inspectedPages: 0, clicks: 0, complete: false, telemetry: { requestsStarted: 0 } });
+  assert.equal(zeroPage.budgetExhausted, false);
 });
 
 test('safe telemetry rejects malformed mode and clamps malformed counters', () => {

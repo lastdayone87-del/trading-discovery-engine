@@ -9,6 +9,21 @@ import {
   GateDisposition
 } from './countryInference';
 
+/**
+ * Durable audit rendering for one country evidence item. Records which
+ * creator field matched, what value matched (in reasoning), the surrounding
+ * context, and which country/rule produced it. These lines persist in
+ * inspection-trail details, so future false attribution is auditable to its
+ * exact field/matcher without feeding trail prose back into evidence.
+ */
+export function formatCountryEvidenceLine(item: CountryInferenceEvidence): string {
+  const provenance: string[] = [];
+  if (item.sourceField) provenance.push(`field: ${item.sourceField}`);
+  if (item.matchedContext) provenance.push(`context: "${item.matchedContext.slice(0, 160)}"`);
+  const suffix = provenance.length ? ` [${provenance.join(' | ')}]` : '';
+  return `  [P${item.priority}] ${item.source}: ${item.detectedCountry} (${item.confidence}/100) — ${item.reasoning}${suffix}`;
+}
+
 export interface ValidationResult {
   score: number;
   status: CountryStatus;
@@ -44,7 +59,11 @@ export function creatorLevelCountryEvidence(channelData: {
   return {
     officialCountry: channelData.locationTag,
     channelName: channelData.channelName,
-    aboutBio: `${channelData.description || ''} ${(channelData.socialBios || []).join(' ')}`,
+    // Provenance boundary: description and socialBios stay separate fields so
+    // P2 evidence records exactly which one produced it. Crawler trail prose,
+    // video metadata, and discovery context must never be passed here.
+    aboutBio: channelData.description || '',
+    socialBios: channelData.socialBios || [],
     officialWebsiteLinks: websiteLinks,
     verifiedSocialLinks: socialLinks,
     // Deliberately exclude videoTitles from country attribution. A creator may
@@ -154,9 +173,12 @@ export async function validateChannelCountry(
     metadataStatus: channelData.metadataStatus
   }, excludedCountries, vocabularies);
 
-  const evidenceLines = assessment.countryEvidence.map(item =>
-    `  [P${item.priority}] ${item.source}: ${item.detectedCountry} (${item.confidence}/100) — ${item.reasoning}`
-  );
+  // Durable audit provenance: every evidence line records which creator field
+  // matched, what value matched, the surrounding context, and which
+  // country/rule produced it. These lines persist in inspection-trail details,
+  // so any future false attribution is auditable to its exact field/matcher
+  // without feeding trail prose back into creator evidence.
+  const evidenceLines = assessment.countryEvidence.map(formatCountryEvidenceLine);
   const decisionLogs = [
     `Official Metadata: ${channelData.metadataStatus === 'UNAVAILABLE' ? 'Unavailable (provider/configuration failure)' : channelData.metadataStatus === 'AVAILABLE_NOT_DECLARED' ? 'Available; channel declared no country' : channelData.metadataStatus === 'AVAILABLE_DECLARED' ? 'Available with declared country' : 'Not requested'}`,
     `Discovery Country: ${assessment.discoveryCountry || 'None'}`,
