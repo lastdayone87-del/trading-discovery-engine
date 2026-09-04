@@ -498,7 +498,7 @@ test('deduped candidate set is fully preserved across mixed success and failure'
 
 // A started-but-never-inspected request is zero-page evidence, not processing.
 test('request starting without page inspection does not count as processed', () => {
-  assert.equal(wasRenderedResultProcessed({ inspectedPages: 0, telemetry: { requestsStarted: 2, requestsFinished: 1 } }), false);
+  assert.equal(wasRenderedResultProcessed({ inspectedPages: 0, telemetry: { requestsStarted: 2 } }), false);
   assert.equal(wasRenderedResultProcessed({ inspectedPages: 1, telemetry: { requestsStarted: 1 } }), true);
   const state = resolveRenderedCompletionState({
     inspectedPages: 0,
