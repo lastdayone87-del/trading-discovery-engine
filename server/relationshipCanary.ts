@@ -1,4 +1,5 @@
 import { getAppSetting, getDb, getDailyYouTubeQuotaBudget, tryReserveQuota, finishQuotaReservation, type DurableJob } from './db';
+import { observeKeywordBaseline } from './candidateTriage';
 import { FEATURED_CHANNEL_PROVIDER_COST } from './featuredChannelAdapter';
 import { PLAYLIST_PROVIDER_COST } from './evidenceGraphAdapters';
 import { fetchYouTubeFeaturedChannels, fetchYouTubePlaylistChannels, type DiscoveredChannelRaw, type RelationshipProvenance } from './youtube';
@@ -265,6 +266,14 @@ export async function processRelationshipCanaryJob(
     matchedDocument: DiscoveredChannelRaw['matchedDocument']; rawObservation: Record<string, unknown>;
   }): Promise<void> => {
     if (!acceptChannel()) return;
+    // Observational keyword baseline (metrics only): would the old funnel
+    // have admitted this candidate? Never influences admission or authority.
+    const keywordBaseline = observeKeywordBaseline(raw);
+    const observedRawObservation: Record<string, unknown> = {
+      ...nomination.rawObservation,
+      keywordBaseline: keywordBaseline.baseline,
+      keywordBaselineReasons: keywordBaseline.reasonCodes,
+    };
     try {
       const record = await nominate({
         channelId: raw.channelId,
@@ -276,7 +285,7 @@ export async function processRelationshipCanaryJob(
         retrievalLane: nomination.sourceType === 'PLAYLIST' ? 'PLAYLIST' : 'FEATURED_CHANNEL',
         resultRank: nomination.resultRank,
         matchedDocument: nomination.matchedDocument,
-        rawObservation: nomination.rawObservation,
+        rawObservation: observedRawObservation,
       });
       raw.nominationId = record?.id || undefined;
       await ingestFn(raw, payload.targetCountry, 'automated_query');
@@ -449,6 +458,8 @@ export interface RelationshipCohortNominationRow {
   cohortId: string | null;
   kind: string | null;
   depth: number | null;
+  /** Observational keyword baseline recorded at nomination time (metrics only). */
+  keywordBaseline?: 'WOULD_ADMIT' | 'WOULD_WITHHOLD' | null;
 }
 
 export interface RelationshipCohortChannelRow {
@@ -466,7 +477,19 @@ export interface RelationshipCohortMetrics {
   confirmed: number;
   relationshipOnlyConfirms: number;
   keywordOverlapConfirms: number;
+  /**
+   * Confirmed cohort channels whose cohort nominations unanimously record a
+   * WOULD_WITHHOLD keyword baseline: the old funnel would not have admitted
+   * them. Stronger than nomination-absence alone; still an observational
+   * proxy (manual sampling required before yield claims).
+   */
+  zeroKeywordConfirms: number;
   rejectedOrUncertain: number;
+  /**
+   * True duplication rate: the proportion of nominations that are duplicates
+   * (0 = every nomination unique, approaching 1 = heavily re-nominated).
+   * Safe on empty cohorts (0, not NaN).
+   */
   duplicationRate: number;
   quotaUnits: number;
   costPerConfirm: number | null;
@@ -502,6 +525,14 @@ export function aggregateRelationshipCohort(
   const confirmed = cohortChannels.filter(row => row.tradingStatus === 'TRADING_CONFIRMED');
   const relationshipOnlyConfirms = confirmed.filter(row => !keywordNominated.has(row.channelId)).length;
   const keywordOverlapConfirms = confirmed.length - relationshipOnlyConfirms;
+  const baselineByChannel = new Map<string, 'WOULD_ADMIT' | 'WOULD_WITHHOLD'>();
+  for (const row of cohort) {
+    // Conservative toward the baseline: any WOULD_ADMIT observation means the
+    // old funnel might have found this channel.
+    if (row.keywordBaseline === 'WOULD_ADMIT') baselineByChannel.set(row.channelId, 'WOULD_ADMIT');
+    else if (!baselineByChannel.has(row.channelId)) baselineByChannel.set(row.channelId, 'WOULD_WITHHOLD');
+  }
+  const zeroKeywordConfirms = confirmed.filter(row => baselineByChannel.get(row.channelId) !== 'WOULD_ADMIT').length;
   const rejectedOrUncertain = cohortChannels.filter(
     row => row.tradingStatus === 'NON_TRADING' || row.tradingStatus === 'UNCERTAIN' || row.tradingStatus === 'NEEDS_REVIEW',
   ).length;
@@ -514,8 +545,9 @@ export function aggregateRelationshipCohort(
     confirmed: confirmed.length,
     relationshipOnlyConfirms,
     keywordOverlapConfirms,
+    zeroKeywordConfirms,
     rejectedOrUncertain,
-    duplicationRate: channelIds.size ? cohort.length / channelIds.size : 0,
+    duplicationRate: cohort.length ? (cohort.length - channelIds.size) / cohort.length : 0,
     quotaUnits,
     costPerConfirm: confirmed.length ? quotaUnits / confirmed.length : null,
   };

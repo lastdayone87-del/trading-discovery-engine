@@ -241,11 +241,13 @@ test('quota exhaustion halts expansion gracefully', async () => {
 
 // 12. Cohort metrics distinguish every required dimension.
 test('cohort metrics aggregate relationship vs keyword evidence', () => {
-  const rel = (channelId: string, kind: string, depth: number) => ({ channelId, sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind, depth });
+  const rel = (channelId: string, kind: string, depth: number, keywordBaseline: 'WOULD_ADMIT' | 'WOULD_WITHHOLD' = 'WOULD_WITHHOLD') => (
+    { channelId, sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind, depth, keywordBaseline }
+  );
   const nominations = [
     rel(UC('a1'), 'featured', 1),
     rel(UC('a1'), 'featured', 1),
-    rel(UC('a2'), 'playlist', 1),
+    rel(UC('a2'), 'playlist', 1, 'WOULD_ADMIT'),
     rel(UC('a3'), 'featured', 2),
     { channelId: UC('a2'), sourceType: 'automated_query', cohortId: null, kind: null, depth: null },
     { channelId: UC('other'), sourceType: 'automated_query', cohortId: null, kind: null, depth: null },
@@ -263,11 +265,80 @@ test('cohort metrics aggregate relationship vs keyword evidence', () => {
   assert.equal(metrics.confirmed, 2);
   assert.equal(metrics.relationshipOnlyConfirms, 1);
   assert.equal(metrics.keywordOverlapConfirms, 1);
+  assert.equal(metrics.zeroKeywordConfirms, 1);
   assert.equal(metrics.rejectedOrUncertain, 1);
-  assert.equal(metrics.duplicationRate, 4 / 3);
+  assert.equal(metrics.duplicationRate, 0.25);
   assert.equal(metrics.quotaUnits, 12);
   assert.equal(metrics.costPerConfirm, 6);
   const empty = aggregateRelationshipCohort('c1', [], [], 0);
   assert.equal(empty.costPerConfirm, null);
   assert.equal(empty.duplicationRate, 0);
+  assert.equal(empty.zeroKeywordConfirms, 0);
+});
+
+test('duplication rate is a true duplicate proportion', () => {
+  const one = (channelId: string) => ({ channelId, sourceType: 'FEATURED_CHANNEL', cohortId: 'c1', kind: 'featured', depth: 1 });
+  const unique = aggregateRelationshipCohort('c1', [one(UC('u1')), one(UC('u2')), one(UC('u3'))], []);
+  assert.equal(unique.duplicationRate, 0);
+  const single = aggregateRelationshipCohort('c1', [one(UC('u1'))], []);
+  assert.equal(single.duplicationRate, 0);
+  const duped = aggregateRelationshipCohort('c1', [one(UC('u1')), one(UC('u1')), one(UC('u1')), one(UC('u2'))], []);
+  assert.equal(duped.duplicationRate, 0.5);
+});
+
+// Corroboration boundary: triage yields hypothesis structure only — no verdict
+// fields capable of establishing trading identity.
+test('relationship triage result carries hypothesis structure, never a verdict', () => {
+  const decision = triageAutonomousSearchCandidate(
+    genericRaw({
+      relationshipProvenance: buildRelationshipProvenance({ cohortId: 'c', kind: 'featured', depth: 1, path: [UC('seed')] }),
+    }),
+    'automated_query',
+    false,
+  );
+  assert.deepEqual(Object.keys(decision).sort(), ['disposition', 'matchedSignals', 'reasonCodes']);
+  assert.equal(decision.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+});
+
+// Observational keyword baseline uses the existing predicate without routing.
+test('keyword baseline observes admission without affecting it', async () => {
+  const { observeKeywordBaseline } = await import('./candidateTriage');
+  const generic = observeKeywordBaseline(genericRaw(), 'automated_query');
+  assert.equal(generic.baseline, 'WOULD_WITHHOLD');
+  const keyworded = observeKeywordBaseline(
+    genericRaw({ channelName: 'NQ Futures Trader', matchedDocument: { type: 'CHANNEL', providerNativeId: 'x', title: 'NQ Futures Trader' } }),
+    'automated_query',
+  );
+  assert.equal(keyworded.baseline, 'WOULD_ADMIT');
+  // Same generic candidate WITH a marker is still admitted by relationship
+  // while its baseline says the old funnel would withhold it.
+  const admitted = triageAutonomousSearchCandidate(
+    genericRaw({ relationshipProvenance: buildRelationshipProvenance({ cohortId: 'c', kind: 'playlist', depth: 2, path: [UC('a'), UC('b')] }) }),
+    'automated_query',
+    false,
+  );
+  assert.equal(admitted.disposition, 'PLAUSIBLE_TRADING_HYPOTHESIS');
+  assert.equal(generic.baseline, 'WOULD_WITHHOLD');
+});
+
+// Worker records the observational baseline on every nomination.
+test('worker persists keyword baseline per nomination without branching on it', async () => {
+  const seen: Record<string, unknown>[] = [];
+  await processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'US', seeds: [{ kind: 'playlist', id: 'PLseedlist' }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
+      fetchPlaylistChannels: async () => [{ channelId: UC('plchan'), channelName: 'Quiet Kitchen', description: 'soup', videoTitles: ['soup sunday'] }],
+      nominate: async (input) => { seen.push(input.rawObservation); return { id: 'n1' }; },
+      ingest: async () => {},
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      log: () => {},
+    },
+  );
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].keywordBaseline, 'WOULD_WITHHOLD');
+  assert.equal(seen[0].cohortId, 'c');
+  assert.equal(seen[0].relationshipDepth, 1);
 });
