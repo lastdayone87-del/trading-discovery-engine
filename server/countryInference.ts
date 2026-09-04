@@ -52,6 +52,12 @@ export interface CountryInferenceInput {
    * Creator social-profile biography texts. Matched as P2 creator-country
    * evidence with sourceField 'socialBios', independently from channelName
    * and description so every P2 item is auditable to its exact field.
+   * NOTE: currently unpopulated by production ingestion/revalidation — no
+   * existing source provides social-profile biography prose (channel links
+   * are URLs, not bios; fetching them would be a new acquisition system).
+   * The typed provenance boundary is ready for future wiring; until then
+   * P2 rests on channelName + description only. Never substitute trail
+   * prose, video metadata, or discovery context here.
    */
   socialBios?: string[];
   officialWebsiteLinks?: string[];

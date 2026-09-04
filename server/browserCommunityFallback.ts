@@ -120,15 +120,52 @@ export function wasRenderedResultProcessed(
   result: { inspectedPages?: unknown; telemetry?: { requestsStarted?: unknown } | undefined } | null | undefined,
 ): boolean {
   if (!result || typeof result !== 'object') return false;
-  return (Number(result.inspectedPages) || 0) > 0 || (Number(result.telemetry?.requestsStarted) || 0) > 0;
+  // Processing requires actual successfully inspected page evidence. A
+  // request merely starting (admitted but never inspected, e.g. deadline
+  // before admission or pre-handler rejection) is zero-page evidence and must
+  // not count as processed.
+  return (Number(result.inspectedPages) || 0) > 0;
 }
 
 /**
- * Terminal-failure accounting for rendered coverage. A failed request attempt
- * that later succeeds (retry recovery, redirect resolution) is resolved and
- * must not invalidate the crawl; a request that never succeeds after its
- * attempts stays unresolved (terminal) and keeps the acquisition incomplete.
- * Click outcomes never participate.
+ * Per-crawl request lifecycle tracker (shared state for the Crawlee
+ * errorHandler/requestHandler wiring below and for completion accounting).
+ * A failed attempt that later succeeds on the same request URL is recovered,
+ * not terminal; only URLs that never succeed after their attempts stay
+ * unresolved. Click outcomes never touch this state.
+ */
+export interface RenderedRequestTracker {
+  failedRequestUrls: Set<string>;
+  succeededRequestUrls: Set<string>;
+}
+
+export function createRenderedRequestTracker(): RenderedRequestTracker {
+  return { failedRequestUrls: new Set<string>(), succeededRequestUrls: new Set<string>() };
+}
+
+/** Crawlee errorHandler path: record a failed attempt for the request URL. */
+export function markRenderedRequestFailed(tracker: RenderedRequestTracker, url: string): void {
+  if (url) tracker.failedRequestUrls.add(url);
+}
+
+/**
+ * Crawlee requestHandler path: record successful page processing for the
+ * request URL. Call only after page evidence was actually retained
+ * (initial/scroll inspection), never for click handling.
+ */
+export function markRenderedRequestSucceeded(tracker: RenderedRequestTracker, url: string): void {
+  if (url) tracker.succeededRequestUrls.add(url);
+}
+
+/** Terminal unresolved failures for completion accounting. */
+export function renderedUnresolvedFailureCount(tracker: RenderedRequestTracker): number {
+  return terminalUnresolvedFailures(tracker.failedRequestUrls, tracker.succeededRequestUrls);
+}
+
+/**
+ * Pure terminal-failure accounting: failed request URLs minus URLs with a
+ * later success. Deduplicated; click outcomes never participate (callers must
+ * only supply request lifecycle URLs).
  */
 export function terminalUnresolvedFailures(
   failedRequestUrls: Iterable<string>,
@@ -147,7 +184,9 @@ export function resolveRenderedCompletionState(input: {
   timedOut: boolean;
   telemetry: BrowserFallbackTelemetry;
 }): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
-  const processed = input.inspectedPages > 0 || (input.telemetry?.requestsStarted || 0) > 0;
+  // Processed means actual successfully inspected page evidence — a request
+  // merely starting (admitted but never inspected) is zero-page evidence.
+  const processed = input.inspectedPages > 0;
   // Completion considers terminal unresolved failures, not raw attempts: a
   // failed attempt that later succeeds (retry recovery) is resolved and never
   // invalidates coverage, while a request that permanently fails after its
@@ -234,11 +273,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     clicksFailed: 0,
     clickFailureClasses: { BLOCKED: 0, RATE_LIMITED: 0, TRANSIENT: 0, OTHER: 0 },
   };
-  // Terminal-vs-recovered accounting: a failed attempt that later succeeds on
-  // the same request URL is recovered (retry/redirect success), not terminal.
-  // Only URLs that never succeed after their attempts stay unresolved.
-  const failedRequestUrls = new Set<string>();
-  const succeededRequestUrls = new Set<string>();
+  // Terminal-vs-recovered accounting shared with completion logic below.
+  // Failed attempts and page-processing successes are recorded per request
+  // URL; a later success resolves an earlier failure (retry recovery).
+  const requestTracker = createRenderedRequestTracker();
   const hostBackoffUntil = new Map<string, number>();
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
@@ -282,7 +320,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           }],
           errorHandler: async ({ request, session }, error) => {
             telemetry.requestsFailed++;
-            failedRequestUrls.add(request.url);
+            markRenderedRequestFailed(requestTracker, request.url);
             const retryCount = request.retryCount || 0;
             const policy = renderedCrawlerRetryPolicy(error, retryCount);
             const failureClass = classifyRenderedCrawlerFailure(error);
@@ -310,6 +348,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               retain(`${url}\n${html}`,url);
             };
             await inspect();
+            // Page evidence retained: the request is successfully processed
+            // regardless of any earlier failed attempt (retry recovery) and
+            // regardless of later click outcomes (clicks never participate).
+            markRenderedRequestSucceeded(requestTracker, request.url);
 
             for (let i = 0; i < limits.maxScrollsPerPage; i++) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -337,7 +379,6 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 telemetry.clicksSucceeded++;
                 await page.waitForTimeout(400);
             await inspect();
-            succeededRequestUrls.add(request.url);
               } catch (error) {
                 telemetry.clicksFailed++;
                 const failureClass = classifyRenderedCrawlerFailure(error);
@@ -357,7 +398,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
         markBrowserCapabilityReady();
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
-        telemetry.unresolvedFailedRequests=terminalUnresolvedFailures(failedRequestUrls,succeededRequestUrls);
+        telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const candidates=mergeDiscordCandidates(discovered);

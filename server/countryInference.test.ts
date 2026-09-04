@@ -441,3 +441,42 @@ test('genuine excluded-country declaration still rejects with authority', () => 
   assert.equal(result.status, 'REJECTED');
   assert.equal(result.gateDisposition, 'REJECT_EXCLUDED');
 });
+
+test('socialBios travel as their own provenance field and default to empty', async () => {
+  const { creatorLevelCountryEvidence } = await import('./countryValidator');
+  const empty = creatorLevelCountryEvidence({ channelName: 'Daily Trades', description: 'Daily analysis.' });
+  assert.deepEqual(empty.socialBios, []);
+  const wired = creatorLevelCountryEvidence({ channelName: 'Daily Trades', description: 'Daily analysis.', socialBios: ['Ghana forex trader'] });
+  assert.deepEqual(wired.socialBios, ['Ghana forex trader']);
+  // Production ingestion/revalidation never supply social biography prose
+  // today (links are URLs, not bios): inference still attributes correctly
+  // when the field is populated, and stays silent when it is absent.
+  const inferred = inferChannelCountry({ channelName: 'Daily Trades', aboutBio: 'Daily analysis.', socialBios: wired.socialBios });
+  assert.equal(inferred.evidence.find(item => item.source === 'CHANNEL_ABOUT_BIO' && item.detectedCountry === 'Ghana')?.sourceField, 'socialBios');
+});
+
+test('durable audit lines preserve field, value, context, and rule provenance', async () => {
+  const { formatCountryEvidenceLine } = await import('./countryValidator');
+  const line = formatCountryEvidenceLine({
+    source: 'CHANNEL_ABOUT_BIO',
+    priority: 2,
+    detectedCountry: 'Vietnam',
+    confidence: 92,
+    reasoning: `Channel About/Bio location: 'vietnam' indicates Vietnam.`,
+    matchedValue: 'vietnam',
+    matchedContext: 'trading the markets vietnam forex community',
+    sourceField: 'description',
+  });
+  assert.match(line, /\[P2\] CHANNEL_ABOUT_BIO: Vietnam \(92\/100\)/);
+  assert.match(line, /\[field: description/);
+  assert.match(line, /context: "trading the markets vietnam forex community"/);
+  assert.match(line, /indicates Vietnam/);
+  const bare = formatCountryEvidenceLine({
+    source: 'EXCLUSION_POLICY',
+    priority: 0,
+    detectedCountry: 'Vietnam',
+    confidence: 92,
+    reasoning: 'Excluded by policy.',
+  });
+  assert.ok(!bare.includes('[field:'));
+});

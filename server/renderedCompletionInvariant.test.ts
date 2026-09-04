@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  createRenderedRequestTracker,
+  markRenderedRequestFailed,
+  markRenderedRequestSucceeded,
+  renderedUnresolvedFailureCount,
   resolveRenderedCompletionState,
   terminalUnresolvedFailures,
   wasRenderedResultProcessed,
@@ -490,4 +494,82 @@ test('deduped candidate set is fully preserved across mixed success and failure'
   const urls = new Set((result.acquisitionOutcomes || []).filter((item) => item.surface === 'CREATOR_WEBSITES').map((item) => item.requestedUrl));
   assert.ok(urls.has('https://one.example.com/'));
   assert.ok(urls.has('https://two.example.com/'));
+});
+
+// A started-but-never-inspected request is zero-page evidence, not processing.
+test('request starting without page inspection does not count as processed', () => {
+  assert.equal(wasRenderedResultProcessed({ inspectedPages: 0, telemetry: { requestsStarted: 2, requestsFinished: 1 } }), false);
+  assert.equal(wasRenderedResultProcessed({ inspectedPages: 1, telemetry: { requestsStarted: 1 } }), true);
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 0,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 1 },
+  });
+  assert.equal(state.complete, false);
+  assert.equal(state.retryable, true);
+  assert.equal(state.failureClass, 'NO_PAGE_PROCESSED');
+});
+
+// Lifecycle 1: seed + child fails once + retry succeeds → recovered → COMPLETE.
+// Exercises the exact tracker/completion composition wired into the crawler.
+test('lifecycle recovered failure completes with usable page evidence', () => {
+  const tracker = createRenderedRequestTracker();
+  markRenderedRequestFailed(tracker, 'https://creator.example/child');
+  markRenderedRequestSucceeded(tracker, 'https://creator.example/');
+  markRenderedRequestSucceeded(tracker, 'https://creator.example/child');
+  assert.equal(renderedUnresolvedFailureCount(tracker), 0);
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 2, requestsFailed: 1, transientRequests: 1, unresolvedFailedRequests: renderedUnresolvedFailureCount(tracker) },
+  });
+  assert.equal(state.complete, true);
+  assert.equal(state.retryable, false);
+});
+
+// Lifecycle 2: seed succeeds + child permanently fails → INCOMPLETE + retryable.
+test('lifecycle terminal child failure keeps crawl incomplete and retryable', () => {
+  const tracker = createRenderedRequestTracker();
+  markRenderedRequestSucceeded(tracker, 'https://creator.example/');
+  markRenderedRequestFailed(tracker, 'https://creator.example/child');
+  markRenderedRequestFailed(tracker, 'https://creator.example/child');
+  assert.equal(renderedUnresolvedFailureCount(tracker), 1);
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 1,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 1, requestsFailed: 2, transientRequests: 2, unresolvedFailedRequests: renderedUnresolvedFailureCount(tracker) },
+  });
+  assert.equal(state.complete, false);
+  assert.equal(state.retryable, true);
+});
+
+// Lifecycle 3: failed/blocked sole request + zero pages → NO_PAGE_PROCESSED.
+test('lifecycle blocked sole request with zero pages is NO_PAGE_PROCESSED', () => {
+  const tracker = createRenderedRequestTracker();
+  markRenderedRequestFailed(tracker, 'https://blocked.example/');
+  assert.equal(renderedUnresolvedFailureCount(tracker), 1);
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 0,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 1, requestsFailed: 1, blockedRequests: 1, unresolvedFailedRequests: renderedUnresolvedFailureCount(tracker) },
+  });
+  assert.equal(state.complete, false);
+  assert.equal(state.retryable, true);
+  assert.equal(state.failureClass, 'NO_PAGE_PROCESSED');
+});
+
+// Lifecycle 5: click handling never touches request terminal accounting.
+test('lifecycle click outcomes never affect terminal accounting or completion', () => {
+  const tracker = createRenderedRequestTracker();
+  markRenderedRequestSucceeded(tracker, 'https://creator.example/');
+  // Clicks have no mark function by design: only page processing and request
+  // failures participate. Completion with click failures stays complete.
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 2, requestsFinished: 2, unresolvedFailedRequests: renderedUnresolvedFailureCount(tracker), clicksStarted: 4, clicksSucceeded: 1, clicksFailed: 3 },
+  });
+  assert.equal(renderedUnresolvedFailureCount(tracker), 0);
+  assert.equal(state.complete, true);
+  assert.equal(state.retryable, false);
 });
