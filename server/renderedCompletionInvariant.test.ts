@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   resolveRenderedCompletionState,
+  terminalUnresolvedFailures,
   wasRenderedResultProcessed,
   type BrowserFallbackTelemetry,
 } from './browserCommunityFallback';
@@ -16,6 +17,7 @@ const zeroTelemetry = (): BrowserFallbackTelemetry => ({
   blockedRequests: 0,
   rateLimitedRequests: 0,
   transientRequests: 0,
+  unresolvedFailedRequests: 0,
   hostBackoffsApplied: 0,
   clicksStarted: 0,
   clicksSucceeded: 0,
@@ -343,16 +345,44 @@ test('duplicate discovered URLs collapse to a single attempted target', async ()
   assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
 });
 
-// A single failed secondary request must not erase useful page coverage.
-test('pages processed with one failed request and no timeout still completes', () => {
+// A failed attempt that later succeeds is recovered: raw requestsFailed must
+// not invalidate coverage on its own — only terminal unresolved failures do.
+test('pages processed with one recovered failed request still completes', () => {
   const state = resolveRenderedCompletionState({
     inspectedPages: 3,
     timedOut: false,
-    telemetry: { ...zeroTelemetry(), requestsStarted: 4, requestsFinished: 3, requestsFailed: 1, transientRequests: 1 },
+    telemetry: { ...zeroTelemetry(), requestsStarted: 4, requestsFinished: 3, requestsFailed: 1, transientRequests: 1, unresolvedFailedRequests: 0 },
   });
   assert.equal(state.complete, true);
   assert.equal(state.retryable, false);
   assert.equal(state.failureClass, undefined);
+});
+
+// A permanently failed child after its attempts keeps the crawl incomplete
+// even when the seed and siblings succeeded: the failed child may hold the
+// Discord evidence sought.
+test('successful seed with terminally failed child stays incomplete and retryable', () => {
+  const state = resolveRenderedCompletionState({
+    inspectedPages: 2,
+    timedOut: false,
+    telemetry: { ...zeroTelemetry(), requestsStarted: 3, requestsFinished: 2, requestsFailed: 1, transientRequests: 1, unresolvedFailedRequests: 1 },
+  });
+  assert.equal(state.complete, false);
+  assert.equal(state.retryable, true);
+});
+
+test('terminalUnresolvedFailures counts failed URLs with no later success', () => {
+  assert.equal(terminalUnresolvedFailures([], []), 0);
+  assert.equal(terminalUnresolvedFailures(['https://a.example/x'], ['https://a.example/x']), 0);
+  assert.equal(terminalUnresolvedFailures(['https://a.example/x', 'https://a.example/x'], ['https://a.example/x']), 0);
+  assert.equal(terminalUnresolvedFailures(['https://a.example/x'], []), 1);
+  assert.equal(
+    terminalUnresolvedFailures(
+      ['https://a.example/x', 'https://b.example/y'],
+      ['https://a.example/x'],
+    ),
+    1,
+  );
 });
 
 // Failures with zero pages remain failures; timeouts always stay incomplete.

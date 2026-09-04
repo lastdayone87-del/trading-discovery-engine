@@ -169,6 +169,17 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
     item.surface !== 'RECENT_VIDEO_DESCRIPTIONS';
 }
 
+/**
+ * Shared validation-lifecycle boundary: whether required community
+ * acquisition observations own a retry (RETRY_PENDING path). All callers must
+ * use this predicate instead of duplicating outcome checks, so FAILED and
+ * retryable PARTIALLY_INSPECTED stay consistent across directive building and
+ * validation-state projection.
+ */
+export function hasRetryableCommunityAcquisitionFailure(observations: CommunityRetryObservation[]): boolean {
+  return observations.some(item => item.required && isCommunityRetryableObservation(item));
+}
+
 export function communityAcquisitionRetryDirective(
   observations: CommunityRetryObservation[],
 ): CommunityRetryDirective | undefined {

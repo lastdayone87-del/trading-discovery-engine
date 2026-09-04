@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {buildCommunityRetryJobMetadata,communityAcquisitionRetryDirective,isCommunityRetryableObservation,isAttemptFreeCommunityFailure,retryAtFromUnknown,attemptFreeDiscordValidation,COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE} from './communityRetryPolicy';
+import {buildCommunityRetryJobMetadata,communityAcquisitionRetryDirective,hasRetryableCommunityAcquisitionFailure,isCommunityRetryableObservation,isAttemptFreeCommunityFailure,retryAtFromUnknown,attemptFreeDiscordValidation,COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE} from './communityRetryPolicy';
 
 test('new retry payload metadata is explicit and starts unreconciled',()=>{
   const metadata=buildCommunityRetryJobMetadata({code:'BROWSER_RUNTIME_UNAVAILABLE',retryReason:'BROWSER_RUNTIME_UNAVAILABLE',retrySource:'INSPECTION',observedAt:'2026-08-25T12:00:00.000Z'});
@@ -81,4 +81,29 @@ test('required partial coverage preserves retry ownership as recoverable',()=>{
 
 test('non-retryable partial coverage owns no retry',()=>{
   assert.equal(isCommunityRetryableObservation({surface:'CREATOR_WEBSITES',required:true,outcome:'PARTIALLY_INSPECTED',retryable:false}),false);
+});
+
+test('partial-only required acquisition follows RETRY_PENDING via the shared boundary',()=>{
+  const partialOnly=[
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'RENDERED_BUDGET_EXPIRED'},
+  ];
+  assert.equal(hasRetryableCommunityAcquisitionFailure(partialOnly),true);
+  // Definitive failures keep their behavior.
+  assert.equal(hasRetryableCommunityAcquisitionFailure([
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NO_PAGE_PROCESSED'},
+  ]),true);
+  // Non-retryable partials must not claim retry ownership.
+  assert.equal(hasRetryableCommunityAcquisitionFailure([
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'PARTIALLY_INSPECTED',retryable:false},
+  ]),false);
+  // YouTube exclusions remain unchanged.
+  assert.equal(hasRetryableCommunityAcquisitionFailure([
+    {surface:'YOUTUBE_ABOUT',required:true,outcome:'PARTIALLY_INSPECTED',retryable:true},
+    {surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true},
+  ]),false);
+  // Successful/FOUND outcomes remain unaffected (no retry ownership).
+  assert.equal(hasRetryableCommunityAcquisitionFailure([
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'FOUND',retryable:false},
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false},
+  ]),false);
 });

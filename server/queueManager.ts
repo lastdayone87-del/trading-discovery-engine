@@ -39,7 +39,7 @@ import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidenc
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
 import { mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
-import { isCommunityRetryableObservation } from './communityRetryPolicy';
+import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
@@ -914,8 +914,10 @@ export async function inspectAndValidateChannel(
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
-      const requiredAcquisitionFailures=(inspection.acquisitionOutcomes||[]).filter(item=>item.required&&item.outcome==='ACQUISITION_FAILED');
-      const hasRetryableAcquisitionFailure=requiredAcquisitionFailures.some(item=>isCommunityRetryableObservation(item));
+      // Shared predicate (not a local outcome check): required retryable FAILED
+      // and required retryable PARTIALLY_INSPECTED both own the RETRY_PENDING
+      // path, so partial-only acquisitions never strand in FAILED_OPERATIONAL.
+      const hasRetryableAcquisitionFailure=hasRetryableCommunityAcquisitionFailure(inspection.acquisitionOutcomes||[]);
       if(!alreadyValidatedSuccess){
         channel.discord_status='UNCERTAIN';
         channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';
