@@ -131,7 +131,12 @@ function canonicalObservationKey(item: AcquisitionObservationLike): string {
   } catch {
     url = url.replace(/\/$/, '');
   }
-  return `${item.surface}\u0000${url}`;
+  // Required (retry-eligible, operational) and auxiliary observations are
+  // different claims about a URL and must never collapse into each other: a
+  // non-required static clean must not swallow a required rendered failure
+  // (which would hide incomplete coverage as successfully inspected).
+  const requiredFlag = (item as { required?: unknown }).required === true ? 'required' : '';
+  return `${item.surface}\u0000${url}|${requiredFlag}`;
 }
 
 const OUTCOME_PRECEDENCE: Record<AcquisitionObservationLike['outcome'], number> = {
