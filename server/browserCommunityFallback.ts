@@ -48,7 +48,7 @@ export interface BrowserFallbackResult {
   clicks: number;
   complete: boolean;
   retryable: boolean;
-  failureClass?: BrowserFailureClass;
+  failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED';
   telemetry?: BrowserFallbackTelemetry;
   detail: string;
 }
@@ -90,6 +90,33 @@ export function isTelegramPostPermalink(rawUrl: string): boolean {
 export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
   if (isTelegramPostPermalink(rawUrl)) return false;
   return COMMUNITY_HINTS.test(rawUrl);
+}
+
+/**
+ * Rendered completion invariant (recall correctness): `complete=true` must
+ * never occur when zero pages/requests were processed. The crawler can resolve
+ * without ever admitting a request to the request handler (seed rejected
+ * pre-handler, deadline before admission, unresolvable hosts such as
+ * `https://g/`, redirect-dead short links); all failure counters then stay at
+ * zero and the naive `!timedOut && requestsFailed===0` check wrongly reports a
+ * clean, fully inspected surface. That false clean suppresses retryability and
+ * destroys Discord discovery recall downstream.
+ */
+export function wasRenderedResultProcessed(
+  result: { inspectedPages?: unknown; telemetry?: { requestsStarted?: unknown } | undefined } | null | undefined,
+): boolean {
+  if (!result || typeof result !== 'object') return false;
+  return (Number(result.inspectedPages) || 0) > 0 || (Number(result.telemetry?.requestsStarted) || 0) > 0;
+}
+
+export function resolveRenderedCompletionState(input: {
+  inspectedPages: number;
+  timedOut: boolean;
+  telemetry: BrowserFallbackTelemetry;
+}): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
+  const processed = input.inspectedPages > 0 || (input.telemetry?.requestsStarted || 0) > 0;
+  const incomplete = !processed || input.timedOut || (input.telemetry?.requestsFailed || 0) > 0;
+  return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
 function boundedEnvInt(value: string | undefined, fallback: number, min: number, max: number): number {
@@ -273,7 +300,8 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
         markBrowserCapabilityReady();
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
-        const incomplete=timedOut||telemetry.requestsFailed>0;
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
+        const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
         return {
@@ -281,12 +309,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           foundLocation:first?.sourceUrl,
           candidates,
           inspectedPages,scrolls,clicks,
-          complete:!incomplete,
-          retryable:incomplete,
+          complete:completion.complete,
+          retryable:completion.retryable,
+          failureClass:completion.failureClass,
           telemetry,
           detail:candidates.length
             ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
-            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.requestsFailed>0?`Rendered acquisition incomplete: ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
+            : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.requestsFailed>0?`Rendered acquisition incomplete: ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);
