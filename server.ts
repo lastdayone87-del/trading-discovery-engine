@@ -53,7 +53,8 @@ import {
   processNextSearchJob,
   executeFullManualSearch,
   startSearchWorkers,
-  auditExistingChannelsWithExclusionEngine
+  auditExistingChannelsWithExclusionEngine,
+  enqueueRelationshipCanaryRun
 } from './server/queueManager';
 import { sanitizeSearchQuery } from './server/youtube';
 import {
@@ -210,6 +211,15 @@ async function startServer() {
   app.post('/api/acquisition-adapters/playlist/proposals',async(req,res)=>{try{res.status(201).json(await proposePlaylistInspection({...req.body,programKey:req.body.programKey||'price-action-trading'}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/control',async(req,res)=>{try{res.json(await configurePlaylistCanary({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(err.message==='ADAPTER_CONFIGURATION_CONFLICT'?409:400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/acquisition-adapters/playlist/actions/:id/enqueue',async(req,res)=>{try{const result=await enqueuePlaylistCanary(req.params.id,String(req.body.targetCountry||''));res.status(result.queued?202:409).json(result);}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
+  // Bounded relationship-canary run (report PR #439 §10 experiment). Admin
+  // only: validates the cohort payload bounds and enqueues exactly one
+  // idempotent job. Execution additionally requires the canary enabled flag
+  // and a cleared kill switch; defaults are inert.
+  app.post('/api/relationship-canary/run',async(req,res)=>{try{
+    if (req.operator?.role !== 'admin') return res.status(403).json({ error: 'Administrator role required for relationship-canary runs.', code: 'FORBIDDEN' });
+    const result=await enqueueRelationshipCanaryRun(req.body||{});
+    res.status(202).json(result);
+  }catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.get('/api/portfolio',async(req,res)=>{try{res.json(await inspectPortfolio(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/portfolio/simulate',async(req,res)=>{try{res.json({networkAccess:false,materialized:false,choices:allocateBestFirst(req.body.candidates||[],req.body.configuration)});}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});
   app.post('/api/portfolio/policies',async(req,res)=>{try{res.status(201).json(await createPolicy({...req.body,actor:req.operator!.actorId}));}catch(err:any){res.status(400).json({error:err.message,code:err.message,requestId:req.requestId});}});

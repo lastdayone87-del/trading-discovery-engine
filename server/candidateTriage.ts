@@ -88,6 +88,28 @@ export function triageAutonomousSearchCandidate(
     };
   }
 
+  // Bounded relationship-canary admission. Candidates discovered by traversing
+  // creator relationships inside an explicitly designated canary cohort carry
+  // relationshipProvenance; the relationship itself establishes a bounded
+  // hypothesis WITHOUT any keyword requirement, so the keyword admission
+  // bottleneck below does not apply to this cohort. This is hypothesis only:
+  // relationship evidence never proves trading identity — downstream gates
+  // (country exclusion, audience, semantic classification, Discord, quality)
+  // remain the verifiers. Depth is capped so traversal cannot run away.
+  const relationship = candidate.relationshipProvenance;
+  if (
+    relationship &&
+    typeof relationship.cohortId === 'string' && relationship.cohortId.trim().length > 0 &&
+    (relationship.kind === 'featured' || relationship.kind === 'playlist') &&
+    Number.isInteger(relationship.depth) && relationship.depth >= 1 && relationship.depth <= 2
+  ) {
+    return {
+      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
+      reasonCodes: ['RELATIONSHIP_DERIVED_HYPOTHESIS', 'RELATIONSHIP_CORROBORATION_VIA_ENRICHMENT_PASS'],
+      matchedSignals: [`RELATIONSHIP_${relationship.kind.toUpperCase()}`, `RELATIONSHIP_DEPTH_${relationship.depth}`]
+    };
+  }
+
   const retrievalText = [
     candidate.channelName,
     candidate.matchedDocument?.title,

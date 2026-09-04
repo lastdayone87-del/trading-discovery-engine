@@ -76,6 +76,19 @@ export function generateCountryQueries(vocab: CountryVocabulary, count = 5): str
   return queries;
 }
 
+export interface RelationshipProvenance {
+  /** Explicitly designated canary cohort this candidate was discovered under. */
+  cohortId: string;
+  /** Relationship kind traversed to reach this candidate. */
+  kind: 'featured' | 'playlist';
+  /** Traversal depth from the cohort seed: 1 for direct relations, 2 maximum. */
+  depth: number;
+  /** Channel the relationship was traversed from (seed at depth 1). */
+  parentChannelId?: string;
+  /** Full traversal path from the seed, e.g. [seed, intermediate]. */
+  path: string[];
+}
+
 export interface DiscoveredChannelRaw {
   channelId: string;
   channelName: string;
@@ -108,6 +121,14 @@ export interface DiscoveredChannelRaw {
   investigationId?: string;
   /** The retrieval document nominated this channel; it is not channel About metadata. */
   matchedDocument?: {type:'VIDEO'|'CHANNEL'|'PLAYLIST'|'EXTERNAL'|'MANUAL'|'UNKNOWN';providerNativeId?:string;title?:string;description?:string;publishedAt?:string;locator?:string};
+  /**
+   * Relationship-canary provenance. Present only for candidates discovered by
+   * traversing creator relationships (featured sections, playlists) inside an
+   * explicitly designated canary cohort — never for keyword search results.
+   * It routes admission (hypothesis only, never proof) and cohort metrics; it
+   * is not creator-level evidence and must never enter country attribution.
+   */
+  relationshipProvenance?: RelationshipProvenance;
   nominationId?: string;
   queryRunId?: string;
   discoveryJobId?: string;
