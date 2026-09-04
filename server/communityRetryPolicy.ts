@@ -159,8 +159,11 @@ export function retryAtFromUnknown(error: any, now = Date.now()): number | undef
 }
 
 export function isCommunityRetryableObservation(item: CommunityRetryObservation): boolean {
+  // Both failed and partially-inspected required community observations own
+  // retries: partial coverage is recoverable/inconclusive, never a terminal
+  // negative. YouTube About / recent-video-description surfaces stay upstream.
   return item.required !== false &&
-    item.outcome === 'ACQUISITION_FAILED' &&
+    (item.outcome === 'ACQUISITION_FAILED' || item.outcome === 'PARTIALLY_INSPECTED') &&
     item.retryable &&
     item.surface !== 'YOUTUBE_ABOUT' &&
     item.surface !== 'RECENT_VIDEO_DESCRIPTIONS';

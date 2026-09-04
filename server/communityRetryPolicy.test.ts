@@ -70,3 +70,15 @@ test('new community retry metadata carries the current lifecycle version',()=>{
   const metadata=buildCommunityRetryJobMetadata({code:'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',retrySource:'INSPECTION',observedAt:'2026-08-25T12:00:00.000Z'});
   assert.equal(metadata.retryLifecycleVersion,2);
 });
+
+test('required partial coverage preserves retry ownership as recoverable',()=>{
+  const partial={surface:'CREATOR_WEBSITES',required:true,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'RENDERED_BUDGET_EXPIRED'};
+  assert.equal(isCommunityRetryableObservation(partial),true);
+  const directive=communityAcquisitionRetryDirective([partial]);
+  assert.equal(directive?.retryReason,'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  assert.equal(directive?.attemptFree,true);
+});
+
+test('non-retryable partial coverage owns no retry',()=>{
+  assert.equal(isCommunityRetryableObservation({surface:'CREATOR_WEBSITES',required:true,outcome:'PARTIALLY_INSPECTED',retryable:false}),false);
+});

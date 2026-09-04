@@ -101,10 +101,13 @@ test('rendered acquisition failure becomes required retryable uncertainty', asyn
     renderedFallback,
   });
 
-  const renderedObservation = result.acquisitionOutcomes?.find(observation => observation.failureClass === 'RENDERED_ACQUISITION_INCOMPLETE');
+  // One inspected page is useful partial evidence: it must not collapse into
+  // "unavailable". The observation stays required and retryable (uncertainty
+  // with retry ownership), classified as partial rather than failed.
+  const renderedObservation = result.acquisitionOutcomes?.find(observation => observation.failureClass === 'RENDERED_PARTIAL_COVERAGE');
   assert.ok(renderedObservation);
   assert.equal(renderedObservation?.required, true);
   assert.equal(renderedObservation?.retryable, true);
-  assert.equal(renderedObservation?.outcome, 'ACQUISITION_FAILED');
-  assert.equal(result.acquisitionStatus, 'ACQUISITION_FAILED');
+  assert.equal(renderedObservation?.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
 });

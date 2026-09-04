@@ -48,6 +48,13 @@ export interface BrowserFallbackResult {
   clicks: number;
   complete: boolean;
   retryable: boolean;
+  /**
+   * True when the per-seed time budget expired before coverage completed.
+   * Threaded separately from failure classes so budget expiration stays
+   * semantically distinct from target blocking, zero-page results, and
+   * transient/network failures in telemetry and outcome classification.
+   */
+  timedOut?: boolean;
   failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED';
   telemetry?: BrowserFallbackTelemetry;
   detail: string;
@@ -115,7 +122,14 @@ export function resolveRenderedCompletionState(input: {
   telemetry: BrowserFallbackTelemetry;
 }): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   const processed = input.inspectedPages > 0 || (input.telemetry?.requestsStarted || 0) > 0;
-  const incomplete = !processed || input.timedOut || (input.telemetry?.requestsFailed || 0) > 0;
+  // A single failed secondary request must not erase otherwise useful page
+  // coverage: failures fail the acquisition only when nothing was processed
+  // at all. Timeouts still fail even with pages, because an expired budget
+  // leaves coverage genuinely unknown (reported as partial downstream when
+  // pages were processed). Click outcomes never participate: clicks are
+  // opportunistic traversal, not acquisition evidence.
+  const failedWithNoPages = (input.telemetry?.requestsFailed || 0) > 0 && input.inspectedPages === 0;
+  const incomplete = !processed || input.timedOut || failedWithNoPages;
   return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
@@ -311,6 +325,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           inspectedPages,scrolls,clicks,
           complete:completion.complete,
           retryable:completion.retryable,
+          timedOut,
           failureClass:completion.failureClass,
           telemetry,
           detail:candidates.length
@@ -321,7 +336,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         const candidates=mergeDiscordCandidates(discovered);
         const failureClass=isBrowserRuntimeFailure(error)?classifyBrowserFailure(error):undefined;
         if (failureClass) markBrowserCapabilityUnavailable(error);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
       }
     });
   } catch (error:any) {
@@ -329,7 +344,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
     const failureClass=saturated||!isBrowserRuntimeFailure(error)?undefined:classifyBrowserFailure(error);
     if (failureClass) markBrowserCapabilityUnavailable(error);
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
   }
 }
 

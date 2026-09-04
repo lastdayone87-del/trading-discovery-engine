@@ -44,7 +44,11 @@ export function creatorLevelCountryEvidence(channelData: {
   return {
     officialCountry: channelData.locationTag,
     channelName: channelData.channelName,
-    aboutBio: `${channelData.description || ''} ${(channelData.socialBios || []).join(' ')}`,
+    // Provenance boundary: description and socialBios stay separate fields so
+    // P2 evidence records exactly which one produced it. Crawler trail prose,
+    // video metadata, and discovery context must never be passed here.
+    aboutBio: channelData.description || '',
+    socialBios: channelData.socialBios || [],
     officialWebsiteLinks: websiteLinks,
     verifiedSocialLinks: socialLinks,
     // Deliberately exclude videoTitles from country attribution. A creator may

@@ -751,10 +751,16 @@ export async function inspectAndValidateChannel(
   let attemptFree = false;
   try {
     // 1. Re-check Country Validation before Discord scanning
+    // Provenance boundary: only creator-level fields may enter P2 matching.
+    // Inspection-trail prose must never stand in for the About/Bio text: the
+    // trail quotes exchange/market references and prior validation logs that
+    // mention country names (e.g. "Vietnam", "South Africa"), which would
+    // manufacture false P2 creator-country evidence. Unknown bio stays empty
+    // (UNCERTAIN → PROCESS), never contaminated.
     const valRes = await validateChannelCountry(
       {
         channelName: channel.channel_name,
-        description: rawDetails?.description || channel.inspection_trail?.map(t => t.details || '').join(' ') || channel.channel_name,
+        description: rawDetails?.description || '',
         videoTitles: rawDetails?.videoTitles || [channel.channel_name],
         locationTag: rawDetails?.locationTag,
         externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : []),
@@ -990,11 +996,15 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
     let rejectedCount = 0;
 
     for (const channel of allChannels) {
-      const trailDetails = (channel.inspection_trail || []).map(t => t.details || '').join(' ') || channel.channel_name;
+      // Provenance boundary (see country revalidation above): the bulk audit
+      // has no stored bio text available, and trail prose quotes country names
+      // from prior validation/ acquisition logs. Feeding it as the Bio would
+      // manufacture P2 evidence and terminally REJECT clean channels, so the
+      // audit may only use the creator-level channelName. Unproven → untouched.
       const valRes = await validateChannelCountry(
         {
           channelName: channel.channel_name,
-          description: trailDetails,
+          description: '',
           videoTitles: [channel.channel_name],
           externalLinks: channel.discord_invite ? [channel.discord_invite] : []
         },
