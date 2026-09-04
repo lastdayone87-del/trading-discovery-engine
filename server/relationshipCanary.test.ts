@@ -185,6 +185,7 @@ test('worker ingests duplicate channels once across seeds', async () => {
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: dup }] }),
       nominate: async () => ({ id: 'n1' }),
       ingest: async (raw) => { ingested.push(raw.channelId); },
@@ -207,6 +208,7 @@ test('seed failure is isolated; siblings proceed and job completes with record',
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchFeaturedChannels: async (sourceChannelId: string) => {
         if (sourceChannelId === UC('badseed')) throw new Error('provider boom');
         return { observations: [{ featuredChannelId: good }] };
@@ -232,6 +234,7 @@ test('quota exhaustion halts expansion gracefully', async () => {
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
       reserveQuota: async () => false,
       finishQuota: async () => {},
@@ -334,6 +337,7 @@ test('worker persists keyword baseline per nomination without branching on it', 
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchPlaylistChannels: async () => [{ channelId: UC('plchan'), channelName: 'Quiet Kitchen', description: 'soup', videoTitles: ['soup sunday'] }],
       nominate: async (input) => { seen.push(input.rawObservation); return { id: 'n1' }; },
       ingest: async () => {},
@@ -404,6 +408,7 @@ test('maxChannels stops provider traversal at the boundary', async () => {
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchFeaturedChannels: async () => { fetches++; return { observations: [{ featuredChannelId: UC('c1') }, { featuredChannelId: UC('c2') }] }; },
       nominate: async () => ({ id: 'n1' }),
       ingest: async () => {},
@@ -429,6 +434,7 @@ test('duplicate seeds and seed-as-discovery expand exactly once', async () => {
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchFeaturedChannels: async (sourceChannelId: string) => {
         fetches++;
         seen.push(sourceChannelId);
@@ -478,6 +484,7 @@ test('zero quota allowance halts before any fetch', async () => {
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 0 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
       reserveQuota: async () => true,
       finishQuota: async () => {},
@@ -499,6 +506,7 @@ test('reserved baseline from other cohorts counts against the allocation', async
     {
       settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
       dailyBudget: 10000,
+      checkCountryAllowed: async () => {},
       fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
       reserveQuota: async () => true,
       finishQuota: async () => {},
@@ -569,7 +577,8 @@ test('canary enqueue is idempotent per cohort/day and never reopens runs', async
     return { id: `job-${calls.length}` };
   }) as never;
   const input = { cohortId: 'c9', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 50 };
-  const first = await enqueueRelationshipCanaryRun(input, { enqueueJob });
+  const allowCountry = { enqueueJob, checkCountryAllowed: async () => {} };
+  const first = await enqueueRelationshipCanaryRun(input, allowCountry);
   assert.equal(first.cohortId, 'c9');
   assert.equal(calls.length, 1);
   // Narrowly scoped reopen guard: completed/failed rows are returned as-is,
@@ -579,13 +588,112 @@ test('canary enqueue is idempotent per cohort/day and never reopens runs', async
   // Idempotency key is cohort+day scoped: same cohort/day shares it, anything
   // else is independent.
   const keyOf = (opts: Record<string, unknown>) => String(opts.idempotencyKey || '');
-  const second = await enqueueRelationshipCanaryRun(input, { enqueueJob });
+  const second = await enqueueRelationshipCanaryRun(input, allowCountry);
   assert.equal(keyOf(calls[1].opts), keyOf(calls[0].opts));
   assert.equal(second.cohortId, 'c9');
-  const other = await enqueueRelationshipCanaryRun({ ...input, cohortId: 'c10' }, { enqueueJob });
+  const other = await enqueueRelationshipCanaryRun({ ...input, cohortId: 'c10' }, allowCountry);
   assert.notEqual(keyOf(calls[2].opts), keyOf(calls[0].opts));
   assert.equal(other.cohortId, 'c10');
   // Invalid payloads never reach the queue.
-  await assert.rejects(enqueueRelationshipCanaryRun({ cohortId: '', targetCountry: 'US', seeds: [] }, { enqueueJob }), /COHORT|SEEDS/);
+  await assert.rejects(enqueueRelationshipCanaryRun({ cohortId: '', targetCountry: 'US', seeds: [] }, allowCountry), /COHORT|SEEDS/);
   assert.equal(calls.length, 3);
+});
+
+// Spent-units query: consumed same-day rows count, old rows excluded, single SUM.
+test('spent-units query counts reserved plus same-day consumed exactly once', async () => {
+  const { relationshipCanarySpentUnitsQuery } = await import('./relationshipCanary');
+  const query = relationshipCanarySpentUnitsQuery('2026-09-04T07:00:00.000Z');
+  assert.match(query.text, /operation_type='RELATIONSHIP_CANARY'/);
+  assert.match(query.text, /status='RESERVED'/);
+  assert.match(query.text, /status='CONSUMED'/);
+  assert.match(query.text, /consumed_at/);
+  assert.deepEqual(query.values, ['2026-09-04T07:00:00.000Z']);
+  // Single aggregate over mutually exclusive statuses: no double counting.
+  assert.equal((query.text.match(/SUM\(units\)/g) || []).length, 1);
+});
+
+// Sequential same-day cohorts share one allocation (the quota finding scenario).
+test('cohort B cannot re-spend cohort A consumed allocation', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const live = {
+    settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
+    dailyBudget: 1000,
+    checkCountryAllowed: async () => {},
+  };
+  const runCohort = (cohortId: string, reservedBaseline: number) => processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId, targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      ...live,
+      fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: UC('found') }] }),
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => {},
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      readReservedUnits: async () => reservedBaseline,
+      log: () => {},
+    },
+  );
+  // Allowance at 1% of 1000 = 10. Cohort A spends its full share.
+  const cohortA = await runCohort('cohort-a', 0);
+  assert.equal(cohortA.status, 'COMPLETED');
+  // Cohort B later the same day sees A's 10 consumed units in its baseline
+  // and halts before any fetch: no second full allocation.
+  const spent = 10;
+  const cohortB = await runCohort('cohort-b', spent);
+  assert.equal(cohortB.status, 'QUOTA_EXHAUSTED');
+  assert.equal(cohortB.nominations, 0);
+  // Partial baseline still permits the remainder: 6 used of 10 allows a
+  // 1-unit fetch but records honest spend.
+  let fetches = 0;
+  const cohortC = await processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId: 'cohort-c', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      ...live,
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      readReservedUnits: async () => 6,
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 1);
+  assert.equal(cohortC.status, 'COMPLETED');
+});
+
+// Excluded countries never launch or spend.
+test('excluded target country is rejected at enqueue and execution', async () => {
+  const { enqueueRelationshipCanaryRun } = await import('./queueManager');
+  const blocked = new Error('excluded');
+  await assert.rejects(
+    enqueueRelationshipCanaryRun(
+      { cohortId: 'c', targetCountry: 'XX', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 },
+      { enqueueJob: (async () => { throw new Error('must not enqueue'); }) as never, checkCountryAllowed: async () => { throw blocked; } },
+    ),
+    /excluded/,
+  );
+  let fetches = 0;
+  await assert.rejects(
+    processRelationshipCanaryJob(
+      { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'XX', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+      async () => {},
+      {
+        settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+        dailyBudget: 10000,
+        checkCountryAllowed: async () => { throw blocked; },
+        fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+        log: () => {},
+      },
+    ),
+    /excluded/,
+  );
+  assert.equal(fetches, 0);
+});
+
+// Consumer wiring: SEARCH pool continuously claims the canary type.
+test('SEARCH pool claims canary jobs through the existing tick lifecycle', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  assert.match(source, /startWorkerPool\('SEARCH_YOUTUBE'[\s\S]*?'RELATIONSHIP_CANARY_EXPANSION'/);
 });

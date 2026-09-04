@@ -1,4 +1,6 @@
 import { getAppSetting, getDb, getDailyYouTubeQuotaBudget, tryReserveQuota, finishQuotaReservation, type DurableJob } from './db';
+import { getYouTubeQuotaDayStartAt } from './youtubeQuotaDay';
+import { assertCountryAllowed } from './countryExclusion';
 import { observeKeywordBaseline } from './candidateTriage';
 import { FEATURED_CHANNEL_PROVIDER_COST } from './featuredChannelAdapter';
 import { PLAYLIST_PROVIDER_COST } from './evidenceGraphAdapters';
@@ -220,6 +222,8 @@ export interface RelationshipCanaryDeps {
   readReservedUnits?: () => Promise<number>;
   /** Test override for the shared daily budget (production reads provider config). */
   dailyBudget?: number;
+  /** Test override for the excluded-country gate (production uses assertCountryAllowed). */
+  checkCountryAllowed?: (country: string) => Promise<void>;
   /** Test/operator override for the enabled/kill-switch settings (production reads app settings). */
   settings?: RelationshipCanarySettings;
   log?: (message: string) => void;
@@ -239,15 +243,25 @@ async function defaultReserveQuota(operationId: string, units: number): Promise<
 }
 
 /**
- * Already-reserved canary units across runs/cohorts (20-minute reservation
- * window). Lets concurrent canary runs share one configured allocation
- * instead of each spending a full share.
+ * Already-spent canary units for the active quota day: live RESERVED rows
+ * plus CONSUMED rows from earlier (possibly completed) runs since the current
+ * YouTube quota-day start. Single-status rows can never double-count. Old
+ * CONSUMED rows from previous quota days are excluded (no cross-day leakage).
  */
+export function relationshipCanarySpentUnitsQuery(dayStartIso: string): { text: string; values: [string] } {
+  return {
+    text: `SELECT COALESCE(SUM(units),0)::int AS reserved FROM quota_reservations
+      WHERE operation_type='RELATIONSHIP_CANARY'
+        AND (status='RESERVED'
+             OR (status='CONSUMED' AND COALESCE(consumed_at, reserved_at) >= $1::timestamptz))`,
+    values: [dayStartIso],
+  };
+}
+
 async function defaultReadReservedUnits(): Promise<number> {
   const db = await getDb();
-  const res = await db.query(
-    `SELECT COALESCE(SUM(units),0)::int AS reserved FROM quota_reservations WHERE operation_type='RELATIONSHIP_CANARY' AND status='RESERVED'`,
-  );
+  const query = relationshipCanarySpentUnitsQuery(new Date(getYouTubeQuotaDayStartAt()).toISOString());
+  const res = await db.query(query.text, query.values);
   return Number(res.rows[0]?.reserved || 0);
 }
 
@@ -284,6 +298,10 @@ export async function processRelationshipCanaryJob(
     log(`[RelationshipCanary] cohort=${payload.cohortId} killed (enabled=${settings.enabled}); no provider spend.`);
     return summary;
   }
+  // Execution-time exclusion boundary (mirrors enqueue-time): countries
+  // excluded after queuing must not spend provider quota or enter ingestion.
+  const checkAllowed = deps.checkCountryAllowed || (async (country: string) => { await assertCountryAllowed(country, 'relationship-canary:execution'); });
+  await checkAllowed(payload.targetCountry);
   const fetchFeatured = deps.fetchFeaturedChannels || fetchYouTubeFeaturedChannels;
   const fetchPlaylist = deps.fetchPlaylistChannels || fetchYouTubePlaylistChannels;
   // Effective ingest: explicit dep override wins (tests), otherwise the live

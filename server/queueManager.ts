@@ -151,10 +151,18 @@ export function preferredLanguageFromQueryMetadata(metadata: Record<string, unkn
 }
 
 /**
+ * Durable job types claimable through processNextSearchJob overrides.
+ * RELATIONSHIP_CANARY_EXPANSION rides the existing SEARCH pool (same YouTube
+ * provider profile, same tick lifecycle) behind its own settings gate, so no
+ * new worker architecture is required for continuous canary consumption.
+ */
+export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
+
+/**
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
-  claimableOverride?: Array<'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION'>,
+  claimableOverride?: Array<ClaimableSearchJobType>,
   workerId = WORKER_ID
 ): Promise<boolean> {
   await recoverStaleJobs();
@@ -998,10 +1006,14 @@ export function communityAcquisitionRetryKey(channelId:string):string{return `co
  */
 export async function enqueueRelationshipCanaryRun(
   input: unknown,
-  deps?: { enqueueJob?: typeof enqueueJob },
+  deps?: { enqueueJob?: typeof enqueueJob; checkCountryAllowed?: (country: string) => Promise<void> },
 ): Promise<{ jobId: string; cohortId: string }> {
   const { validateRelationshipCanaryPayload, RELATIONSHIP_CANARY_JOB_TYPE } = await import('./relationshipCanary');
   const payload = validateRelationshipCanaryPayload(input);
+  // Enqueue-time exclusion boundary (same gate as search/enrichment jobs):
+  // excluded targets never enter the canary queue.
+  const checkAllowed = deps?.checkCountryAllowed || (async (country: string) => { await assertCountryAllowed(country, 'relationship-canary:enqueue'); });
+  await checkAllowed(payload.targetCountry);
   const day = new Date().toISOString().slice(0, 10);
   const enqueue = deps?.enqueueJob || enqueueJob;
   const job = await enqueue(
@@ -1446,13 +1458,13 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
   return { session, traceId, message: 'Manual discovery is queued; page 1 and all continuation pages will run in the high-priority durable queue.' };
 }
 
-function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number): void {
+function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = []): void {
   const safeConcurrency = Math.min(20, Math.max(1, Math.floor(concurrency) || 1));
   for (let index = 0; index < safeConcurrency; index++) {
     const workerId = `${type.toLowerCase()}_${process.pid}_${index}`;
     const tick = async () => {
       try {
-        await processNextSearchJob([type], workerId);
+        await processNextSearchJob([type, ...extraClaimableTypes], workerId);
       } catch (error) {
         console.error(`[Queue Worker:${workerId}] Worker tick failed:`, error);
       } finally {
@@ -1474,7 +1486,10 @@ let workersStarted = false;
 export function startSearchWorkers(): void {
   if (workersStarted) return;
   workersStarted = true;
-  startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)));
+  // The canary shares the SEARCH pool tick (same provider profile, same
+  // lifecycle, unchanged concurrency): its own settings gate keeps the claim
+  // closed unless explicitly enabled, so default pool behavior is identical.
+  startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)), ['RELATIONSHIP_CANARY_EXPANSION']);
   startWorkerPool('MANUAL_SEARCH_PAGE', Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1)));
   startWorkerPool('ENRICH_CHANNEL', Math.max(1, Number(process.env.ENRICHMENT_WORKER_CONCURRENCY || 1)));
 }
