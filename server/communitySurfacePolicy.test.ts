@@ -28,6 +28,89 @@ test('ranking is prioritization only and keeps low-value URLs for later inspecti
   assert.ok(scoreCommunitySurface(ranked[0]) > scoreCommunitySurface(ranked[ranked.length - 1]));
 });
 
+test('required rendered success supersedes earlier non-required static failure regardless of order', () => {
+  const staticFailure = {
+    requestedUrl: 'https://creator.example/guide',
+    surface: 'CREATOR_WEBSITES',
+    outcome: 'ACQUISITION_FAILED' as const,
+    required: false,
+  };
+  const renderedSuccess = {
+    requestedUrl: 'https://creator.example/guide',
+    surface: 'CREATOR_WEBSITES',
+    outcome: 'INSPECTED_NO_MATCH' as const,
+    required: true,
+  };
+  for (const observations of [[staticFailure, renderedSuccess], [renderedSuccess, staticFailure]]) {
+    const effective = effectiveAcquisitionOutcomes(observations);
+    assert.equal(effective.length, 1);
+    assert.equal(effective[0].outcome, 'INSPECTED_NO_MATCH');
+    assert.equal((effective[0] as { required?: unknown }).required, true);
+  }
+});
+
+test('required rendered failure overrides earlier non-required static clean regardless of order', () => {
+  const staticClean = {
+    requestedUrl: 'https://creator.example/guide',
+    surface: 'CREATOR_WEBSITES',
+    outcome: 'INSPECTED_NO_MATCH' as const,
+    required: false,
+  };
+  const renderedFailure = {
+    requestedUrl: 'https://creator.example/guide',
+    surface: 'CREATOR_WEBSITES',
+    outcome: 'ACQUISITION_FAILED' as const,
+    required: true,
+  };
+  for (const observations of [[staticClean, renderedFailure], [renderedFailure, staticClean]]) {
+    const effective = effectiveAcquisitionOutcomes(observations);
+    assert.equal(effective.length, 1);
+    assert.equal(effective[0].outcome, 'ACQUISITION_FAILED');
+    assert.equal((effective[0] as { required?: unknown }).required, true);
+  }
+});
+
+test('required rendered success supersedes non-required static partial results', () => {
+  const effective = effectiveAcquisitionOutcomes([
+    {
+      requestedUrl: 'https://creator.example/guide',
+      surface: 'CREATOR_WEBSITES',
+      outcome: 'PARTIALLY_INSPECTED' as const,
+      required: false,
+    },
+    {
+      requestedUrl: 'https://creator.example/guide',
+      surface: 'CREATOR_WEBSITES',
+      outcome: 'INSPECTED_NO_MATCH' as const,
+      required: true,
+    },
+  ]);
+  assert.equal(effective.length, 1);
+  assert.equal(effective[0].outcome, 'INSPECTED_NO_MATCH');
+});
+
+test('explicit zero-evidence clean never beats a real failure signal for the same URL', () => {
+  const zeroEvidence = { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0, budgetExhausted: false };
+  const effective = effectiveAcquisitionOutcomes([
+    {
+      requestedUrl: 'https://creator.example/guide',
+      surface: 'CREATOR_WEBSITES',
+      outcome: 'INSPECTED_NO_MATCH' as const,
+      required: true,
+      telemetry: zeroEvidence,
+    },
+    {
+      requestedUrl: 'https://creator.example/guide',
+      surface: 'CREATOR_WEBSITES',
+      outcome: 'ACQUISITION_FAILED' as const,
+      required: true,
+      telemetry: { pagesInspected: 1, requestsStarted: 0, redirectsFollowed: 0, budgetExhausted: false },
+    },
+  ]);
+  assert.equal(effective.length, 1);
+  assert.equal(effective[0].outcome, 'ACQUISITION_FAILED');
+});
+
 test('successful rendered coverage supersedes an earlier static failure for the same URL', () => {
   const observations = effectiveAcquisitionOutcomes([
     {

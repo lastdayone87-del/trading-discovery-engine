@@ -258,8 +258,9 @@ test('mixed real no-match and zero-page incomplete yields PARTIAL with community
   assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
 });
 
-// 9. Step 4 success-counting: zero-page-only is PARTIAL (mixed static clean +
-// required rendered failure), genuine-only is NOT_FOUND.
+// 9. Step 4 success-counting: zero-only is ERROR (the required rendered
+// failure dominates the superseded auxiliary static clean), genuine-only is
+// NOT_FOUND.
 test('Step 4 counts only evidenced inspections as success', async () => {
   const zeroOnly = await runChannelInspection({
     channelId: 'UCstepzero0000000000000001',
@@ -271,9 +272,9 @@ test('Step 4 counts only evidenced inspections as success', async () => {
     externalFetchImpl: noInviteHtml as typeof fetch,
     renderedFallback: zeroPageStub(),
   });
-  // Static clean (auxiliary) plus required rendered failure is mixed coverage:
-  // the zero-page pass must not be counted as a success.
-  assert.equal(zeroOnly.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
+  // Static clean (auxiliary) plus required rendered failure collapses to the
+  // required failure: the zero-page pass must not be counted as a success.
+  assert.equal(zeroOnly.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'ERROR');
 
   const genuineOnly = await runChannelInspection({
     channelId: 'UCstepgenuine00000000000001',
@@ -286,6 +287,28 @@ test('Step 4 counts only evidenced inspections as success', async () => {
     renderedFallback: processedStub(),
   });
   assert.equal(genuineOnly.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
+});
+
+// Static partial/failure followed by required rendered success collapses to
+// INSPECTED_NO_MATCH end to end (never PARTIALLY_INSPECTED).
+test('static budget exhaustion with later successful rendered completion reports INSPECTED_NO_MATCH', async () => {
+  const rootLinks = Array.from({ length: 12 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
+  const result = await runChannelInspection({
+    channelId: 'UCexhaustrender000000000001',
+    channelName: 'Exhaust Render Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://exhaust.test/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async (input) =>
+      String(input) === 'https://exhaust.test/'
+        ? html(rootLinks)
+        : html('Subpage without invite')) as typeof fetch,
+    renderedFallback: processedStub(),
+  });
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
+  assert.equal(result.retryDirective, undefined);
 });
 
 // 7. Duplicate URLs collapse without losing the unique target.

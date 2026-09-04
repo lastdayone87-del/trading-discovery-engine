@@ -131,12 +131,11 @@ function canonicalObservationKey(item: AcquisitionObservationLike): string {
   } catch {
     url = url.replace(/\/$/, '');
   }
-  // Required (retry-eligible, operational) and auxiliary observations are
-  // different claims about a URL and must never collapse into each other: a
-  // non-required static clean must not swallow a required rendered failure
-  // (which would hide incomplete coverage as successfully inspected).
-  const requiredFlag = (item as { required?: unknown }).required === true ? 'required' : '';
-  return `${item.surface}\u0000${url}|${requiredFlag}`;
+  // One canonical key per surface+URL (required-agnostic): collapsing happens
+  // in effectiveAcquisitionOutcomes with required-dominance, so a required
+  // rendered result and a non-required static note for the same URL always
+  // resolve to a single effective outcome instead of coexisting.
+  return `${item.surface}\u0000${url}`;
 }
 
 const OUTCOME_PRECEDENCE: Record<AcquisitionObservationLike['outcome'], number> = {
@@ -145,34 +144,69 @@ const OUTCOME_PRECEDENCE: Record<AcquisitionObservationLike['outcome'], number> 
   INSPECTED_NO_MATCH: 2,
   FOUND: 3,
 };
-
 /**
  * Collapses multiple acquisition attempts for the same surface+URL into the
- * best effective coverage. A successful rendered inspection therefore
+ * single correct effective outcome. A successful rendered inspection therefore
  * supersedes an earlier static acquisition failure without deleting the raw
  * audit observations.
+ *
+ * Selection within a group, in order:
+ * 1. Any FOUND wins — a discovered candidate must never be lost to collapse.
+ * 2. Required (retry-eligible, operational) observations dominate auxiliary
+ *    notes: a required rendered failure overrides an earlier non-required
+ *    static clean, and a required rendered success supersedes an earlier
+ *    non-required static failure/partial — regardless of observation order.
+ * 3. An unevidenced clean never beats a real signal: an INSPECTED_NO_MATCH
+ *    carrying explicit zero-evidence telemetry loses to a failure/partial (or
+ *    an evidenced clean) in the same pool. Observations predating telemetry
+ *    count as evidenced (absence of a signal is not a signal of absence).
+ * 4. Otherwise the best outcome wins, ties broken by latest observation.
  */
 export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLike>(observations: T[]): T[] {
-  const effective = new Map<string, { item: T; index: number }>();
-
+  const groups = new Map<string, Array<{ item: T; index: number }>>();
   observations.forEach((item, index) => {
     const key = canonicalObservationKey(item);
-    const existing = effective.get(key);
-    if (!existing) {
-      effective.set(key, { item, index });
-      return;
-    }
-
-    const incomingPrecedence = OUTCOME_PRECEDENCE[item.outcome];
-    const existingPrecedence = OUTCOME_PRECEDENCE[existing.item.outcome];
-    if (incomingPrecedence > existingPrecedence || (incomingPrecedence === existingPrecedence && index > existing.index)) {
-      effective.set(key, { item, index });
-    }
+    const group = groups.get(key);
+    if (group) group.push({ item, index });
+    else groups.set(key, [{ item, index }]);
   });
 
-  return [...effective.values()]
+  const hasProcessedEvidence = (entry: { item: T }): boolean => {
+    const telemetry = (
+      entry.item as {
+        telemetry?: { pagesInspected?: unknown; requestsStarted?: unknown; redirectsFollowed?: unknown };
+      }
+    ).telemetry;
+    if (!telemetry) return true;
+    return (
+      (Number(telemetry.pagesInspected) || 0) > 0 ||
+      (Number(telemetry.requestsStarted) || 0) > 0 ||
+      (Number(telemetry.redirectsFollowed) || 0) > 0
+    );
+  };
+
+  const pick = (entries: Array<{ item: T; index: number }>): { item: T; index: number } => {
+    const found = entries.filter((entry) => entry.item.outcome === 'FOUND');
+    const pool = found.length > 0 ? found : entries;
+    const required = pool.filter((entry) => (entry.item as { required?: unknown }).required === true);
+    const eligible = required.length > 0 ? required : pool;
+    const evidenced = eligible.filter(
+      (entry) => entry.item.outcome !== 'INSPECTED_NO_MATCH' || hasProcessedEvidence(entry),
+    );
+    const finalists = evidenced.length > 0 ? evidenced : eligible;
+    return finalists.reduce((best, entry) => {
+      const precedence = OUTCOME_PRECEDENCE[entry.item.outcome];
+      const bestPrecedence = OUTCOME_PRECEDENCE[best.item.outcome];
+      return precedence > bestPrecedence || (precedence === bestPrecedence && entry.index > best.index)
+        ? entry
+        : best;
+    });
+  };
+
+  return [...groups.values()]
+    .map(pick)
     .sort((a, b) => a.index - b.index)
-    .map(entry => entry.item);
+    .map((entry) => entry.item);
 }
 
 /**
