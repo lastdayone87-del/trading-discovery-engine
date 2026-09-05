@@ -1204,6 +1204,11 @@ const makeLifecycleStore = () => {
         }
         return { rows: [] };
       }
+      if (t.includes('SELECT 1 FROM jobs WHERE id=$1')) {
+        const [id, attempt, worker] = values as [string, number, string];
+        const owned = id === 'job-9' && job.status === 'PROCESSING' && job.attempts === attempt && job.locked_by === worker;
+        return { rows: owned ? [{ '?column?': 1 }] : [], rowCount: owned ? 1 : 0 };
+      }
       throw new Error(`unexpected statement: ${text.slice(0, 100)}`);
     }),
   };
@@ -1406,4 +1411,57 @@ test('worker losing ownership mid-run stops before further fetches', async () =>
   assert.equal(summary.nominations, 1);
   assert.equal(summary.depth2Fetches, 0);
   assert.ok(checks >= 3);
+});
+
+// Ownership predicate truth table against the live jobs row semantics.
+test('claimOwnershipChecker reflects claim, recovery, and mismatch states', async () => {
+  const { claimOwnershipChecker } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  const check = (workerId: string, attemptNumber: number) =>
+    claimOwnershipChecker(store.query, 'job-9', { workerId, attemptNumber })();
+  store.claim('worker-A');
+  assert.equal(await check('worker-A', 1), true);
+  assert.equal(await check('worker-B', 1), false);
+  assert.equal(await check('worker-A', 2), false);
+  store.recover();
+  assert.equal(await check('worker-A', 1), false);
+  store.claim('worker-B');
+  assert.equal(await check('worker-B', 2), true);
+  assert.equal(await check('worker-A', 1), false);
+});
+
+// Fencing through the real predicate (no mocks): stale before start.
+test('worker fenced by the real ownership predicate spends nothing when stale', async () => {
+  const { processRelationshipCanaryJob, claimOwnershipChecker } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  store.claim('worker-A');
+  store.recover();
+  store.claim('worker-B');
+  let fetches = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => { throw new Error('ingest must never run without ownership'); },
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      claim: { workerId: 'worker-A', attemptNumber: 1 },
+      checkOwnership: () => claimOwnershipChecker(store.query, 'job-9', { workerId: 'worker-A', attemptNumber: 1 })(),
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+      nominate: async () => { throw new Error('nominate must never run without ownership'); },
+      reserveQuota: async () => { throw new Error('reserve must never run without ownership'); },
+      claimQuota: async () => { throw new Error('claim must never run without ownership'); },
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 0);
+  assert.equal(summary.nominations, 0);
+  assert.equal(summary.seedsAttempted, 0);
+});
+
+// Dispatcher forwards the claim into the default worker run.
+test('dispatcher threads claim identity into the default canary run', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  assert.match(source, /processRelationshipCanaryJob\(\{ id: j\.id, payload: j\.payload \}, processDiscoveredChannel, claim \? \{ claim \} : undefined\)/);
 });

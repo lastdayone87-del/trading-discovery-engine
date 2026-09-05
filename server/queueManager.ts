@@ -1036,7 +1036,11 @@ export async function handleRelationshipCanaryExpansionJob(
   claim?: { workerId: string; attemptNumber: number },
 ): Promise<{ completed: boolean }> {
   const { processRelationshipCanaryJob, persistRelationshipCanarySummary, completeRelationshipCanaryAttempt } = await import('./relationshipCanary');
-  const summary = await (deps?.runCanary || ((j) => processRelationshipCanaryJob({ id: j.id, payload: j.payload }, processDiscoveredChannel)))(job);
+  // Forward the claim so the worker's ownership fence is live on the default
+  // path too — otherwise fencing would only exist when tests inject it.
+  const runDefault = (j: { id: string; payload?: unknown }) =>
+    processRelationshipCanaryJob({ id: j.id, payload: j.payload }, processDiscoveredChannel, claim ? { claim } : undefined);
+  const summary = await (deps?.runCanary || runDefault)(job);
   // Persist BEFORE completing: the attempt row must carry the observable
   // summary (including pre-dispatch provider failures) rather than closing
   // as COMPLETED with empty logs. Bound to this claim's attempt number.

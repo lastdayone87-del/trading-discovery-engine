@@ -516,6 +516,25 @@ export async function claimRelationshipCanaryQuota(input: {
  * to existing job retry semantics. Retry ownership for discovered candidates
  * flows through the normal pipeline (existing directives), never invented here.
  */
+/**
+ * Ownership predicate over the live jobs row: true only while the job is
+ * still PROCESSING under this exact claim (attempt counter + lock holder).
+ * Pure query construction around an injected query fn so the exact predicate
+ * production enforces is unit-testable without a database.
+ */
+export function claimOwnershipChecker(
+  query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>,
+  jobId: string,
+  claim: { workerId: string; attemptNumber: number },
+): () => Promise<boolean> {
+  return async (): Promise<boolean> => {
+    const row = await query(
+      `SELECT 1 FROM jobs WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3`,
+      [jobId, claim.attemptNumber, claim.workerId],
+    );
+    return (row.rowCount ?? row.rows.length) > 0;
+  };
+}
 export async function processRelationshipCanaryJob(
   job: { id: string; payload: unknown },
   ingest: (raw: DiscoveredChannelRaw, country: string, source: 'automated_query') => Promise<unknown>,
@@ -547,18 +566,20 @@ export async function processRelationshipCanaryJob(
   // excluded after queuing must not spend provider quota or enter ingestion.
   const checkAllowed = deps.checkCountryAllowed || (async (country: string) => { await assertCountryAllowed(country, 'relationship-canary:execution'); });
   await checkAllowed(payload.targetCountry);
-  // Ownership fence: a stale worker (recovered + re-claimed by another
-  // worker) must stop before provider calls, quota claims, nominations, and
-  // ingestion — not merely at final completion. Without claim identity (e.g.
-  // direct calls) the fence stays open, preserving existing behavior.
+
+
+  // Effective ownership fence: explicit override wins (tests), else the
+  // claim identity against the live jobs row, else open (direct calls).
+  // A stale worker stops before provider calls, quota claims, nominations,
+  // and ingestion — not merely at final completion.
   const checkOwnership = deps.checkOwnership || (deps.claim
     ? (async (): Promise<boolean> => {
       const db = await getDb();
-      const row = await db.query(
-        `SELECT 1 FROM jobs WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3`,
-        [job.id, deps.claim!.attemptNumber, deps.claim!.workerId],
-      );
-      return !!row.rowCount;
+      return claimOwnershipChecker(
+        (text: string, values?: unknown[]) => db.query(text, values),
+        job.id,
+        deps.claim!,
+      )();
     })
     : (async (): Promise<boolean> => true));
   if (!(await checkOwnership())) {
