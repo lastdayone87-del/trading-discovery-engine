@@ -12,6 +12,7 @@ import {
   processRelationshipCanaryJob,
   validateRelationshipCanaryPayload,
 } from './relationshipCanary';
+import type { RelationshipCanarySummary } from './relationshipCanary';
 
 const UC = (suffix: string) => `UC${suffix.padEnd(22, '0').slice(0, 22)}`;
 const genericRaw = (overrides: Partial<DiscoveredChannelRaw> = {}): DiscoveredChannelRaw => ({
@@ -903,4 +904,694 @@ test('canary jobs stay claimable while disabled for inert drain', async () => {
   assert.match(gate, /claimableTypes\.push\('RELATIONSHIP_CANARY_EXPANSION'\)/);
   assert.doesNotMatch(gate, /getAppSetting\('relationship_canary_enabled'/);
   assert.doesNotMatch(gate, /kill_switch/);
+});
+
+// Failure classification: stable codes, never secret material.
+test('provider failures classify to safe non-secret codes', async () => {
+  const { classifyRelationshipCanaryFailure } = await import('./relationshipCanary');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('YouTube featured-channel inspection requires an API key.')), 'NO_YOUTUBE_API_KEY');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('YouTube providers cooling down')), 'PROVIDER_POOL_UNAVAILABLE');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('QUOTA_EXHAUSTED for key')), 'QUOTA_EXHAUSTED');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('429 too many requests')), 'QUOTA_EXHAUSTED');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('INVALID_FEATURED_CHANNEL_PROVIDER_INPUT')), 'INVALID_INPUT');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('socket hangup')), 'PROVIDER_CALL_FAILED');
+  assert.equal(classifyRelationshipCanaryFailure('plain string failure'), 'PROVIDER_CALL_FAILED');
+});
+
+// Redaction: credentials never reach persisted logs; telemetry survives.
+test('log scrubber redacts credentials and caps length', async () => {
+  const { sanitizeCanaryLogText } = await import('./relationshipCanary');
+  const dirty = 'fetch https://youtube.googleapis.com/v3/x?part=snippet&key=AIzaFakeKey123 failed Bearer abc.DEF_ghi quota 10 blocked 2';
+  const clean = sanitizeCanaryLogText(dirty);
+  assert.ok(!clean.includes('AIzaFakeKey123'));
+  assert.ok(!clean.includes('abc.DEF_ghi'));
+  assert.ok(clean.includes('quota 10'));
+  assert.ok(clean.includes('[REDACTED]'));
+  assert.equal(sanitizeCanaryLogText('x'.repeat(500), 200).length, 200);
+  assert.equal(
+    sanitizeCanaryLogText('api_key=supersecret-value here'),
+    'api_key=[REDACTED] here',
+  );
+});
+
+// Attempt-log entry shape: counts + sanitized failures, no secrets.
+test('attempt-log entry carries observable summary without secrets', async () => {
+  const { relationshipCanaryAttemptLog } = await import('./relationshipCanary');
+  const entry = relationshipCanaryAttemptLog({
+    cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 3, depth1Channels: 0, depth2Fetches: 0,
+    nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+    failures: ['channel:UCx:boom'], failureCodes: ['PROVIDER_CALL_FAILED'], quotaUnits: 3,
+  });
+  assert.equal(entry.cohortId, 'c1');
+  assert.deepEqual(entry.failures, ['channel:UCx:boom']);
+  assert.deepEqual(entry.failureCodes, ['PROVIDER_CALL_FAILED']);
+  assert.ok(!JSON.stringify(entry).includes('AIza'));
+});
+
+// Persistence targets the open attempt row and never throws.
+test('summary persistence appends to the unfinished attempt only', async () => {
+  const { persistRelationshipCanarySummary, relationshipCanaryAttemptLog } = await import('./relationshipCanary');
+  const calls: Array<{ text: string; values: unknown[] }> = [];
+  await persistRelationshipCanarySummary(
+    (async (text: string, values?: unknown[]) => { calls.push({ text, values: values || [] }); return { rows: [] }; }) as never,
+    'job-9',
+    {
+      cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 1, depth1Channels: 0, depth2Fetches: 0,
+      nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+      failures: [], failureCodes: [], quotaUnits: 0,
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].text, /UPDATE job_attempts SET logs = logs \|\|/);
+  assert.match(calls[0].text, /finished_at IS NULL/);
+  assert.equal(calls[0].values[0], 'job-9');
+  const logged = JSON.parse(String((calls[0].values[1] as string)));
+  assert.equal(logged.cohortId, 'c1');
+  assert.deepEqual(Object.keys(relationshipCanaryAttemptLog({
+    cohortId: 'x', status: 'KILLED', seedsAttempted: 0, depth1Channels: 0, depth2Fetches: 0,
+    nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0, failures: [], failureCodes: [], quotaUnits: 0,
+  })).sort(), Object.keys(logged).sort());
+  // A failing persistence layer resolves (observability never fails the job).
+  await persistRelationshipCanarySummary(
+    (async () => { throw new Error('db down'); }) as never,
+    'job-9',
+    {
+      cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 0, depth1Channels: 0, depth2Fetches: 0,
+      nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+      failures: [], failureCodes: [], quotaUnits: 0,
+    },
+  );
+});
+
+// Pre-dispatch provider failure is visible end to end (no silent COMPLETED).
+test('pre-dispatch provider failure surfaces classified in the attempt log', async () => {
+  const { processRelationshipCanaryJob, persistRelationshipCanarySummary } = await import('./relationshipCanary');
+  const logged: unknown[] = [];
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }, { kind: 'channel', id: UC('seed2') }, { kind: 'channel', id: UC('seed3') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      fetchFeaturedChannels: async () => { throw new Error('YouTube featured-channel inspection requires an API key.'); },
+      nominate: async () => { throw new Error('must not nominate without provider data'); },
+      ingest: async () => { throw new Error('must not ingest without provider data'); },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async () => true,
+      log: () => {},
+    } as never,
+  );
+  assert.equal(summary.failures.length, 3);
+  assert.deepEqual(summary.failureCodes, ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY']);
+  assert.equal(summary.nominations, 0);
+  await persistRelationshipCanarySummary(
+    (async (text: string, values?: unknown[]) => { logged.push(JSON.parse(String((values || [])[1]))); return { rows: [] }; }) as never,
+    'job-9',
+    summary,
+  );
+  assert.equal(logged.length, 1);
+  assert.deepEqual((logged[0] as Record<string, unknown>).failureCodes, ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY']);
+});
+
+// Real provider path: with no configured keys the real fetcher fails closed
+// before any network call, with the production no-key classification.
+test('real provider path fails closed pre-dispatch when no keys exist', async () => {
+  const { getYouTubeKeyPool } = await import('./db');
+  if (getYouTubeKeyPool().length > 0) return;
+  const { fetchYouTubeFeaturedChannels } = await import('./youtube');
+  const { classifyRelationshipCanaryFailure } = await import('./relationshipCanary');
+  await assert.rejects(fetchYouTubeFeaturedChannels(UC('seed'), 5), /API key/);
+  try {
+    await fetchYouTubeFeaturedChannels(UC('seed'), 5);
+    assert.fail('must throw without keys');
+  } catch (error) {
+    assert.equal(classifyRelationshipCanaryFailure(error), 'NO_YOUTUBE_API_KEY');
+  }
+});
+
+// Pool-capacity messages from production classify as pool-unavailable.
+test('production pool messages classify as pool unavailable', async () => {
+  const { classifyRelationshipCanaryFailure } = await import('./relationshipCanary');
+  assert.equal(
+    classifyRelationshipCanaryFailure(new Error('YouTube provider pool became unavailable before request dispatch.')),
+    'PROVIDER_POOL_UNAVAILABLE',
+  );
+  assert.equal(
+    classifyRelationshipCanaryFailure(new Error('No eligible YouTube provider is available at request dispatch.')),
+    'PROVIDER_POOL_UNAVAILABLE',
+  );
+});
+
+// Nomination/ingestion failures carry the non-provider admission code.
+test('admission failures record ADMISSION_FAILED, not provider codes', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'playlist', id: 'PLseedlist' }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      fetchPlaylistChannels: async () => [{ channelId: UC('admitme'), channelName: 'Admit Me', description: 'd', videoTitles: ['v'] }],
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => { throw new Error('ingestion pipeline exploded'); },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async () => true,
+      log: () => {},
+    },
+  );
+  assert.equal(summary.failures.length, 1);
+  assert.deepEqual(summary.failureCodes, ['ADMISSION_FAILED']);
+});
+
+// Lowercase/mixed-case bearer schemes redact like canonical Bearer.
+test('bearer redaction is case-insensitive', async () => {
+  const { sanitizeCanaryLogText } = await import('./relationshipCanary');
+  assert.ok(!sanitizeCanaryLogText('authorization: bearer secret-token-xyz').includes('secret-token-xyz'));
+  assert.ok(!sanitizeCanaryLogText('Authorization: BEARER tok123').includes('tok123'));
+  assert.ok(sanitizeCanaryLogText('authorization: bearer secret-token-xyz').includes('[REDACTED]'));
+});
+
+// Attempt binding: stale workers cannot write into newer retries.
+test('summary persistence binds to the exact attempt number', async () => {
+  const { persistRelationshipCanarySummary } = await import('./relationshipCanary');
+  const calls: Array<{ text: string; values: unknown[] }> = [];
+  const query = (async (text: string, values?: unknown[]) => {
+    calls.push({ text, values: values || [] });
+    return { rows: [] };
+  }) as never;
+  const summary = {
+    cohortId: 'c1', status: 'COMPLETED' as const, seedsAttempted: 1, depth1Channels: 0, depth2Fetches: 0,
+    nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+    failures: [] as string[], failureCodes: [] as string[], quotaUnits: 0,
+  };
+  await persistRelationshipCanarySummary(query, 'job-9', { ...summary }, 4);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].text, /attempt_number=\$3/);
+  assert.deepEqual([calls[0].values[0], calls[0].values[2]], ['job-9', 4]);
+  // Without an attempt number the legacy open-row targeting still applies.
+  await persistRelationshipCanarySummary(query, 'job-9', { ...summary });
+  assert.match(calls[1].text, /finished_at IS NULL/);
+  assert.ok(!calls[1].text.includes('attempt_number'));
+});
+
+// Dispatcher wiring: run worker → persist summary → complete job, in order.
+// A pre-dispatch provider failure ends up observable instead of COMPLETED
+// with empty logs.
+test('dispatcher persists pre-dispatch failure before completing the job', async () => {
+  const { handleRelationshipCanaryExpansionJob } = await import('./queueManager');
+  const events: string[] = [];
+  let persisted: { jobId: string; summary: Record<string, unknown>; attempt?: number } | null = null;
+  await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 3, payload: { cohortId: 'c1' } },
+    {
+      runCanary: async (job) => {
+        events.push(`run:${job.id}`);
+        return {
+          cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 3, depth1Channels: 0, depth2Fetches: 0,
+          nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+          failures: [
+            'channel:UCa:YouTube featured-channel inspection requires an API key.',
+            'channel:UCb:YouTube featured-channel inspection requires an API key.',
+            'channel:UCc:YouTube featured-channel inspection requires an API key.',
+          ],
+          failureCodes: ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY'],
+          quotaUnits: 0,
+        };
+      },
+      persistSummary: async (jobId, summary, attempt) => {
+        events.push(`persist:${jobId}`);
+        persisted = { jobId, summary: summary as unknown as Record<string, unknown>, attempt };
+      },
+      completeAttempt: async (input) => {
+        events.push(`complete:${input.jobId}#${input.attemptNumber}`);
+        return { completed: true };
+      },
+    },
+    { workerId: 'worker-1', attemptNumber: 3 },
+  );
+  // Persist-before-complete ordering is what makes failures observable.
+  assert.deepEqual(events, ['run:job-9', 'persist:job-9', 'complete:job-9#3']);
+  assert.ok(persisted);
+  assert.equal((persisted as unknown as { jobId: string }).jobId, 'job-9');
+  assert.equal((persisted as unknown as { attempt?: number }).attempt, 3);
+  const summary = (persisted as unknown as { summary: Record<string, unknown> }).summary;
+  assert.equal((summary.failures as string[]).length, 3);
+  assert.deepEqual(summary.failureCodes, ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY']);
+  assert.equal(summary.nominations, 0);
+});
+
+// The dispatcher branch delegates to the helper (no parallel wiring).
+test('dispatcher routes canary jobs through the persist-before-complete helper', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  assert.match(source, /job\.type==='RELATIONSHIP_CANARY_EXPANSION'\)\{\s*await handleRelationshipCanaryExpansionJob\(job, undefined, \{ workerId, attemptNumber: job\.attempts \}\);return true;/);
+});
+
+// Stale-worker race: fake queue lifecycle mirroring claim/recover semantics
+// (PENDING→PROCESSING+attempts+1+lock, recovery→PENDING+unlock+fail-open-rows).
+const makeLifecycleStore = () => {
+  const job = { status: 'PENDING', attempts: 0, locked_by: null as string | null };
+  const attempts: Array<{ attempt_number: number; status: string; finished_at: string | null; logs: unknown[] }> = [];
+  const api = {
+    job,
+    attempts,
+    claim(workerId: string) {
+      if (job.status !== 'PENDING') return null;
+      job.status = 'PROCESSING';
+      job.locked_by = workerId;
+      job.attempts += 1;
+      attempts.push({ attempt_number: job.attempts, status: 'PROCESSING', finished_at: null, logs: [] });
+      return { attempts: job.attempts };
+    },
+    recover() {
+      if (job.status !== 'PROCESSING') return;
+      job.status = 'PENDING';
+      job.locked_by = null;
+      for (const row of attempts) {
+        if (!row.finished_at) {
+          row.status = 'FAILED';
+          row.finished_at = 'recovered';
+        }
+      }
+    },
+    query: (async (text: string, values: unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount?: number | null }> => {
+      const t = text.replace(/\s+/g, ' ');
+      if (/^(BEGIN|COMMIT|ROLLBACK)/.test(t.trim())) return { rows: [] };
+      if (t.includes('UPDATE jobs SET') && t.includes('attempts=$2 AND locked_by=$3')) {
+        const [id, attempt, worker] = values as [string, number, string];
+        if (id === 'job-9' && job.status === 'PROCESSING' && job.attempts === attempt && job.locked_by === worker) {
+          job.status = 'COMPLETED';
+          job.locked_by = null;
+          return { rows: [{ id }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }
+      if (t.includes('UPDATE job_attempts SET logs = logs ||')) {
+        const withAttempt = t.includes('attempt_number=$3');
+        const row = attempts.find(a => !a.finished_at && (!withAttempt || a.attempt_number === (values[2] as number)));
+        if (row) row.logs.push(JSON.parse(String(values[1])));
+        return { rows: [] };
+      }
+      if (t.includes('UPDATE job_attempts SET status=')) {
+        const row = attempts.find(a => a.attempt_number === (values[1] as number) && !a.finished_at);
+        if (row) {
+          row.status = 'COMPLETED';
+          row.finished_at = 'now';
+        }
+        return { rows: [] };
+      }
+      if (t.includes('SELECT 1 FROM jobs WHERE id=$1')) {
+        const [id, attempt, worker] = values as [string, number, string];
+        const owned = id === 'job-9' && job.status === 'PROCESSING' && job.attempts === attempt && job.locked_by === worker;
+        return { rows: owned ? [{ '?column?': 1 }] : [], rowCount: owned ? 1 : 0 };
+      }
+      throw new Error(`unexpected statement: ${text.slice(0, 100)}`);
+    }),
+  };
+  return api;
+};
+
+const cannedSummary = (tag: string): {
+  cohortId: string; status: 'COMPLETED'; seedsAttempted: number; depth1Channels: number; depth2Fetches: number;
+  nominations: number; ingested: number; channelsCapped: number; downstreamCapped: number;
+  failures: string[]; failureCodes: string[]; quotaUnits: number;
+} => ({
+  cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 1, depth1Channels: 0, depth2Fetches: 0,
+  nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+  failures: [`${tag}:boom`], failureCodes: ['PROVIDER_CALL_FAILED'], quotaUnits: 0,
+});
+
+// The dangerous race, step by step: stale Worker A must not complete Worker
+// B's retry, and B must still complete normally afterwards.
+test('stale canary worker cannot complete a newer retry', async () => {
+  const { handleRelationshipCanaryExpansionJob, completeRelationshipCanaryAttempt, persistRelationshipCanarySummary } = await import('./queueManager').then(async (qm) => ({
+    handleRelationshipCanaryExpansionJob: qm.handleRelationshipCanaryExpansionJob,
+    ...(await import('./relationshipCanary')),
+  }));
+  const store = makeLifecycleStore();
+  const q = store.query;
+  const connectOnce = () => Promise.resolve({ query: q, release: () => {} });
+  const wired = (tag: string) => ({
+    runCanary: async () => cannedSummary(tag),
+    persistSummary: (jobId: string, summary: RelationshipCanarySummary, attempt?: number) =>
+      persistRelationshipCanarySummary(q, jobId, summary, attempt),
+    completeAttempt: (input: { jobId: string; attemptNumber: number; workerId: string }) =>
+      completeRelationshipCanaryAttempt(connectOnce, input),
+  });
+
+  // Worker A claims attempt 1, then goes stale; recovery requeues.
+  const claimA = store.claim('worker-A');
+  assert.equal(claimA?.attempts, 1);
+  store.recover();
+  assert.equal(store.job.status, 'PENDING');
+  // Worker B claims attempt 2 and starts work.
+  const claimB = store.claim('worker-B');
+  assert.equal(claimB?.attempts, 2);
+  // Worker A finishes late: persist targets only attempt 1 (already failed),
+  // and conditional completion refuses (ownership lost).
+  const staleResult = await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 1, payload: {} },
+    wired('stale-A'),
+    { workerId: 'worker-A', attemptNumber: 1 },
+  );
+  assert.deepEqual(staleResult, { completed: false });
+  assert.equal(store.job.status, 'PROCESSING');
+  assert.equal(store.job.attempts, 2);
+  assert.equal(store.job.locked_by, 'worker-B');
+  assert.deepEqual(store.attempts[1].logs, []);
+  // Worker B remains the valid owner and completes normally.
+  const freshResult = await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 2, payload: {} },
+    wired('fresh-B'),
+    { workerId: 'worker-B', attemptNumber: 2 },
+  );
+  assert.deepEqual(freshResult, { completed: true });
+  assert.equal(store.job.status, 'COMPLETED');
+  assert.equal(store.attempts[1].status, 'COMPLETED');
+  assert.ok(store.attempts[1].finished_at);
+  assert.equal(store.attempts[1].logs.length, 1);
+  // Attempt 1 keeps its recovery lifecycle state (FAILED), untouched by B.
+  assert.equal(store.attempts[0].status, 'FAILED');
+});
+
+// Ownership mismatch variants: wrong worker, wrong attempt, non-processing.
+test('conditional completion rejects mismatched ownership', async () => {
+  const { completeRelationshipCanaryAttempt } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  const connectOnce = () => Promise.resolve({ query: store.query, release: () => {} });
+  store.claim('worker-A');
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-B' }), { completed: false });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-9', attemptNumber: 2, workerId: 'worker-A' }), { completed: false });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-other', attemptNumber: 1, workerId: 'worker-A' }), { completed: false });
+  assert.equal(store.job.status, 'PROCESSING');
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-A' }), { completed: true });
+  assert.equal(store.job.status, 'COMPLETED');
+});
+
+// Normal path: claim → run → persist → conditional complete, in order.
+test('normal canary run completes its own attempt with observable logs', async () => {
+  const { handleRelationshipCanaryExpansionJob, completeRelationshipCanaryAttempt, persistRelationshipCanarySummary } = await import('./queueManager').then(async (qm) => ({
+    handleRelationshipCanaryExpansionJob: qm.handleRelationshipCanaryExpansionJob,
+    ...(await import('./relationshipCanary')),
+  }));
+  const store = makeLifecycleStore();
+  const connectOnce = () => Promise.resolve({ query: store.query, release: () => {} });
+  const events: string[] = [];
+  store.claim('worker-A');
+  const result = await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 1, payload: {} },
+    {
+      runCanary: async () => { events.push('run'); return cannedSummary('ok'); },
+      persistSummary: async (jobId: string, summary: RelationshipCanarySummary, attempt?: number) => {
+        events.push('persist');
+        await persistRelationshipCanarySummary(store.query, jobId, summary, attempt);
+      },
+      completeAttempt: async (input) => {
+        events.push('complete');
+        return completeRelationshipCanaryAttempt(connectOnce, input);
+      },
+    },
+    { workerId: 'worker-A', attemptNumber: 1 },
+  );
+  assert.deepEqual(result, { completed: true });
+  assert.deepEqual(events, ['run', 'persist', 'complete']);
+  assert.equal(store.job.status, 'COMPLETED');
+  assert.equal(store.attempts[0].logs.length, 1);
+});
+
+// Connection discipline: the whole completion transaction runs on exactly
+// one acquired client, which is always released — BEGIN/COMMIT can never
+// split across pooled connections.
+test('completion transaction uses a single dedicated client', async () => {
+  const { completeRelationshipCanaryAttempt } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  store.claim('worker-A');
+  const clients: Array<{ id: number; statements: string[] }> = [];
+  let nextId = 0;
+  let releases = 0;
+  const connect = async (): Promise<{ query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[]; rowCount?: number | null }>; release: () => void }> => {
+    const client = {
+      id: nextId++,
+      statements: [] as string[],
+      query: async (text: string, values: unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount?: number | null }> => {
+        client.statements.push(text.trim().split('\n')[0].slice(0, 40));
+        return store.query(text, values);
+      },
+      release: () => {
+        releases++;
+      },
+    };
+    clients.push(client);
+    return client;
+  };
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connect, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-A' }), { completed: true });
+  assert.equal(clients.length, 1);
+  assert.deepEqual(clients[0].statements, ['BEGIN', 'UPDATE jobs SET status=\'COMPLETED\',compl', 'UPDATE job_attempts SET status=\'COMPLETE', 'COMMIT']);
+  assert.equal(releases, 1);
+  assert.equal(store.job.status, 'COMPLETED');
+});
+
+// Ownership fencing: a stale worker stops before any provider spend.
+test('worker without ownership performs zero provider work', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  let fetches = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => { throw new Error('ingest must never run without ownership'); },
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      checkOwnership: async () => false,
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+      nominate: async () => { throw new Error('nominate must never run without ownership'); },
+      reserveQuota: async () => { throw new Error('reserve must never run without ownership'); },
+      claimQuota: async () => { throw new Error('claim must never run without ownership'); },
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 0);
+  assert.equal(summary.nominations, 0);
+  assert.equal(summary.seedsAttempted, 0);
+});
+
+// Ownership fencing mid-run: loss after the first seed stops depth-2 work.
+test('worker losing ownership mid-run stops before further fetches', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  const fetched: string[] = [];
+  let checks = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      checkOwnership: async () => { checks++; return checks <= 3; },
+      fetchFeaturedChannels: async (sourceChannelId: string) => {
+        fetched.push(sourceChannelId);
+        return { observations: [{ featuredChannelId: UC('newchan') }] };
+      },
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => {},
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async () => true,
+      log: () => {},
+    },
+  );
+  // Pre-start check (1) + seed-loop check (2) + admission check (3) pass; the
+  // seed fetch runs and its candidate is admitted; the depth-2 check (4)
+  // fails → stop with no further fetches.
+  assert.deepEqual(fetched, [seed]);
+  assert.equal(summary.nominations, 1);
+  assert.equal(summary.depth2Fetches, 0);
+  assert.ok(checks >= 4);
+});
+
+// Ownership predicate truth table against the live jobs row semantics.
+test('claimOwnershipChecker reflects claim, recovery, and mismatch states', async () => {
+  const { claimOwnershipChecker } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  const check = (workerId: string, attemptNumber: number) =>
+    claimOwnershipChecker(store.query, 'job-9', { workerId, attemptNumber })();
+  store.claim('worker-A');
+  assert.equal(await check('worker-A', 1), true);
+  assert.equal(await check('worker-B', 1), false);
+  assert.equal(await check('worker-A', 2), false);
+  store.recover();
+  assert.equal(await check('worker-A', 1), false);
+  store.claim('worker-B');
+  assert.equal(await check('worker-B', 2), true);
+  assert.equal(await check('worker-A', 1), false);
+});
+
+// Fencing through the real predicate (no mocks): stale before start.
+test('worker fenced by the real ownership predicate spends nothing when stale', async () => {
+  const { processRelationshipCanaryJob, claimOwnershipChecker } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  store.claim('worker-A');
+  store.recover();
+  store.claim('worker-B');
+  let fetches = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => { throw new Error('ingest must never run without ownership'); },
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      claim: { workerId: 'worker-A', attemptNumber: 1 },
+      checkOwnership: () => claimOwnershipChecker(store.query, 'job-9', { workerId: 'worker-A', attemptNumber: 1 })(),
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+      nominate: async () => { throw new Error('nominate must never run without ownership'); },
+      reserveQuota: async () => { throw new Error('reserve must never run without ownership'); },
+      claimQuota: async () => { throw new Error('claim must never run without ownership'); },
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 0);
+  assert.equal(summary.nominations, 0);
+  assert.equal(summary.seedsAttempted, 0);
+});
+
+// Dispatcher forwards the claim into the default worker run.
+test('dispatcher threads claim identity into the default canary run', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  assert.match(source, /processRelationshipCanaryJob\(\{ id: j\.id, payload: j\.payload \}, processDiscoveredChannel, claim \? \{ claim \} : undefined\)/);
+});
+
+// Mid-batch fencing: ownership lost after a fetch returns but before any
+// admission stops all side effects for the batch (no quota earmark, no
+// nomination, no ingestion) and ends the run.
+test('ownership lost mid-batch admits nothing from the fetched batch', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  let fetches = 0;
+  const claimedOps: string[] = [];
+  let nominates = 0;
+  let ingests = 0;
+  let checks = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      claim: { workerId: 'worker-A', attemptNumber: 1 },
+      // Pre-start + seed-loop checks pass; every admission check fails.
+      checkOwnership: async () => { checks++; return checks <= 2; },
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [{ featuredChannelId: UC('c1') }, { featuredChannelId: UC('c2') }] }; },
+      nominate: async () => { nominates++; return { id: 'n1' }; },
+      ingest: async () => { ingests++; },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async (operationId: string) => { claimedOps.push(operationId); return true; },
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 1);
+  assert.equal(nominates, 0);
+  assert.equal(ingests, 0);
+  assert.equal(summary.nominations, 0);
+  assert.equal(summary.ingested, 0);
+  assert.ok(!claimedOps.some(op => op.includes(':downstream:')));
+});
+
+// Attempt-scoped quota identity: stale and fresh attempts never share keys.
+test('quota operation ids are scoped to the claimed attempt', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const runWithAttempt = async (attemptNumber: number) => {
+    const ops: string[] = [];
+    await processRelationshipCanaryJob(
+      { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+      async () => {},
+      {
+        settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+        dailyBudget: 100000,
+        checkCountryAllowed: async () => {},
+        claim: { workerId: 'worker-A', attemptNumber },
+        checkOwnership: async () => true,
+        fetchFeaturedChannels: async () => ({ observations: [] }),
+        reserveQuota: async () => true,
+        finishQuota: async () => {},
+        claimQuota: async (operationId: string) => { ops.push(operationId); return true; },
+        log: () => {},
+      },
+    );
+    return ops;
+  };
+  const attempt1Ops = await runWithAttempt(1);
+  const attempt2Ops = await runWithAttempt(2);
+  assert.ok(attempt1Ops.length > 0 && attempt2Ops.length > 0);
+  assert.ok(attempt1Ops.every(op => op.includes(':attempt-1:')));
+  assert.ok(attempt2Ops.every(op => op.includes(':attempt-2:')));
+  assert.deepEqual(attempt1Ops.filter(op => attempt2Ops.includes(op)), []);
+});
+
+// Fence infrastructure failure propagates to job retry semantics instead of
+// being recorded as a provider failure or swallowed into a completed run.
+test('ownership-check infrastructure failure rejects instead of misrecording', async () => {
+  const { processRelationshipCanaryJob, CanaryOwnershipCheckError } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  let nominates = 0;
+  await assert.rejects(
+    processRelationshipCanaryJob(
+      { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+      async () => {},
+      {
+        settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+        dailyBudget: 100000,
+        checkCountryAllowed: async () => {},
+        checkOwnership: async () => { throw new Error('db unreachable'); },
+        fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: UC('newchan') }] }),
+        nominate: async () => { nominates++; return { id: 'n1' }; },
+        ingest: async () => {},
+        reserveQuota: async () => true,
+        finishQuota: async () => {},
+        claimQuota: async () => true,
+        log: () => {},
+      },
+    ),
+    (error: unknown) => error instanceof CanaryOwnershipCheckError,
+  );
+  assert.equal(nominates, 0);
+});
+
+// Mid-batch fence failure also propagates (not recorded as seed failure).
+test('mid-batch fence failure rejects without provider-failure record', async () => {
+  const { processRelationshipCanaryJob, CanaryOwnershipCheckError } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  let calls = 0;
+  await assert.rejects(
+    processRelationshipCanaryJob(
+      { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+      async () => {},
+      {
+        settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+        dailyBudget: 100000,
+        checkCountryAllowed: async () => {},
+        checkOwnership: async () => {
+          calls++;
+          if (calls <= 2) return true;
+          throw new Error('connection reset');
+        },
+        fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: UC('newchan') }] }),
+        nominate: async () => ({ id: 'n1' }),
+        ingest: async () => {},
+        reserveQuota: async () => true,
+        finishQuota: async () => {},
+        claimQuota: async () => true,
+        log: () => {},
+      },
+    ),
+    (error: unknown) => error instanceof CanaryOwnershipCheckError,
+  );
 });

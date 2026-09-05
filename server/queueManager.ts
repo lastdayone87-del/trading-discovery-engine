@@ -269,9 +269,7 @@ export async function processNextSearchJob(
     if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannel);return true;}
     if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannel);return true;}
     if(job.type==='RELATIONSHIP_CANARY_EXPANSION'){
-      const { processRelationshipCanaryJob } = await import('./relationshipCanary');
-      await processRelationshipCanaryJob(job, processDiscoveredChannel);
-      await completeJob(job.id);return true;
+      await handleRelationshipCanaryExpansionJob(job, undefined, { workerId, attemptNumber: job.attempts });return true;
     }
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
       const channelId=String(job.payload.channelId||'');
@@ -1020,6 +1018,66 @@ export async function enqueueRelationshipCanaryRun(
     { idempotencyKey: `relationship-canary:${payload.cohortId}:${day}`, priority: 5, maxAttempts: 2, preventReopen: true },
   );
   return { jobId: job.id, cohortId: payload.cohortId };
+}
+
+/**
+ * Dispatcher body for RELATIONSHIP_CANARY_EXPANSION jobs, extracted so the
+ * production wiring (run worker → persist summary → attempt-bound complete,
+ * in that order) is directly regression-testable without a database. Default
+ * dependencies are the live pipeline; overrides are test seams only.
+ */
+export async function handleRelationshipCanaryExpansionJob(
+  job: { id: string; attempts?: number; payload?: unknown },
+  deps?: {
+    runCanary?: (job: { id: string; payload?: unknown }) => Promise<import('./relationshipCanary').RelationshipCanarySummary>;
+    persistSummary?: (jobId: string, summary: import('./relationshipCanary').RelationshipCanarySummary, attemptNumber?: number) => Promise<void>;
+    completeAttempt?: (input: { jobId: string; attemptNumber: number; workerId: string }) => Promise<{ completed: boolean }>;
+  },
+  claim?: { workerId: string; attemptNumber: number },
+): Promise<{ completed: boolean }> {
+  const { processRelationshipCanaryJob, persistRelationshipCanarySummary, completeRelationshipCanaryAttempt } = await import('./relationshipCanary');
+  // Forward the claim so the worker's ownership fence is live on the default
+  // path too — otherwise fencing would only exist when tests inject it.
+  const runDefault = (j: { id: string; payload?: unknown }) =>
+    processRelationshipCanaryJob({ id: j.id, payload: j.payload }, processDiscoveredChannel, claim ? { claim } : undefined);
+  const summary = await (deps?.runCanary || runDefault)(job);
+  // Persist BEFORE completing: the attempt row must carry the observable
+  // summary (including pre-dispatch provider failures) rather than closing
+  // as COMPLETED with empty logs. Bound to this claim's attempt number.
+  if (deps?.persistSummary) {
+    await deps.persistSummary(job.id, summary, job.attempts);
+  } else {
+    const db = await getDb();
+    await persistRelationshipCanarySummary(
+      (text: string, values?: unknown[]) => db.query(text, values),
+      job.id,
+      summary,
+      job.attempts,
+    );
+  }
+  // Attempt-bound completion: a stale worker whose job was recovered and
+  // re-claimed must not complete the newer retry. When this run has no claim
+  // identity (defensive fallback only), no conditional completion is possible.
+  if (deps?.completeAttempt) {
+    return deps.completeAttempt({ jobId: job.id, attemptNumber: claim?.attemptNumber ?? job.attempts ?? 0, workerId: claim?.workerId ?? '' });
+  }
+  if (!claim) {
+    const db = await getDb();
+    await completeJob(job.id);
+    return { completed: true };
+  }
+  const db = await getDb();
+  // One dedicated client for the whole completion transaction: BEGIN/COMMIT
+  // must not split across pooled connections (the helper acquires/releases).
+  const result = await completeRelationshipCanaryAttempt(() => db.connect(), {
+    jobId: job.id,
+    attemptNumber: claim.attemptNumber,
+    workerId: claim.workerId,
+  });
+  if (!result.completed) {
+    console.warn(`[Queue Manager] Stale relationship-canary worker lost ownership of ${job.id}; leaving the active retry untouched.`);
+  }
+  return result;
 }
 async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION'):Promise<void>{
   const metadata=buildCommunityRetryJobMetadata({

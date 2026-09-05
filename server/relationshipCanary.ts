@@ -216,7 +216,175 @@ export interface RelationshipCanarySummary {
   /** Admissions refused for lack of downstream budget (estimate exceeds remainder). */
   downstreamCapped: number;
   failures: string[];
+  /**
+   * Stable per-failure classification parallel to failures[] (same order).
+   * Lets operators distinguish pre-dispatch provider configuration problems
+   * (NO_YOUTUBE_API_KEY, PROVIDER_POOL_UNAVAILABLE, ...) from ordinary
+   * provider call failures without exposing any secret material.
+   */
+  failureCodes: string[];
   quotaUnits: number;
+}
+
+/** Stable, non-secret classification for canary provider-side failures. */
+export type RelationshipCanaryFailureCode =
+  | 'NO_YOUTUBE_API_KEY'
+  | 'PROVIDER_POOL_UNAVAILABLE'
+  | 'QUOTA_EXHAUSTED'
+  | 'INVALID_INPUT'
+  | 'ADMISSION_FAILED'
+  | 'PROVIDER_CALL_FAILED';
+
+/**
+ * Pure classifier mapping raw errors to stable codes. Inspects message text
+ * only — never keys, tokens, headers, or provider configuration values.
+ */
+export function classifyRelationshipCanaryFailure(error: unknown): RelationshipCanaryFailureCode {
+  const message = String((error as Error)?.message || error || '');
+  if (/api key/i.test(message) && /requir|missing|not configured|unavailable/i.test(message)) return 'NO_YOUTUBE_API_KEY';
+  if (/cooling|cool-?down|pool (became unavailable|exhausted|unavailable)|no eligible .* provider|no provider|backoff/i.test(message)) return 'PROVIDER_POOL_UNAVAILABLE';
+  if (/quota|QUOTA_EXHAUSTED|429|rate.?limit/i.test(message)) return 'QUOTA_EXHAUSTED';
+  if (/invalid|VALIDATION|out of range|exceeded|required/i.test(message)) return 'INVALID_INPUT';
+  return 'PROVIDER_CALL_FAILED';
+}
+
+/**
+ * Pure scrubber for log-bound strings. Redacts anything shaped like a
+ * credential (query-param keys, api keys, bearer tokens) and caps length.
+ * Quota counts, channel IDs, and reason codes pass through untouched.
+ */
+export function sanitizeCanaryLogText(value: string, maxLength = 200): string {
+  return String(value || '')
+    .replace(/([?&](?:key|api[_-]?key)=)[^&\s'"]+/gi, '$1[REDACTED]')
+    .replace(/(api[_-]?key["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer [REDACTED]')
+    .replace(/(token["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[REDACTED]')
+    .slice(0, Math.max(1, maxLength));
+}
+
+/** Record one classified failure onto the run summary (message + code together). */
+export function recordCanaryFailure(
+  summary: Pick<RelationshipCanarySummary, 'failures' | 'failureCodes'>,
+  context: string,
+  error: unknown,
+  codeOverride?: RelationshipCanaryFailureCode,
+): void {
+  summary.failures.push(sanitizeCanaryLogText(`${context}:${error instanceof Error ? error.message : String(error)}`));
+  summary.failureCodes.push(codeOverride || classifyRelationshipCanaryFailure(error));
+}
+
+/**
+ * Pure builder for the durable job-attempt log entry. Contains only counts,
+ * statuses, sanitized failure messages/codes, and the cohort id — never keys,
+ * secrets, headers, tokens, or provider configuration.
+ */
+export function relationshipCanaryAttemptLog(summary: RelationshipCanarySummary): Record<string, unknown> {
+  return {
+    canary: true,
+    cohortId: summary.cohortId,
+    status: summary.status,
+    seedsAttempted: summary.seedsAttempted,
+    depth1Channels: summary.depth1Channels,
+    depth2Fetches: summary.depth2Fetches,
+    nominations: summary.nominations,
+    ingested: summary.ingested,
+    channelsCapped: summary.channelsCapped,
+    downstreamCapped: summary.downstreamCapped,
+    failures: summary.failures.slice(0, 100),
+    failureCodes: summary.failureCodes.slice(0, 100),
+    quotaUnits: summary.quotaUnits,
+    observedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Attempt/ownership-bound completion for relationship-canary jobs. Completes
+ * the job ONLY when the caller still owns the exact claimed attempt (job is
+ * PROCESSING, attempt counter matches, lock holder matches), and then only
+ * finishes that attempt's row. A stale worker whose job was recovered and
+ * re-claimed (attempt N+1 owned by another worker) gets completed:false and
+ * must not touch the job or the newer attempt. Single transaction: the job
+ * row lock serializes concurrent completions.
+ */
+export interface RelationshipCanaryDbClient {
+  query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>;
+  release: () => void;
+}
+
+/**
+ * Attempt/ownership-bound completion for relationship-canary jobs. Completes
+ * the job ONLY when the caller still owns the exact claimed attempt (job is
+ * PROCESSING, attempt counter matches, lock holder matches), and then only
+ * finishes that attempt's row. A stale worker whose job was recovered and
+ * re-claimed (attempt N+1 owned by another worker) gets completed:false and
+ * must not touch the job or the newer attempt. Single transaction on ONE
+ * dedicated client: the caller must acquire the client (pool.connect()) and
+ * release it — passing a pool-level query function would split BEGIN/COMMIT
+ * across connections and break atomicity.
+ */
+export async function completeRelationshipCanaryAttempt(
+  connect: () => Promise<RelationshipCanaryDbClient>,
+  input: { jobId: string; attemptNumber: number; workerId: string },
+): Promise<{ completed: boolean }> {
+  const client = await connect();
+  try {
+    await client.query('BEGIN');
+    try {
+      const owned = await client.query(
+        `UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now()
+          WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3 RETURNING id`,
+        [input.jobId, input.attemptNumber, input.workerId],
+      );
+      if (!owned.rowCount) {
+        await client.query('ROLLBACK');
+        return { completed: false };
+      }
+      await client.query(
+        `UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND attempt_number=$2 AND finished_at IS NULL`,
+        [input.jobId, input.attemptNumber],
+      );
+      await client.query('COMMIT');
+      return { completed: true };
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Appends the run summary to the open job_attempts record (logs JSONB array)
+ * so provider failures are visible instead of surfacing as COMPLETED with
+ * empty logs. When attemptNumber is provided, the write is bound to that
+ * exact attempt so a stale worker can never append its summary to a newer
+ * retry's open row. Targets only unfinished rows; a missing row is a no-op.
+ * Never throws: observability must not fail the canary job itself.
+ */
+export async function persistRelationshipCanarySummary(
+  query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>,
+  jobId: string,
+  summary: RelationshipCanarySummary,
+  attemptNumber?: number,
+): Promise<void> {
+  try {
+    if (typeof attemptNumber === 'number' && Number.isFinite(attemptNumber)) {
+      await query(
+        `UPDATE job_attempts SET logs = logs || $2::jsonb WHERE job_id=$1 AND attempt_number=$3 AND finished_at IS NULL`,
+        [jobId, JSON.stringify(relationshipCanaryAttemptLog(summary)), attemptNumber],
+      );
+    } else {
+      await query(
+        `UPDATE job_attempts SET logs = logs || $2::jsonb WHERE job_id=$1 AND finished_at IS NULL`,
+        [jobId, JSON.stringify(relationshipCanaryAttemptLog(summary))],
+      );
+    }
+  } catch (error) {
+    console.warn(`[RelationshipCanary] attempt-log persistence failed for ${jobId}:`, error instanceof Error ? error.message : error);
+  }
 }
 
 export interface RelationshipCanaryDeps {
@@ -240,6 +408,17 @@ export interface RelationshipCanaryDeps {
   dailyBudget?: number;
   /** Test override for the excluded-country gate (production uses assertCountryAllowed). */
   checkCountryAllowed?: (country: string) => Promise<void>;
+  /**
+   * Claim identity for ownership fencing. When present, the worker re-checks
+   * ownership before any provider spend and stops silently when the job no
+   * longer belongs to this claim (recovered + re-claimed by another worker).
+   */
+  claim?: { workerId: string; attemptNumber: number };
+  /**
+   * Test override for the ownership fence (production queries the jobs row).
+   * Takes precedence over `claim` when both are provided.
+   */
+  checkOwnership?: () => Promise<boolean>;
   /** Test/operator override for the enabled/kill-switch settings (production reads app settings). */
   settings?: RelationshipCanarySettings;
   log?: (message: string) => void;
@@ -337,6 +516,48 @@ export async function claimRelationshipCanaryQuota(input: {
  * to existing job retry semantics. Retry ownership for discovered candidates
  * flows through the normal pipeline (existing directives), never invented here.
  */
+/**
+ * Ownership predicate over the live jobs row: true only while the job is
+ * still PROCESSING under this exact claim (attempt counter + lock holder).
+ * Pure query construction around an injected query fn so the exact predicate
+ * production enforces is unit-testable without a database.
+ */
+/**
+ * Thrown when the ownership fence itself cannot be evaluated (infrastructure
+ * error reading the jobs row). Must propagate to normal job retry semantics —
+ * never recorded as a provider/traversal failure and never swallowed into a
+ * completed run.
+ */
+export class CanaryOwnershipCheckError extends Error {
+  readonly causeError: unknown;
+  constructor(cause: unknown) {
+    super(`Canary ownership check failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'CanaryOwnershipCheckError';
+    this.causeError = cause;
+  }
+}
+
+/** Evaluate the fence, converting infrastructure failures to the sentinel. */
+async function requireOwnership(checkOwnership: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await checkOwnership();
+  } catch (error) {
+    throw new CanaryOwnershipCheckError(error);
+  }
+}
+export function claimOwnershipChecker(
+  query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>,
+  jobId: string,
+  claim: { workerId: string; attemptNumber: number },
+): () => Promise<boolean> {
+  return async (): Promise<boolean> => {
+    const row = await query(
+      `SELECT 1 FROM jobs WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3`,
+      [jobId, claim.attemptNumber, claim.workerId],
+    );
+    return (row.rowCount ?? row.rows.length) > 0;
+  };
+}
 export async function processRelationshipCanaryJob(
   job: { id: string; payload: unknown },
   ingest: (raw: DiscoveredChannelRaw, country: string, source: 'automated_query') => Promise<unknown>,
@@ -355,6 +576,7 @@ export async function processRelationshipCanaryJob(
     channelsCapped: 0,
     downstreamCapped: 0,
     failures: [],
+    failureCodes: [],
     quotaUnits: 0,
   };
   const log = deps.log || ((message: string) => console.info(message));
@@ -367,6 +589,26 @@ export async function processRelationshipCanaryJob(
   // excluded after queuing must not spend provider quota or enter ingestion.
   const checkAllowed = deps.checkCountryAllowed || (async (country: string) => { await assertCountryAllowed(country, 'relationship-canary:execution'); });
   await checkAllowed(payload.targetCountry);
+
+
+  // Effective ownership fence: explicit override wins (tests), else the
+  // claim identity against the live jobs row, else open (direct calls).
+  // A stale worker stops before provider calls, quota claims, nominations,
+  // and ingestion — not merely at final completion.
+  const checkOwnership = deps.checkOwnership || (deps.claim
+    ? (async (): Promise<boolean> => {
+      const db = await getDb();
+      return claimOwnershipChecker(
+        (text: string, values?: unknown[]) => db.query(text, values),
+        job.id,
+        deps.claim!,
+      )();
+    })
+    : (async (): Promise<boolean> => true));
+  if (!(await requireOwnership(checkOwnership))) {
+    log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership before start; stopping without provider spend.`);
+    return summary;
+  }
   const fetchFeatured = deps.fetchFeaturedChannels || fetchYouTubeFeaturedChannels;
   const fetchPlaylist = deps.fetchPlaylistChannels || fetchYouTubePlaylistChannels;
   // Effective ingest: explicit dep override wins (tests), otherwise the live
@@ -383,6 +625,11 @@ export async function processRelationshipCanaryJob(
   // was already expanded (seed fetch or depth-2 fetch) is never fetched
   // again, while admission dedupe stays purely channel-ID based.
   const expandedTargets = new Set<string>();
+  // Quota operation identity includes the claimed attempt: a stale worker
+  // and its replacement retry must never share operation IDs in a way that
+  // records one quota claim for two provider calls. Direct calls without a
+  // claim keep the unscoped form.
+  const opScope = `relationship-canary:${payload.cohortId}${deps.claim ? `:attempt-${deps.claim.attemptNumber}` : ''}`;
   const seeds = dedupeRelationshipSeeds(payload.seeds);
   for (const seed of seeds) {
     if (seed.kind === 'channel') {
@@ -416,19 +663,29 @@ export async function processRelationshipCanaryJob(
     return true;
   };
 
+
   const admitCandidate = async (raw: DiscoveredChannelRaw, nomination: {
     sourceType: string; query: string; resultRank: number;
     matchedDocument: DiscoveredChannelRaw['matchedDocument']; rawObservation: Record<string, unknown>;
-  }): Promise<void> => {
-    if (!acceptChannel()) return;
+  }): Promise<boolean> => {
+    // Ownership fence per admission: recovery may have struck while a
+    // provider fetch was in flight, so re-check before spending quota,
+    // nominating, or ingesting — not just before the next fetch.
+    // Infrastructure failures propagate as CanaryOwnershipCheckError (job
+    // retry semantics), never as provider failures.
+    if (!(await requireOwnership(checkOwnership))) {
+      log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-batch; stopping without admitting ${raw.channelId}.`);
+      return false;
+    }
+    if (!acceptChannel()) return true;
     // Truthful downstream bound: admitting a candidate is expected to trigger
     // hydration and enrichment work outside traversal. Earmark the
     // conservative downstream estimate from the same atomic allowance BEFORE
     // nominating or ingesting; if it does not fit, the candidate is not
     // admitted at all (counted separately from the channel cap).
-    if (!await claimQuota(`relationship-canary:${payload.cohortId}:downstream:${raw.channelId}`, RELATIONSHIP_CANARY_ESTIMATED_DOWNSTREAM_UNITS, { consumeImmediately: true })) {
+    if (!await claimQuota(`${opScope}:downstream:${raw.channelId}`, RELATIONSHIP_CANARY_ESTIMATED_DOWNSTREAM_UNITS, { consumeImmediately: true })) {
       summary.downstreamCapped++;
-      return;
+      return true;
     }
     // Observational keyword baseline (metrics only): would the old funnel
     // have admitted this candidate? Never influences admission or authority.
@@ -456,12 +713,15 @@ export async function processRelationshipCanaryJob(
       summary.nominations++;
       summary.ingested++;
     } catch (error) {
-      summary.failures.push(`${raw.channelId}:${error instanceof Error ? error.message : String(error)}`.slice(0, 200));
+      // Nomination/ingestion failures are admission-side, never provider
+      // evidence: record them under an explicit non-provider code.
+      recordCanaryFailure(summary, raw.channelId, error, 'ADMISSION_FAILED');
     }
+    return true;
   };
 
   const expandFeatured = async (sourceChannelId: string, provenance: Omit<RelationshipProvenance, 'kind'> & { kind: 'featured' }): Promise<string[]> => {
-    const operationId = `relationship-canary:${payload.cohortId}:${provenance.depth}:${sourceChannelId}`;
+    const operationId = `${opScope}:${provenance.depth}:${sourceChannelId}`;
     // Atomic canary-share claim first (serializes concurrent cohorts), then
     // the existing global reservation guard. Either denial stops the fetch.
     if (!await claimQuota(operationId, FEATURED_CHANNEL_PROVIDER_COST)) {
@@ -491,6 +751,10 @@ export async function processRelationshipCanaryJob(
   const capacityRemains = (): boolean => channelsAccepted < payload.maxChannels;
   for (const seed of seeds) {
     if (!capacityRemains()) break;
+    if (!(await requireOwnership(checkOwnership))) {
+      log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-run; stopping without further provider spend.`);
+      return summary;
+    }
     summary.seedsAttempted++;
     try {
       if (seed.kind === 'channel') {
@@ -502,7 +766,7 @@ export async function processRelationshipCanaryJob(
           depth1.push({ channelId, seedId: seed.id });
           seedOf[channelId] = seed.id;
           const provenance = buildRelationshipProvenance({ cohortId: payload.cohortId, kind: 'featured', depth: 1, parentChannelId: seed.id, path: [seed.id] });
-          await admitCandidate({
+          if (!await admitCandidate({
             channelId,
             channelName: channelId,
             youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
@@ -518,10 +782,10 @@ export async function processRelationshipCanaryJob(
             resultRank: index + 1,
             matchedDocument: { type: 'EXTERNAL', providerNativeId: channelId, locator: `youtube:relationship-canary:${payload.cohortId}:featured:${seed.id}` },
             rawObservation: { sourceChannelId: seed.id, relationshipDepth: 1, relationshipKind: 'featured', cohortId: payload.cohortId, relationshipPath: [seed.id] },
-          });
+          })) { return summary; }
         }
       } else {
-        const operationId = `relationship-canary:${payload.cohortId}:playlist:${seed.id}`;
+        const operationId = `${opScope}:playlist:${seed.id}`;
         if (!await claimQuota(operationId, PLAYLIST_PROVIDER_COST)) {
           summary.status = 'QUOTA_EXHAUSTED';
           quotaExhausted = true;
@@ -543,7 +807,7 @@ export async function processRelationshipCanaryJob(
             depth1.push({ channelId: item.channelId, seedId: seed.id });
             seedOf[item.channelId] = seed.id;
             const provenance = buildRelationshipProvenance({ cohortId: payload.cohortId, kind: 'playlist', depth: 1, parentChannelId: seed.id, path: [seed.id] });
-            await admitCandidate({
+            if (!await admitCandidate({
               channelId: item.channelId,
               channelName: item.channelName,
               youtubeUrl: `https://www.youtube.com/channel/${item.channelId}`,
@@ -559,7 +823,7 @@ export async function processRelationshipCanaryJob(
               resultRank: index + 1,
               matchedDocument: { type: 'PLAYLIST', providerNativeId: seed.id, title: item.videoTitles[0], description: item.description, locator: `youtube:relationship-canary:${payload.cohortId}:playlist:${seed.id}` },
               rawObservation: { playlistId: seed.id, relationshipDepth: 1, relationshipKind: 'playlist', cohortId: payload.cohortId, relationshipPath: [seed.id] },
-            });
+            })) { return summary; }
           }
         } catch (error) {
           await finish(operationId, false).catch(() => {});
@@ -567,7 +831,10 @@ export async function processRelationshipCanaryJob(
         }
       }
     } catch (error) {
-      summary.failures.push(`${seed.kind}:${seed.id}:${error instanceof Error ? error.message : String(error)}`.slice(0, 200));
+      // Ownership-fence infrastructure failures propagate to normal job retry
+      // semantics — they must never be recorded as provider/traversal failures.
+      if (error instanceof CanaryOwnershipCheckError) throw error;
+      recordCanaryFailure(summary, `${seed.kind}:${seed.id}`, error);
     }
     if (quotaExhausted) break;
   }
@@ -587,6 +854,12 @@ export async function processRelationshipCanaryJob(
       // every admitted candidate keeps its own full provenance.
       if (expandedTargets.has(target.targetId)) continue;
       expandedTargets.add(target.targetId);
+      // Ownership can be lost mid-run (recovery + re-claim by another
+      // worker): stop before spending the next fetch, same as seeds above.
+      if (!(await requireOwnership(checkOwnership))) {
+        log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-run; stopping without further provider spend.`);
+        return summary;
+      }
       // No admissible capacity left: stop traversal before spending fetches
       // whose results could not be admitted.
       if (!capacityRemains()) break;
@@ -603,7 +876,7 @@ export async function processRelationshipCanaryJob(
           if (visited.has(channelId)) continue;
           visited.add(channelId);
           const provenance = buildRelationshipProvenance({ cohortId: payload.cohortId, kind: 'featured', depth: 2, parentChannelId: target.parentChannelId, path: target.path });
-          await admitCandidate({
+          if (!await admitCandidate({
             channelId,
             channelName: channelId,
             youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
@@ -619,10 +892,11 @@ export async function processRelationshipCanaryJob(
             resultRank: index + 1,
             matchedDocument: { type: 'EXTERNAL', providerNativeId: channelId, locator: `youtube:relationship-canary:${payload.cohortId}:featured:${target.parentChannelId}` },
             rawObservation: { sourceChannelId: target.parentChannelId, relationshipDepth: 2, relationshipKind: 'featured', cohortId: payload.cohortId, relationshipPath: target.path },
-          });
+          })) { return summary; }
         }
       } catch (error) {
-        summary.failures.push(`featured:${target.targetId}:${error instanceof Error ? error.message : String(error)}`.slice(0, 200));
+        if (error instanceof CanaryOwnershipCheckError) throw error;
+        recordCanaryFailure(summary, `featured:${target.targetId}`, error);
       }
       if (quotaExhausted) break;
     }
