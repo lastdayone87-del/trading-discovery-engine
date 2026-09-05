@@ -845,6 +845,30 @@ test('dotless garbage alongside genuine failure owns no retry itself', async () 
   }
 });
 
+// Retry quality: garbage alongside a genuinely inspected clean site yields a
+// definitive negative driven by the genuine root — garbage contributes
+// nothing, and no retry is owned.
+test('dotless garbage alongside genuine clean inspection stays definitive', async () => {
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'UCmixedclean00000000000001',
+    channelName: 'Mixed Clean Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://g/', 'https://clean.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: noInviteHtml as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return processedStub()(seedUrl);
+    },
+  });
+  // Rendered fallback runs for the genuine root only, never for garbage.
+  assert.equal(renderedCalls, 1);
+  assert.equal(result.retryDirective, undefined);
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+});
+
 // IPv6 literals are genuine website targets: failures stay eligible for the
 // normal rendered/retry path and never quarantined as single-label garbage.
 test('IPv6 literal failure remains eligible for rendered retry', async () => {
