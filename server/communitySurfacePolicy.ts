@@ -264,6 +264,10 @@ export function isMessagingPreviewUrl(raw: string): boolean {
 export function isDotlessHostnameUrl(raw: string): boolean {
   try {
     const host = new URL(raw).hostname.toLowerCase();
+    // Bracketed IP literals (notably IPv6, e.g. `[2606:4700:4700::1111]`) are
+    // genuine website targets, never single-label garbage: the WHATWG hostname
+    // keeps its brackets and any colons, and must not be read as "dotless".
+    if (host.startsWith('[')) return false;
     return host.length > 0 && !host.includes('.');
   } catch {
     return false;

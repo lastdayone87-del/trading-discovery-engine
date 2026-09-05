@@ -273,6 +273,7 @@ export function rowToChannel(row: any): ChannelRecord {
     community_retry_job_error: row.community_retry_job_error || undefined,
     community_retry_job_execution_count: row.community_retry_job_execution_count == null ? undefined : Number(row.community_retry_job_execution_count),
     community_retry_job_deferral_count: row.community_retry_job_deferral_count == null ? undefined : Number(row.community_retry_job_deferral_count),
+    community_retry_job_executed_count: row.community_retry_job_executed_count == null ? undefined : Number(row.community_retry_job_executed_count),
     community_retry_job_last_execution_at: iso(row.community_retry_job_last_execution_at),
     community_retry_job_last_execution_status: row.community_retry_job_last_execution_status || undefined,
     community_retry_job_retry_reason: row.community_retry_job_retry_reason || undefined,
@@ -402,6 +403,7 @@ export async function listChannelsPage(args:ChannelListingFilter&{limit:number;o
     (SELECT last_error FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_error,
     (SELECT COUNT(*)::int FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1)) community_retry_job_execution_count,
     (SELECT COUNT(*)::int FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) AND a.error LIKE '%Community acquisition deferred:%') community_retry_job_deferral_count,
+    (SELECT COUNT(*)::int FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) AND a.logs ? 'communityInspectionStarted' AND (a.status='COMPLETED' OR (a.status='FAILED' AND COALESCE(a.error,'') NOT LIKE '%Community acquisition deferred:%' AND COALESCE(a.error,'') NOT LIKE '%Worker heartbeat expired%'))) community_retry_job_executed_count,
     (SELECT started_at FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) ORDER BY a.started_at DESC LIMIT 1) community_retry_job_last_execution_at,
     (SELECT status FROM job_attempts a WHERE a.job_id=(SELECT id FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) ORDER BY a.started_at DESC LIMIT 1) community_retry_job_last_execution_status,
     (SELECT payload->>'retryReason' FROM jobs WHERE type='RETRY_COMMUNITY_ACQUISITION' AND payload->>'channelId'=channels.channel_id ORDER BY created_at DESC LIMIT 1) community_retry_job_retry_reason,
@@ -747,6 +749,30 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
   if(traceId){try{await db.query(`INSERT INTO discovery_execution_trace(trace_id,stage,outcome,detail) VALUES($1,'WORKER_POLLING','REACHED',$2),($1,'QUEUE_CLAIM','REACHED',$3)`,[traceId,JSON.stringify({workerId,claimableTypes:types||null}),JSON.stringify({workerId,jobId:claimed!.id,type:claimed!.type})]);}catch(error){console.warn('[Execution Trace] Claim trace unavailable; discovery claim remains committed.',error instanceof Error?error.message:error);}}
   return claimed;}
 export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
+
+/**
+ * Durable affirmative proof that community inspection genuinely began for one
+ * exact claimed attempt of a retry job. Appends to the attempt's `logs` array
+ * (same established `logs ||` pattern as relationship-canary attempt logs; no
+ * schema change), bound to the open PROCESSING row of that attempt number.
+ *
+ * A FAILED attempt row is therefore NOT evidence of execution by itself: the
+ * worker can fail before dispatch (`recordExecutionStage`), while loading the
+ * channel, on terminal/pause early returns, or on a stale/pre-dispatch crash.
+ *
+ * Attempt-scoping (relationship-canary pattern): a recovered worker waking up
+ * late must never mark a newer replacement attempt, and a zero-row update
+ * means the claim was already recovered or completed — the caller aborts
+ * before inspection instead of running unmarked. Deliberately throws instead
+ * of warning: running an unmarked inspection would silently undercount
+ * execution, while failing fast retries the job with the marker intact.
+ */
+export const COMMUNITY_INSPECTION_STARTED_MARKER = 'communityInspectionStarted';
+export async function markCommunityInspectionStarted(jobId:string,attemptNumber:number):Promise<void>{
+  const db=await getDb();
+  const res=await db.query(`UPDATE job_attempts SET logs = logs || $3::jsonb WHERE job_id=$1 AND attempt_number=$2 AND status='PROCESSING' AND finished_at IS NULL`,[jobId,attemptNumber,JSON.stringify(COMMUNITY_INSPECTION_STARTED_MARKER)]);
+  if(!res.rowCount) throw new Error(`Community inspection marker found no open attempt (job ${jobId} attempt ${attemptNumber}); claim was recovered or completed before inspection.`);
+}
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','PROVIDER_COOLDOWN','PROVIDER_CONCURRENCY_CAP_EXCEEDED','BRAVE_API_RATE_LIMIT_429','BRAVE_API_TIMEOUT','BRAVE_API_NETWORK_FAILURE','BRAVE_API_HTTP_500','BRAVE_API_HTTP_502','BRAVE_API_HTTP_503','BRAVE_API_HTTP_504']);
 const TRANSIENT_HTTP_STATUS=new Set([408,425,429,500,502,503,504]);

@@ -11,6 +11,28 @@ test('post-approval operational projection is terminal-only and preserves review
   assert.doesNotMatch(queueManager, /POST_APPROVAL_ENRICH[\s\S]{0,1200}recordAdmissionShadow/);
 });
 
+test('post-approval failures preserve provider taxonomy instead of erasing it', () => {
+  // A plain `throw new Error(result.message)` would erase retryable/errorClass/
+  // retryAt, turning quota/transient deferrals into attempt-consuming failures
+  // and stranding approved enrichment. The worker must carry the taxonomy
+  // forward so failJob can defer attempt-free with the provider schedule.
+  assert.match(queueManager, /triggerManualRecheck\(channelId, true, true\)/);
+  assert.match(queueManager, /errorClass:typedTransient\?result\.errorClass:undefined/);
+  assert.match(queueManager, /retryAt:typedTransient\?result\.retryAt:undefined/);
+  assert.match(queueManager, /retryAfterMs:typedTransient\?result\.retryAfterMs:undefined/);
+  assert.doesNotMatch(queueManager, /if\(!result\.success\) throw new Error\(result\.message\);/);
+});
+
+test('quota-exhausted enrichment defers attempt-free instead of consuming budget', () => {
+  // triggerManualRecheck reports quota exhaustion as retryable RATE_LIMIT;
+  // the worker's typed-transient gate admits exactly that class, so the
+  // failure reaches failJob as retryable and waits without consuming one of
+  // the 4 bounded post-approval attempts.
+  assert.match(queueManager, /code: 'QUOTA_ALLOCATION_EXHAUSTED'/);
+  assert.match(queueManager, /errorClass: 'RATE_LIMIT'/);
+  assert.match(queueManager, /'TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'/);
+});
+
 test('existing community retry terminal projection remains a separate lifecycle path', () => {
   assert.match(queueManager, /if \(job\.type === 'RETRY_COMMUNITY_ACQUISITION' && terminal\)/);
   assert.match(queueManager, /projectTerminalCommunityRetryFailure\(channel,job\.attempts/);

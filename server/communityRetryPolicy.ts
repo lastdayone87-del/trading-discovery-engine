@@ -20,9 +20,22 @@ export interface CommunityRetryObservation {
   retryable: boolean;
   retryAt?: number;
   failureClass?: string;
+  telemetry?: {
+    pagesInspected?: unknown;
+    requestsStarted?: unknown;
+    redirectsFollowed?: unknown;
+  };
 }
 
 export interface CommunityRetryDirective {
+  /**
+   * Channel-level accounting: an attempt-free directive schedules a durable
+   * retry without incrementing the channel's `scan_attempts`. This does NOT
+   * decide job-level execution accounting — the retry worker grants
+   * attempt-free *execution* (claim increment undone) only when `retryReason`
+   * is BROWSER_RUNTIME_UNAVAILABLE, i.e. every retry-owning failure proves no
+   * acquisition work started. Genuine failures consume one job attempt each.
+   */
   attemptFree: boolean;
   code: string;
   retryAt?: number;
@@ -76,7 +89,11 @@ const BROWSER_RUNTIME_FAILURES = new Set([
   'BROWSER_LINUX_DEPENDENCY_MISSING',
   'BROWSER_PERMISSION_DENIED',
   'BROWSER_LAUNCH_FAILED',
-  'BROWSER_RUNTIME_UNAVAILABLE'
+  'BROWSER_RUNTIME_UNAVAILABLE',
+  // Browser-gate saturation rejects the crawl before admission: no acquisition
+  // work started. Classified here (not via browser-capability marking, which
+  // stays healthy) so saturation defers attempt-free like other capacity.
+  'RENDERED_FALLBACK_SATURATED'
 ]);
 
 export function isBrowserRuntimeFailureClass(value: unknown): boolean {
@@ -202,7 +219,15 @@ export function communityAcquisitionRetryDirective(
   const requiredFailures = observations.filter(isCommunityRetryableObservation);
   if (!requiredFailures.length) return undefined;
   const retryTimes = requiredFailures.map(item => Number(item.retryAt)).filter(value => Number.isFinite(value) && value > 0);
-  const browserRuntimeUnavailable = requiredFailures.some(item => isBrowserRuntimeFailureClass(item.failureClass));
+  // Attempt-free capacity classification must be unanimous over proven
+  // no-start observations, never existential over bare error classes: a
+  // browser-runtime failure AFTER pages were processed is executed work and
+  // must consume a bounded attempt. failureClass alone cannot prove no work
+  // started, so each retry-owning observation must ALSO carry zero acquisition
+  // evidence (same pages/requests/redirects boundary as collapse accounting;
+  // telemetry-less rows count as evidenced and consume, since absence of a
+  // signal is not a signal of absence).
+  const browserRuntimeUnavailable = requiredFailures.every(isProvenUnstartedCapacityObservation);
   return {
     attemptFree: true,
     code: browserRuntimeUnavailable ? 'BROWSER_RUNTIME_UNAVAILABLE' : COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
@@ -212,6 +237,22 @@ export function communityAcquisitionRetryDirective(
       ? COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE
       : COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE
   };
+}
+
+/**
+ * Capacity-only predicate: a browser-runtime/capacity failure class PLUS
+ * affirmative zero-evidence telemetry (no pages inspected, no requests
+ * started, no redirects followed). Either condition alone is insufficient —
+ * the class without evidence could be a post-work crash, and zero evidence
+ * without the class is a genuine failure — so both are required.
+ */
+export function isProvenUnstartedCapacityObservation(item: CommunityRetryObservation): boolean {
+  if (!isBrowserRuntimeFailureClass(item.failureClass)) return false;
+  const telemetry = item.telemetry;
+  if (!telemetry) return false;
+  return (Number(telemetry.pagesInspected) || 0) === 0
+    && (Number(telemetry.requestsStarted) || 0) === 0
+    && (Number(telemetry.redirectsFollowed) || 0) === 0;
 }
 
 export function attemptFreeDiscordValidation(outcome: string, retryable: boolean): boolean {

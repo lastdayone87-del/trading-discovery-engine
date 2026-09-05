@@ -136,9 +136,14 @@ test('zero-page incompleteness never resolves clean across zero-processed varian
 });
 
 // 4. Zero-page https://g/ never counts as successful inspection.
-test('zero-page https://g/ becomes incomplete and retryable, never INSPECTED_NO_MATCH', async () => {
+// 4. Dotless garbage (e.g. https://g/) is statically attempted for recall
+// safety but never escalates to rendered fallback and never owns retry work:
+// no browser run can turn a meaningless input into evidence.
+// Garbage-only input must NOT read as a definitive negative either: with no
+// genuine site inspected, the truthful state is non-definitive partial
+// coverage (no retry — nothing retry-owning failed), never INSPECTED_NO_MATCH.
+test('dotless garbage creates no rendered work and no retry', async () => {
   let renderedCalls = 0;
-  const countingZeroPageStub = zeroPageStub();
   const result = await runChannelInspection({
     channelId: 'UCzeropage0000000000000001',
     channelName: 'Zero Page Channel',
@@ -152,25 +157,18 @@ test('zero-page https://g/ becomes incomplete and retryable, never INSPECTED_NO_
     }) as typeof fetch,
     renderedFallback: async (seedUrl) => {
       renderedCalls++;
-      return countingZeroPageStub(seedUrl);
+      return zeroPageStub()(seedUrl);
     },
   });
-  assert.equal(renderedCalls, 1);
-  const renderedObs = (result.acquisitionOutcomes || []).filter(
-    (item) => item.requestedUrl === 'https://g/' && item.failureClass === 'NO_PAGE_PROCESSED',
-  );
-  assert.equal(renderedObs.length, 1);
-  assert.equal(renderedObs[0].outcome, 'ACQUISITION_FAILED');
-  assert.equal(renderedObs[0].required, true);
-  assert.equal(renderedObs[0].retryable, true);
+  assert.equal(renderedCalls, 0);
+  assert.equal(result.retryDirective, undefined);
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+  // The static attempt is still recorded as audit evidence.
   assert.ok(
-    !(result.acquisitionOutcomes || []).some(
-      (item) => item.requestedUrl === 'https://g/' && item.outcome === 'INSPECTED_NO_MATCH',
+    (result.acquisitionOutcomes || []).some(
+      (item) => item.requestedUrl === 'https://g/' && item.outcome === 'ACQUISITION_FAILED',
     ),
   );
-  assert.equal(result.acquisitionStatus, 'ACQUISITION_FAILED');
-  assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
-  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'ERROR');
 });
 
 // 5. Zero-page http://fb.me/BV4REX stays eligible but never clean.
@@ -769,4 +767,163 @@ test('all website observations carry explicit phase telemetry', async () => {
       );
     }
   }
+});
+
+// Retry quality: a genuine website whose static fetch times out remains
+// retryable uncertainty (rendered escalation runs, directive owns the retry).
+test('genuine website navigation timeout becomes retryable uncertainty', async () => {
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'UCtimeoutgenuine00000000001',
+    channelName: 'Timeout Genuine Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://timeout.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => {
+      throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }) as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return zeroPageStub()(seedUrl);
+    },
+  });
+  assert.equal(renderedCalls, 1);
+  assert.notEqual(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  assert.ok(result.retryDirective);
+  assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+// Retry quality: a genuine website with a transient HTTP 500 remains retryable.
+test('genuine website transient failure becomes retryable uncertainty', async () => {
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'UCtransientgenuine000000001',
+    channelName: 'Transient Genuine Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://flaky.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () =>
+      new Response('error', { status: 500, headers: { 'content-type': 'text/html' } })) as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return zeroPageStub()(seedUrl);
+    },
+  });
+  assert.equal(renderedCalls, 1);
+  assert.ok(result.retryDirective);
+  assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+// Retry quality: garbage alongside a genuine failure does not create its own
+// retry ownership — the directive is attributable to the genuine root only.
+test('dotless garbage alongside genuine failure owns no retry itself', async () => {
+  const result = await runChannelInspection({
+    channelId: 'UCmixedgarbage000000000001',
+    channelName: 'Mixed Garbage Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://g/', 'https://flaky.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async (input) => {
+      if (String(input).includes('https://g/')) throw new Error('getaddrinfo ENOTFOUND g');
+      return new Response('error', { status: 500, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch,
+    renderedFallback: zeroPageStub(),
+  });
+  assert.ok(result.retryDirective, 'genuine failure must still own a retry');
+  const requiredFailed = (result.acquisitionOutcomes || []).filter(
+    (item) => item.surface === 'CREATOR_WEBSITES' && item.required && item.outcome === 'ACQUISITION_FAILED',
+  );
+  assert.ok(requiredFailed.length > 0);
+  for (const item of requiredFailed) {
+    assert.ok(
+      !(item.rootUrl || item.requestedUrl).startsWith('https://g/'),
+      `garbage root must never own retry work: ${item.requestedUrl}`,
+    );
+  }
+});
+
+// Retry quality: garbage alongside a genuinely inspected clean site yields a
+// definitive negative driven by the genuine root — garbage contributes
+// nothing, and no retry is owned.
+test('dotless garbage alongside genuine clean inspection stays definitive', async () => {
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'UCmixedclean00000000000001',
+    channelName: 'Mixed Clean Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://g/', 'https://clean.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: noInviteHtml as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return processedStub()(seedUrl);
+    },
+  });
+  // Rendered fallback runs for the genuine root only, never for garbage.
+  assert.equal(renderedCalls, 1);
+  assert.equal(result.retryDirective, undefined);
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+});
+
+// Saturation uses the exact result shape the browser-gate catch produces:
+// zero pages, explicit RENDERED_FALLBACK_SATURATED class. It must classify as
+// attempt-free capacity (browser reason), never as a genuine NO_PAGE_PROCESSED
+// failure that consumes a bounded attempt for work that never started.
+test('saturated browser gate defers attempt-free as capacity', async () => {
+  const result = await runChannelInspection({
+    channelId: 'UCsaturated0000000000000001',
+    channelName: 'Saturated Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://saturated.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => {
+      throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 0,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: false,
+      failureClass: 'RENDERED_FALLBACK_SATURATED',
+      telemetry: zeroTelemetry(),
+      detail: 'Rendered acquisition deferred because the process-wide browser launch gate is saturated',
+    })) as (seedUrl: string) => Promise<BrowserFallbackResult>,
+  });
+  assert.ok(result.retryDirective, 'saturated capacity must still own a (deferrable) retry');
+  assert.equal(result.retryDirective?.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
+  assert.equal(result.retryDirective?.code, 'BROWSER_RUNTIME_UNAVAILABLE');
+});
+
+// IPv6 literals are genuine website targets: failures stay eligible for the
+// normal rendered/retry path and never quarantined as single-label garbage.
+test('IPv6 literal failure remains eligible for rendered retry', async () => {
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'UCipv6genuine0000000000001',
+    channelName: 'IPv6 Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['http://[2606:4700:4700::1111]/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => {
+      throw Object.assign(new Error('connect ENETUNREACH'), { name: 'AbortError' });
+    }) as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return zeroPageStub()(seedUrl);
+    },
+  });
+  assert.equal(renderedCalls, 1);
+  assert.ok(result.retryDirective, 'genuine IPv6 failure must own a retry');
+  assert.notEqual(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
 });

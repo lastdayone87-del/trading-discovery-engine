@@ -37,3 +37,14 @@ test('queue gates channel attempt increments and retry scheduling on the directi
   assert.match(queue,/BROWSER_RUNTIME_UNAVAILABLE/);
   assert.match(readFileSync(new URL('./dbCore.ts',import.meta.url),'utf8'),/excludedErrorPatterns/);
 });
+
+test('retry worker defers attempt-free only for browser-runtime capacity, genuine failures consume an attempt',()=>{
+  const queue=readFileSync(new URL('./queueManager.ts',import.meta.url),'utf8');
+  // The deferral branch must be scoped to the browser-runtime retry reason:
+  // a genuine COMMUNITY_REQUIRED failure did real inspection work and must
+  // fall through to the normal failure path (attempts+1, exponential
+  // backoff, eventual terminal) instead of looping forever at attempts=0.
+  assert.match(queue,/directive\.retryReason===COMMUNITY_RETRY_REASON\.BROWSER_RUNTIME_UNAVAILABLE/);
+  assert.match(queue,/Community acquisition deferred/);
+  assert.match(queue,/Retryable community acquisition remains unresolved/);
+});
