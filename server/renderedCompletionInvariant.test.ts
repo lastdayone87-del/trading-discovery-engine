@@ -726,3 +726,17 @@ test('static crawl observations carry the seed root URL', async () => {
   assert.ok(result.observations.length > 1, 'child page must actually be fetched and fail');
   assert.deepEqual([...urls], ['https://rootsite.example/']);
 });
+
+// Static and rendered phases use independent counters: both survive totaling.
+test('pages total across phases without multiplying shared counters', async () => {
+  const { summarizeLinkedWebsiteAcquisition } = await import('./inspector');
+  const staticTelemetry = (pages: number) => ({ mode: 'STATIC' as const, redirectsFollowed: 0, pagesInspected: pages, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 });
+  const renderedTelemetry = (pages: number) => ({ ...staticTelemetry(pages), mode: 'RENDERED' as const });
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://root.example/sub', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: staticTelemetry(2) },
+    { requestedUrl: 'https://root.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: staticTelemetry(5) },
+    { requestedUrl: 'https://root.example/', surface: 'CREATOR_WEBSITES', required: true, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: renderedTelemetry(3) },
+  ]);
+  assert.equal(summary.uniqueRootUrls, 1);
+  assert.equal(summary.pagesProcessed, 8);
+});

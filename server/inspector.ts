@@ -338,10 +338,15 @@ export function summarizeLinkedWebsiteAcquisition(observations: ExternalAcquisit
   // Telemetry counters are cumulative snapshots per crawl: each observation
   // carries the running total at its own point in time. Summing them would
   // count the same pages many times over, so take the maximum per unique URL.
-  const pagesByUrl = new Map<string, number>();
+  // Telemetry counters are cumulative snapshots within one crawl phase but
+  // independent across phases: static sub-observations share one crawl's
+  // running total (take the maximum per root), while a rendered rerun of the
+  // same root inspects pages anew (counted separately). Keying by phase+root
+  // avoids both multiplying shared counters and dropping a whole phase.
+  const pagesByPhaseRoot = new Map<string, number>();
   for (const item of website) {
-    const key = rootKey(item);
-    pagesByUrl.set(key, Math.max(pagesByUrl.get(key) || 0, Number(item.telemetry?.pagesInspected) || 0));
+    const key = `${phaseOf(item)}:${rootKey(item)}`;
+    pagesByPhaseRoot.set(key, Math.max(pagesByPhaseRoot.get(key) || 0, Number(item.telemetry?.pagesInspected) || 0));
   }
   return {
     uniqueRootUrls,
@@ -351,7 +356,7 @@ export function summarizeLinkedWebsiteAcquisition(observations: ExternalAcquisit
     renderedRan: rendereds.length,
     renderedSucceeded: succeeded(rendereds),
     renderedFailed: failed(rendereds),
-    pagesProcessed: [...pagesByUrl.values()].reduce((total, pages) => total + pages, 0),
+    pagesProcessed: [...pagesByPhaseRoot.values()].reduce((total, pages) => total + pages, 0),
     retryableFailures: website.filter(item => item.outcome === 'ACQUISITION_FAILED' && item.retryable).length,
   };
 }
