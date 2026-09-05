@@ -298,6 +298,44 @@ export function relationshipCanaryAttemptLog(summary: RelationshipCanarySummary)
 }
 
 /**
+ * Attempt/ownership-bound completion for relationship-canary jobs. Completes
+ * the job ONLY when the caller still owns the exact claimed attempt (job is
+ * PROCESSING, attempt counter matches, lock holder matches), and then only
+ * finishes that attempt's row. A stale worker whose job was recovered and
+ * re-claimed (attempt N+1 owned by another worker) gets completed:false and
+ * must not touch the job or the newer attempt. Single transaction: the job
+ * row lock serializes concurrent completions.
+ */
+export async function completeRelationshipCanaryAttempt(
+  query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>,
+  input: { jobId: string; attemptNumber: number; workerId: string },
+): Promise<{ completed: boolean }> {
+  await query('BEGIN');
+  try {
+    const owned = await query(
+      `UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now()
+        WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3 RETURNING id`,
+      [input.jobId, input.attemptNumber, input.workerId],
+    );
+    if (!owned.rowCount) {
+      await query('ROLLBACK');
+      return { completed: false };
+    }
+    await query(
+      `UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND attempt_number=$2 AND finished_at IS NULL`,
+      [input.jobId, input.attemptNumber],
+    );
+    await query('COMMIT');
+    return { completed: true };
+  } catch (error) {
+    try {
+      await query('ROLLBACK');
+    } catch {}
+    throw error;
+  }
+}
+
+/**
  * Appends the run summary to the open job_attempts record (logs JSONB array)
  * so provider failures are visible instead of surfacing as COMPLETED with
  * empty logs. When attemptNumber is provided, the write is bound to that

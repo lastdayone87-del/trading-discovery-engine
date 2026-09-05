@@ -12,6 +12,7 @@ import {
   processRelationshipCanaryJob,
   validateRelationshipCanaryPayload,
 } from './relationshipCanary';
+import type { RelationshipCanarySummary } from './relationshipCanary';
 
 const UC = (suffix: string) => `UC${suffix.padEnd(22, '0').slice(0, 22)}`;
 const genericRaw = (overrides: Partial<DiscoveredChannelRaw> = {}): DiscoveredChannelRaw => ({
@@ -1125,13 +1126,15 @@ test('dispatcher persists pre-dispatch failure before completing the job', async
         events.push(`persist:${jobId}`);
         persisted = { jobId, summary: summary as unknown as Record<string, unknown>, attempt };
       },
-      finishJob: async (jobId) => {
-        events.push(`complete:${jobId}`);
+      completeAttempt: async (input) => {
+        events.push(`complete:${input.jobId}#${input.attemptNumber}`);
+        return { completed: true };
       },
     },
+    { workerId: 'worker-1', attemptNumber: 3 },
   );
   // Persist-before-complete ordering is what makes failures observable.
-  assert.deepEqual(events, ['run:job-9', 'persist:job-9', 'complete:job-9']);
+  assert.deepEqual(events, ['run:job-9', 'persist:job-9', 'complete:job-9#3']);
   assert.ok(persisted);
   assert.equal((persisted as unknown as { jobId: string }).jobId, 'job-9');
   assert.equal((persisted as unknown as { attempt?: number }).attempt, 3);
@@ -1145,5 +1148,171 @@ test('dispatcher persists pre-dispatch failure before completing the job', async
 test('dispatcher routes canary jobs through the persist-before-complete helper', async () => {
   const { readFileSync } = await import('node:fs');
   const source = readFileSync('server/queueManager.ts', 'utf8');
-  assert.match(source, /job\.type==='RELATIONSHIP_CANARY_EXPANSION'\)\{\s*await handleRelationshipCanaryExpansionJob\(job\);return true;/);
+  assert.match(source, /job\.type==='RELATIONSHIP_CANARY_EXPANSION'\)\{\s*await handleRelationshipCanaryExpansionJob\(job, undefined, \{ workerId, attemptNumber: job\.attempts \}\);return true;/);
+});
+
+// Stale-worker race: fake queue lifecycle mirroring claim/recover semantics
+// (PENDING→PROCESSING+attempts+1+lock, recovery→PENDING+unlock+fail-open-rows).
+const makeLifecycleStore = () => {
+  const job = { status: 'PENDING', attempts: 0, locked_by: null as string | null };
+  const attempts: Array<{ attempt_number: number; status: string; finished_at: string | null; logs: unknown[] }> = [];
+  const api = {
+    job,
+    attempts,
+    claim(workerId: string) {
+      if (job.status !== 'PENDING') return null;
+      job.status = 'PROCESSING';
+      job.locked_by = workerId;
+      job.attempts += 1;
+      attempts.push({ attempt_number: job.attempts, status: 'PROCESSING', finished_at: null, logs: [] });
+      return { attempts: job.attempts };
+    },
+    recover() {
+      if (job.status !== 'PROCESSING') return;
+      job.status = 'PENDING';
+      job.locked_by = null;
+      for (const row of attempts) {
+        if (!row.finished_at) {
+          row.status = 'FAILED';
+          row.finished_at = 'recovered';
+        }
+      }
+    },
+    query: (async (text: string, values: unknown[] = []) => {
+      const t = text.replace(/\s+/g, ' ');
+      if (/^(BEGIN|COMMIT|ROLLBACK)/.test(t.trim())) return { rows: [] };
+      if (t.includes('UPDATE jobs SET') && t.includes('attempts=$2 AND locked_by=$3')) {
+        const [id, attempt, worker] = values as [string, number, string];
+        if (id === 'job-9' && job.status === 'PROCESSING' && job.attempts === attempt && job.locked_by === worker) {
+          job.status = 'COMPLETED';
+          job.locked_by = null;
+          return { rows: [{ id }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }
+      if (t.includes('UPDATE job_attempts SET logs = logs ||')) {
+        const withAttempt = t.includes('attempt_number=$3');
+        const row = attempts.find(a => !a.finished_at && (!withAttempt || a.attempt_number === (values[2] as number)));
+        if (row) row.logs.push(JSON.parse(String(values[1])));
+        return { rows: [] };
+      }
+      if (t.includes('UPDATE job_attempts SET status=')) {
+        const row = attempts.find(a => a.attempt_number === (values[1] as number) && !a.finished_at);
+        if (row) {
+          row.status = 'COMPLETED';
+          row.finished_at = 'now';
+        }
+        return { rows: [] };
+      }
+      throw new Error(`unexpected statement: ${text.slice(0, 100)}`);
+    }) as never,
+  };
+  return api;
+};
+
+const cannedSummary = (tag: string): {
+  cohortId: string; status: 'COMPLETED'; seedsAttempted: number; depth1Channels: number; depth2Fetches: number;
+  nominations: number; ingested: number; channelsCapped: number; downstreamCapped: number;
+  failures: string[]; failureCodes: string[]; quotaUnits: number;
+} => ({
+  cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 1, depth1Channels: 0, depth2Fetches: 0,
+  nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+  failures: [`${tag}:boom`], failureCodes: ['PROVIDER_CALL_FAILED'], quotaUnits: 0,
+});
+
+// The dangerous race, step by step: stale Worker A must not complete Worker
+// B's retry, and B must still complete normally afterwards.
+test('stale canary worker cannot complete a newer retry', async () => {
+  const { handleRelationshipCanaryExpansionJob, completeRelationshipCanaryAttempt, persistRelationshipCanarySummary } = await import('./queueManager').then(async (qm) => ({
+    handleRelationshipCanaryExpansionJob: qm.handleRelationshipCanaryExpansionJob,
+    ...(await import('./relationshipCanary')),
+  }));
+  const store = makeLifecycleStore();
+  const q = store.query;
+  const wired = (tag: string) => ({
+    runCanary: async () => cannedSummary(tag),
+    persistSummary: (jobId: string, summary: RelationshipCanarySummary, attempt?: number) =>
+      persistRelationshipCanarySummary(q, jobId, summary, attempt),
+    completeAttempt: (input: { jobId: string; attemptNumber: number; workerId: string }) =>
+      completeRelationshipCanaryAttempt(q, input),
+  });
+
+  // Worker A claims attempt 1, then goes stale; recovery requeues.
+  const claimA = store.claim('worker-A');
+  assert.equal(claimA?.attempts, 1);
+  store.recover();
+  assert.equal(store.job.status, 'PENDING');
+  // Worker B claims attempt 2 and starts work.
+  const claimB = store.claim('worker-B');
+  assert.equal(claimB?.attempts, 2);
+  // Worker A finishes late: persist targets only attempt 1 (already failed),
+  // and conditional completion refuses (ownership lost).
+  const staleResult = await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 1, payload: {} },
+    wired('stale-A'),
+    { workerId: 'worker-A', attemptNumber: 1 },
+  );
+  assert.deepEqual(staleResult, { completed: false });
+  assert.equal(store.job.status, 'PROCESSING');
+  assert.equal(store.job.attempts, 2);
+  assert.equal(store.job.locked_by, 'worker-B');
+  assert.deepEqual(store.attempts[1].logs, []);
+  // Worker B remains the valid owner and completes normally.
+  const freshResult = await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 2, payload: {} },
+    wired('fresh-B'),
+    { workerId: 'worker-B', attemptNumber: 2 },
+  );
+  assert.deepEqual(freshResult, { completed: true });
+  assert.equal(store.job.status, 'COMPLETED');
+  assert.equal(store.attempts[1].status, 'COMPLETED');
+  assert.ok(store.attempts[1].finished_at);
+  assert.equal(store.attempts[1].logs.length, 1);
+  // Attempt 1 keeps its recovery lifecycle state (FAILED), untouched by B.
+  assert.equal(store.attempts[0].status, 'FAILED');
+});
+
+// Ownership mismatch variants: wrong worker, wrong attempt, non-processing.
+test('conditional completion rejects mismatched ownership', async () => {
+  const { completeRelationshipCanaryAttempt } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  const q = store.query;
+  store.claim('worker-A');
+  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-B' }), { completed: false });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-9', attemptNumber: 2, workerId: 'worker-A' }), { completed: false });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-other', attemptNumber: 1, workerId: 'worker-A' }), { completed: false });
+  assert.equal(store.job.status, 'PROCESSING');
+  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-A' }), { completed: true });
+  assert.equal(store.job.status, 'COMPLETED');
+});
+
+// Normal path: claim → run → persist → conditional complete, in order.
+test('normal canary run completes its own attempt with observable logs', async () => {
+  const { handleRelationshipCanaryExpansionJob, completeRelationshipCanaryAttempt, persistRelationshipCanarySummary } = await import('./queueManager').then(async (qm) => ({
+    handleRelationshipCanaryExpansionJob: qm.handleRelationshipCanaryExpansionJob,
+    ...(await import('./relationshipCanary')),
+  }));
+  const store = makeLifecycleStore();
+  const q = store.query;
+  const events: string[] = [];
+  store.claim('worker-A');
+  const result = await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 1, payload: {} },
+    {
+      runCanary: async () => { events.push('run'); return cannedSummary('ok'); },
+      persistSummary: async (jobId: string, summary: RelationshipCanarySummary, attempt?: number) => {
+        events.push('persist');
+        await persistRelationshipCanarySummary(q, jobId, summary, attempt);
+      },
+      completeAttempt: async (input) => {
+        events.push('complete');
+        return completeRelationshipCanaryAttempt(q, input);
+      },
+    },
+    { workerId: 'worker-A', attemptNumber: 1 },
+  );
+  assert.deepEqual(result, { completed: true });
+  assert.deepEqual(events, ['run', 'persist', 'complete']);
+  assert.equal(store.job.status, 'COMPLETED');
+  assert.equal(store.attempts[0].logs.length, 1);
 });
