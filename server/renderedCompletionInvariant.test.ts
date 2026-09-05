@@ -612,3 +612,161 @@ test('lifecycle failed extraction yields NO_PAGE_PROCESSED, never partial', () =
   assert.equal(state.retryable, true);
   assert.equal(state.failureClass, 'NO_PAGE_PROCESSED');
 });
+
+// Step 4 reporting splits populations instead of comparing observations to URLs.
+test('linked-website summary separates URLs, static, rendered, pages, retryables', async () => {
+  const { summarizeLinkedWebsiteAcquisition, formatLinkedWebsiteAcquisitionSummary } = await import('./inspector');
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://a.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', telemetry: { mode: 'STATIC', redirectsFollowed: 0, pagesInspected: 2, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 } },
+    { requestedUrl: 'https://a.example/', surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'NO_PAGE_PROCESSED', detail: '', observedAt: '' },
+    { requestedUrl: 'https://b.example/docs', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '' },
+  ]);
+  assert.equal(summary.uniqueRootUrls, 2);
+  assert.equal(summary.staticRan, 2);
+  assert.equal(summary.staticSucceeded, 1);
+  assert.equal(summary.staticFailed, 0);
+  assert.equal(summary.renderedRan, 1);
+  assert.equal(summary.renderedSucceeded, 0);
+  assert.equal(summary.renderedFailed, 1);
+  assert.equal(summary.pagesProcessed, 2);
+  assert.equal(summary.retryableFailures, 1);
+  const text = formatLinkedWebsiteAcquisitionSummary(summary);
+  assert.match(text, /2 unique website URL\(s\)/);
+  assert.match(text, /static: 2 attempted, 1 inspected, 0 failed/);
+  assert.match(text, /rendered fallback: 1 attempted, 0 inspected, 1 failed/);
+  assert.match(text, /2 page\(s\) processed/);
+  assert.match(text, /1 retryable failure\(s\)/);
+});
+
+// Static required:true failures (messaging previews use the flag for retry
+// ownership) must not be reported as rendered fallback attempts.
+test('required static failures split as static, not rendered', async () => {
+  const { summarizeLinkedWebsiteAcquisition } = await import('./inspector');
+  const staticTelemetry = (pages: number) => ({ mode: 'STATIC' as const, redirectsFollowed: 0, pagesInspected: pages, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 });
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://t.me/preview', surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', telemetry: staticTelemetry(0) },
+    { requestedUrl: 'https://site.example/', surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '' },
+  ]);
+  assert.equal(summary.staticRan, 1);
+  assert.equal(summary.staticFailed, 1);
+  assert.equal(summary.renderedRan, 1);
+  assert.equal(summary.renderedFailed, 1);
+});
+
+// Cumulative per-crawl counters must not multiply pages across observations.
+test('pages are deduplicated per URL instead of summed raw', async () => {
+  const { summarizeLinkedWebsiteAcquisition } = await import('./inspector');
+  const telemetry = (pages: number) => ({ mode: 'STATIC' as const, redirectsFollowed: 0, pagesInspected: pages, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 });
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://a.example/sub', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', telemetry: telemetry(2) },
+    { requestedUrl: 'https://a.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', telemetry: telemetry(5) },
+  ]);
+  assert.equal(summary.uniqueRootUrls, 2);
+  assert.equal(summary.pagesProcessed, 7);
+  const sameUrl = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://a.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', telemetry: telemetry(2) },
+    { requestedUrl: 'https://a.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', telemetry: telemetry(5) },
+  ]);
+  assert.equal(sameUrl.uniqueRootUrls, 1);
+  assert.equal(sameUrl.pagesProcessed, 5);
+});
+
+// FOUND results carry the same split summary (previously omitted entirely).
+test('found website acquisition still reports the URL/phase split', async () => {
+  const result = await runChannelInspection({
+    channelId: 'UCfoundwithsummary00000001',
+    channelName: 'Found Summary Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://found.example/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async () => html('<html><body><p>Join https://discord.gg/foundroom1</p></body></html>')) as typeof fetch,
+  });
+  const step = result.steps.find((item) => item.step === 'CUSTOM_DOMAINS');
+  assert.equal(step?.status, 'FOUND');
+  assert.match(step?.details || '', /unique website URL\(s\)/);
+  assert.match(step?.details || '', /static:/);
+});
+
+// Child-fetch failures group under their seed root: one crawled website,
+// pages counted once per root crawl, never multiplied.
+test('child observations collapse to the seed root URL', async () => {
+  const { summarizeLinkedWebsiteAcquisition } = await import('./inspector');
+  const telemetry = (pages: number) => ({ mode: 'STATIC' as const, redirectsFollowed: 0, pagesInspected: pages, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 });
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://root.example/guide/part-1', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: telemetry(2) },
+    { requestedUrl: 'https://root.example/guide/part-2', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: telemetry(4) },
+    { requestedUrl: 'https://root.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: telemetry(4) },
+    { requestedUrl: 'https://other.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', telemetry: telemetry(1) },
+  ]);
+  assert.equal(summary.uniqueRootUrls, 2);
+  assert.equal(summary.pagesProcessed, 5);
+  assert.equal(summary.staticFailed, 2);
+  assert.equal(summary.staticSucceeded, 2);
+});
+
+// Static crawl tags every observation of a seed crawl with the seed root.
+test('static crawl observations carry the seed root URL', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const result = await crawlExternalLinks(
+    ['https://rootsite.example/'],
+    [],
+    undefined,
+    (async (input: unknown) => {
+      const url = String(input);
+      if (url === 'https://rootsite.example/') {
+        return html('<html><body><a href="/community">join our community</a><p>hello</p></body></html>');
+      }
+      throw new Error('connection reset');
+    }) as typeof fetch,
+    'CREATOR_WEBSITES',
+    false,
+  );
+  const urls = new Set(result.observations.map(item => (item as { rootUrl?: string }).rootUrl || item.requestedUrl));
+  assert.ok(result.observations.length > 1, 'child page must actually be fetched and fail');
+  assert.deepEqual([...urls], ['https://rootsite.example/']);
+});
+
+// Static and rendered phases use independent counters: both survive totaling.
+test('pages total across phases without multiplying shared counters', async () => {
+  const { summarizeLinkedWebsiteAcquisition } = await import('./inspector');
+  const staticTelemetry = (pages: number) => ({ mode: 'STATIC' as const, redirectsFollowed: 0, pagesInspected: pages, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 });
+  const renderedTelemetry = (pages: number) => ({ ...staticTelemetry(pages), mode: 'RENDERED' as const });
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://root.example/sub', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: staticTelemetry(2) },
+    { requestedUrl: 'https://root.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: staticTelemetry(5) },
+    { requestedUrl: 'https://root.example/', surface: 'CREATOR_WEBSITES', required: true, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: renderedTelemetry(3) },
+  ]);
+  assert.equal(summary.uniqueRootUrls, 1);
+  assert.equal(summary.pagesProcessed, 8);
+});
+
+// Phase-fallback safety invariant: every CREATOR_WEBSITES observation carries
+// explicit acquisition-mode telemetry, so the required-flag fallback never
+// decides a real row (it survives only for legacy persisted trails).
+test('all website observations carry explicit phase telemetry', async () => {
+  const collect = async (options: Record<string, unknown>) => {
+    const result = await runChannelInspection({
+      channelId: 'UCphaseaudit0000000000001',
+      channelName: 'Phase Audit Channel',
+      channelBio: 'Trading notes',
+      channelLinks: ['https://audit.example/', 'https://g/'],
+      videoDescriptions: fillers,
+      creatorLikelyTrading: true,
+      externalFetchImpl: (async () => noInviteHtml()) as typeof fetch,
+      renderedFallback: zeroPageStub(),
+      ...(options as Record<string, unknown>),
+    } as never);
+    return (result.acquisitionOutcomes || []).filter(item => item.surface === 'CREATOR_WEBSITES');
+  };
+  for (const options of [{}, { channelLinks: ['https://t.me/auditpreview'] }]) {
+    const observations = await collect(options);
+    assert.ok(observations.length > 0);
+    for (const item of observations) {
+      assert.ok(
+        item.telemetry?.mode === 'STATIC' || item.telemetry?.mode === 'RENDERED',
+        `missing phase telemetry on ${item.requestedUrl} (${item.outcome})`,
+      );
+    }
+  }
+});
