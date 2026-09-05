@@ -80,7 +80,7 @@ import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
-import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { processPendingStagedCandidates } from './candidateStaging';
@@ -241,8 +241,14 @@ export async function processNextSearchJob(
       const channel=await getChannelById(String(job.payload.channelId||''));
       if(!channel){await completeJob(job.id);return true;}
       const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false);
-      if(inspectionResult && inspectionResult.retryDirective?.attemptFree){
-        const directive=inspectionResult.retryDirective;
+      // Attempt-free deferral is reserved for capacity/browser signals where no
+      // real acquisition was attempted (browser runtime unavailable). Genuine
+      // acquisition failures (COMMUNITY_REQUIRED) consumed a real inspection
+      // run and must consume one durable attempt via the normal failure path
+      // below, so retries progress and eventually terminate instead of looping
+      // forever at attempts=0 with ever-growing execution counts.
+      const directive=inspectionResult?inspectionResult.retryDirective:undefined;
+      if(directive?.attemptFree&&directive.retryReason===COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE){
         const deferred=Object.assign(new Error(`Community acquisition deferred: ${directive.reason}`),{code:directive.code,retryable:true,retryAt:directive.retryAt});
         throw deferred;
       }
@@ -276,7 +282,21 @@ export async function processNextSearchJob(
       const before=await getChannelById(channelId);
       if(!before) { await completeJob(job.id); return true; }
       const result=await triggerManualRecheck(channelId, true, true);
-      if(!result.success) throw new Error(result.message);
+      if(!result.success){
+        // Preserve the provider/admission taxonomy so capacity/transient
+        // failures defer attempt-free with their retry schedule, while genuine
+        // failures consume one bounded attempt and eventually project a
+        // truthful terminal state. A plain Error would erase that distinction.
+        const typedTransient=result.retryable===true
+          &&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(String(result.errorClass||''));
+        throw Object.assign(new Error(result.message),{
+          code:result.code,
+          retryable:typedTransient,
+          errorClass:typedTransient?result.errorClass:undefined,
+          retryAt:typedTransient?result.retryAt:undefined,
+          retryAfterMs:typedTransient?result.retryAfterMs:undefined
+        });
+      }
       const refreshed=await getChannelById(channelId);
       if(refreshed && job.type==='POST_APPROVAL_ENRICH') {
         // Human approval remains authoritative; learning is delayed until this

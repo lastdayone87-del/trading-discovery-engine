@@ -56,6 +56,24 @@ test('application/logic failures still consume the bounded retry budget',()=>{
   assert.equal(decideJobFailure(new Error('classifier invariant failed'),3,3,now).disposition,'FAILED');
 });
 
+test('genuine community retry execution consumes one attempt and eventually terminates',()=>{
+  // The retry worker throws a plain (non-retryable) error when a genuine
+  // inspection still fails: each execution is a real attempt.
+  const unresolved=new Error('Retryable community acquisition remains unresolved');
+  assert.equal(isRetryableInfrastructureFailure(unresolved),false);
+  assert.equal(decideJobFailure(unresolved,1,5,now).disposition,'RETRYING');
+  assert.equal(decideJobFailure(unresolved,5,5,now).disposition,'FAILED');
+});
+
+test('browser-runtime community deferrals never consume the attempt budget',()=>{
+  // Capacity deferrals carry retryable:true + the browser code: the claim is
+  // undone (attempts-1) and the job stays PENDING with a fresh run_after.
+  const deferred=Object.assign(new Error('Community acquisition deferred: BROWSER_RUNTIME_UNAVAILABLE'),{code:'BROWSER_RUNTIME_UNAVAILABLE',retryable:true,retryAt:now+60_000});
+  assert.equal(isRetryableInfrastructureFailure(deferred),true);
+  assert.deepEqual(decideJobFailure(deferred,0,5,now),{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:now+60_000});
+  assert.deepEqual(decideJobFailure(deferred,5,5,now),{disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:now+60_000});
+});
+
 test('investigation deadline remains terminal and cannot loop forever',()=>{
   assert.equal(decideJobFailure({code:'INVESTIGATION_DEADLINE_EXCEEDED'},1,5,now).disposition,'FAILED');
 });

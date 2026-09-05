@@ -395,10 +395,12 @@ test('exhausted crawl budget produces PARTIALLY_INSPECTED at channel level', asy
   assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
 });
 
-test('dotless single-label hosts are attempted, labeled narrowly, and stay policy-eligible', async () => {
+test('dotless single-label hosts are attempted, labeled narrowly, and own no rendered/retry work', async () => {
   // Quarantine means "malformed/non-public single-label host, attempted
-  // statically first and labeled" — never "not allowed to be rendered".
-  // Forensic basis (PR #434 §7A): zero historical FOUND for dotless seeds.
+  // statically first and labeled" — plus no rendered escalation and no retry
+  // ownership: no browser run can turn a meaningless input into evidence, so
+  // escalation would only manufacture garbage retry jobs. Forensic basis
+  // (PR #434 §7A): zero historical FOUND for dotless seeds.
   let renderedCalls = 0;
   const result = await runChannelInspection({
     channelId: 'dotless-channel',
@@ -422,8 +424,9 @@ test('dotless single-label hosts are attempted, labeled narrowly, and stay polic
       (item) => item.requestedUrl === 'https://g/' && item.outcome === 'ACQUISITION_FAILED' && item.required === false,
     ),
   );
-  // Eligible per existing policy: static non-FOUND + trading → rendered attempted.
-  assert.equal(renderedCalls, 1);
+  // Malformed input owns no rendered work and no retry: statically attempted
+  // and recorded, then filtered from escalation and retry ownership.
+  assert.equal(renderedCalls, 0);
   assert.equal(result.retryDirective, undefined);
 });
 

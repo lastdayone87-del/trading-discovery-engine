@@ -52,7 +52,7 @@ test('later successful no-match supersedes an earlier raw acquisition failure fo
   assert.equal(effective[0].outcome,'INSPECTED_NO_MATCH');
   assert.equal(communityAcquisitionRetryDirective(effective),undefined);
   const inspector=readFileSync('server/inspector.ts','utf8');
-  assert.match(inspector,/communityRequired=required\.filter\(item=>isDiscordCommunityAcquisitionSurface\(item\.surface\)\)/);
+  assert.match(inspector,/communityRequired=required\.filter\(item=>isDiscordCommunityAcquisitionSurface\(item\.surface\)&&isMeaningfulWebsiteObservation/);
   assert.match(inspector,/retryDirective:communityAcquisitionRetryDirective\(communityRequired\)/);
 });
 
