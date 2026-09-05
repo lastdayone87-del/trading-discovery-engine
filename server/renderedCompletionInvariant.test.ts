@@ -740,3 +740,33 @@ test('pages total across phases without multiplying shared counters', async () =
   assert.equal(summary.uniqueRootUrls, 1);
   assert.equal(summary.pagesProcessed, 8);
 });
+
+// Phase-fallback safety invariant: every CREATOR_WEBSITES observation carries
+// explicit acquisition-mode telemetry, so the required-flag fallback never
+// decides a real row (it survives only for legacy persisted trails).
+test('all website observations carry explicit phase telemetry', async () => {
+  const collect = async (options: Record<string, unknown>) => {
+    const result = await runChannelInspection({
+      channelId: 'UCphaseaudit0000000000001',
+      channelName: 'Phase Audit Channel',
+      channelBio: 'Trading notes',
+      channelLinks: ['https://audit.example/', 'https://g/'],
+      videoDescriptions: fillers,
+      creatorLikelyTrading: true,
+      externalFetchImpl: (async () => noInviteHtml()) as typeof fetch,
+      renderedFallback: zeroPageStub(),
+      ...(options as Record<string, unknown>),
+    } as never);
+    return (result.acquisitionOutcomes || []).filter(item => item.surface === 'CREATOR_WEBSITES');
+  };
+  for (const options of [{}, { channelLinks: ['https://t.me/auditpreview'] }]) {
+    const observations = await collect(options);
+    assert.ok(observations.length > 0);
+    for (const item of observations) {
+      assert.ok(
+        item.telemetry?.mode === 'STATIC' || item.telemetry?.mode === 'RENDERED',
+        `missing phase telemetry on ${item.requestedUrl} (${item.outcome})`,
+      );
+    }
+  }
+});
