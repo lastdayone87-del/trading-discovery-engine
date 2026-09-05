@@ -602,6 +602,11 @@ export async function processRelationshipCanaryJob(
   // was already expanded (seed fetch or depth-2 fetch) is never fetched
   // again, while admission dedupe stays purely channel-ID based.
   const expandedTargets = new Set<string>();
+  // Quota operation identity includes the claimed attempt: a stale worker
+  // and its replacement retry must never share operation IDs in a way that
+  // records one quota claim for two provider calls. Direct calls without a
+  // claim keep the unscoped form.
+  const opScope = `relationship-canary:${payload.cohortId}${deps.claim ? `:attempt-${deps.claim.attemptNumber}` : ''}`;
   const seeds = dedupeRelationshipSeeds(payload.seeds);
   for (const seed of seeds) {
     if (seed.kind === 'channel') {
@@ -638,14 +643,21 @@ export async function processRelationshipCanaryJob(
   const admitCandidate = async (raw: DiscoveredChannelRaw, nomination: {
     sourceType: string; query: string; resultRank: number;
     matchedDocument: DiscoveredChannelRaw['matchedDocument']; rawObservation: Record<string, unknown>;
-  }): Promise<void> => {
-    if (!acceptChannel()) return;
+  }): Promise<boolean> => {
+    // Ownership fence per admission: recovery may have struck while a
+    // provider fetch was in flight, so re-check before spending quota,
+    // nominating, or ingesting — not just before the next fetch.
+    if (!(await checkOwnership())) {
+      log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-batch; stopping without admitting ${raw.channelId}.`);
+      return false;
+    }
+    if (!acceptChannel()) return true;
     // Truthful downstream bound: admitting a candidate is expected to trigger
     // hydration and enrichment work outside traversal. Earmark the
     // conservative downstream estimate from the same atomic allowance BEFORE
     // nominating or ingesting; if it does not fit, the candidate is not
     // admitted at all (counted separately from the channel cap).
-    if (!await claimQuota(`relationship-canary:${payload.cohortId}:downstream:${raw.channelId}`, RELATIONSHIP_CANARY_ESTIMATED_DOWNSTREAM_UNITS, { consumeImmediately: true })) {
+    if (!await claimQuota(`${opScope}:downstream:${raw.channelId}`, RELATIONSHIP_CANARY_ESTIMATED_DOWNSTREAM_UNITS, { consumeImmediately: true })) {
       summary.downstreamCapped++;
       return;
     }
@@ -679,10 +691,11 @@ export async function processRelationshipCanaryJob(
       // evidence: record them under an explicit non-provider code.
       recordCanaryFailure(summary, raw.channelId, error, 'ADMISSION_FAILED');
     }
+    return true;
   };
 
   const expandFeatured = async (sourceChannelId: string, provenance: Omit<RelationshipProvenance, 'kind'> & { kind: 'featured' }): Promise<string[]> => {
-    const operationId = `relationship-canary:${payload.cohortId}:${provenance.depth}:${sourceChannelId}`;
+    const operationId = `${opScope}:${provenance.depth}:${sourceChannelId}`;
     // Atomic canary-share claim first (serializes concurrent cohorts), then
     // the existing global reservation guard. Either denial stops the fetch.
     if (!await claimQuota(operationId, FEATURED_CHANNEL_PROVIDER_COST)) {
@@ -727,7 +740,7 @@ export async function processRelationshipCanaryJob(
           depth1.push({ channelId, seedId: seed.id });
           seedOf[channelId] = seed.id;
           const provenance = buildRelationshipProvenance({ cohortId: payload.cohortId, kind: 'featured', depth: 1, parentChannelId: seed.id, path: [seed.id] });
-          await admitCandidate({
+          if (!await admitCandidate({
             channelId,
             channelName: channelId,
             youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
@@ -743,10 +756,10 @@ export async function processRelationshipCanaryJob(
             resultRank: index + 1,
             matchedDocument: { type: 'EXTERNAL', providerNativeId: channelId, locator: `youtube:relationship-canary:${payload.cohortId}:featured:${seed.id}` },
             rawObservation: { sourceChannelId: seed.id, relationshipDepth: 1, relationshipKind: 'featured', cohortId: payload.cohortId, relationshipPath: [seed.id] },
-          });
+          })) { return summary; }
         }
       } else {
-        const operationId = `relationship-canary:${payload.cohortId}:playlist:${seed.id}`;
+        const operationId = `${opScope}:playlist:${seed.id}`;
         if (!await claimQuota(operationId, PLAYLIST_PROVIDER_COST)) {
           summary.status = 'QUOTA_EXHAUSTED';
           quotaExhausted = true;
@@ -768,7 +781,7 @@ export async function processRelationshipCanaryJob(
             depth1.push({ channelId: item.channelId, seedId: seed.id });
             seedOf[item.channelId] = seed.id;
             const provenance = buildRelationshipProvenance({ cohortId: payload.cohortId, kind: 'playlist', depth: 1, parentChannelId: seed.id, path: [seed.id] });
-            await admitCandidate({
+            if (!await admitCandidate({
               channelId: item.channelId,
               channelName: item.channelName,
               youtubeUrl: `https://www.youtube.com/channel/${item.channelId}`,
@@ -784,7 +797,7 @@ export async function processRelationshipCanaryJob(
               resultRank: index + 1,
               matchedDocument: { type: 'PLAYLIST', providerNativeId: seed.id, title: item.videoTitles[0], description: item.description, locator: `youtube:relationship-canary:${payload.cohortId}:playlist:${seed.id}` },
               rawObservation: { playlistId: seed.id, relationshipDepth: 1, relationshipKind: 'playlist', cohortId: payload.cohortId, relationshipPath: [seed.id] },
-            });
+            })) { return summary; }
           }
         } catch (error) {
           await finish(operationId, false).catch(() => {});
@@ -834,7 +847,7 @@ export async function processRelationshipCanaryJob(
           if (visited.has(channelId)) continue;
           visited.add(channelId);
           const provenance = buildRelationshipProvenance({ cohortId: payload.cohortId, kind: 'featured', depth: 2, parentChannelId: target.parentChannelId, path: target.path });
-          await admitCandidate({
+          if (!await admitCandidate({
             channelId,
             channelName: channelId,
             youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
@@ -850,7 +863,7 @@ export async function processRelationshipCanaryJob(
             resultRank: index + 1,
             matchedDocument: { type: 'EXTERNAL', providerNativeId: channelId, locator: `youtube:relationship-canary:${payload.cohortId}:featured:${target.parentChannelId}` },
             rawObservation: { sourceChannelId: target.parentChannelId, relationshipDepth: 2, relationshipKind: 'featured', cohortId: payload.cohortId, relationshipPath: target.path },
-          });
+          })) { return summary; }
         }
       } catch (error) {
         recordCanaryFailure(summary, `featured:${target.targetId}`, error);

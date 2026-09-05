@@ -1392,7 +1392,7 @@ test('worker losing ownership mid-run stops before further fetches', async () =>
       settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
       dailyBudget: 100000,
       checkCountryAllowed: async () => {},
-      checkOwnership: async () => { checks++; return checks <= 2; },
+      checkOwnership: async () => { checks++; return checks <= 3; },
       fetchFeaturedChannels: async (sourceChannelId: string) => {
         fetched.push(sourceChannelId);
         return { observations: [{ featuredChannelId: UC('newchan') }] };
@@ -1405,12 +1405,13 @@ test('worker losing ownership mid-run stops before further fetches', async () =>
       log: () => {},
     },
   );
-  // Pre-start check (1) + seed-loop check (2) pass; the seed fetch runs and
-  // its candidate is admitted; the depth-2 check (3) fails → stop.
+  // Pre-start check (1) + seed-loop check (2) + admission check (3) pass; the
+  // seed fetch runs and its candidate is admitted; the depth-2 check (4)
+  // fails → stop with no further fetches.
   assert.deepEqual(fetched, [seed]);
   assert.equal(summary.nominations, 1);
   assert.equal(summary.depth2Fetches, 0);
-  assert.ok(checks >= 3);
+  assert.ok(checks >= 4);
 });
 
 // Ownership predicate truth table against the live jobs row semantics.
@@ -1464,4 +1465,73 @@ test('dispatcher threads claim identity into the default canary run', async () =
   const { readFileSync } = await import('node:fs');
   const source = readFileSync('server/queueManager.ts', 'utf8');
   assert.match(source, /processRelationshipCanaryJob\(\{ id: j\.id, payload: j\.payload \}, processDiscoveredChannel, claim \? \{ claim \} : undefined\)/);
+});
+
+// Mid-batch fencing: ownership lost after a fetch returns but before any
+// admission stops all side effects for the batch (no quota earmark, no
+// nomination, no ingestion) and ends the run.
+test('ownership lost mid-batch admits nothing from the fetched batch', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  let fetches = 0;
+  const claimedOps: string[] = [];
+  let nominates = 0;
+  let ingests = 0;
+  let checks = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      claim: { workerId: 'worker-A', attemptNumber: 1 },
+      // Pre-start + seed-loop checks pass; every admission check fails.
+      checkOwnership: async () => { checks++; return checks <= 2; },
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [{ featuredChannelId: UC('c1') }, { featuredChannelId: UC('c2') }] }; },
+      nominate: async () => { nominates++; return { id: 'n1' }; },
+      ingest: async () => { ingests++; },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async (operationId: string) => { claimedOps.push(operationId); return true; },
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 1);
+  assert.equal(nominates, 0);
+  assert.equal(ingests, 0);
+  assert.equal(summary.nominations, 0);
+  assert.equal(summary.ingested, 0);
+  assert.ok(!claimedOps.some(op => op.includes(':downstream:')));
+});
+
+// Attempt-scoped quota identity: stale and fresh attempts never share keys.
+test('quota operation ids are scoped to the claimed attempt', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const runWithAttempt = async (attemptNumber: number) => {
+    const ops: string[] = [];
+    await processRelationshipCanaryJob(
+      { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+      async () => {},
+      {
+        settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+        dailyBudget: 100000,
+        checkCountryAllowed: async () => {},
+        claim: { workerId: 'worker-A', attemptNumber },
+        checkOwnership: async () => true,
+        fetchFeaturedChannels: async () => ({ observations: [] }),
+        reserveQuota: async () => true,
+        finishQuota: async () => {},
+        claimQuota: async (operationId: string) => { ops.push(operationId); return true; },
+        log: () => {},
+      },
+    );
+    return ops;
+  };
+  const attempt1Ops = await runWithAttempt(1);
+  const attempt2Ops = await runWithAttempt(2);
+  assert.ok(attempt1Ops.length > 0 && attempt2Ops.length > 0);
+  assert.ok(attempt1Ops.every(op => op.includes(':attempt-1:')));
+  assert.ok(attempt2Ops.every(op => op.includes(':attempt-2:')));
+  assert.deepEqual(attempt1Ops.filter(op => attempt2Ops.includes(op)), []);
 });
