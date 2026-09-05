@@ -273,12 +273,15 @@ export async function processNextSearchJob(
       const summary = await processRelationshipCanaryJob(job, processDiscoveredChannel);
       // Persist the run summary (including per-seed failures) onto the open
       // job_attempts record: without this, provider failures surface only as
-      // COMPLETED with empty logs and become unobservable.
+      // COMPLETED with empty logs and become unobservable. Bound to this
+      // claim's attempt number so a stale worker can never write into a newer
+      // retry's open attempt row.
       const db = await getDb();
       await persistRelationshipCanarySummary(
         (text: string, values?: unknown[]) => db.query(text, values),
         job.id,
         summary,
+        job.attempts,
       );
       await completeJob(job.id);return true;
     }

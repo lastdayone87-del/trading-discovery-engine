@@ -232,6 +232,7 @@ export type RelationshipCanaryFailureCode =
   | 'PROVIDER_POOL_UNAVAILABLE'
   | 'QUOTA_EXHAUSTED'
   | 'INVALID_INPUT'
+  | 'ADMISSION_FAILED'
   | 'PROVIDER_CALL_FAILED';
 
 /**
@@ -241,7 +242,7 @@ export type RelationshipCanaryFailureCode =
 export function classifyRelationshipCanaryFailure(error: unknown): RelationshipCanaryFailureCode {
   const message = String((error as Error)?.message || error || '');
   if (/api key/i.test(message) && /requir|missing|not configured|unavailable/i.test(message)) return 'NO_YOUTUBE_API_KEY';
-  if (/cooling|cool-?down|pool (exhausted|unavailable)|no provider|backoff/i.test(message)) return 'PROVIDER_POOL_UNAVAILABLE';
+  if (/cooling|cool-?down|pool (became unavailable|exhausted|unavailable)|no eligible .* provider|no provider|backoff/i.test(message)) return 'PROVIDER_POOL_UNAVAILABLE';
   if (/quota|QUOTA_EXHAUSTED|429|rate.?limit/i.test(message)) return 'QUOTA_EXHAUSTED';
   if (/invalid|VALIDATION|out of range|exceeded|required/i.test(message)) return 'INVALID_INPUT';
   return 'PROVIDER_CALL_FAILED';
@@ -256,15 +257,20 @@ export function sanitizeCanaryLogText(value: string, maxLength = 200): string {
   return String(value || '')
     .replace(/([?&](?:key|api[_-]?key)=)[^&\s'"]+/gi, '$1[REDACTED]')
     .replace(/(api[_-]?key["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[REDACTED]')
-    .replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/g, 'Bearer [REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer [REDACTED]')
     .replace(/(token["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[REDACTED]')
     .slice(0, Math.max(1, maxLength));
 }
 
 /** Record one classified failure onto the run summary (message + code together). */
-export function recordCanaryFailure(summary: Pick<RelationshipCanarySummary, 'failures' | 'failureCodes'>, context: string, error: unknown): void {
+export function recordCanaryFailure(
+  summary: Pick<RelationshipCanarySummary, 'failures' | 'failureCodes'>,
+  context: string,
+  error: unknown,
+  codeOverride?: RelationshipCanaryFailureCode,
+): void {
   summary.failures.push(sanitizeCanaryLogText(`${context}:${error instanceof Error ? error.message : String(error)}`));
-  summary.failureCodes.push(classifyRelationshipCanaryFailure(error));
+  summary.failureCodes.push(codeOverride || classifyRelationshipCanaryFailure(error));
 }
 
 /**
@@ -294,19 +300,29 @@ export function relationshipCanaryAttemptLog(summary: RelationshipCanarySummary)
 /**
  * Appends the run summary to the open job_attempts record (logs JSONB array)
  * so provider failures are visible instead of surfacing as COMPLETED with
- * empty logs. Targets only the unfinished attempt row; a missing row is a
- * no-op. Never throws: observability must not fail the canary job itself.
+ * empty logs. When attemptNumber is provided, the write is bound to that
+ * exact attempt so a stale worker can never append its summary to a newer
+ * retry's open row. Targets only unfinished rows; a missing row is a no-op.
+ * Never throws: observability must not fail the canary job itself.
  */
 export async function persistRelationshipCanarySummary(
   query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>,
   jobId: string,
   summary: RelationshipCanarySummary,
+  attemptNumber?: number,
 ): Promise<void> {
   try {
-    await query(
-      `UPDATE job_attempts SET logs = logs || $2::jsonb WHERE job_id=$1 AND finished_at IS NULL`,
-      [jobId, JSON.stringify(relationshipCanaryAttemptLog(summary))],
-    );
+    if (typeof attemptNumber === 'number' && Number.isFinite(attemptNumber)) {
+      await query(
+        `UPDATE job_attempts SET logs = logs || $2::jsonb WHERE job_id=$1 AND attempt_number=$3 AND finished_at IS NULL`,
+        [jobId, JSON.stringify(relationshipCanaryAttemptLog(summary)), attemptNumber],
+      );
+    } else {
+      await query(
+        `UPDATE job_attempts SET logs = logs || $2::jsonb WHERE job_id=$1 AND finished_at IS NULL`,
+        [jobId, JSON.stringify(relationshipCanaryAttemptLog(summary))],
+      );
+    }
   } catch (error) {
     console.warn(`[RelationshipCanary] attempt-log persistence failed for ${jobId}:`, error instanceof Error ? error.message : error);
   }
@@ -550,7 +566,9 @@ export async function processRelationshipCanaryJob(
       summary.nominations++;
       summary.ingested++;
     } catch (error) {
-      recordCanaryFailure(summary, raw.channelId, error);
+      // Nomination/ingestion failures are admission-side, never provider
+      // evidence: record them under an explicit non-provider code.
+      recordCanaryFailure(summary, raw.channelId, error, 'ADMISSION_FAILED');
     }
   };
 

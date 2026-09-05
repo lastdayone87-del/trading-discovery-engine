@@ -1029,3 +1029,70 @@ test('real provider path fails closed pre-dispatch when no keys exist', async ()
     assert.equal(classifyRelationshipCanaryFailure(error), 'NO_YOUTUBE_API_KEY');
   }
 });
+
+// Pool-capacity messages from production classify as pool-unavailable.
+test('production pool messages classify as pool unavailable', async () => {
+  const { classifyRelationshipCanaryFailure } = await import('./relationshipCanary');
+  assert.equal(
+    classifyRelationshipCanaryFailure(new Error('YouTube provider pool became unavailable before request dispatch.')),
+    'PROVIDER_POOL_UNAVAILABLE',
+  );
+  assert.equal(
+    classifyRelationshipCanaryFailure(new Error('No eligible YouTube provider is available at request dispatch.')),
+    'PROVIDER_POOL_UNAVAILABLE',
+  );
+});
+
+// Nomination/ingestion failures carry the non-provider admission code.
+test('admission failures record ADMISSION_FAILED, not provider codes', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'playlist', id: 'PLseedlist' }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      fetchPlaylistChannels: async () => [{ channelId: UC('admitme'), channelName: 'Admit Me', description: 'd', videoTitles: ['v'] }],
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => { throw new Error('ingestion pipeline exploded'); },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async () => true,
+      log: () => {},
+    },
+  );
+  assert.equal(summary.failures.length, 1);
+  assert.deepEqual(summary.failureCodes, ['ADMISSION_FAILED']);
+});
+
+// Lowercase/mixed-case bearer schemes redact like canonical Bearer.
+test('bearer redaction is case-insensitive', async () => {
+  const { sanitizeCanaryLogText } = await import('./relationshipCanary');
+  assert.ok(!sanitizeCanaryLogText('authorization: bearer secret-token-xyz').includes('secret-token-xyz'));
+  assert.ok(!sanitizeCanaryLogText('Authorization: BEARER tok123').includes('tok123'));
+  assert.ok(sanitizeCanaryLogText('authorization: bearer secret-token-xyz').includes('[REDACTED]'));
+});
+
+// Attempt binding: stale workers cannot write into newer retries.
+test('summary persistence binds to the exact attempt number', async () => {
+  const { persistRelationshipCanarySummary } = await import('./relationshipCanary');
+  const calls: Array<{ text: string; values: unknown[] }> = [];
+  const query = (async (text: string, values?: unknown[]) => {
+    calls.push({ text, values: values || [] });
+    return { rows: [] };
+  }) as never;
+  const summary = {
+    cohortId: 'c1', status: 'COMPLETED' as const, seedsAttempted: 1, depth1Channels: 0, depth2Fetches: 0,
+    nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+    failures: [] as string[], failureCodes: [] as string[], quotaUnits: 0,
+  };
+  await persistRelationshipCanarySummary(query, 'job-9', { ...summary }, 4);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].text, /attempt_number=\$3/);
+  assert.deepEqual([calls[0].values[0], calls[0].values[2]], ['job-9', 4]);
+  // Without an attempt number the legacy open-row targeting still applies.
+  await persistRelationshipCanarySummary(query, 'job-9', { ...summary });
+  assert.match(calls[1].text, /finished_at IS NULL/);
+  assert.ok(!calls[1].text.includes('attempt_number'));
+});
