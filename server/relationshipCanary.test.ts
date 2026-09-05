@@ -1096,3 +1096,54 @@ test('summary persistence binds to the exact attempt number', async () => {
   assert.match(calls[1].text, /finished_at IS NULL/);
   assert.ok(!calls[1].text.includes('attempt_number'));
 });
+
+// Dispatcher wiring: run worker → persist summary → complete job, in order.
+// A pre-dispatch provider failure ends up observable instead of COMPLETED
+// with empty logs.
+test('dispatcher persists pre-dispatch failure before completing the job', async () => {
+  const { handleRelationshipCanaryExpansionJob } = await import('./queueManager');
+  const events: string[] = [];
+  let persisted: { jobId: string; summary: Record<string, unknown>; attempt?: number } | null = null;
+  await handleRelationshipCanaryExpansionJob(
+    { id: 'job-9', attempts: 3, payload: { cohortId: 'c1' } },
+    {
+      runCanary: async (job) => {
+        events.push(`run:${job.id}`);
+        return {
+          cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 3, depth1Channels: 0, depth2Fetches: 0,
+          nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+          failures: [
+            'channel:UCa:YouTube featured-channel inspection requires an API key.',
+            'channel:UCb:YouTube featured-channel inspection requires an API key.',
+            'channel:UCc:YouTube featured-channel inspection requires an API key.',
+          ],
+          failureCodes: ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY'],
+          quotaUnits: 0,
+        };
+      },
+      persistSummary: async (jobId, summary, attempt) => {
+        events.push(`persist:${jobId}`);
+        persisted = { jobId, summary: summary as unknown as Record<string, unknown>, attempt };
+      },
+      finishJob: async (jobId) => {
+        events.push(`complete:${jobId}`);
+      },
+    },
+  );
+  // Persist-before-complete ordering is what makes failures observable.
+  assert.deepEqual(events, ['run:job-9', 'persist:job-9', 'complete:job-9']);
+  assert.ok(persisted);
+  assert.equal((persisted as unknown as { jobId: string }).jobId, 'job-9');
+  assert.equal((persisted as unknown as { attempt?: number }).attempt, 3);
+  const summary = (persisted as unknown as { summary: Record<string, unknown> }).summary;
+  assert.equal((summary.failures as string[]).length, 3);
+  assert.deepEqual(summary.failureCodes, ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY']);
+  assert.equal(summary.nominations, 0);
+});
+
+// The dispatcher branch delegates to the helper (no parallel wiring).
+test('dispatcher routes canary jobs through the persist-before-complete helper', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  assert.match(source, /job\.type==='RELATIONSHIP_CANARY_EXPANSION'\)\{\s*await handleRelationshipCanaryExpansionJob\(job\);return true;/);
+});
