@@ -687,3 +687,42 @@ test('found website acquisition still reports the URL/phase split', async () => 
   assert.match(step?.details || '', /unique website URL\(s\)/);
   assert.match(step?.details || '', /static:/);
 });
+
+// Child-fetch failures group under their seed root: one crawled website,
+// pages counted once per root crawl, never multiplied.
+test('child observations collapse to the seed root URL', async () => {
+  const { summarizeLinkedWebsiteAcquisition } = await import('./inspector');
+  const telemetry = (pages: number) => ({ mode: 'STATIC' as const, redirectsFollowed: 0, pagesInspected: pages, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 });
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://root.example/guide/part-1', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: telemetry(2) },
+    { requestedUrl: 'https://root.example/guide/part-2', surface: 'CREATOR_WEBSITES', required: false, outcome: 'ACQUISITION_FAILED', retryable: true, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: telemetry(4) },
+    { requestedUrl: 'https://root.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', rootUrl: 'https://root.example/', telemetry: telemetry(4) },
+    { requestedUrl: 'https://other.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', telemetry: telemetry(1) },
+  ]);
+  assert.equal(summary.uniqueRootUrls, 2);
+  assert.equal(summary.pagesProcessed, 5);
+  assert.equal(summary.staticFailed, 2);
+  assert.equal(summary.staticSucceeded, 2);
+});
+
+// Static crawl tags every observation of a seed crawl with the seed root.
+test('static crawl observations carry the seed root URL', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const result = await crawlExternalLinks(
+    ['https://rootsite.example/'],
+    [],
+    undefined,
+    (async (input: unknown) => {
+      const url = String(input);
+      if (url === 'https://rootsite.example/') {
+        return html('<html><body><a href="/community">join our community</a><p>hello</p></body></html>');
+      }
+      throw new Error('connection reset');
+    }) as typeof fetch,
+    'CREATOR_WEBSITES',
+    false,
+  );
+  const urls = new Set(result.observations.map(item => (item as { rootUrl?: string }).rootUrl || item.requestedUrl));
+  assert.ok(result.observations.length > 1, 'child page must actually be fetched and fail');
+  assert.deepEqual([...urls], ['https://rootsite.example/']);
+});

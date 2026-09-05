@@ -24,7 +24,7 @@ export interface InspectionResult {
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
 export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
-export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry}
+export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string}
 
 export interface NormalizedExternalUrl {url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'}
 const socialHosts=new Set(['twitter.com','www.twitter.com','x.com','www.x.com','instagram.com','www.instagram.com','tiktok.com','www.tiktok.com','facebook.com','www.facebook.com']);
@@ -128,10 +128,10 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     const seedLocators=extractDiscordCandidates(url,surface,url);const direct=seedLocators.filter(candidate=>candidate.nativeInviteCode);const wrapperCandidate=seedLocators.find(candidate=>candidate.locatorType==='ALTERNATIVE_REDIRECT'||candidate.locatorType==='DIRECTORY_PAGE');
     discovered.push(...direct);
     if(debugLog)debugLog.discordRegexAttempts.push({source:'crawlExternalLinks_direct',url,result:direct.map(c=>c.nativeInviteCode)});
-    if(direct.length){observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,outcome:'FOUND',retryable:false,detail:`${direct.length} direct Discord candidate(s) in URL`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,budgetExhausted:false})});continue;}
+    if(direct.length){observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'FOUND',retryable:false,detail:`${direct.length} direct Discord candidate(s) in URL`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,budgetExhausted:false})});continue;}
 
     let pagesInspected=0,redirectsFollowed=0,budgetExhausted=false;
-    const acquired=await fetchExternalPage(url,fetchImpl),page=acquired.page;if(acquired.observation)observations.push({...acquired.observation,wrapperUrl,surface,required,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,budgetExhausted})});
+    const acquired=await fetchExternalPage(url,fetchImpl),page=acquired.page;if(acquired.observation)observations.push({...acquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,budgetExhausted})});
     if(debugLog&&page)debugLog.redirectsFollowed.push({from:url,to:page.finalUrl});if(page&&page.finalUrl!==url)redirectsFollowed++;if(!page){logDetails.push(`Failed or timed out trying to reach external URL: ${url}`);continue;}
 
     const inspectPage=(current:{html:string;finalUrl:string},depth:number):Array<{url:string;score:number}>=>{
@@ -147,11 +147,11 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // eligible targets are dropped. Truncation of eligible uniques is itself
     // incomplete coverage.
     const dedupedNavigation=(()=>{const best=new Map<string,{url:string;score:number}>();for(const item of firstNavigation){const prior=best.get(item.url);if(!prior||item.score>prior.score)best.set(item.url,item);}return [...best.values()];})();if(dedupedNavigation.length>12)budgetExhausted=true;const queue=dedupedNavigation.slice(0,12).map(item=>({...item,depth:1}));let explored=0;
-    while(queue.length&&explored<8){queue.sort((a,b)=>b.score-a.score);const next=queue.shift()!;if(visited.has(next.url)||next.depth>2){if(next.depth>2)budgetExhausted=true;continue;}visited.add(next.url);explored++;logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl),subPage=subAcquired.page;if(subAcquired.observation)observations.push({...subAcquired.observation,wrapperUrl,surface,required,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,budgetExhausted})});if(!subPage)continue;if(debugLog)debugLog.redirectsFollowed.push({from:next.url,to:subPage.finalUrl});if(subPage.finalUrl!==next.url)redirectsFollowed++;const children=inspectPage(subPage,next.depth);if(next.depth>=2){if(children.some(child=>!visited.has(child.url)))budgetExhausted=true;}else for(const child of children)if(!visited.has(child.url))queue.push({...child,depth:next.depth+1});}
+    while(queue.length&&explored<8){queue.sort((a,b)=>b.score-a.score);const next=queue.shift()!;if(visited.has(next.url)||next.depth>2){if(next.depth>2)budgetExhausted=true;continue;}visited.add(next.url);explored++;logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl),subPage=subAcquired.page;if(subAcquired.observation)observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,budgetExhausted})});if(!subPage)continue;if(debugLog)debugLog.redirectsFollowed.push({from:next.url,to:subPage.finalUrl});if(subPage.finalUrl!==next.url)redirectsFollowed++;const children=inspectPage(subPage,next.depth);if(next.depth>=2){if(children.some(child=>!visited.has(child.url)))budgetExhausted=true;}else for(const child of children)if(!visited.has(child.url))queue.push({...child,depth:next.depth+1});}
     if(queue.some(item=>!visited.has(item.url)))budgetExhausted=true;
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
-    const foundForSeed=discovered.length>beforeSeed;const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':budgetExhausted?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,outcome:seedOutcome,retryable:false,httpStatus:200,detail:foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:budgetExhausted?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,budgetExhausted})});
-    }catch(error:any){logDetails.push(`Isolated acquisition error for ${String(rawUrl)}: ${error instanceof Error?error.message:String(error)}; continuing to next candidate.`);observations.push({requestedUrl:String(rawUrl||'unknown'),wrapperUrl,surface,required,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'ISOLATED_ACQUISITION_ERROR',detail:`Per-URL failure isolated; remaining candidates continue: ${error instanceof Error?error.message:String(error)}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,budgetExhausted:false})});continue;}
+    const foundForSeed=discovered.length>beforeSeed;const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':budgetExhausted?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:false,httpStatus:200,detail:foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:budgetExhausted?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,budgetExhausted})});
+    }catch(error:any){logDetails.push(`Isolated acquisition error for ${String(rawUrl)}: ${error instanceof Error?error.message:String(error)}; continuing to next candidate.`);observations.push({requestedUrl:String(rawUrl||'unknown'),wrapperUrl,surface,required,rootUrl:String(rawUrl||'unknown'),outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'ISOLATED_ACQUISITION_ERROR',detail:`Per-URL failure isolated; remaining candidates continue: ${error instanceof Error?error.message:String(error)}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,budgetExhausted:false})});continue;}
   }
   const candidates=mergeDiscordCandidates(discovered);const failed=observations.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspected=observations.filter(item=>item.outcome==='INSPECTED_NO_MATCH').length,partial=observations.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,found=observations.some(item=>item.outcome==='FOUND');const outcome:ExternalAcquisitionStatus=found?'FOUND':(failed&&inspected)||partial>0?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';
   logDetails.push(`Crawled ${scannedCount} external link(s); retained ${candidates.length} distinct Discord candidate(s).`);
@@ -311,7 +311,14 @@ function normalizeSummaryUrl(raw: string): string {
  */
 export function summarizeLinkedWebsiteAcquisition(observations: ExternalAcquisitionObservation[]): LinkedWebsiteAcquisitionSummary {
   const website = observations.filter(item => item.surface === 'CREATOR_WEBSITES');
-  const uniqueRootUrls = new Set(website.map(item => normalizeSummaryUrl(item.requestedUrl))).size;
+  // Root grouping: child-fetch observations carry the seed crawl's rootUrl so
+  // subpage failures never inflate the unique-website count, and cumulative
+  // per-crawl page counters collapse to one maximum per root crawl instead of
+  // summing the same pages many times over. Rows predating rootUrl fall back
+  // to their own requested URL.
+  const rootKey = (item: ExternalAcquisitionObservation): string =>
+    normalizeSummaryUrl(item.rootUrl || item.requestedUrl);
+  const uniqueRootUrls = new Set(website.map(rootKey)).size;
   // Phase attribution follows the telemetry mode recorded at observation
   // time — never the retry-ownership `required` flag. Static messaging
   // previews deliberately use required:true for retry ownership even though
@@ -333,7 +340,7 @@ export function summarizeLinkedWebsiteAcquisition(observations: ExternalAcquisit
   // count the same pages many times over, so take the maximum per unique URL.
   const pagesByUrl = new Map<string, number>();
   for (const item of website) {
-    const key = normalizeSummaryUrl(item.requestedUrl);
+    const key = rootKey(item);
     pagesByUrl.set(key, Math.max(pagesByUrl.get(key) || 0, Number(item.telemetry?.pagesInspected) || 0));
   }
   return {
