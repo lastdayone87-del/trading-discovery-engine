@@ -62,7 +62,12 @@ export interface BrowserFallbackResult {
    * transient/network failures in telemetry and outcome classification.
    */
   timedOut?: boolean;
-  failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED';
+  /**
+   * Browser-gate saturation is capacity, not a launch defect: it is typed
+   * alongside (not inside) BrowserFailureClass so retry accounting can defer
+   * it attempt-free without tripping browser-capability health marking.
+   */
+  failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED' | 'RENDERED_FALLBACK_SATURATED';
   telemetry?: BrowserFallbackTelemetry;
   detail: string;
 }
@@ -443,8 +448,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   } catch (error:any) {
     const candidates=mergeDiscordCandidates(discovered);
     const saturated=error?.message==='RENDERED_FALLBACK_SATURATED';
-    const failureClass=saturated||!isBrowserRuntimeFailure(error)?undefined:classifyBrowserFailure(error);
-    if (failureClass) markBrowserCapabilityUnavailable(error);
+    // Saturation is explicit browser-gate capacity, not a browser defect: keep
+    // it classified as capacity (so retry accounting can defer attempt-free)
+    // without marking the browser capability itself unavailable.
+    const failureClass=saturated?'RENDERED_FALLBACK_SATURATED':(!isBrowserRuntimeFailure(error)?undefined:classifyBrowserFailure(error));
+    if (failureClass&&!saturated) markBrowserCapabilityUnavailable(error);
     return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
   }
 }

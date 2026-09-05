@@ -21,8 +21,9 @@ test('recent-video acquisition failure is excluded from Discord community retry 
 });
 
 test('genuine required community acquisition failure remains attempt-free and preserves retry time',()=>{
+  const zeroEvidence = { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 };
   const directive=communityAcquisitionRetryDirective([
-    {surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'BROWSER_RUNTIME_UNAVAILABLE',retryAt:20_000},
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'BROWSER_RUNTIME_UNAVAILABLE',retryAt:20_000,telemetry:zeroEvidence},
     {surface:'CREATOR_WEBSITES',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false},
     {surface:'SOCIAL_PROFILES',required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'NETWORK_FAILURE'},
   ]);
@@ -38,7 +39,8 @@ test('optional external/social failure alone does not create a retry directive',
 });
 
 test('global browser runtime failure is separately classified and remains attempt-free',()=>{
-  const directive=communityAcquisitionRetryDirective([{required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'BROWSER_BINARY_MISSING'}]);
+  const zeroEvidence = { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 };
+  const directive=communityAcquisitionRetryDirective([{required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'BROWSER_BINARY_MISSING',telemetry:zeroEvidence}]);
   assert.equal(directive?.code,'BROWSER_RUNTIME_UNAVAILABLE');
   assert.equal(directive?.retryReason,'BROWSER_RUNTIME_UNAVAILABLE');
   assert.equal(isAttemptFreeCommunityFailure(Object.assign(new Error('browser unavailable'),{code:'BROWSER_RUNTIME_UNAVAILABLE',retryable:true})),true);
@@ -147,9 +149,52 @@ test('unbounded Infinity retry delay collapses to the ceiling instead of undefin
 
 test('browser-runtime-only failures classify as capacity without consuming attempts', async () => {
   const { communityAcquisitionRetryDirective } = await import('./communityRetryPolicy');
+  const zeroEvidence = { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 };
   const directive = communityAcquisitionRetryDirective([
-    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_LAUNCH_FAILED' },
-    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_RUNTIME_UNAVAILABLE' },
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_LAUNCH_FAILED', telemetry: zeroEvidence },
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_RUNTIME_UNAVAILABLE', telemetry: zeroEvidence },
+  ]);
+  assert.equal(directive?.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
+  assert.equal(directive?.code, 'BROWSER_RUNTIME_UNAVAILABLE');
+});
+
+test('browser-runtime failure WITH processed pages consumes an attempt', async () => {
+  const { communityAcquisitionRetryDirective } = await import('./communityRetryPolicy');
+  // A browser crash after useful work is executed work: the class alone must
+  // never grant attempt-free behavior once pages were processed.
+  const directive = communityAcquisitionRetryDirective([
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_LAUNCH_FAILED', telemetry: { pagesInspected: 2, requestsStarted: 3, redirectsFollowed: 0 } },
+  ]);
+  assert.equal(directive?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  assert.equal(directive?.code, 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE');
+});
+
+test('browser-runtime class without telemetry cannot prove no-start and consumes', async () => {
+  const { communityAcquisitionRetryDirective } = await import('./communityRetryPolicy');
+  // Absence of telemetry is not evidence of absence: legacy/telemetry-less
+  // rows count as evidenced and consume, matching collapse accounting.
+  const directive = communityAcquisitionRetryDirective([
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_BINARY_MISSING' },
+  ]);
+  assert.equal(directive?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+test('mixed capacity plus processed browser failure consumes an attempt', async () => {
+  const { communityAcquisitionRetryDirective } = await import('./communityRetryPolicy');
+  const zeroEvidence = { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 };
+  const directive = communityAcquisitionRetryDirective([
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'RENDERED_FALLBACK_SATURATED', telemetry: zeroEvidence },
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_LAUNCH_FAILED', telemetry: { pagesInspected: 1, requestsStarted: 2, redirectsFollowed: 0 } },
+  ]);
+  assert.equal(directive?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+test('all-saturated zero-evidence failures defer attempt-free as capacity', async () => {
+  const { communityAcquisitionRetryDirective } = await import('./communityRetryPolicy');
+  const zeroEvidence = { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 };
+  const directive = communityAcquisitionRetryDirective([
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'RENDERED_FALLBACK_SATURATED', telemetry: zeroEvidence },
+    { surface: 'SOCIAL_PROFILES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'RENDERED_FALLBACK_SATURATED', telemetry: zeroEvidence },
   ]);
   assert.equal(directive?.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
   assert.equal(directive?.code, 'BROWSER_RUNTIME_UNAVAILABLE');
@@ -166,17 +211,20 @@ test('genuine acquisition failure consumes an attempt even without capacity sign
 test('mixed browser-runtime + genuine failure MUST NOT classify as attempt-free capacity', async () => {
   const { communityAcquisitionRetryDirective } = await import('./communityRetryPolicy');
   // One capacity row must never launder genuine executed work: real inspection
-  // ran for the TIMEOUT root, so the retry consumes a bounded attempt.
+  // ran for the TIMEOUT root, so the retry consumes a bounded attempt. The
+  // browser row carries zero-evidence telemetry (proven unstarted) to isolate
+  // the unanimity semantic: unanimity fails because of the genuine row alone.
+  const zeroEvidence = { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 };
   const directive = communityAcquisitionRetryDirective([
-    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_RUNTIME_UNAVAILABLE' },
-    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'TIMEOUT' },
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_RUNTIME_UNAVAILABLE', telemetry: zeroEvidence },
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'TIMEOUT', telemetry: { pagesInspected: 0, requestsStarted: 1, redirectsFollowed: 0 } },
   ]);
   assert.equal(directive?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
   assert.equal(directive?.code, 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE');
   // And symmetrically regardless of observation order.
   const reversed = communityAcquisitionRetryDirective([
-    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'PARTIALLY_INSPECTED', retryable: true, failureClass: 'RENDERED_BUDGET_EXPIRED' },
-    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_BINARY_MISSING' },
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'PARTIALLY_INSPECTED', retryable: true, failureClass: 'RENDERED_BUDGET_EXPIRED', telemetry: { pagesInspected: 3, requestsStarted: 4, redirectsFollowed: 0 } },
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'BROWSER_BINARY_MISSING', telemetry: zeroEvidence },
   ]);
   assert.equal(reversed?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
 });

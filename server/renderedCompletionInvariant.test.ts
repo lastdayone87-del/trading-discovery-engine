@@ -869,6 +869,41 @@ test('dotless garbage alongside genuine clean inspection stays definitive', asyn
   assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
 });
 
+// Saturation uses the exact result shape the browser-gate catch produces:
+// zero pages, explicit RENDERED_FALLBACK_SATURATED class. It must classify as
+// attempt-free capacity (browser reason), never as a genuine NO_PAGE_PROCESSED
+// failure that consumes a bounded attempt for work that never started.
+test('saturated browser gate defers attempt-free as capacity', async () => {
+  const result = await runChannelInspection({
+    channelId: 'UCsaturated0000000000000001',
+    channelName: 'Saturated Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://saturated.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => {
+      throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 0,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: false,
+      failureClass: 'RENDERED_FALLBACK_SATURATED',
+      telemetry: zeroTelemetry(),
+      detail: 'Rendered acquisition deferred because the process-wide browser launch gate is saturated',
+    })) as (seedUrl: string) => Promise<BrowserFallbackResult>,
+  });
+  assert.ok(result.retryDirective, 'saturated capacity must still own a (deferrable) retry');
+  assert.equal(result.retryDirective?.retryReason, 'BROWSER_RUNTIME_UNAVAILABLE');
+  assert.equal(result.retryDirective?.code, 'BROWSER_RUNTIME_UNAVAILABLE');
+});
+
 // IPv6 literals are genuine website targets: failures stay eligible for the
 // normal rendered/retry path and never quarantined as single-label garbage.
 test('IPv6 literal failure remains eligible for rendered retry', async () => {

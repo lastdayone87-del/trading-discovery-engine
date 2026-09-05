@@ -148,3 +148,12 @@ test('browser acquisition failure remains retryable rather than proving NOT_FOUN
   assert.match(source, /retryOnBlocked:\s*true/);
   assert.match(source, /maxSessionRotations:\s*limits\.maxSessionRotations/);
 });
+
+test('browser-gate saturation keeps an explicit capacity class without poisoning capability', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
+  // Saturation must surface as RENDERED_FALLBACK_SATURATED (attempt-free
+  // capacity), never collapse into generic NO_PAGE_PROCESSED (which would
+  // consume a bounded attempt for work that never started).
+  assert.match(source, /failureClass=saturated\?'RENDERED_FALLBACK_SATURATED'/);
+  assert.match(source, /if \(failureClass&&!saturated\) markBrowserCapabilityUnavailable\(error\)/);
+});
