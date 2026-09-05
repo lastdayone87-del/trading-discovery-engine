@@ -191,6 +191,7 @@ test('worker ingests duplicate channels once across seeds', async () => {
       ingest: async (raw) => { ingested.push(raw.channelId); },
       reserveQuota: async () => true,
       finishQuota: async () => {},
+      claimQuota: async () => true,
       log: () => {},
     },
   );
@@ -217,6 +218,7 @@ test('seed failure is isolated; siblings proceed and job completes with record',
       ingest: async (raw) => { ingested.push(raw.channelId); },
       reserveQuota: async () => true,
       finishQuota: async () => {},
+      claimQuota: async () => true,
       log: () => {},
     },
   );
@@ -238,6 +240,7 @@ test('quota exhaustion halts expansion gracefully', async () => {
       fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
       reserveQuota: async () => false,
       finishQuota: async () => {},
+      claimQuota: async () => true,
       log: () => {},
     },
   );
@@ -343,6 +346,7 @@ test('worker persists keyword baseline per nomination without branching on it', 
       ingest: async () => {},
       reserveQuota: async () => true,
       finishQuota: async () => {},
+      claimQuota: async () => true,
       log: () => {},
     },
   );
@@ -414,7 +418,7 @@ test('maxChannels stops provider traversal at the boundary', async () => {
       ingest: async () => {},
       reserveQuota: async () => true,
       finishQuota: async () => {},
-      readReservedUnits: async () => 0,
+      claimQuota: async () => true,
       log: () => {},
     },
   );
@@ -445,7 +449,7 @@ test('duplicate seeds and seed-as-discovery expand exactly once', async () => {
       ingest: async () => {},
       reserveQuota: async () => true,
       finishQuota: async () => {},
-      readReservedUnits: async () => 0,
+      claimQuota: async () => true,
       log: () => {},
     },
   );
@@ -488,7 +492,7 @@ test('zero quota allowance halts before any fetch', async () => {
       fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
       reserveQuota: async () => true,
       finishQuota: async () => {},
-      readReservedUnits: async () => 0,
+      claimQuota: async () => false,
       log: () => {},
     },
   );
@@ -497,8 +501,8 @@ test('zero quota allowance halts before any fetch', async () => {
   assert.equal(summary.nominations, 0);
 });
 
-// F7: concurrent cohorts share one allocation via reserved baseline.
-test('reserved baseline from other cohorts counts against the allocation', async () => {
+// F7: denied claims halt expansion gracefully (e.g. allowance consumed).
+test('denied atomic claims stop traversal without failing the job', async () => {
   let fetches = 0;
   const summary = await processRelationshipCanaryJob(
     { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
@@ -510,7 +514,7 @@ test('reserved baseline from other cohorts counts against the allocation', async
       fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
       reserveQuota: async () => true,
       finishQuota: async () => {},
-      readReservedUnits: async () => 999999,
+      claimQuota: async () => false,
       log: () => {},
     },
   );
@@ -599,67 +603,204 @@ test('canary enqueue is idempotent per cohort/day and never reopens runs', async
   assert.equal(calls.length, 3);
 });
 
-// Spent-units query: consumed same-day rows count, old rows excluded, single SUM.
-test('spent-units query counts reserved plus same-day consumed exactly once', async () => {
-  const { relationshipCanarySpentUnitsQuery } = await import('./relationshipCanary');
-  const query = relationshipCanarySpentUnitsQuery('2026-09-04T07:00:00.000Z');
-  assert.match(query.text, /operation_type='RELATIONSHIP_CANARY'/);
-  assert.match(query.text, /status='RESERVED'/);
-  assert.match(query.text, /status='CONSUMED'/);
-  assert.match(query.text, /consumed_at/);
-  assert.deepEqual(query.values, ['2026-09-04T07:00:00.000Z']);
-  // Single aggregate over mutually exclusive statuses: no double counting.
-  assert.equal((query.text.match(/SUM\(units\)/g) || []).length, 1);
+// Atomic claim tests run against a minimal in-memory quota store that honors
+// transactions: BEGIN chains (serializing concurrent claims exactly like the
+// advisory lock does in Postgres), SUM respects the day bound, INSERT upserts
+// per (operation_type, operation_id). Statement order is asserted so the lock
+// provably precedes the spend check.
+const makeQuotaStore = () => {
+  const rows = new Map<string, { units: number; status: string; reserved_at: string; consumed_at: string | null }>();
+  const statements: string[] = [];
+  let mutex: Promise<void> = Promise.resolve();
+  let releaseTxn: (() => void) | null = null;
+  const query = async (text: string, values: unknown[] = []): Promise<{ rows: Record<string, unknown>[] }> => {
+    statements.push(text.trim().split('\n')[0].slice(0, 60));
+    const head = text.trim().toUpperCase();
+    if (head === 'BEGIN') {
+      let release!: () => void;
+      const prev = mutex;
+      mutex = new Promise<void>(resolve => { release = resolve; });
+      await prev;
+      releaseTxn = release;
+      return { rows: [] };
+    }
+    if (head === 'COMMIT' || head === 'ROLLBACK') {
+      releaseTxn?.();
+      releaseTxn = null;
+      return { rows: [] };
+    }
+    if (text.includes('pg_advisory_xact_lock')) return { rows: [{}] };
+    if (text.includes('SUM(units)')) {
+      // Mirrors production semantics exactly: live RESERVED rows always count
+      // (staleness is the sweeper's job, as in tryReserveQuota); CONSUMED rows
+      // count only inside the active quota day.
+      const dayStart = String(values[0]);
+      let sum = 0;
+      for (const row of rows.values()) {
+        if (row.status === 'RESERVED') sum += row.units;
+        else if (row.status === 'CONSUMED' && (row.consumed_at || row.reserved_at) >= dayStart) sum += row.units;
+      }
+      return { rows: [{ spent: sum }] };
+    }
+    if (text.includes('AS own')) {
+      const key = `RELATIONSHIP_CANARY|${String(values[0])}`;
+      return { rows: [{ own: rows.get(key)?.units || 0 }] };
+    }
+    if (text.includes('INSERT INTO quota_reservations')) {
+      const [opId, units] = values as [string, number];
+      const status = /status='CONSUMED'/.test(text.split('ON CONFLICT')[0]) ? 'CONSUMED' : 'RESERVED';
+      const now = new Date().toISOString();
+      const key = `RELATIONSHIP_CANARY|${opId}`;
+      const existing = rows.get(key);
+      if (existing) {
+        existing.units = units;
+        existing.status = status;
+        if (status === 'CONSUMED') existing.consumed_at = now;
+      } else {
+        rows.set(key, { units, status, reserved_at: now, consumed_at: status === 'CONSUMED' ? now : null });
+      }
+      return { rows: [] };
+    }
+    throw new Error(`unexpected statement: ${text.slice(0, 80)}`);
+  };
+  return { query, statements, rows };
+};
+
+const DAY = '2026-09-04T07:00:00.000Z';
+
+// Claim locks before checking spend (the race guard), then inserts atomically.
+test('atomic claim serializes check-and-insert behind the advisory lock', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  const first = await claimRelationshipCanaryQuota({ db: store, operationId: 'op-a', units: 6, allowance: 10, dayStartIso: DAY });
+  assert.equal(first.allowed, true);
+  assert.equal(first.used, 0);
+  const lockIdx = store.statements.findIndex(s => s.includes('pg_advisory_xact_lock'));
+  const sumIdx = store.statements.findIndex(s => s.includes('SUM(units)'));
+  const insertIdx = store.statements.findIndex(s => s.includes('INSERT INTO quota_reservations'));
+  assert.ok(lockIdx >= 0 && lockIdx < sumIdx && sumIdx < insertIdx);
+  const second = await claimRelationshipCanaryQuota({ db: store, operationId: 'op-b', units: 5, allowance: 10, dayStartIso: DAY });
+  assert.equal(second.allowed, false);
+  assert.equal(second.used, 6);
 });
 
-// Sequential same-day cohorts share one allocation (the quota finding scenario).
+// Concurrent cohorts cannot jointly exceed the allowance.
+test('concurrent claims share one hard aggregate bound', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  const attempt = (op: string) => claimRelationshipCanaryQuota({ db: store, operationId: op, units: 10, allowance: 10, dayStartIso: DAY });
+  const [a, b] = await Promise.all([attempt('cohort-a:fetch'), attempt('cohort-b:fetch')]);
+  assert.equal([a.allowed, b.allowed].filter(Boolean).length, 1);
+  const total = await claimRelationshipCanaryQuota({ db: store, operationId: 'probe', units: 1, allowance: 10, dayStartIso: DAY });
+  assert.equal(total.allowed, false);
+  assert.equal(total.used, 10);
+});
+
+// Three simultaneous cohorts: exactly the allowance spends, no more.
+test('three concurrent cohorts split one allowance without excess', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  const results = await Promise.all([1, 2, 3].map(i =>
+    claimRelationshipCanaryQuota({ db: store, operationId: `op-${i}`, units: 4, allowance: 10, dayStartIso: DAY }),
+  ));
+  const allowed = results.filter(r => r.allowed).length;
+  assert.ok(allowed >= 1 && allowed <= 2);
+  const probe = await claimRelationshipCanaryQuota({ db: store, operationId: 'probe', units: 1, allowance: 10, dayStartIso: DAY });
+  let spent = 0;
+  for (const row of store.rows.values()) spent += row.units;
+  assert.ok(spent <= 10);
+  assert.equal(probe.allowed, spent + 1 <= 10);
+});
+
+// Sequential cohorts: completed consumption blocks the next full allocation.
+test('completed consumption blocks the next full allocation same-day', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  const cohortA = await claimRelationshipCanaryQuota({ db: store, operationId: 'a:fetch', units: 10, allowance: 10, dayStartIso: DAY, consumeImmediately: true });
+  assert.equal(cohortA.allowed, true);
+  const cohortB = await claimRelationshipCanaryQuota({ db: store, operationId: 'b:fetch', units: 10, allowance: 10, dayStartIso: DAY });
+  assert.equal(cohortB.allowed, false);
+  assert.equal(cohortB.used, 10);
+});
+
+// Retrying the same operation never double-counts.
+test('repeat claims on one operation id count once', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  await claimRelationshipCanaryQuota({ db: store, operationId: 'op-retry', units: 6, allowance: 10, dayStartIso: DAY });
+  const again = await claimRelationshipCanaryQuota({ db: store, operationId: 'op-retry', units: 6, allowance: 10, dayStartIso: DAY });
+  assert.equal(again.allowed, true);
+  assert.equal(again.used, 6);
+});
+
+// Next-day reset: previous-day consumption does not leak forward.
+test('previous-day consumption resets with the quota day', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  store.rows.set('RELATIONSHIP_CANARY|old', {
+    units: 10, status: 'CONSUMED',
+    reserved_at: '2026-09-03T06:00:00.000Z', consumed_at: '2026-09-03T06:05:00.000Z',
+  });
+  const fresh = await claimRelationshipCanaryQuota({ db: store, operationId: 'new', units: 10, allowance: 10, dayStartIso: DAY });
+  assert.equal(fresh.allowed, true);
+  assert.equal(fresh.used, 0);
+});
+
+// Zero allowance spends nothing.
+test('zero allowance denies every claim', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  const denied = await claimRelationshipCanaryQuota({ db: store, operationId: 'op', units: 1, allowance: 0, dayStartIso: DAY });
+  assert.equal(denied.allowed, false);
+});
+
+// Worker-level sequential proof through the real claim path.
 test('cohort B cannot re-spend cohort A consumed allocation', async () => {
-  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
-  const live = {
-    settings: { enabled: true, killSwitch: false, quotaPercent: 1 },
-    dailyBudget: 1000,
+  const { processRelationshipCanaryJob, claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  const DAY_ISO = DAY;
+  const boundClaim = (allowance: number) => async (operationId: string, units: number, opts?: { consumeImmediately?: boolean }) =>
+    (await claimRelationshipCanaryQuota({ db: store, operationId, units, allowance, dayStartIso: DAY_ISO, consumeImmediately: opts?.consumeImmediately })).allowed;
+  const base = {
+    settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+    dailyBudget: 100000,
     checkCountryAllowed: async () => {},
+    reserveQuota: async () => true,
+    finishQuota: async () => {},
+    log: () => {},
   };
-  const runCohort = (cohortId: string, reservedBaseline: number) => processRelationshipCanaryJob(
-    { id: 'job-1', payload: { cohortId, targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+  // Allowance 310: cohort A spends 1 (fetch) + 305 (downstream earmark) = 306.
+  const cohortA = await processRelationshipCanaryJob(
+    { id: 'job-a', payload: { cohortId: 'cohort-a', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
     async () => {},
     {
-      ...live,
+      ...base,
+      claimQuota: boundClaim(310),
       fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: UC('found') }] }),
       nominate: async () => ({ id: 'n1' }),
       ingest: async () => {},
-      reserveQuota: async () => true,
-      finishQuota: async () => {},
-      readReservedUnits: async () => reservedBaseline,
-      log: () => {},
     },
   );
-  // Allowance at 1% of 1000 = 10. Cohort A spends its full share.
-  const cohortA = await runCohort('cohort-a', 0);
   assert.equal(cohortA.status, 'COMPLETED');
-  // Cohort B later the same day sees A's 10 consumed units in its baseline
-  // and halts before any fetch: no second full allocation.
-  const spent = 10;
-  const cohortB = await runCohort('cohort-b', spent);
-  assert.equal(cohortB.status, 'QUOTA_EXHAUSTED');
-  assert.equal(cohortB.nominations, 0);
-  // Partial baseline still permits the remainder: 6 used of 10 allows a
-  // 1-unit fetch but records honest spend.
-  let fetches = 0;
-  const cohortC = await processRelationshipCanaryJob(
-    { id: 'job-1', payload: { cohortId: 'cohort-c', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+  assert.equal(cohortA.nominations, 1);
+  // Cohort B later the same day: 306 already spent, its first fetch (307th
+  // unit) exceeds 310 only after... 306+1=307 <= 310 allowed; admission needs
+  // 307+305=612 > 310, so traversal may start but no admission completes.
+  const cohortB = await processRelationshipCanaryJob(
+    { id: 'job-b', payload: { cohortId: 'cohort-b', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
     async () => {},
     {
-      ...live,
-      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
-      reserveQuota: async () => true,
-      finishQuota: async () => {},
-      readReservedUnits: async () => 6,
-      log: () => {},
+      ...base,
+      claimQuota: boundClaim(310),
+      fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: UC('found') }] }),
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => {},
     },
   );
-  assert.equal(fetches, 1);
-  assert.equal(cohortC.status, 'COMPLETED');
+  assert.equal(cohortB.nominations, 0);
+  let total = 0;
+  for (const row of store.rows.values()) total += row.units;
+  assert.ok(total <= 310);
 });
 
 // Excluded countries never launch or spend.
@@ -696,4 +837,31 @@ test('SEARCH pool claims canary jobs through the existing tick lifecycle', async
   const { readFileSync } = await import('node:fs');
   const source = readFileSync('server/queueManager.ts', 'utf8');
   assert.match(source, /startWorkerPool\('SEARCH_YOUTUBE'[\s\S]*?'RELATIONSHIP_CANARY_EXPANSION'/);
+});
+
+// Downstream estimate denied: traversal proceeds but no admission occurs.
+test('downstream budget denial skips admission without failing traversal', async () => {
+  let fetches = 0;
+  let ingested = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-1', payload: { cohortId: 'c', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [{ featuredChannelId: UC('found') }] }; },
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => { ingested++; },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async (_op, units) => units <= 5,
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 1);
+  assert.equal(ingested, 0);
+  assert.equal(summary.nominations, 0);
+  assert.equal(summary.downstreamCapped, 1);
+  assert.equal(summary.status, 'COMPLETED');
 });

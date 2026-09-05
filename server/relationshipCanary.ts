@@ -29,6 +29,16 @@ export const RELATIONSHIP_CANARY_MAX_DEPTH = 2;
 export const RELATIONSHIP_CANARY_MAX_FANOUT = 10;
 export const RELATIONSHIP_CANARY_MAX_DEPTH2_PARENTS = 5;
 export const RELATIONSHIP_CANARY_MAX_CHANNELS_PER_RUN = 150;
+/**
+ * Conservative downstream estimate (YouTube units) earmarked per admitted
+ * candidate: max enrich reservation weight 202 (queueManager stage≥2) +
+ * recent-video search 100 + video details 1 + channel metadata 1 + 1 headroom.
+ * Deliberately worst-case: actual downstream is usually far cheaper, and
+ * over-reserving only stops the canary earlier (safe direction). Without this
+ * earmark the 1-unit traversal bound would be dishonest, because admitted
+ * candidates trigger hydration and ENRICH_CHANNEL work outside traversal.
+ */
+export const RELATIONSHIP_CANARY_ESTIMATED_DOWNSTREAM_UNITS = 305;
 
 export interface RelationshipCanarySeed {
   kind: 'channel' | 'playlist';
@@ -203,6 +213,8 @@ export interface RelationshipCanarySummary {
   nominations: number;
   ingested: number;
   channelsCapped: number;
+  /** Admissions refused for lack of downstream budget (estimate exceeds remainder). */
+  downstreamCapped: number;
   failures: string[];
   quotaUnits: number;
 }
@@ -218,8 +230,12 @@ export interface RelationshipCanaryDeps {
   ingest?: (raw: DiscoveredChannelRaw, country: string, source: 'automated_query') => Promise<unknown>;
   reserveQuota?: (operationId: string, units: number) => Promise<boolean>;
   finishQuota?: (operationId: string, consumed: boolean) => Promise<void>;
-  /** Test/operator override for already-reserved canary units across runs (production sums quota_reservations). */
-  readReservedUnits?: () => Promise<number>;
+  /**
+   * Test override for the atomic canary claim (production uses
+   * claimRelationshipCanaryQuota against quota_reservations). Returning false
+   * denies the spend (QUOTA_EXHAUSTED path) without touching shared state.
+   */
+  claimQuota?: (operationId: string, units: number, opts?: { consumeImmediately?: boolean }) => Promise<boolean>;
   /** Test override for the shared daily budget (production reads provider config). */
   dailyBudget?: number;
   /** Test override for the excluded-country gate (production uses assertCountryAllowed). */
@@ -243,26 +259,70 @@ async function defaultReserveQuota(operationId: string, units: number): Promise<
 }
 
 /**
- * Already-spent canary units for the active quota day: live RESERVED rows
- * plus CONSUMED rows from earlier (possibly completed) runs since the current
- * YouTube quota-day start. Single-status rows can never double-count. Old
- * CONSUMED rows from previous quota days are excluded (no cross-day leakage).
+ * Atomic canary quota claim against the existing quota_reservations table
+ * (no second quota system). One transaction: take the advisory lock for the
+ * canary share, sum RESERVED plus same-quota-day CONSUMED units, and insert
+ * the claim only when it fits the allowance. Concurrent workers serialize on
+ * the lock, so two cohorts can never both spend the same remaining allowance.
+ * The lock is held only for this short transaction — never across provider
+ * or network calls. Single-status rows can never double-count; day-scoping
+ * the CONSUMED leg prevents cross-day leakage.
  */
-export function relationshipCanarySpentUnitsQuery(dayStartIso: string): { text: string; values: [string] } {
-  return {
-    text: `SELECT COALESCE(SUM(units),0)::int AS reserved FROM quota_reservations
-      WHERE operation_type='RELATIONSHIP_CANARY'
-        AND (status='RESERVED'
-             OR (status='CONSUMED' AND COALESCE(consumed_at, reserved_at) >= $1::timestamptz))`,
-    values: [dayStartIso],
-  };
-}
-
-async function defaultReadReservedUnits(): Promise<number> {
-  const db = await getDb();
-  const query = relationshipCanarySpentUnitsQuery(new Date(getYouTubeQuotaDayStartAt()).toISOString());
-  const res = await db.query(query.text, query.values);
-  return Number(res.rows[0]?.reserved || 0);
+export async function claimRelationshipCanaryQuota(input: {
+  db: { query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> };
+  operationId: string;
+  units: number;
+  allowance: number;
+  dayStartIso: string;
+  consumeImmediately?: boolean;
+}): Promise<{ allowed: boolean; used: number; allowance: number }> {
+  const units = Math.max(1, Math.trunc(input.units) || 1);
+  const allowance = Math.max(0, Math.trunc(input.allowance) || 0);
+  const { db } = input;
+  await db.query('BEGIN');
+  try {
+    await db.query(`SELECT pg_advisory_xact_lock(hashtext('relationship-canary-quota'))`);
+    const spent = await db.query(
+      `SELECT COALESCE(SUM(units),0)::int AS spent FROM quota_reservations
+        WHERE operation_type='RELATIONSHIP_CANARY'
+          AND (status='RESERVED'
+               OR (status='CONSUMED' AND COALESCE(consumed_at, reserved_at) >= $1::timestamptz))`,
+      [input.dayStartIso],
+    );
+    const used = Math.max(0, Number(spent.rows[0]?.spent || 0));
+    // Upsert semantics: re-claiming the same operation replaces its row
+    // rather than adding spend, so the row's current units do not count
+    // against the allowance (crash-recovery retries must not block on their
+    // own prior claims).
+    const own = await db.query(
+      `SELECT COALESCE(units,0)::int AS own FROM quota_reservations
+        WHERE operation_type='RELATIONSHIP_CANARY' AND operation_id=$1`,
+      [input.operationId],
+    );
+    const ownUnits = Math.max(0, Number(own.rows[0]?.own || 0));
+    if (used - ownUnits + units > allowance) {
+      await db.query('ROLLBACK');
+      return { allowed: false, used, allowance };
+    }
+    const status = input.consumeImmediately ? 'CONSUMED' : 'RESERVED';
+    await db.query(
+      `INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, reserved_at, expires_at, consumed_at)
+        VALUES('RELATIONSHIP_CANARY', $1, 'AUTONOMOUS', $2, '${status}', now(), now() + interval '20 minutes', ${input.consumeImmediately ? 'now()' : 'NULL'})
+        ON CONFLICT(operation_type, operation_id) DO UPDATE
+          SET units=excluded.units, status='${status}',
+              reserved_at=CASE WHEN '${status}'='RESERVED' THEN now() ELSE quota_reservations.reserved_at END,
+              expires_at=now() + interval '20 minutes',
+              consumed_at=CASE WHEN '${status}'='CONSUMED' THEN now() ELSE quota_reservations.consumed_at END`,
+      [input.operationId, units],
+    );
+    await db.query('COMMIT');
+    return { allowed: true, used, allowance };
+  } catch (error) {
+    try {
+      await db.query('ROLLBACK');
+    } catch {}
+    throw error;
+  }
 }
 
 /**
@@ -289,6 +349,7 @@ export async function processRelationshipCanaryJob(
     nominations: 0,
     ingested: 0,
     channelsCapped: 0,
+    downstreamCapped: 0,
     failures: [],
     quotaUnits: 0,
   };
@@ -310,7 +371,6 @@ export async function processRelationshipCanaryJob(
   const nominate = deps.nominate || (async (input) => recordNomination({ ...input, queryGenerationMode: 'RELATIONSHIP_CANARY' } as never));
   const reserve = deps.reserveQuota || defaultReserveQuota;
   const finish = deps.finishQuota || (async (operationId: string, consumed: boolean) => { await finishQuotaReservation('RELATIONSHIP_CANARY', operationId, consumed); });
-  const readReserved = deps.readReservedUnits || defaultReadReservedUnits;
   // Channel-ID-normalized visited set: seeds pre-registered so a seed reached
   // again as a depth-1 discovery is not re-admitted under a different key
   // representation. Provenance per nomination is unaffected.
@@ -326,18 +386,19 @@ export async function processRelationshipCanaryJob(
       expandedTargets.add(seed.id);
     }
   }
-  // Real canary allocation: configured percent of the shared daily budget,
-  // minus units already reserved by other canary runs. tryReserveQuota still
-  // guards the global budget on every fetch; this bounds the canary's share.
+  // Real canary allocation: configured percent of the shared daily budget.
+  // Every spend — traversal fetches AND estimated downstream per admission —
+  // goes through one atomic claim (advisory-locked check+insert, day-scoped),
+  // so concurrent and sequential cohorts share a single hard aggregate bound.
+  // tryReserveQuota still guards the global budget on every fetch.
   const dailyBudget = deps.dailyBudget ?? getDailyYouTubeQuotaBudget();
   const allowance = relationshipCanaryQuotaAllowance(dailyBudget, settings.quotaPercent);
-  let reservedBaseline = 0;
-  try {
-    reservedBaseline = Math.max(0, Math.trunc(await readReserved()) || 0);
-  } catch {
-    reservedBaseline = 0;
-  }
-  const withinAllowance = (cost: number): boolean => summary.quotaUnits + reservedBaseline + cost <= allowance;
+  const dayStartIso = new Date(getYouTubeQuotaDayStartAt()).toISOString();
+  const claimQuota = deps.claimQuota || (async (operationId: string, units: number, opts?: { consumeImmediately?: boolean }): Promise<boolean> => {
+    const db = await getDb();
+    const claim = await claimRelationshipCanaryQuota({ db, operationId, units, allowance, dayStartIso, consumeImmediately: opts?.consumeImmediately });
+    return claim.allowed;
+  });
   const depth1: Array<{ channelId: string; seedId: string }> = [];
   const seedOf: Record<string, string> = {};
   let channelsAccepted = 0;
@@ -356,6 +417,15 @@ export async function processRelationshipCanaryJob(
     matchedDocument: DiscoveredChannelRaw['matchedDocument']; rawObservation: Record<string, unknown>;
   }): Promise<void> => {
     if (!acceptChannel()) return;
+    // Truthful downstream bound: admitting a candidate is expected to trigger
+    // hydration and enrichment work outside traversal. Earmark the
+    // conservative downstream estimate from the same atomic allowance BEFORE
+    // nominating or ingesting; if it does not fit, the candidate is not
+    // admitted at all (counted separately from the channel cap).
+    if (!await claimQuota(`relationship-canary:${payload.cohortId}:downstream:${raw.channelId}`, RELATIONSHIP_CANARY_ESTIMATED_DOWNSTREAM_UNITS, { consumeImmediately: true })) {
+      summary.downstreamCapped++;
+      return;
+    }
     // Observational keyword baseline (metrics only): would the old funnel
     // have admitted this candidate? Never influences admission or authority.
     const keywordBaseline = observeKeywordBaseline(raw);
@@ -388,7 +458,9 @@ export async function processRelationshipCanaryJob(
 
   const expandFeatured = async (sourceChannelId: string, provenance: Omit<RelationshipProvenance, 'kind'> & { kind: 'featured' }): Promise<string[]> => {
     const operationId = `relationship-canary:${payload.cohortId}:${provenance.depth}:${sourceChannelId}`;
-    if (!withinAllowance(FEATURED_CHANNEL_PROVIDER_COST)) {
+    // Atomic canary-share claim first (serializes concurrent cohorts), then
+    // the existing global reservation guard. Either denial stops the fetch.
+    if (!await claimQuota(operationId, FEATURED_CHANNEL_PROVIDER_COST)) {
       summary.status = 'QUOTA_EXHAUSTED';
       quotaExhausted = true;
       return [];
@@ -446,7 +518,7 @@ export async function processRelationshipCanaryJob(
         }
       } else {
         const operationId = `relationship-canary:${payload.cohortId}:playlist:${seed.id}`;
-        if (!withinAllowance(PLAYLIST_PROVIDER_COST)) {
+        if (!await claimQuota(operationId, PLAYLIST_PROVIDER_COST)) {
           summary.status = 'QUOTA_EXHAUSTED';
           quotaExhausted = true;
           continue;
@@ -552,7 +624,7 @@ export async function processRelationshipCanaryJob(
     }
   }
 
-  log(`[RelationshipCanary] cohort=${payload.cohortId} status=${summary.status} seeds=${summary.seedsAttempted} depth1=${summary.depth1Channels} depth2fetches=${summary.depth2Fetches} nominations=${summary.nominations} ingested=${summary.ingested} capped=${summary.channelsCapped} failures=${summary.failures.length} quotaUnits=${summary.quotaUnits}`);
+  log(`[RelationshipCanary] cohort=${payload.cohortId} status=${summary.status} seeds=${summary.seedsAttempted} depth1=${summary.depth1Channels} depth2fetches=${summary.depth2Fetches} nominations=${summary.nominations} ingested=${summary.ingested} capped=${summary.channelsCapped} downstreamCapped=${summary.downstreamCapped} failures=${summary.failures.length} quotaUnits=${summary.quotaUnits}`);
   return summary;
 }
 
