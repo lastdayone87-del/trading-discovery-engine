@@ -138,3 +138,10 @@ test('directive retryAt honors the same bound',async()=>{
   ]);
   assert.ok(directive?.retryAt!==undefined&&(directive?.retryAt as number)<=Date.now()+900000);
 });
+
+test('unbounded Infinity retry delay collapses to the ceiling instead of undefined', async () => {
+  const { clampRetryAtTimestamp } = await import('./communityRetryPolicy');
+  const now = Date.now();
+  assert.equal(clampRetryAtTimestamp(Infinity, now), now + 900000);
+  assert.equal(clampRetryAtTimestamp(-Infinity, now), undefined);
+});

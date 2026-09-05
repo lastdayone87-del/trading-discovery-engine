@@ -160,10 +160,10 @@ export function isAttemptFreeCommunityFailure(error: any): boolean {
 export const MAX_COMMUNITY_RETRY_DELAY_MS = 900_000;
 
 export function clampRetryAtTimestamp(value: number | undefined, now = Date.now()): number | undefined {
-  if (!Number.isFinite(value) || (value as number) <= 0) return undefined;
-  const timestamp = value as number;
-  if (timestamp <= now) return timestamp;
-  return Math.min(timestamp, now + MAX_COMMUNITY_RETRY_DELAY_MS);
+  if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) return undefined;
+  if (!Number.isFinite(value)) return now + MAX_COMMUNITY_RETRY_DELAY_MS;
+  if (value <= now) return value;
+  return Math.min(value, now + MAX_COMMUNITY_RETRY_DELAY_MS);
 }
 
 export function retryAtFromUnknown(error: any, now = Date.now()): number | undefined {
