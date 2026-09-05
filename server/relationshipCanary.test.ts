@@ -1535,3 +1535,63 @@ test('quota operation ids are scoped to the claimed attempt', async () => {
   assert.ok(attempt2Ops.every(op => op.includes(':attempt-2:')));
   assert.deepEqual(attempt1Ops.filter(op => attempt2Ops.includes(op)), []);
 });
+
+// Fence infrastructure failure propagates to job retry semantics instead of
+// being recorded as a provider failure or swallowed into a completed run.
+test('ownership-check infrastructure failure rejects instead of misrecording', async () => {
+  const { processRelationshipCanaryJob, CanaryOwnershipCheckError } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  let nominates = 0;
+  await assert.rejects(
+    processRelationshipCanaryJob(
+      { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+      async () => {},
+      {
+        settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+        dailyBudget: 100000,
+        checkCountryAllowed: async () => {},
+        checkOwnership: async () => { throw new Error('db unreachable'); },
+        fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: UC('newchan') }] }),
+        nominate: async () => { nominates++; return { id: 'n1' }; },
+        ingest: async () => {},
+        reserveQuota: async () => true,
+        finishQuota: async () => {},
+        claimQuota: async () => true,
+        log: () => {},
+      },
+    ),
+    (error: unknown) => error instanceof CanaryOwnershipCheckError,
+  );
+  assert.equal(nominates, 0);
+});
+
+// Mid-batch fence failure also propagates (not recorded as seed failure).
+test('mid-batch fence failure rejects without provider-failure record', async () => {
+  const { processRelationshipCanaryJob, CanaryOwnershipCheckError } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  let calls = 0;
+  await assert.rejects(
+    processRelationshipCanaryJob(
+      { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+      async () => {},
+      {
+        settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+        dailyBudget: 100000,
+        checkCountryAllowed: async () => {},
+        checkOwnership: async () => {
+          calls++;
+          if (calls <= 2) return true;
+          throw new Error('connection reset');
+        },
+        fetchFeaturedChannels: async () => ({ observations: [{ featuredChannelId: UC('newchan') }] }),
+        nominate: async () => ({ id: 'n1' }),
+        ingest: async () => {},
+        reserveQuota: async () => true,
+        finishQuota: async () => {},
+        claimQuota: async () => true,
+        log: () => {},
+      },
+    ),
+    (error: unknown) => error instanceof CanaryOwnershipCheckError,
+  );
+});

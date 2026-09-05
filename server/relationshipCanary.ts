@@ -522,6 +522,29 @@ export async function claimRelationshipCanaryQuota(input: {
  * Pure query construction around an injected query fn so the exact predicate
  * production enforces is unit-testable without a database.
  */
+/**
+ * Thrown when the ownership fence itself cannot be evaluated (infrastructure
+ * error reading the jobs row). Must propagate to normal job retry semantics —
+ * never recorded as a provider/traversal failure and never swallowed into a
+ * completed run.
+ */
+export class CanaryOwnershipCheckError extends Error {
+  readonly causeError: unknown;
+  constructor(cause: unknown) {
+    super(`Canary ownership check failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'CanaryOwnershipCheckError';
+    this.causeError = cause;
+  }
+}
+
+/** Evaluate the fence, converting infrastructure failures to the sentinel. */
+async function requireOwnership(checkOwnership: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await checkOwnership();
+  } catch (error) {
+    throw new CanaryOwnershipCheckError(error);
+  }
+}
 export function claimOwnershipChecker(
   query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>,
   jobId: string,
@@ -582,7 +605,7 @@ export async function processRelationshipCanaryJob(
       )();
     })
     : (async (): Promise<boolean> => true));
-  if (!(await checkOwnership())) {
+  if (!(await requireOwnership(checkOwnership))) {
     log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership before start; stopping without provider spend.`);
     return summary;
   }
@@ -640,6 +663,7 @@ export async function processRelationshipCanaryJob(
     return true;
   };
 
+
   const admitCandidate = async (raw: DiscoveredChannelRaw, nomination: {
     sourceType: string; query: string; resultRank: number;
     matchedDocument: DiscoveredChannelRaw['matchedDocument']; rawObservation: Record<string, unknown>;
@@ -647,7 +671,9 @@ export async function processRelationshipCanaryJob(
     // Ownership fence per admission: recovery may have struck while a
     // provider fetch was in flight, so re-check before spending quota,
     // nominating, or ingesting — not just before the next fetch.
-    if (!(await checkOwnership())) {
+    // Infrastructure failures propagate as CanaryOwnershipCheckError (job
+    // retry semantics), never as provider failures.
+    if (!(await requireOwnership(checkOwnership))) {
       log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-batch; stopping without admitting ${raw.channelId}.`);
       return false;
     }
@@ -659,7 +685,7 @@ export async function processRelationshipCanaryJob(
     // admitted at all (counted separately from the channel cap).
     if (!await claimQuota(`${opScope}:downstream:${raw.channelId}`, RELATIONSHIP_CANARY_ESTIMATED_DOWNSTREAM_UNITS, { consumeImmediately: true })) {
       summary.downstreamCapped++;
-      return;
+      return true;
     }
     // Observational keyword baseline (metrics only): would the old funnel
     // have admitted this candidate? Never influences admission or authority.
@@ -725,7 +751,7 @@ export async function processRelationshipCanaryJob(
   const capacityRemains = (): boolean => channelsAccepted < payload.maxChannels;
   for (const seed of seeds) {
     if (!capacityRemains()) break;
-    if (!(await checkOwnership())) {
+    if (!(await requireOwnership(checkOwnership))) {
       log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-run; stopping without further provider spend.`);
       return summary;
     }
@@ -805,6 +831,9 @@ export async function processRelationshipCanaryJob(
         }
       }
     } catch (error) {
+      // Ownership-fence infrastructure failures propagate to normal job retry
+      // semantics — they must never be recorded as provider/traversal failures.
+      if (error instanceof CanaryOwnershipCheckError) throw error;
       recordCanaryFailure(summary, `${seed.kind}:${seed.id}`, error);
     }
     if (quotaExhausted) break;
@@ -827,7 +856,7 @@ export async function processRelationshipCanaryJob(
       expandedTargets.add(target.targetId);
       // Ownership can be lost mid-run (recovery + re-claim by another
       // worker): stop before spending the next fetch, same as seeds above.
-      if (!(await checkOwnership())) {
+      if (!(await requireOwnership(checkOwnership))) {
         log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-run; stopping without further provider spend.`);
         return summary;
       }
@@ -866,6 +895,7 @@ export async function processRelationshipCanaryJob(
           })) { return summary; }
         }
       } catch (error) {
+        if (error instanceof CanaryOwnershipCheckError) throw error;
         recordCanaryFailure(summary, `featured:${target.targetId}`, error);
       }
       if (quotaExhausted) break;
