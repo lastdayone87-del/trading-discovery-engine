@@ -269,9 +269,7 @@ export async function processNextSearchJob(
     if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannel);return true;}
     if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannel);return true;}
     if(job.type==='RELATIONSHIP_CANARY_EXPANSION'){
-      const { processRelationshipCanaryJob } = await import('./relationshipCanary');
-      await processRelationshipCanaryJob(job, processDiscoveredChannel);
-      await completeJob(job.id);return true;
+      await handleRelationshipCanaryExpansionJob(job);return true;
     }
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
       const channelId=String(job.payload.channelId||'');
@@ -1020,6 +1018,39 @@ export async function enqueueRelationshipCanaryRun(
     { idempotencyKey: `relationship-canary:${payload.cohortId}:${day}`, priority: 5, maxAttempts: 2, preventReopen: true },
   );
   return { jobId: job.id, cohortId: payload.cohortId };
+}
+
+/**
+ * Dispatcher body for RELATIONSHIP_CANARY_EXPANSION jobs, extracted so the
+ * production wiring (run worker → persist summary → complete job, in that
+ * order) is directly regression-testable without a database. Default
+ * dependencies are the live pipeline; overrides are test seams only.
+ */
+export async function handleRelationshipCanaryExpansionJob(
+  job: { id: string; attempts?: number; payload?: unknown },
+  deps?: {
+    runCanary?: (job: { id: string; payload?: unknown }) => Promise<import('./relationshipCanary').RelationshipCanarySummary>;
+    persistSummary?: (jobId: string, summary: import('./relationshipCanary').RelationshipCanarySummary, attemptNumber?: number) => Promise<void>;
+    finishJob?: (jobId: string) => Promise<void>;
+  },
+): Promise<void> {
+  const { processRelationshipCanaryJob, persistRelationshipCanarySummary } = await import('./relationshipCanary');
+  const summary = await (deps?.runCanary || ((j) => processRelationshipCanaryJob({ id: j.id, payload: j.payload }, processDiscoveredChannel)))(job);
+  // Persist BEFORE completing: the attempt row must carry the observable
+  // summary (including pre-dispatch provider failures) rather than closing
+  // as COMPLETED with empty logs. Bound to this claim's attempt number.
+  if (deps?.persistSummary) {
+    await deps.persistSummary(job.id, summary, job.attempts);
+  } else {
+    const db = await getDb();
+    await persistRelationshipCanarySummary(
+      (text: string, values?: unknown[]) => db.query(text, values),
+      job.id,
+      summary,
+      job.attempts,
+    );
+  }
+  await (deps?.finishJob || completeJob)(job.id);
 }
 async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION'):Promise<void>{
   const metadata=buildCommunityRetryJobMetadata({
