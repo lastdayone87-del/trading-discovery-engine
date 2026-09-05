@@ -88,6 +88,30 @@ export function triageAutonomousSearchCandidate(
     };
   }
 
+  // Bounded relationship-canary admission. Candidates discovered by traversing
+  // creator relationships inside an explicitly designated canary cohort carry
+  // relationshipProvenance; the relationship itself establishes a bounded
+  // hypothesis WITHOUT any keyword requirement, so the keyword admission
+  // bottleneck below does not apply to this cohort. This is hypothesis only:
+  // relationship evidence never proves trading identity — it merely unlocks
+  // the existing verification chain (Gate 1 country + metadata hydration,
+  // audience gate, Gate 2 evidence-based trading classification, Discord and
+  // quality gates), which remain solely authoritative. Depth is capped so
+  // traversal cannot run away.
+  const relationship = candidate.relationshipProvenance;
+  if (
+    relationship &&
+    typeof relationship.cohortId === 'string' && relationship.cohortId.trim().length > 0 &&
+    (relationship.kind === 'featured' || relationship.kind === 'playlist') &&
+    Number.isInteger(relationship.depth) && relationship.depth >= 1 && relationship.depth <= 2
+  ) {
+    return {
+      disposition: 'PLAUSIBLE_TRADING_HYPOTHESIS',
+      reasonCodes: ['RELATIONSHIP_DERIVED_HYPOTHESIS', 'RELATIONSHIP_CORROBORATION_VIA_ENRICHMENT_PASS'],
+      matchedSignals: [`RELATIONSHIP_${relationship.kind.toUpperCase()}`, `RELATIONSHIP_DEPTH_${relationship.depth}`]
+    };
+  }
+
   const retrievalText = [
     candidate.channelName,
     candidate.matchedDocument?.title,
@@ -177,4 +201,26 @@ export function hasIndependentTradingHypothesis(decision: VerificationDecision):
   if (substantivePositive) return true;
   const candidateStage = decision.stagedClassification?.stages.find(stage => stage.stage === 'CANDIDATE_DETECTION');
   return candidateStage?.disposition === 'PASS';
+}
+
+export type KeywordBaseline = 'WOULD_ADMIT' | 'WOULD_WITHHOLD';
+
+/**
+ * Observational keyword-baseline signal for relationship-canary measurement.
+ * Answers "would the old keyword-first funnel have admitted this candidate?"
+ * by evaluating the EXISTING keyword predicate on the candidate WITHOUT its
+ * relationship marker. Pure and side-effect free. The result is recorded for
+ * cohort metrics only and must never influence admission, classification,
+ * country/exclusion, or review authority — callers use it for observation.
+ */
+export function observeKeywordBaseline(
+  candidate: DiscoveredChannelRaw,
+  source: DiscoverySource = 'automated_query',
+): { baseline: KeywordBaseline; reasonCodes: string[] } {
+  const { relationshipProvenance: _ignored, ...unmarked } = candidate;
+  const decision = triageAutonomousSearchCandidate(unmarked as DiscoveredChannelRaw, source, false);
+  return {
+    baseline: decision.disposition === 'PLAUSIBLE_TRADING_HYPOTHESIS' ? 'WOULD_ADMIT' : 'WOULD_WITHHOLD',
+    reasonCodes: decision.reasonCodes,
+  };
 }
