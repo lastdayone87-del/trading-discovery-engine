@@ -1178,7 +1178,7 @@ const makeLifecycleStore = () => {
         }
       }
     },
-    query: (async (text: string, values: unknown[] = []) => {
+    query: (async (text: string, values: unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount?: number | null }> => {
       const t = text.replace(/\s+/g, ' ');
       if (/^(BEGIN|COMMIT|ROLLBACK)/.test(t.trim())) return { rows: [] };
       if (t.includes('UPDATE jobs SET') && t.includes('attempts=$2 AND locked_by=$3')) {
@@ -1205,7 +1205,7 @@ const makeLifecycleStore = () => {
         return { rows: [] };
       }
       throw new Error(`unexpected statement: ${text.slice(0, 100)}`);
-    }) as never,
+    }),
   };
   return api;
 };
@@ -1229,12 +1229,13 @@ test('stale canary worker cannot complete a newer retry', async () => {
   }));
   const store = makeLifecycleStore();
   const q = store.query;
+  const connectOnce = () => Promise.resolve({ query: q, release: () => {} });
   const wired = (tag: string) => ({
     runCanary: async () => cannedSummary(tag),
     persistSummary: (jobId: string, summary: RelationshipCanarySummary, attempt?: number) =>
       persistRelationshipCanarySummary(q, jobId, summary, attempt),
     completeAttempt: (input: { jobId: string; attemptNumber: number; workerId: string }) =>
-      completeRelationshipCanaryAttempt(q, input),
+      completeRelationshipCanaryAttempt(connectOnce, input),
   });
 
   // Worker A claims attempt 1, then goes stale; recovery requeues.
@@ -1276,13 +1277,13 @@ test('stale canary worker cannot complete a newer retry', async () => {
 test('conditional completion rejects mismatched ownership', async () => {
   const { completeRelationshipCanaryAttempt } = await import('./relationshipCanary');
   const store = makeLifecycleStore();
-  const q = store.query;
+  const connectOnce = () => Promise.resolve({ query: store.query, release: () => {} });
   store.claim('worker-A');
-  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-B' }), { completed: false });
-  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-9', attemptNumber: 2, workerId: 'worker-A' }), { completed: false });
-  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-other', attemptNumber: 1, workerId: 'worker-A' }), { completed: false });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-B' }), { completed: false });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-9', attemptNumber: 2, workerId: 'worker-A' }), { completed: false });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-other', attemptNumber: 1, workerId: 'worker-A' }), { completed: false });
   assert.equal(store.job.status, 'PROCESSING');
-  assert.deepEqual(await completeRelationshipCanaryAttempt(q, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-A' }), { completed: true });
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connectOnce, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-A' }), { completed: true });
   assert.equal(store.job.status, 'COMPLETED');
 });
 
@@ -1293,7 +1294,7 @@ test('normal canary run completes its own attempt with observable logs', async (
     ...(await import('./relationshipCanary')),
   }));
   const store = makeLifecycleStore();
-  const q = store.query;
+  const connectOnce = () => Promise.resolve({ query: store.query, release: () => {} });
   const events: string[] = [];
   store.claim('worker-A');
   const result = await handleRelationshipCanaryExpansionJob(
@@ -1302,11 +1303,11 @@ test('normal canary run completes its own attempt with observable logs', async (
       runCanary: async () => { events.push('run'); return cannedSummary('ok'); },
       persistSummary: async (jobId: string, summary: RelationshipCanarySummary, attempt?: number) => {
         events.push('persist');
-        await persistRelationshipCanarySummary(q, jobId, summary, attempt);
+        await persistRelationshipCanarySummary(store.query, jobId, summary, attempt);
       },
       completeAttempt: async (input) => {
         events.push('complete');
-        return completeRelationshipCanaryAttempt(q, input);
+        return completeRelationshipCanaryAttempt(connectOnce, input);
       },
     },
     { workerId: 'worker-A', attemptNumber: 1 },
@@ -1315,4 +1316,94 @@ test('normal canary run completes its own attempt with observable logs', async (
   assert.deepEqual(events, ['run', 'persist', 'complete']);
   assert.equal(store.job.status, 'COMPLETED');
   assert.equal(store.attempts[0].logs.length, 1);
+});
+
+// Connection discipline: the whole completion transaction runs on exactly
+// one acquired client, which is always released — BEGIN/COMMIT can never
+// split across pooled connections.
+test('completion transaction uses a single dedicated client', async () => {
+  const { completeRelationshipCanaryAttempt } = await import('./relationshipCanary');
+  const store = makeLifecycleStore();
+  store.claim('worker-A');
+  const clients: Array<{ id: number; statements: string[] }> = [];
+  let nextId = 0;
+  let releases = 0;
+  const connect = async (): Promise<{ query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[]; rowCount?: number | null }>; release: () => void }> => {
+    const client = {
+      id: nextId++,
+      statements: [] as string[],
+      query: async (text: string, values: unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount?: number | null }> => {
+        client.statements.push(text.trim().split('\n')[0].slice(0, 40));
+        return store.query(text, values);
+      },
+      release: () => {
+        releases++;
+      },
+    };
+    clients.push(client);
+    return client;
+  };
+  assert.deepEqual(await completeRelationshipCanaryAttempt(connect, { jobId: 'job-9', attemptNumber: 1, workerId: 'worker-A' }), { completed: true });
+  assert.equal(clients.length, 1);
+  assert.deepEqual(clients[0].statements, ['BEGIN', 'UPDATE jobs SET status=\'COMPLETED\',compl', 'UPDATE job_attempts SET status=\'COMPLETE', 'COMMIT']);
+  assert.equal(releases, 1);
+  assert.equal(store.job.status, 'COMPLETED');
+});
+
+// Ownership fencing: a stale worker stops before any provider spend.
+test('worker without ownership performs zero provider work', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  let fetches = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => { throw new Error('ingest must never run without ownership'); },
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      checkOwnership: async () => false,
+      fetchFeaturedChannels: async () => { fetches++; return { observations: [] }; },
+      nominate: async () => { throw new Error('nominate must never run without ownership'); },
+      reserveQuota: async () => { throw new Error('reserve must never run without ownership'); },
+      claimQuota: async () => { throw new Error('claim must never run without ownership'); },
+      log: () => {},
+    },
+  );
+  assert.equal(fetches, 0);
+  assert.equal(summary.nominations, 0);
+  assert.equal(summary.seedsAttempted, 0);
+});
+
+// Ownership fencing mid-run: loss after the first seed stops depth-2 work.
+test('worker losing ownership mid-run stops before further fetches', async () => {
+  const { processRelationshipCanaryJob } = await import('./relationshipCanary');
+  const seed = UC('seedx');
+  const fetched: string[] = [];
+  let checks = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      checkOwnership: async () => { checks++; return checks <= 2; },
+      fetchFeaturedChannels: async (sourceChannelId: string) => {
+        fetched.push(sourceChannelId);
+        return { observations: [{ featuredChannelId: UC('newchan') }] };
+      },
+      nominate: async () => ({ id: 'n1' }),
+      ingest: async () => {},
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async () => true,
+      log: () => {},
+    },
+  );
+  // Pre-start check (1) + seed-loop check (2) pass; the seed fetch runs and
+  // its candidate is admitted; the depth-2 check (3) fails → stop.
+  assert.deepEqual(fetched, [seed]);
+  assert.equal(summary.nominations, 1);
+  assert.equal(summary.depth2Fetches, 0);
+  assert.ok(checks >= 3);
 });

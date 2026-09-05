@@ -306,32 +306,53 @@ export function relationshipCanaryAttemptLog(summary: RelationshipCanarySummary)
  * must not touch the job or the newer attempt. Single transaction: the job
  * row lock serializes concurrent completions.
  */
+export interface RelationshipCanaryDbClient {
+  query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>;
+  release: () => void;
+}
+
+/**
+ * Attempt/ownership-bound completion for relationship-canary jobs. Completes
+ * the job ONLY when the caller still owns the exact claimed attempt (job is
+ * PROCESSING, attempt counter matches, lock holder matches), and then only
+ * finishes that attempt's row. A stale worker whose job was recovered and
+ * re-claimed (attempt N+1 owned by another worker) gets completed:false and
+ * must not touch the job or the newer attempt. Single transaction on ONE
+ * dedicated client: the caller must acquire the client (pool.connect()) and
+ * release it — passing a pool-level query function would split BEGIN/COMMIT
+ * across connections and break atomicity.
+ */
 export async function completeRelationshipCanaryAttempt(
-  query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }>,
+  connect: () => Promise<RelationshipCanaryDbClient>,
   input: { jobId: string; attemptNumber: number; workerId: string },
 ): Promise<{ completed: boolean }> {
-  await query('BEGIN');
+  const client = await connect();
   try {
-    const owned = await query(
-      `UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now()
-        WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3 RETURNING id`,
-      [input.jobId, input.attemptNumber, input.workerId],
-    );
-    if (!owned.rowCount) {
-      await query('ROLLBACK');
-      return { completed: false };
-    }
-    await query(
-      `UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND attempt_number=$2 AND finished_at IS NULL`,
-      [input.jobId, input.attemptNumber],
-    );
-    await query('COMMIT');
-    return { completed: true };
-  } catch (error) {
+    await client.query('BEGIN');
     try {
-      await query('ROLLBACK');
-    } catch {}
-    throw error;
+      const owned = await client.query(
+        `UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now()
+          WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3 RETURNING id`,
+        [input.jobId, input.attemptNumber, input.workerId],
+      );
+      if (!owned.rowCount) {
+        await client.query('ROLLBACK');
+        return { completed: false };
+      }
+      await client.query(
+        `UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND attempt_number=$2 AND finished_at IS NULL`,
+        [input.jobId, input.attemptNumber],
+      );
+      await client.query('COMMIT');
+      return { completed: true };
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
+      throw error;
+    }
+  } finally {
+    client.release();
   }
 }
 
@@ -387,6 +408,17 @@ export interface RelationshipCanaryDeps {
   dailyBudget?: number;
   /** Test override for the excluded-country gate (production uses assertCountryAllowed). */
   checkCountryAllowed?: (country: string) => Promise<void>;
+  /**
+   * Claim identity for ownership fencing. When present, the worker re-checks
+   * ownership before any provider spend and stops silently when the job no
+   * longer belongs to this claim (recovered + re-claimed by another worker).
+   */
+  claim?: { workerId: string; attemptNumber: number };
+  /**
+   * Test override for the ownership fence (production queries the jobs row).
+   * Takes precedence over `claim` when both are provided.
+   */
+  checkOwnership?: () => Promise<boolean>;
   /** Test/operator override for the enabled/kill-switch settings (production reads app settings). */
   settings?: RelationshipCanarySettings;
   log?: (message: string) => void;
@@ -515,6 +547,24 @@ export async function processRelationshipCanaryJob(
   // excluded after queuing must not spend provider quota or enter ingestion.
   const checkAllowed = deps.checkCountryAllowed || (async (country: string) => { await assertCountryAllowed(country, 'relationship-canary:execution'); });
   await checkAllowed(payload.targetCountry);
+  // Ownership fence: a stale worker (recovered + re-claimed by another
+  // worker) must stop before provider calls, quota claims, nominations, and
+  // ingestion — not merely at final completion. Without claim identity (e.g.
+  // direct calls) the fence stays open, preserving existing behavior.
+  const checkOwnership = deps.checkOwnership || (deps.claim
+    ? (async (): Promise<boolean> => {
+      const db = await getDb();
+      const row = await db.query(
+        `SELECT 1 FROM jobs WHERE id=$1 AND status='PROCESSING' AND attempts=$2 AND locked_by=$3`,
+        [job.id, deps.claim!.attemptNumber, deps.claim!.workerId],
+      );
+      return !!row.rowCount;
+    })
+    : (async (): Promise<boolean> => true));
+  if (!(await checkOwnership())) {
+    log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership before start; stopping without provider spend.`);
+    return summary;
+  }
   const fetchFeatured = deps.fetchFeaturedChannels || fetchYouTubeFeaturedChannels;
   const fetchPlaylist = deps.fetchPlaylistChannels || fetchYouTubePlaylistChannels;
   // Effective ingest: explicit dep override wins (tests), otherwise the live
@@ -641,6 +691,10 @@ export async function processRelationshipCanaryJob(
   const capacityRemains = (): boolean => channelsAccepted < payload.maxChannels;
   for (const seed of seeds) {
     if (!capacityRemains()) break;
+    if (!(await checkOwnership())) {
+      log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-run; stopping without further provider spend.`);
+      return summary;
+    }
     summary.seedsAttempted++;
     try {
       if (seed.kind === 'channel') {
@@ -737,6 +791,12 @@ export async function processRelationshipCanaryJob(
       // every admitted candidate keeps its own full provenance.
       if (expandedTargets.has(target.targetId)) continue;
       expandedTargets.add(target.targetId);
+      // Ownership can be lost mid-run (recovery + re-claim by another
+      // worker): stop before spending the next fetch, same as seeds above.
+      if (!(await checkOwnership())) {
+        log(`[RelationshipCanary] cohort=${payload.cohortId} lost ownership mid-run; stopping without further provider spend.`);
+        return summary;
+      }
       // No admissible capacity left: stop traversal before spending fetches
       // whose results could not be admitted.
       if (!capacityRemains()) break;

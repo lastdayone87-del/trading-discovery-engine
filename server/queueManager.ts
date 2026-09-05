@@ -1063,8 +1063,9 @@ export async function handleRelationshipCanaryExpansionJob(
     return { completed: true };
   }
   const db = await getDb();
-  const query = (text: string, values?: unknown[]) => db.query(text, values);
-  const result = await completeRelationshipCanaryAttempt(query, {
+  // One dedicated client for the whole completion transaction: BEGIN/COMMIT
+  // must not split across pooled connections (the helper acquires/releases).
+  const result = await completeRelationshipCanaryAttempt(() => db.connect(), {
     jobId: job.id,
     attemptNumber: claim.attemptNumber,
     workerId: claim.workerId,
