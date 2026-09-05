@@ -904,3 +904,128 @@ test('canary jobs stay claimable while disabled for inert drain', async () => {
   assert.doesNotMatch(gate, /getAppSetting\('relationship_canary_enabled'/);
   assert.doesNotMatch(gate, /kill_switch/);
 });
+
+// Failure classification: stable codes, never secret material.
+test('provider failures classify to safe non-secret codes', async () => {
+  const { classifyRelationshipCanaryFailure } = await import('./relationshipCanary');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('YouTube featured-channel inspection requires an API key.')), 'NO_YOUTUBE_API_KEY');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('YouTube providers cooling down')), 'PROVIDER_POOL_UNAVAILABLE');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('QUOTA_EXHAUSTED for key')), 'QUOTA_EXHAUSTED');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('429 too many requests')), 'QUOTA_EXHAUSTED');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('INVALID_FEATURED_CHANNEL_PROVIDER_INPUT')), 'INVALID_INPUT');
+  assert.equal(classifyRelationshipCanaryFailure(new Error('socket hangup')), 'PROVIDER_CALL_FAILED');
+  assert.equal(classifyRelationshipCanaryFailure('plain string failure'), 'PROVIDER_CALL_FAILED');
+});
+
+// Redaction: credentials never reach persisted logs; telemetry survives.
+test('log scrubber redacts credentials and caps length', async () => {
+  const { sanitizeCanaryLogText } = await import('./relationshipCanary');
+  const dirty = 'fetch https://youtube.googleapis.com/v3/x?part=snippet&key=AIzaFakeKey123 failed Bearer abc.DEF_ghi quota 10 blocked 2';
+  const clean = sanitizeCanaryLogText(dirty);
+  assert.ok(!clean.includes('AIzaFakeKey123'));
+  assert.ok(!clean.includes('abc.DEF_ghi'));
+  assert.ok(clean.includes('quota 10'));
+  assert.ok(clean.includes('[REDACTED]'));
+  assert.equal(sanitizeCanaryLogText('x'.repeat(500), 200).length, 200);
+  assert.equal(
+    sanitizeCanaryLogText('api_key=supersecret-value here'),
+    'api_key=[REDACTED] here',
+  );
+});
+
+// Attempt-log entry shape: counts + sanitized failures, no secrets.
+test('attempt-log entry carries observable summary without secrets', async () => {
+  const { relationshipCanaryAttemptLog } = await import('./relationshipCanary');
+  const entry = relationshipCanaryAttemptLog({
+    cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 3, depth1Channels: 0, depth2Fetches: 0,
+    nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+    failures: ['channel:UCx:boom'], failureCodes: ['PROVIDER_CALL_FAILED'], quotaUnits: 3,
+  });
+  assert.equal(entry.cohortId, 'c1');
+  assert.deepEqual(entry.failures, ['channel:UCx:boom']);
+  assert.deepEqual(entry.failureCodes, ['PROVIDER_CALL_FAILED']);
+  assert.ok(!JSON.stringify(entry).includes('AIza'));
+});
+
+// Persistence targets the open attempt row and never throws.
+test('summary persistence appends to the unfinished attempt only', async () => {
+  const { persistRelationshipCanarySummary, relationshipCanaryAttemptLog } = await import('./relationshipCanary');
+  const calls: Array<{ text: string; values: unknown[] }> = [];
+  await persistRelationshipCanarySummary(
+    (async (text: string, values?: unknown[]) => { calls.push({ text, values: values || [] }); return { rows: [] }; }) as never,
+    'job-9',
+    {
+      cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 1, depth1Channels: 0, depth2Fetches: 0,
+      nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+      failures: [], failureCodes: [], quotaUnits: 0,
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].text, /UPDATE job_attempts SET logs = logs \|\|/);
+  assert.match(calls[0].text, /finished_at IS NULL/);
+  assert.equal(calls[0].values[0], 'job-9');
+  const logged = JSON.parse(String((calls[0].values[1] as string)));
+  assert.equal(logged.cohortId, 'c1');
+  assert.deepEqual(Object.keys(relationshipCanaryAttemptLog({
+    cohortId: 'x', status: 'KILLED', seedsAttempted: 0, depth1Channels: 0, depth2Fetches: 0,
+    nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0, failures: [], failureCodes: [], quotaUnits: 0,
+  })).sort(), Object.keys(logged).sort());
+  // A failing persistence layer resolves (observability never fails the job).
+  await persistRelationshipCanarySummary(
+    (async () => { throw new Error('db down'); }) as never,
+    'job-9',
+    {
+      cohortId: 'c1', status: 'COMPLETED', seedsAttempted: 0, depth1Channels: 0, depth2Fetches: 0,
+      nominations: 0, ingested: 0, channelsCapped: 0, downstreamCapped: 0,
+      failures: [], failureCodes: [], quotaUnits: 0,
+    },
+  );
+});
+
+// Pre-dispatch provider failure is visible end to end (no silent COMPLETED).
+test('pre-dispatch provider failure surfaces classified in the attempt log', async () => {
+  const { processRelationshipCanaryJob, persistRelationshipCanarySummary } = await import('./relationshipCanary');
+  const logged: unknown[] = [];
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-9', payload: { cohortId: 'c1', targetCountry: 'US', seeds: [{ kind: 'channel', id: UC('seed') }, { kind: 'channel', id: UC('seed2') }, { kind: 'channel', id: UC('seed3') }], maxDepth: 1, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      fetchFeaturedChannels: async () => { throw new Error('YouTube featured-channel inspection requires an API key.'); },
+      nominate: async () => { throw new Error('must not nominate without provider data'); },
+      ingest: async () => { throw new Error('must not ingest without provider data'); },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async () => true,
+      log: () => {},
+    } as never,
+  );
+  assert.equal(summary.failures.length, 3);
+  assert.deepEqual(summary.failureCodes, ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY']);
+  assert.equal(summary.nominations, 0);
+  await persistRelationshipCanarySummary(
+    (async (text: string, values?: unknown[]) => { logged.push(JSON.parse(String((values || [])[1]))); return { rows: [] }; }) as never,
+    'job-9',
+    summary,
+  );
+  assert.equal(logged.length, 1);
+  assert.deepEqual((logged[0] as Record<string, unknown>).failureCodes, ['NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY', 'NO_YOUTUBE_API_KEY']);
+});
+
+// Real provider path: with no configured keys the real fetcher fails closed
+// before any network call, with the production no-key classification.
+test('real provider path fails closed pre-dispatch when no keys exist', async () => {
+  const { getYouTubeKeyPool } = await import('./db');
+  if (getYouTubeKeyPool().length > 0) return;
+  const { fetchYouTubeFeaturedChannels } = await import('./youtube');
+  const { classifyRelationshipCanaryFailure } = await import('./relationshipCanary');
+  await assert.rejects(fetchYouTubeFeaturedChannels(UC('seed'), 5), /API key/);
+  try {
+    await fetchYouTubeFeaturedChannels(UC('seed'), 5);
+    assert.fail('must throw without keys');
+  } catch (error) {
+    assert.equal(classifyRelationshipCanaryFailure(error), 'NO_YOUTUBE_API_KEY');
+  }
+});

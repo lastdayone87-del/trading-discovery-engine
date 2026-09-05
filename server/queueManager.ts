@@ -269,8 +269,17 @@ export async function processNextSearchJob(
     if(job.type==='INSPECT_PLAYLIST'){await processPlaylistInspectionJob(job,processDiscoveredChannel);return true;}
     if(job.type==='INSPECT_FEATURED_CHANNELS'){await processFeaturedChannelInspectionJob(job,processDiscoveredChannel);return true;}
     if(job.type==='RELATIONSHIP_CANARY_EXPANSION'){
-      const { processRelationshipCanaryJob } = await import('./relationshipCanary');
-      await processRelationshipCanaryJob(job, processDiscoveredChannel);
+      const { processRelationshipCanaryJob, persistRelationshipCanarySummary } = await import('./relationshipCanary');
+      const summary = await processRelationshipCanaryJob(job, processDiscoveredChannel);
+      // Persist the run summary (including per-seed failures) onto the open
+      // job_attempts record: without this, provider failures surface only as
+      // COMPLETED with empty logs and become unobservable.
+      const db = await getDb();
+      await persistRelationshipCanarySummary(
+        (text: string, values?: unknown[]) => db.query(text, values),
+        job.id,
+        summary,
+      );
       await completeJob(job.id);return true;
     }
     if (job.type === 'POST_APPROVAL_ENRICH' || job.type === 'FORCE_REVIEW_RESCAN') {
