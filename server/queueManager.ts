@@ -199,17 +199,15 @@ export async function processNextSearchJob(
   if(!claimableOverride||claimableOverride.includes('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER')){const db=await getDb();const c=await db.query(`SELECT 1 FROM external_provider_adapter_controls WHERE mode IN('CANARY','ACTIVE') AND NOT paused AND NOT kill_switch LIMIT 1`);if(c.rowCount)claimableTypes.push('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_PLAYLIST')){const db=await getDb();const c=await db.query(`SELECT mode,paused,kill_switch FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_PLAYLIST'`);if(c.rows[0]?.mode==='CANARY'&&!c.rows[0].paused&&!c.rows[0].kill_switch)claimableTypes.push('INSPECT_PLAYLIST');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_FEATURED_CHANNELS')){const db=await getDb();const c=await db.query(`SELECT 1 FROM acquisition_adapter_controls adapter JOIN creator_search_canary_control authority ON authority.singleton=true WHERE adapter.adapter_type='INSPECT_FEATURED_CHANNELS' AND adapter.mode='CANARY' AND NOT adapter.paused AND NOT adapter.kill_switch AND authority.enabled AND NOT authority.kill_switch AND authority.serving_authority_enabled AND authority.featured_channel_authority_enabled AND authority.featured_channel_rollout_basis_points>0`);if(c.rowCount)claimableTypes.push('INSPECT_FEATURED_CHANNELS');}
-  // Relationship-canary expansion runs only while explicitly enabled and not
-  // killed (app settings, default inert). No new worker pool: the type is
-  // claimed on no-override processing paths like the adapter canaries above.
+  // Relationship-canary expansion is always claimable so queued runs drain:
+  // the worker itself returns KILLED with zero spend when the canary is
+  // disabled or killed, which completes stale queued runs inertly instead of
+  // leaving them pending to fire on a later re-enable. No new worker pool:
+  // the type rides the existing tick lifecycle like the adapter canaries.
+  // Default inertness is preserved because only explicitly queued
+  // relationship jobs match this type — nothing else is claimed by it.
   if(!claimableOverride||claimableOverride.includes('RELATIONSHIP_CANARY_EXPANSION')){
-    const [enabled, killSwitch] = await Promise.all([
-      getAppSetting('relationship_canary_enabled', 'false'),
-      getAppSetting('relationship_canary_kill_switch', 'true'),
-    ]);
-    if (enabled.trim().toLowerCase() === 'true' && killSwitch.trim().toLowerCase() !== 'true') {
-      claimableTypes.push('RELATIONSHIP_CANARY_EXPANSION');
-    }
+    claimableTypes.push('RELATIONSHIP_CANARY_EXPANSION');
   }
   if (!claimableOverride || claimableOverride.includes('TERM_HARVEST')) {
     const db=await getDb();const control=await db.query(`SELECT paused FROM corpus_controls WHERE singleton=true`);

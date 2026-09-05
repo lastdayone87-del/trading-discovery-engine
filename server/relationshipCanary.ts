@@ -293,11 +293,15 @@ export async function claimRelationshipCanaryQuota(input: {
     // Upsert semantics: re-claiming the same operation replaces its row
     // rather than adding spend, so the row's current units do not count
     // against the allowance (crash-recovery retries must not block on their
-    // own prior claims).
+    // own prior claims) — but ONLY when that row actually contributed to the
+    // aggregate above. A previous-day row is invisible to `used`, so it must
+    // not be subtracted either; otherwise a stale row becomes a bypass.
     const own = await db.query(
       `SELECT COALESCE(units,0)::int AS own FROM quota_reservations
-        WHERE operation_type='RELATIONSHIP_CANARY' AND operation_id=$1`,
-      [input.operationId],
+        WHERE operation_type='RELATIONSHIP_CANARY' AND operation_id=$1
+          AND (status='RESERVED'
+               OR (status='CONSUMED' AND COALESCE(consumed_at, reserved_at) >= $2::timestamptz))`,
+      [input.operationId, input.dayStartIso],
     );
     const ownUnits = Math.max(0, Number(own.rows[0]?.own || 0));
     if (used - ownUnits + units > allowance) {

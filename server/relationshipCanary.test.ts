@@ -643,8 +643,14 @@ const makeQuotaStore = () => {
       return { rows: [{ spent: sum }] };
     }
     if (text.includes('AS own')) {
-      const key = `RELATIONSHIP_CANARY|${String(values[0])}`;
-      return { rows: [{ own: rows.get(key)?.units || 0 }] };
+      const opId = String(values[0]);
+      const dayStart = String(values[1]);
+      const key = `RELATIONSHIP_CANARY|${opId}`;
+      const row = rows.get(key);
+      // Same active-day predicate as the aggregate: only rows contributing to
+      // `used` may be subtracted for upsert retries.
+      const active = row && (row.status === 'RESERVED' || (row.status === 'CONSUMED' && (row.consumed_at || row.reserved_at) >= dayStart));
+      return { rows: [{ own: active ? row.units : 0 }] };
     }
     if (text.includes('INSERT INTO quota_reservations')) {
       const [opId, units] = values as [string, number];
@@ -864,4 +870,37 @@ test('downstream budget denial skips admission without failing traversal', async
   assert.equal(summary.nominations, 0);
   assert.equal(summary.downstreamCapped, 1);
   assert.equal(summary.status, 'COMPLETED');
+});
+
+// Previous-day own rows must not subsidize today's allowance.
+test('stale own-row cannot bypass the current-day allowance', async () => {
+  const { claimRelationshipCanaryQuota } = await import('./relationshipCanary');
+  const store = makeQuotaStore();
+  store.rows.set('RELATIONSHIP_CANARY|stale-op', {
+    units: 10, status: 'CONSUMED',
+    reserved_at: '2026-09-03T06:00:00.000Z', consumed_at: '2026-09-03T06:05:00.000Z',
+  });
+  // Allowance 10, already 0 used today; retrying the stale op for 10 more
+  // must count fully (its old units are not in `used`) — and a second, fresh
+  // operation must then see the full 10 as spent.
+  const retry = await claimRelationshipCanaryQuota({ db: store, operationId: 'stale-op', units: 10, allowance: 10, dayStartIso: DAY });
+  assert.equal(retry.allowed, true);
+  const next = await claimRelationshipCanaryQuota({ db: store, operationId: 'fresh-op', units: 1, allowance: 10, dayStartIso: DAY });
+  assert.equal(next.allowed, false);
+  assert.equal(next.used, 10);
+});
+
+// Killed-queued runs drain: the claim gate never filters on settings (the
+// worker itself returns KILLED with zero spend), so disabling the canary
+// cannot strand pending runs to fire on a later re-enable.
+test('canary jobs stay claimable while disabled for inert drain', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync('server/queueManager.ts', 'utf8');
+  const gate = source.slice(
+    source.indexOf('Relationship-canary expansion is always claimable'),
+    source.indexOf('TERM_HARVEST', source.indexOf('Relationship-canary expansion is always claimable')),
+  );
+  assert.match(gate, /claimableTypes\.push\('RELATIONSHIP_CANARY_EXPANSION'\)/);
+  assert.doesNotMatch(gate, /getAppSetting\('relationship_canary_enabled'/);
+  assert.doesNotMatch(gate, /kill_switch/);
 });
