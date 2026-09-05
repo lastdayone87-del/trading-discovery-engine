@@ -24,6 +24,7 @@ test('recoverable Discord validation distinguishes queued, budget-exhausted, ter
   assert.match(dbCore,/community_retry_job_run_after/);
   assert.match(dbCore,/community_retry_job_execution_count/);
   assert.match(dbCore,/community_retry_job_deferral_count/);
+  assert.match(dbCore,/community_retry_job_executed_count/);
   assert.match(dbCore,/community_retry_job_last_execution_at/);
   assert.match(dbCore,/community_retry_job_retry_reason/);
   assert.match(dbCore,/community_retry_job_reconciliation_status/);
@@ -44,4 +45,18 @@ test('recoverable Discord validation distinguishes queued, budget-exhausted, ter
 test('pending retries (attempts=0) read as not-yet-executed, executed retries show counts',()=>{
   assert.match(resultsTable,/Pending · not yet executed/);
   assert.match(resultsTable,/Retry-window attempts/);
+});
+
+test('executed attempts require affirmative execution evidence, never a bare claim',()=>{
+  // A worker claim persisted before dispatch (PROCESSING), a capacity
+  // deferral, or a pre-dispatch stale recovery must NOT display as an
+  // executed inspection. Only COMPLETED rows or FAILED rows with a
+  // non-deferral, non-stale error count.
+  assert.match(dbCore,/community_retry_job_executed_count/);
+  assert.match(dbCore,/a\.status='COMPLETED'/);
+  assert.match(dbCore,/COALESCE\(a\.error,''\) NOT LIKE '%Community acquisition deferred:%'/);
+  assert.match(dbCore,/COALESCE\(a\.error,''\) NOT LIKE '%Worker heartbeat expired%'/);
+  assert.match(resultsTable,/community_retry_job_executed_count/);
+  assert.match(resultsTable,/Worker claims/);
+  assert.match(resultsTable,/executed attempts/);
 });

@@ -155,6 +155,13 @@ export interface ChannelRecord {
   community_retry_job_error?: string;
   community_retry_job_execution_count?: number;
   community_retry_job_deferral_count?: number;
+  /**
+   * Attempt rows with affirmative evidence that acquisition actually ran:
+   * COMPLETED rows, or FAILED rows whose error is neither a capacity
+   * deferral nor a stale-worker recovery. A bare claim (PROCESSING),
+   * deferral, or pre-dispatch stale failure is never counted here.
+   */
+  community_retry_job_executed_count?: number;
   community_retry_job_last_execution_at?: string | null;
   community_retry_job_last_execution_status?: string;
   community_retry_job_retry_reason?: 'NO_SURFACE' | 'BROWSER_RUNTIME_UNAVAILABLE' | 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' | 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' | string;

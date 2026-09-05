@@ -23,6 +23,14 @@ export interface CommunityRetryObservation {
 }
 
 export interface CommunityRetryDirective {
+  /**
+   * Channel-level accounting: an attempt-free directive schedules a durable
+   * retry without incrementing the channel's `scan_attempts`. This does NOT
+   * decide job-level execution accounting — the retry worker grants
+   * attempt-free *execution* (claim increment undone) only when `retryReason`
+   * is BROWSER_RUNTIME_UNAVAILABLE, i.e. every retry-owning failure proves no
+   * acquisition work started. Genuine failures consume one job attempt each.
+   */
   attemptFree: boolean;
   code: string;
   retryAt?: number;
@@ -202,7 +210,15 @@ export function communityAcquisitionRetryDirective(
   const requiredFailures = observations.filter(isCommunityRetryableObservation);
   if (!requiredFailures.length) return undefined;
   const retryTimes = requiredFailures.map(item => Number(item.retryAt)).filter(value => Number.isFinite(value) && value > 0);
-  const browserRuntimeUnavailable = requiredFailures.some(item => isBrowserRuntimeFailureClass(item.failureClass));
+  // Attempt-free capacity classification must be unanimous, never existential:
+  // browser-runtime failures mean NO acquisition work started (binary missing,
+  // launch failed, saturated gate), so a retry owning ONLY such failures may
+  // defer without consuming budget. But if ANY retry-owning failure is a
+  // genuine acquisition failure (timeout, transient HTTP, zero-page rendered
+  // run, ...), real inspection work executed and the retry MUST consume one
+  // bounded attempt. `some()` here would let one capacity row launder genuine
+  // work into an infinite attempt-free loop.
+  const browserRuntimeUnavailable = requiredFailures.every(item => isBrowserRuntimeFailureClass(item.failureClass));
   return {
     attemptFree: true,
     code: browserRuntimeUnavailable ? 'BROWSER_RUNTIME_UNAVAILABLE' : COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,

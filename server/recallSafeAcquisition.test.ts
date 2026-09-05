@@ -267,9 +267,15 @@ test('dotless quarantine applies only to exact single-label hostnames and never 
   // Forensic basis (PR #434 §7A): zero historical FOUND observations for
   // dotless seeds. The predicate stays exact: single-label only.
   assert.equal(isDotlessHostnameUrl('https://g/'), true);
+  assert.equal(isDotlessHostnameUrl('https://pea/'), true);
+  assert.equal(isDotlessHostnameUrl('https://peak/'), true);
   assert.equal(isDotlessHostnameUrl('https://g.co/'), false);
   assert.equal(isDotlessHostnameUrl('https://example.com/'), false);
+  assert.equal(isDotlessHostnameUrl('https://sub.example.com/'), false);
   assert.equal(isDotlessHostnameUrl('https://192.168.0.1/'), false);
+  // Bracketed IPv6 literals are genuine website targets, never garbage.
+  assert.equal(isDotlessHostnameUrl('http://[2606:4700:4700::1111]/'), false);
+  assert.equal(isDotlessHostnameUrl('http://[::1]/'), false);
   assert.equal(isDotlessHostnameUrl('not-a-url'), false);
 });
 

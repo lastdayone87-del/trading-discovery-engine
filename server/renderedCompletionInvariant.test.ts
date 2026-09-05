@@ -139,6 +139,9 @@ test('zero-page incompleteness never resolves clean across zero-processed varian
 // 4. Dotless garbage (e.g. https://g/) is statically attempted for recall
 // safety but never escalates to rendered fallback and never owns retry work:
 // no browser run can turn a meaningless input into evidence.
+// Garbage-only input must NOT read as a definitive negative either: with no
+// genuine site inspected, the truthful state is non-definitive partial
+// coverage (no retry — nothing retry-owning failed), never INSPECTED_NO_MATCH.
 test('dotless garbage creates no rendered work and no retry', async () => {
   let renderedCalls = 0;
   const result = await runChannelInspection({
@@ -159,8 +162,7 @@ test('dotless garbage creates no rendered work and no retry', async () => {
   });
   assert.equal(renderedCalls, 0);
   assert.equal(result.retryDirective, undefined);
-  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
-  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
   // The static attempt is still recorded as audit evidence.
   assert.ok(
     (result.acquisitionOutcomes || []).some(
@@ -841,4 +843,28 @@ test('dotless garbage alongside genuine failure owns no retry itself', async () 
       `garbage root must never own retry work: ${item.requestedUrl}`,
     );
   }
+});
+
+// IPv6 literals are genuine website targets: failures stay eligible for the
+// normal rendered/retry path and never quarantined as single-label garbage.
+test('IPv6 literal failure remains eligible for rendered retry', async () => {
+  let renderedCalls = 0;
+  const result = await runChannelInspection({
+    channelId: 'UCipv6genuine0000000000001',
+    channelName: 'IPv6 Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['http://[2606:4700:4700::1111]/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => {
+      throw Object.assign(new Error('connect ENETUNREACH'), { name: 'AbortError' });
+    }) as typeof fetch,
+    renderedFallback: async (seedUrl) => {
+      renderedCalls++;
+      return zeroPageStub()(seedUrl);
+    },
+  });
+  assert.equal(renderedCalls, 1);
+  assert.ok(result.retryDirective, 'genuine IPv6 failure must own a retry');
+  assert.notEqual(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
 });
