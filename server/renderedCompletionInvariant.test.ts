@@ -612,3 +612,28 @@ test('lifecycle failed extraction yields NO_PAGE_PROCESSED, never partial', () =
   assert.equal(state.retryable, true);
   assert.equal(state.failureClass, 'NO_PAGE_PROCESSED');
 });
+
+// Step 4 reporting splits populations instead of comparing observations to URLs.
+test('linked-website summary separates URLs, static, rendered, pages, retryables', async () => {
+  const { summarizeLinkedWebsiteAcquisition, formatLinkedWebsiteAcquisitionSummary } = await import('./inspector');
+  const summary = summarizeLinkedWebsiteAcquisition([
+    { requestedUrl: 'https://a.example/', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '', telemetry: { mode: 'STATIC', redirectsFollowed: 0, pagesInspected: 2, budgetExhausted: false, clicksStarted: 0, clicksSucceeded: 0, clicksFailed: 0, requestsStarted: 0, requestsFinished: 0, requestsFailed: 0, navigationTimeouts: 0, blockedRequests: 0, rateLimitedRequests: 0, hostBackoffsApplied: 0 } },
+    { requestedUrl: 'https://a.example/', surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'NO_PAGE_PROCESSED', detail: '', observedAt: '' },
+    { requestedUrl: 'https://b.example/docs', surface: 'CREATOR_WEBSITES', required: false, outcome: 'INSPECTED_NO_MATCH', retryable: false, detail: '', observedAt: '' },
+  ]);
+  assert.equal(summary.uniqueRootUrls, 2);
+  assert.equal(summary.staticRan, 2);
+  assert.equal(summary.staticSucceeded, 1);
+  assert.equal(summary.staticFailed, 0);
+  assert.equal(summary.renderedRan, 1);
+  assert.equal(summary.renderedSucceeded, 0);
+  assert.equal(summary.renderedFailed, 1);
+  assert.equal(summary.pagesProcessed, 2);
+  assert.equal(summary.retryableFailures, 1);
+  const text = formatLinkedWebsiteAcquisitionSummary(summary);
+  assert.match(text, /2 unique website URL\(s\)/);
+  assert.match(text, /static: 2 attempted, 1 inspected, 0 failed/);
+  assert.match(text, /rendered fallback: 1 attempted, 0 inspected, 1 failed/);
+  assert.match(text, /2 page\(s\) processed/);
+  assert.match(text, /1 retryable failure\(s\)/);
+});

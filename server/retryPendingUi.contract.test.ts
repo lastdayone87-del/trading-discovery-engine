@@ -39,3 +39,8 @@ test('recoverable Discord validation distinguishes queued, budget-exhausted, ter
   assert.match(resultsTable,/RECONCILIATION REQUIRED/);
   assert.match(resultsTable,/LEGACY UNCLASSIFIED/);
 });
+
+test('pending retries (attempts=0) read as not-yet-executed, executed retries show counts',()=>{
+  assert.match(resultsTable,/Pending · not yet executed/);
+  assert.match(resultsTable,/Retry-window attempts/);
+});

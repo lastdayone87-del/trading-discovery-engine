@@ -150,11 +150,27 @@ export function isAttemptFreeCommunityFailure(error: any): boolean {
   );
 }
 
+/**
+ * Ceiling for provider-requested retry delays. Matches failJob's own backoff
+ * ceiling (900s): a single Retry-After header or provider timestamp must
+ * never park a retry job beyond the queue's own maximum backoff horizon.
+ * Unbounded values previously produced PENDING jobs with far-future run_after
+ * that read as permanently stuck at attempts=0.
+ */
+export const MAX_COMMUNITY_RETRY_DELAY_MS = 900_000;
+
+export function clampRetryAtTimestamp(value: number | undefined, now = Date.now()): number | undefined {
+  if (!Number.isFinite(value) || (value as number) <= 0) return undefined;
+  const timestamp = value as number;
+  if (timestamp <= now) return timestamp;
+  return Math.min(timestamp, now + MAX_COMMUNITY_RETRY_DELAY_MS);
+}
+
 export function retryAtFromUnknown(error: any, now = Date.now()): number | undefined {
   const direct = Number(error?.retryAt ?? error?.cause?.retryAt);
-  if (Number.isFinite(direct) && direct > 0) return direct;
+  if (Number.isFinite(direct) && direct > 0) return clampRetryAtTimestamp(direct, now);
   const retryAfterMs = Number(error?.retryAfterMs ?? error?.cause?.retryAfterMs);
-  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return now + retryAfterMs;
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return clampRetryAtTimestamp(now + retryAfterMs, now);
   return undefined;
 }
 
@@ -190,7 +206,7 @@ export function communityAcquisitionRetryDirective(
   return {
     attemptFree: true,
     code: browserRuntimeUnavailable ? 'BROWSER_RUNTIME_UNAVAILABLE' : COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
-    retryAt: retryTimes.length ? Math.min(...retryTimes) : undefined,
+    retryAt: retryTimes.length ? clampRetryAtTimestamp(Math.min(...retryTimes)) : undefined,
     reason: requiredFailures.map(item => item.failureClass || 'TRANSIENT_ACQUISITION_FAILURE').join(', '),
     retryReason: browserRuntimeUnavailable
       ? COMMUNITY_RETRY_REASON.BROWSER_RUNTIME_UNAVAILABLE

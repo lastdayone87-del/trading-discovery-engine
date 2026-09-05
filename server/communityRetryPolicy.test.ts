@@ -107,3 +107,34 @@ test('partial-only required acquisition follows RETRY_PENDING via the shared bou
     {surface:'CREATOR_WEBSITES',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false},
   ]),false);
 });
+
+test('provider-requested retry delays are bounded by the queue backoff ceiling',async()=>{
+  const {clampRetryAtTimestamp,MAX_COMMUNITY_RETRY_DELAY_MS}=await import('./communityRetryPolicy');
+  const now=Date.now();
+  assert.equal(MAX_COMMUNITY_RETRY_DELAY_MS,900000);
+  // Absurd Retry-After values (legal HTTP, e.g. one year) cannot park a retry
+  // job beyond the queue's own maximum backoff horizon.
+  assert.equal(clampRetryAtTimestamp(now+31_536_000_000,now),now+900000);
+  assert.equal(clampRetryAtTimestamp(now+3_600_000,now),now+900000);
+  // Normal delays pass through untouched; due/overdue stays due.
+  assert.equal(clampRetryAtTimestamp(now+60_000,now),now+60_000);
+  assert.equal(clampRetryAtTimestamp(now-1000,now),now-1000);
+  assert.equal(clampRetryAtTimestamp(undefined,now),undefined);
+  assert.equal(clampRetryAtTimestamp(NaN,now),undefined);
+});
+
+test('retryAtFromUnknown never yields an unbounded future timestamp',async()=>{
+  const {retryAtFromUnknown}=await import('./communityRetryPolicy');
+  const now=Date.now();
+  assert.ok((retryAtFromUnknown({retryAfterMs:31_536_000_000},now) as number)<=now+900000);
+  assert.ok((retryAtFromUnknown({retryAt:now+31_536_000_000},now) as number)<=now+900000);
+  assert.equal(retryAtFromUnknown({retryAfterMs:5000},now),now+5000);
+});
+
+test('directive retryAt honors the same bound',async()=>{
+  const {communityAcquisitionRetryDirective}=await import('./communityRetryPolicy');
+  const directive=communityAcquisitionRetryDirective([
+    {surface:'CREATOR_WEBSITES',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'TRANSIENT',retryAt:Date.now()+31_536_000_000},
+  ]);
+  assert.ok(directive?.retryAt!==undefined&&(directive?.retryAt as number)<=Date.now()+900000);
+});
