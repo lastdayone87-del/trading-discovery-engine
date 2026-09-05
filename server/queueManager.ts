@@ -33,7 +33,8 @@ import {
   selectDiscordCandidate,
   countDiscordInvalidObservations,
   appendExternalAcquisitionObservations,
-  getNeighborhoodForQueryRun
+  getNeighborhoodForQueryRun,
+  markCommunityInspectionStarted
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -240,6 +241,11 @@ export async function processNextSearchJob(
     if(job.type==='RETRY_COMMUNITY_ACQUISITION'){
       const channel=await getChannelById(String(job.payload.channelId||''));
       if(!channel){await completeJob(job.id);return true;}
+      // Durable proof that community inspection genuinely began for this
+      // attempt. Everything above (dispatch trace, channel load, this guard)
+      // can fail first — none of it is acquisition execution. The marker must
+      // land before inspectAndValidateChannel and nowhere earlier.
+      await markCommunityInspectionStarted(job.id);
       const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false);
       // Attempt-free deferral is reserved for capacity/browser signals where no
       // real acquisition was attempted (browser runtime unavailable). Genuine
