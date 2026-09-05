@@ -751,22 +751,27 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
 export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
 
 /**
- * Durable affirmative proof that community inspection genuinely began for the
- * open attempt of a retry job. Appended to the attempt's `logs` array (same
- * established `logs ||` pattern as relationship-canary attempt logs; no
- * schema change) immediately before `inspectAndValidateChannel` runs.
+ * Durable affirmative proof that community inspection genuinely began for one
+ * exact claimed attempt of a retry job. Appends to the attempt's `logs` array
+ * (same established `logs ||` pattern as relationship-canary attempt logs; no
+ * schema change), bound to the open PROCESSING row of that attempt number.
  *
  * A FAILED attempt row is therefore NOT evidence of execution by itself: the
  * worker can fail before dispatch (`recordExecutionStage`), while loading the
- * channel, or on a stale/pre-dispatch crash. Only rows carrying this marker
- * prove the inspection boundary was reached. Deliberately throws on failure
- * instead of warning: running an unmarked inspection would silently undercount
+ * channel, on terminal/pause early returns, or on a stale/pre-dispatch crash.
+ *
+ * Attempt-scoping (relationship-canary pattern): a recovered worker waking up
+ * late must never mark a newer replacement attempt, and a zero-row update
+ * means the claim was already recovered or completed — the caller aborts
+ * before inspection instead of running unmarked. Deliberately throws instead
+ * of warning: running an unmarked inspection would silently undercount
  * execution, while failing fast retries the job with the marker intact.
  */
 export const COMMUNITY_INSPECTION_STARTED_MARKER = 'communityInspectionStarted';
-export async function markCommunityInspectionStarted(jobId:string):Promise<void>{
+export async function markCommunityInspectionStarted(jobId:string,attemptNumber:number):Promise<void>{
   const db=await getDb();
-  await db.query(`UPDATE job_attempts SET logs = logs || $2::jsonb WHERE job_id=$1 AND status='PROCESSING' AND finished_at IS NULL`,[jobId,JSON.stringify(COMMUNITY_INSPECTION_STARTED_MARKER)]);
+  const res=await db.query(`UPDATE job_attempts SET logs = logs || $3::jsonb WHERE job_id=$1 AND attempt_number=$2 AND status='PROCESSING' AND finished_at IS NULL`,[jobId,attemptNumber,JSON.stringify(COMMUNITY_INSPECTION_STARTED_MARKER)]);
+  if(!res.rowCount) throw new Error(`Community inspection marker found no open attempt (job ${jobId} attempt ${attemptNumber}); claim was recovered or completed before inspection.`);
 }
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 const TRANSIENT_PROVIDER_CODES=new Set(['QUOTA_ALLOCATION_EXHAUSTED','YOUTUBE_PROVIDERS_COOLING_DOWN','YOUTUBE_PROVIDER_POOL_EXHAUSTED','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','PROVIDER_COOLDOWN','PROVIDER_CONCURRENCY_CAP_EXCEEDED','BRAVE_API_RATE_LIMIT_429','BRAVE_API_TIMEOUT','BRAVE_API_NETWORK_FAILURE','BRAVE_API_HTTP_500','BRAVE_API_HTTP_502','BRAVE_API_HTTP_503','BRAVE_API_HTTP_504']);

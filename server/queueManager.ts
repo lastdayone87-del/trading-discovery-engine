@@ -241,12 +241,10 @@ export async function processNextSearchJob(
     if(job.type==='RETRY_COMMUNITY_ACQUISITION'){
       const channel=await getChannelById(String(job.payload.channelId||''));
       if(!channel){await completeJob(job.id);return true;}
-      // Durable proof that community inspection genuinely began for this
-      // attempt. Everything above (dispatch trace, channel load, this guard)
-      // can fail first — none of it is acquisition execution. The marker must
-      // land before inspectAndValidateChannel and nowhere earlier.
-      await markCommunityInspectionStarted(job.id);
-      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false);
+      // job.attempts is the post-claim number matching this attempt's
+      // job_attempts row; the marker call throws on a stale/recovered claim so
+      // inspection never starts unmarked.
+      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts});
       // Attempt-free deferral is reserved for capacity/browser signals where no
       // real acquisition was attempted (browser runtime unavailable). Genuine
       // acquisition failures (COMMUNITY_REQUIRED) consumed a real inspection
@@ -776,7 +774,8 @@ export async function inspectAndValidateChannel(
   rawDetails?: DiscoveredChannelRaw,
   isManualScan: boolean = false,
   enableDebug: boolean = false,
-  scheduleRetry: boolean = true
+  scheduleRetry: boolean = true,
+  executionMarker?: { jobId: string; attemptNumber: number }
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
@@ -789,6 +788,13 @@ export async function inspectAndValidateChannel(
     await upsertChannel(channel);
     return;
   }
+
+  // Durable proof that community inspection genuinely began. Both early
+  // returns above (terminal state, processing pause) skip inspection without
+  // marking, so they can never count as executed. The marker is bound to the
+  // exact claimed attempt: a zero-row update means the claim was already
+  // recovered or completed, and inspection must not start on a stale claim.
+  if (executionMarker) await markCommunityInspectionStarted(executionMarker.jobId, executionMarker.attemptNumber);
 
   const now = new Date().toISOString();
 
