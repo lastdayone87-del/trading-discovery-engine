@@ -176,13 +176,16 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     if (typeof value !== 'string' || !value.trim()) return undefined;
     return value.replace(/\s+/g, ' ').trim().slice(0, max) || undefined;
   };
-  // Lifecycle stage and zero-page reason are validated against their closed
-  // taxonomies (see browserCommunityFallback): unknown persisted values are
-  // dropped rather than stored, keeping the ledger queryable. Rows predating
-  // instrumentation simply omit these fields (backward compatible).
+  // Lifecycle stage, zero-page reason, and browser cause are rendered-only
+  // diagnostics (see browserCommunityFallback): the sanitizer drops them on
+  // STATIC rows so static telemetry can never carry rendered diagnostics.
+  // The cause additionally passes through the redaction routine — truncation
+  // alone is not redaction, and the sanitizer must stay safe even if a caller
+  // passes unredacted text. Unknown taxonomy values are dropped rather than
+  // stored. Rows predating instrumentation simply omit these fields.
   const stage = candidate.mode === 'RENDERED' ? text(candidate.lastLifecycleStage, 40) : undefined;
   const reason = candidate.mode === 'RENDERED' ? text(candidate.zeroPageReason, 40) : undefined;
-  const cause = candidate.mode === 'RENDERED' ? text(candidate.launchCauseSnippet, 500) : undefined;
+  const cause = candidate.mode === 'RENDERED' ? redactCauseSnippet(candidate.launchCauseSnippet) : undefined;
   const instance = text(candidate.workerInstanceId, 120);
   return {
     ...emptyCrawlerTelemetry(candidate.mode),
@@ -204,4 +207,30 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(cause ? { launchCauseSnippet: cause } : {}),
     ...(instance ? { workerInstanceId: instance } : {}),
   };
+}
+
+/**
+ * Bounded safe redaction for persisted/visible diagnostics. Truncation is not
+ * redaction, and both launchCauseSnippet and acquisition detail persist —
+ * so secrets are scrubbed before either receives the text:
+ * - URL userinfo (`scheme://user:pass@host` → `scheme://***@host`);
+ * - query/fragment values on sensitive keys (token, secret, key, auth,
+ *   password, session, bearer) → `key=***`;
+ * - bearer/basic authorization material → `Bearer ***, Basic ***`;
+ * - password-style assignments (`\"password\": \"...\"`, `password=...`);
+ * - home-directory filesystem paths (`/root/...`, `/home/<user>/...`).
+ * Error classes, codes, hostnames, non-sensitive paths, and Chromium internals
+ * survive: diagnostics keep everything that identifies the failure mode.
+ */
+export function redactCauseSnippet(raw: unknown, maxLength = 500): string | undefined {
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  let out = raw.replace(/\s+/g, ' ').trim();
+  out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:]+:)[^@/\s]+@/g, '$1***@');
+  out = out.replace(/([?&#;](?:[^?&#;=]*?(?:token|secret|api[_-]?key|auth|password|passwd|pwd|credential|session|bearer)[^?&#;=]*)=)[^?&#;\s]*/gi, '$1***');
+  out = out.replace(/\b([Bb]earer\s+)[A-Za-z0-9\-._~+/=]{4,}/g, '$1***');
+  out = out.replace(/\b([Bb]asic\s+)[A-Za-z0-9+/=]{8,}/g, '$1***');
+  out = out.replace(/((?:"|')?(?:password|passwd|pwd|secret|api[_-]?key)(?:"|')?\s*[:=]\s*"?)[^"\s,}]+/gi, '$1***');
+  out = out.replace(/\/(?:root|home\/[^/\s'"]+)(?:\/[^\s'"]*)?/g, '/<redacted-path>');
+  const flat = out.trim().slice(0, Math.max(1, maxLength));
+  return flat || undefined;
 }

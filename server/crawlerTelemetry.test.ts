@@ -167,3 +167,24 @@ test('ledger persists sanitized telemetry wholesale into observation provenance'
   assert.match(dbCore, /const telemetry=safeCrawlerTelemetry\(observation\.telemetry\)/);
   assert.match(dbCore, /\.\.\.\(telemetry\?\{crawlerTelemetry:telemetry\}:\{\}\)/);
 });
+
+test('sanitizer redacts sensitive cause text independently of callers', () => {
+  // Defense in depth: even if a caller passes raw unredacted text, the
+  // persistence boundary itself must scrub secrets before returning.
+  const telemetry = safeCrawlerTelemetry({
+    mode: 'RENDERED',
+    pagesInspected: 0,
+    launchCauseSnippet: 'Failed to launch https://ops:s3cret@proxy:8080 browser; token=abc123 Bearer eyJhbGciOiJIUzI1NiJ9 opts {"password": "hunter2"} at /root/.cache/x',
+  });
+  const snippet = telemetry?.launchCauseSnippet || '';
+  assert.doesNotMatch(snippet, /s3cret/);
+  assert.doesNotMatch(snippet, /abc123/);
+  assert.doesNotMatch(snippet, /eyJhbGciOiJIUzI1NiJ9/);
+  assert.doesNotMatch(snippet, /hunter2/);
+  assert.doesNotMatch(snippet, /\/root\/.cache/);
+  assert.match(snippet, /https:\/\/ops:\*\*\*@proxy:8080/);
+  assert.match(snippet, /token=\*\*\*/);
+  assert.match(snippet, /Bearer \*\*\*/);
+  assert.match(snippet, /Failed to launch/);
+  assert.ok(snippet.length <= 500);
+});
