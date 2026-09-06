@@ -14,7 +14,7 @@ HuggingFace Hub egress for the one-time weight download.
 
 ## Protocol (identical to the TF-IDF tracks or the comparison is void)
 
-1. Same dataset (`fetch_dataset.js`), same channel-held-out folds, same seeds
+1. Same dataset (`fetch_dataset.cjs`), same channel-held-out folds, same seeds
    (1000+rep / 2000+rep / 3000+rep / 4000+rep as in evaluate*.py).
 2. Track A — multilingual embeddings + LR: `multilingual-E5-small`
    (or MiniLM-L12-v2 if E5 underperforms on short bios), mean-pooled,
