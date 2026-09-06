@@ -96,3 +96,7 @@ fully offline. Embeddings track would add ~500MB weights + ~50–200ms/doc CPU.
 ## 9. Recommendation
 
 YES, continue to a larger POC — but scoped: (a) collect 30–50 more gold negatives via the existing human review queue (highest leverage action; unlocks tight precision CIs); (b) run the embeddings + SetFit track where torch exists, same protocol; (c) prototype the abstention-gated hybrid (local decides ≥ threshold, else current LLM path) OFFLINE with replay measurement before any shadow discussion. Do NOT integrate, shadow, or route traffic on these numbers.
+
+## 10. Experiment D — 6 model-disputed FPs as provisional gold negatives
+
+Per 2026-09-06 instruction, the 6 LLM-disputed channels joined gold (41 pos + 15 neg eval pool, n=150 pooled OOF). Results at th=0.5: word+LR P=1.000/FP=0, word+SVM P=0.940/FP=5, char+LR P=1.000/FP=0. ALL FPs at every threshold come from the 6 provisional channels; the 3 original gold negatives are never misclassified by any model at any threshold. The provisional 6 carry 100% of the error mass — they are genuinely trading-smelling to every model family tested (TF-IDF and LLM alike), which is precisely why the pending human verdicts on them are the highest-leverage labels in the program. These 6 are PROVISIONAL pending human confirmation; if any flips to TRADING, reported precision rises.
