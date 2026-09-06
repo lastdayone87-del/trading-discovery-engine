@@ -116,6 +116,26 @@ test('cleanup failure is observable without changing the crawl result', async ()
   assert.doesNotMatch(warnings[0], /abc123/);
 });
 
+test('cleanup failure with an Error object preserves the redacted message', async () => {
+  // Drop rejections are Error objects, not strings: the warning must carry
+  // the redacted message rather than degrading to "unknown storage error".
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    await dropIsolatedRenderedQueue(
+      { drop: async () => { throw new Error('storage locked for https://ops:s3cret@proxy:8080'); } },
+      'rendered-community-test-1b',
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /storage locked/);
+  assert.doesNotMatch(warnings[0], /s3cret/);
+  assert.doesNotMatch(warnings[0], /unknown storage error/);
+});
+
 test('successful cleanup emits no signal', async () => {
   const warnings: string[] = [];
   const originalWarn = console.warn;

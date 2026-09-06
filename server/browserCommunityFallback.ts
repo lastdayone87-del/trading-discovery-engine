@@ -427,7 +427,7 @@ export async function dropIsolatedRenderedQueue(
     await queue.drop();
   } catch (error) {
     console.warn(
-      `[RenderedAcquisition] Isolated request queue cleanup failed for ${name}: ${redactCauseSnippet(error) || 'unknown storage error'}`,
+      `[RenderedAcquisition] Isolated request queue cleanup failed for ${name}: ${browserCauseSnippet(error) || 'unknown storage error'}`,
     );
   }
 }
