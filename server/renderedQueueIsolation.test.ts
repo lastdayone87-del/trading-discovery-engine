@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Configuration, RequestQueue, type Request } from 'crawlee';
-import { openIsolatedRenderedRequestQueue } from './browserCommunityFallback';
+import { dropIsolatedRenderedQueue, openIsolatedRenderedRequestQueue } from './browserCommunityFallback';
 
 // No-browser regression coverage for per-crawl RequestQueue isolation.
 // Production proved repeat crawls of already-handled seed URLs resolve with
@@ -86,10 +86,44 @@ test('queue opener mints a unique name per invocation', async () => {
 
 test('crawler uses a per-invocation named queue and always drops it', async () => {
   // Wiring contract: construction receives an explicitly opened queue and a
-  // finally guarantees drop() on every path, so named queues cannot
-  // accumulate in storage.
+  // finally guarantees best-effort cleanup on every path, so named queues
+  // cannot accumulate in storage.
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
   assert.match(source, /openIsolatedRenderedRequestQueue\(\(name\) => RequestQueue\.open\(name\)\)/);
   assert.match(source, /requestQueue: isolated\.queue,/);
-  assert.match(source, /await isolated\.queue\.drop\(\)\.catch\(\(\) => undefined\)/);
+  assert.match(source, /await dropIsolatedRenderedQueue\(isolated\.queue, isolated\.name\)/);
+});
+
+test('cleanup failure is observable without changing the crawl result', async () => {
+  // A failing drop() must emit one bounded warning (queue name + redacted
+  // cause, never raw secrets) while resolving normally so the settled crawl
+  // result is preserved.
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    const result = await dropIsolatedRenderedQueue(
+      { drop: async () => { throw new Error('storage locked for https://ops:s3cret@proxy:8080 queue token=abc123'); } },
+      'rendered-community-test-1',
+    );
+    assert.equal(result, undefined);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Isolated request queue cleanup failed for rendered-community-test-1/);
+  assert.doesNotMatch(warnings[0], /s3cret/);
+  assert.doesNotMatch(warnings[0], /abc123/);
+});
+
+test('successful cleanup emits no signal', async () => {
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    await dropIsolatedRenderedQueue({ drop: async () => undefined }, 'rendered-community-test-2');
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.length, 0);
 });

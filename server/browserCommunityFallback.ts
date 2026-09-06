@@ -412,6 +412,26 @@ export async function openIsolatedRenderedRequestQueue<T extends { drop: () => P
   return { name, queue: await open(name) };
 }
 
+/**
+ * Best-effort cleanup for a per-crawl isolated queue. Drop failures never
+ * change the crawl result (the crawl already settled): they emit one bounded
+ * operational warning carrying only the generated queue name plus the
+ * redacted storage error, so silent accumulation stays observable without
+ * ever leaking URLs, credentials, or tokens.
+ */
+export async function dropIsolatedRenderedQueue(
+  queue: { drop: () => Promise<void> },
+  name: string,
+): Promise<void> {
+  try {
+    await queue.drop();
+  } catch (error) {
+    console.warn(
+      `[RenderedAcquisition] Isolated request queue cleanup failed for ${name}: ${redactCauseSnippet(error) || 'unknown storage error'}`,
+    );
+  }
+}
+
 /** Expensive Tier-2 acquisition. Finding one invite no longer terminates the
  * rendered crawl: every invite visible within the bounded page/click budget is
  * retained so ownership can be decided after acquisition. */
@@ -617,9 +637,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       } finally {
         // The isolated queue must never outlive its crawl: drop it on success,
         // failure, and unexpected throws alike so named queues cannot
-        // accumulate in storage. Drop failures are swallowed (best effort) —
-        // a stale named queue is inert and cannot affect other crawls.
-        await isolated.queue.drop().catch(() => undefined);
+        // accumulate in storage. Cleanup is best-effort with a bounded warning
+        // (see dropIsolatedRenderedQueue) — it never affects the crawl result.
+        await dropIsolatedRenderedQueue(isolated.queue, isolated.name);
       }
     });
   } catch (error:any) {
