@@ -1,5 +1,7 @@
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
+import type { RenderedLifecycleStage, RenderedZeroPageReason } from './crawlerTelemetry';
+import { redactCauseSnippet } from './crawlerTelemetry';
 import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
   DEFAULT_RENDERED_MAX_SESSION_ROTATIONS,
@@ -40,10 +42,35 @@ export interface BrowserFallbackTelemetry {
   clicksSucceeded: number;
   clicksFailed: number;
   clickFailureClasses: Record<RenderedCrawlerFailureClass, number>;
+  /**
+   * Furthest lifecycle stage with affirmative evidence for this crawl
+   * (seed accepted → gate acquired → crawler running → handler entered →
+   * page processed). Required: every telemetry object must state where its
+   * crawl stopped, so zero-page outcomes are diagnosable from the ledger.
+   */
+  lastLifecycleStage: RenderedLifecycleStage;
+  /**
+   * Explicit zero-page reason, set only when no page was inspected (see
+   * resolveRenderedZeroPageReason). Diagnosability only: outcome, retry, and
+   * collapse semantics keep reading failureClass and page evidence.
+   */
+  zeroPageReason?: RenderedZeroPageReason;
+  /**
+   * Bounded underlying launch/start error text (whitespace-collapsed, capped
+   * at 500 chars). Preserves the actual Playwright/browser cause instead of
+   * only the generic classifier label.
+   */
+  launchCauseSnippet?: string;
 }
 
 export function browserFallbackTelemetrySummary(telemetry: BrowserFallbackTelemetry): string {
-  return `telemetry{started:${telemetry.requestsStarted},finished:${telemetry.requestsFinished},failed:${telemetry.requestsFailed},navigationTimeouts:${telemetry.navigationTimeouts},blocked:${telemetry.blockedRequests},rateLimited:${telemetry.rateLimitedRequests},transient:${telemetry.transientRequests},hostBackoffs:${telemetry.hostBackoffsApplied},clicksStarted:${telemetry.clicksStarted},clicksSucceeded:${telemetry.clicksSucceeded},clicksFailed:${telemetry.clicksFailed},clickFailureClasses:${JSON.stringify(telemetry.clickFailureClasses)}}`;
+  const base = `telemetry{started:${telemetry.requestsStarted},finished:${telemetry.requestsFinished},failed:${telemetry.requestsFailed},navigationTimeouts:${telemetry.navigationTimeouts},blocked:${telemetry.blockedRequests},rateLimited:${telemetry.rateLimitedRequests},transient:${telemetry.transientRequests},hostBackoffs:${telemetry.hostBackoffsApplied},clicksStarted:${telemetry.clicksStarted},clicksSucceeded:${telemetry.clicksSucceeded},clicksFailed:${telemetry.clicksFailed},clickFailureClasses:${JSON.stringify(telemetry.clickFailureClasses)}}`;
+  // Stage/reason suffixes are conditional: snapshots predating instrumentation
+  // (and all existing contracted strings) keep their exact legacy shape.
+  const extras: string[] = [];
+  if (telemetry.lastLifecycleStage) extras.push(`stage:${telemetry.lastLifecycleStage}`);
+  if (telemetry.zeroPageReason) extras.push(`zeroPage:${telemetry.zeroPageReason}`);
+  return extras.length ? `${base.slice(0, -1)},${extras.join(',')}}` : base;
 }
 
 export interface BrowserFallbackResult {
@@ -222,6 +249,100 @@ export function resolveRenderedCompletionState(input: {
   return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
+/** Bounded underlying error text: message plus one cause level, redacted, capped. */
+export function browserCauseSnippet(error: unknown, maxLength = 500): string | undefined {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+  const causeMessage = cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : '';
+  const flat = [message, causeMessage && causeMessage !== message ? causeMessage : '']
+    .filter(Boolean)
+    .join(' | ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return redactCauseSnippet(flat, maxLength);
+}
+/**
+ * Classifies a crawler-run catch into its durable failure identity. Pure and
+ * exported for regression coverage. `launchCauseSnippet` (the
+ * browser-launch/startup cause field) is preserved ONLY on affirmative
+ * browser launch/startup/runtime failure: an ordinary crawler execution error
+ * must never populate a field named "launch cause", so generic throws leave
+ * it unset (redaction alone cannot fix that semantic contamination).
+ */
+export function classifyCrawlCatch(error: unknown, options: { saturated: boolean }): {
+  browserLaunchFailed: boolean;
+  failureClass: BrowserFailureClass | 'NO_PAGE_PROCESSED' | 'RENDERED_FALLBACK_SATURATED' | undefined;
+  preserveLaunchCause: boolean;
+} {
+  if (options.saturated) {
+    return { browserLaunchFailed: false, failureClass: 'RENDERED_FALLBACK_SATURATED', preserveLaunchCause: false };
+  }
+  const browserLaunchFailed = isBrowserRuntimeFailure(error);
+  return {
+    browserLaunchFailed,
+    failureClass: browserLaunchFailed ? classifyBrowserFailure(error) : undefined,
+    preserveLaunchCause: browserLaunchFailed,
+  };
+}
+/**
+ * Monotonic lifecycle advance: stages only move forward along
+ * GATE_QUEUED → GATE_ACQUIRED → CRAWLER_RUNNING → HANDLER_ENTERED →
+ * PAGE_PROCESSED. A later event at a shallower stage (e.g. another handler
+ * entry after a page was already processed) can never downgrade the recorded
+ * furthest stage, so a successful crawl always retains PAGE_PROCESSED as its
+ * terminal observed stage. Pure and exported for regression coverage.
+ */
+const RENDERED_LIFECYCLE_RANK: Record<RenderedLifecycleStage, number> = {
+  GATE_QUEUED: 0,
+  GATE_ACQUIRED: 1,
+  CRAWLER_RUNNING: 2,
+  HANDLER_ENTERED: 3,
+  PAGE_PROCESSED: 4,
+};
+export function advanceRenderedLifecycleStage(
+  current: RenderedLifecycleStage,
+  event: RenderedLifecycleStage,
+): RenderedLifecycleStage {
+  return RENDERED_LIFECYCLE_RANK[event] > RENDERED_LIFECYCLE_RANK[current] ? event : current;
+}
+/**
+ * Maps a zero-page crawl to its explicit terminal reason. Pure and exported
+ * for regression coverage. Precedence is affirmative-evidence-first:
+ * saturation and browser-launch failure classify at their throw sites, then
+ * lifecycle stage (startup stages mean the run never began, even when it
+ * threw; HANDLER_ENTERED proves admission), then the thrown flag (an aborted
+ * started run is never a clean no-op return).
+ * Then request-level evidence (failures before admission, deadline before
+ * admission), then the residual "returned without requests" bucket. Returns
+ * undefined when pages exist. Never perturbs outcome/retry/collapse
+ * semantics: those keep reading failureClass and page evidence.
+ */
+export function resolveRenderedZeroPageReason(input: {
+  inspectedPages: number;
+  timedOut: boolean;
+  saturated: boolean;
+  browserLaunchFailed: boolean;
+  thrown?: boolean;
+  telemetry: Pick<BrowserFallbackTelemetry, 'requestsStarted' | 'requestsFailed' | 'lastLifecycleStage'>;
+}): RenderedZeroPageReason | undefined {
+  if (input.inspectedPages > 0) return undefined;
+  if (input.saturated) return 'GATE_SATURATED';
+  if (input.browserLaunchFailed) return 'BROWSER_LAUNCH_FAILED';
+  // Lifecycle evidence precedes the thrown flag: a throw before crawler.run()
+  // began (module load, construction, lease) never progressed past startup,
+  // while a throw at CRAWLER_RUNNING or later aborted a started execution.
+  // HANDLER_ENTERED keeps its proof even when the run later threw.
+  const stage = input.telemetry.lastLifecycleStage;
+  if (stage === 'GATE_QUEUED' || stage === 'GATE_ACQUIRED') return 'CRAWLER_START_FAILED';
+  if (stage === 'HANDLER_ENTERED') return 'HANDLER_ENTERED_NO_PAGES';
+  if (input.thrown) return 'CRAWLER_RUN_THREW';
+  const started = input.telemetry.requestsStarted || 0;
+  const failed = input.telemetry.requestsFailed || 0;
+  if (failed > 0 && started === 0) return 'PRE_HANDLER_REQUEST_FAILURE';
+  if (input.timedOut && started === 0) return 'DEADLINE_BEFORE_ADMISSION';
+  return 'CRAWLER_RETURNED_WITHOUT_REQUESTS';
+}
+
 function boundedEnvInt(value: string | undefined, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -287,6 +408,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     clicksSucceeded: 0,
     clicksFailed: 0,
     clickFailureClasses: { BLOCKED: 0, RATE_LIMITED: 0, TRANSIENT: 0, OTHER: 0 },
+    lastLifecycleStage: 'GATE_QUEUED',
   };
   // Terminal-vs-recovered accounting shared with completion logic below.
   // Failed attempts and page-processing successes are recorded per request
@@ -312,6 +434,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
 
   try {
     return await renderedFallbackGate.run(async () => {
+      telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
       const startedAt = Date.now();
       try {
         const { PlaywrightCrawler } = await import('crawlee');
@@ -351,6 +474,11 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (policy.delayMs > 0 && remainingMs > 0) await new Promise(resolve => setTimeout(resolve, Math.min(policy.delayMs, remainingMs)));
           },
           async requestHandler({ page, request, enqueueLinks }) {
+            // Handler entry proves navigation completed (Crawlee navigates
+            // before invoking the handler). Recorded before the deadline
+            // guards so even an immediately-returning handler leaves proof
+            // that admission happened.
+            telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'HANDLER_ENTERED');
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             const remainingMs = Math.max(0, limits.totalTimeoutMs - (Date.now() - startedAt));
             await waitForHostBackoff(request.url, remainingMs);
@@ -366,6 +494,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // failed extraction must never claim a page).
             await inspect();
             inspectedPages++;
+            telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
 
             for (let i = 0; i < limits.maxScrollsPerPage; i++) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -416,12 +545,19 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           },
         });
 
+        // Proves the crawl was scheduled and attempted; the handler overwrites
+        // this with deeper stages when navigation/admission actually happens.
+        // A throw below (e.g. browser launch failure) keeps CRAWLER_RUNNING,
+        // and the browser flag — not the stage — carries that classification.
+        telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'CRAWLER_RUNNING');
         await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
         markBrowserCapabilityReady();
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
+        const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
+        if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
         return {
@@ -440,9 +576,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         };
       } catch (error:any) {
         const candidates=mergeDiscordCandidates(discovered);
-        const failureClass=isBrowserRuntimeFailure(error)?classifyBrowserFailure(error):undefined;
+        const catchClass=classifyCrawlCatch(error,{saturated:false});
+        const browserLaunchFailed=catchClass.browserLaunchFailed;
+        const failureClass=catchClass.failureClass;
         if (failureClass) markBrowserCapabilityUnavailable(error);
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
+        const causeSnippet=catchClass.preserveLaunchCause?browserCauseSnippet(error):undefined;
+        if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
+        const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
+        if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       }
     });
   } catch (error:any) {
@@ -451,9 +593,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     // Saturation is explicit browser-gate capacity, not a browser defect: keep
     // it classified as capacity (so retry accounting can defer attempt-free)
     // without marking the browser capability itself unavailable.
-    const failureClass=saturated?'RENDERED_FALLBACK_SATURATED':(!isBrowserRuntimeFailure(error)?undefined:classifyBrowserFailure(error));
+    const catchClass=classifyCrawlCatch(error,{saturated});
+    const browserLaunchFailed=catchClass.browserLaunchFailed;
+    const failureClass=catchClass.failureClass;
     if (failureClass&&!saturated) markBrowserCapabilityUnavailable(error);
-    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed: ${browserFallbackTelemetrySummary(telemetry)}`};
+    const causeSnippet=catchClass.preserveLaunchCause?browserCauseSnippet(error):undefined;
+    if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
+    const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated,browserLaunchFailed,telemetry});
+    if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
+    return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:saturated?`Rendered acquisition deferred because the process-wide browser launch gate is saturated; ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
   }
 }
 

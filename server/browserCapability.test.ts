@@ -74,6 +74,18 @@ test('navigation timeouts remain page-level failures and do not demote browser c
   assert.equal(browserCapabilityIsUnavailable(), false);
 });
 
+test('browser startup timeouts keep browser-launch classification despite timeout wording', () => {
+  // The timeout exclusion must not swallow timeouts explicitly tied to
+  // browser startup: launch markers take precedence over timeout wording.
+  assert.equal(isBrowserRuntimeFailure(new Error('browserType.launch: Timeout 15000ms exceeded.')), true);
+  assert.equal(isBrowserRuntimeFailure(new Error('Failed to launch browser: Timeout 30000ms exceeded')), true);
+  assert.equal(isBrowserRuntimeFailure(new Error('browser process exited: Timeout 5000ms exceeded')), true);
+  // Ordinary navigation/request/handler timeouts stay excluded.
+  assert.equal(isBrowserRuntimeFailure(new Error('Page.goto: Timeout 15000ms exceeded.')), false);
+  assert.equal(isBrowserRuntimeFailure(new Error('navigation timeout of 15000ms exceeded')), false);
+  assert.equal(isBrowserRuntimeFailure(new Error('net::ERR_CONNECTION_TIMED_OUT')), false);
+});
+
 test('browser executable diagnostics expose only safe permission metadata', async () => {
   const probe = await inspectBrowserExecutable(process.execPath);
   assert.equal(probe.exists, true);
