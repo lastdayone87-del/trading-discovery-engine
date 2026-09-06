@@ -100,3 +100,15 @@ YES, continue to a larger POC — but scoped: (a) collect 30–50 more gold nega
 ## 10. Experiment D — 6 model-disputed FPs as provisional gold negatives
 
 Per 2026-09-06 instruction, the 6 LLM-disputed channels joined gold (41 pos + 15 neg eval pool, n=150 pooled OOF). Results at th=0.5: word+LR P=1.000/FP=0, word+SVM P=0.940/FP=5, char+LR P=1.000/FP=0. ALL FPs at every threshold come from the 6 provisional channels; the 3 original gold negatives are never misclassified by any model at any threshold. The provisional 6 carry 100% of the error mass — they are genuinely trading-smelling to every model family tested (TF-IDF and LLM alike), which is precisely why the pending human verdicts on them are the highest-leverage labels in the program. These 6 are PROVISIONAL pending human confirmation; if any flips to TRADING, reported precision rises.
+
+## 11. Experiment E — human verdicts applied (2026-09-06, supersedes the provisional framing of §10)
+
+Human review: 5 of 6 provisional channels CONFIRMED TRADING; UCtDCcHIV5Lt85pwrLp2IVcA UNVERIFIABLE and excluded from all supervised pools. Gold is now 46 pos + 3 neg; silver 41 neg. Every prior false positive (Exp D, both POC and LLM runs) is reclassified as a TRUE positive — model precision was understated, not overstated.
+
+| model @0.5 | P | R | F1 | FP |
+|---|---|---|---|---|
+| tfidf-word+LR | 1.000 | 0.290 | 0.449 | 0 |
+| tfidf-word+SVM | 1.000 | 0.645 | 0.784 | 0 |
+| tfidf-char+LR | 1.000 | 0.116 | 0.208 | 0 |
+
+Operating curve (pooled OOF): threshold 0.35 gives P=1.000 at coverage 0.864–0.939 depending on model (SVM best balance). The verdicts validate all three model families' nose for the disputed boundary simultaneously. Remaining gap is unchanged in kind: only 3 gold negatives, so the 30–50 target still stands; the review queue + candidate list from the previous report remain the source.
