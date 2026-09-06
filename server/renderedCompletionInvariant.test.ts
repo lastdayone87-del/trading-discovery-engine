@@ -27,6 +27,7 @@ const zeroTelemetry = (): BrowserFallbackTelemetry => ({
   clicksSucceeded: 0,
   clicksFailed: 0,
   clickFailureClasses: { BLOCKED: 0, RATE_LIMITED: 0, TRANSIENT: 0, OTHER: 0 },
+  lastLifecycleStage: 'GATE_QUEUED',
 });
 
 const zeroPageStub = (overrides: Partial<BrowserFallbackResult> = {}) =>

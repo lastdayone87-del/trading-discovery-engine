@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, browserFallbackTelemetrySummary, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, browserCauseSnippet, browserFallbackTelemetrySummary, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry } from './browserCommunityFallback';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
 test('browser fallback remains bounded while allowing useful retries', () => {
@@ -125,7 +125,8 @@ test('can escalate a fully static no-match because Discord may be JS-hidden', ()
 });
 
 test('crawler telemetry summary is sanitized and bounded for durable inspection detail', () => {
-  assert.equal(browserFallbackTelemetrySummary({requestsStarted:2,requestsFinished:1,requestsFailed:1,navigationTimeouts:1,blockedRequests:0,rateLimitedRequests:0,transientRequests:1,unresolvedFailedRequests:1,hostBackoffsApplied:1,clicksStarted:3,clicksSucceeded:2,clicksFailed:1,clickFailureClasses:{BLOCKED:0,RATE_LIMITED:0,TRANSIENT:1,OTHER:0}}), 'telemetry{started:2,finished:1,failed:1,navigationTimeouts:1,blocked:0,rateLimited:0,transient:1,hostBackoffs:1,clicksStarted:3,clicksSucceeded:2,clicksFailed:1,clickFailureClasses:{"BLOCKED":0,"RATE_LIMITED":0,"TRANSIENT":1,"OTHER":0}}');
+  assert.equal(browserFallbackTelemetrySummary({requestsStarted:2,requestsFinished:1,requestsFailed:1,navigationTimeouts:1,blockedRequests:0,rateLimitedRequests:0,transientRequests:1,unresolvedFailedRequests:1,hostBackoffsApplied:1,clicksStarted:3,clicksSucceeded:2,clicksFailed:1,clickFailureClasses:{BLOCKED:0,RATE_LIMITED:0,TRANSIENT:1,OTHER:0}} as BrowserFallbackTelemetry), 'telemetry{started:2,finished:1,failed:1,navigationTimeouts:1,blocked:0,rateLimited:0,transient:1,hostBackoffs:1,clicksStarted:3,clicksSucceeded:2,clicksFailed:1,clickFailureClasses:{"BLOCKED":0,"RATE_LIMITED":0,"TRANSIENT":1,"OTHER":0}}');
+  assert.equal(browserFallbackTelemetrySummary({requestsStarted:0,requestsFinished:0,requestsFailed:0,navigationTimeouts:0,blockedRequests:0,rateLimitedRequests:0,transientRequests:0,unresolvedFailedRequests:0,hostBackoffsApplied:0,clicksStarted:0,clicksSucceeded:0,clicksFailed:0,clickFailureClasses:{BLOCKED:0,RATE_LIMITED:0,TRANSIENT:0,OTHER:0},lastLifecycleStage:'CRAWLER_RUNNING',zeroPageReason:'CRAWLER_RETURNED_WITHOUT_REQUESTS'}), 'telemetry{started:0,finished:0,failed:0,navigationTimeouts:0,blocked:0,rateLimited:0,transient:0,hostBackoffs:0,clicksStarted:0,clicksSucceeded:0,clicksFailed:0,clickFailureClasses:{"BLOCKED":0,"RATE_LIMITED":0,"TRANSIENT":0,"OTHER":0},stage:CRAWLER_RUNNING,zeroPage:CRAWLER_RETURNED_WITHOUT_REQUESTS}');
 });
 
 test('crawler exposes bounded failure telemetry and keeps partial results retryable', () => {
@@ -156,4 +157,49 @@ test('browser-gate saturation keeps an explicit capacity class without poisoning
   // consume a bounded attempt for work that never started).
   assert.match(source, /failureClass=saturated\?'RENDERED_FALLBACK_SATURATED'/);
   assert.match(source, /if \(failureClass&&!saturated\) markBrowserCapabilityUnavailable\(error\)/);
+});
+
+test('zero-page reason names the concrete terminal condition', () => {
+  const base = { inspectedPages: 0, timedOut: false, saturated: false, browserLaunchFailed: false };
+  const tel = (overrides: object) => ({
+    requestsStarted: 0, requestsFailed: 0, lastLifecycleStage: 'CRAWLER_RUNNING' as const, ...overrides,
+  });
+  assert.equal(resolveRenderedZeroPageReason({ ...base, saturated: true, telemetry: tel({}) }), 'GATE_SATURATED');
+  assert.equal(resolveRenderedZeroPageReason({ ...base, browserLaunchFailed: true, telemetry: tel({}) }), 'BROWSER_LAUNCH_FAILED');
+  assert.equal(resolveRenderedZeroPageReason({ ...base, telemetry: tel({ lastLifecycleStage: 'GATE_QUEUED' }) }), 'CRAWLER_START_FAILED');
+  assert.equal(resolveRenderedZeroPageReason({ ...base, telemetry: tel({ lastLifecycleStage: 'GATE_ACQUIRED' }) }), 'CRAWLER_START_FAILED');
+  assert.equal(
+    resolveRenderedZeroPageReason({ ...base, telemetry: tel({ requestsFailed: 2 }) }),
+    'PRE_HANDLER_REQUEST_FAILURE',
+  );
+  assert.equal(
+    resolveRenderedZeroPageReason({ ...base, timedOut: true, telemetry: tel({}) }),
+    'DEADLINE_BEFORE_ADMISSION',
+  );
+  assert.equal(
+    resolveRenderedZeroPageReason({ ...base, telemetry: tel({ requestsStarted: 1, lastLifecycleStage: 'HANDLER_ENTERED' }) }),
+    'HANDLER_ENTERED_NO_PAGES',
+  );
+  assert.equal(resolveRenderedZeroPageReason({ ...base, telemetry: tel({}) }), 'CRAWLER_RETURNED_WITHOUT_REQUESTS');
+  // Pages present is never zero-page, regardless of flags.
+  assert.equal(
+    resolveRenderedZeroPageReason({ ...base, inspectedPages: 2, saturated: true, browserLaunchFailed: true, telemetry: tel({ requestsStarted: 2 }) }),
+    undefined,
+  );
+  // Concrete request failures outrank an expired deadline for diagnosis.
+  assert.equal(
+    resolveRenderedZeroPageReason({ ...base, timedOut: true, telemetry: tel({ requestsFailed: 1 }) }),
+    'PRE_HANDLER_REQUEST_FAILURE',
+  );
+});
+
+test('browser cause snippet preserves message plus cause, bounded and flat', () => {
+  assert.equal(browserCauseSnippet(new Error('launch boom')), 'launch boom');
+  const nested = new Error('outer');
+  (nested as { cause?: unknown }).cause = new Error('inner\n  spaced\ttext');
+  assert.equal(browserCauseSnippet(nested), 'outer | inner spaced text');
+  assert.equal(browserCauseSnippet(new Error('x'), 5), 'x');
+  assert.equal(browserCauseSnippet('a'.repeat(600)), 'a'.repeat(500));
+  assert.equal(browserCauseSnippet(undefined), undefined);
+  assert.equal(browserCauseSnippet(''), undefined);
 });
