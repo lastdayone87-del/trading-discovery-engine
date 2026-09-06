@@ -308,8 +308,10 @@ export function advanceRenderedLifecycleStage(
 /**
  * Maps a zero-page crawl to its explicit terminal reason. Pure and exported
  * for regression coverage. Precedence is affirmative-evidence-first:
- * - recorded lifecycle stage outranks zero counters: HANDLER_ENTERED proves
- *   admission even when the deadline guard fired before requestsStarted++.
+ * saturation and browser-launch failure classify at their throw sites, then
+ * lifecycle stage (startup stages mean the run never began, even when it
+ * threw; HANDLER_ENTERED proves admission), then the thrown flag (an aborted
+ * started run is never a clean no-op return).
  * Then request-level evidence (failures before admission, deadline before
  * admission), then the residual "returned without requests" bucket. Returns
  * undefined when pages exist. Never perturbs outcome/retry/collapse
@@ -326,10 +328,14 @@ export function resolveRenderedZeroPageReason(input: {
   if (input.inspectedPages > 0) return undefined;
   if (input.saturated) return 'GATE_SATURATED';
   if (input.browserLaunchFailed) return 'BROWSER_LAUNCH_FAILED';
-  if (input.thrown) return 'CRAWLER_RUN_THREW';
+  // Lifecycle evidence precedes the thrown flag: a throw before crawler.run()
+  // began (module load, construction, lease) never progressed past startup,
+  // while a throw at CRAWLER_RUNNING or later aborted a started execution.
+  // HANDLER_ENTERED keeps its proof even when the run later threw.
   const stage = input.telemetry.lastLifecycleStage;
   if (stage === 'GATE_QUEUED' || stage === 'GATE_ACQUIRED') return 'CRAWLER_START_FAILED';
   if (stage === 'HANDLER_ENTERED') return 'HANDLER_ENTERED_NO_PAGES';
+  if (input.thrown) return 'CRAWLER_RUN_THREW';
   const started = input.telemetry.requestsStarted || 0;
   const failed = input.telemetry.requestsFailed || 0;
   if (failed > 0 && started === 0) return 'PRE_HANDLER_REQUEST_FAILURE';

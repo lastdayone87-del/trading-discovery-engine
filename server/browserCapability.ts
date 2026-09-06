@@ -123,6 +123,11 @@ function errorText(error: unknown, seen = new Set<unknown>()): string {
 
 export function isBrowserRuntimeFailure(error: unknown): boolean {
   const text = errorText(error);
+  // Launch-marker carve-out first: a timeout explicitly associated with
+  // browser startup (e.g. "browserType.launch: Timeout 15000ms exceeded") is
+  // a browser runtime failure, not a navigation/request timeout. Only texts
+  // without any launch marker fall through to the timeout exclusion below.
+  if (/browsertype\.launch|failed to launch browser|browser process exited/.test(text)) return true;
   if (/page\.goto|navigation|timed? ?out|net::err|response status/.test(text)) return false;
   return /executable doesn't exist|browser executable|cannot find chromium|no executable|shared library|libnss|libgbm|libatk|eacces|permission denied|sandbox.*(root|setuid|namespace)|browsertype\.launch|failed to launch browser|browser process exited/.test(text);
 }

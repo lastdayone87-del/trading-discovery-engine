@@ -221,6 +221,43 @@ test('thrown crawler execution is distinct from a normal zero-request return', (
   );
 });
 
+test('thrown startup failure resolves by lifecycle stage, not the thrown flag', () => {
+  // Module loading or crawler construction throwing before crawler.run()
+  // begins never progressed past startup: stage evidence outranks the thrown
+  // flag, so these resolve to CRAWLER_START_FAILED rather than
+  // CRAWLER_RUN_THREW. A throw at/after CRAWLER_RUNNING keeps RUN_THREW.
+  const zeroed = { requestsStarted: 0, requestsFailed: 0 };
+  assert.equal(
+    resolveRenderedZeroPageReason({
+      inspectedPages: 0, timedOut: false, saturated: false, browserLaunchFailed: false, thrown: true,
+      telemetry: { ...zeroed, lastLifecycleStage: 'GATE_ACQUIRED' },
+    }),
+    'CRAWLER_START_FAILED',
+  );
+  assert.equal(
+    resolveRenderedZeroPageReason({
+      inspectedPages: 0, timedOut: false, saturated: false, browserLaunchFailed: false, thrown: true,
+      telemetry: { ...zeroed, lastLifecycleStage: 'GATE_QUEUED' },
+    }),
+    'CRAWLER_START_FAILED',
+  );
+  assert.equal(
+    resolveRenderedZeroPageReason({
+      inspectedPages: 0, timedOut: false, saturated: false, browserLaunchFailed: false, thrown: true,
+      telemetry: { ...zeroed, lastLifecycleStage: 'CRAWLER_RUNNING' },
+    }),
+    'CRAWLER_RUN_THREW',
+  );
+  // HANDLER_ENTERED proof survives even a later throw.
+  assert.equal(
+    resolveRenderedZeroPageReason({
+      inspectedPages: 0, timedOut: true, saturated: false, browserLaunchFailed: false, thrown: true,
+      telemetry: { ...zeroed, lastLifecycleStage: 'HANDLER_ENTERED' },
+    }),
+    'HANDLER_ENTERED_NO_PAGES',
+  );
+});
+
 test('browser cause snippet preserves message plus cause, bounded and flat', () => {
   assert.equal(browserCauseSnippet(new Error('launch boom')), 'launch boom');
   const nested = new Error('outer');
