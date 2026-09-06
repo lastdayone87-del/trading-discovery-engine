@@ -114,3 +114,15 @@ Human review: 5 of 6 provisional channels CONFIRMED TRADING; UCtDCcHIV5Lt85pwrLp
 Operating curve (pooled OOF): threshold 0.35 gives P=1.000 at coverage 0.864–0.980 depending on model; 0.40 gives P≈1.000 at 0.80–0.94 (SVM best balance). No model misclassifies any gold negative at any threshold.
 
 Correction note: the first Exp-E run (evaluate5.py) accidentally trained the 5 flipped channels with their STALE poc.py labels (negative) while testing them as positive — an adversarial label-shift mix, not the clean protocol. Its lower recalls (0.08–0.65) measure robustness to stale training labels, not current-truth accuracy. The label-file rerun above (flips trained as the positives they are) supersedes it. Lesson recorded: label semantics must come from exactly one source (labels/*.txt), which evaluate_labels.py now enforces.
+
+## 12. Experiment F — 24 gold negatives (user-adjudicated Tier 1–3)
+
+Human verdicts applied via labels/*.txt: Tier 1 (9) + Tier 2 (11) TRADING, Tier 3 (18) NOT_TRADING, UCtDCc excluded everywhere (verified counts: gold 66 pos / 24 neg, silver 41 neg, 131 rows, 0 near-dup pairs >0.3). Same Exp-B protocol (train gold+silver, gold-only OOF eval, pooled over 3x5 folds, n=270):
+
+| model @0.5 | P | R | F1 | FP |
+|---|---|---|---|---|
+| tfidf-word+LR | 0.909 | 0.505 | 0.649 | 10 |
+| tfidf-word+SVM | 0.930 | 0.667 | 0.776 | 10 |
+| tfidf-char+LR | 0.925 | 0.561 | 0.698 | 9 |
+
+Before/after (Exp E → Exp F @0.5): precision 1.000 → 0.909–0.930 (real negatives bite, as expected); recall 0.29–0.77 → 0.51–0.67; FP 0 → 9–10. Operating curve: P>=0.95 requires th>=0.45 (coverage 0.66–0.81); th=0.65 gives FP=0 at coverage ~0–23% (SVM retains 15 TP). FP attribution (mean-prob diagnostic): persistent FPs across all models are trading-adjacent gaming/entertainment (OG Kamo Gaming, DAMAREOUS, Catalin Arseniu) plus The Trading Guide (UCt1Gq1mUok8n9zOOJbzb9VA) — flagged back as prime re-review candidates since their content reads trading-related. Confirmed REJECT channels are correctly negative at th=0.5 for all models.
