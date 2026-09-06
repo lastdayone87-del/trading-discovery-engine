@@ -139,10 +139,10 @@ test('zero-page incompleteness never resolves clean across zero-processed varian
 // 4. Zero-page https://g/ never counts as successful inspection.
 // 4. Dotless garbage (e.g. https://g/) is statically attempted for recall
 // safety but never escalates to rendered fallback and never owns retry work:
-// no browser run can turn a meaningless input into evidence.
-// Garbage-only input must NOT read as a definitive negative either: with no
-// genuine site inspected, the truthful state is non-definitive partial
-// coverage (no retry — nothing retry-owning failed), never INSPECTED_NO_MATCH.
+// no browser run can turn a meaningless input into evidence. Garbage is fully
+// invisible to outcome accounting: with no genuine retry-owning failure, a
+// garbage-only input set resolves to the definitive negative (NOT_FOUND at
+// Step 4) instead of manufacturing UNCERTAIN work.
 test('dotless garbage creates no rendered work and no retry', async () => {
   let renderedCalls = 0;
   const result = await runChannelInspection({
@@ -163,7 +163,8 @@ test('dotless garbage creates no rendered work and no retry', async () => {
   });
   assert.equal(renderedCalls, 0);
   assert.equal(result.retryDirective, undefined);
-  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
   // The static attempt is still recorded as audit evidence.
   assert.ok(
     (result.acquisitionOutcomes || []).some(
