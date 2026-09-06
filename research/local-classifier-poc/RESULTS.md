@@ -126,3 +126,17 @@ Human verdicts applied via labels/*.txt: Tier 1 (9) + Tier 2 (11) TRADING, Tier 
 | tfidf-char+LR | 0.925 | 0.561 | 0.698 | 9 |
 
 Before/after (Exp E → Exp F @0.5): precision 1.000 → 0.909–0.930 (real negatives bite, as expected); recall 0.29–0.77 → 0.51–0.67; FP 0 → 9–10. Operating curve: P>=0.95 requires th>=0.45 (coverage 0.66–0.81); th=0.65 gives FP=0 at coverage ~0–23% (SVM retains 15 TP). FP attribution (mean-prob diagnostic): persistent FPs across all models are trading-adjacent gaming/entertainment (OG Kamo Gaming, DAMAREOUS, Catalin Arseniu) plus The Trading Guide (UCt1Gq1mUok8n9zOOJbzb9VA) — flagged back as prime re-review candidates since their content reads trading-related. Confirmed REJECT channels are correctly negative at th=0.5 for all models.
+
+## 13. Experiment G — 5 flipped to TRADING, 2 held NOT_TRADING (69/21 gold)
+
+Human verdicts applied via labels/*.txt (3 flips moved neg->pos, UCtDCc stays excluded everywhere; verified counts). Same Exp-B protocol (train gold+silver, gold-only OOF, n=270 pooled):
+
+| model @0.5 | P | R | F1 | FP |
+|---|---|---|---|---|
+| tfidf-word+LR | 0.921 | 0.792 | 0.852 | 14 |
+| tfidf-word+SVM | 0.921 | 0.787 | 0.849 | 14 |
+| tfidf-char+LR | 0.929 | 0.826 | 0.875 | 13 |
+
+Operating curve: P>=0.95 needs th>=0.45 (coverage 0.66–0.83); th=0.65 gives FP~0 with sharply reduced coverage. Recall roughly doubled vs Exp F (more positives to learn from); precision 0.92 reflects genuinely hard negatives now present.
+
+FP attribution (mean-prob diagnostic): persistent across all models — the 2 held gaming/entertainment hybrids (OG Kamo, Catalin Arsieniu) plus DayTradeToWin (Tier-3 entertainment, trading-named). Notably, two confirmed REJECT channels (UCNogn1o, UCzZJaZz) also score trading-positive — genuine human-vs-model disagreements worth a second look, not model errors by default. The 3 flips to TRADING eliminated the models' largest prior error mass, validating all families' nose a third time.

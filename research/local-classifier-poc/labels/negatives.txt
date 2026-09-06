@@ -1,11 +1,10 @@
-# human-confirmed NOT_TRADING: 6 REJECT decisions (3 with rich inputs). EXTEND HERE with adjudicated verdicts, one channel_id per line.
+# human-confirmed NOT_TRADING: 6 REJECT + 15 Tier-3 (3 flipped out, UCtDCc excluded) = 21
 UC0sEIyXXalzD1lbwm3D2xpA
 UCKh1j1JrjYEV06fjyXh-iWQ
 UCNogn1o_YnFfwJzmWhYEZxw
 UCYFhVsF3UqWgWbK9Jb8-ahQ
 UC_ZEJ9iYBPL7_YFjJvSsIpQ
 UCzZJaZzJmUsCfUADwgCX7gg
-
 UCoTPgPXebv0wyTq4_4fITPQ
 UC-XJEUQjBIGNbANAr60v6Sw
 UChqBU-Qqa-4ARP-wm3zoupw
@@ -16,11 +15,8 @@ UCrNNuopIUhYBCEhtSF3sQgw
 UCwc8IaX_nWTAIbe-2oCfmHg
 UCAwBbO1DYBGM_cB5gekQxYA
 UCzXwjTI6c6mVn6oui_p6oiw
-UCcO3HOutVQAfMedL7zZVxuw
-UC3pRGM1QmKvtUPRouXczaeA
 UCIZJoRNYoKpHEkDXg9wnmpw
 UC3eXyIuMQPFy0m195vpk6Ug
 UCNgVdd5Oe7OVr2SFijUkjGA
-UCt1Gq1mUok8n9zOOJbzb9VA
 UCGHI2_hhDTt1CkuDn3rEiFg
 UCuOfqLUnI-tC9GwjDfAwREg
