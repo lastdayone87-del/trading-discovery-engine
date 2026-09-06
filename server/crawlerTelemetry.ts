@@ -226,7 +226,7 @@ export function redactCauseSnippet(raw: unknown, maxLength = 500): string | unde
   if (typeof raw !== 'string' || !raw.trim()) return undefined;
   let out = raw.replace(/\s+/g, ' ').trim();
   out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:]+:)[^@/\s]+@/g, '$1***@');
-  out = out.replace(/([?&#;](?:[^?&#;=]*?(?:token|secret|api[_-]?key|auth|password|passwd|pwd|credential|session|bearer)[^?&#;=]*)=)[^?&#;\s]*/gi, '$1***');
+  out = out.replace(/((?:^|[\s?&#;])(?:[^?&#;=\s]*?(?:token|secret|api[_-]?key|auth|password|passwd|pwd|credential|session|bearer)[^?&#;=]*)=)[^?&#;\s]*/gi, '$1***');
   out = out.replace(/\b([Bb]earer\s+)[A-Za-z0-9\-._~+/=]{4,}/g, '$1***');
   out = out.replace(/\b([Bb]asic\s+)[A-Za-z0-9+/=]{8,}/g, '$1***');
   out = out.replace(/((?:"|')?(?:password|passwd|pwd|secret|api[_-]?key)(?:"|')?\s*[:=]\s*"?)[^"\s,}]+/gi, '$1***');

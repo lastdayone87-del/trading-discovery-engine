@@ -388,6 +388,50 @@ export const renderedFallbackGate = new RenderedFallbackGate(
   boundedEnvInt(process.env.RENDERED_FALLBACK_MAX_PENDING, 8, 0, 32),
 );
 
+let renderedQueueSequence = 0;
+/**
+ * Opens a request queue isolated to one rendered crawl invocation. Crawlee's
+ * process-default persisted queue remembers handled uniqueKeys across crawls,
+ * so reusing it lets a repeat crawl of an already-handled seed URL resolve
+ * cleanly with zero requests/pages — burning a bounded retry attempt for zero
+ * work. A per-invocation named queue makes every crawl independent while
+ * preserving within-crawl deduplication (seed plus enqueueLinks children
+ * share the instance queue). The caller must drop() the queue in a finally;
+ * names are unique per process lifetime so concurrent crawls never collide.
+ * The opener is injected so unit tests can prove the contract without
+ * touching real storage.
+ */
+export async function openIsolatedRenderedRequestQueue<T extends { drop: () => Promise<void> }>(
+  open: (name: string) => Promise<T>,
+): Promise<{ name: string; queue: T }> {
+  renderedQueueSequence = (renderedQueueSequence + 1) % Number.MAX_SAFE_INTEGER;
+  const name =
+    `rendered-community-${process.pid.toString(36)}-` +
+    `${Date.now().toString(36)}-${renderedQueueSequence.toString(36)}` +
+    Math.floor(Math.random() * 0xffffffff).toString(36);
+  return { name, queue: await open(name) };
+}
+
+/**
+ * Best-effort cleanup for a per-crawl isolated queue. Drop failures never
+ * change the crawl result (the crawl already settled): they emit one bounded
+ * operational warning carrying only the generated queue name plus the
+ * redacted storage error, so silent accumulation stays observable without
+ * ever leaking URLs, credentials, or tokens.
+ */
+export async function dropIsolatedRenderedQueue(
+  queue: { drop: () => Promise<void> },
+  name: string,
+): Promise<void> {
+  try {
+    await queue.drop();
+  } catch (error) {
+    console.warn(
+      `[RenderedAcquisition] Isolated request queue cleanup failed for ${name}: ${browserCauseSnippet(error) || 'unknown storage error'}`,
+    );
+  }
+}
+
 /** Expensive Tier-2 acquisition. Finding one invite no longer terminates the
  * rendered crawl: every invite visible within the bounded page/click budget is
  * retained so ownership can be decided after acquisition. */
@@ -436,9 +480,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     return await renderedFallbackGate.run(async () => {
       telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
       const startedAt = Date.now();
+      const { PlaywrightCrawler, RequestQueue } = await import('crawlee');
+      // Per-invocation isolated queue: never the process-default persisted
+      // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
+      // below on every path so named queues cannot accumulate.
+      const isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name));
       try {
-        const { PlaywrightCrawler } = await import('crawlee');
         const crawler = new PlaywrightCrawler({
+          requestQueue: isolated.queue,
           maxRequestsPerCrawl: limits.maxPages,
           maxConcurrency: 1,
           maxRequestRetries: limits.maxRequestRetries,
@@ -585,6 +634,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+      } finally {
+        // The isolated queue must never outlive its crawl: drop it on success,
+        // failure, and unexpected throws alike so named queues cannot
+        // accumulate in storage. Cleanup is best-effort with a bounded warning
+        // (see dropIsolatedRenderedQueue) — it never affects the crawl result.
+        await dropIsolatedRenderedQueue(isolated.queue, isolated.name);
       }
     });
   } catch (error:any) {
