@@ -1,4 +1,4 @@
-# human-confirmed NOT_TRADING: 6 REJECT + 15 Tier-3 (3 flipped out, UCtDCc excluded) = 21
+# human-confirmed NOT_TRADING
 UC0sEIyXXalzD1lbwm3D2xpA
 UCKh1j1JrjYEV06fjyXh-iWQ
 UCNogn1o_YnFfwJzmWhYEZxw
@@ -20,3 +20,5 @@ UC3eXyIuMQPFy0m195vpk6Ug
 UCNgVdd5Oe7OVr2SFijUkjGA
 UCGHI2_hhDTt1CkuDn3rEiFg
 UCuOfqLUnI-tC9GwjDfAwREg
+UCbXgUtjjSJU1kX-zBuQ9MHw
+UCX5nh607M8hSBLiMB9MgbIQ

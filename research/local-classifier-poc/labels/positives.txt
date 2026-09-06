@@ -1,4 +1,4 @@
-# human-confirmed TRADING: 37 ambiguous-cohort + 4 APPROVE + 5 flipped FPs + 20 Tier1/2 + 3 flipped Tier3 = 69
+# human-confirmed TRADING
 UC-AvjBlw3ONbGymujqg2agg
 UC-QaySvHBNyHpcetvl9blZg
 UC0TazU_QrHENAodJWSJNj5A
@@ -51,9 +51,7 @@ UCthu-_a9wfLCyy7Onv9fHyg
 UCJanz7A2jtXGcZCkIvzTp4g
 UCfy4wlUmGtgY-6YtKgaAECw
 UCSsK7wz36bKido3kuw0tyMg
-UCbXgUtjjSJU1kX-zBuQ9MHw
 UCMi4flxQqy2dhc0S3aqLk0Q
-UCX5nh607M8hSBLiMB9MgbIQ
 UCaWuBbpp6G26EHlexnQYH4g
 UCi9b2Fif5d4bImuy0TuRd5g
 UC2w5_igJvW_BcB6jGZTIAxw

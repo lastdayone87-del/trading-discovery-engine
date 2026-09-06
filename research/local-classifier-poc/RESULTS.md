@@ -140,3 +140,15 @@ Human verdicts applied via labels/*.txt (3 flips moved neg->pos, UCtDCc stays ex
 Operating curve: P>=0.95 needs th>=0.45 (coverage 0.66–0.83); th=0.65 gives FP~0 with sharply reduced coverage. Recall roughly doubled vs Exp F (more positives to learn from); precision 0.92 reflects genuinely hard negatives now present.
 
 FP attribution (mean-prob diagnostic): persistent across all models — the 2 held gaming/entertainment hybrids (OG Kamo, Catalin Arsieniu) plus DayTradeToWin (Tier-3 entertainment, trading-named). Notably, two confirmed REJECT channels (UCNogn1o, UCzZJaZz) also score trading-positive — genuine human-vs-model disagreements worth a second look, not model errors by default. The 3 flips to TRADING eliminated the models' largest prior error mass, validating all families' nose a third time.
+
+## 14. Experiment H — corrected labels: 67 pos / 23 neg gold (current authoritative)
+
+Correction: commit 46d8d90 prematurely added 20 undecided Tier 1–2 channels as positives (2 of which human review then ruled NOT_TRADING). Those 2 moved to negatives; all other Tier 1–2 verdicts confirmed the provisional labels. Exp F/G numbers trained on the contaminated set are superseded by this section — same Exp-B protocol (train gold+silver, gold-only OOF, n=270 pooled), UCtDCc excluded everywhere:
+
+| model @0.5 | P | R | F1 | FP |
+|---|---|---|---|---|
+| tfidf-word+LR | 0.946 | 0.701 | 0.806 | 8 |
+| tfidf-word+SVM | 0.935 | 0.721 | 0.815 | 10 |
+| tfidf-char+LR | 0.948 | 0.726 | 0.823 | 8 |
+
+Operating curve: P>=0.95 needs th>=~0.5 at coverage 0.55–0.68; th=0.65 gives FP~0 with sharply reduced coverage. FP attribution (mean-prob diagnostic): only OG Kamo Gaming, Catalin Arsieniu (held hybrids), and DayTradeToWin (Tier-3, trading-named) persist across all models; the two previously-disputed REJECT channels no longer misclassify. The 3 flipped Tier-3 channels are now true positives. Base rate 67/90 = 0.744.
