@@ -257,38 +257,69 @@ export function browserCauseSnippet(error: unknown, maxLength = 500): string | u
     .filter(Boolean)
     .join(' | ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, Math.max(1, maxLength));
+    .trim();
+  return redactCauseSnippet(flat, maxLength);
+}
+
+/**
+ * Bounded safe redaction for persisted/visible diagnostics. Truncation is not
+ * redaction, and both launchCauseSnippet and acquisition detail persist —
+ * so secrets are scrubbed before either receives the text:
+ * - URL userinfo (`scheme://user:pass@host` → `scheme://***@host`);
+ * - query/fragment values on sensitive keys (token, secret, key, auth,
+ *   password, session, bearer) → `key=***`;
+ * - bearer/basic authorization material → `Bearer ***, Basic ***`;
+ * - password-style assignments (`\"password\": \"...\"`, `password=...`);
+ * - home-directory filesystem paths (`/root/...`, `/home/<user>/...`).
+ * Error classes, codes, hostnames, non-sensitive paths, and Chromium internals
+ * survive: diagnostics keep everything that identifies the failure mode.
+ */
+export function redactCauseSnippet(raw: string, maxLength = 500): string | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  let out = raw.replace(/\s+/g, ' ').trim();
+  out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:]+:)[^@/\s]+@/g, '$1***@');
+  out = out.replace(/([?&#](?:[^?&#=]*?(?:token|secret|api[_-]?key|auth|password|passwd|pwd|credential|session|bearer)[^?&#=]*)=)[^?&#\s]*/gi, '$1***');
+  out = out.replace(/\b([Bb]earer\s+)[A-Za-z0-9\-._~+/=]{4,}/g, '$1***');
+  out = out.replace(/\b([Bb]asic\s+)[A-Za-z0-9+/=]{8,}/g, '$1***');
+  out = out.replace(/((?:"|')?(?:password|passwd|pwd|secret|api[_-]?key)(?:"|')?\s*[:=]\s*"?)[^"\s,}]+/gi, '$1***');
+  out = out.replace(/\/(?:root|home\/[^/\s'"]+)(?:\/[^\s'"]*)?/g, '/<redacted-path>');
+  const flat = out.trim().slice(0, Math.max(1, maxLength));
   return flat || undefined;
 }
 
 /**
  * Maps a zero-page crawl to its explicit terminal reason. Pure and exported
- * for regression coverage. Precedence is concrete-evidence-first:
- * saturation and browser-launch failure are classified at their throw sites,
- * then request-level evidence (failures before admission, deadline before
- * admission), then handler entry without processed pages, then the residual
- * "returned without requests" bucket. Returns undefined when pages exist.
- * Never perturbs outcome/retry/collapse semantics: those keep reading
- * failureClass and page evidence.
+ * for regression coverage. Precedence is affirmative-evidence-first:
+ * - saturation and browser-launch failure are classified at their throw sites;
+ * - a throw that aborts the run is distinct from a normal return with no
+ *   requests (thrown flag), so an aborted crawl is never labeled as a clean
+ *   no-op return;
+ * - recorded lifecycle stage outranks zero counters: HANDLER_ENTERED proves
+ *   admission even when the deadline guard fired before requestsStarted++.
+ * Then request-level evidence (failures before admission, deadline before
+ * admission), then the residual "returned without requests" bucket. Returns
+ * undefined when pages exist. Never perturbs outcome/retry/collapse
+ * semantics: those keep reading failureClass and page evidence.
  */
 export function resolveRenderedZeroPageReason(input: {
   inspectedPages: number;
   timedOut: boolean;
   saturated: boolean;
   browserLaunchFailed: boolean;
+  thrown?: boolean;
   telemetry: Pick<BrowserFallbackTelemetry, 'requestsStarted' | 'requestsFailed' | 'lastLifecycleStage'>;
 }): RenderedZeroPageReason | undefined {
   if (input.inspectedPages > 0) return undefined;
   if (input.saturated) return 'GATE_SATURATED';
   if (input.browserLaunchFailed) return 'BROWSER_LAUNCH_FAILED';
+  if (input.thrown) return 'CRAWLER_RUN_THREW';
   const stage = input.telemetry.lastLifecycleStage;
   if (stage === 'GATE_QUEUED' || stage === 'GATE_ACQUIRED') return 'CRAWLER_START_FAILED';
+  if (stage === 'HANDLER_ENTERED') return 'HANDLER_ENTERED_NO_PAGES';
   const started = input.telemetry.requestsStarted || 0;
   const failed = input.telemetry.requestsFailed || 0;
   if (failed > 0 && started === 0) return 'PRE_HANDLER_REQUEST_FAILURE';
   if (input.timedOut && started === 0) return 'DEADLINE_BEFORE_ADMISSION';
-  if (started > 0) return 'HANDLER_ENTERED_NO_PAGES';
   return 'CRAWLER_RETURNED_WITHOUT_REQUESTS';
 }
 
@@ -505,7 +536,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
-        const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,telemetry});
+        const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
@@ -530,7 +561,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (failureClass) markBrowserCapabilityUnavailable(error);
         const causeSnippet=browserCauseSnippet(error);
         if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
-        const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,telemetry});
+        const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       }

@@ -23,19 +23,22 @@ export interface CrawlerTelemetry {
   workerInstanceId?: string;
   /**
    * Furthest rendered-crawler lifecycle stage confirmed for this observation
-   * (see RenderedLifecycleStage). Absent on static rows and pre-instrumentation
-   * rendered rows.
+   * (see RenderedLifecycleStage). Rendered-only: the ledger sanitizer drops
+   * this field on STATIC rows so static telemetry can never carry rendered
+   * diagnostics. Absent on rows predating instrumentation.
    */
   lastLifecycleStage?: string;
   /**
    * Explicit zero-page/pre-handler reason for rendered rows with no inspected
-   * pages (see RenderedZeroPageReason). Never a substitute for failureClass:
-   * retry and outcome semantics keep reading failureClass; this field exists
-   * so zero-page results are diagnosable instead of generic.
+   * pages (see RenderedZeroPageReason). Rendered-only, same retention rule as
+   * lastLifecycleStage. Never a substitute for failureClass: retry and outcome
+   * semantics keep reading failureClass; this field exists so zero-page
+   * results are diagnosable instead of generic.
    */
   zeroPageReason?: string;
   /**
-   * Bounded underlying launch/start error text (whitespace-collapsed, capped).
+   * Bounded underlying launch/start error text (whitespace-collapsed, capped,
+   * secrets redacted before persistence). Rendered-only, same retention rule.
    * Preserves the actual Playwright/browser cause instead of only the generic
    * classifier label.
    */
@@ -74,6 +77,7 @@ export const RENDERED_ZERO_PAGE_REASONS = [
   'GATE_SATURATED',
   'CRAWLER_START_FAILED',
   'BROWSER_LAUNCH_FAILED',
+  'CRAWLER_RUN_THREW',
   'PRE_HANDLER_REQUEST_FAILURE',
   'DEADLINE_BEFORE_ADMISSION',
   'HANDLER_ENTERED_NO_PAGES',
@@ -86,15 +90,21 @@ export function isRenderedZeroPageReason(value: unknown): value is RenderedZeroP
 
 let cachedWorkerInstanceId: string | null = null;
 /**
- * Stable per-process worker identity (`hostname:pid`). On Railway the
- * hostname is the replica container name, so distinct replicas (and distinct
- * worker processes after restarts) produce distinct ids, while one process
- * keeps its id for life. Cached: never changes identity mid-process.
+ * Stable per-process worker identity (`hostname:pid:startup discriminator`).
+ * On Railway the hostname names the replica container; the pid and the
+ * startup discriminator (random per process boot) make the id unique even
+ * when a pid is reused after a worker restart. Cached: constant for the life
+ * of the process, different across restarts. Documented as worker/process
+ * provenance, not deployment provenance: no platform deployment id is
+ * consumed, because none is reliably available at runtime.
  */
 export function workerInstanceId(): string {
   if (!cachedWorkerInstanceId) {
     const host = (os.hostname() || 'unknown-host').toLowerCase();
-    cachedWorkerInstanceId = `${host}:${process.pid}`;
+    const discriminator = Math.floor(Math.random() * 0xffffffff)
+      .toString(16)
+      .padStart(8, '0');
+    cachedWorkerInstanceId = `${host}:${process.pid}:${discriminator}`;
   }
   return cachedWorkerInstanceId;
 }
@@ -170,8 +180,10 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   // taxonomies (see browserCommunityFallback): unknown persisted values are
   // dropped rather than stored, keeping the ledger queryable. Rows predating
   // instrumentation simply omit these fields (backward compatible).
-  const stage = text(candidate.lastLifecycleStage, 40);
-  const reason = text(candidate.zeroPageReason, 40);
+  const stage = candidate.mode === 'RENDERED' ? text(candidate.lastLifecycleStage, 40) : undefined;
+  const reason = candidate.mode === 'RENDERED' ? text(candidate.zeroPageReason, 40) : undefined;
+  const cause = candidate.mode === 'RENDERED' ? text(candidate.launchCauseSnippet, 500) : undefined;
+  const instance = text(candidate.workerInstanceId, 120);
   return {
     ...emptyCrawlerTelemetry(candidate.mode),
     redirectsFollowed: number(candidate.redirectsFollowed),
@@ -189,7 +201,7 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     hostBackoffsApplied: number(candidate.hostBackoffsApplied),
     ...(isRenderedLifecycleStage(stage) ? { lastLifecycleStage: stage } : {}),
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),
-    ...(text(candidate.launchCauseSnippet, 500) ? { launchCauseSnippet: text(candidate.launchCauseSnippet, 500)! } : {}),
-    ...(text(candidate.workerInstanceId, 120) ? { workerInstanceId: text(candidate.workerInstanceId, 120)! } : {}),
+    ...(cause ? { launchCauseSnippet: cause } : {}),
+    ...(instance ? { workerInstanceId: instance } : {}),
   };
 }

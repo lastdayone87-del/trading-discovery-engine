@@ -22,7 +22,7 @@ test('static telemetry records redirect/page/budget measurements without changin
     rateLimitedRequests: 0,
     hostBackoffsApplied: 0,
   });
-  assert.match(instance || '', /^.+:\d+$/);
+  assert.match(instance || '', /^.+:\d+:[0-9a-f]{8}$/);
 });
 
 test('rendered telemetry preserves bounded click/request counters without mislabeling budget', () => {
@@ -73,8 +73,8 @@ test('safe telemetry rejects malformed mode and clamps malformed counters', () =
 
 test('worker instance id is stable per process and identifies host and pid', () => {
   assert.equal(workerInstanceId(), workerInstanceId());
-  assert.match(workerInstanceId(), /^.+:\d+$/);
-  assert.equal(workerInstanceId().split(':').pop(), String(process.pid));
+  assert.match(workerInstanceId(), /^.+:\d+:[0-9a-f]{8}$/);
+  assert.equal(workerInstanceId().split(':')[1], String(process.pid));
 });
 
 test('rendered constructor stamps this-process instance attribution', () => {
@@ -137,6 +137,25 @@ test('safe telemetry keeps old observations valid without new fields', () => {
   assert.equal(telemetry?.zeroPageReason, undefined);
   assert.equal(telemetry?.launchCauseSnippet, undefined);
   assert.equal(telemetry?.workerInstanceId, undefined);
+});
+
+test('safe telemetry drops rendered-only diagnostics from static rows', () => {
+  // Lifecycle stage, zero-page reason, and browser-cause text are rendered
+  // diagnostics: they must never pollute STATIC telemetry, even when present.
+  // The instance id is process provenance and is retained for both modes.
+  const telemetry = safeCrawlerTelemetry({
+    mode: 'STATIC',
+    pagesInspected: 1,
+    lastLifecycleStage: 'HANDLER_ENTERED',
+    zeroPageReason: 'HANDLER_ENTERED_NO_PAGES',
+    launchCauseSnippet: 'boom',
+    workerInstanceId: 'replica-a:123:abcdef01',
+  });
+  assert.equal(telemetry?.pagesInspected, 1);
+  assert.equal(telemetry?.lastLifecycleStage, undefined);
+  assert.equal(telemetry?.zeroPageReason, undefined);
+  assert.equal(telemetry?.launchCauseSnippet, undefined);
+  assert.equal(telemetry?.workerInstanceId, 'replica-a:123:abcdef01');
 });
 
 test('ledger persists sanitized telemetry wholesale into observation provenance', () => {

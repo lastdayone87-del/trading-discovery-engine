@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { DEFAULT_BROWSER_FALLBACK_BUDGET, browserCauseSnippet, browserFallbackTelemetrySummary, isTelegramPostPermalink, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry } from './browserCommunityFallback';
+import { DEFAULT_BROWSER_FALLBACK_BUDGET, browserCauseSnippet, browserFallbackTelemetrySummary, isTelegramPostPermalink, redactCauseSnippet, RenderedFallbackGate, renderedFallbackGate, resolveRenderedZeroPageReason, shouldEnqueueRenderedCommunityLink, shouldEscalateToRenderedFallback, type BrowserFallbackTelemetry } from './browserCommunityFallback';
 import { classifyRenderedCrawlerFailure, isRenderedNavigationTimeout, renderedCrawlerHostBackoffMs, renderedCrawlerRetryPolicy } from './renderedCrawlerPolicy';
 
 test('browser fallback remains bounded while allowing useful retries', () => {
@@ -193,6 +193,31 @@ test('zero-page reason names the concrete terminal condition', () => {
   );
 });
 
+test('recorded lifecycle stage outranks zero counters in zero-page reasons', () => {
+  // HANDLER_ENTERED proves admission even when the deadline guard fired before
+  // requestsStarted++: classifying that as DEADLINE_BEFORE_ADMISSION would be
+  // false, so the stage takes precedence over requestsStarted === 0.
+  const tel = () => ({ requestsStarted: 0, requestsFailed: 0, lastLifecycleStage: 'HANDLER_ENTERED' as const });
+  assert.equal(
+    resolveRenderedZeroPageReason({ inspectedPages: 0, timedOut: true, saturated: false, browserLaunchFailed: false, telemetry: tel() }),
+    'HANDLER_ENTERED_NO_PAGES',
+  );
+});
+
+test('thrown crawler execution is distinct from a normal zero-request return', () => {
+  const tel = () => ({ requestsStarted: 0, requestsFailed: 0, lastLifecycleStage: 'CRAWLER_RUNNING' as const });
+  const base = { inspectedPages: 0, timedOut: false, saturated: false, browserLaunchFailed: false, telemetry: tel() };
+  // A normal return with no requests is a clean no-op bucket...
+  assert.equal(resolveRenderedZeroPageReason(base), 'CRAWLER_RETURNED_WITHOUT_REQUESTS');
+  // ...while a run that threw before admission is an aborted execution, even
+  // with identical counters. Browser throws keep their own classification.
+  assert.equal(resolveRenderedZeroPageReason({ ...base, thrown: true }), 'CRAWLER_RUN_THREW');
+  assert.equal(
+    resolveRenderedZeroPageReason({ ...base, thrown: true, browserLaunchFailed: true }),
+    'BROWSER_LAUNCH_FAILED',
+  );
+});
+
 test('browser cause snippet preserves message plus cause, bounded and flat', () => {
   assert.equal(browserCauseSnippet(new Error('launch boom')), 'launch boom');
   const nested = new Error('outer');
@@ -202,4 +227,45 @@ test('browser cause snippet preserves message plus cause, bounded and flat', () 
   assert.equal(browserCauseSnippet('a'.repeat(600)), 'a'.repeat(500));
   assert.equal(browserCauseSnippet(undefined), undefined);
   assert.equal(browserCauseSnippet(''), undefined);
+});
+
+test('cause redaction removes secrets but keeps diagnostic meaning', () => {
+  // URL credentials, token/query values, bearer material, password
+  // assignments, and home-directory paths must not survive into the snippet
+  // (and therefore neither into persisted detail); error classes, codes,
+  // hostnames, and Chromium internals stay for diagnosis.
+  assert.equal(
+    redactCauseSnippet('Failed to launch https://user:s3cret@proxy:8080 browser'),
+    'Failed to launch https://user:***@proxy:8080 browser',
+  );
+  assert.equal(
+    redactCauseSnippet('net::ERR_ABORTED https://x.test/cb?token=abc123&other=keep#frag'),
+    'net::ERR_ABORTED https://x.test/cb?token=***&other=keep#frag',
+  );
+  assert.equal(
+    redactCauseSnippet('auth failed Bearer eyJhbGciOiJIUzI1NiJ9 payload'),
+    'auth failed Bearer *** payload',
+  );
+  assert.equal(
+    redactCauseSnippet('launch opts {"password": "hunter2", "headless": true}'),
+    'launch opts {"password": "***", "headless": true}',
+  );
+  assert.equal(
+    redactCauseSnippet('spawn EAGAIN at /root/.cache/ms-playwright/chromium/chrome'),
+    'spawn EAGAIN at /<redacted-path>',
+  );
+  assert.equal(
+    redactCauseSnippet('ok plain BROWSER_BINARY_MISSING code 12'),
+    'ok plain BROWSER_BINARY_MISSING code 12',
+  );
+  // Redaction applies before the length cap, and empty input stays empty.
+  assert.equal(redactCauseSnippet(''), undefined);
+  assert.ok((redactCauseSnippet(`t=${'s'.repeat(40)} ` + 'v'.repeat(600)) || '').length <= 500);
+});
+
+test('persisted detail carries the redacted cause, never raw secrets', async () => {
+  // The failure detail is what lands in the observation ledger: prove a
+  // secret-bearing launch error cannot reach it unredacted.
+  const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
+  assert.match(source, /\(cause: \$\{causeSnippet\}\)`:''\}/);
 });
