@@ -1,0 +1,7 @@
+# human-confirmed NOT_TRADING: 6 REJECT decisions (3 with rich inputs). EXTEND HERE with adjudicated verdicts, one channel_id per line.
+UC0sEIyXXalzD1lbwm3D2xpA
+UCKh1j1JrjYEV06fjyXh-iWQ
+UCNogn1o_YnFfwJzmWhYEZxw
+UCYFhVsF3UqWgWbK9Jb8-ahQ
+UC_ZEJ9iYBPL7_YFjJvSsIpQ
+UCzZJaZzJmUsCfUADwgCX7gg

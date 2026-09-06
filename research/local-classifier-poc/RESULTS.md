@@ -101,14 +101,16 @@ YES, continue to a larger POC — but scoped: (a) collect 30–50 more gold nega
 
 Per 2026-09-06 instruction, the 6 LLM-disputed channels joined gold (41 pos + 15 neg eval pool, n=150 pooled OOF). Results at th=0.5: word+LR P=1.000/FP=0, word+SVM P=0.940/FP=5, char+LR P=1.000/FP=0. ALL FPs at every threshold come from the 6 provisional channels; the 3 original gold negatives are never misclassified by any model at any threshold. The provisional 6 carry 100% of the error mass — they are genuinely trading-smelling to every model family tested (TF-IDF and LLM alike), which is precisely why the pending human verdicts on them are the highest-leverage labels in the program. These 6 are PROVISIONAL pending human confirmation; if any flips to TRADING, reported precision rises.
 
-## 11. Experiment E — human verdicts applied (2026-09-06, supersedes the provisional framing of §10)
+## 11. Experiment E — human verdicts applied (2026-09-06; label-file-driven rerun is authoritative)
 
-Human review: 5 of 6 provisional channels CONFIRMED TRADING; UCtDCcHIV5Lt85pwrLp2IVcA UNVERIFIABLE and excluded from all supervised pools. Gold is now 46 pos + 3 neg; silver 41 neg. Every prior false positive (Exp D, both POC and LLM runs) is reclassified as a TRUE positive — model precision was understated, not overstated.
+Human review: 5 of 6 provisional channels CONFIRMED TRADING; UCtDCcHIV5Lt85pwrLp2IVcA UNVERIFIABLE and excluded from all supervised pools (enforced via labels/exclude.txt; verified in run output). Gold is 46 pos + 3 neg; silver 41 neg. Re-run through research/local-classifier-poc/evaluate_labels.py (reads labels/*.txt, no hard-coded IDs):
 
 | model @0.5 | P | R | F1 | FP |
 |---|---|---|---|---|
-| tfidf-word+LR | 1.000 | 0.290 | 0.449 | 0 |
-| tfidf-word+SVM | 1.000 | 0.645 | 0.784 | 0 |
-| tfidf-char+LR | 1.000 | 0.116 | 0.208 | 0 |
+| tfidf-word+LR | 1.000 | 0.572 | 0.728 | 0 |
+| tfidf-word+SVM | 1.000 | 0.768 | 0.869 | 0 |
+| tfidf-char+LR | 1.000 | 0.638 | 0.779 | 0 |
 
-Operating curve (pooled OOF): threshold 0.35 gives P=1.000 at coverage 0.864–0.939 depending on model (SVM best balance). The verdicts validate all three model families' nose for the disputed boundary simultaneously. Remaining gap is unchanged in kind: only 3 gold negatives, so the 30–50 target still stands; the review queue + candidate list from the previous report remain the source.
+Operating curve (pooled OOF): threshold 0.35 gives P=1.000 at coverage 0.864–0.980 depending on model; 0.40 gives P≈1.000 at 0.80–0.94 (SVM best balance). No model misclassifies any gold negative at any threshold.
+
+Correction note: the first Exp-E run (evaluate5.py) accidentally trained the 5 flipped channels with their STALE poc.py labels (negative) while testing them as positive — an adversarial label-shift mix, not the clean protocol. Its lower recalls (0.08–0.65) measure robustness to stale training labels, not current-truth accuracy. The label-file rerun above (flips trained as the positives they are) supersedes it. Lesson recorded: label semantics must come from exactly one source (labels/*.txt), which evaluate_labels.py now enforces.
