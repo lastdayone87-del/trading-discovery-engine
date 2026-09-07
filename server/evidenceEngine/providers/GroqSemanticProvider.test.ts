@@ -233,7 +233,7 @@ test('malformed model content emits exactly one failure event, never a false suc
   globalThis.fetch = (async () => malformed) as unknown as typeof fetch;
   process.env.GROQ_API_KEY = 'test-key';
   try {
-    const client = defaultClient(async event => { events.push(event); });
+    const client = defaultClient(async event => { events.push(event); }, { persistedCooldownExpiryMs: async () => undefined });
     await assert.rejects(client!.classify('prompt', 'model'), (error: unknown) => error instanceof ProviderCallError);
     assert.equal(events.length, 1);
     assert.notEqual(events[0].status, 'SUCCESS');
@@ -254,7 +254,7 @@ test('valid model content emits exactly one success event with the parsed value'
   globalThis.fetch = (async () => valid) as unknown as typeof fetch;
   process.env.GROQ_API_KEY = 'test-key';
   try {
-    const client = defaultClient(async event => { events.push(event); });
+    const client = defaultClient(async event => { events.push(event); }, { persistedCooldownExpiryMs: async () => undefined });
     assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
     assert.equal(events.length, 1);
     assert.equal(events[0].status, 'SUCCESS');
@@ -342,7 +342,7 @@ test('oversized provider responses fail closed with one failure event, never SUC
   globalThis.fetch = (async () => oversized) as unknown as typeof fetch;
   process.env.GROQ_API_KEY = 'test-key';
   try {
-    const client = defaultClient(async event => { events.push(event); });
+    const client = defaultClient(async event => { events.push(event); }, { persistedCooldownExpiryMs: async () => undefined });
     await assert.rejects(client!.classify('prompt', 'model'), (error: unknown) => error instanceof ProviderCallError);
     assert.equal(events.length, 1);
     assert.equal(events[0].status, 'TRANSIENT_ERROR');
@@ -365,7 +365,7 @@ test('groq 429 arms the shared cooldown: repeat workers short-circuit without fe
   globalThis.fetch = (async () => { fetches++; return limited.clone(); }) as unknown as typeof fetch;
   process.env.GROQ_API_KEY = 'test-key';
   try {
-    const client = defaultClient(async event => { events.push(event); });
+    const client = defaultClient(async event => { events.push(event); }, { persistedCooldownExpiryMs: async () => undefined });
     const first = await client!.classify('prompt', 'model').then(() => null, (error: unknown) => error);
     assert.ok(first instanceof ProviderCallError && first.errorClass === 'RATE_LIMIT');
     assert.ok((first as { providerReasons?: string[] }).providerReasons?.includes('GROQ_RATE_LIMITED'));
@@ -402,7 +402,7 @@ test('groq cooldown recovery: requests resume after expiry', async () => {
   process.env.GROQ_API_KEY = 'test-key';
   process.env.GROQ_RATE_LIMIT_COOLDOWN_MS = '50';
   try {
-    const client = defaultClient(async event => { events.push(event); });
+    const client = defaultClient(async event => { events.push(event); }, { persistedCooldownExpiryMs: async () => undefined });
     await assert.rejects(client!.classify('prompt', 'model'));
     assert.equal(fetches, 1);
     limited = false;
@@ -434,7 +434,7 @@ test('disabled deadlines never abort groq calls', async () => {
   process.env.PROVIDER_DEADLINES_ENABLED = 'false';
   process.env.GROQ_PROVIDER_TIMEOUT_MS = '20';
   try {
-    const client = defaultClient(async () => undefined);
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
     assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
   } finally {
     globalThis.fetch = savedFetch;
@@ -465,7 +465,7 @@ test('enabled deadlines preserve timeout classification and cleanup', async () =
   process.env.PROVIDER_DEADLINES_ENABLED = 'true';
   process.env.GROQ_PROVIDER_TIMEOUT_MS = '20';
   try {
-    const client = defaultClient(async () => undefined);
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
     await assert.rejects(
       client!.classify('prompt', 'model'),
       (error: unknown) => error instanceof ProviderCallError && error.errorClass === 'TIMEOUT' && error.retryable,
@@ -498,4 +498,104 @@ test('groq rate-limit failures schedule retries past the shared cooldown expiry'
   assert.equal(noExpiry.runAfter, now + 30_000);
   const unmarked = decideJobFailure({ message: 'x', retryable: true, errorClass: 'TRANSIENT' }, 1, 4, now, now, undefined, expiry);
   assert.equal(unmarked.runAfter, now + 30_000);
+});
+
+test('cross-replica cooldown: a 429 persisted by one worker defers a fresh replica with zero fetches', async () => {
+  resetGroqCooldownForTests();
+  // Shared fake persisted ledger standing in for provider_call_events.
+  let ledgerExpiryMs: number | undefined;
+  const ledger = { persistedCooldownExpiryMs: async () => ledgerExpiryMs };
+  let fetchesA = 0;
+  let fetchesB = 0;
+  const limited = () => new Response('{"error":{"message":"Rate limit reached"}}', {
+    status: 429, headers: { 'content-type': 'application/json' },
+  });
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    // Replica A hits the limit; its telemetry persist updates the ledger.
+    globalThis.fetch = (async () => { fetchesA++; return limited(); }) as unknown as typeof fetch;
+    const eventsA: Array<{ status: string }> = [];
+    const clientA = defaultClient(async event => {
+      eventsA.push(event);
+      if (event.status === 'RATE_LIMITED') ledgerExpiryMs = Date.now() + 60_000;
+    }, ledger);
+    const first = await clientA!.classify('prompt', 'model').then(() => null, (error: unknown) => error);
+    assert.ok(first instanceof ProviderCallError && first.errorClass === 'RATE_LIMIT');
+    assert.equal(fetchesA, 1);
+    assert.ok(ledgerExpiryMs !== undefined && ledgerExpiryMs > Date.now());
+    // Replica B never saw the 429 (cold in-process flag) but reads the ledger.
+    resetGroqCooldownForTests();
+    assert.equal(groqCooldownRemainingMs(), 0);
+    globalThis.fetch = (async () => { fetchesB++; return limited(); }) as unknown as typeof fetch;
+    const eventsB: Array<{ status: string }> = [];
+    const clientB = defaultClient(async event => { eventsB.push(event); }, ledger);
+    const second = await clientB!.classify('prompt', 'model').then(() => null, (error: unknown) => error);
+    assert.equal(fetchesB, 0);
+    assert.ok(second instanceof ProviderCallError && second.errorClass === 'RATE_LIMIT');
+    assert.ok(((second as { providerReasons?: string[] }).providerReasons || []).includes('GROQ_RATE_LIMITED'));
+    assert.ok(Number((second as { retryAfterMs?: unknown }).retryAfterMs) > 0);
+    assert.equal(eventsB.length, 1);
+    assert.equal(eventsB[0].status, 'RATE_LIMITED');
+    // The persisted hit also arms B's fast in-process flag for followers.
+    assert.ok(groqCooldownRemainingMs() > 0);
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    resetGroqCooldownForTests();
+  }
+});
+
+test('persisted cooldown outage fails open to a live fetch', async () => {
+  resetGroqCooldownForTests();
+  let fetches = 0;
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  globalThis.fetch = (async () => {
+    fetches++;
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async () => undefined, {
+      persistedCooldownExpiryMs: async () => { throw new Error('ledger down'); },
+    });
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+    assert.equal(fetches, 1);
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    resetGroqCooldownForTests();
+  }
+});
+
+test('expired persisted window resumes fetching', async () => {
+  resetGroqCooldownForTests();
+  let fetches = 0;
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  globalThis.fetch = (async () => {
+    fetches++;
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async () => undefined, {
+      persistedCooldownExpiryMs: async () => Date.now() - 1_000,
+    });
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+    assert.equal(fetches, 1);
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    resetGroqCooldownForTests();
+  }
 });

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { appendProviderCallEvent } from '../../db';
+import { appendProviderCallEvent, resolveGroqSemanticCooldownExpiryMs } from '../../db';
 import { MAX_CRAWL_RESPONSE_CHARS, readBoundedResponseText } from '../../crawlResponseBounds';
 import {
   ProviderCallError,
@@ -125,11 +125,34 @@ function emitGroqEvent(event: ProviderCallEvent): Promise<void> {
 }
 
 /** Test seam: the emit sink is injectable so telemetry ordering is unit-testable without a database. */
-export function defaultClient(emit: (event: ProviderCallEvent) => Promise<void> = emitGroqEvent): SemanticModelClient | undefined {
+export interface GroqDefaultClientDeps {
+  /**
+   * Shared-cooldown read, resolving to the persisted expiry (ms epoch) or
+   * undefined when no window is active. Defaults to the persisted ledger so
+   * a 429 seen by any replica (or any earlier process) defers this one too;
+   * tests inject a stub. Fail-open: a ledger outage must never block
+   * classification.
+   */
+  persistedCooldownExpiryMs?: () => Promise<number | undefined>;
+}
+
+async function defaultPersistedCooldownExpiryMs(): Promise<number | undefined> {
+  try {
+    return await resolveGroqSemanticCooldownExpiryMs();
+  } catch {
+    return undefined;
+  }
+}
+
+export function defaultClient(
+  emit: (event: ProviderCallEvent) => Promise<void> = emitGroqEvent,
+  deps?: GroqDefaultClientDeps,
+): SemanticModelClient | undefined {
   const routes = configuredGroqRoutes();
   if (!routes.length) return undefined;
   const timeoutMs = groqTimeoutMs();
   const deadlinesEnabled = groqDeadlinesEnabled();
+  const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
   return { classify: async (prompt, model) => {
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
@@ -149,6 +172,22 @@ export function defaultClient(emit: (event: ProviderCallEvent) => Promise<void> 
         // converge on one deferred failure each.
         const remainingMs = groqCooldownRemainingMs();
         if (remainingMs > 0) throw groqCooldownDeferredError(remainingMs);
+        // Cross-replica gate: the in-process flag above only knows this
+        // process. A 429 recorded by another replica (or an earlier process)
+        // lives in the persisted ledger — consult it on every classification
+        // so fresh replicas and queue-bypassing paths (rechecks, shadow
+        // runners) also defer instead of re-hitting the window. Fail-open on
+        // ledger errors; also arms the fast in-process flag for followers.
+        let persistedExpiryMs: number | undefined;
+        try {
+          persistedExpiryMs = await persistedCooldownExpiryMs();
+        } catch {
+          persistedExpiryMs = undefined;
+        }
+        if (persistedExpiryMs !== undefined && persistedExpiryMs > Date.now()) {
+          groqCooldownUntilMs = Math.max(groqCooldownUntilMs, persistedExpiryMs);
+          throw groqCooldownDeferredError(persistedExpiryMs - Date.now());
+        }
         const res = await fetch(GROQ_API_BASE_URL, {
           method: 'POST',
           headers: { Authorization: `Bearer ${route.key}`, 'Content-Type': 'application/json' },
