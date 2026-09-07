@@ -176,3 +176,26 @@ Human verdicts: 8 strong + Queen-Esther + True Wealth + De Lamar NOT_TRADING (11
 | tfidf-char+LR | 0.990 | 0.505 | 0.669 | 1 |
 
 Operating curve: P>=0.95 needs th>=~0.55+ (coverage falls steeply; exact band re-fit per model). char-LR is the precision leader (single FP). FP attribution (mean-prob diagnostic): the 2 held hybrids persist; new negatives mostly classify correctly — exceptions are Sports Monde (all models at 0.5, clean by 0.65 except SVM), True Wealth, De Lamar Cabrais, and Breyer Trot (SVM@0.5 only). The 2 confirmed REJECT channels no longer misclassify on LR/char (SVM flags both at 0.5 only). 30-negative minimum: REACHED (32 gold negatives).
+
+## 17. Experiment K status + stopword-ablation finding (2026-09-06)
+
+Experiment K (multilingual-E5 + LR, SetFit) could NOT execute here: re-verified this session — no torch wheels for cp314-Android, Termux repos unreachable (403/DNS), nested proot denied, no alternative interpreter. \ + \ remain the ready-to-run specification. No numbers below are embedding results; nothing is fabricated.
+
+What WAS measured instead — a classical ablation that isolates how much of the boundary problem is stopword artifacts vs true compositional semantics (same Exp-B protocol, word-TFIDF+SVM + 400-word multilingual stopword strip with accent folding; list committed as stopwords.multilingual.txt):
+
+| model @0.5 | P | R | F1 | FP |
+|---|---|---|---|---|
+| word+SVM baseline | 0.921 | 0.787 | 0.847 | 10 |
+| word+SVM nostop | 0.953 | 0.691 | 0.801 | 7 |
+
+Mean-prob FP attribution after stripping: ONLY the 2 held hybrids (OG Kamo, Catalin Arsieniu) remain at th=0.5 (vs 4–5 before); Sports Monde, True Wealth, De Lamar Cabrais, and Breyer Trot all classify correctly. The stopword strip fixes exactly the French/German-function-word artifact class identified in the token analysis — no embeddings needed for those.
+
+Per-boundary-case mechanism (token-odds evidence):
+- OG Kamo (gaming + trading tokens: trading 41:9, futures, nq, mindset): keyword-inseparable; needs compositional semantics OR abstention. Embeddings plausibly help; unproven.
+- Catalin Arsieniu (music + trading/futures/trade tokens): same compositional need.
+- Sports Monde / True Wealth (French/German function words as top discriminators): stopword artifact — fixed classically, confirmed above.
+- De Lamar Cabrais (forex-shaped tokens usdcad/audjpy/gold): needs semantics or abstention; thin-evidence caution applies.
+- Breyer Trot (generic English, near-zero distinctive tokens): no signal for any text model — argues for ABSTAIN-on-thin-evidence, not better representations.
+- True Wealth taxonomy note (per human verdict): long-term investing/portfolio management, NOT active trading. The binary task boundary is fuzzy here by definition; future label guidelines should separate active-trading vs investing explicitly.
+
+Revised embeddings value proposition: after the stopword fix, the remaining addressable set is ~3 compositional cases (OG Kamo, Catalin, De Lamar). An embeddings track must beat abstention-handling on THOSE cases specifically to justify its weight — a much narrower bar than originally framed, and testable the moment a torch runtime exists.
