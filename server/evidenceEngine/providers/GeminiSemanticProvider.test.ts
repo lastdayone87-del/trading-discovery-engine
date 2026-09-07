@@ -91,12 +91,25 @@ test('configured Gemini routes are ordered, non-empty, and deduplicated without 
   assert.deepEqual(routes.map(route=>route.key),['a','b','e','z']);
 });
 
-test('retryable Gemini route failure advances to the next authorized route',async()=>{
+test('rate-limited Gemini route failure surfaces without cross-route burst',async()=>{
+  // Gemini rate limits are project-level: failing over to another key after a
+  // 429 would multiply the burst, so the failover rethrows immediately and the
+  // shared cooldown (not another key) absorbs the pressure.
+  const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
+  const calls:string[]=[];
+  await assert.rejects(runGeminiRouteFailover([{id:'gemini-1',key:'hidden-a'},{id:'gemini-2',key:'hidden-b'}],async route=>{
+    calls.push(route.id);
+    throw new ProviderCallError('rate pressure','RATE_LIMIT',true,{status:429});
+  }), (error:any)=>error instanceof ProviderCallError&&error.errorClass==='RATE_LIMIT');
+  assert.deepEqual(calls,['gemini-1']);
+});
+
+test('transient transport failure still advances to the next authorized route',async()=>{
   const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
   const calls:string[]=[];
   const result=await runGeminiRouteFailover([{id:'gemini-1',key:'hidden-a'},{id:'gemini-2',key:'hidden-b'}],async route=>{
     calls.push(route.id);
-    if(route.id==='gemini-1')throw new ProviderCallError('rate pressure','RATE_LIMIT',true,{status:429});
+    if(route.id==='gemini-1')throw new ProviderCallError('connection reset','TRANSIENT',true);
     return {route:route.id};
   });
   assert.deepEqual(calls,['gemini-1','gemini-2']);
