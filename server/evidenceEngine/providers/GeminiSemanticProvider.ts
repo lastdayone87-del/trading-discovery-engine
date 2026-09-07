@@ -104,7 +104,8 @@ function fieldDocuments(input: RawChannelInput) {
   ].filter(document => document.text?.trim()).map(document => ({ ...document, text: document.text.slice(0, 1200) }));
 }
 
-function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
+/** Shared creator-context gate (see buildSemanticPrompt). */
+export function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
   const retrievalOnly = !!input.search_match_context && (input.enrichment_stage || 0) === 0;
   if (!retrievalOnly) return true;
   return (input.description?.trim().length || 0) >= 20 ||
@@ -115,6 +116,14 @@ function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
 }
 
 function prompt(input: RawChannelInput, tier: 'CANDIDATE' | 'ADJUDICATION') {
+  return buildSemanticPrompt(input, tier);
+}
+
+/**
+ * Shared production semantic prompt: the single construction both the Gemini
+ * and Groq providers send, so prompt behavior can never drift between routes.
+ */
+export function buildSemanticPrompt(input: RawChannelInput, tier: 'CANDIDATE' | 'ADJUDICATION') {
   return JSON.stringify({
     task: tier, promptVersion: SEMANTIC_PROMPT_VERSION, closedTaxonomy: SEMANTIC_TAXONOMY,
     instructions: [
@@ -129,6 +138,11 @@ function prompt(input: RawChannelInput, tier: 'CANDIDATE' | 'ADJUDICATION') {
 }
 
 function parse(value: any): SemanticModelResult {
+  return parseSemanticResult(value);
+}
+
+/** Shared production semantic-result parser (see buildSemanticPrompt). */
+export function parseSemanticResult(value: any): SemanticModelResult {
   const label = SEMANTIC_TAXONOMY.includes(value?.label) ? value.label : 'AMBIGUOUS';
   const fields = new Set(['channel_title','channel_bio','video_title','video_description','playlist_name','playlist_description','external_link_label','external_link_domain','country','language','transcript_excerpt','visual_evidence','discord_invite']);
   return {
