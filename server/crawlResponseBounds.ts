@@ -45,7 +45,10 @@ export async function readBoundedResponseText(
       if (done) break;
       if (value && value.length) {
         text += decoder.decode(value, { stream: true });
-        if (text.length >= cap) {
+        // Strictly greater-than: a body of exactly `cap` chars followed by
+        // EOF is complete, not truncated. Only an over-cap prefix proves the
+        // origin served more than the bound.
+        if (text.length > cap) {
           text = text.slice(0, cap);
           try {
             await reader.cancel();

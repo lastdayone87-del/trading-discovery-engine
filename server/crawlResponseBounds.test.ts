@@ -93,3 +93,15 @@ test('custom cap is honored', async () => {
   assert.equal(bounded.text, 'abc');
   assert.equal(bounded.truncated, true);
 });
+
+test('body of exactly cap size at EOF is complete, not truncated', async () => {
+  const bounded = await readBoundedResponseText(htmlResponse('abc'), 3);
+  assert.equal(bounded.text, 'abc');
+  assert.equal(bounded.truncated, false);
+});
+
+test('body one char over cap is truncated', async () => {
+  const bounded = await readBoundedResponseText(htmlResponse('abcd'), 3);
+  assert.equal(bounded.text, 'abc');
+  assert.equal(bounded.truncated, true);
+});
