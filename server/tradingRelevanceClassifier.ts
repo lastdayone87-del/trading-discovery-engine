@@ -74,7 +74,7 @@ export async function classifyTradingRelevanceDetailed(
     ai_reviewed: !!decision.geminiSemanticSummary,
     fast_heuristic_status: decision.status === 'TRADING_CONFIRMED' ? 'FAST_ACCEPT' : decision.status === 'NON_TRADING' ? 'FAST_REJECT' : 'UNCERTAIN',
     classification_method: 'AI_SEMANTIC_CLASSIFIER',
-    ai_model: decision.versions.geminiModelVersion,
+    ai_model: decision.geminiSemanticSummary?.modelUsed || decision.versions.geminiModelVersion,
     ai_prompt_payload: decision.geminiSemanticSummary ? JSON.stringify(decision.geminiSemanticSummary) : undefined,
     ai_raw_response: decision.geminiSemanticSummary ? decision.geminiSemanticSummary.reason : undefined,
     reasoning: reasoningLogs

@@ -82,7 +82,8 @@ function emitGroqEvent(event: ProviderCallEvent): Promise<void> {
   return appendProviderCallEvent(event).catch(() => undefined);
 }
 
-function defaultClient(): SemanticModelClient | undefined {
+/** Test seam: the emit sink is injectable so telemetry ordering is unit-testable without a database. */
+export function defaultClient(emit: (event: ProviderCallEvent) => Promise<void> = emitGroqEvent): SemanticModelClient | undefined {
   const routes = configuredGroqRoutes();
   if (!routes.length) return undefined;
   const timeoutMs = groqTimeoutMs();
@@ -119,17 +120,21 @@ function defaultClient(): SemanticModelClient | undefined {
         if (typeof content !== 'string' || !content) {
           throw Object.assign(new Error('Groq returned no message content.'), { status: res.status });
         }
-        await emitGroqEvent({
+        // Parse before persisting SUCCESS: a malformed completion must emit
+        // exactly one terminal event (the failure below), never a false
+        // success that the conflicting failure insert cannot overwrite.
+        const parsedContent = JSON.parse(content);
+        await emit({
           ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
           actualCost: 0, occurredAt: new Date().toISOString(),
         });
-        return JSON.parse(content);
+        return parsedContent;
       } catch (error) {
         const aborted = controller.signal.aborted;
         const typed = aborted
           ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
           : classifyProviderError(error);
-        await emitGroqEvent({
+        await emit({
           ...base, status: statusFor(typed), latencyMs: Date.now() - started,
           actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
         });

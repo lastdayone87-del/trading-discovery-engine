@@ -2,6 +2,7 @@ import type {
   ClassificationStageResult, EvidenceCollectionReport, EvidenceFieldRef, EvidenceItem,
   LifecycleAction, RawChannelInput, StagedClassificationReport
 } from './types';
+import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
 import { hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
 
@@ -16,7 +17,8 @@ function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
     case 'country_knowledge': return [{ field: 'country' }, { field: 'channel_bio' }];
     case 'discord_metadata': return [{ field: 'discord_invite' }];
     case 'multilingual_context': return [{ field: 'language' }, { field: 'channel_bio' }, { field: 'video_title' }];
-    case 'gemini_semantic': return [{ field: 'channel_title' }, { field: 'channel_bio' }, { field: 'video_title' }, { field: 'video_description' }];
+    case 'gemini_semantic':
+    case 'groq_semantic': return [{ field: 'channel_title' }, { field: 'channel_bio' }, { field: 'video_title' }, { field: 'video_description' }];
     default: return [];
   }
 }
@@ -56,14 +58,14 @@ function terminalContradictionWeights(negative: EvidenceItem[], positiveWeight: 
  * positive blockers remain the responsibility of decisionPolicy.ts. */
 function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], collection: EvidenceCollectionReport): boolean {
   if (collection.terminalNegativeSufficiency?.status !== 'SUFFICIENT' || !collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
-  const semanticUnrelated=negative.filter(item => item.source === 'gemini_semantic' && item.category === 'IRRELEVANT_DOMAIN' && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED');
+  const semanticUnrelated=negative.filter(item => isSemanticClassificationSource(item.source) && item.category === 'IRRELEVANT_DOMAIN' && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED');
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
 export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport): StagedClassificationReport {
   const positive = evidence.filter(item => item.polarity === 'POSITIVE' && item.rawMatches.length > 0);
   const negative = evidence.filter(item => item.polarity === 'NEGATIVE');
-  const semantic = positive.filter(item => item.source === 'gemini_semantic' || item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY' || item.category === 'INSTRUMENT');
+  const semantic = positive.filter(item => isSemanticClassificationSource(item.source) || item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY' || item.category === 'INSTRUMENT');
   const strongPositive = positive.filter(item => item.reliability !== 'LOWER' && Math.abs(item.finalWeight) >= 6);
   const corroborating = strongPositive.filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY');
   const sources = new Set(corroborating.map(item => item.source));

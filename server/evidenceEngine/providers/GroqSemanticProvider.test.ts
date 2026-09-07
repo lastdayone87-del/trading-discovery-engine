@@ -5,6 +5,7 @@ import {
   DEFAULT_GROQ_CANDIDATE_MODEL,
   GroqSemanticProvider,
   configuredGroqRoutes,
+  defaultClient,
   groqTimeoutMs,
   runGroqRouteFailover,
   shouldUseGroqSemantic,
@@ -16,6 +17,8 @@ import {
   GeminiSemanticProvider,
 } from './GeminiSemanticProvider';
 import { ProviderCallError } from '../../providerResilience';
+import { ConfigurableWeightedStrategy } from '../scoringEngine';
+import { getLayeredKnowledgeContext } from '../knowledgePacks';
 
 const input = {
   channel_id: 'channel-1',
@@ -216,4 +219,66 @@ test('shared parser keeps taxonomy boundary identical across providers', () => {
   assert.equal(parseSemanticResult({ label: 'NOPE', confidence: 80, supportedLanguage: true }).label, 'AMBIGUOUS');
   assert.equal(DEFAULT_GROQ_CANDIDATE_MODEL, 'openai/gpt-oss-120b');
   assert.equal(DEFAULT_GROQ_ADJUDICATOR_MODEL, 'openai/gpt-oss-120b');
+});
+
+test('malformed model content emits exactly one failure event, never a false success', async () => {
+  const events: Array<{ status: string }> = [];
+  const malformed = new Response(JSON.stringify({ choices: [{ message: { content: 'not-json{{{' } }] }), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  });
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  globalThis.fetch = (async () => malformed) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async event => { events.push(event); });
+    await assert.rejects(client!.classify('prompt', 'model'), (error: unknown) => error instanceof ProviderCallError);
+    assert.equal(events.length, 1);
+    assert.notEqual(events[0].status, 'SUCCESS');
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+  }
+});
+
+test('valid model content emits exactly one success event with the parsed value', async () => {
+  const events: Array<{ status: string }> = [];
+  const valid = new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  });
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  globalThis.fetch = (async () => valid) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async event => { events.push(event); });
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].status, 'SUCCESS');
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+  }
+});
+
+test('groq-routed classifications populate the semantic audit trail with the serving model', async () => {
+  const provider = new GroqSemanticProvider(of(unrelatedResult));
+  const [item] = await provider.collectEvidence(input, {} as any);
+  assert.equal(item.source, 'groq_semantic');
+  const context = getLayeredKnowledgeContext('United States');
+  const collection = {
+    sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false,
+    fieldsPresent: ['description'], reasonCodes: [],
+    providers: [{ provider: 'groq_semantic', availability: 'AVAILABLE', evidenceCount: 1, outcome: 'EXECUTED_WITH_EVIDENCE', reasonCodes: ['PROVIDER_EVIDENCE_EMITTED'] }],
+    terminalNegativeSufficiency: { status: 'SUFFICIENT', creatorLevelCoverage: true, independentSourceFamilies: 2, independentObservations: 2, reasonCodes: ['CREATOR_LEVEL_NEGATIVE_COVERAGE'] },
+  } as any;
+  const decision = new ConfigurableWeightedStrategy().evaluateDecision([item], context, 'United States', collection);
+  // ai_reviewed expression from tradingRelevanceClassifier must hold for Groq.
+  assert.ok(!!decision.geminiSemanticSummary);
+  assert.equal(decision.geminiSemanticSummary?.modelUsed, 'openai/gpt-oss-120b');
+  assert.equal(decision.geminiSemanticSummary?.isTrading, 'NO');
+  assert.match(decision.geminiSemanticSummary?.reason || '', /UNRELATED/);
+  assert.equal(decision.status, 'NON_TRADING');
 });

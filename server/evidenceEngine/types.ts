@@ -14,6 +14,22 @@ export type EvidenceSourceType =
 
 export type EvidencePolarity = 'POSITIVE' | 'NEGATIVE';
 
+/**
+ * Governed semantic-classification providers. Both share the production
+ * prompt, parser, calibration, and terminal-reject gates, so every
+ * semantic-source check must admit both — never Gemini alone.
+ */
+export const SEMANTIC_CLASSIFICATION_SOURCES: readonly EvidenceSourceType[] = [
+  'gemini_semantic',
+  'groq_semantic',
+];
+
+export function isSemanticClassificationSource(
+  source: unknown,
+): source is 'gemini_semantic' | 'groq_semantic' {
+  return source === 'gemini_semantic' || source === 'groq_semantic';
+}
+
 export type EvidenceCategory =
   | 'INSTRUMENT'
   | 'PLATFORM_BROKER_PROPFIRM'
