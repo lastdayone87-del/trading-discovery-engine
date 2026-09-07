@@ -89,7 +89,9 @@ export class ConfigurableWeightedStrategy {
     let geminiSemanticSummary = undefined;
     if (semanticItem) {
       geminiSemanticSummary = {
-        isTrading: semanticItem.polarity === 'POSITIVE' ? ('YES' as const) : semanticItem.polarity === 'NEGATIVE' ? ('NO' as const) : ('UNCERTAIN' as const),
+        // Abstentions carry positive polarity with zero weight: an abstention
+        // is uncertainty, never a trading approval, for either provider.
+        isTrading: semanticItem.category === 'SEMANTIC_ABSTENTION' ? ('UNCERTAIN' as const) : semanticItem.polarity === 'POSITIVE' ? ('YES' as const) : semanticItem.polarity === 'NEGATIVE' ? ('NO' as const) : ('UNCERTAIN' as const),
         concepts: semanticItem.rawMatches,
         instruments: [],
         reason: semanticItem.fact,

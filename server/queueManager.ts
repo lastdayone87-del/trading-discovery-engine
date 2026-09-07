@@ -76,6 +76,7 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { isGeminiSemanticCooldownActive } from './providerResilience';
+import { shouldUseGroqSemantic } from './evidenceEngine/providers/GroqSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
@@ -152,6 +153,21 @@ export function preferredLanguageFromQueryMetadata(metadata: Record<string, unkn
 }
 
 /**
+ * Pure ENRICH_CHANNEL claim gate over the active semantic route's cooldown.
+ * Gemini-selected claims pause while the Gemini cooldown is active (DEFER
+ * storm guard); Groq-selected claims are never blocked by a stale Gemini
+ * cooldown. Unit-testable without a database; the async cooldown read stays
+ * at the call site.
+ */
+export function enrichChannelClaimableDuringCooldown(input: {
+  groqSelected: boolean;
+  geminiCooldownActive: boolean;
+}): boolean {
+  if (input.groqSelected) return true;
+  return !input.geminiCooldownActive;
+}
+
+/**
  * Durable job types claimable through processNextSearchJob overrides.
  * RELATIONSHIP_CANARY_EXPANSION rides the existing SEARCH pool (same YouTube
  * provider profile, same tick lifecycle) behind its own settings gate, so no
@@ -181,17 +197,19 @@ export async function processNextSearchJob(
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
-  // ENRICH_CHANNEL: every such job runs the full evidence pipeline, which
-  // always includes GeminiSemanticProvider (availability() returns AVAILABLE
-  // for enrichment_stage >= 1). When Gemini is rate-limited, every claimed
+  // ENRICH_CHANNEL: every such job runs the full evidence pipeline. Under the
+  // default Gemini route, availability() returns AVAILABLE for
+  // enrichment_stage >= 1, so when Gemini is rate-limited every claimed
   // ENRICH_CHANNEL job immediately defers via SEMANTIC_DEFERRED_RATE_PRESSURE,
   // creating a ~1Hz DEFER storm. This gate pauses ENRICH_CHANNEL claims
-  // during the cooldown period, but only when ALL configured Gemini routes
-  // are rate-limited. If any route is available, ENRICH_CHANNEL work can
-  // proceed through the healthy route.
+  // during the Gemini cooldown period. When Groq serves semantic
+  // classification instead, a stale Gemini cooldown must not stall healthy
+  // Groq work: the Groq path never defers on Gemini capacity, so no storm is
+  // possible and the gate stays open.
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
-    const geminiActive = await isGeminiSemanticCooldownActive();
-    if (!geminiActive) claimableTypes.push('ENRICH_CHANNEL');
+    const groqSelected = shouldUseGroqSemantic();
+    const geminiCooldownActive = groqSelected ? false : await isGeminiSemanticCooldownActive();
+    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
   }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');

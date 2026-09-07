@@ -282,3 +282,71 @@ test('groq-routed classifications populate the semantic audit trail with the ser
   assert.match(decision.geminiSemanticSummary?.reason || '', /UNRELATED/);
   assert.equal(decision.status, 'NON_TRADING');
 });
+
+test('production routing matrix: unset/gemini stay on Gemini, groq+key selects Groq, kill switch wins immediately', () => {
+  const groqKeys = Object.keys(process.env).filter(name => name === 'GROQ_API_KEY' || /^GROQ_API_KEY_[2-9][0-9]*$/.test(name));
+  const savedGroq: Record<string, string | undefined> = {};
+  for (const name of groqKeys) savedGroq[name] = process.env[name];
+  const savedProvider = process.env.SEMANTIC_PROVIDER;
+  const savedForce = process.env.SEMANTIC_PROVIDER_FORCE_GEMINI;
+  for (const name of groqKeys) delete process.env[name];
+  try {
+    delete process.env.SEMANTIC_PROVIDER;
+    delete process.env.SEMANTIC_PROVIDER_FORCE_GEMINI;
+    assert.equal(shouldUseGroqSemantic(), false);
+    process.env.SEMANTIC_PROVIDER = 'gemini';
+    process.env.GROQ_API_KEY = 'k';
+    assert.equal(shouldUseGroqSemantic(), false);
+    process.env.SEMANTIC_PROVIDER = 'groq';
+    assert.equal(shouldUseGroqSemantic(), true);
+    process.env.SEMANTIC_PROVIDER_FORCE_GEMINI = 'true';
+    assert.equal(shouldUseGroqSemantic(), false);
+  } finally {
+    for (const name of groqKeys) {
+      if (savedGroq[name] === undefined) delete process.env[name];
+      else process.env[name] = savedGroq[name] as string;
+    }
+    if (savedProvider === undefined) delete process.env.SEMANTIC_PROVIDER;
+    else process.env.SEMANTIC_PROVIDER = savedProvider;
+    if (savedForce === undefined) delete process.env.SEMANTIC_PROVIDER_FORCE_GEMINI;
+    else process.env.SEMANTIC_PROVIDER_FORCE_GEMINI = savedForce;
+    if (!groqKeys.includes('GROQ_API_KEY')) delete process.env.GROQ_API_KEY;
+  }
+});
+
+test('groq abstentions audit as UNCERTAIN, never trading approval', async () => {
+  const abstained = new GroqSemanticProvider(of({ ...unrelatedResult, supportedLanguage: false }));
+  const [item] = await abstained.collectEvidence(input, {} as any);
+  assert.equal(item.category, 'SEMANTIC_ABSTENTION');
+  const context = getLayeredKnowledgeContext('United States');
+  const collection = {
+    sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false,
+    fieldsPresent: ['description'], reasonCodes: [],
+    providers: [{ provider: 'groq_semantic', availability: 'AVAILABLE', evidenceCount: 0, outcome: 'ABSTAINED_LOW_CONFIDENCE', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED'] }],
+    terminalNegativeSufficiency: { status: 'INSUFFICIENT', creatorLevelCoverage: false, independentSourceFamilies: 0, independentObservations: 0, reasonCodes: [] },
+  } as any;
+  const decision = new ConfigurableWeightedStrategy().evaluateDecision([item], context, 'United States', collection);
+  assert.equal(decision.geminiSemanticSummary?.isTrading, 'UNCERTAIN');
+});
+
+test('oversized provider responses fail closed with one failure event, never SUCCESS', async () => {
+  const events: Array<{ status: string }> = [];
+  const envelope = JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] });
+  const oversized = new Response(envelope + 'y'.repeat(2_100_000), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  });
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  globalThis.fetch = (async () => oversized) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async event => { events.push(event); });
+    await assert.rejects(client!.classify('prompt', 'model'), (error: unknown) => error instanceof ProviderCallError);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].status, 'TRANSIENT_ERROR');
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+  }
+});

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { appendProviderCallEvent } from '../../db';
+import { MAX_CRAWL_RESPONSE_CHARS, readBoundedResponseText } from '../../crawlResponseBounds';
 import {
   ProviderCallError,
   classifyProviderError,
@@ -111,7 +112,18 @@ export function defaultClient(emit: (event: ProviderCallEvent) => Promise<void> 
           }),
           signal: controller.signal,
         });
-        const text = await res.text();
+        // Bounded body: the completion envelope is capped server-side, but a
+        // misbehaving origin/proxy must never grow the heap. A cut envelope
+        // fails closed as a transient provider error (retryable), never as a
+        // parsed success.
+        const bounded = await readBoundedResponseText(res);
+        if (bounded.truncated) {
+          throw Object.assign(
+            new Error(`Groq response exceeded the ${MAX_CRAWL_RESPONSE_CHARS}-char bound.`),
+            { status: res.status },
+          );
+        }
+        const text = bounded.text;
         if (!res.ok) {
           throw Object.assign(new Error(`Groq HTTP ${res.status}: ${text.slice(0, 500)}`),
             { status: res.status, code: res.status });
