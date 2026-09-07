@@ -165,7 +165,7 @@ Human correction applied via labels/*.txt (DayTradeToWin moved neg->pos; UCtDCc 
 
 Operating curve: P>=0.95 needs th>=~0.5 (coverage 0.60–0.68); th=0.65 gives FP~0 with sharply reduced coverage. FP attribution (mean-prob diagnostic): only the 2 held hybrids (OG Kamo, Catalin Arsieniu) persist across all models at th=0.5, plus Marko's Trading Journey for char-LR — all trading-adjacent entertainment, all human-confirmed NOT_TRADING. DayTradeToWin is now a true positive everywhere. Remaining persistent-FP list for re-examination: OG Kamo, Catalin Arsieniu (re-examination does not mean relabeling without human review).
 
-## 16. Experiment J — 11-batch verdicts applied (68/22... wait, recount below)
+## 16. Experiment J — 11-batch verdicts applied (68 pos / 32 neg gold)
 
 Human verdicts: 8 strong + Queen-Esther + True Wealth + De Lamar NOT_TRADING (11); DayTradeToWin correction retained. Verified counts: gold 68 pos / 32 neg, silver 41 neg, 131 rows post-exclusion, 0 near-dup pairs. Same Exp-B protocol (train gold+silver, gold-only OOF, n=300 pooled):
 
