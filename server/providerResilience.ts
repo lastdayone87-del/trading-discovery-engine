@@ -34,7 +34,7 @@ export function classifyProviderError(error: unknown): ProviderCallError {
   return new ProviderCallError('Provider call failed.','TRANSIENT',true,{cause:error});
 }
 
-const statusFor=(e:ProviderCallError):ProviderStatus => e.errorClass==='TIMEOUT'?'TIMEOUT':e.errorClass==='CANCELLED'?'CANCELLED':e.errorClass==='RATE_LIMIT'?'RATE_LIMITED':e.retryable?'TRANSIENT_ERROR':'PERMANENT_ERROR';
+export const statusFor=(e:ProviderCallError):ProviderStatus => e.errorClass==='TIMEOUT'?'TIMEOUT':e.errorClass==='CANCELLED'?'CANCELLED':e.errorClass==='RATE_LIMIT'?'RATE_LIMITED':e.retryable?'TRANSIENT_ERROR':'PERMANENT_ERROR';
 export type ProviderEventSink=(event:ProviderCallEvent)=>Promise<void>;
 
 const GEMINI_CAPACITY_LOCK = 741963285;

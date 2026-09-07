@@ -5,6 +5,7 @@ import { VideoMetadataProvider } from './providers/VideoMetadataProvider';
 import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
 import { CountryKnowledgeProvider } from './providers/CountryKnowledgeProvider';
 import { GeminiSemanticProvider } from './providers/GeminiSemanticProvider';
+import { GroqSemanticProvider, shouldUseGroqSemantic } from './providers/GroqSemanticProvider';
 import { DiscordProvider } from './providers/DiscordProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { ConfigurableWeightedStrategy } from './scoringEngine';
@@ -59,8 +60,14 @@ export class EvidenceBasedTradingEngine {
     const routedCodes=contentLanguagePacks(input,knowledgeContext).map(pack=>pack.languageCode);
     knowledgeContext.languageKnowledgePacks=[...new Map([...(knowledgeContext.languageKnowledgePacks||[]),...routedCodes.map(code=>LANGUAGE_KNOWLEDGE_PACKS[code]).filter(Boolean)].map(pack=>[pack.languageCode,pack])).values()];
 
-    // Collect evidence from all independent providers in parallel
-    const providerPromises = this.providers.map(async provider => {
+    // Collect evidence from all independent providers in parallel. Semantic
+    // routing is resolved per evaluation (not at construction) so
+    // SEMANTIC_PROVIDER / SEMANTIC_PROVIDER_FORCE_GEMINI take effect without
+    // a restart; default (unset) keeps Gemini exactly as before.
+    const providers = shouldUseGroqSemantic()
+      ? this.providers.map(provider => provider.name === 'gemini_semantic' ? new GroqSemanticProvider() : provider)
+      : this.providers;
+    const providerPromises = providers.map(async provider => {
       const started = Date.now();
       const declared = provider.availability?.(input) || { availability: 'AVAILABLE' as const };
       if (declared.availability !== 'AVAILABLE') {
