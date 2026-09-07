@@ -152,3 +152,15 @@ Correction: commit 46d8d90 prematurely added 20 undecided Tier 1–2 channels as
 | tfidf-char+LR | 0.948 | 0.726 | 0.823 | 8 |
 
 Operating curve: P>=0.95 needs th>=~0.5 at coverage 0.55–0.68; th=0.65 gives FP~0 with sharply reduced coverage. FP attribution (mean-prob diagnostic): only OG Kamo Gaming, Catalin Arsieniu (held hybrids), and DayTradeToWin (Tier-3, trading-named) persist across all models; the two previously-disputed REJECT channels no longer misclassify. The 3 flipped Tier-3 channels are now true positives. Base rate 67/90 = 0.744.
+
+## 15. Experiment I — DayTradeToWin corrected to TRADING (68/22 gold)
+
+Human correction applied via labels/*.txt (DayTradeToWin moved neg->pos; UCtDCc still excluded; verified counts). Same Exp-B protocol (train gold+silver, gold-only OOF, n=270 pooled):
+
+| model @0.5 | P | R | F1 | FP |
+|---|---|---|---|---|
+| tfidf-word+LR | 0.951 | 0.760 | 0.845 | 8 |
+| tfidf-word+SVM | 0.957 | 0.760 | 0.847 | 7 |
+| tfidf-char+LR | 0.947 | 0.784 | 0.858 | 9 |
+
+Operating curve: P>=0.95 needs th>=~0.5 (coverage 0.60–0.68); th=0.65 gives FP~0 with sharply reduced coverage. FP attribution (mean-prob diagnostic): only the 2 held hybrids (OG Kamo, Catalin Arsieniu) persist across all models at th=0.5, plus Marko's Trading Journey for char-LR — all trading-adjacent entertainment, all human-confirmed NOT_TRADING. DayTradeToWin is now a true positive everywhere. Remaining persistent-FP list for re-examination: OG Kamo, Catalin Arsieniu (re-examination does not mean relabeling without human review).
