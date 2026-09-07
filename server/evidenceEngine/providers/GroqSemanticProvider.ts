@@ -249,9 +249,15 @@ export function defaultClient(
             (typed as { providerReasons?: string[] }).providerReasons = [...reasons, GROQ_RATE_LIMITED_REASON];
           }
         }
+        // Deferred short-circuits stay observable but must never restart the
+        // persisted window: the shared expiry derives from the latest
+        // RATE_LIMITED row, so a deferral is tagged and the resolver below
+        // excludes tagged rows. Genuine provider 429s carry no tag.
+        const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
         await emit({
           ...base, status: statusFor(typed), latencyMs: Date.now() - started,
           actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
+          ...(deferred ? { requestMetadata: { ...base.requestMetadata, groqCooldownDeferral: 'true' } } : {}),
         });
         throw typed;
       } finally {

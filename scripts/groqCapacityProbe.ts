@@ -59,7 +59,8 @@ async function main(): Promise<void> {
       results.push({ n: i + 1, ok: true, latency_ms: Date.now() - started, label: (value as { label?: unknown })?.label ?? null });
     } catch (error: unknown) {
       const status = Number((error as { status?: unknown })?.status) || undefined;
-      const is429 = status === 429 || /rate.?limit|429/i.test(String((error as Error)?.message || ''));
+      const errorClass = (error as { errorClass?: unknown })?.errorClass;
+      const is429 = status === 429 || errorClass === 'RATE_LIMIT' || /rate.?limit|429/i.test(String((error as Error)?.message || ''));
       if (is429) {
         consecutive429++;
         results.push({ n: i + 1, ok: false, latency_ms: Date.now() - started, rate_limited: true, status });

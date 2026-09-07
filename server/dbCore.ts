@@ -796,12 +796,15 @@ export async function resolveGeminiSemanticCooldownExpiryMs(nowMs:number=Date.no
  * project-level limits apply to all Gemini routes: one RATE_LIMITED event on
  * any Groq route cools the whole pool. Consumed by the ENRICH claim gate and
  * retry timing so deferred jobs wake after the window instead of ticking.
+ * Local cooldown deferrals are tagged (groqCooldownDeferral) and excluded:
+ * they are backpressure echoes, not new provider responses, and must never
+ * restart the shared window.
  */
 export async function resolveGroqSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{
   const cooldownMs=groqSemanticCooldownMs();
   try{
     const db=await getDb();
-    const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='groq' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`);
+    const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`);
     if(!res.rows[0]?.occurred_at)return undefined;
     const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
     if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;

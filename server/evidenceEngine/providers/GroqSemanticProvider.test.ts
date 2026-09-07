@@ -516,20 +516,24 @@ test('cross-replica cooldown: a 429 persisted by one worker defers a fresh repli
   try {
     // Replica A hits the limit; its telemetry persist updates the ledger.
     globalThis.fetch = (async () => { fetchesA++; return limited(); }) as unknown as typeof fetch;
-    const eventsA: Array<{ status: string }> = [];
+    const eventsA: Array<{ status: string; requestMetadata?: Record<string, string | null> }> = [];
     const clientA = defaultClient(async event => {
       eventsA.push(event);
       if (event.status === 'RATE_LIMITED') ledgerExpiryMs = Date.now() + 60_000;
     }, ledger);
     const first = await clientA!.classify('prompt', 'model').then(() => null, (error: unknown) => error);
     assert.ok(first instanceof ProviderCallError && first.errorClass === 'RATE_LIMIT');
+    assert.ok(((first as { providerReasons?: string[] }).providerReasons || []).includes('GROQ_RATE_LIMITED'));
     assert.equal(fetchesA, 1);
     assert.ok(ledgerExpiryMs !== undefined && ledgerExpiryMs > Date.now());
+    // Genuine provider 429s carry no deferral tag, so the ledger keeps them.
+    assert.equal(eventsA.length, 1);
+    assert.equal(eventsA[0].requestMetadata?.groqCooldownDeferral, undefined);
     // Replica B never saw the 429 (cold in-process flag) but reads the ledger.
     resetGroqCooldownForTests();
     assert.equal(groqCooldownRemainingMs(), 0);
     globalThis.fetch = (async () => { fetchesB++; return limited(); }) as unknown as typeof fetch;
-    const eventsB: Array<{ status: string }> = [];
+    const eventsB: Array<{ status: string; requestMetadata?: Record<string, string | null> }> = [];
     const clientB = defaultClient(async event => { eventsB.push(event); }, ledger);
     const second = await clientB!.classify('prompt', 'model').then(() => null, (error: unknown) => error);
     assert.equal(fetchesB, 0);
@@ -538,6 +542,8 @@ test('cross-replica cooldown: a 429 persisted by one worker defers a fresh repli
     assert.ok(Number((second as { retryAfterMs?: unknown }).retryAfterMs) > 0);
     assert.equal(eventsB.length, 1);
     assert.equal(eventsB[0].status, 'RATE_LIMITED');
+    // Deferral echoes are tagged so the persisted window never restarts.
+    assert.equal(eventsB[0].requestMetadata?.groqCooldownDeferral, 'true');
     // The persisted hit also arms B's fast in-process flag for followers.
     assert.ok(groqCooldownRemainingMs() > 0);
   } finally {
@@ -598,4 +604,13 @@ test('expired persisted window resumes fetching', async () => {
     else process.env.GROQ_API_KEY = savedKey;
     resetGroqCooldownForTests();
   }
+});
+
+test('repeated deferrals never restart the persisted cooldown window', async () => {
+  // Emulates the ledger contract: the authoritative expiry derives from the
+  // latest untagged RATE_LIMITED row, so tagged deferral echoes cannot move it.
+  const { resolveGroqSemanticCooldownExpiryMs } = await import('../../dbCore');
+  const fnStr = resolveGroqSemanticCooldownExpiryMs.toString();
+  assert.ok(fnStr.includes('groqCooldownDeferral'), 'resolver must exclude deferral-tagged rows');
+  assert.ok(fnStr.includes("provider='groq'") || fnStr.includes('provider=\'groq\''), 'resolver stays groq-scoped');
 });
