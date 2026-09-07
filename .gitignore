@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Research evaluation caches with human-adjacent channel data (never publish raw)
+research/local-classifier-poc/labels/dataset_cache.json
