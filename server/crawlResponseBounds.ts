@@ -14,19 +14,27 @@
  * chars, comfortably above the ~1.6MB YouTube About page with headroom).
  * Truncation preserves recall for normal pages (Discord invites live in the
  * early document) and keeps behavior byte-identical below the cap. Callers
- * inspect the prefix; no new failure taxonomy, no retry change.
+ * must treat a truncated prefix as incomplete coverage: it must never
+ * resolve a definitive clean negative (INSPECTED_NO_MATCH / ATTEMPTED_EMPTY)
+ * because evidence past the boundary was never observed.
  */
 export const MAX_CRAWL_RESPONSE_CHARS = 2_000_000;
+
+export interface BoundedResponseText {
+  text: string;
+  /** True when the origin served more than the cap and the prefix was cut. */
+  truncated: boolean;
+}
 
 export async function readBoundedResponseText(
   response: Response,
   maxChars: number = MAX_CRAWL_RESPONSE_CHARS,
-): Promise<string> {
+): Promise<BoundedResponseText> {
   const cap = Math.max(1, Math.floor(maxChars) || MAX_CRAWL_RESPONSE_CHARS);
   const body = (response as Response & { body?: ReadableStream<Uint8Array> | null }).body;
   if (!body || typeof (body as ReadableStream<Uint8Array>).getReader !== 'function') {
     const text = await response.text();
-    return text.length > cap ? text.slice(0, cap) : text;
+    return text.length > cap ? { text: text.slice(0, cap), truncated: true } : { text, truncated: false };
   }
   const reader = (body as ReadableStream<Uint8Array>).getReader();
   const decoder = new TextDecoder();
@@ -45,12 +53,12 @@ export async function readBoundedResponseText(
             // Best-effort: the prefix is already captured; a cancel failure
             // must never fail the crawl itself.
           }
-          return text;
+          return { text, truncated: true };
         }
       }
     }
     text += decoder.decode();
-    return text.length > cap ? text.slice(0, cap) : text;
+    return text.length > cap ? { text: text.slice(0, cap), truncated: true } : { text, truncated: false };
   } finally {
     try {
       reader.releaseLock();

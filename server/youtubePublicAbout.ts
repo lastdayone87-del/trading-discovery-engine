@@ -19,6 +19,8 @@ export interface PublicYouTubeChannelAbout {
   thumbnailUrl?: string;
   rawHtml?: string;
   fetchLog?: string;
+  /** True when the source page exceeded the bounded-response cap. */
+  truncated?: boolean;
 }
 
 /** Match inspection short-bio threshold: treat under 20 chars as insufficient About text. */
@@ -95,7 +97,7 @@ export async function fetchPublicYouTubePage(
   url: string,
   depth = 0,
   fetchImpl: typeof fetch = fetch
-): Promise<{ html: string; finalUrl: string } | null> {
+): Promise<{ html: string; finalUrl: string; truncated: boolean } | null> {
   if (depth > 2) return null;
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 10_000);
@@ -119,7 +121,8 @@ export async function fetchPublicYouTubePage(
     ) {
       return null;
     }
-    return { html: await readBoundedResponseText(res), finalUrl: res.url };
+    const bounded = await readBoundedResponseText(res);
+    return { html: bounded.text, finalUrl: res.url, truncated: bounded.truncated };
   } catch {
     return null;
   } finally {
@@ -220,10 +223,15 @@ export async function fetchLiveYouTubeChannelData(
   try {
     const page = await fetchPublicYouTubePage(youtubeUrl, 0, fetchImpl);
     if (!page) return null;
-    return parseYouTubeChannelAboutFromHtml(page.html, {
+    const parsed = parseYouTubeChannelAboutFromHtml(page.html, {
       enableDebug,
       finalUrl: page.finalUrl
     });
+    // A truncated prefix with no usable evidence is an incomplete fetch, not
+    // a definitive empty About page: return null so callers record
+    // ATTEMPTED_FAILED (retryable) instead of ATTEMPTED_EMPTY (terminal).
+    if (page.truncated && !parsed.bio?.trim() && !(parsed.channelLinks?.length)) return null;
+    return page.truncated ? { ...parsed, truncated: true } : parsed;
   } catch {
     return null;
   }
