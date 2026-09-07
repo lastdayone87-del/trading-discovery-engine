@@ -9,6 +9,7 @@ export type EvidenceSourceType =
   | 'adaptive_catalog'
   | 'evidence_graph'
   | 'gemini_semantic'
+  | 'groq_semantic'
   | 'discord_metadata';
 
 export type EvidencePolarity = 'POSITIVE' | 'NEGATIVE';
