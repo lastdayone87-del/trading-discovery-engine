@@ -60,6 +60,14 @@ async function main(): Promise<void> {
     } catch (error: unknown) {
       const status = Number((error as { status?: unknown })?.status) || undefined;
       const errorClass = (error as { errorClass?: unknown })?.errorClass;
+      // Local cooldown deferrals are backpressure echoes, not provider
+      // responses: they must neither inflate the genuine-429 stop condition
+      // nor the ordinary-failure count, so they get their own bucket.
+      const cooldownDeferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
+      if (cooldownDeferred) {
+        results.push({ n: i + 1, ok: false, latency_ms: Date.now() - started, deferred: true });
+        continue;
+      }
       const is429 = status === 429 || errorClass === 'RATE_LIMIT' || /rate.?limit|429/i.test(String((error as Error)?.message || ''));
       if (is429) {
         consecutive429++;
@@ -84,7 +92,8 @@ async function main(): Promise<void> {
     attempted: results.filter(r => typeof r.n === 'number').length,
     succeeded: ok,
     rate_limited: results.filter(r => r.rate_limited).length,
-    failed: results.filter(r => !r.ok && !r.rate_limited && typeof r.n === 'number').length,
+    deferred: results.filter(r => r.deferred).length,
+    failed: results.filter(r => !r.ok && !r.rate_limited && !r.deferred && typeof r.n === 'number').length,
     latency_ms: latencies.length
       ? { p50: latencies[Math.floor((latencies.length - 1) * 0.5)], p95: latencies[Math.floor((latencies.length - 1) * 0.95)] }
       : null,
