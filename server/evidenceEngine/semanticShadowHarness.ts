@@ -77,10 +77,17 @@ export async function runSemanticShadowComparison(
   cases: ShadowCaseInput[],
   providers: { gemini: EvidenceProvider; groq: EvidenceProvider },
   knowledge: LayeredKnowledgeContext,
+  options?: { intervalMs?: number },
 ): Promise<ShadowComparisonReport> {
+  const intervalMs = Math.max(0, Math.floor(options?.intervalMs ?? 0) || 0);
   const comparisons: ShadowCaseComparison[] = [];
   const failures: ShadowComparisonReport['failures'] = [];
+  let first = true;
   for (const { id, input } of cases) {
+    // Optional pacing between cases so live shadow runs respect free-tier
+    // RPM/TPM envelopes; offline stub runs pass 0 and stay fast.
+    if (!first && intervalMs > 0) await new Promise<void>(resolve => setTimeout(resolve, intervalMs));
+    first = false;
     const [geminiSettled, groqSettled] = await Promise.allSettled([
       providers.gemini.collectEvidence(input, knowledge),
       providers.groq.collectEvidence(input, knowledge),
