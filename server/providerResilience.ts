@@ -183,6 +183,19 @@ export function geminiSemanticCooldownMs(): number {
   return geminiCapacityConfig().semanticRateLimitCooldownMs;
 }
 
+/**
+ * Returns true when the Groq semantic pool is inside its shared rate-limit
+ * cooldown (any route's RATE_LIMITED event still within the window).
+ * Delegates to the persisted-ledger resolver so queue admission and retry
+ * timing read one authoritative state. Dynamic import preserves the
+ * module's existing lazy database boundary.
+ */
+export async function isGroqSemanticCooldownActive(nowMs: number = Date.now()): Promise<boolean> {
+  const { resolveGroqSemanticCooldownExpiryMs } = await import('./dbCore');
+  const expiry = await resolveGroqSemanticCooldownExpiryMs(nowMs);
+  return expiry !== undefined && expiry > nowMs;
+}
+
 function abortError():Error{const error=new Error('aborted');error.name='AbortError';return error;}
 
 function waitForCapacity(ms:number,signal?:AbortSignal):Promise<void>{

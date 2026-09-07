@@ -75,7 +75,7 @@ import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWorker';
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
-import { isGeminiSemanticCooldownActive } from './providerResilience';
+import { isGeminiSemanticCooldownActive, isGroqSemanticCooldownActive } from './providerResilience';
 import { shouldUseGroqSemantic } from './evidenceEngine/providers/GroqSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
@@ -154,16 +154,18 @@ export function preferredLanguageFromQueryMetadata(metadata: Record<string, unkn
 
 /**
  * Pure ENRICH_CHANNEL claim gate over the active semantic route's cooldown.
- * Gemini-selected claims pause while the Gemini cooldown is active (DEFER
- * storm guard); Groq-selected claims are never blocked by a stale Gemini
- * cooldown. Unit-testable without a database; the async cooldown read stays
- * at the call site.
+ * Each route consults only its own provider's cooldown: Gemini-selected
+ * claims pause while the Gemini cooldown is active (DEFER storm guard), and
+ * Groq-selected claims pause while the Groq cooldown is active — a stale
+ * cooldown on the idle route never stalls the serving one. Unit-testable
+ * without a database; the async cooldown reads stay at the call site.
  */
 export function enrichChannelClaimableDuringCooldown(input: {
   groqSelected: boolean;
   geminiCooldownActive: boolean;
+  groqCooldownActive: boolean;
 }): boolean {
-  if (input.groqSelected) return true;
+  if (input.groqSelected) return !input.groqCooldownActive;
   return !input.geminiCooldownActive;
 }
 
@@ -202,14 +204,14 @@ export async function processNextSearchJob(
   // enrichment_stage >= 1, so when Gemini is rate-limited every claimed
   // ENRICH_CHANNEL job immediately defers via SEMANTIC_DEFERRED_RATE_PRESSURE,
   // creating a ~1Hz DEFER storm. This gate pauses ENRICH_CHANNEL claims
-  // during the Gemini cooldown period. When Groq serves semantic
-  // classification instead, a stale Gemini cooldown must not stall healthy
-  // Groq work: the Groq path never defers on Gemini capacity, so no storm is
-  // possible and the gate stays open.
+  // during the active route's cooldown period: Gemini-selected claims consult
+  // the Gemini cooldown, Groq-selected claims consult the Groq cooldown, so a
+  // stale cooldown on the idle route can never stall the serving one.
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiCooldownActive = groqSelected ? false : await isGeminiSemanticCooldownActive();
-    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
+    const groqCooldownActive = groqSelected ? await isGroqSemanticCooldownActive() : false;
+    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiCooldownActive, groqCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
   }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');

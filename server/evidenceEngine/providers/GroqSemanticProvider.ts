@@ -49,6 +49,47 @@ export function groqTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 135000;
 }
 
+/** Global provider-deadline rollout contract (mirrors the Gemini semantic call site). */
+export function groqDeadlinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PROVIDER_DEADLINES_ENABLED !== 'false';
+}
+
+/**
+ * Shared in-process Groq rate-limit cooldown. A genuine provider 429 arms it;
+ * while armed, every worker short-circuits before any fetch, so repeated
+ * ticks cannot re-hit the same limit window. The persisted
+ * provider_call_events ledger (provider='groq', RATE_LIMITED) carries the
+ * cross-replica state consumed by the queue gate and retry timing; this
+ * in-process flag is the fast path for repeated in-process workers.
+ */
+export const DEFAULT_GROQ_RATE_LIMIT_COOLDOWN_MS = 90_000;
+/** Stable marker identifying Groq rate-limit failures for retry-timing alignment. */
+export const GROQ_RATE_LIMITED_REASON = 'GROQ_RATE_LIMITED';
+
+export function groqRateLimitCooldownMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.GROQ_RATE_LIMIT_COOLDOWN_MS || '90000');
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_GROQ_RATE_LIMIT_COOLDOWN_MS;
+}
+
+let groqCooldownUntilMs = 0;
+export function groqCooldownRemainingMs(nowMs: number = Date.now()): number {
+  return Math.max(0, groqCooldownUntilMs - nowMs);
+}
+
+/** Test-only reset for the in-process cooldown. */
+export function resetGroqCooldownForTests(): void {
+  groqCooldownUntilMs = 0;
+}
+
+function groqCooldownDeferredError(remainingMs: number): ProviderCallError {
+  return Object.assign(
+    new ProviderCallError('Groq semantic classification deferred during provider rate pressure.', 'RATE_LIMIT', true, {
+      providerReasons: [GROQ_RATE_LIMITED_REASON],
+    }),
+    { groqCooldownDeferred: true, retryAfterMs: Math.max(0, remainingMs) },
+  );
+}
+
 export async function runGroqRouteFailover<T>(routes: GroqRoute[], call: (route: GroqRoute) => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (const route of routes) {
@@ -88,17 +129,26 @@ export function defaultClient(emit: (event: ProviderCallEvent) => Promise<void> 
   const routes = configuredGroqRoutes();
   if (!routes.length) return undefined;
   const timeoutMs = groqTimeoutMs();
+  const deadlinesEnabled = groqDeadlinesEnabled();
   return { classify: async (prompt, model) => {
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
         requestMetadata: { groqRoute: route.id }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
       try {
+        // Cooldown short-circuit: never spend a fetch while the shared window
+        // is armed. Thrown inside the try so the catch below still emits
+        // exactly one failure event (keeping the persisted ledger fresh) and
+        // the sentinel skips re-arming. Failover policy still applies
+        // (RATE_LIMIT never spills to another route), so concurrent workers
+        // converge on one deferred failure each.
+        const remainingMs = groqCooldownRemainingMs();
+        if (remainingMs > 0) throw groqCooldownDeferredError(remainingMs);
         const res = await fetch(GROQ_API_BASE_URL, {
           method: 'POST',
           headers: { Authorization: `Bearer ${route.key}`, 'Content-Type': 'application/json' },
@@ -146,13 +196,27 @@ export function defaultClient(emit: (event: ProviderCallEvent) => Promise<void> 
         const typed = aborted
           ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
           : classifyProviderError(error);
+        if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred !== true) {
+          // Genuine provider 429: arm the shared cooldown once. The deferred
+          // sentinel above is excluded so short-circuits never extend the
+          // window indefinitely.
+          groqCooldownUntilMs = Date.now() + groqRateLimitCooldownMs();
+        }
+        if (typed.errorClass === 'RATE_LIMIT') {
+          const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
+            ? ((typed as { providerReasons?: unknown }).providerReasons as string[]).map(String)
+            : [];
+          if (!reasons.includes(GROQ_RATE_LIMITED_REASON)) {
+            (typed as { providerReasons?: string[] }).providerReasons = [...reasons, GROQ_RATE_LIMITED_REASON];
+          }
+        }
         await emit({
           ...base, status: statusFor(typed), latencyMs: Date.now() - started,
           actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
         });
         throw typed;
       } finally {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
       }
     });
     return response;

@@ -6,7 +6,9 @@ import {
   GroqSemanticProvider,
   configuredGroqRoutes,
   defaultClient,
+  groqCooldownRemainingMs,
   groqTimeoutMs,
+  resetGroqCooldownForTests,
   runGroqRouteFailover,
   shouldUseGroqSemantic,
 } from './GroqSemanticProvider';
@@ -349,4 +351,151 @@ test('oversized provider responses fail closed with one failure event, never SUC
     if (savedKey === undefined) delete process.env.GROQ_API_KEY;
     else process.env.GROQ_API_KEY = savedKey;
   }
+});
+
+test('groq 429 arms the shared cooldown: repeat workers short-circuit without fetching', async () => {
+  resetGroqCooldownForTests();
+  const events: Array<{ status: string }> = [];
+  let fetches = 0;
+  const limited = new Response('{"error":{"message":"Rate limit reached"}}', {
+    status: 429, headers: { 'content-type': 'application/json' },
+  });
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  globalThis.fetch = (async () => { fetches++; return limited.clone(); }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async event => { events.push(event); });
+    const first = await client!.classify('prompt', 'model').then(() => null, (error: unknown) => error);
+    assert.ok(first instanceof ProviderCallError && first.errorClass === 'RATE_LIMIT');
+    assert.ok((first as { providerReasons?: string[] }).providerReasons?.includes('GROQ_RATE_LIMITED'));
+    assert.equal(fetches, 1);
+    assert.ok(groqCooldownRemainingMs() > 0);
+    // Repeated worker ticks during the window: no new fetches, one deferred failure each.
+    const repeats = await Promise.all([0, 1, 2, 3, 4].map(() => client!.classify('prompt', 'model').then(() => null, (error: unknown) => error)));
+    assert.equal(fetches, 1);
+    assert.ok(repeats.every(error => error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT'));
+    assert.ok(repeats.every(error => Number((error as { retryAfterMs?: unknown }).retryAfterMs) > 0));
+    assert.equal(events.length, 6);
+    assert.ok(events.every(event => event.status !== 'SUCCESS'));
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    resetGroqCooldownForTests();
+  }
+});
+
+test('groq cooldown recovery: requests resume after expiry', async () => {
+  resetGroqCooldownForTests();
+  const events: Array<{ status: string }> = [];
+  let fetches = 0;
+  let limited = true;
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  const savedCooldown = process.env.GROQ_RATE_LIMIT_COOLDOWN_MS;
+  globalThis.fetch = (async () => {
+    fetches++;
+    if (limited) return new Response('{"error":{"message":"Rate limit reached"}}', { status: 429, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  process.env.GROQ_RATE_LIMIT_COOLDOWN_MS = '50';
+  try {
+    const client = defaultClient(async event => { events.push(event); });
+    await assert.rejects(client!.classify('prompt', 'model'));
+    assert.equal(fetches, 1);
+    limited = false;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+    assert.equal(fetches, 2);
+    assert.equal(events.at(-1)?.status, 'SUCCESS');
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    if (savedCooldown === undefined) delete process.env.GROQ_RATE_LIMIT_COOLDOWN_MS;
+    else process.env.GROQ_RATE_LIMIT_COOLDOWN_MS = savedCooldown;
+    resetGroqCooldownForTests();
+  }
+});
+
+test('disabled deadlines never abort groq calls', async () => {
+  resetGroqCooldownForTests();
+  const valid = () => new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  });
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  const savedDeadlines = process.env.PROVIDER_DEADLINES_ENABLED;
+  const savedTimeout = process.env.GROQ_PROVIDER_TIMEOUT_MS;
+  globalThis.fetch = (async () => { await new Promise(resolve => setTimeout(resolve, 60)); return valid(); }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  process.env.PROVIDER_DEADLINES_ENABLED = 'false';
+  process.env.GROQ_PROVIDER_TIMEOUT_MS = '20';
+  try {
+    const client = defaultClient(async () => undefined);
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    if (savedDeadlines === undefined) delete process.env.PROVIDER_DEADLINES_ENABLED;
+    else process.env.PROVIDER_DEADLINES_ENABLED = savedDeadlines;
+    if (savedTimeout === undefined) delete process.env.GROQ_PROVIDER_TIMEOUT_MS;
+    else process.env.GROQ_PROVIDER_TIMEOUT_MS = savedTimeout;
+    resetGroqCooldownForTests();
+  }
+});
+
+test('enabled deadlines preserve timeout classification and cleanup', async () => {
+  resetGroqCooldownForTests();
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.GROQ_API_KEY;
+  const savedDeadlines = process.env.PROVIDER_DEADLINES_ENABLED;
+  const savedTimeout = process.env.GROQ_PROVIDER_TIMEOUT_MS;
+  globalThis.fetch = ((url: unknown, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => {
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      reject(error);
+    });
+  })) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'test-key';
+  process.env.PROVIDER_DEADLINES_ENABLED = 'true';
+  process.env.GROQ_PROVIDER_TIMEOUT_MS = '20';
+  try {
+    const client = defaultClient(async () => undefined);
+    await assert.rejects(
+      client!.classify('prompt', 'model'),
+      (error: unknown) => error instanceof ProviderCallError && error.errorClass === 'TIMEOUT' && error.retryable,
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = savedKey;
+    if (savedDeadlines === undefined) delete process.env.PROVIDER_DEADLINES_ENABLED;
+    else process.env.PROVIDER_DEADLINES_ENABLED = savedDeadlines;
+    if (savedTimeout === undefined) delete process.env.GROQ_PROVIDER_TIMEOUT_MS;
+    else process.env.GROQ_PROVIDER_TIMEOUT_MS = savedTimeout;
+    resetGroqCooldownForTests();
+  }
+});
+
+test('groq rate-limit failures schedule retries past the shared cooldown expiry', async () => {
+  const { decideJobFailure } = await import('../../dbCore');
+  const now = 1_000_000_000;
+  const expiry = now + 90_000;
+  const groqRateLimit = (): unknown => ({
+    message: 'Groq HTTP 429', retryable: true, errorClass: 'RATE_LIMIT', status: 429, providerReasons: ['GROQ_RATE_LIMITED'],
+  });
+  const first = decideJobFailure(groqRateLimit(), 1, 4, now, now, undefined, expiry);
+  assert.equal(first.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.ok(first.runAfter! >= expiry);
+  const concurrent = [1, 2, 3].map(attempt => decideJobFailure(groqRateLimit(), attempt, 4, now, now, undefined, expiry));
+  assert.ok(concurrent.every(result => result.disposition === 'RETRYING_WITHOUT_ATTEMPT' && result.runAfter! >= expiry));
+  const noExpiry = decideJobFailure(groqRateLimit(), 1, 4, now, now, undefined, undefined);
+  assert.equal(noExpiry.runAfter, now + 30_000);
+  const unmarked = decideJobFailure({ message: 'x', retryable: true, errorClass: 'TRANSIENT' }, 1, 4, now, now, undefined, expiry);
+  assert.equal(unmarked.runAfter, now + 30_000);
 });

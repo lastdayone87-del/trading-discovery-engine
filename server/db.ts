@@ -3,7 +3,7 @@
 // and independently testable without changing the rest of the database surface.
 export * from './dbCore';
 
-import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs } from './dbCore';
+import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs } from './dbCore';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -36,12 +36,18 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   // Gemini rate limits are project-level: a single RATE_LIMITED event on any
   // route triggers a shared cooldown that blocks all semantic operations.
   let geminiSemanticCooldownExpiryMs: number|undefined=undefined;
+  let groqSemanticCooldownExpiryMs: number|undefined=undefined;
   const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
   if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){
     geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(now);
   }
+  // Groq pool cooldown from the same persisted ledger (provider='groq'):
+  // a Groq 429 defers the retry past the shared window instead of ticking.
+  if(providerReasons.includes('GROQ_RATE_LIMITED')){
+    groqSemanticCooldownExpiryMs=await resolveGroqSemanticCooldownExpiryMs(now);
+  }
 
-  const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs);
+  const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs);
   const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 
