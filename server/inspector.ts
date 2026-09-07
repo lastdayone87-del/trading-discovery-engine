@@ -8,6 +8,7 @@ import type { BrowserFallbackResult } from './browserCommunityFallback';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, type CrawlerTelemetry} from './crawlerTelemetry';
+import { readBoundedResponseText } from './crawlResponseBounds';
 
 export interface InspectionResult {
   debugLog?: any;
@@ -82,7 +83,7 @@ async function fetchWithTimeout(url: string, depth = 0): Promise<{ html: string;
     if (!res.ok) return null;
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('text/html') && !contentType.includes('json') && !contentType.includes('plain')) return null;
-    return { html: await res.text(), finalUrl: res.url };
+    return { html: await readBoundedResponseText(res), finalUrl: res.url };
   } catch { return null; }
   finally { clearTimeout(id); }
 }
@@ -99,7 +100,7 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch):Promise<{pag
     const contentType=response.headers.get('content-type')||'';
     if(!response.ok){const retryable=response.status===429||response.status>=500,retryAfter=response.headers.get('retry-after')||'',retryAfterSeconds=Number(retryAfter),retryAt=retryable?(Number.isFinite(retryAfterSeconds)?clampRetryAtTimestamp(Date.now()+Math.max(0,retryAfterSeconds*1000)):clampRetryAtTimestamp(Date.parse(retryAfter)||undefined)):undefined;return {page:null,observation:{requestedUrl:url,finalUrl:response.url||url,outcome:'ACQUISITION_FAILED',retryable,httpStatus:response.status,failureClass:response.status===429?'RATE_LIMIT':response.status>=500?'TRANSIENT_HTTP':'HTTP_ERROR',retryAt,detail:`HTTP ${response.status}`}};}
     if(!contentType.includes('text/html')&&!contentType.includes('json')&&!contentType.includes('plain'))return {page:null,observation:{requestedUrl:url,finalUrl:response.url||url,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:response.status,failureClass:'UNSUPPORTED_CONTENT_TYPE',detail:`Unsupported content type ${contentType||'unknown'}`}};
-    return {page:{html:await response.text(),finalUrl:response.url||url}};
+    return {page:{html:await readBoundedResponseText(response),finalUrl:response.url||url}};
   }catch(error:any){const timeout=error?.name==='AbortError';return {page:null,observation:{requestedUrl:url,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:timeout?'TIMEOUT':'NETWORK_FAILURE',detail:String(error?.message||error)}};}
   finally { clearTimeout(timer); }
 }

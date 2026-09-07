@@ -3,6 +3,7 @@
  * Shared by Gate 1 country validation fallback and channel inspection.
  */
 import { decodeEmbeddedMarkup, extractEmbeddedUrls } from './crawlerExtraction';
+import { readBoundedResponseText } from './crawlResponseBounds';
 
 /** Local unions avoid coupling this helper to the full app types module. */
 export type PublicAboutCountryStatus = 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED';
@@ -118,7 +119,7 @@ export async function fetchPublicYouTubePage(
     ) {
       return null;
     }
-    return { html: await res.text(), finalUrl: res.url };
+    return { html: await readBoundedResponseText(res), finalUrl: res.url };
   } catch {
     return null;
   } finally {
