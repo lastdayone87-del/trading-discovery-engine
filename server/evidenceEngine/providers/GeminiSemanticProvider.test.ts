@@ -97,10 +97,15 @@ test('rate-limited Gemini route failure surfaces without cross-route burst',asyn
   // shared cooldown (not another key) absorbs the pressure.
   const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
   const calls:string[]=[];
-  await assert.rejects(runGeminiRouteFailover([{id:'gemini-1',key:'hidden-a'},{id:'gemini-2',key:'hidden-b'}],async route=>{
+  const thrown=new ProviderCallError('rate pressure','RATE_LIMIT',true,{status:429});
+  const caught=await runGeminiRouteFailover([{id:'gemini-1',key:'hidden-a'},{id:'gemini-2',key:'hidden-b'}],async route=>{
     calls.push(route.id);
-    throw new ProviderCallError('rate pressure','RATE_LIMIT',true,{status:429});
-  }), (error:any)=>error instanceof ProviderCallError&&error.errorClass==='RATE_LIMIT');
+    throw thrown;
+  }).then(()=>null,(error:any)=>error);
+  // Identity: the original 429 (status + provider metadata) must reach the
+  // caller untouched so cooldown persistence and diagnostics keep working.
+  assert.equal(caught,thrown);
+  assert.equal((caught as ProviderCallError).status,429);
   assert.deepEqual(calls,['gemini-1']);
 });
 
