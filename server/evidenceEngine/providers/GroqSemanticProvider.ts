@@ -302,6 +302,7 @@ export function isDecisiveButUncited(result: SemanticModelResult): boolean {
  * only for the missing field citations. The original candidate prompt is
  * reused verbatim so no prompt behavior can drift.
  */
+export const SEMANTIC_CITATION_REPAIR_PROMPT_VERSION = 'citation-repair-1';
 export function buildCitationRepairPrompt(candidatePrompt: string, result: SemanticModelResult): string {
   return [
     'Your previous classification is missing required field citations.',
@@ -385,7 +386,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
     const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
-    const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...(repairSurvived() ? ['SEMANTIC_CITATION_REPAIR'] : []), ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : []), ...(abstained && isDecisiveButUncited(result) ? ['SEMANTIC_ABSTAIN_NO_CITATIONS'] : [])] };
+    const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, ...(repairSurvived() ? { repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION } : {}), taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...(repairSurvived() ? ['SEMANTIC_CITATION_REPAIR'] : []), ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : []), ...(abstained && isDecisiveButUncited(result) ? ['SEMANTIC_ABSTAIN_NO_CITATIONS'] : [])] };
     const citations=result.citations.map(ref=>{const video=ref.field==='video_title'||ref.field==='video_description'?input.videos?.[ref.index||0]:undefined,family=video?.source_family_id||(ref.field==='channel_title'||ref.field==='channel_bio'?input.channel_source_family_id:undefined),entity=video?.source_entity_id||((video||ref.field==='channel_title'||ref.field==='channel_bio')?input.channel_entity_id:undefined);return {...ref,...(family?{sourceFamilyId:family}:{}),...(entity?{sourceEntityId:entity}:{})};});
     return [{
       id: `semantic_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, source: this.name, polarity: positive || abstained ? 'POSITIVE' : 'NEGATIVE', category,

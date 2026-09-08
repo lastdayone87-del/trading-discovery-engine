@@ -66,6 +66,7 @@ function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
 test('groq provider emits a terminal negative with identical weights for unrelated creators', async () => {
   const provider = new GroqSemanticProvider(of(unrelatedResult));
   const [item] = await provider.collectEvidence(input, {} as any);
+  assert.equal(item.provenance?.semantic?.repairPromptVersion, undefined);
   assert.equal(item.source, 'groq_semantic');
   assert.equal(item.polarity, 'NEGATIVE');
   assert.equal(item.category, 'IRRELEVANT_DOMAIN');
@@ -718,6 +719,7 @@ test('repair preserves the original decision when the model tries to change it',
   assert.equal(item.provenance?.semantic?.taxonomyLabel, 'UNRELATED');
   assert.equal(item.provenance?.semantic?.rawConfidence, 96);
   assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
+  assert.equal(item.provenance?.semantic?.repairPromptVersion, 'citation-repair-1');
 });
 
 test('hallucinated citations never become evidence', async () => {

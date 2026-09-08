@@ -57,6 +57,8 @@ export interface EvidenceProvenance {
     promptVersion: string;
     featureVersion: string;
     calibrationVersion: string;
+    /** Present only when a citation-repair retry produced the surviving result. */
+    repairPromptVersion?: string;
     taxonomyLabel: string;
     rawConfidence: number;
     calibratedConfidence: number;
