@@ -628,10 +628,18 @@ test('isDecisiveButUncited admits only confident supported labels missing citati
 });
 
 test('repair prompt preserves the original decision and reuses the candidate prompt', () => {
-  const prompt = buildCitationRepairPrompt('{"task":"CANDIDATE"}', { label: 'UNRELATED', confidence: 96, supportedLanguage: true } as any);
+  const refs = [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }];
+  const prompt = buildCitationRepairPrompt('{"task":"CANDIDATE"}', { label: 'UNRELATED', confidence: 96, supportedLanguage: true } as any, refs as never);
   assert.match(prompt, /UNRELATED/);
   assert.match(prompt, /citations/);
   assert.ok(prompt.includes('{"task":"CANDIDATE"}'));
+});
+
+test('V3 repair prompt enumerates the supplied refs with the honesty clause', () => {
+  const refs = [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }];
+  const prompt = buildCitationRepairPrompt('{"task":"CANDIDATE"}', { label: 'UNRELATED', confidence: 96, supportedLanguage: true } as any, refs as never);
+  assert.ok(prompt.includes('You may only cite from this exact list: [{"field":"channel_bio"}, {"field":"video_title","index":0}]'));
+  assert.match(prompt, /never invent a reference/);
 });
 
 test('citation repair recovers a decisive-but-uncited result without changing its label', async () => {
@@ -642,6 +650,9 @@ test('citation repair recovers a decisive-but-uncited result without changing it
   const [item] = await new GroqSemanticProvider(repairing).collectEvidence(input, {} as any);
   assert.equal(seen.length, 2);
   assert.match(seen[1], /citations/);
+  assert.match(seen[1], /You may only cite from this exact list/);
+  assert.match(seen[1], /never invent a reference/);
+  assert.ok(seen[1].includes('{"field":"channel_bio"}'));
   assert.equal(item.category, 'IRRELEVANT_DOMAIN');
   assert.equal(item.polarity, 'NEGATIVE');
   assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
@@ -719,7 +730,7 @@ test('repair preserves the original decision when the model tries to change it',
   assert.equal(item.provenance?.semantic?.taxonomyLabel, 'UNRELATED');
   assert.equal(item.provenance?.semantic?.rawConfidence, 96);
   assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
-  assert.equal(item.provenance?.semantic?.repairPromptVersion, 'citation-repair-1');
+  assert.equal(item.provenance?.semantic?.repairPromptVersion, 'citation-repair-2');
 });
 
 test('hallucinated citations never become evidence', async () => {

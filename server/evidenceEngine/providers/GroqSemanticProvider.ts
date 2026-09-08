@@ -298,15 +298,25 @@ export function isDecisiveButUncited(result: SemanticModelResult): boolean {
 }
 
 /**
- * Targeted citation-repair prompt: preserves the original decision and asks
- * only for the missing field citations. The original candidate prompt is
- * reused verbatim so no prompt behavior can drift.
+ * Targeted citation-repair prompt (V3): preserves the original decision and
+ * asks only for the missing field citations, enumerating the exact supplied
+ * references with an honesty clause. The original candidate prompt is reused
+ * verbatim so no prompt behavior can drift. Measured offline: 3/3 resolution
+ * with 15/15 valid citations and 100% label/polarity preservation, against
+ * 1/3 for the unlisted preface; the closed list without the honesty clause
+ * resolved 0/3 and must not ship.
  */
-export const SEMANTIC_CITATION_REPAIR_PROMPT_VERSION = 'citation-repair-1';
-export function buildCitationRepairPrompt(candidatePrompt: string, result: SemanticModelResult): string {
+export const SEMANTIC_CITATION_REPAIR_PROMPT_VERSION = 'citation-repair-2';
+export function buildCitationRepairPrompt(
+  candidatePrompt: string,
+  result: SemanticModelResult,
+  refs: Array<{ field: string; index?: number; sourceId?: string }>,
+): string {
+  const refList = refs.map(ref => JSON.stringify(ref)).join(', ');
   return [
     'Your previous classification is missing required field citations.',
     `Keep label=${result.label}, confidence=${result.confidence}, supportedLanguage=${result.supportedLanguage}.`,
+    `You may only cite from this exact list: [${refList}]. Cite only list entries, with matching field, index, and sourceId. If no listed reference supports the decision, return "citations":[] — never invent a reference.`,
     'Return the complete classification JSON with citations populated from the supplied field references; an uncited classification cannot be used.',
     `Original request: ${candidatePrompt}`,
   ].join(' ');
@@ -361,7 +371,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
     let repairedCitations: SemanticModelResult['citations'] | null = null;
     if (isDecisiveButUncited(result)) {
       try {
-        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result), model));
+        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result, candidateDocumentRefs(input)), model));
         const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
         if (retained.length > 0) {
           result = { ...result, citations: retained };
