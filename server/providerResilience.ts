@@ -34,7 +34,7 @@ export function classifyProviderError(error: unknown): ProviderCallError {
   return new ProviderCallError('Provider call failed.','TRANSIENT',true,{cause:error});
 }
 
-const statusFor=(e:ProviderCallError):ProviderStatus => e.errorClass==='TIMEOUT'?'TIMEOUT':e.errorClass==='CANCELLED'?'CANCELLED':e.errorClass==='RATE_LIMIT'?'RATE_LIMITED':e.retryable?'TRANSIENT_ERROR':'PERMANENT_ERROR';
+export const statusFor=(e:ProviderCallError):ProviderStatus => e.errorClass==='TIMEOUT'?'TIMEOUT':e.errorClass==='CANCELLED'?'CANCELLED':e.errorClass==='RATE_LIMIT'?'RATE_LIMITED':e.retryable?'TRANSIENT_ERROR':'PERMANENT_ERROR';
 export type ProviderEventSink=(event:ProviderCallEvent)=>Promise<void>;
 
 const GEMINI_CAPACITY_LOCK = 741963285;
@@ -181,6 +181,19 @@ export async function isGeminiSemanticCooldownActive(nowMs: number = Date.now())
  */
 export function geminiSemanticCooldownMs(): number {
   return geminiCapacityConfig().semanticRateLimitCooldownMs;
+}
+
+/**
+ * Returns true when the Groq semantic pool is inside its shared rate-limit
+ * cooldown (any route's RATE_LIMITED event still within the window).
+ * Delegates to the persisted-ledger resolver so queue admission and retry
+ * timing read one authoritative state. Dynamic import preserves the
+ * module's existing lazy database boundary.
+ */
+export async function isGroqSemanticCooldownActive(nowMs: number = Date.now()): Promise<boolean> {
+  const { resolveGroqSemanticCooldownExpiryMs } = await import('./dbCore');
+  const expiry = await resolveGroqSemanticCooldownExpiryMs(nowMs);
+  return expiry !== undefined && expiry > nowMs;
 }
 
 function abortError():Error{const error=new Error('aborted');error.name='AbortError';return error;}

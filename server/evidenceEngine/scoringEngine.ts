@@ -6,6 +6,7 @@ import {
   LayeredKnowledgeContext
 } from './types';
 import type { StagedClassificationReport } from './types';
+import { isSemanticClassificationSource } from './types';
 import { evaluateClassificationStages } from './stagedClassification';
 import { ENGINE_VERSIONS, getScoringConfig } from './config';
 import { TradingCategory } from '../../src/types';
@@ -80,16 +81,21 @@ export class ConfigurableWeightedStrategy {
 
     justifications.push(`UNIFIED POLICY ${UNIFIED_DECISION_POLICY_VERSION}: ${policy.reasonCodes.join(', ')}; calibrated trading probability ${policy.tradingProbability}%; coverage ${policy.coverageConfidence}%.`);
 
-    // Extract Gemini semantic summary if available
-    const geminiItem = evidenceItems.find(i => i.source === 'gemini_semantic');
+    // Semantic audit summary for whichever governed semantic provider served
+    // this evaluation (routing guarantees at most one). The field name stays
+    // provider-neutral-compatible for existing consumers; the model reports
+    // the actual serving model from semantic provenance.
+    const semanticItem = evidenceItems.find(i => isSemanticClassificationSource(i.source));
     let geminiSemanticSummary = undefined;
-    if (geminiItem) {
+    if (semanticItem) {
       geminiSemanticSummary = {
-        isTrading: geminiItem.polarity === 'POSITIVE' ? ('YES' as const) : geminiItem.polarity === 'NEGATIVE' ? ('NO' as const) : ('UNCERTAIN' as const),
-        concepts: geminiItem.rawMatches,
+        // Abstentions carry positive polarity with zero weight: an abstention
+        // is uncertainty, never a trading approval, for either provider.
+        isTrading: semanticItem.category === 'SEMANTIC_ABSTENTION' ? ('UNCERTAIN' as const) : semanticItem.polarity === 'POSITIVE' ? ('YES' as const) : semanticItem.polarity === 'NEGATIVE' ? ('NO' as const) : ('UNCERTAIN' as const),
+        concepts: semanticItem.rawMatches,
         instruments: [],
-        reason: geminiItem.fact,
-        modelUsed: ENGINE_VERSIONS.geminiModelVersion
+        reason: semanticItem.fact,
+        modelUsed: semanticItem.provenance?.semantic?.modelVersion || ENGINE_VERSIONS.geminiModelVersion
       };
     }
 

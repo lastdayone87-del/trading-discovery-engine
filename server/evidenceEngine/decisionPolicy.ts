@@ -1,4 +1,5 @@
 import type { EvidenceCollectionReport, EvidenceItem, LifecycleAction } from './types';
+import { isSemanticClassificationSource } from './types';
 import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v2-conflict-aware';
@@ -27,7 +28,7 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
   const substantivePositiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   if(substantivePositiveWeight>0) return false;
-  const semanticUnrelated=evidence.filter(item=>item.source==='gemini_semantic'&&item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
+  const semanticUnrelated=evidence.filter(item=>isSemanticClassificationSource(item.source)&&item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 

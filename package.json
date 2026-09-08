@@ -32,6 +32,8 @@
     "creator-intelligence:readiness": "tsx scripts/creatorIntelligenceReadiness.ts",
     "phase4:replay": "tsx scripts/phase4Replay.ts",
     "semantic:benchmark": "tsx scripts/semanticProviderBenchmark.ts",
+    "semantic:shadow": "tsx scripts/groqShadowRun.ts",
+    "groq:capacity": "tsx scripts/groqCapacityProbe.ts",
     "phase5:verify": "npm test && npm run lint && npm run build",
     "phase6:verify": "npm test && npm run lint && npm run build",
     "phase7:verify": "npm test && npm run lint && npm run build",

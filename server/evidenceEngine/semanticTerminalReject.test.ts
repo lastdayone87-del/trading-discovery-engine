@@ -5,12 +5,13 @@ import { evaluateUnifiedDecisionPolicy, SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDEN
 import { calibrateSemanticConfidence, SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 import type { EvidenceCollectionReport, EvidenceItem } from './types';
 
-function semanticUnrelated(rawConfidence = 96, fields: any[] = [{ field: 'channel_bio', sourceId: 'about' }], taxonomyLabel = 'UNRELATED'): EvidenceItem {
+function semanticUnrelated(rawConfidence = 96, fields: any[] = [{ field: 'channel_bio', sourceId: 'about' }], taxonomyLabel = 'UNRELATED', source: 'gemini_semantic' | 'groq_semantic' = 'gemini_semantic'): EvidenceItem {
   const calibratedConfidence = calibrateSemanticConfidence(rawConfidence);
   const rawWeight = 26;
+  const modelVersion = source === 'groq_semantic' ? 'openai/gpt-oss-120b' : 'gemini-3.6-flash';
   return {
     id: 'semantic-unrelated',
-    source: 'gemini_semantic',
+    source,
     polarity: 'NEGATIVE',
     category: taxonomyLabel === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT',
     fact: 'Multilingual semantic evidence [UNRELATED]: The content is a sports and entertainment podcast with no financial or trading focus.',
@@ -22,13 +23,13 @@ function semanticUnrelated(rawConfidence = 96, fields: any[] = [{ field: 'channe
     finalWeight: -(rawWeight * 0.65 * (calibratedConfidence / 100)),
     timestamp: new Date(0).toISOString(),
     provenance: {
-      provider: 'gemini_semantic',
+      provider: source,
       type: taxonomyLabel === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT',
       matchedTerm: 'sports podcast, entertainment, NFL history',
-      sourceRef: 'structured-semantic:gemini-3.6-flash',
+      sourceRef: `structured-semantic:${modelVersion}`,
       fields,
       semantic: {
-        modelVersion: 'gemini-3.6-flash',
+        modelVersion,
         promptVersion: 'priority2-multilingual-structured-1',
         featureVersion: 'field-aware-evidence-1',
         calibrationVersion: 'multilingual-semantic-calibration-bootstrap-1',
@@ -42,14 +43,14 @@ function semanticUnrelated(rawConfidence = 96, fields: any[] = [{ field: 'channe
   } as EvidenceItem;
 }
 
-function makeCollection(status: 'SUFFICIENT' | 'INSUFFICIENT' = 'SUFFICIENT', creatorLevelCoverage = status === 'SUFFICIENT'): EvidenceCollectionReport {
+function makeCollection(status: 'SUFFICIENT' | 'INSUFFICIENT' = 'SUFFICIENT', creatorLevelCoverage = status === 'SUFFICIENT', provider: 'gemini_semantic' | 'groq_semantic' = 'gemini_semantic'): EvidenceCollectionReport {
   return {
     sufficiency: 'SUFFICIENT',
     sparseMetadata: false,
     degraded: false,
     fieldsPresent: ['description', 'video_titles'],
     reasonCodes: [],
-    providers: [{ provider: 'gemini_semantic', availability: 'AVAILABLE', evidenceCount: 1, outcome: 'EXECUTED_WITH_EVIDENCE', reasonCodes: ['PROVIDER_EVIDENCE_EMITTED'] }],
+    providers: [{ provider, availability: 'AVAILABLE', evidenceCount: 1, outcome: 'EXECUTED_WITH_EVIDENCE', reasonCodes: ['PROVIDER_EVIDENCE_EMITTED'] }],
     terminalNegativeSufficiency: {
       status,
       creatorLevelCoverage,
@@ -202,4 +203,42 @@ test('ordinary negative evidence below -25 remains UNCERTAIN without semantic te
   }];
   const { decision } = decide(evidence);
   assert.equal(decision.status, 'UNCERTAIN');
+});
+test('groq high-confidence UNRELATED takes the same terminal reject path as gemini', () => {
+  const evidence = [semanticUnrelated(96, [{ field: 'channel_bio', sourceId: 'about' }], 'UNRELATED', 'groq_semantic')];
+  const { stages, decision } = decide(evidence, makeCollection('SUFFICIENT', true, 'groq_semantic'));
+  assert.equal(stages.lifecycleAction, 'REJECT');
+  assert.equal(decision.status, 'NON_TRADING');
+  assert.ok(decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
+});
+
+test('groq UNRELATED below the top calibrated tier abstains like gemini', () => {
+  const { decision } = decide(
+    [semanticUnrelated(88, [{ field: 'channel_bio', sourceId: 'about' }], 'UNRELATED', 'groq_semantic')],
+    makeCollection('SUFFICIENT', true, 'groq_semantic'),
+  );
+  assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(!decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
+});
+
+test('groq evidence from one isolated video cannot use the shortcut', () => {
+  const { decision } = decide(
+    [semanticUnrelated(96, [{ field: 'video_title', sourceId: 'video-1', sourceFamilyId: 'youtube-video:1' }], 'UNRELATED', 'groq_semantic')],
+    makeCollection('SUFFICIENT', true, 'groq_semantic'),
+  );
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('substantive positive evidence blocks the groq shortcut', () => {
+  const positive: EvidenceItem = {
+    id: 'positive', source: 'channel_metadata', polarity: 'POSITIVE', category: 'TERMINOLOGY', fact: 'Trading term', rawMatches: ['futures'], confidence: 80,
+    reliability: 'HIGH', reliabilityMultiplier: 0.8, rawWeight: 10, finalWeight: 6.4, timestamp: new Date(0).toISOString(),
+    provenance: { provider: 'channel_metadata', type: 'metadata', matchedTerm: 'futures', sourceRef: 'channel_bio', fields: [{ field: 'channel_bio', sourceId: 'about' }] }
+  };
+  const { decision } = decide(
+    [semanticUnrelated(96, [{ field: 'channel_bio', sourceId: 'about' }], 'UNRELATED', 'groq_semantic'), positive],
+    makeCollection('SUFFICIENT', true, 'groq_semantic'),
+  );
+  assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(!decision.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 });

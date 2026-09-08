@@ -75,7 +75,8 @@ import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWorker';
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
-import { isGeminiSemanticCooldownActive } from './providerResilience';
+import { isGeminiSemanticCooldownActive, isGroqSemanticCooldownActive } from './providerResilience';
+import { shouldUseGroqSemantic } from './evidenceEngine/providers/GroqSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
@@ -152,6 +153,23 @@ export function preferredLanguageFromQueryMetadata(metadata: Record<string, unkn
 }
 
 /**
+ * Pure ENRICH_CHANNEL claim gate over the active semantic route's cooldown.
+ * Each route consults only its own provider's cooldown: Gemini-selected
+ * claims pause while the Gemini cooldown is active (DEFER storm guard), and
+ * Groq-selected claims pause while the Groq cooldown is active — a stale
+ * cooldown on the idle route never stalls the serving one. Unit-testable
+ * without a database; the async cooldown reads stay at the call site.
+ */
+export function enrichChannelClaimableDuringCooldown(input: {
+  groqSelected: boolean;
+  geminiCooldownActive: boolean;
+  groqCooldownActive: boolean;
+}): boolean {
+  if (input.groqSelected) return !input.groqCooldownActive;
+  return !input.geminiCooldownActive;
+}
+
+/**
  * Durable job types claimable through processNextSearchJob overrides.
  * RELATIONSHIP_CANARY_EXPANSION rides the existing SEARCH pool (same YouTube
  * provider profile, same tick lifecycle) behind its own settings gate, so no
@@ -181,17 +199,19 @@ export async function processNextSearchJob(
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
-  // ENRICH_CHANNEL: every such job runs the full evidence pipeline, which
-  // always includes GeminiSemanticProvider (availability() returns AVAILABLE
-  // for enrichment_stage >= 1). When Gemini is rate-limited, every claimed
+  // ENRICH_CHANNEL: every such job runs the full evidence pipeline. Under the
+  // default Gemini route, availability() returns AVAILABLE for
+  // enrichment_stage >= 1, so when Gemini is rate-limited every claimed
   // ENRICH_CHANNEL job immediately defers via SEMANTIC_DEFERRED_RATE_PRESSURE,
   // creating a ~1Hz DEFER storm. This gate pauses ENRICH_CHANNEL claims
-  // during the cooldown period, but only when ALL configured Gemini routes
-  // are rate-limited. If any route is available, ENRICH_CHANNEL work can
-  // proceed through the healthy route.
+  // during the active route's cooldown period: Gemini-selected claims consult
+  // the Gemini cooldown, Groq-selected claims consult the Groq cooldown, so a
+  // stale cooldown on the idle route can never stall the serving one.
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
-    const geminiActive = await isGeminiSemanticCooldownActive();
-    if (!geminiActive) claimableTypes.push('ENRICH_CHANNEL');
+    const groqSelected = shouldUseGroqSemantic();
+    const geminiCooldownActive = groqSelected ? false : await isGeminiSemanticCooldownActive();
+    const groqCooldownActive = groqSelected ? await isGroqSemanticCooldownActive() : false;
+    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiCooldownActive, groqCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
   }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
