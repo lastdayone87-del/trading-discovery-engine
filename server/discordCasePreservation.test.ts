@@ -49,6 +49,27 @@ test('code extraction preserves case across invite URL variants', () => {
   assert.equal(extractDiscordInviteCode('https://kick.com/some/chat'), null);
 });
 
+test('lookup index exactly mirrors the display_locator predicate (no seq/filter scans)', () => {
+  const migration = readFileSync(
+    'server/db/migrations/129_discord_display_locator_lookup.sql',
+    'utf8'
+  );
+  const dbCore = readFileSync('server/dbCore.ts', 'utf8');
+  // Index leading columns must equal the subquery's equality predicate + ordering.
+  assert.match(
+    migration,
+    /ON discord_check_attempts \(channel_id, lower\(COALESCE\(resolved_locator, invite_locator\)\), checked_at DESC\)/
+  );
+  assert.match(dbCore, /a\.channel_id=dc\.channel_id/);
+  assert.match(
+    dbCore,
+    /lower\(COALESCE\(a\.resolved_locator, a\.invite_locator\)\)=dc\.normalized_locator/
+  );
+  assert.match(dbCore, /ORDER BY a\.checked_at DESC LIMIT 1/);
+  // Index migration is structure-only: no row writes, safe to deploy unapplied.
+  assert.doesNotMatch(migration, /UPDATE|DELETE|INSERT INTO discord_candidates/);
+});
+
 test('listing API supplies latest-attempt casing without touching stored keys', () => {
   const dbCore = readFileSync('server/dbCore.ts', 'utf8');
   assert.match(dbCore, /display_locator/);
