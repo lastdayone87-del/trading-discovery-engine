@@ -700,3 +700,91 @@ test('repaired n-cooking shape resolves the recorded disagreement end to end', a
   assert.equal(decision.status, 'NON_TRADING');
   assert.ok(decision.decisionPolicy?.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
 });
+
+test('repair preserves the original decision when the model tries to change it', async () => {
+  const uncited = { ...unrelatedResult, confidence: 96, citations: [] };
+  const seen: string[] = [];
+  const rewriting: SemanticModelClient = {
+    classify: async prompt => {
+      seen.push(prompt);
+      if (seen.length === 1) return uncited;
+      return { label: 'HYPE', confidence: 99, supportedLanguage: false, reasonCodes: ['REWRITE'], explanation: 'changed', concepts: ['hype'], languages: [], citations: [{ field: 'channel_bio' }] };
+    },
+  };
+  const [item] = await new GroqSemanticProvider(rewriting).collectEvidence(input, {} as any);
+  assert.equal(seen.length, 2);
+  assert.equal(item.category, 'IRRELEVANT_DOMAIN');
+  assert.equal(item.polarity, 'NEGATIVE');
+  assert.equal(item.provenance?.semantic?.taxonomyLabel, 'UNRELATED');
+  assert.equal(item.provenance?.semantic?.rawConfidence, 96);
+  assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
+});
+
+test('hallucinated citations never become evidence', async () => {
+  const uncited = { ...unrelatedResult, confidence: 96, citations: [] };
+  const hallucinations = [
+    { field: 'playlist_name', index: 0 },
+    { field: 'video_title', index: 99 },
+    { field: 'channel_bio', sourceId: 'someone-elses-doc' },
+  ];
+  for (const citation of hallucinations) {
+    let calls = 0;
+    const hallucinating: SemanticModelClient = {
+      classify: async prompt => {
+        calls++;
+        return String(prompt).includes('missing required field citations')
+          ? { ...unrelatedResult, confidence: 96, citations: [citation] }
+          : uncited;
+      },
+    };
+    const [item] = await new GroqSemanticProvider(hallucinating).collectEvidence(input, {} as any);
+    assert.equal(calls, 2);
+    assert.equal(item.category, 'SEMANTIC_ABSTENTION', `citation ${JSON.stringify(citation)} must not score`);
+    assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_ABSTAIN_NO_CITATIONS'));
+  }
+});
+
+test('retainSuppliedCitations keeps exact references only', async () => {
+  const { retainSuppliedCitations } = await import('./GroqSemanticProvider');
+  const refs = [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }];
+  assert.deepEqual(
+    retainSuppliedCitations(
+      [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }, { field: 'video_title', index: 3 }] as never,
+      refs as never,
+    ),
+    [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }],
+  );
+});
+
+test('adjudication replacing a repaired result drops the repair code', async () => {
+  const saved = { ...process.env };
+  process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  process.env.GROQ_CANDIDATE_MODEL = 'candidate-model';
+  process.env.GROQ_ADJUDICATOR_MODEL = 'adjudicator-model';
+  try {
+    const uncited = { ...unrelatedResult, confidence: 65, citations: [] };
+    const repaired = { ...unrelatedResult, confidence: 65, citations: [{ field: 'channel_bio' }] };
+    const adjudicated = { ...unrelatedResult, label: 'AMBIGUOUS', confidence: 40, citations: [{ field: 'channel_bio' }] };
+    let calls = 0;
+    const routing: SemanticModelClient = {
+      classify: async (prompt, model) => {
+        calls++;
+        assert.equal(model, calls === 3 ? 'adjudicator-model' : 'candidate-model');
+        if (String(prompt).includes('missing required field citations')) return repaired;
+        if (String(prompt).includes('"task":"ADJUDICATION"')) return adjudicated;
+        return uncited;
+      },
+    };
+    const [item] = await new GroqSemanticProvider(routing).collectEvidence(input, {} as any);
+    assert.equal(calls, 3);
+    assert.equal(item.category, 'SEMANTIC_ABSTENTION');
+    assert.ok(!(item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
+  } finally {
+    if (saved.MULTILINGUAL_ADJUDICATION_ENABLED === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+    else process.env.MULTILINGUAL_ADJUDICATION_ENABLED = saved.MULTILINGUAL_ADJUDICATION_ENABLED;
+    if (saved.GROQ_CANDIDATE_MODEL === undefined) delete process.env.GROQ_CANDIDATE_MODEL;
+    else process.env.GROQ_CANDIDATE_MODEL = saved.GROQ_CANDIDATE_MODEL;
+    if (saved.GROQ_ADJUDICATOR_MODEL === undefined) delete process.env.GROQ_ADJUDICATOR_MODEL;
+    else process.env.GROQ_ADJUDICATOR_MODEL = saved.GROQ_ADJUDICATOR_MODEL;
+  }
+});
