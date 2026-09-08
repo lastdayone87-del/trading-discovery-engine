@@ -104,6 +104,16 @@ function fieldDocuments(input: RawChannelInput) {
   ].filter(document => document.text?.trim()).map(document => ({ ...document, text: document.text.slice(0, 1200) }));
 }
 
+/**
+ * Exact field references emitted for one input (see buildSemanticPrompt).
+ * Shared source of truth for validating repaired citations: prompt
+ * construction and citation validation read the same document set, so a
+ * repaired citation can only ever attribute a supplied document.
+ */
+export function candidateDocumentRefs(input: RawChannelInput): EvidenceFieldRef[] {
+  return fieldDocuments(input).map(document => document.ref);
+}
+
 /** Shared creator-context gate (see buildSemanticPrompt). */
 export function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
   const retrievalOnly = !!input.search_match_context && (input.enrichment_stage || 0) === 0;

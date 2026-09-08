@@ -11,11 +11,13 @@ import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../se
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
+  candidateDocumentRefs,
   hasCreatorLevelSemanticContext,
   parseSemanticResult,
   SEMANTIC_FEATURE_VERSION,
   SEMANTIC_PROMPT_VERSION,
   type SemanticModelClient,
+  type SemanticModelResult,
 } from './GeminiSemanticProvider';
 
 export const DEFAULT_GROQ_CANDIDATE_MODEL = 'openai/gpt-oss-120b';
@@ -279,6 +281,53 @@ async function classifyCandidateWith404Fallback(client: SemanticModelClient, can
   }
 }
 
+/**
+ * Decisive-but-uncited shape: the model committed to a supported,
+ * non-ambiguous label at terminal confidence yet supplied zero usable field
+ * citations, so the result would abstain for lack of evidence attribution —
+ * not for lack of a decision. This is the only shape eligible for citation
+ * repair; every other abstention trigger is left untouched.
+ */
+export function isDecisiveButUncited(result: SemanticModelResult): boolean {
+  return (
+    result.supportedLanguage &&
+    result.label !== 'AMBIGUOUS' &&
+    calibrateSemanticConfidence(result.confidence) >= 50 &&
+    result.citations.length === 0
+  );
+}
+
+/**
+ * Targeted citation-repair prompt: preserves the original decision and asks
+ * only for the missing field citations. The original candidate prompt is
+ * reused verbatim so no prompt behavior can drift.
+ */
+export const SEMANTIC_CITATION_REPAIR_PROMPT_VERSION = 'citation-repair-1';
+export function buildCitationRepairPrompt(candidatePrompt: string, result: SemanticModelResult): string {
+  return [
+    'Your previous classification is missing required field citations.',
+    `Keep label=${result.label}, confidence=${result.confidence}, supportedLanguage=${result.supportedLanguage}.`,
+    'Return the complete classification JSON with citations populated from the supplied field references; an uncited classification cannot be used.',
+    `Original request: ${candidatePrompt}`,
+  ].join(' ');
+}
+
+/**
+ * Retains only repaired citations that exactly reference a document supplied
+ * in this input's candidate prompt (field + index + source identifier, with
+ * absent values equal). An allowlisted-but-absent field, an out-of-range
+ * index, or a mismatched source identifier is dropped: fabricated
+ * attribution can never become scored evidence.
+ */
+export function retainSuppliedCitations(
+  citations: SemanticModelResult['citations'],
+  refs: Array<{ field: string; index?: number; sourceId?: string }>,
+): SemanticModelResult['citations'] {
+  return citations.filter(citation =>
+    refs.some(ref => ref.field === citation.field && (ref.index ?? null) === (citation.index ?? null) && (ref.sourceId ?? null) === (citation.sourceId ?? null)),
+  );
+}
+
 export class GroqSemanticProvider implements EvidenceProvider {
   name = 'groq_semantic' as const;
   constructor(private readonly injectedClient?: SemanticModelClient) {}
@@ -301,6 +350,33 @@ export class GroqSemanticProvider implements EvidenceProvider {
     let result = parseSemanticResult(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
+    // Citation repair (Groq-only): a decisive-but-uncited result would abstain
+    // for missing attribution, not for lack of a decision. Offer exactly one
+    // targeted retry demanding citations. The original decision fields are
+    // preserved in code (prompt text is unenforceable on model output) and
+    // only citations referencing supplied documents are retained; a
+    // still-uncited result abstains as before, so unsupported classifications
+    // can never pass this gate.
+    let repairUsed = false;
+    let repairedCitations: SemanticModelResult['citations'] | null = null;
+    if (isDecisiveButUncited(result)) {
+      try {
+        const repaired = parseSemanticResult(await client.classify(buildCitationRepairPrompt(candidatePrompt, result), model));
+        const retained = retainSuppliedCitations(repaired.citations, candidateDocumentRefs(input));
+        if (retained.length > 0) {
+          result = { ...result, citations: retained };
+          repairedCitations = retained;
+          repairUsed = true;
+        }
+      } catch {
+        // Repair is best-effort: keep the original result, which abstains.
+      }
+    }
+    // The repair code marks only results that survive to evidence
+    // construction with their repaired citations: a later adjudication that
+    // replaces the result drops the code with it. Evaluated below, after
+    // adjudication has had its chance to replace the result.
+    const repairSurvived = () => repairUsed && repairedCitations !== null && result.citations === repairedCitations;
     if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && model !== adjudicatorModel) {
       result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
     }
@@ -310,7 +386,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
     const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
-    const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : [])] };
+    const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, ...(repairSurvived() ? { repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION } : {}), taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...(repairSurvived() ? ['SEMANTIC_CITATION_REPAIR'] : []), ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : []), ...(abstained && isDecisiveButUncited(result) ? ['SEMANTIC_ABSTAIN_NO_CITATIONS'] : [])] };
     const citations=result.citations.map(ref=>{const video=ref.field==='video_title'||ref.field==='video_description'?input.videos?.[ref.index||0]:undefined,family=video?.source_family_id||(ref.field==='channel_title'||ref.field==='channel_bio'?input.channel_source_family_id:undefined),entity=video?.source_entity_id||((video||ref.field==='channel_title'||ref.field==='channel_bio')?input.channel_entity_id:undefined);return {...ref,...(family?{sourceFamilyId:family}:{}),...(entity?{sourceEntityId:entity}:{})};});
     return [{
       id: `semantic_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, source: this.name, polarity: positive || abstained ? 'POSITIVE' : 'NEGATIVE', category,

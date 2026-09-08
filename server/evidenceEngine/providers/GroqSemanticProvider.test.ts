@@ -4,10 +4,12 @@ import {
   DEFAULT_GROQ_ADJUDICATOR_MODEL,
   DEFAULT_GROQ_CANDIDATE_MODEL,
   GroqSemanticProvider,
+  buildCitationRepairPrompt,
   configuredGroqRoutes,
   defaultClient,
   groqCooldownRemainingMs,
   groqTimeoutMs,
+  isDecisiveButUncited,
   resetGroqCooldownForTests,
   runGroqRouteFailover,
   shouldUseGroqSemantic,
@@ -64,6 +66,7 @@ function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
 test('groq provider emits a terminal negative with identical weights for unrelated creators', async () => {
   const provider = new GroqSemanticProvider(of(unrelatedResult));
   const [item] = await provider.collectEvidence(input, {} as any);
+  assert.equal(item.provenance?.semantic?.repairPromptVersion, undefined);
   assert.equal(item.source, 'groq_semantic');
   assert.equal(item.polarity, 'NEGATIVE');
   assert.equal(item.category, 'IRRELEVANT_DOMAIN');
@@ -613,4 +616,177 @@ test('repeated deferrals never restart the persisted cooldown window', async () 
   const fnStr = resolveGroqSemanticCooldownExpiryMs.toString();
   assert.ok(fnStr.includes('groqCooldownDeferral'), 'resolver must exclude deferral-tagged rows');
   assert.ok(fnStr.includes("provider='groq'") || fnStr.includes('provider=\'groq\''), 'resolver stays groq-scoped');
+});
+
+test('isDecisiveButUncited admits only confident supported labels missing citations', () => {
+  const base = { ...unrelatedResult, confidence: 96, supportedLanguage: true };
+  assert.equal(isDecisiveButUncited({ ...base, citations: [] } as any), true);
+  assert.equal(isDecisiveButUncited({ ...base, citations: [{ field: 'channel_bio' }] } as any), false);
+  assert.equal(isDecisiveButUncited({ ...base, label: 'AMBIGUOUS', citations: [] } as any), false);
+  assert.equal(isDecisiveButUncited({ ...base, confidence: 10, citations: [] } as any), false);
+  assert.equal(isDecisiveButUncited({ ...base, supportedLanguage: false, citations: [] } as any), false);
+});
+
+test('repair prompt preserves the original decision and reuses the candidate prompt', () => {
+  const prompt = buildCitationRepairPrompt('{"task":"CANDIDATE"}', { label: 'UNRELATED', confidence: 96, supportedLanguage: true } as any);
+  assert.match(prompt, /UNRELATED/);
+  assert.match(prompt, /citations/);
+  assert.ok(prompt.includes('{"task":"CANDIDATE"}'));
+});
+
+test('citation repair recovers a decisive-but-uncited result without changing its label', async () => {
+  const uncited = { ...unrelatedResult, confidence: 96, citations: [] };
+  const cited = { ...unrelatedResult, confidence: 96 };
+  const seen: string[] = [];
+  const repairing: SemanticModelClient = { classify: async prompt => { seen.push(prompt); return seen.length === 1 ? uncited : cited; } };
+  const [item] = await new GroqSemanticProvider(repairing).collectEvidence(input, {} as any);
+  assert.equal(seen.length, 2);
+  assert.match(seen[1], /citations/);
+  assert.equal(item.category, 'IRRELEVANT_DOMAIN');
+  assert.equal(item.polarity, 'NEGATIVE');
+  assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
+  assert.ok(!(item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_MODEL_ABSTAINED'));
+});
+
+test('failed repair still abstains with the no-citations tag', async () => {
+  const uncited = { ...unrelatedResult, confidence: 96, citations: [] };
+  let calls = 0;
+  const stubborn: SemanticModelClient = { classify: async () => { calls++; return uncited; } };
+  const [item] = await new GroqSemanticProvider(stubborn).collectEvidence(input, {} as any);
+  assert.equal(calls, 2);
+  assert.equal(item.category, 'SEMANTIC_ABSTENTION');
+  assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_ABSTAIN_NO_CITATIONS'));
+  const throwing: SemanticModelClient = {
+    classify: async prompt => {
+      calls++;
+      if (String(prompt).includes('missing required field citations')) throw new Error('repair outage');
+      return uncited;
+    },
+  };
+  calls = 0;
+  const [fallback] = await new GroqSemanticProvider(throwing).collectEvidence(input, {} as any);
+  assert.equal(fallback.category, 'SEMANTIC_ABSTENTION');
+  assert.ok((fallback.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_ABSTAIN_NO_CITATIONS'));
+});
+
+test('repair never fires for cited, ambiguous, low-confidence, or unsupported results', async () => {
+  const shapes = [
+    { ...unrelatedResult, confidence: 96 },
+    { ...unrelatedResult, confidence: 96, label: 'AMBIGUOUS', citations: [] },
+    { ...unrelatedResult, confidence: 10, citations: [] },
+    { ...unrelatedResult, confidence: 96, supportedLanguage: false, citations: [] },
+  ];
+  for (const shape of shapes) {
+    let calls = 0;
+    const counting: SemanticModelClient = { classify: async () => { calls++; return shape; } };
+    await new GroqSemanticProvider(counting).collectEvidence(input, {} as any);
+    assert.equal(calls, 1);
+  }
+});
+
+test('repaired n-cooking shape resolves the recorded disagreement end to end', async () => {
+  const uncited = { ...unrelatedResult, confidence: 96, citations: [] };
+  const cited = { ...unrelatedResult, confidence: 96 };
+  const repairing: SemanticModelClient = { classify: async prompt => (String(prompt).includes('missing required field citations') ? cited : uncited) };
+  const [item] = await new GroqSemanticProvider(repairing).collectEvidence(input, {} as any);
+  assert.equal(item.category, 'IRRELEVANT_DOMAIN');
+  const context = getLayeredKnowledgeContext('United States');
+  const collection = {
+    sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: false,
+    fieldsPresent: ['description'], reasonCodes: [],
+    providers: [{ provider: 'groq_semantic', availability: 'AVAILABLE', evidenceCount: 1, outcome: 'EXECUTED_WITH_EVIDENCE', reasonCodes: ['PROVIDER_EVIDENCE_EMITTED'] }],
+    terminalNegativeSufficiency: { status: 'SUFFICIENT', creatorLevelCoverage: true, independentSourceFamilies: 2, independentObservations: 2, reasonCodes: ['CREATOR_LEVEL_NEGATIVE_COVERAGE'] },
+  } as any;
+  const decision = new ConfigurableWeightedStrategy().evaluateDecision([item], context, 'United States', collection);
+  assert.equal(decision.status, 'NON_TRADING');
+  assert.ok(decision.decisionPolicy?.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'));
+});
+
+test('repair preserves the original decision when the model tries to change it', async () => {
+  const uncited = { ...unrelatedResult, confidence: 96, citations: [] };
+  const seen: string[] = [];
+  const rewriting: SemanticModelClient = {
+    classify: async prompt => {
+      seen.push(prompt);
+      if (seen.length === 1) return uncited;
+      return { label: 'HYPE', confidence: 99, supportedLanguage: false, reasonCodes: ['REWRITE'], explanation: 'changed', concepts: ['hype'], languages: [], citations: [{ field: 'channel_bio' }] };
+    },
+  };
+  const [item] = await new GroqSemanticProvider(rewriting).collectEvidence(input, {} as any);
+  assert.equal(seen.length, 2);
+  assert.equal(item.category, 'IRRELEVANT_DOMAIN');
+  assert.equal(item.polarity, 'NEGATIVE');
+  assert.equal(item.provenance?.semantic?.taxonomyLabel, 'UNRELATED');
+  assert.equal(item.provenance?.semantic?.rawConfidence, 96);
+  assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
+  assert.equal(item.provenance?.semantic?.repairPromptVersion, 'citation-repair-1');
+});
+
+test('hallucinated citations never become evidence', async () => {
+  const uncited = { ...unrelatedResult, confidence: 96, citations: [] };
+  const hallucinations = [
+    { field: 'playlist_name', index: 0 },
+    { field: 'video_title', index: 99 },
+    { field: 'channel_bio', sourceId: 'someone-elses-doc' },
+  ];
+  for (const citation of hallucinations) {
+    let calls = 0;
+    const hallucinating: SemanticModelClient = {
+      classify: async prompt => {
+        calls++;
+        return String(prompt).includes('missing required field citations')
+          ? { ...unrelatedResult, confidence: 96, citations: [citation] }
+          : uncited;
+      },
+    };
+    const [item] = await new GroqSemanticProvider(hallucinating).collectEvidence(input, {} as any);
+    assert.equal(calls, 2);
+    assert.equal(item.category, 'SEMANTIC_ABSTENTION', `citation ${JSON.stringify(citation)} must not score`);
+    assert.ok((item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_ABSTAIN_NO_CITATIONS'));
+  }
+});
+
+test('retainSuppliedCitations keeps exact references only', async () => {
+  const { retainSuppliedCitations } = await import('./GroqSemanticProvider');
+  const refs = [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }];
+  assert.deepEqual(
+    retainSuppliedCitations(
+      [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }, { field: 'video_title', index: 3 }] as never,
+      refs as never,
+    ),
+    [{ field: 'channel_bio' }, { field: 'video_title', index: 0 }],
+  );
+});
+
+test('adjudication replacing a repaired result drops the repair code', async () => {
+  const saved = { ...process.env };
+  process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  process.env.GROQ_CANDIDATE_MODEL = 'candidate-model';
+  process.env.GROQ_ADJUDICATOR_MODEL = 'adjudicator-model';
+  try {
+    const uncited = { ...unrelatedResult, confidence: 65, citations: [] };
+    const repaired = { ...unrelatedResult, confidence: 65, citations: [{ field: 'channel_bio' }] };
+    const adjudicated = { ...unrelatedResult, label: 'AMBIGUOUS', confidence: 40, citations: [{ field: 'channel_bio' }] };
+    let calls = 0;
+    const routing: SemanticModelClient = {
+      classify: async (prompt, model) => {
+        calls++;
+        assert.equal(model, calls === 3 ? 'adjudicator-model' : 'candidate-model');
+        if (String(prompt).includes('missing required field citations')) return repaired;
+        if (String(prompt).includes('"task":"ADJUDICATION"')) return adjudicated;
+        return uncited;
+      },
+    };
+    const [item] = await new GroqSemanticProvider(routing).collectEvidence(input, {} as any);
+    assert.equal(calls, 3);
+    assert.equal(item.category, 'SEMANTIC_ABSTENTION');
+    assert.ok(!(item.provenance?.semantic?.reasonCodes || []).includes('SEMANTIC_CITATION_REPAIR'));
+  } finally {
+    if (saved.MULTILINGUAL_ADJUDICATION_ENABLED === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+    else process.env.MULTILINGUAL_ADJUDICATION_ENABLED = saved.MULTILINGUAL_ADJUDICATION_ENABLED;
+    if (saved.GROQ_CANDIDATE_MODEL === undefined) delete process.env.GROQ_CANDIDATE_MODEL;
+    else process.env.GROQ_CANDIDATE_MODEL = saved.GROQ_CANDIDATE_MODEL;
+    if (saved.GROQ_ADJUDICATOR_MODEL === undefined) delete process.env.GROQ_ADJUDICATOR_MODEL;
+    else process.env.GROQ_ADJUDICATOR_MODEL = saved.GROQ_ADJUDICATOR_MODEL;
+  }
 });
