@@ -38,7 +38,7 @@ test('candidate authority is durable, normalized unique, selected, and returned 
   assert.match(migration,/PRIMARY KEY\(channel_id,candidate_id\)/);
   assert.match(migration,/UNIQUE\(channel_id,normalized_locator\)/);
   assert.match(migration,/attempt_count INTEGER/);
-  assert.match(dbCore,/jsonb_agg\(to_jsonb\(dc\)/);
+  assert.match(dbCore,/jsonb_agg\(\(to_jsonb\(dc\) \|\| jsonb_build_object\('display_locator'/);
   assert.match(queue,/persistDiscordCandidates/);
   assert.match(queue,/selectDiscordCandidate/);
   assert.match(ui,/candidate\.failure_reason/);
