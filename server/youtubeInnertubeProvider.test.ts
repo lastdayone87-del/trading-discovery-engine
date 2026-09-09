@@ -529,6 +529,126 @@ test('page timeout is one wall-clock budget across search and continuations', as
   }
 });
 
+test('a hung session attempt does not wedge later retrievals', async () => {
+  // First factory call hangs forever; the first page must time out, drop the
+  // stuck shared attempt, and let the second page create a fresh session and
+  // succeed. Without invalidation the second page would reuse the permanently
+  // pending promise and time out too (InnerTube disabled until restart).
+  const previousTimeout = process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '100';
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  let factoryCalls = 0;
+  setInnertubeSessionFactoryForTests(async () => {
+    factoryCalls += 1;
+    if (factoryCalls === 1) return new Promise(() => undefined) as never;
+    return {
+      search: async () => ({
+        channels: [{ author: { id: UC, name: 'Desk' } }],
+        has_continuation: false,
+      }),
+    };
+  });
+  try {
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'CHANNEL',
+        cursor: null,
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+    );
+    assert.equal(factoryCalls, 1);
+    const recovered = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'trading',
+      country: 'US',
+      lane: 'CHANNEL',
+      cursor: null,
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.equal(factoryCalls, 2);
+    assert.equal(recovered.channels.length, 1);
+    assert.equal(recovered.channels[0].channelId, UC);
+  } finally {
+    if (previousTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+    else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = previousTimeout;
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('an older timed-out page never clears a newer session attempt', async () => {
+  // The older page awaits the stuck first attempt with a long deadline while
+  // a newer page times out, drops it, and a replacement session is created.
+  // When the older page finally times out it must leave the replacement
+  // alone: a further page reuses it without invoking the factory again.
+  const previousTimeout = process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  let factoryCalls = 0;
+  setInnertubeSessionFactoryForTests(async () => {
+    factoryCalls += 1;
+    if (factoryCalls === 1) return new Promise(() => undefined) as never;
+    return {
+      search: async () => ({
+        channels: [{ author: { id: UC, name: 'Desk' } }],
+        has_continuation: false,
+      }),
+    };
+  });
+  const page = () => executeInnertubeRetrievalPage({
+    provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+    query: 'trading',
+    country: 'US',
+    lane: 'CHANNEL',
+    cursor: null,
+    ordering: 'RELEVANCE',
+  } as any);
+  try {
+    process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '500';
+    const older = page();
+    process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '100';
+    await assert.rejects(
+      page(),
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+    );
+    assert.equal(factoryCalls, 1);
+    const recovered = await page();
+    assert.equal(factoryCalls, 2);
+    assert.equal(recovered.channels.length, 1);
+    await assert.rejects(
+      older,
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+    );
+    const reuse = await page();
+    assert.equal(factoryCalls, 2);
+    assert.equal(reuse.channels.length, 1);
+  } finally {
+    if (previousTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+    else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = previousTimeout;
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
 test('slow session creation consumes the same page budget as the search', async () => {
   // Budget 300ms. Session creation consumes ~250ms, then the search stalls.
   // Per-operation timeouts would allow 250 + 300 = ~550ms; the page deadline

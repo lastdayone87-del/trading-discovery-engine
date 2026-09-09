@@ -98,10 +98,18 @@ let innertubeNextAllowedAtMs = 0;
 let innertubePacingChain: Promise<void> = Promise.resolve();
 /** Test-only count of pacing-gate acquisitions since the last reset. */
 let innertubePacingGatePasses = 0;
+/**
+ * Pacing generation: bumped by the test reset so a stale pace run abandoned
+ * via page-deadline (its wait still sleeping in the background) can never
+ * write a stale nextAllowed over newer state when it finally wakes.
+ * Production never resets, so the guard is a no-op outside tests.
+ */
+let innertubePacingGeneration = 0;
 export function resetInnertubePacingForTests(): void {
   innertubeNextAllowedAtMs = 0;
   innertubePacingChain = Promise.resolve();
   innertubePacingGatePasses = 0;
+  innertubePacingGeneration += 1;
 }
 /** Test-only read of pacing-gate acquisitions (one per actual outbound request). */
 export function innertubePacingGatePassesForTests(): number {
@@ -112,10 +120,13 @@ function paceInnertubeRequest(minIntervalMs: number): Promise<void> {
   // provider request (initial search or continuation), so the count proves
   // each request is paced exactly once — no duplicate waits per page.
   innertubePacingGatePasses += 1;
+  const generation = innertubePacingGeneration;
   const run = innertubePacingChain.then(async () => {
     const waitMs = Math.max(0, innertubeNextAllowedAtMs - Date.now());
     if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
-    innertubeNextAllowedAtMs = Date.now() + minIntervalMs;
+    if (generation === innertubePacingGeneration) {
+      innertubeNextAllowedAtMs = Date.now() + minIntervalMs;
+    }
   });
   // Chain stays alive across rejections; callers observe only their own run.
   innertubePacingChain = run.catch(() => undefined);
@@ -341,6 +352,8 @@ type InnertubeSession = {
 };
 
 let sessionPromise: Promise<InnertubeSession> | null = null;
+/** Attempts that already settled (success or failure) — never invalidated. */
+const settledSessionAttempts = new WeakSet<Promise<InnertubeSession>>();
 let sessionFactory: (() => Promise<InnertubeSession>) | null = null;
 /** Test seam: inject a stub session so no test ever touches the network. */
 export function setInnertubeSessionFactoryForTests(factory: (() => Promise<InnertubeSession>) | null): void {
@@ -358,17 +371,46 @@ function emit(event: Parameters<typeof appendProviderCallEvent>[0]): Promise<voi
   return (emitSink ? emitSink(event) : appendProviderCallEvent(event)).catch(() => undefined);
 }
 
-async function getInnertubeSession(): Promise<InnertubeSession> {
+/**
+ * Returns the shared session promise itself (NOT an async wrapper), so
+ * callers can compare its identity — the stuck-attempt invalidation in
+ * executeInnertubeRetrievalPage relies on object identity with the cached
+ * attempt. An `async` wrapper would hand out a fresh promise per call and
+ * silently defeat that check.
+ */
+function getInnertubeSession(): Promise<InnertubeSession> {
   if (!sessionPromise) {
-    sessionPromise = (sessionFactory
+    const attempt: Promise<InnertubeSession> = (sessionFactory
       ? sessionFactory()
       : Innertube.create().then((session) => session as unknown as InnertubeSession)
-    ).catch((error) => {
-      sessionPromise = null;
-      throw error;
-    });
+    ).then(
+      (session) => {
+        settledSessionAttempts.add(attempt);
+        return session;
+      },
+      (error) => {
+        settledSessionAttempts.add(attempt);
+        if (sessionPromise === attempt) sessionPromise = null;
+        throw error;
+      },
+    );
+    sessionPromise = attempt;
   }
   return sessionPromise;
+}
+
+/**
+ * Drops a stuck session attempt after a page-deadline timeout so later pages
+ * can create a fresh session instead of reusing a permanently pending
+ * promise (which would disable InnerTube until process restart). Narrow by
+ * construction: only the still-current attempt is cleared (an older timed-out
+ * request can never clear a newer attempt), and settled attempts — including
+ * a successfully initialized shared session — are always preserved.
+ */
+function invalidateStuckSessionAttempt(attempt: Promise<InnertubeSession>): void {
+  if (sessionPromise === attempt && !settledSessionAttempts.has(attempt)) {
+    sessionPromise = null;
+  }
 }
 
 export function innertubeTimeoutError(): Error & { code?: string; retryable?: boolean } {
@@ -486,7 +528,18 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     // pacedContinuation. No pacing here — a second admission would halve
     // throughput and could expire queued pages before they search. Session
     // creation still consumes the page deadline below.
-    const session = await withInnertubeRemaining(getInnertubeSession(), deadlineAtMs);
+    const sessionAttempt = getInnertubeSession();
+    let session: InnertubeSession;
+    try {
+      session = await withInnertubeRemaining(sessionAttempt, deadlineAtMs);
+    } catch (error) {
+      // A deadline expiry during session creation must not wedge the shared
+      // session forever: drop the attempt so the next page creates a fresh
+      // session. Narrow: only the still-current pending attempt is cleared
+      // (never a newer attempt, never a settled session).
+      invalidateStuckSessionAttempt(sessionAttempt);
+      throw error;
+    }
     // Page walk: InnerTube continuations belong to a live feed object, so page
     // N is reached by re-running the search and advancing N-1 continuations.
     // Bounded to YOUTUBE_INNERTUBE_MAX_PAGES (mirrors the autonomous 3-page cap).
