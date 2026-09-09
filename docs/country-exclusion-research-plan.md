@@ -60,18 +60,18 @@ Already fetched and persisted under current quota flow:
 
 ## 6. Recommended evidence hierarchy
 
-New source **`AGGREGATED_CONTENT_LANGUAGE` at priority 3** (alongside website TLD, below bio): deterministic criteria — eligible language per the approved map (§5), usable videos ≥ 8, dominant share ≥ 80%, single winner, higher-priority country evidence absent or inconclusive, bio empty-or-noncommittal — confidence from a fixed 2-row table tied to the existing ≥85 gate (100% share → 90, 80–<100% share → 86, always with usable ≥ 8). It can then satisfy `exclusionAuthority` unchanged. Nothing else in the hierarchy moves; P9 stays advisory; forbidden signals (markets, brokers, audience, timezone, external sites, messaging links) remain outside the allowlist.
+New source **`AGGREGATED_CONTENT_LANGUAGE` at priority 3** (alongside website TLD, below bio): deterministic criteria — eligible language per the approved map (§5), usable videos ≥ 8, dominant share ≥ 80%, single winner, bio empty-or-noncommittal, and tier precedence satisfied (P1–P2 absent or inconclusive; any P3 website evidence agrees — see §11) — confidence from a fixed 2-row table tied to the existing ≥85 gate (100% share → 90, 80–<100% share → 86, always with usable ≥ 8). It can then satisfy `exclusionAuthority` unchanged. Nothing else in the hierarchy moves; P9 stays advisory; forbidden signals (markets, brokers, audience, timezone, external sites, messaging links) remain outside the allowlist.
 
 ## 7. Recommended language aggregation approach
 
 1. Sample = up to 10 most recent video descriptions (+ stage≥2 playlist names/descriptions as corroboration, never decisive alone); skip empties; **fewer than 8 usable → insufficient-data → PROCESS, regardless of share**.
 2. Per-video language: script/diacritic pass → keyword-list pass (extended lists) → semantic-model per-field language when classification already ran. Each video votes for at most one eligible language or abstains.
-3. Dominance = **usable ≥ 8 AND `votes(L) / usable ≥ 0.8`** with a single winner; any second eligible language with ≥2 votes voids dominance → PROCESS. Higher-priority (P1–P3) country evidence that is present and conclusive takes precedence — the language path is evaluated only when it is absent or inconclusive, and never overrides a clear conflicting country signal.
+3. Dominance = **usable ≥ 8 AND `votes(L) / usable ≥ 0.8`** with a single winner; any second eligible language with ≥2 votes voids dominance → PROCESS. Tier precedence (§11): P1–P2 evidence that is present and conclusive is evaluated first and the language path is skipped; P3 website evidence must agree (unanimity) — disagreement voids a language-based REJECT.
 4. Mixed-language, multilingual, and below-minimum-sample cases therefore PROCESS by construction.
 
 ## 8. Recommended confidence / decision thresholds
 
-No invented weights: reuse the gate (`decisivePriority ≤ 3`, `topConfidence ≥ 85`, unanimity, conflict→UNCERTAIN). New source confidence is criterion-derived (100% share → 90, 80–<100% share → 86, always with usable ≥ 8), i.e., calibrated *by* the gate it must pass. HIGH CONFIDENCE (all required) → REJECT: approved-map language, usable ≥ 8, share ≥ 80%, single winner, higher-priority evidence absent/inconclusive, bio empty/non-committal. Everything else → PROCESS (including NEEDS_REVIEW/CONTINUE paths unchanged).
+No invented weights: reuse the gate (`decisivePriority ≤ 3`, `topConfidence ≥ 85`, unanimity, conflict→UNCERTAIN). New source confidence is criterion-derived (100% share → 90, 80–<100% share → 86, always with usable ≥ 8), i.e., calibrated *by* the gate it must pass. HIGH CONFIDENCE (all required) → REJECT: approved-map language, usable ≥ 8, share ≥ 80%, single winner, P1–P2 absent/inconclusive, P3 website agrees or is absent, bio empty/non-committal. Everything else → PROCESS (including NEEDS_REVIEW/CONTINUE paths unchanged).
 
 ## 9. Exact decision flow
 
@@ -79,16 +79,16 @@ No invented weights: reuse the gate (`decisivePriority ≤ 3`, `topConfidence �
 Collect available country signals (unchanged: P1–P10)
   ↓ Is there strong explicit excluded-country evidence (gate as today)?
 YES → REJECT (unchanged)
-NO ↓ Is higher-priority (P1–P3) country evidence present and conclusive?
+NO ↓ Is P1–P2 country evidence present and conclusive?
 YES → follow existing rules (language path skipped; conflict → PROCESS
       unless existing rules independently justify REJECT)
 NO ↓ Thread already-fetched descriptions/playlists into validator input
 Aggregate per-video language over ≤10 recent videos (titles excluded)
   ↓ Approved-map language AND usable ≥ 8 AND share ≥ 80% AND single winner
-    AND bio empty/non-committal?
-YES → REJECT (new P3 evidence satisfies the unchanged gate)
+    AND bio empty/non-committal AND (P3 website absent OR agrees)?
+YES → REJECT (new P3 evidence satisfies the unchanged gate unanimously)
 NO ↓ (mixed / multilingual / below-minimum sample / worldwide language /
-      conflicting evidence / no data)
+      P3 website disagreement / conflicting evidence / no data)
 PROCESS via existing UNCERTAIN / NEEDS_REVIEW / CONTINUE paths (unchanged)
 ```
 
@@ -100,7 +100,7 @@ PROCESS via existing UNCERTAIN / NEEDS_REVIEW / CONTINUE paths (unchanged)
 
 ## 11. Conflicting-signal handling
 
-Unchanged mechanics, extended input: official metadata (P1) and bio/website (P2/P3) outrank or tie-break language; equal-top-score conflict forces UNCERTAIN (`countryInference.ts:362-372`); `mergeCountryValidationResults` prevents weaker live evidence from overriding; target mismatch can never create REJECTED. Language evidence additionally self-voids on any second eligible language with ≥2 votes. **Non-override rule:** language-based rejection applies only when higher-priority country evidence is absent or inconclusive. If strong country evidence from official YouTube metadata, the channel bio/About, or other higher-priority sources conflicts with the aggregated language evidence, the result is PROCESS unless the existing country-validation rules independently justify REJECT.
+Unchanged mechanics, extended input: official metadata (P1) and bio (P2) outrank language — when conclusive, the language path is skipped before it can compete. Website evidence shares tier P3 with the new language source, so the existing unanimity rule governs their interaction with no new logic: agreement (same country) → gate evaluates unanimously; disagreement → not unanimous → no language-based REJECT (the top-confidence country wins for CONFIRMED/LIKELY, ties stay UNCERTAIN, `countryInference.ts:362-372`). Lower tiers (P4–P9) never block or outvote a decisive P3, exactly as today. `mergeCountryValidationResults` prevents weaker live evidence from overriding; target mismatch can never create REJECTED. Language evidence additionally self-voids on any second eligible language with ≥2 votes. **Non-override rule:** language-based rejection applies only when P1–P2 evidence is absent or inconclusive and P3 website evidence is absent or agrees. If strong country evidence conflicts with the aggregated language evidence, the result is PROCESS unless the existing country-validation rules independently justify REJECT.
 
 ## 12. Recommended location (safest, smallest change)
 
@@ -124,6 +124,7 @@ Unchanged mechanics, extended input: official metadata (P1) and bio/website (P2/
 - Mixed Hindi/other languages without ≥80% dominance → PROCESS; worldwide language dominance (English/French/Arabic) → PROCESS.
 - Mixed VI/EN, multilingual, 4/4 or 5/5 samples → PROCESS (absolute minimum not met).
 - 10/10 Vietnamese + `locationTag` US (or US bio line) → PROCESS/UNCERTAIN (higher-priority evidence takes precedence; no override).
+- P3 website TLD US + 10/10 Vietnamese descriptions → PROCESS (equal-tier disagreement breaks unanimity, no language-based REJECT); P3 website `.vn` + 10/10 Vietnamese → REJECT (agreement, gate evaluates unanimously).
 - Urdu 9/10 → REJECT (PK/IN both excluded); Bengali 8/10 → REJECT (BD/IN both excluded); Hindi + US bio → PROCESS.
 - Pre-enrichment candidate (0–1 descriptions) → behavior unchanged (UNCERTAIN path).
 - Regression: existing 29-country attribution suite, threshold/conflict/merge/boundary tests all green unchanged.
