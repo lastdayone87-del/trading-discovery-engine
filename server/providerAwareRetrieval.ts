@@ -19,23 +19,48 @@ export const YOUTUBE_SEARCH_PROVIDER: ProviderAllocation = Object.freeze({
 });
 
 /**
+ * Observation window (seconds) for provider-level cooldown signals. A
+ * provider with a recent RATE_LIMITED ledger row is treated as cooling.
+ */
+export const PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS = 300;
+
+/**
+ * Maps provider_call_events provider names to discovery provider keys.
+ * Unknown ledger names pass through unchanged (never silently dropped).
+ */
+export function ledgerProviderToRegistryKey(ledgerProvider: string): string {
+  if (ledgerProvider === 'youtube') return 'youtube-search';
+  if (ledgerProvider === 'youtube-innertube') return 'youtube-innertube';
+  return ledgerProvider;
+}
+
+/**
  * Deterministic traffic sharing across equally-eligible provider rows.
  * Single-row registries resolve to that row. With several ACTIVE rows
  * sharing a capability (official YouTube API + YouTube.js), the rotation key
  * hash spreads allocations across all of them with no shared state and no
- * caps. CANARY rows never receive ordinary traffic while any ACTIVE row is
- * eligible; they serve only when no ACTIVE row exists (or via explicit
- * targeting upstream). Ordering is ACTIVE-first then provider_key so the
- * spread is stable regardless of database return order.
+ * caps. Providers in `unhealthyKeys` (e.g. recent RATE_LIMITED ledger rows =
+ * cooling down) are excluded while at least one healthy row remains, so a
+ * cooling provider stops receiving new opportunities while a healthy
+ * alternative is available; if every row is unhealthy (or none are), the
+ * pool degrades to the full set rather than failing. CANARY rows never
+ * receive ordinary traffic while any ACTIVE row is eligible; they serve only
+ * when no ACTIVE row exists (or via explicit targeting upstream). Ordering
+ * is ACTIVE-first then provider_key so the spread is stable regardless of
+ * database return order.
  */
 export function rotateActiveProviderRow<T extends { provider_key: string; mode: string }>(
   rows: T[],
   rotationKey: string,
+  unhealthyKeys?: Iterable<string>,
 ): T {
   if (!rows.length) throw new Error('NO_ELIGIBLE_PROVIDER_ROWS');
   const active = rows.filter((row) => row.mode === 'ACTIVE');
   const pool = active.length ? active : rows;
-  const ordered = [...pool].sort((a, b) => {
+  const unhealthy = new Set(unhealthyKeys || []);
+  const healthy = pool.filter((row) => !unhealthy.has(row.provider_key));
+  const candidates = healthy.length ? healthy : pool;
+  const ordered = [...candidates].sort((a, b) => {
     const rankA = a.mode === 'ACTIVE' ? 0 : 1;
     const rankB = b.mode === 'ACTIVE' ? 0 : 1;
     if (rankA !== rankB) return rankA - rankB;

@@ -27,7 +27,7 @@ import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance } from './terminologyIntelligence';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -1067,19 +1067,28 @@ export async function scheduleAutonomousQueryRuns(
         // Ordinary (non-frontier) allocations carry no explicit provider and
         // would otherwise always default to the official API, leaving
         // YouTube.js idle whenever the frontier gate rejects. Rotate across
-        // ACTIVE SEARCH_YOUTUBE providers instead (stable per query; official
-        // default preserved on any failure or single-provider registry).
+        // ACTIVE SEARCH_YOUTUBE providers instead (stable per query), so even
+        // a single eligible ACTIVE provider is selected explicitly rather
+        // than inherited from the default; official default preserved only on
+        // query failure or an empty registry. Cooling providers (recent
+        // RATE_LIMITED ledger rows) are excluded while a healthy alternative
+        // remains; the lookup fails open to the full pool.
         try {
           const rotationRes = await client.query(
             `SELECT provider_key,provider_family,capabilities,quota_domain,mode FROM discovery_provider_registry WHERE mode='ACTIVE' AND capabilities ? 'SEARCH_YOUTUBE' ORDER BY provider_key FOR SHARE`
           );
-          if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 1) {
-            const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`);
+          const coolingRes = await client.query(
+            `SELECT DISTINCT provider FROM provider_call_events WHERE provider IN ('youtube','youtube-innertube') AND status='RATE_LIMITED' AND occurred_at > now() - ($1||' seconds')::interval`,
+            [String(PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS)]
+          ).catch(() => ({ rows: [] as any[] }));
+          const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
+          if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {
+            const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
             allocatedProvider = providerSnapshot({
               providerKey: picked.provider_key,
               retrievalSurface: picked.provider_family === 'youtube' ? 'YOUTUBE_NATIVE' : `${String(picked.provider_family).toUpperCase()}_NATIVE`,
               capability: 'SEARCH_YOUTUBE',
-              costDomain: picked.quota_domain,
+              costDomain: picked.cost_domain,
               continuationOwner: 'PHASE_9',
             });
           }

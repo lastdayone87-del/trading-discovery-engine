@@ -101,6 +101,29 @@ function paceInnertubeRequest(minIntervalMs: number): Promise<void> {
   return run;
 }
 
+/**
+ * Every provider request — initial search and each continuation — passes
+ * through pacing first, so bursts (including multi-page walks) never hit the
+ * unofficial endpoint unthrottled.
+ */
+async function pacedSearch(
+  session: InnertubeSession,
+  query: string,
+  searchType: string,
+  timeoutMs: number,
+): Promise<InnertubeFeedLike> {
+  await paceInnertubeRequest(innertubeMinIntervalMs());
+  return withInnertubeDeadline(session.search(query, { type: searchType }), timeoutMs);
+}
+
+async function pacedContinuation(
+  feed: InnertubeFeedLike,
+  timeoutMs: number,
+): Promise<unknown> {
+  await paceInnertubeRequest(innertubeMinIntervalMs());
+  return withInnertubeDeadline(feed.getContinuation!(), timeoutMs);
+}
+
 /** In-process backpressure flag. Module-private: the official provider's pool cannot see it. */
 let innertubeCooldownUntilMs = 0;
 export function innertubeCooldownRemainingMs(nowMs: number = Date.now()): number {
@@ -206,16 +229,17 @@ export function mapInnertubeChannelsToRaw(
 }
 
 /**
- * Pure VIDEO-lane mapping from InnerTube video-search nodes. Each video
- * attributes its author channel; videos from the same channel are NOT merged
- * here (downstream dedupe merges by channelId, mirroring the official path).
- * matchedDocument.publishedAt is intentionally unset: InnerTube exposes only
- * relative display text ("3 days ago"), never a timestamp, and a fabricated
- * timestamp would corrupt the downstream staleness triage (which fail-opens
- * on a missing value).
+ * Pure VIDEO-lane mapping from InnerTube video-search nodes. Videos sharing
+ * an author channel are merged into one entry (titles/descriptions
+ * accumulated, first video's matchedDocument kept) — mirroring the official
+ * provider's per-channel merge — so downstream channel dedupe cannot silently
+ * discard legitimate video evidence. matchedDocument.publishedAt is
+ * intentionally unset: InnerTube exposes only relative display text
+ * ("3 days ago"), never a timestamp, and a fabricated timestamp would corrupt
+ * the downstream staleness triage (which fail-opens on a missing value).
  */
 export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): DiscoveredChannelRaw[] {
-  const out: DiscoveredChannelRaw[] = [];
+  const byChannel = new Map<string, DiscoveredChannelRaw>();
   for (const node of nodes || []) {
     const authorId = typeof node?.author?.id === 'string' ? node.author.id : '';
     const channelId = channelIdOf(authorId, '');
@@ -224,10 +248,16 @@ export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): Discovered
     const title = textOf(node?.title);
     if (!videoId || !title) continue;
     const videoDescription = textOf(node?.description_snippet);
+    const existing = byChannel.get(channelId);
+    if (existing) {
+      existing.videoTitles.push(title);
+      if (videoDescription) (existing.videoDescriptions ??= []).push(videoDescription);
+      continue;
+    }
     const authorName = typeof node?.author?.name === 'string' && node.author.name.trim()
       ? node.author.name.trim()
       : channelId;
-    out.push({
+    byChannel.set(channelId, {
       channelId,
       channelName: authorName,
       youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
@@ -246,7 +276,7 @@ export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): Discovered
       },
     });
   }
-  return out;
+  return [...byChannel.values()];
 }
 
 export function parseInnertubeCursor(cursor: string | null | undefined): number {
@@ -388,8 +418,15 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     // Page walk: InnerTube continuations belong to a live feed object, so page
     // N is reached by re-running the search and advancing N-1 continuations.
     // Bounded to YOUTUBE_INNERTUBE_MAX_PAGES (mirrors the autonomous 3-page cap).
+    // NOTE on durability: youtubei.js exposes no serializable continuation
+    // token, so cross-job pages re-run the search and walk live continuations
+    // rather than resuming an opaque cursor. Result churn between jobs can
+    // duplicate (absorbed downstream: per-page channelId dedupe, duplicate-
+    // ratio stop, idempotent page records) or skip (bounded to pages 2-3)
+    // results; within one call the walk uses live continuations with no drift.
+    // A cursor is therefore a page number, not an equivalent server cursor.
     const searchType = lane === 'VIDEO' ? 'video' : 'channel';
-    let feed = await withInnertubeDeadline(session.search(request.query, { type: searchType }), timeoutMs);
+    let feed = await pacedSearch(session, request.query, searchType, timeoutMs);
     for (let walked = 1; walked < pageNumber; walked++) {
       if (!feed?.has_continuation || typeof feed.getContinuation !== 'function') {
         throw Object.assign(
@@ -397,8 +434,11 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
           { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
         );
       }
+      // Rejections propagate with their original classification (429s arm the
+      // cooldown, network errors stay network errors); only a genuinely empty
+      // (null/undefined) continuation becomes CONTINUATION_UNAVAILABLE.
       const next = (await withInnertubeDeadline(
-        (feed.getContinuation() as Promise<unknown>).catch(() => null),
+        pacedContinuation(feed, timeoutMs),
         timeoutMs,
       )) as InnertubeFeedLike | null;
       if (!next) {
@@ -411,6 +451,10 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     }
     const rawNodes = (lane === 'VIDEO' ? feed?.videos : feed?.channels) ?? [];
     const nodes: Array<InnertubeChannelLike & InnertubeVideoLike> = Array.isArray(rawNodes) ? rawNodes : [];
+    // rawResultCount counts raw InnerTube results BEFORE mapping drops
+    // invalid/unresolvable nodes — same metric semantics as the official
+    // provider (items.length), which downstream yield math relies on.
+    const rawResultCount = nodes.length;
     const channels = lane === 'VIDEO'
       ? mapInnertubeVideosToRaw(nodes)
       : mapInnertubeChannelsToRaw(nodes, request.country);
@@ -421,7 +465,7 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     }).catch(() => undefined);
     return {
       channels,
-      rawResultCount: channels.length,
+      rawResultCount,
       nextPageToken: hasMore ? String(pageNumber + 1) : null,
       providerCostUsd: 0,
       providerRequestId: request.queryRunId ? `${request.queryRunId}:youtube-innertube:${lane.toLowerCase()}:p${pageNumber}` : undefined,

@@ -95,6 +95,121 @@ test('video mapping attributes author channels with VIDEO provenance', () => {
   assert.equal((mapped[0].matchedDocument as Record<string, unknown>).publishedAt, undefined);
 });
 
+test('videos from the same channel merge so dedupe cannot discard evidence', () => {
+  const mapped = mapInnertubeVideosToRaw([
+    { video_id: 'vid1', title: { text: 'First setup' }, author: { id: UC, name: 'Desk' }, description_snippet: { text: 'd1' } },
+    { video_id: 'vid2', title: { text: 'Second setup' }, author: { id: UC, name: 'Desk' }, description_snippet: { text: '' } },
+  ]);
+  assert.equal(mapped.length, 1);
+  assert.deepEqual(mapped[0].videoTitles, ['First setup', 'Second setup']);
+  assert.deepEqual(mapped[0].videoDescriptions, ['d1']);
+  // First video's provenance wins, mirroring the official merge.
+  assert.equal(mapped[0].matchedDocument?.providerNativeId, 'vid1');
+  assert.equal(mapped[0].matchedDocument?.locator, 'youtube:video:vid1');
+});
+
+test('rawResultCount counts raw results before mapping drops nodes', async () => {
+  resetInnertubeCooldownForTests();
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => ({
+      videos: [
+        { video_id: 'vid1', title: { text: 'Good' }, author: { id: UC, name: 'Desk' } },
+        { video_id: '', title: { text: 'dropped: no id' }, author: { id: UC } },
+        { video_id: 'vid9', title: { text: 'dropped: bad channel' }, author: { id: 'x' } },
+      ],
+      has_continuation: false,
+    }),
+  }));
+  try {
+    const page = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'scalping',
+      country: 'US',
+      lane: 'VIDEO',
+      cursor: null,
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.equal(page.rawResultCount, 3);
+    assert.equal(page.channels.length, 1);
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+  }
+});
+
+test('continuation 429 keeps its classification and arms the cooldown', async () => {
+  resetInnertubeCooldownForTests();
+  const firstFeed = {
+    videos: [{ video_id: 'vid1', title: { text: 't' }, author: { id: UC } }],
+    has_continuation: true,
+    getContinuation: async () => { throw new Error('429 Too Many Requests'); },
+  };
+  setInnertubeSessionFactoryForTests(async () => ({ search: async () => firstFeed }));
+  try {
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'VIDEO',
+        cursor: '2',
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_RATE_LIMITED_CODE && error?.retryable === true,
+    );
+    assert.ok(innertubeCooldownRemainingMs() > 0, 'continuation 429 must arm backpressure');
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+  }
+});
+
+test('continuation requests pass through pacing like the initial search', async () => {
+  resetInnertubeCooldownForTests();
+  const { resetInnertubePacingForTests } = await import('./youtubeInnertubeProvider');
+  resetInnertubePacingForTests();
+  const stamps: number[] = [];
+  const secondFeed = {
+    videos: [{ video_id: 'vid2', title: { text: 't2' }, author: { id: UC } }],
+    has_continuation: false,
+  };
+  const firstFeed = {
+    videos: [{ video_id: 'vid1', title: { text: 't1' }, author: { id: UC } }],
+    has_continuation: true,
+    getContinuation: async () => {
+      stamps.push(Date.now());
+      return secondFeed;
+    },
+  };
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => {
+      stamps.push(Date.now());
+      return firstFeed;
+    },
+  }));
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '60';
+  try {
+    const page = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'trading',
+      country: 'US',
+      lane: 'VIDEO',
+      cursor: '2',
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.equal(page.channels.length, 1);
+    assert.equal(stamps.length, 2);
+    assert.ok(stamps[1] - stamps[0] >= 40, `search and continuation must be paced, gap was ${stamps[1] - stamps[0]}ms`);
+  } finally {
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
 test('cursor parsing is bounded to the page cap', () => {
   assert.equal(parseInnertubeCursor(null), 1);
   assert.equal(parseInnertubeCursor(''), 1);

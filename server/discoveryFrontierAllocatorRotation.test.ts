@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rotateActiveProviderRow, applyDateOrderingProviderGuard } from './providerAwareRetrieval';
+import { rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey } from './providerAwareRetrieval';
 import { YOUTUBE_SEARCH_PROVIDER } from './providerAwareRetrieval';
 
 const official = { provider_key: 'youtube-search', mode: 'ACTIVE' };
@@ -89,4 +89,35 @@ test('RELEVANCE ordering never re-targets any provider', () => {
   const official = applyDateOrderingProviderGuard({ ...YOUTUBE_SEARCH_PROVIDER }, 'DATE');
   assert.equal(official.switched, false);
   assert.equal(official.provider.providerKey, 'youtube-search');
+});
+
+test('cooling providers are excluded while a healthy alternative remains', () => {
+  const official = { provider_key: 'youtube-search', mode: 'ACTIVE' };
+  const innertube = { provider_key: 'youtube-innertube', mode: 'ACTIVE' };
+  for (let i = 0; i < 50; i++) {
+    assert.equal(
+      rotateActiveProviderRow([official, innertube], `opp-${i}`, new Set(['youtube-search'])).provider_key,
+      'youtube-innertube',
+    );
+    assert.equal(
+      rotateActiveProviderRow([official, innertube], `opp-${i}`, new Set(['youtube-innertube'])).provider_key,
+      'youtube-search',
+    );
+  }
+});
+
+test('rotation degrades to the full pool when every provider is cooling', () => {
+  const official = { provider_key: 'youtube-search', mode: 'ACTIVE' };
+  const innertube = { provider_key: 'youtube-innertube', mode: 'ACTIVE' };
+  const picks = new Set<string>();
+  for (let i = 0; i < 50; i++) {
+    picks.add(rotateActiveProviderRow([official, innertube], `opp-${i}`, new Set(['youtube-search', 'youtube-innertube'])).provider_key);
+  }
+  assert.ok(picks.has('youtube-search') && picks.has('youtube-innertube'), 'must not fail closed when all cool');
+});
+
+test('ledger provider names map to registry keys without silent drops', () => {
+  assert.equal(ledgerProviderToRegistryKey('youtube'), 'youtube-search');
+  assert.equal(ledgerProviderToRegistryKey('youtube-innertube'), 'youtube-innertube');
+  assert.equal(ledgerProviderToRegistryKey('something-else'), 'something-else');
 });

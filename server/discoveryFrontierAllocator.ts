@@ -9,7 +9,7 @@ import {
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
-import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, type ProviderAllocation } from './providerAwareRetrieval';
+import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, type ProviderAllocation } from './providerAwareRetrieval';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -663,8 +663,23 @@ export async function evaluateFrontierCanaryAllocation(input: {
     // ACTIVE rows (official API + YouTube.js), allocations spread
     // deterministically across all of them by opportunityKey hash — no shared
     // state, no caps, and the official path is never modified or bypassed.
-    const providerRow = !targetProviderKey && providerResult.rows.length > 1
-      ? rotateActiveProviderRow(providerResult.rows, input.opportunityKey)
+    // Providers with recent RATE_LIMITED ledger rows are excluded while a
+    // healthy alternative remains, so a cooling provider stops receiving new
+    // opportunities; the lookup fails open to the full pool.
+    let coolingKeys: string[] = [];
+    if (!targetProviderKey && providerResult.rows.length > 0) {
+      try {
+        const coolingRes = await runner.query(
+          `SELECT DISTINCT provider FROM provider_call_events WHERE provider IN ('youtube','youtube-innertube') AND status='RATE_LIMITED' AND occurred_at > now() - ($1||' seconds')::interval`,
+          [String(PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS)]
+        );
+        coolingKeys = coolingRes.rows.map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
+      } catch {
+        coolingKeys = [];
+      }
+    }
+    const providerRow = !targetProviderKey && providerResult.rows.length > 0
+      ? rotateActiveProviderRow(providerResult.rows, input.opportunityKey, coolingKeys)
       : providerResult.rows[0];
 
     if (!providerRow || !Array.isArray(providerRow.capabilities) || !providerRow.capabilities.includes(requiredCapability) ||

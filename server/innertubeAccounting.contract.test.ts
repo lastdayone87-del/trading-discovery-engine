@@ -64,7 +64,7 @@ test('DATE retargeting re-checks caps and amends amounts without touching immuta
 });
 
 test('ordinary scheduling rotates across ACTIVE providers for provider-less candidates', () => {
-  assert.match(dbCore, /rotateActiveProviderRow\(rotationRes\.rows, `scheduled:\$\{candidate\.query\.id\}:\$\{candidate\.query\.country\}`\)/);
+  assert.match(dbCore, /rotateActiveProviderRow\(rotationRes\.rows, `scheduled:\$\{candidate\.query\.id\}:\$\{candidate\.query\.country\}`, coolingKeys\)/);
   // Rotation reads only real registry columns (provider_key, provider_family,
   // capabilities, quota_domain, mode) and derives the surface exactly like
   // the frontier allocator — a bad column would silently disable rotation.
