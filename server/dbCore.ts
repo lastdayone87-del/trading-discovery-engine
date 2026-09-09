@@ -1071,16 +1071,16 @@ export async function scheduleAutonomousQueryRuns(
         // default preserved on any failure or single-provider registry).
         try {
           const rotationRes = await client.query(
-            `SELECT provider_key,retrieval_surface,provider_capability,cost_domain,continuation_owner,mode FROM discovery_provider_registry WHERE mode='ACTIVE' AND capabilities ? 'SEARCH_YOUTUBE' ORDER BY provider_key FOR SHARE`
+            `SELECT provider_key,provider_family,capabilities,quota_domain,mode FROM discovery_provider_registry WHERE mode='ACTIVE' AND capabilities ? 'SEARCH_YOUTUBE' ORDER BY provider_key FOR SHARE`
           );
           if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 1) {
             const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`);
             allocatedProvider = providerSnapshot({
               providerKey: picked.provider_key,
-              retrievalSurface: picked.retrieval_surface,
-              capability: picked.provider_capability,
-              costDomain: picked.cost_domain,
-              continuationOwner: picked.continuation_owner,
+              retrievalSurface: picked.provider_family === 'youtube' ? 'YOUTUBE_NATIVE' : `${String(picked.provider_family).toUpperCase()}_NATIVE`,
+              capability: 'SEARCH_YOUTUBE',
+              costDomain: picked.quota_domain,
+              continuationOwner: 'PHASE_9',
             });
           }
         } catch {
