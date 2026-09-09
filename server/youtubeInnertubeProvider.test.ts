@@ -18,7 +18,10 @@ import {
   innertubeCooldownRemainingMs,
   resetInnertubeCooldownForTests,
   setInnertubeSessionFactoryForTests,
+  setInnertubeEmitSinkForTests,
   withInnertubeDeadline,
+  withInnertubeRemaining,
+  resetInnertubePacingForTests,
   executeInnertubeRetrievalPage,
 } from './youtubeInnertubeProvider';
 
@@ -409,6 +412,110 @@ test('withInnertubeDeadline ignores late losers so no post-timeout success emits
   await assert.rejects(withInnertubeDeadline(slow, 5), (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE);
   await new Promise((resolve) => setTimeout(resolve, 80));
   assert.equal(settled, 'late');
+});
+
+test('an already-exhausted page deadline rejects immediately with the timeout code', async () => {
+  const started = Date.now();
+  await assert.rejects(
+    withInnertubeRemaining(new Promise(() => undefined), Date.now() - 1),
+    (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+  );
+  assert.ok(Date.now() - started < 50, 'exhausted budget must not wait out another full timeout');
+});
+
+test('page timeout is one wall-clock budget across search and continuations', async () => {
+  // Budget 300ms. The search consumes ~250ms of it, then the continuation
+  // stalls. Per-operation timeouts would allow 250 + 300 = ~550ms; the page
+  // deadline must fire at ~300ms from page start instead.
+  const previousTimeout = process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '300';
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  let continuationAttempted = false;
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return {
+        channels: [],
+        has_continuation: true,
+        getContinuation: async () => {
+          continuationAttempted = true;
+          return new Promise(() => undefined) as never;
+        },
+      };
+    },
+  }));
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'CHANNEL',
+        cursor: '2',
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(continuationAttempted, 'the walk must reach the continuation for the bound to be meaningful');
+    assert.ok(elapsed < 500, `page must respect the single 300ms budget, took ${elapsed}ms`);
+  } finally {
+    if (previousTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+    else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = previousTimeout;
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('slow session creation consumes the same page budget as the search', async () => {
+  // Budget 300ms. Session creation consumes ~250ms, then the search stalls.
+  // Per-operation timeouts would allow 250 + 300 = ~550ms; the page deadline
+  // must fire at ~300ms from page start instead.
+  const previousTimeout = process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '300';
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  setInnertubeSessionFactoryForTests(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return { search: async () => new Promise(() => undefined) as never };
+  });
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'CHANNEL',
+        cursor: null,
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 500, `page must respect the single 300ms budget, took ${elapsed}ms`);
+  } finally {
+    if (previousTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+    else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = previousTimeout;
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
 });
 
 test('request pacing serializes bursts behind a minimum interval', async () => {

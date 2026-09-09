@@ -62,6 +62,16 @@ export const INNERTUBE_CONTINUATION_UNAVAILABLE_CODE = 'INNERTUBE_API_CONTINUATI
 
 const CHANNEL_ID_PATTERN = /^UC[A-Za-z0-9_-]{22}$/;
 
+/**
+ * Timeout contract: YOUTUBE_INNERTUBE_TIMEOUT_MS is the maximum wall-clock
+ * duration of an ENTIRE retrieval page — session creation, pacing waits, the
+ * initial search, and every continuation walk step share ONE absolute
+ * deadline established when executeInnertubeRetrievalPage starts. It is NOT
+ * a per-request budget: a page can never consume N x timeout no matter how
+ * many provider operations it performs. This bounds worker hold time on the
+ * unofficial endpoint, where stalls (hung session/search/continuation) would
+ * otherwise stack per-operation timeouts severalfold.
+ */
 export function innertubeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env.YOUTUBE_INNERTUBE_TIMEOUT_MS || '30000');
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 30000;
@@ -104,24 +114,26 @@ function paceInnertubeRequest(minIntervalMs: number): Promise<void> {
 /**
  * Every provider request — initial search and each continuation — passes
  * through pacing first, so bursts (including multi-page walks) never hit the
- * unofficial endpoint unthrottled.
+ * unofficial endpoint unthrottled. Pacing waits run INSIDE the page deadline
+ * (they consume the same budget via withInnertubeRemaining), so the timeout
+ * contract bounds total wall-clock time including queueing, not just I/O.
  */
 async function pacedSearch(
   session: InnertubeSession,
   query: string,
   searchType: string,
-  timeoutMs: number,
+  deadlineAtMs: number,
 ): Promise<InnertubeFeedLike> {
-  await paceInnertubeRequest(innertubeMinIntervalMs());
-  return withInnertubeDeadline(session.search(query, { type: searchType }), timeoutMs);
+  await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
+  return withInnertubeRemaining(session.search(query, { type: searchType }), deadlineAtMs);
 }
 
 async function pacedContinuation(
   feed: InnertubeFeedLike,
-  timeoutMs: number,
+  deadlineAtMs: number,
 ): Promise<unknown> {
-  await paceInnertubeRequest(innertubeMinIntervalMs());
-  return withInnertubeDeadline(feed.getContinuation!(), timeoutMs);
+  await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
+  return withInnertubeRemaining(feed.getContinuation!(), deadlineAtMs);
 }
 
 /**
@@ -355,10 +367,14 @@ export function innertubeTimeoutError(): Error & { code?: string; retryable?: bo
 }
 
 /**
- * Races provider work against the wall-clock deadline. Whichever settles
+ * Races provider work against a timeout budget. Whichever settles
  * first wins; a late loser is ignored, so a timed-out operation can never
  * emit success telemetry after the fact. Both sides carry handlers, so late
  * rejections are never unhandled.
+ *
+ * This is the per-operation primitive. Page execution never calls it with the
+ * full configured timeout directly — it goes through withInnertubeRemaining
+ * so every operation shares the page's single absolute deadline.
  */
 export function withInnertubeDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -370,6 +386,21 @@ export function withInnertubeDeadline<T>(work: Promise<T>, timeoutMs: number): P
     (error) => { if (timer) clearTimeout(timer); throw error; },
   );
   return Promise.race([guarded, timeout]);
+}
+
+/**
+ * Page-deadline enforcement: races work against the time REMAINING until the
+ * page's absolute deadline (established once in executeInnertubeRetrievalPage
+ * from the configured timeout). Each successive provider operation therefore
+ * gets a shrinking budget, and the page as a whole can never exceed the
+ * configured timeout no matter how many operations it performs. An already-
+ * exhausted deadline rejects immediately with the standard timeout error
+ * (classified INNERTUBE_API_TIMEOUT downstream, like any other expiry).
+ */
+export function withInnertubeRemaining<T>(work: Promise<T>, deadlineAtMs: number): Promise<T> {
+  const remainingMs = deadlineAtMs - Date.now();
+  if (!(remainingMs > 0)) return Promise.reject(innertubeTimeoutError());
+  return withInnertubeDeadline(work, remainingMs);
 }
 
 function classifyInnertubeError(error: unknown): Error & { code?: string; retryable?: boolean } {
@@ -400,7 +431,12 @@ function classifyInnertubeError(error: unknown): Error & { code?: string; retrya
 }
 
 export async function executeInnertubeRetrievalPage(request: RetrievalRequest): Promise<RetrievalPage> {
+  // Single absolute page deadline: session creation, pacing, the initial
+  // search, and every continuation share this one budget (see the timeout
+  // contract on innertubeTimeoutMs). Operations arriving after it expired get
+  // zero budget and fail immediately with INNERTUBE_API_TIMEOUT.
   const timeoutMs = innertubeTimeoutMs();
+  const deadlineAtMs = Date.now() + timeoutMs;
   const remainingMs = innertubeCooldownRemainingMs();
   if (remainingMs > 0) {
     throw Object.assign(
@@ -433,8 +469,8 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     policyVersion: 'provider-resilience-v1',
   };
   try {
-    await paceInnertubeRequest(innertubeMinIntervalMs());
-    const session = await withInnertubeDeadline(getInnertubeSession(), timeoutMs);
+    await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
+    const session = await withInnertubeRemaining(getInnertubeSession(), deadlineAtMs);
     // Page walk: InnerTube continuations belong to a live feed object, so page
     // N is reached by re-running the search and advancing N-1 continuations.
     // Bounded to YOUTUBE_INNERTUBE_MAX_PAGES (mirrors the autonomous 3-page cap).
@@ -446,7 +482,7 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     // results; within one call the walk uses live continuations with no drift.
     // A cursor is therefore a page number, not an equivalent server cursor.
     const searchType = lane === 'VIDEO' ? 'video' : 'channel';
-    let feed = await pacedSearch(session, request.query, searchType, timeoutMs);
+    let feed = await pacedSearch(session, request.query, searchType, deadlineAtMs);
     for (let walked = 1; walked < pageNumber; walked++) {
       if (!feed?.has_continuation || typeof feed.getContinuation !== 'function') {
         throw Object.assign(
@@ -456,10 +492,12 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
       }
       // Rejections propagate with their original classification (429s arm the
       // cooldown, network errors stay network errors); only a genuinely empty
-      // (null/undefined) continuation becomes CONTINUATION_UNAVAILABLE.
-      const next = (await withInnertubeDeadline(
-        pacedContinuation(feed, timeoutMs),
-        timeoutMs,
+      // (null/undefined) continuation becomes CONTINUATION_UNAVAILABLE. The
+      // walk shares the page deadline, so a stalled continuation cannot stack
+      // another full timeout on top of the search that preceded it.
+      const next = (await withInnertubeRemaining(
+        pacedContinuation(feed, deadlineAtMs),
+        deadlineAtMs,
       )) as InnertubeFeedLike | null;
       if (!next) {
         throw Object.assign(
