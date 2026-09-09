@@ -1241,12 +1241,16 @@ export async function scheduleAutonomousQueryRuns(
       // a DATE allocation served by YouTube.js would execute relevance order
       // while labeled DATE (mislabeled retrieval experiments). Re-target such
       // runs to the official provider explicitly; RELEVANCE runs are
-      // unaffected. The switch re-checks both daily caps with the official
-      // 100 units BEFORE any reservation is amended, and rewrites the
-      // frontier decision + treatment reservation to the same provider and
-      // amount — so frontier, canary, run, and consumption records agree. A
+      // unaffected. The switch re-checks daily caps with the official 100
+      // units BEFORE any reservation is amended, and amends amount fields so
+      // canary, run, and consumption records agree on the official amount. A
       // cap breach fails this candidate's scheduling loudly (same backpressure
       // semantics as every other cap) instead of silently over-allocating.
+      // Frontier lineage note: frontier_allocation_decisions provider identity
+      // columns are trigger-immutable (migration 111
+      // protect_provider_allocation_lineage), so the frontier row keeps the
+      // Phase 8-authorized innertube identity while its amount fields reflect
+      // actual official consumption; the run row carries official identity.
       if (searchOrdering === 'DATE' && allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE') {
         activeOperation = 'date_ordering_provider_guard';
         const guarded = applyDateOrderingProviderGuard(allocatedProvider, searchOrdering);
@@ -1256,22 +1260,24 @@ export async function scheduleAutonomousQueryRuns(
           [allocatedProvider.providerKey, allocatedProvider.costDomain, allocatedProvider.capability]
         );
         if (!recheck.rowCount) await failStep('provider_registry_eligibility', new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE'));
-        const [frontierCapRes, frontierUseRes] = await Promise.all([
-          client.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_allocation_daily_quota_cap'`),
-          client.query(
-            `SELECT COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
-             FROM frontier_allocation_decisions
-             WHERE quota_day = $1 AND allocation_origin = 'FRONTIER_CANARY' AND decision_status IN ('RESERVED', 'COMMITTED')`,
-            [getYouTubeQuotaDay(new Date())]
-          ),
-        ]);
-        const frontierQuotaCap = Number(frontierCapRes.rows[0]?.setting_value ?? 1000);
-        if (Number(frontierUseRes.rows[0]?.daily_quota_used || 0) + 100 > frontierQuotaCap) {
-          await failStep('provider_guard_quota', new Error(`FRONTIER_CANARY_DAILY_CAP_EXCEEDED (date-ordering retarget needs official units)`));
-        }
+        // Frontier caps/amounts apply only to frontier-authorized runs: legacy
+        // runs have no frontier decision row and consume no frontier allowance.
         if (candidate.frontierDecisionId) {
+          const [frontierCapRes, frontierUseRes] = await Promise.all([
+            client.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_allocation_daily_quota_cap'`),
+            client.query(
+              `SELECT COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
+               FROM frontier_allocation_decisions
+               WHERE quota_day = $1 AND allocation_origin = 'FRONTIER_CANARY' AND decision_status IN ('RESERVED', 'COMMITTED')`,
+              [getYouTubeQuotaDay(new Date())]
+            ),
+          ]);
+          const frontierQuotaCap = Number(frontierCapRes.rows[0]?.setting_value ?? 1000);
+          if (Number(frontierUseRes.rows[0]?.daily_quota_used || 0) + 100 > frontierQuotaCap) {
+            await failStep('provider_guard_quota', new Error(`FRONTIER_CANARY_DAILY_CAP_EXCEEDED (date-ordering retarget needs official units)`));
+          }
           await client.query(
-            `UPDATE frontier_allocation_decisions SET quota_reserved=100, provider_key='youtube-search', retrieval_surface='YOUTUBE_NATIVE', provider_capability='SEARCH_YOUTUBE', cost_domain='YOUTUBE_DATA_API', provider_reserved_amount=100 WHERE decision_id=$1 AND decision_status IN ('RESERVED','COMMITTED')`,
+            `UPDATE frontier_allocation_decisions SET quota_reserved=100, provider_reserved_amount=100 WHERE decision_id=$1 AND decision_status IN ('RESERVED','COMMITTED')`,
             [candidate.frontierDecisionId]
           );
         }

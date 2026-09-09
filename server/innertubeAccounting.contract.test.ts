@@ -49,10 +49,15 @@ test('quota-free runs never fall back to the official search path', () => {
   assert.match(queueManager, /quotaFreeInnertubeProvider \? \[\] : await searchYouTubeChannels/);
 });
 
-test('DATE retargeting re-checks caps and rewrites lineage before reserving', () => {
+test('DATE retargeting re-checks caps and amends amounts without touching immutable lineage', () => {
   assert.match(dbCore, /DATE_ORDERING_RETARGETED_OFFICIAL/);
-  // Frontier decision rewritten to the official provider and amount.
-  assert.match(dbCore, /UPDATE frontier_allocation_decisions SET quota_reserved=100, provider_key='youtube-search'/);
+  // Frontier decision: amount fields only — provider identity columns are
+  // trigger-immutable (migration 111 protect_provider_allocation_lineage).
+  assert.match(dbCore, /UPDATE frontier_allocation_decisions SET quota_reserved=100, provider_reserved_amount=100 WHERE decision_id=\$1/);
+  assert.doesNotMatch(dbCore, /UPDATE frontier_allocation_decisions SET quota_reserved=100, provider_key/);
+  // Frontier caps apply only to frontier-authorized runs (legacy runs have no
+  // frontier decision and consume no frontier allowance).
+  assert.match(dbCore, /if \(candidate\.frontierDecisionId\) \{/);
   // Both daily caps re-checked with official units before amending anything.
   assert.match(dbCore, /FRONTIER_CANARY_DAILY_CAP_EXCEEDED \(date-ordering retarget needs official units\)/);
   assert.match(dbCore, /RETRIEVAL_CANARY_DAILY_CAP_EXCEEDED \(date-ordering retarget needs official units\)/);
