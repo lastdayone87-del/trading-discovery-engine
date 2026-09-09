@@ -51,6 +51,19 @@ export function creatorLevelCountryEvidence(channelData: {
   externalLinks?: string[];
   socialBios?: string[];
   metadataStatus?: CountryMetadataStatus;
+  /**
+   * Already-fetched creator-written video descriptions. Used ONLY by the
+   * aggregated-content-language voter (never joined into bio text, never
+   * matched by P2/P5–P8 matchers). Titles stay excluded per the boundary
+   * below; descriptions are long-form creator prose, not retrieval-selected
+   * query echoes, so the circularity concern does not apply.
+   */
+  videoDescriptions?: string[];
+  /**
+   * Already-fetched playlist names/descriptions. Corroboration veto only
+   * (see aggregateContentLanguage); never decisive alone.
+   */
+  playlists?: Array<{ name?: string; description?: string }>;
 }) {
   const socialLinks = (channelData.externalLinks || []).filter(link =>
     /(?:instagram|twitter|x|facebook|linkedin|tiktok)\.com/i.test(link)
@@ -61,11 +74,15 @@ export function creatorLevelCountryEvidence(channelData: {
     channelName: channelData.channelName,
     // Provenance boundary: description and socialBios stay separate fields so
     // P2 evidence records exactly which one produced it. Crawler trail prose,
-    // video metadata, and discovery context must never be passed here.
+    // video TITLES, and discovery context must never be passed here.
+    // Video DESCRIPTIONS travel in their own field for the aggregated-language
+    // voter only (see CountryInferenceInput.videoDescriptions).
     aboutBio: channelData.description || '',
     socialBios: channelData.socialBios || [],
     officialWebsiteLinks: websiteLinks,
     verifiedSocialLinks: socialLinks,
+    videoDescriptions: Array.isArray(channelData.videoDescriptions) ? channelData.videoDescriptions : [],
+    playlists: Array.isArray(channelData.playlists) ? channelData.playlists : [],
     // Deliberately exclude videoTitles from country attribution. A creator may
     // cover any country's instrument/market, and discovery-selected titles are
     // especially vulnerable to circular query evidence.
@@ -159,6 +176,8 @@ export async function validateChannelCountry(
     externalLinks?: string[];
     socialBios?: string[];
     metadataStatus?: CountryMetadataStatus;
+    videoDescriptions?: string[];
+    playlists?: Array<{ name?: string; description?: string }>;
   },
   targetCountryName?: string | null
 ): Promise<ValidationResult> {

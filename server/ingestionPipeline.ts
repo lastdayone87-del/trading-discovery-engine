@@ -211,7 +211,9 @@ export async function processChannelThroughPipeline(
       videoTitles: candidate.videoTitles,
       locationTag: candidate.locationTag,
       externalLinks: candidate.channelLinks,
-      metadataStatus: candidate.countryMetadataStatus
+      metadataStatus: candidate.countryMetadataStatus,
+      videoDescriptions: candidate.videoDescriptions,
+      playlists: candidate.playlists
     },
     targetCountry
   );
@@ -225,7 +227,7 @@ export async function processChannelThroughPipeline(
     const hydrated = await fetchYouTubeChannelCountryMetadata(candidate.channelId, candidate);
     Object.assign(candidate, hydrated);
     countryVal = await validateChannelCountry({ channelName:candidate.channelName, description:candidate.description,
-      videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus }, targetCountry);
+      videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus, videoDescriptions:candidate.videoDescriptions, playlists:candidate.playlists }, targetCountry);
   }
 
   // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
@@ -261,6 +263,8 @@ export async function processChannelThroughPipeline(
           locationTag: candidate.locationTag,
           externalLinks: candidate.channelLinks,
           metadataStatus: candidate.countryMetadataStatus,
+          videoDescriptions: candidate.videoDescriptions,
+          playlists: candidate.playlists,
         }, targetCountry);
       } else {
         (candidate as any).publicAboutStatus = liveAbout ? 'ATTEMPTED_EMPTY' : 'ATTEMPTED_FAILED';

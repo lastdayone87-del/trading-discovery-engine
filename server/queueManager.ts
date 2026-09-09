@@ -911,7 +911,9 @@ export async function inspectAndValidateChannel(
         videoTitles: rawDetails?.videoTitles || [channel.channel_name],
         locationTag: rawDetails?.locationTag,
         externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : []),
-        metadataStatus: rawDetails?.countryMetadataStatus || channel.country_metadata_status
+        metadataStatus: rawDetails?.countryMetadataStatus || channel.country_metadata_status,
+        videoDescriptions: rawDetails?.videoDescriptions,
+        playlists: rawDetails?.playlists
       },
       rawDetails?.locationTag || null
     );
@@ -965,7 +967,8 @@ export async function inspectAndValidateChannel(
     const rawLiveCountry = await validateChannelCountry({channelName:channel.channel_name,
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
-      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, rawDetails?.locationTag || null);
+      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status,
+      videoDescriptions:rawDetails?.videoDescriptions, playlists:rawDetails?.playlists}, rawDetails?.locationTag || null);
     const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
     const liveCountryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',

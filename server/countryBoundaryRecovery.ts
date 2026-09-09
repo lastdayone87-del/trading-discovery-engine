@@ -1,5 +1,6 @@
 import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb, enqueueJob, upsertChannel, getChannelById } from './db';
 import { canonicalCountry, inferChannelCountry } from './countryInference';
+import { normalizeCountryName } from './countryExclusionRules';
 import { creatorLevelCountryEvidence } from './countryValidator';
 import type { ChannelRecord, CountryVocabulary } from '../src/types';
 
@@ -44,6 +45,30 @@ export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, _excluded
  * - INSUFFICIENT_EVIDENCE: No creator-level country evidence exists to resolve the boundary.
  * - LEGITIMATE_REJECTION: The rejection was not a false target boundary mismatch (e.g. explicitly rejected by policy).
  */
+/**
+ * Parses an aggregated-content-language rejection from a channel's inspection
+ * trail. The language evidence line carries the source marker plus the full
+ * candidate-country set (`candidate countries [A, B]`), so reconciliation
+ * can match rows by set membership when an exclusion is removed — not only
+ * by the mechanical representative string. Returns null when the trail
+ * carries no language rejection.
+ */
+export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
+  representative: string;
+  countries: string[];
+} | null {
+  const text = trailText(channel);
+  if (!text.includes('AGGREGATED_CONTENT_LANGUAGE')) return null;
+  const representativeMatch = text.match(/AGGREGATED_CONTENT_LANGUAGE:\s*([^\n(]+?)\s*\(/);
+  const representative = (representativeMatch?.[1] || '').trim();
+  const setMatch = text.match(/candidate countries \[([^\]]+)\]/);
+  const countries = setMatch
+    ? setMatch[1].split(',').map(part => part.trim()).filter(Boolean)
+    : (representative ? [representative] : []);
+  if (!representative || countries.length === 0) return null;
+  return { representative, countries };
+}
+
 export function classifyReconciliationState(
   channel: ChannelRecord,
   excludedCountries: Array<{ country_name: string; reason?: string }>,
@@ -56,12 +81,40 @@ export function classifyReconciliationState(
 } {
   const hasBoundaryRejection = hasPinnedBoundaryRejection(channel);
   if (!hasBoundaryRejection && channel.country_status === 'REJECTED') {
-    return {
-      state: 'LEGITIMATE_REJECTION',
-      detectedCountry: channel.country || null,
-      reasoning: 'Channel was rejected by policy or explicit country match, not target boundary mismatch.',
-      confidence: 100
-    };
+    const isLiveExcluded = (country: string): boolean =>
+      excludedCountries.some(item => normalizeCountryName(item.country_name) === normalizeCountryName(country));
+    // Aggregated-language rejections carry their candidate-country set in the
+    // trail: restore the row unless every set member is still excluded.
+    // Set membership (not the mechanical representative) decides, so removing
+    // a non-representative member still catches the row.
+    const languageRejection = parseAggregatedLanguageRejection(channel);
+    if (languageRejection) {
+      if (languageRejection.countries.every(isLiveExcluded)) {
+        return {
+          state: 'RETAIN_EXCLUDED',
+          detectedCountry: languageRejection.representative,
+          reasoning: `Aggregated language candidate countries [${languageRejection.countries.join(', ')}] remain fully excluded.`,
+          confidence: 86
+        };
+      }
+      return {
+        state: 'RECOVERABLE_NON_EXCLUDED',
+        detectedCountry: null,
+        reasoning: `Aggregated language candidate countries [${languageRejection.countries.join(', ')}] are no longer fully excluded by the live list.`,
+        confidence: 86
+      };
+    }
+    // Explicit single-country rejections stand only while the recorded
+    // country is still excluded; otherwise fall through to re-evaluation
+    // against the live list below.
+    if (channel.country && isLiveExcluded(channel.country)) {
+      return {
+        state: 'LEGITIMATE_REJECTION',
+        detectedCountry: channel.country || null,
+        reasoning: 'Channel was rejected by policy or explicit country match, not target boundary mismatch.',
+        confidence: 100
+      };
+    }
   }
 
   // Re-evaluate creator-level evidence using standard production extraction path.
