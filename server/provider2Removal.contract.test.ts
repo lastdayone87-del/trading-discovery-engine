@@ -9,10 +9,8 @@ const operationalMaintenanceWorkers = readFileSync(new URL('./operationalMainten
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 const activeProvider2Symbols = [
-  'youtubeInnerTubeProvider',
   'youtubeInnerTubeEnrichment',
   'innerTubeLane',
-  'YOUTUBE_INNERTUBE_',
   'YOUTUBE_JS_HYBRID_ENRICHMENT_ENABLED',
   'youtube_inner_tube_',
   'youtube_js_hybrid_enrichment_enabled',
@@ -23,13 +21,26 @@ test('Provider2 is physically absent from active YouTube runtime and tooling', (
   for (const symbol of activeProvider2Symbols) {
     assert.equal(queueManager.includes(symbol), false, `queueManager still contains ${symbol}`);
     assert.equal(youtube.includes(symbol), false, `youtube runtime still contains ${symbol}`);
-  }
-  assert.equal(existsSync(new URL('./youtubeInnerTubeProvider.ts', import.meta.url)), false);
+  };
   assert.equal(existsSync(new URL('./youtubeInnerTubeEnrichment.ts', import.meta.url)), false);
   assert.equal(existsSync(new URL('../scripts/youtubeProviderBakeoff.ts', import.meta.url)), false);
   assert.equal(existsSync(new URL('../.github/workflows/youtube-provider-bakeoff.yml', import.meta.url)), false);
-  assert.equal(pkg.dependencies?.['youtubei.js'], undefined);
   assert.equal(pkg.scripts?.['youtube:provider-bakeoff'], undefined);
+});
+
+test('YouTube.js provider is registered as an independent active retrieval path', () => {
+  assert.equal(existsSync(new URL('./youtubeInnertubeProvider.ts', import.meta.url)), true);
+  assert.notEqual(pkg.dependencies?.['youtubei.js'], undefined);
+  assert.match(queueManager, /youtubeInnertubeProvider/);
+  // Isolation: the new provider must never touch the official key pool,
+  // scheduler, quota ledger, or fetch path.
+  const innertube = readFileSync(new URL('./youtubeInnertubeProvider.ts', import.meta.url), 'utf8');
+  // Type-only imports are erased at compile time; only value imports couple runtimes.
+  const innertubeValueImports = innertube.split('\n').filter((line) => !/^\s*import\s+type\b/.test(line)).join('\n');
+  assert.doesNotMatch(innertubeValueImports, /from '\.\/youtube'/);
+  assert.doesNotMatch(innertube, /YOUTUBE_API_KEY|YOUTUBE_DATA_API|youtubeFetch|getYouTubeKeyPool/);
+  assert.match(innertube, /YOUTUBE_INNERTUBE_FREE/);
+  assert.match(innertube, /provider='youtube-innertube'|provider: 'youtube-innertube'/);
 });
 
 test('durable autonomous discovery is official API only', () => {
@@ -38,7 +49,9 @@ test('durable autonomous discovery is official API only', () => {
   assert.match(queueManager, /finishQuotaReservation\('AUTONOMOUS_QUERY_PAGE'/);
   assert.match(queueManager, /decision\.shouldContinue&&searchPage\?\.nextPageToken/);
   assert.match(queueManager, /const quotaConsumed=pageNumber\*100/);
-  assert.match(queueManager, /via YOUTUBE_DATA_API/);
+  // Dual-provider completion log: official runs still report YOUTUBE_DATA_API,
+  // InnerTube runs report their own quota-free domain (never official quota).
+  assert.match(queueManager, /YOUTUBE_INNERTUBE_FREE':'YOUTUBE_DATA_API'/);
 });
 
 test('channel enrichment remains official and stage-costed', () => {

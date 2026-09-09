@@ -46,6 +46,7 @@ import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from 
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
+import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
@@ -475,13 +476,18 @@ export async function processNextSearchJob(
       const dbProvider=providerSnapshot(lineage.rows[0].provider_allocation_snapshot);
       if(dbProvider.providerKey!==allocatedProvider.providerKey||dbProvider.retrievalSurface!==allocatedProvider.retrievalSurface||dbProvider.capability!==allocatedProvider.capability||dbProvider.costDomain!==allocatedProvider.costDomain||dbProvider.continuationOwner!==allocatedProvider.continuationOwner)throw new Error('PHASE9_PROVIDER_LINEAGE_MISMATCH');
       braveProvider=allocatedProvider.costDomain==='BRAVE_SEARCH_API';
+      // YouTube.js (InnerTube) is quota-free and cost-free: it must never
+      // reserve official YouTube quota units nor accrue USD ledger spend.
+      // It shares the quota-free execution path with Brave but keeps its own
+      // provider key, cost domain, cooldown, and telemetry throughout.
+      const quotaFreeInnertubeProvider=allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE';
       let providerRequestId: string | null = null;
       if(braveProvider){
         providerRequestId=`${autonomousOperationId}:provider-request`;
         const reservation = await reserveProviderRequest({provider:allocatedProvider,requestId:providerRequestId,queryRunId});
         providerPricingVersion = reservation.pricingVersion;
         providerRequestsAttempted=1;
-      } else {
+      } else if(!quotaFreeInnertubeProvider){
         providerQuotaUnits=100;
         const budget=getDailyYouTubeQuotaBudget();
         const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
@@ -492,7 +498,7 @@ export async function processNextSearchJob(
         const queryMetadata = authorityQueryRecord?.generation_metadata || {};
         const preferredLanguage = preferredLanguageFromQueryMetadata(queryMetadata);
         searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
-          if(braveProvider) return;
+          if(braveProvider||quotaFreeInnertubeProvider) return;
           const budget=getDailyYouTubeQuotaBudget();
           const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
           const toppedUp=await topUpQuotaReservation({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',additionalUnits,dailyBudget:budget,allocationPercent:percent});
@@ -502,7 +508,7 @@ export async function processNextSearchJob(
           providerRequestsSucceeded=1; providerPagesRetrieved=1; providerCostUsd=Number(searchPage.providerCostUsd ?? 0);
           await settleProviderRequest(providerRequestId!, 'SUCCEEDED', providerCostUsd);
           await (await getDb()).query(`UPDATE query_runs SET provider_cost_usd=provider_cost_usd+$2,provider_pricing_version=$3,provider_requests_attempted=provider_requests_attempted+1,provider_requests_succeeded=provider_requests_succeeded+1,provider_pages_retrieved=provider_pages_retrieved+1 WHERE id=$1`,[queryRunId,providerCostUsd,providerPricingVersion]);
-        } else await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
+        } else if(!quotaFreeInnertubeProvider) await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,true);
       } catch (error:any) {
         if(braveProvider){
           const rateLimited=String(error?.code||'').toUpperCase()==='BRAVE_API_RATE_LIMIT_429';
@@ -510,7 +516,7 @@ export async function processNextSearchJob(
           await settleProviderRequest(providerRequestId!, rateLimited?'RATE_LIMITED':'FAILED', 0, String(error?.code||error?.message||'PROVIDER_FAILURE'));
           await (await getDb()).query(`UPDATE query_runs SET provider_requests_attempted=provider_requests_attempted+1,provider_requests_failed=provider_requests_failed+$2,provider_rate_limited=provider_rate_limited+$3 WHERE id=$1`,[queryRunId,rateLimited?0:1,rateLimited?1:0]);
           if(rateLimited&&Number(error?.retryAfterMs)>0) await setAppSetting('brave_cooldown_until',new Date(Date.now()+Number(error.retryAfterMs)).toISOString()).catch(()=>undefined);
-        } else await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,false);
+        } else if(!quotaFreeInnertubeProvider) await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE',autonomousOperationId,false);
         throw error;
       }
     }
@@ -652,6 +658,23 @@ export async function processNextSearchJob(
           providerRequestsFailed,
           providerRateLimited
         });
+      } else if (allocatedProvider.providerKey === 'youtube-innertube' && queryRunId) {
+        // InnerTube telemetry lives under its own provider name so the
+        // official provider's run stats stay pure; same outcome math.
+        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube-innertube' AND operation='search'`, [queryRunId]);
+        const counts = providerCounts.rows[0] || {};
+        providerRequestsAttempted = Number(counts.attempted || 0);
+        providerRequestsSucceeded = Number(counts.succeeded || 0);
+        providerRequestsFailed = Number(counts.failed || 0);
+        providerRateLimited = Number(counts.rate_limited || 0);
+        providerPagesRetrieved = providerRequestsSucceeded;
+        providerRunOutcome = classifyProviderRunOutcome({
+          rawResults: finalMetrics.rawResults,
+          providerRequestsAttempted,
+          providerRequestsSucceeded,
+          providerRequestsFailed,
+          providerRateLimited
+        });
       } else if (allocatedProvider.providerKey === 'brave-search') {
         providerRunOutcome = classifyProviderRunOutcome({
           rawResults: finalMetrics.rawResults,
@@ -661,7 +684,7 @@ export async function processNextSearchJob(
           providerRateLimited
         });
       }
-      const quotaConsumed=providerCostUsd>0?0:pageNumber*100;
+      const quotaConsumed=providerCostUsd>0||allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?0:pageNumber*100;
       const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
@@ -686,7 +709,7 @@ export async function processNextSearchJob(
         channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
         quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
         cycle_quality_score: performance.performanceScore,
-        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via YOUTUBE_DATA_API.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(metrics)}`]
+        logs: [`Durable autonomous ${retrievalLane} lane run ${queryRunId} completed by ${workerId} via ${allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?'YOUTUBE_INNERTUBE_FREE':'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(metrics)}`]
       });
 
       // Post-run idempotent recomputation of derived evidence aggregate

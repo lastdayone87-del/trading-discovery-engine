@@ -6,6 +6,7 @@ import { ExternalLinkProvider } from './providers/ExternalLinkProvider';
 import { CountryKnowledgeProvider } from './providers/CountryKnowledgeProvider';
 import { GeminiSemanticProvider } from './providers/GeminiSemanticProvider';
 import { GroqSemanticProvider, shouldUseGroqSemantic } from './providers/GroqSemanticProvider';
+import { GeminiFreeSemanticProvider, shouldUseGeminiFreeSemantic } from './providers/GeminiFreeSemanticProvider';
 import { DiscordProvider } from './providers/DiscordProvider';
 import { MultilingualContextProvider } from './providers/MultilingualContextProvider';
 import { ConfigurableWeightedStrategy } from './scoringEngine';
@@ -64,7 +65,12 @@ export class EvidenceBasedTradingEngine {
     // routing is resolved per evaluation (not at construction) so
     // SEMANTIC_PROVIDER / SEMANTIC_PROVIDER_FORCE_GEMINI take effect without
     // a restart; default (unset) keeps Gemini exactly as before.
-    const providers = shouldUseGroqSemantic()
+    // SEMANTIC_PROVIDER names a single provider, so the gemini-free and groq
+    // selectors are mutually exclusive by construction; neither is a fallback
+    // for the other.
+    const providers = shouldUseGeminiFreeSemantic()
+      ? this.providers.map(provider => provider.name === 'gemini_semantic' ? new GeminiFreeSemanticProvider() : provider)
+      : shouldUseGroqSemantic()
       ? this.providers.map(provider => provider.name === 'gemini_semantic' ? new GroqSemanticProvider() : provider)
       : this.providers;
     const providerPromises = providers.map(async provider => {
