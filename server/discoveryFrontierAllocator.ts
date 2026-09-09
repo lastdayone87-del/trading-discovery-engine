@@ -9,7 +9,7 @@ import {
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
-import { isShadowBraveCanaryAllowed, providerSnapshot, type ProviderAllocation } from './providerAwareRetrieval';
+import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, type ProviderAllocation } from './providerAwareRetrieval';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -17,41 +17,6 @@ export type DecisionStatus = 'RESERVED' | 'COMMITTED' | 'RELEASED' | 'DEFERRED';
 
 /** Geographic scope is explicit so ordinary persistent-country opportunities cannot silently use global candidates. */
 export type GeographicAllocationIntent = 'PIN_LEGACY_COUNTRY' | 'ALLOW_GLOBAL';
-
-/**
- * Deterministic traffic sharing across equally-eligible provider rows.
- * Single-row registries resolve to that row (behavior identical to the
- * previous rows[0] pick). With several ACTIVE rows sharing a capability
- * (official YouTube API + YouTube.js), the opportunityKey hash spreads
- * allocations across all of them: both providers stay fully active with no
- * caps, no canary gating, and neither provider's runtime is touched by the
- * other's traffic. CANARY rows never receive ordinary untargeted traffic
- * while any ACTIVE row is eligible; they serve only when no ACTIVE row
- * exists (or via explicit targeting upstream). Ordering is ACTIVE-first
- * then provider_key so the spread is stable regardless of database order.
- */
-export function rotateActiveProviderRow<T extends { provider_key: string; mode: string }>(
-  rows: T[],
-  opportunityKey: string,
-): T {
-  if (!rows.length) throw new Error('NO_ELIGIBLE_PROVIDER_ROWS');
-  const active = rows.filter((row) => row.mode === 'ACTIVE');
-  const pool = active.length ? active : rows;
-  const ordered = [...pool].sort((a, b) => {
-    const rankA = a.mode === 'ACTIVE' ? 0 : 1;
-    const rankB = b.mode === 'ACTIVE' ? 0 : 1;
-    if (rankA !== rankB) return rankA - rankB;
-    return String(a.provider_key).localeCompare(String(b.provider_key));
-  });
-  if (ordered.length === 1) return ordered[0];
-  let hash = 0x811c9dc5;
-  const key = String(opportunityKey || '');
-  for (let i = 0; i < key.length; i++) {
-    hash ^= key.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return ordered[(hash >>> 0) % ordered.length];
-}
 
 export function resolveFrontierCandidateCountry(input: {
   legacyCountry: string;

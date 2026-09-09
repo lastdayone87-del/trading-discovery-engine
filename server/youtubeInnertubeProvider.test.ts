@@ -296,6 +296,41 @@ test('withInnertubeDeadline ignores late losers so no post-timeout success emits
   assert.equal(settled, 'late');
 });
 
+test('request pacing serializes bursts behind a minimum interval', async () => {
+  const { resetInnertubePacingForTests, innertubeMinIntervalMs } = await import('./youtubeInnertubeProvider');
+  assert.equal(innertubeMinIntervalMs({} as any), 500);
+  assert.equal(innertubeMinIntervalMs({ YOUTUBE_INNERTUBE_MIN_INTERVAL_MS: '0' } as any), 0);
+  resetInnertubePacingForTests();
+  resetInnertubeCooldownForTests();
+  const stamps: number[] = [];
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => {
+      stamps.push(Date.now());
+      return { channels: [], has_continuation: false };
+    },
+  }));
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '60';
+  try {
+    await Promise.all([
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER }, query: 'a', country: 'US', lane: 'CHANNEL', cursor: null, ordering: 'RELEVANCE',
+      } as any),
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER }, query: 'b', country: 'US', lane: 'CHANNEL', cursor: null, ordering: 'RELEVANCE',
+      } as any),
+    ]);
+    assert.equal(stamps.length, 2);
+    assert.ok(stamps[1] - stamps[0] >= 40, `expected pacing gap, got ${stamps[1] - stamps[0]}ms`);
+  } finally {
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
 test('rate-limit failure arms only the innertube-local cooldown', async () => {
   resetInnertubeCooldownForTests();
   setInnertubeSessionFactoryForTests(async () => ({

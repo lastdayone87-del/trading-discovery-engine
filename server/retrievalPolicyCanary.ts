@@ -592,7 +592,15 @@ export async function releaseIncrementalTreatmentPageReservation(
   try {
     if (client) await activeRunner.query('BEGIN');
 
-    // Only RESERVED page reservations can be released on enqueue failure; COMMITTED reservations are preserved
+    // Only RESERVED page reservations can be released on enqueue failure; COMMITTED reservations are preserved.
+    // Read the persisted units first so the parent is credited by exactly what
+    // this page reserved (0 for quota-free providers) instead of a hard-coded
+    // 100 that would invent official quota on free runs.
+    const prior = await activeRunner.query(
+      `SELECT quota_reserved FROM retrieval_canary_page_reservations WHERE page_reservation_id = $1 FOR UPDATE`,
+      [pageReservationId]
+    );
+    const releasedUnits = Math.max(0, Math.floor(Number(prior.rows[0]?.quota_reserved ?? 0)) || 0);
     const res = await activeRunner.query(
       `UPDATE retrieval_canary_page_reservations
        SET reservation_status = 'RELEASED',
@@ -606,9 +614,9 @@ export async function releaseIncrementalTreatmentPageReservation(
     if (res.rowCount > 0) {
       await activeRunner.query(
         `UPDATE retrieval_canary_reservations
-         SET quota_reserved = GREATEST(100, quota_reserved - 100)
+         SET quota_reserved = GREATEST($2, quota_reserved - $3)
          WHERE query_run_id = $1 AND reservation_status IN ('RESERVED', 'COMMITTED')`,
-        [queryRunId]
+        [queryRunId, releasedUnits > 0 ? 100 : 0, releasedUnits]
       );
     }
 

@@ -19,6 +19,68 @@ export const YOUTUBE_SEARCH_PROVIDER: ProviderAllocation = Object.freeze({
 });
 
 /**
+ * Deterministic traffic sharing across equally-eligible provider rows.
+ * Single-row registries resolve to that row. With several ACTIVE rows
+ * sharing a capability (official YouTube API + YouTube.js), the rotation key
+ * hash spreads allocations across all of them with no shared state and no
+ * caps. CANARY rows never receive ordinary traffic while any ACTIVE row is
+ * eligible; they serve only when no ACTIVE row exists (or via explicit
+ * targeting upstream). Ordering is ACTIVE-first then provider_key so the
+ * spread is stable regardless of database return order.
+ */
+export function rotateActiveProviderRow<T extends { provider_key: string; mode: string }>(
+  rows: T[],
+  rotationKey: string,
+): T {
+  if (!rows.length) throw new Error('NO_ELIGIBLE_PROVIDER_ROWS');
+  const active = rows.filter((row) => row.mode === 'ACTIVE');
+  const pool = active.length ? active : rows;
+  const ordered = [...pool].sort((a, b) => {
+    const rankA = a.mode === 'ACTIVE' ? 0 : 1;
+    const rankB = b.mode === 'ACTIVE' ? 0 : 1;
+    if (rankA !== rankB) return rankA - rankB;
+    return String(a.provider_key).localeCompare(String(b.provider_key));
+  });
+  if (ordered.length === 1) return ordered[0];
+  let hash = 0x811c9dc5;
+  const key = String(rotationKey || '');
+  for (let i = 0; i < key.length; i++) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return ordered[(hash >>> 0) % ordered.length];
+}
+
+/**
+ * Capability guard for DATE-ordered retrieval. InnerTube exposes no
+ * sort-by-date (verified against the youtubei.js surface: SearchFilters
+ * carries only recency filters, never sort), so a DATE allocation served by
+ * a quota-free InnerTube run would execute relevance order while the run is
+ * labeled DATE — mislabeling retrieval experiments. DATE runs are therefore
+ * re-targeted to the official YouTube provider, which honors order=date.
+ * RELEVANCE runs are unaffected. Returns the (possibly re-targeted)
+ * provider plus whether a switch occurred.
+ */
+export function applyDateOrderingProviderGuard(
+  provider: ProviderAllocation,
+  searchOrdering: string,
+): { provider: ProviderAllocation; switched: boolean } {
+  if (searchOrdering === 'DATE' && provider.costDomain === 'YOUTUBE_INNERTUBE_FREE') {
+    return {
+      provider: providerSnapshot({
+        providerKey: 'youtube-search',
+        retrievalSurface: 'YOUTUBE_NATIVE',
+        capability: 'SEARCH_YOUTUBE',
+        costDomain: 'YOUTUBE_DATA_API',
+        continuationOwner: 'PHASE_9',
+      }),
+      switched: true,
+    };
+  }
+  return { provider, switched: false };
+}
+
+/**
  * SHADOW is never eligible for ordinary allocation. The only exception is the
  * explicitly admin-gated, exactly-one-run Brave direct-search canary path.
  */

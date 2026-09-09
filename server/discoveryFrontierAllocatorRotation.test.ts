@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rotateActiveProviderRow } from './discoveryFrontierAllocator';
+import { rotateActiveProviderRow, applyDateOrderingProviderGuard } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER } from './providerAwareRetrieval';
 
 const official = { provider_key: 'youtube-search', mode: 'ACTIVE' };
 const innertube = { provider_key: 'youtube-innertube', mode: 'ACTIVE' };
@@ -58,4 +59,34 @@ test('mixed ACTIVE/ACTIVE/CANARY registries rotate across active only', () => {
   }
   assert.ok(!picks.has('brave-search'), 'canary must be excluded while ACTIVE rows exist');
   assert.ok(picks.has('youtube-search') && picks.has('youtube-innertube'));
+});
+
+test('DATE ordering re-targets innertube runs to the official provider', () => {
+  const innertube = {
+    providerKey: 'youtube-innertube',
+    retrievalSurface: 'YOUTUBE_NATIVE',
+    capability: 'SEARCH_YOUTUBE',
+    costDomain: 'YOUTUBE_INNERTUBE_FREE',
+    continuationOwner: 'PHASE_9',
+  } as const;
+  const guarded = applyDateOrderingProviderGuard({ ...innertube }, 'DATE');
+  assert.equal(guarded.switched, true);
+  assert.equal(guarded.provider.providerKey, 'youtube-search');
+  assert.equal(guarded.provider.costDomain, 'YOUTUBE_DATA_API');
+});
+
+test('RELEVANCE ordering never re-targets any provider', () => {
+  const innertube = {
+    providerKey: 'youtube-innertube',
+    retrievalSurface: 'YOUTUBE_NATIVE',
+    capability: 'SEARCH_YOUTUBE',
+    costDomain: 'YOUTUBE_INNERTUBE_FREE',
+    continuationOwner: 'PHASE_9',
+  } as const;
+  const kept = applyDateOrderingProviderGuard({ ...innertube }, 'RELEVANCE');
+  assert.equal(kept.switched, false);
+  assert.equal(kept.provider.providerKey, 'youtube-innertube');
+  const official = applyDateOrderingProviderGuard({ ...YOUTUBE_SEARCH_PROVIDER }, 'DATE');
+  assert.equal(official.switched, false);
+  assert.equal(official.provider.providerKey, 'youtube-search');
 });

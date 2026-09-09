@@ -27,7 +27,7 @@ import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance } from './terminologyIntelligence';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -1063,6 +1063,30 @@ export async function scheduleAutonomousQueryRuns(
       candidateDiagnostic = {};
       activeOperation = 'provider_lineage_lookup';
       let allocatedProvider=providerSnapshot(candidate.provider||YOUTUBE_SEARCH_PROVIDER);
+      if (!candidate.provider && !candidate.frontierDecisionId) {
+        // Ordinary (non-frontier) allocations carry no explicit provider and
+        // would otherwise always default to the official API, leaving
+        // YouTube.js idle whenever the frontier gate rejects. Rotate across
+        // ACTIVE SEARCH_YOUTUBE providers instead (stable per query; official
+        // default preserved on any failure or single-provider registry).
+        try {
+          const rotationRes = await client.query(
+            `SELECT provider_key,retrieval_surface,provider_capability,cost_domain,continuation_owner,mode FROM discovery_provider_registry WHERE mode='ACTIVE' AND capabilities ? 'SEARCH_YOUTUBE' ORDER BY provider_key FOR SHARE`
+          );
+          if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 1) {
+            const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`);
+            allocatedProvider = providerSnapshot({
+              providerKey: picked.provider_key,
+              retrievalSurface: picked.retrieval_surface,
+              capability: picked.provider_capability,
+              costDomain: picked.cost_domain,
+              continuationOwner: picked.continuation_owner,
+            });
+          }
+        } catch {
+          allocatedProvider = providerSnapshot(YOUTUBE_SEARCH_PROVIDER);
+        }
+      }
       if(candidate.frontierDecisionId){
         const lineage=await client.query(`SELECT provider_key,retrieval_surface,provider_capability,cost_domain,continuation_owner FROM frontier_allocation_decisions WHERE decision_id=$1 FOR UPDATE`,[candidate.frontierDecisionId]);
         if(!lineage.rowCount)throw new Error('PROVIDER_ALLOCATION_LINEAGE_MISSING');
@@ -1211,6 +1235,27 @@ export async function scheduleAutonomousQueryRuns(
       if (allocatedDimensions && (retrievalLane !== allocatedDimensions.retrievalLane ||
           searchOrdering !== allocatedDimensions.searchOrdering)) {
         throw new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
+      }
+
+      // DATE-ordering capability guard: InnerTube exposes no sort-by-date, so
+      // a DATE allocation served by YouTube.js would execute relevance order
+      // while labeled DATE (mislabeled retrieval experiments). Re-target such
+      // runs to the official provider explicitly; RELEVANCE runs are
+      // unaffected. The treatment reservation created above under free units
+      // is topped up to the official 100 when a switch occurs.
+      if (searchOrdering === 'DATE' && allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE') {
+        activeOperation = 'date_ordering_provider_guard';
+        const guarded = applyDateOrderingProviderGuard(allocatedProvider, searchOrdering);
+        allocatedProvider = guarded.provider;
+        const recheck = await client.query(
+          `SELECT mode FROM discovery_provider_registry WHERE provider_key=$1 AND (mode IN ('ACTIVE','ACTIVE_GLOBAL','CANARY')) AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,
+          [allocatedProvider.providerKey, allocatedProvider.costDomain, allocatedProvider.capability]
+        );
+        if (!recheck.rowCount) await failStep('provider_registry_eligibility', new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE'));
+        if (canaryReservationId) {
+          await client.query(`UPDATE retrieval_canary_reservations SET quota_reserved = quota_reserved + 100 WHERE reservation_id=$1`, [canaryReservationId]);
+        }
+        setDiagnostic({ provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, providerRegistryReasonCode: 'DATE_ORDERING_RETARGETED_OFFICIAL' });
       }
 
       const executedConfig = buildRetrievalConfiguration({

@@ -72,6 +72,35 @@ export function innertubeCooldownMs(env: NodeJS.ProcessEnv = process.env): numbe
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 90000;
 }
 
+/**
+ * Minimum spacing between InnerTube search requests (process-wide). The
+ * official path paces via its priority scheduler to protect precious quota;
+ * InnerTube quota is free, but unpaced concurrent bursts invite IP-level
+ * throttling on an unofficial endpoint, so a light default interval applies.
+ * Tune or disable (0) via YOUTUBE_INNERTUBE_MIN_INTERVAL_MS.
+ */
+export function innertubeMinIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS || '500');
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 500;
+}
+
+let innertubeNextAllowedAtMs = 0;
+let innertubePacingChain: Promise<void> = Promise.resolve();
+export function resetInnertubePacingForTests(): void {
+  innertubeNextAllowedAtMs = 0;
+  innertubePacingChain = Promise.resolve();
+}
+function paceInnertubeRequest(minIntervalMs: number): Promise<void> {
+  const run = innertubePacingChain.then(async () => {
+    const waitMs = Math.max(0, innertubeNextAllowedAtMs - Date.now());
+    if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+    innertubeNextAllowedAtMs = Date.now() + minIntervalMs;
+  });
+  // Chain stays alive across rejections; callers observe only their own run.
+  innertubePacingChain = run.catch(() => undefined);
+  return run;
+}
+
 /** In-process backpressure flag. Module-private: the official provider's pool cannot see it. */
 let innertubeCooldownUntilMs = 0;
 export function innertubeCooldownRemainingMs(nowMs: number = Date.now()): number {
@@ -354,6 +383,7 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     policyVersion: 'provider-resilience-v1',
   };
   try {
+    await paceInnertubeRequest(innertubeMinIntervalMs());
     const session = await withInnertubeDeadline(getInnertubeSession(), timeoutMs);
     // Page walk: InnerTube continuations belong to a live feed object, so page
     // N is reached by re-running the search and advancing N-1 continuations.
