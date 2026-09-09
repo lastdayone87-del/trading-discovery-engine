@@ -62,7 +62,11 @@ Already fetched and persisted under current quota flow:
 
 New source **`AGGREGATED_CONTENT_LANGUAGE` at priority 3** (alongside website TLD, below bio): deterministic criteria — eligible language per the approved map (§5), usable videos ≥ 8, dominant share ≥ 80%, single winner, bio empty-or-noncommittal, and tier precedence satisfied (P1–P2 absent or inconclusive; P3 website interaction follows the multi-country agreement rule below) — confidence from a fixed 2-row table tied to the existing ≥85 gate (100% share → 90, 80–<100% share → 86, always with usable ≥ 8). It can then satisfy `exclusionAuthority` unchanged. Nothing else in the hierarchy moves; P9 stays advisory; forbidden signals (markets, brokers, audience, timezone, external sites, messaging links) remain outside the allowlist.
 
-**Multi-country representation (Urdu, Bengali).** The evidence carries the language's full candidate-country SET — Urdu→{Pakistan, India}, Bengali→{Bangladesh, India} — never an invented single country. The approved map admits a language only when every set member is excluded, so the set as a whole is rejection-capable. Agreement with P3 website country W is set membership: agree iff W ∈ set (e.g., Urdu + `.pk` or `.in`; Bengali + `.bd` or `.in`); a website country outside the set is disagreement. With no website evidence, rejection requires the all-members-excluded property (true by map construction), recorded with the set named in reasoning rather than a forced single country.
+**Multi-country representation (Urdu, Bengali).** The voter outputs the language's full candidate-country SET — Urdu→{Pakistan, India}, Bengali→{Bangladesh, India} — and the set is reduced to single-country evidence items at construction time, so the gate formula (unanimity, string equality, conflict, thresholds) stays byte-identical:
+- Website country W present: emit a P3 language item with `detectedCountry` set to the exact website string W, only for in-set W. Out-of-set website countries get no language item. Existing equality then yields agreement/disagreement with no gate change; any out-of-set website country breaks unanimity → PROCESS.
+- No website evidence: emit one P3 item only if every set member is currently excluded (live-list rule below), with `detectedCountry` = alphabetically-first member as a mechanical representative and `candidateCountries` = full set recorded alongside; reasoning names the set and the all-excluded check, so lineage never pretends the representative was individually identified. (A set-aware gate branch was considered and rejected: it would touch the shared decision path every evaluation flows through, while construction-time reduction confines all new logic to the new source.)
+
+**Live-list rule (mutable exclusions).** The approved map defines candidate sets only — it never assumes exclusion. The all-members-excluded check and the final `excluded` lookup evaluate against the LIVE `excluded_countries` list passed into every `assessChannelCountry` evaluation, so operator changes via `removeExcludedCountry` / the Countries API take effect immediately: if India is removed, Hindi loses all rejection power, Urdu/Bengali sets are no longer all-excluded (→ PROCESS, website-agreed W still resolves via the website item alone under existing rules), and single-country languages fall back to the existing lookup. No stale policy can persist past the edit.
 
 ## 7. Recommended language aggregation approach
 
@@ -89,10 +93,13 @@ Aggregate per-video language over ≤10 recent videos (titles excluded)
   ↓ Approved-map language AND usable ≥ 8 AND share ≥ 80% AND single winner
     AND bio empty/non-committal?
 YES → Is there P3 website country evidence?
-      YES → website country ∈ language set? YES → REJECT (agree) / NO → PROCESS
-      NO → all set members excluded (map construction)? YES → REJECT / (cannot happen per map)
+      YES → website country ∈ language set? YES → REJECT (agree; language item
+            carries the website string, unanimity holds) / NO → PROCESS
+      NO → every set member currently excluded (live list)? YES → REJECT with
+            set named in reasoning / NO → PROCESS
 NO ↓ (mixed / multilingual / below-minimum sample / worldwide language /
-      P3 website disagreement / conflicting evidence / no data)
+      P3 website disagreement / conflicting evidence / no data / set no longer
+      all-excluded after operator edit)
 PROCESS via existing UNCERTAIN / NEEDS_REVIEW / CONTINUE paths (unchanged)
 ```
 
@@ -117,7 +124,7 @@ Unchanged mechanics, extended input: official metadata (P1) and bio (P2) outrank
 
 1. Extend `CountryInferenceInput` + validator input with `videoDescriptions?: string[]`, `playlists?: {name,description}[]` (thread from candidate; titles stay excluded).
 2. Add per-video language voter (script/diacritic + extended keyword lists + existing vocab packs; abstain on worldwide/unknown).
-3. Add `AGGREGATED_CONTENT_LANGUAGE` evidence (priority 3, 100%→90 / 80–<100%→86 table with usable ≥ 8, approved language map Vietnamese/Tagalog/Hindi/Bengali/Urdu). Evidence carries the language's candidate-country set; website agreement = set membership; rejection without website requires the all-members-excluded property (see §§6, 11).
+3. Add `AGGREGATED_CONTENT_LANGUAGE` evidence (priority 3, 100%→90 / 80–<100%→86 table with usable ≥ 8, approved language map Vietnamese/Tagalog/Hindi/Bengali/Urdu). Evidence carries the language's candidate-country set; construction-time reduction emits single-country P3 items (website-agreed string, or alphabetical representative with the set recorded when website-absent and all-members-excluded live); a set-aware gate branch is explicitly out of scope.
 4. No gate/threshold/conflict changes; no new acquisition; no migration; no config format changes.
 5. Estimated surface: ~120 lines in `countryInference.ts`, ~15 in `countryValidator.ts`, keyword-list data additions, tests below.
 
@@ -131,6 +138,7 @@ Unchanged mechanics, extended input: official metadata (P1) and bio (P2) outrank
 - P3 website TLD US + 10/10 Vietnamese descriptions → PROCESS (equal-tier disagreement breaks unanimity, no language-based REJECT); P3 website `.vn` + 10/10 Vietnamese → REJECT (agreement, gate evaluates unanimously).
 - Urdu 9/10 → REJECT (PK/IN both excluded); Bengali 8/10 → REJECT (BD/IN both excluded); Hindi + US bio → PROCESS.
 - Multi-country website agreement: Urdu + `.pk` website → REJECT; Urdu + `.in` website → REJECT; Urdu + `.us` website → PROCESS (disagreement); Bengali + `.bd` → REJECT; Bengali + `.in` → REJECT; Bengali + `.de` → PROCESS; Urdu/Bengali alone (no website) → REJECT via the all-members-excluded rule with the set named in reasoning.
+- Operator edits exclusion list live: India removed → Hindi 10/10 → PROCESS, Urdu 10/10 → PROCESS (set no longer all-excluded), Bengali 10/10 → PROCESS; re-adding restores prior behavior with no code change.
 - Pre-enrichment candidate (0–1 descriptions) → behavior unchanged (UNCERTAIN path).
 - Regression: existing 29-country attribution suite, threshold/conflict/merge/boundary tests all green unchanged.
 
