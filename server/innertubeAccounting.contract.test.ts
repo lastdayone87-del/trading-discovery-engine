@@ -48,3 +48,16 @@ test('queue monitor shows innertube separately and keeps official aggregates pur
 test('quota-free runs never fall back to the official search path', () => {
   assert.match(queueManager, /quotaFreeInnertubeProvider \? \[\] : await searchYouTubeChannels/);
 });
+
+test('DATE retargeting re-checks caps and rewrites lineage before reserving', () => {
+  assert.match(dbCore, /DATE_ORDERING_RETARGETED_OFFICIAL/);
+  // Frontier decision rewritten to the official provider and amount.
+  assert.match(dbCore, /UPDATE frontier_allocation_decisions SET quota_reserved=100, provider_key='youtube-search'/);
+  // Both daily caps re-checked with official units before amending anything.
+  assert.match(dbCore, /FRONTIER_CANARY_DAILY_CAP_EXCEEDED \(date-ordering retarget needs official units\)/);
+  assert.match(dbCore, /RETRIEVAL_CANARY_DAILY_CAP_EXCEEDED \(date-ordering retarget needs official units\)/);
+});
+
+test('ordinary scheduling rotates across ACTIVE providers for provider-less candidates', () => {
+  assert.match(dbCore, /rotateActiveProviderRow\(rotationRes\.rows, `scheduled:\$\{candidate\.query\.id\}:\$\{candidate\.query\.country\}`\)/);
+});
