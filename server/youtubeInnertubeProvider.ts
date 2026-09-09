@@ -288,8 +288,11 @@ export function mapInnertubeChannelsToRaw(
  * an author channel are merged into one entry (titles/descriptions
  * accumulated, first video's matchedDocument kept) — mirroring the official
  * provider's per-channel merge — so downstream channel dedupe cannot silently
- * discard legitimate video evidence. matchedDocument.publishedAt is
- * intentionally unset: InnerTube exposes only relative display text
+ * discard legitimate video evidence. videoTitles and videoDescriptions are
+ * kept index-parallel (a missing description contributes ''), because
+ * downstream ingestion pairs them by index; omitting empties would shift a
+ * later video's description onto an earlier title. matchedDocument.publishedAt
+ * is intentionally unset: InnerTube exposes only relative display text
  * ("3 days ago"), never a timestamp, and a fabricated timestamp would corrupt
  * the downstream staleness triage (which fail-opens on a missing value).
  */
@@ -306,7 +309,10 @@ export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): Discovered
     const existing = byChannel.get(channelId);
     if (existing) {
       existing.videoTitles.push(title);
-      if (videoDescription) (existing.videoDescriptions ??= []).push(videoDescription);
+      // Always push (even ''): titles and descriptions stay index-parallel so
+      // a missing description can never shift a later video's description
+      // onto this title downstream.
+      (existing.videoDescriptions ??= []).push(videoDescription);
       continue;
     }
     const authorName = typeof node?.author?.name === 'string' && node.author.name.trim()
@@ -320,7 +326,9 @@ export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): Discovered
       // unknown until official enrichment hydrates it (official rule).
       description: '',
       videoTitles: [title],
-      videoDescriptions: videoDescription ? [videoDescription] : [],
+      // Index-parallel with videoTitles from the start: a missing first
+      // description is '' rather than omitted (see the merge branch above).
+      videoDescriptions: [videoDescription],
       channelThumbnailUrl: bestThumbnailUrl(node?.thumbnails) || undefined,
       matchedDocument: {
         type: 'VIDEO',
@@ -425,6 +433,17 @@ export function innertubeTimeoutError(): Error & { code?: string; retryable?: bo
  * first wins; a late loser is ignored, so a timed-out operation can never
  * emit success telemetry after the fact. Both sides carry handlers, so late
  * rejections are never unhandled.
+ *
+ * Cancellation limitation (verified against the installed youtubei.js
+ * 18.0.0 API surface): `Innertube.create`, `search`, and `getContinuation`
+ * accept no AbortSignal and expose no cancel operation, so a timed-out
+ * operation is NOT cancelled — it may still complete in the background.
+ * That is safe by construction here: its result is discarded (never
+ * emitted, never returned), its rejection is already handled (never
+ * unhandled), a late session success is not cached (the timed-out attempt
+ * was already invalidated), and the page still rejects with
+ * INNERTUBE_API_TIMEOUT inside the absolute page budget. No fake
+ * cancellation is introduced: there is nothing to signal.
  *
  * This is the per-operation primitive. Page execution never calls it with the
  * full configured timeout directly — it goes through withInnertubeRemaining

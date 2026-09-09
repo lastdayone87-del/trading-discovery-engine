@@ -18,9 +18,10 @@ import type { SemanticModelClient } from './GeminiSemanticProvider';
 import {
   buildSemanticPrompt,
   parseSemanticResult,
+  configuredGeminiRoutes,
   GeminiSemanticProvider,
 } from './GeminiSemanticProvider';
-import { ProviderCallError } from '../../providerResilience';
+import { ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
 
 const input = {
   channel_id: 'channel-1',
@@ -238,4 +239,69 @@ test('defaultClient is undefined without free keys (paid keys do not enable it)'
     if (savedPaid === undefined) delete process.env.GEMINI_API_KEY;
     else process.env.GEMINI_API_KEY = savedPaid;
   }
+});
+
+test('free SDK targets the documented free-tier Gemini endpoint (generativelanguage v1beta)', () => {
+  // Locks the wiring to the free-tier Gemini API (Google AI Studio keys):
+  // default SDK base URL + API version, with no Vertex/baseUrl override.
+  // Matches the documented base URL https://generativelanguage.googleapis.com/v1beta.
+  clearGeminiFreeSdkCacheForTests();
+  try {
+    const sdk = geminiFreeSdkForRouteForTests({ id: 'gemini-free-1', key: 'KEY_A' });
+    const apiClient = (sdk as unknown as {
+      apiClient: { getBaseUrl(): string; getApiVersion(): string };
+    }).apiClient;
+    assert.equal(apiClient.getBaseUrl(), 'https://generativelanguage.googleapis.com/');
+    assert.equal(apiClient.getApiVersion(), 'v1beta');
+  } finally {
+    clearGeminiFreeSdkCacheForTests();
+  }
+});
+
+test('free keys never enable paid routes (namespaces are disjoint both ways)', () => {
+  assert.deepEqual(configuredGeminiRoutes({ GEMINI_FREE_API_KEY: 'free-key' } as any), []);
+  assert.deepEqual(
+    configuredGeminiRoutes({ GEMINI_API_KEY: 'paid', GEMINI_FREE_API_KEY: 'free-key' } as any).map((r) => r.key),
+    ['paid'],
+  );
+});
+
+test('paid selection ignores free keys and free selection ignores paid keys', () => {
+  assert.equal(
+    shouldUseGeminiFreeSemantic({ SEMANTIC_PROVIDER: 'gemini-free', GEMINI_API_KEY: 'paid-key' } as any),
+    false,
+  );
+  assert.equal(
+    shouldUseGeminiFreeSemantic(
+      { SEMANTIC_PROVIDER: 'gemini-free', GEMINI_API_KEY: 'paid-key', GEMINI_FREE_API_KEY: 'free-key' } as any,
+    ),
+    true,
+  );
+  // Free configuration reads only its own namespace (paid vars are invisible).
+  assert.equal(geminiFreeTimeoutMs({ GEMINI_PROVIDER_TIMEOUT_MS: '1000' } as any), 135000);
+  assert.deepEqual(configuredGeminiFreeRoutes({ GEMINI_API_KEY: 'paid-key' } as any), []);
+});
+
+test('free and paid route ids cannot collide', () => {
+  // Paid ids normalize through resolveGeminiRouteId; free ids must never be
+  // accepted as paid ids (or vice versa), so ledgers/caches keyed by route
+  // id cannot cross attribute.
+  assert.equal(resolveGeminiRouteId('gemini-free-1'), 'gemini-1');
+  assert.equal(resolveGeminiRouteId('gemini-2'), 'gemini-2');
+  assert.deepEqual(
+    configuredGeminiFreeRoutes({ GEMINI_FREE_API_KEY: 'k' } as any).map((r) => r.id),
+    ['gemini-free-1'],
+  );
+});
+
+test('free failover stays within free routes and surfaces their results', async () => {
+  const order: string[] = [];
+  const routes = [{ id: 'gemini-free-1', key: 'k1' }, { id: 'gemini-free-2', key: 'k2' }];
+  const value = await runGeminiFreeRouteFailover(routes, async (route) => {
+    order.push(route.id);
+    if (route.id === 'gemini-free-1') throw new ProviderCallError('transient', 'TRANSIENT', true);
+    return 'ok-from-free-2';
+  });
+  assert.equal(value, 'ok-from-free-2');
+  assert.deepEqual(order, ['gemini-free-1', 'gemini-free-2']);
 });

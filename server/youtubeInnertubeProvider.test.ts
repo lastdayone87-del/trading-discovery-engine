@@ -106,10 +106,35 @@ test('videos from the same channel merge so dedupe cannot discard evidence', () 
   ]);
   assert.equal(mapped.length, 1);
   assert.deepEqual(mapped[0].videoTitles, ['First setup', 'Second setup']);
-  assert.deepEqual(mapped[0].videoDescriptions, ['d1']);
+  // Index-parallel with titles: the missing description is '' (never omitted).
+  assert.deepEqual(mapped[0].videoDescriptions, ['d1', '']);
   // First video's provenance wins, mirroring the official merge.
   assert.equal(mapped[0].matchedDocument?.providerNativeId, 'vid1');
   assert.equal(mapped[0].matchedDocument?.locator, 'youtube:video:vid1');
+});
+
+test('a missing description never shifts a later video description onto an earlier title', () => {
+  const mapped = mapInnertubeVideosToRaw([
+    { video_id: 'vidA', title: { text: 'Title A' }, author: { id: UC, name: 'Desk' } },
+    { video_id: 'vidB', title: { text: 'Title B' }, author: { id: UC, name: 'Desk' }, description_snippet: { text: 'desc B' } },
+  ]);
+  assert.equal(mapped.length, 1);
+  const [entry] = mapped;
+  // Every per-video field stays tied to its own video record by index.
+  assert.deepEqual(entry.videoTitles, ['Title A', 'Title B']);
+  assert.deepEqual(entry.videoDescriptions, ['', 'desc B']);
+  assert.equal(entry.videoDescriptions[0], '');
+  assert.equal(entry.videoDescriptions[1], 'desc B');
+  assert.equal(entry.channelId, UC);
+  // First video's provenance (matches the official merge rule).
+  assert.deepEqual(entry.matchedDocument, {
+    type: 'VIDEO',
+    providerNativeId: 'vidA',
+    title: 'Title A',
+    description: '',
+    locator: 'youtube:video:vidA',
+  });
+  assert.equal((entry.matchedDocument as Record<string, unknown>).publishedAt, undefined);
 });
 
 test('rawResultCount counts raw results before mapping drops nodes', async () => {
@@ -637,6 +662,59 @@ test('an older timed-out page never clears a newer session attempt', async () =>
     const reuse = await page();
     assert.equal(factoryCalls, 2);
     assert.equal(reuse.channels.length, 1);
+  } finally {
+    if (previousTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+    else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = previousTimeout;
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('a search that succeeds after the deadline is discarded, never emitted', async () => {
+  // youtubei.js exposes no cancellation, so the slow search still completes
+  // in the background. The page must already have rejected with TIMEOUT, the
+  // late result must never surface, and exactly one non-SUCCESS telemetry
+  // event must exist even after the late success lands.
+  const previousTimeout = process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '100';
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  const events: Array<Record<string, unknown>> = [];
+  setInnertubeEmitSinkForTests(async (event) => { events.push(event as unknown as Record<string, unknown>); });
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return {
+        channels: [{ author: { id: UC, name: 'Desk' } }],
+        has_continuation: false,
+      };
+    },
+  }));
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'CHANNEL',
+        cursor: null,
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+    );
+    assert.ok(Date.now() - started < 200, 'page must reject on its deadline, not wait out the late success');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].status, 'TRANSIENT_ERROR');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(events.length, 1, 'late background success must never emit');
+    assert.ok(events.every((event) => event.status !== 'SUCCESS'));
   } finally {
     if (previousTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
     else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = previousTimeout;
