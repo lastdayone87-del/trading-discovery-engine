@@ -9,7 +9,7 @@ import {
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
-import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, type ProviderAllocation } from './providerAwareRetrieval';
+import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -671,7 +671,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
       try {
         const coolingRes = await runner.query(
           `SELECT DISTINCT provider FROM provider_call_events WHERE provider IN ('youtube','youtube-innertube') AND status='RATE_LIMITED' AND occurred_at > now() - ($1||' seconds')::interval`,
-          [String(PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS)]
+          [String(providerCooldownObservationWindowSecs())]
         );
         coolingKeys = coolingRes.rows.map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
       } catch {

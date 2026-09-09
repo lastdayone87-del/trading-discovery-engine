@@ -96,11 +96,22 @@ export function innertubeMinIntervalMs(env: NodeJS.ProcessEnv = process.env): nu
 
 let innertubeNextAllowedAtMs = 0;
 let innertubePacingChain: Promise<void> = Promise.resolve();
+/** Test-only count of pacing-gate acquisitions since the last reset. */
+let innertubePacingGatePasses = 0;
 export function resetInnertubePacingForTests(): void {
   innertubeNextAllowedAtMs = 0;
   innertubePacingChain = Promise.resolve();
+  innertubePacingGatePasses = 0;
+}
+/** Test-only read of pacing-gate acquisitions (one per actual outbound request). */
+export function innertubePacingGatePassesForTests(): number {
+  return innertubePacingGatePasses;
 }
 function paceInnertubeRequest(minIntervalMs: number): Promise<void> {
+  // One gate acquisition per call; every caller below is an actual outbound
+  // provider request (initial search or continuation), so the count proves
+  // each request is paced exactly once — no duplicate waits per page.
+  innertubePacingGatePasses += 1;
   const run = innertubePacingChain.then(async () => {
     const waitMs = Math.max(0, innertubeNextAllowedAtMs - Date.now());
     if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
@@ -152,7 +163,8 @@ async function pacedContinuation(
  * zero official cost, and both allocation sites (frontier allocator rotation
  * and ordinary scheduling rotation) exclude providers with a recent
  * RATE_LIMITED ledger row while a healthy alternative remains
- * (PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS window, fail-open to the full
+ * (providerCooldownObservationWindowSecs window — 300s floor or the
+ * configured YOUTUBE_INNERTUBE_COOLDOWN_MS when longer — fail-open to the full
  * pool). Persisted events therefore remain the sufficient, queryable record
  * for dashboards, rotation, and post-incident review; this flag is only the
  * fast local backpressure layer on top.
@@ -469,7 +481,11 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     policyVersion: 'provider-resilience-v1',
   };
   try {
-    await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
+    // Exactly one pacing slot per actual outbound request: the initial search
+    // is paced inside pacedSearch and each continuation inside
+    // pacedContinuation. No pacing here — a second admission would halve
+    // throughput and could expire queued pages before they search. Session
+    // creation still consumes the page deadline below.
     const session = await withInnertubeRemaining(getInnertubeSession(), deadlineAtMs);
     // Page walk: InnerTube continuations belong to a live feed object, so page
     // N is reached by re-running the search and advancing N-1 continuations.

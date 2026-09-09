@@ -5,8 +5,10 @@ import {
   DEFAULT_GEMINI_FREE_CANDIDATE_MODEL,
   GeminiFreeSemanticProvider,
   configuredGeminiFreeRoutes,
+  clearGeminiFreeSdkCacheForTests,
   defaultClient,
   geminiFreeCooldownRemainingMs,
+  geminiFreeSdkForRouteForTests,
   geminiFreeTimeoutMs,
   resetGeminiFreeCooldownForTests,
   runGeminiFreeRouteFailover,
@@ -200,6 +202,27 @@ test('free rate-limit failures schedule retries past the shared cooldown expiry'
   const first = decideJobFailure(freeRateLimit(), 1, 4, now, now, undefined, undefined, expiry);
   assert.equal(first.disposition, 'RETRYING_WITHOUT_ATTEMPT');
   assert.ok(first.runAfter! >= expiry);
+});
+
+test('rotated credentials replace the cached SDK instead of reusing the old key', () => {
+  clearGeminiFreeSdkCacheForTests();
+  const keyOf = (sdk: unknown): unknown => (sdk as { apiKey?: unknown }).apiKey;
+  try {
+    const first = geminiFreeSdkForRouteForTests({ id: 'gemini-free-1', key: 'KEY_A' });
+    assert.equal(keyOf(first), 'KEY_A');
+    // Same key reuses the cached instance (no churn on the hot path).
+    assert.strictEqual(geminiFreeSdkForRouteForTests({ id: 'gemini-free-1', key: 'KEY_A' }), first);
+    // A rotated value for the same route id must take effect without restart.
+    const rotated = geminiFreeSdkForRouteForTests({ id: 'gemini-free-1', key: 'KEY_B' });
+    assert.equal(keyOf(rotated), 'KEY_B');
+    assert.notStrictEqual(rotated, first);
+    // Distinct routes keep independent SDKs.
+    const other = geminiFreeSdkForRouteForTests({ id: 'gemini-free-2', key: 'KEY_C' });
+    assert.equal(keyOf(other), 'KEY_C');
+    assert.notStrictEqual(other, rotated);
+  } finally {
+    clearGeminiFreeSdkCacheForTests();
+  }
 });
 
 test('defaultClient is undefined without free keys (paid keys do not enable it)', () => {

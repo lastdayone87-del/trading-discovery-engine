@@ -22,6 +22,7 @@ import {
   withInnertubeDeadline,
   withInnertubeRemaining,
   resetInnertubePacingForTests,
+  innertubePacingGatePassesForTests,
   executeInnertubeRetrievalPage,
 } from './youtubeInnertubeProvider';
 
@@ -164,6 +165,58 @@ test('continuation 429 keeps its classification and arms the cooldown', async ()
   } finally {
     setInnertubeSessionFactoryForTests(null);
     resetInnertubeCooldownForTests();
+  }
+});
+
+test('each retrieval page passes the pacing gate exactly once per outbound request', async () => {
+  // A page-1 retrieval performs one outbound search (1 gate pass); a page-2
+  // walk performs one search plus one continuation (2 passes). A duplicate
+  // admission per page would show 2 and 3 here instead of 1 and 2.
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  const secondFeed = {
+    videos: [{ video_id: 'vid2', title: { text: 't2' }, author: { id: UC } }],
+    has_continuation: false,
+  };
+  const firstFeed = {
+    videos: [{ video_id: 'vid1', title: { text: 't1' }, author: { id: UC } }],
+    has_continuation: true,
+    getContinuation: async () => secondFeed,
+  };
+  setInnertubeSessionFactoryForTests(async () => ({ search: async () => firstFeed }));
+  try {
+    assert.equal(innertubePacingGatePassesForTests(), 0);
+    const first = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'trading',
+      country: 'US',
+      lane: 'VIDEO',
+      cursor: null,
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.equal(first.channels.length, 1);
+    assert.equal(innertubePacingGatePassesForTests(), 1);
+    const second = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'trading',
+      country: 'US',
+      lane: 'VIDEO',
+      cursor: '2',
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.equal(second.channels.length, 1);
+    assert.equal(second.channels[0].matchedDocument?.providerNativeId, 'vid2');
+    assert.equal(innertubePacingGatePassesForTests(), 3);
+  } finally {
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
   }
 });
 

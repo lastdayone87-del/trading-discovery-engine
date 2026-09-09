@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey } from './providerAwareRetrieval';
+import { readFileSync } from 'node:fs';
+import { rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS } from './providerAwareRetrieval';
 import { YOUTUBE_SEARCH_PROVIDER } from './providerAwareRetrieval';
 
 const official = { provider_key: 'youtube-search', mode: 'ACTIVE' };
@@ -120,4 +121,29 @@ test('ledger provider names map to registry keys without silent drops', () => {
   assert.equal(ledgerProviderToRegistryKey('youtube'), 'youtube-search');
   assert.equal(ledgerProviderToRegistryKey('youtube-innertube'), 'youtube-innertube');
   assert.equal(ledgerProviderToRegistryKey('something-else'), 'something-else');
+});
+
+test('rotation exclusion window tracks the configured innertube cooldown', () => {
+  // Default (90s) and lowered cooldowns keep the conservative 300s floor.
+  assert.equal(providerCooldownObservationWindowSecs({} as any), 300);
+  assert.equal(providerCooldownObservationWindowSecs({ YOUTUBE_INNERTUBE_COOLDOWN_MS: '90000' } as any), 300);
+  assert.equal(providerCooldownObservationWindowSecs({ YOUTUBE_INNERTUBE_COOLDOWN_MS: '10000' } as any), 300);
+  // A raised provider cooldown extends rotation exclusion to match, so
+  // allocation never re-includes a still-cooling provider early.
+  assert.equal(providerCooldownObservationWindowSecs({ YOUTUBE_INNERTUBE_COOLDOWN_MS: '600000' } as any), 600);
+  assert.equal(providerCooldownObservationWindowSecs({ YOUTUBE_INNERTUBE_COOLDOWN_MS: '300001' } as any), 301);
+  // Invalid values fail safe to the floor, never to zero or NaN.
+  assert.equal(providerCooldownObservationWindowSecs({ YOUTUBE_INNERTUBE_COOLDOWN_MS: 'junk' } as any), 300);
+  assert.equal(
+    providerCooldownObservationWindowSecs({ YOUTUBE_INNERTUBE_COOLDOWN_MS: '600000' } as any) >= PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS,
+    true,
+  );
+});
+
+test('both allocation sites exclude cooling providers with the configured window', () => {
+  for (const file of ['./dbCore.ts', './discoveryFrontierAllocator.ts']) {
+    const source = readFileSync(new URL(file, import.meta.url), 'utf8');
+    assert.match(source, /providerCooldownObservationWindowSecs\(\)/);
+    assert.doesNotMatch(source, /\[String\(PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS\)\]/);
+  }
 });

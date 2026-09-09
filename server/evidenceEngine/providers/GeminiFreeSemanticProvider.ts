@@ -136,7 +136,38 @@ async function defaultPersistedCooldownExpiryMs(): Promise<number | undefined> {
   }
 }
 
-const sdkByRoute = new Map<string, GoogleGenAI>();
+/**
+ * SDK cache keyed by route id. Credential contract: deployment credentials
+ * are process-start configuration (Railway env / .env), but route
+ * enumeration re-reads env on every client construction — so a rotated key
+ * value for the SAME route id must replace the cached SDK instead of reusing
+ * the previous credential until restart. The cached key is therefore
+ * validated on every hit; a mismatch recreates the SDK with the current key.
+ * Cache entries never leave this module (isolation from the paid provider's
+ * own cache is by construction: separate Map, separate route ids).
+ */
+const sdkByRoute = new Map<string, { sdk: GoogleGenAI; key: string }>();
+
+/** Test-only reset for the SDK cache. */
+export function clearGeminiFreeSdkCacheForTests(): void {
+  sdkByRoute.clear();
+}
+
+/**
+ * Test-only seam: resolve (and cache) the SDK for a route without a network
+ * call, so credential rotation is observable without touching the provider.
+ */
+export function geminiFreeSdkForRouteForTests(route: GeminiFreeRoute): GoogleGenAI {
+  return sdkFor(route);
+}
+
+function sdkFor(route: GeminiFreeRoute): GoogleGenAI {
+  const cached = sdkByRoute.get(route.id);
+  if (cached && cached.key === route.key) return cached.sdk;
+  const sdk = new GoogleGenAI({ apiKey: route.key });
+  sdkByRoute.set(route.id, { sdk, key: route.key });
+  return sdk;
+}
 
 export function defaultClient(
   emit: (event: ProviderCallEvent) => Promise<void> = emitGeminiFreeEvent,
@@ -147,13 +178,6 @@ export function defaultClient(
   const timeoutMs = geminiFreeTimeoutMs();
   const deadlinesEnabled = geminiFreeDeadlinesEnabled();
   const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
-  const sdkFor = (route: GeminiFreeRoute) => {
-    const existing = sdkByRoute.get(route.id);
-    if (existing) return existing;
-    const created = new GoogleGenAI({ apiKey: route.key });
-    sdkByRoute.set(route.id, created);
-    return created;
-  };
   return {
     classify: async (prompt, model) => {
       const response = await runGeminiFreeRouteFailover(routes, async route => {

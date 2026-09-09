@@ -27,7 +27,7 @@ import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance } from './terminologyIntelligence';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -1079,7 +1079,7 @@ export async function scheduleAutonomousQueryRuns(
           );
           const coolingRes = await client.query(
             `SELECT DISTINCT provider FROM provider_call_events WHERE provider IN ('youtube','youtube-innertube') AND status='RATE_LIMITED' AND occurred_at > now() - ($1||' seconds')::interval`,
-            [String(PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS)]
+            [String(providerCooldownObservationWindowSecs())]
           ).catch(() => ({ rows: [] as any[] }));
           const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
           if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {

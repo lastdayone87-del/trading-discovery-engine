@@ -19,10 +19,33 @@ export const YOUTUBE_SEARCH_PROVIDER: ProviderAllocation = Object.freeze({
 });
 
 /**
- * Observation window (seconds) for provider-level cooldown signals. A
+ * Floor (seconds) for the provider-level cooldown observation window. A
  * provider with a recent RATE_LIMITED ledger row is treated as cooling.
  */
 export const PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS = 300;
+
+/**
+ * Rotation exclusion window (seconds) for recent RATE_LIMITED ledger rows.
+ * Tracks the configured InnerTube cooldown
+ * (YOUTUBE_INNERTUBE_COOLDOWN_MS, default 90s) with the 300s floor above as
+ * a conservative minimum, so allocation health can never disagree with the
+ * provider's actual cooldown in the dangerous direction: if an operator
+ * raises the provider cooldown beyond the floor, rotation excludes the
+ * cooling provider for at least that long instead of re-including it early.
+ * Lowering the provider cooldown below the floor keeps the conservative
+ * exclusion (fail-open to the full pool when every provider is cooling, so
+ * traffic is never blocked).
+ *
+ * Reads env directly here (same pattern as the provider's own
+ * innertubeCooldownMs) rather than importing the provider module, keeping
+ * the dispatch boundary free of a provider import cycle and provider
+ * isolation intact: allocation never touches provider runtime state.
+ */
+export function providerCooldownObservationWindowSecs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.YOUTUBE_INNERTUBE_COOLDOWN_MS);
+  const innertubeSecs = Number.isFinite(parsed) && parsed > 0 ? Math.ceil(parsed / 1000) : 0;
+  return Math.max(PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, innertubeSecs);
+}
 
 /**
  * Maps provider_call_events provider names to discovery provider keys.
