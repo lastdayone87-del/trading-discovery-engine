@@ -53,25 +53,25 @@ Already fetched and persisted under current quota flow:
 
 ## 5. Research findings
 
-- **Language→country is safe only when every strongly-associated country is excluded.** Eligible: Vietnamese→{VN}, Tagalog→{PH}, Bengali→{BD,IN} (both excluded — ambiguity harmless), Urdu→{PK,IN} (both excluded), Hindi→{IN} (+large diaspora: eligible only with no-conflicting-evidence guard, residual expat risk documented). **Never language-reject** on English/French/Spanish/Portuguese/Arabic (worldwide) or Bahasa (ID/MY overlap); African excluded countries have no distinctive single-country language → explicit evidence only.
+- **Language→country is safe only when every strongly-associated country is excluded.** Approved language map: Vietnamese→{Vietnam}, Tagalog→{Philippines}, Hindi→{India}, Bengali→{Bangladesh, India} (both excluded — ambiguity harmless), Urdu→{Pakistan, India} (both excluded). Hindi is fully eligible: India is excluded and strong consistent Hindi evidence rejects without any additional India signal; diaspora false positives are a documented residual risk (see §15), not a blocking guard. **Never language-reject** on English/French/Spanish/Portuguese/Arabic (worldwide) or Bahasa (ID/MY overlap); African excluded countries have no distinctive single-country language → explicit evidence only.
 - **Per-video language without new libraries**: script detection (existing) + Vietnamese diacritic density (ăâđêôơư + tone marks — deterministic, cheap) + extended keyword lists per eligible language + existing vocab packs. Descriptions (creator-written long-form) only — **titles stay excluded** to preserve the anti-circularity guarantee.
-- **Sample size**: 10 recent videos (already fetched at stage 1; zero new quota). Below ~4 usable descriptions → insufficient data → PROCESS.
+- **Sample size: minimum 8 usable videos, no exceptions.** The rejection rule needs both an absolute floor and a share: usable descriptions ≥ 8 AND dominant-language share ≥ 80% (8/10 boundary inclusive; 8/8, 8/9, 9/9, 9/10, 10/10 all qualify). Any sample below 8 usable videos → PROCESS regardless of share — a 4/4 or 5/5 sample is never enough for automatic rejection. 10 recent videos are already fetched at stage 1 (zero new quota).
 - **Tiers beat weights here**: the existing gate (priority ≤3, ≥85, unanimity, conflict→UNCERTAIN) already encodes the asymmetry. A new evidence source that meets the gate needs no threshold redesign and inherits conflict handling (e.g., US official metadata P1 automatically outranks language; equal-top conflict forces UNCERTAIN).
 
 ## 6. Recommended evidence hierarchy
 
-New source **`AGGREGATED_CONTENT_LANGUAGE` at priority 3** (alongside website TLD, below bio): deterministic criteria (eligible language, ≥8/10 videos, single winner, bio empty-or-noncommittal, no conflicting P1–P3 evidence), confidence from a fixed 2-row table tied to the existing ≥85 gate (10/10 → 90, 8–9/10 → 86). It can then satisfy `exclusionAuthority` unchanged. Nothing else in the hierarchy moves; P9 stays advisory; forbidden signals (markets, brokers, audience, timezone, external sites, messaging links) remain outside the allowlist.
+New source **`AGGREGATED_CONTENT_LANGUAGE` at priority 3** (alongside website TLD, below bio): deterministic criteria — eligible language per the approved map (§5), usable videos ≥ 8, dominant share ≥ 80%, single winner, higher-priority country evidence absent or inconclusive, bio empty-or-noncommittal — confidence from a fixed 2-row table tied to the existing ≥85 gate (100% share → 90, 80–<100% share → 86, always with usable ≥ 8). It can then satisfy `exclusionAuthority` unchanged. Nothing else in the hierarchy moves; P9 stays advisory; forbidden signals (markets, brokers, audience, timezone, external sites, messaging links) remain outside the allowlist.
 
 ## 7. Recommended language aggregation approach
 
-1. Sample = up to 10 most recent video descriptions (+ stage≥2 playlist names/descriptions as corroboration, never decisive alone); skip empties; need ≥4 usable or insufficient-data → PROCESS.
+1. Sample = up to 10 most recent video descriptions (+ stage≥2 playlist names/descriptions as corroboration, never decisive alone); skip empties; **fewer than 8 usable → insufficient-data → PROCESS, regardless of share**.
 2. Per-video language: script/diacritic pass → keyword-list pass (extended lists) → semantic-model per-field language when classification already ran. Each video votes for at most one eligible language or abstains.
-3. Dominance = `votes(L) / usable ≥ 0.8` with a single winner; any second eligible language with ≥2 votes, or any conflicting P1–P3 evidence, voids dominance → PROCESS.
-4. Mixed-language, multilingual, and low-sample cases therefore PROCESS by construction.
+3. Dominance = **usable ≥ 8 AND `votes(L) / usable ≥ 0.8`** with a single winner; any second eligible language with ≥2 votes voids dominance → PROCESS. Higher-priority (P1–P3) country evidence that is present and conclusive takes precedence — the language path is evaluated only when it is absent or inconclusive, and never overrides a clear conflicting country signal.
+4. Mixed-language, multilingual, and below-minimum-sample cases therefore PROCESS by construction.
 
 ## 8. Recommended confidence / decision thresholds
 
-No invented weights: reuse the gate (`decisivePriority ≤ 3`, `topConfidence ≥ 85`, unanimity, conflict→UNCERTAIN). New source confidence is criterion-derived (90 / 86), i.e., calibrated *by* the gate it must pass. HIGH CONFIDENCE (all required) → REJECT: eligible language, ≥8/10 dominance, single winner, no conflicting evidence, bio empty/non-committal. Everything else → PROCESS (including NEEDS_REVIEW/CONTINUE paths unchanged).
+No invented weights: reuse the gate (`decisivePriority ≤ 3`, `topConfidence ≥ 85`, unanimity, conflict→UNCERTAIN). New source confidence is criterion-derived (100% share → 90, 80–<100% share → 86, always with usable ≥ 8), i.e., calibrated *by* the gate it must pass. HIGH CONFIDENCE (all required) → REJECT: approved-map language, usable ≥ 8, share ≥ 80%, single winner, higher-priority evidence absent/inconclusive, bio empty/non-committal. Everything else → PROCESS (including NEEDS_REVIEW/CONTINUE paths unchanged).
 
 ## 9. Exact decision flow
 
@@ -79,21 +79,28 @@ No invented weights: reuse the gate (`decisivePriority ≤ 3`, `topConfidence �
 Collect available country signals (unchanged: P1–P10)
   ↓ Is there strong explicit excluded-country evidence (gate as today)?
 YES → REJECT (unchanged)
+NO ↓ Is higher-priority (P1–P3) country evidence present and conclusive?
+YES → follow existing rules (language path skipped; conflict → PROCESS
+      unless existing rules independently justify REJECT)
 NO ↓ Thread already-fetched descriptions/playlists into validator input
 Aggregate per-video language over ≤10 recent videos (titles excluded)
-  ↓ Eligible language AND ≥8/10 dominance AND single winner AND no conflicting P1–P3 AND bio empty/non-committal?
+  ↓ Approved-map language AND usable ≥ 8 AND share ≥ 80% AND single winner
+    AND bio empty/non-committal?
 YES → REJECT (new P3 evidence satisfies the unchanged gate)
-NO ↓ (mixed / multilingual / low-sample / worldwide language / conflict / no data)
+NO ↓ (mixed / multilingual / below-minimum sample / worldwide language /
+      conflicting evidence / no data)
 PROCESS via existing UNCERTAIN / NEEDS_REVIEW / CONTINUE paths (unchanged)
 ```
 
 ## 10. Mixed-language and edge-case handling
 
-- Mixed/multilingual → no single ≥80% winner → PROCESS. Expat/diaspora (e.g., Hindi speaker with US bio/location) → conflicting higher-priority evidence outranks or ties → PROCESS/UNCERTAIN by existing rules. Worldwide languages → ineligible, PROCESS. Low sample (<4 usable) → PROCESS. Residual risk (monolingual diaspora, empty bio, no metadata) is accepted explicitly per the asymmetry rule and remains reviewable via NEEDS_REVIEW/sightings.
+- Mixed/multilingual → no single ≥80% winner (with usable ≥ 8) → PROCESS. Worldwide languages → ineligible, PROCESS. Below-minimum sample (<8 usable, e.g. 4/4 or 5/5) → PROCESS regardless of share.
+- Expat/diaspora (e.g., Hindi speaker with US bio/location): present, conclusive higher-priority evidence takes precedence → PROCESS/UNCERTAIN by existing rules. Monolingual-diaspora with empty bio and no metadata is a known residual false-positive risk (see §15): documented, accepted, and reviewable — it does not block automatic rejection when the high-confidence rule is met.
+- Hindi is fully eligible (India excluded): 10/10, 9/10, 8/10 Hindi → REJECT; 7/10 or lower, mixed, conflicting, or below-minimum samples → PROCESS. No additional India location signal is required once the language rule is met.
 
 ## 11. Conflicting-signal handling
 
-Unchanged mechanics, extended input: official metadata (P1) and bio/website (P2/P3) outrank or tie-break language; equal-top-score conflict forces UNCERTAIN (`countryInference.ts:362-372`); `mergeCountryValidationResults` prevents weaker live evidence from overriding; target mismatch can never create REJECTED. Language evidence additionally self-voids on any second eligible language with ≥2 votes.
+Unchanged mechanics, extended input: official metadata (P1) and bio/website (P2/P3) outrank or tie-break language; equal-top-score conflict forces UNCERTAIN (`countryInference.ts:362-372`); `mergeCountryValidationResults` prevents weaker live evidence from overriding; target mismatch can never create REJECTED. Language evidence additionally self-voids on any second eligible language with ≥2 votes. **Non-override rule:** language-based rejection applies only when higher-priority country evidence is absent or inconclusive. If strong country evidence from official YouTube metadata, the channel bio/About, or other higher-priority sources conflicts with the aggregated language evidence, the result is PROCESS unless the existing country-validation rules independently justify REJECT.
 
 ## 12. Recommended location (safest, smallest change)
 
@@ -106,23 +113,24 @@ Unchanged mechanics, extended input: official metadata (P1) and bio/website (P2/
 
 1. Extend `CountryInferenceInput` + validator input with `videoDescriptions?: string[]`, `playlists?: {name,description}[]` (thread from candidate; titles stay excluded).
 2. Add per-video language voter (script/diacritic + extended keyword lists + existing vocab packs; abstain on worldwide/unknown).
-3. Add `AGGREGATED_CONTENT_LANGUAGE` evidence (priority 3, 90/86 table, eligibility map Vietnamese/Tagalog/Bengali/Urdu/Hindi-gated).
+3. Add `AGGREGATED_CONTENT_LANGUAGE` evidence (priority 3, 100%→90 / 80–<100%→86 table with usable ≥ 8, approved language map Vietnamese/Tagalog/Hindi/Bengali/Urdu).
 4. No gate/threshold/conflict changes; no new acquisition; no migration; no config format changes.
 5. Estimated surface: ~120 lines in `countryInference.ts`, ~15 in `countryValidator.ts`, keyword-list data additions, tests below.
 
 ## 14. Proposed tests
 
-- Empty bio + 10/10 and 8/10 Vietnamese descriptions → REJECT_EXCLUDED; 7/10 and 5/10 → PROCESS.
-- Mixed VI/EN, multilingual, <4 usable descriptions → PROCESS.
-- 10/10 Vietnamese + `locationTag` US (or US bio line) → PROCESS/UNCERTAIN (conflict outranks).
-- English/French/Arabic 10/10 dominance → PROCESS (ineligible languages).
-- Urdu 9/10 → REJECT (PK/IN both excluded); Hindi 9/10 empty bio → REJECT; Hindi + US bio → PROCESS.
+- Empty bio + 10/10 and 8/10 Vietnamese descriptions → REJECT_EXCLUDED; 7/10 Vietnamese → PROCESS; <8 usable videos → PROCESS.
+- 10/10 Hindi → REJECT; 9/10 Hindi → REJECT; 8/10 Hindi → REJECT; 7/10 Hindi → PROCESS.
+- Mixed Hindi/other languages without ≥80% dominance → PROCESS; worldwide language dominance (English/French/Arabic) → PROCESS.
+- Mixed VI/EN, multilingual, 4/4 or 5/5 samples → PROCESS (absolute minimum not met).
+- 10/10 Vietnamese + `locationTag` US (or US bio line) → PROCESS/UNCERTAIN (higher-priority evidence takes precedence; no override).
+- Urdu 9/10 → REJECT (PK/IN both excluded); Bengali 8/10 → REJECT (BD/IN both excluded); Hindi + US bio → PROCESS.
 - Pre-enrichment candidate (0–1 descriptions) → behavior unchanged (UNCERTAIN path).
 - Regression: existing 29-country attribution suite, threshold/conflict/merge/boundary tests all green unchanged.
 
 ## 15. Risks and limitations
 
-- Language ≠ domicile (diaspora): mitigated by conflict rules + empty-bio requirement, residual risk accepted per asymmetry; monitor via NEEDS_REVIEW sampling.
-- Latin-script SE-Asian languages need keyword-list quality (Tagalog/Bahasa) — weaker than Vietnamese diacritics; start conservative (Vietnamese + already-excluded-pair languages first).
+- Language ≠ domicile (diaspora): mitigated by higher-priority precedence + empty-bio requirement; monolingual-diaspora residual false positives are documented, accepted per the asymmetry rule, and reviewable via NEEDS_REVIEW sampling — they do not block automatic rejection at the high-confidence threshold.
+- Latin-script SE-Asian languages need keyword-list quality (Tagalog/Bahasa) — weaker than Vietnamese diacritics; start with Vietnamese, Hindi, and already-excluded-pair languages (Bengali, Urdu), then Tagalog once lists are validated.
 - Description availability depends on enrichment stage; pre-enrichment recall unchanged by design.
 - No transcripts/audio language — video-description text is the ceiling without new acquisition (deliberately out of scope).
