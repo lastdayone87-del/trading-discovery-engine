@@ -155,6 +155,42 @@ export function preferredLanguageFromQueryMetadata(metadata: Record<string, unkn
 }
 
 /**
+ * InnerTube run-outcome resolution from ledger counts plus observed results.
+ * Success-event emission is best-effort (a dropped DB write resolves to a
+ * no-op), so the ledger can show zero successes for a run that actually
+ * returned results. A provider that returned valid results necessarily
+ * responded successfully: in exactly that case (rawResults > 0 with zero
+ * ledger successes and a failure outcome) the derived outcome is repaired to
+ * SUCCESS_NON_EMPTY. Everything else is untouched — ledger counts stay
+ * exact (nothing fabricated), genuine failures with no results keep their
+ * failure outcome, and consistent ledgers flow through the shared
+ * classifier unchanged.
+ */
+export function resolveInnertubeRunOutcome(input: {
+  rawResults: number;
+  providerRequestsAttempted: number;
+  providerRequestsSucceeded: number;
+  providerRequestsFailed: number;
+  providerRateLimited: number;
+}): ProviderRunOutcome {
+  const outcome = classifyProviderRunOutcome({
+    rawResults: input.rawResults,
+    providerRequestsAttempted: input.providerRequestsAttempted,
+    providerRequestsSucceeded: input.providerRequestsSucceeded,
+    providerRequestsFailed: input.providerRequestsFailed,
+    providerRateLimited: input.providerRateLimited,
+  });
+  if (
+    input.rawResults > 0 &&
+    input.providerRequestsSucceeded === 0 &&
+    (outcome === 'FAILED_PROVIDER_RESPONSE' || outcome === 'FAILED_ALL_PROVIDERS')
+  ) {
+    return 'SUCCESS_NON_EMPTY';
+  }
+  return outcome;
+}
+
+/**
  * Pure ENRICH_CHANNEL claim gate over the active semantic route's cooldown.
  * Each route consults only its own provider's cooldown: Groq-selected claims
  * pause while the Groq cooldown is active, free-Gemini-selected claims pause
@@ -668,7 +704,7 @@ export async function processNextSearchJob(
         providerRequestsFailed = Number(counts.failed || 0);
         providerRateLimited = Number(counts.rate_limited || 0);
         providerPagesRetrieved = providerRequestsSucceeded;
-        providerRunOutcome = classifyProviderRunOutcome({
+        providerRunOutcome = resolveInnertubeRunOutcome({
           rawResults: finalMetrics.rawResults,
           providerRequestsAttempted,
           providerRequestsSucceeded,

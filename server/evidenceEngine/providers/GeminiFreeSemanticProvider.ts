@@ -137,6 +137,46 @@ async function defaultPersistedCooldownExpiryMs(): Promise<number | undefined> {
 }
 
 /**
+ * Bounds the persisted cooldown lookup by the classify attempt's remaining
+ * wall-clock budget, so a stalled database lookup terminates inside
+ * GEMINI_FREE_PROVIDER_TIMEOUT_MS instead of hanging the worker past the
+ * abort timer (which only governs the later SDK request). On budget expiry
+ * the controller is aborted and a timeout error is thrown, so the existing
+ * aborted-error path classifies it exactly like an SDK timeout (TIMEOUT,
+ * retryable, same telemetry, no cooldown arming). Ordinary lookup errors
+ * still fail open to undefined, and a disabled deadline rollout preserves
+ * the previous unbounded behavior.
+ */
+async function persistedCooldownExpiryWithinBudget(
+  lookup: () => Promise<number | undefined>,
+  startedMs: number,
+  timeoutMs: number,
+  deadlinesEnabled: boolean,
+  controller: AbortController,
+): Promise<number | undefined> {
+  if (!deadlinesEnabled) return lookup();
+  const remainingMs = timeoutMs - (Date.now() - startedMs);
+  if (remainingMs <= 0) {
+    controller.abort();
+    throw new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      lookup(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new ProviderCallError(`Free Gemini call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true));
+        }, remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * SDK cache keyed by route id. Credential contract: deployment credentials
  * are process-start configuration (Railway env / .env), but route
  * enumeration re-reads env on every client construction — so a rotated key
@@ -194,8 +234,14 @@ export function defaultClient(
           if (remainingMs > 0) throw geminiFreeCooldownDeferredError(remainingMs);
           let persistedExpiryMs: number | undefined;
           try {
-            persistedExpiryMs = await persistedCooldownExpiryMs();
-          } catch {
+            persistedExpiryMs = await persistedCooldownExpiryWithinBudget(
+              persistedCooldownExpiryMs, started, timeoutMs, deadlinesEnabled, controller,
+            );
+          } catch (error) {
+            // Budget-expiry timeouts propagate (the controller is already
+            // aborted, so the outer handler classifies them exactly like an
+            // SDK timeout); ordinary ledger errors fail open as before.
+            if (error instanceof ProviderCallError && error.errorClass === 'TIMEOUT') throw error;
             persistedExpiryMs = undefined;
           }
           if (persistedExpiryMs !== undefined && persistedExpiryMs > Date.now()) {
@@ -278,7 +324,13 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     let result = parseSemanticResult(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true' && model !== adjudicatorModel) {
+    // Adjudication is a second pass with the ADJUDICATION prompt for
+    // AMBIGUOUS/low-confidence candidates. Unlike an earlier same-model
+    // guard, the pass runs whenever it is enabled and the result qualifies —
+    // with default models candidate and adjudicator intentionally share
+    // gemini-2.5-flash-lite, and skipping then would silently disable the
+    // flag. Decisive results still cost exactly one call (first conditions).
+    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true') {
       result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);

@@ -21,6 +21,7 @@ import {
   resetInnertubePacingForTests,
 } from './youtubeInnertubeProvider';
 import { classifyProviderRunOutcome } from './providerCapacityDiagnostics';
+import { resolveInnertubeRunOutcome } from './queueManager';
 
 const UC = 'UCabcdefghijklmnopqrstuv';
 
@@ -427,4 +428,76 @@ test('innertube failure with zero successes classifies as all-provider failure',
     }),
     'FAILED_ALL_PROVIDERS',
   );
+});
+
+test('returned results are never FAILED_PROVIDER_RESPONSE over a missing success event', () => {
+  // Exact failure shape: the provider returned 5 results but the SUCCESS
+  // event row was dropped, so the ledger shows zero successes. The shared
+  // classifier alone reports FAILED_PROVIDER_RESPONSE for this input.
+  const dropped = {
+    rawResults: 5,
+    providerRequestsAttempted: 0,
+    providerRequestsSucceeded: 0,
+    providerRequestsFailed: 0,
+    providerRateLimited: 0,
+  };
+  assert.equal(classifyProviderRunOutcome(dropped), 'FAILED_PROVIDER_RESPONSE');
+  assert.equal(resolveInnertubeRunOutcome(dropped), 'SUCCESS_NON_EMPTY');
+});
+
+test('returned results survive an all-failed ledger without hiding the counts', () => {
+  // One page succeeded (results recorded) but its event was dropped; another
+  // page failed with its event present. Outcome is repaired, counts stay
+  // exactly as the ledger reported them (nothing fabricated).
+  assert.equal(
+    resolveInnertubeRunOutcome({
+      rawResults: 3,
+      providerRequestsAttempted: 1,
+      providerRequestsSucceeded: 0,
+      providerRequestsFailed: 1,
+      providerRateLimited: 0,
+    }),
+    'SUCCESS_NON_EMPTY',
+  );
+});
+
+test('genuine innertube failures keep their failure outcomes', () => {
+  assert.equal(
+    resolveInnertubeRunOutcome({
+      rawResults: 0,
+      providerRequestsAttempted: 0,
+      providerRequestsSucceeded: 0,
+      providerRequestsFailed: 0,
+      providerRateLimited: 0,
+    }),
+    'FAILED_PROVIDER_RESPONSE',
+  );
+  assert.equal(
+    resolveInnertubeRunOutcome({
+      rawResults: 0,
+      providerRequestsAttempted: 1,
+      providerRequestsSucceeded: 0,
+      providerRequestsFailed: 1,
+      providerRateLimited: 0,
+    }),
+    'FAILED_ALL_PROVIDERS',
+  );
+});
+
+test('consistent innertube ledgers flow through unchanged', () => {
+  const consistent = {
+    rawResults: 5,
+    providerRequestsAttempted: 2,
+    providerRequestsSucceeded: 2,
+    providerRequestsFailed: 0,
+    providerRateLimited: 0,
+  };
+  assert.equal(resolveInnertubeRunOutcome(consistent), classifyProviderRunOutcome(consistent));
+});
+
+test('completion uses the missing-event-tolerant outcome only for innertube', () => {
+  const queueManager = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queueManager, /providerRunOutcome = resolveInnertubeRunOutcome\(\{/);
+  // Narrow scope: the official branch keeps the shared classifier directly.
+  assert.match(queueManager, /provider='youtube' AND operation='search'[\s\S]{0,600}?providerRunOutcome = classifyProviderRunOutcome\(\{/);
 });

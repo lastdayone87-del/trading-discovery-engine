@@ -245,6 +245,10 @@ test('free SDK targets the documented free-tier Gemini endpoint (generativelangu
   // Locks the wiring to the free-tier Gemini API (Google AI Studio keys):
   // default SDK base URL + API version, with no Vertex/baseUrl override.
   // Matches the documented base URL https://generativelanguage.googleapis.com/v1beta.
+  // Native Gemini route (models.generateContent) is intentional, not the
+  // OpenAI-compat shim (/v1beta/openai/): same free tier/key/model/quota,
+  // but the native SDK supports AbortSignal, which the classify-attempt
+  // deadline requires. The compat shim offers no free-tier advantage.
   clearGeminiFreeSdkCacheForTests();
   try {
     const sdk = geminiFreeSdkForRouteForTests({ id: 'gemini-free-1', key: 'KEY_A' });
@@ -253,6 +257,7 @@ test('free SDK targets the documented free-tier Gemini endpoint (generativelangu
     }).apiClient;
     assert.equal(apiClient.getBaseUrl(), 'https://generativelanguage.googleapis.com/');
     assert.equal(apiClient.getApiVersion(), 'v1beta');
+    assert.doesNotMatch(apiClient.getBaseUrl(), /\/openai\//);
   } finally {
     clearGeminiFreeSdkCacheForTests();
   }
@@ -304,4 +309,80 @@ test('free failover stays within free routes and surfaces their results', async 
   });
   assert.equal(value, 'ok-from-free-2');
   assert.deepEqual(order, ['gemini-free-1', 'gemini-free-2']);
+});
+
+test('enabled adjudication performs the second pass even with same-model defaults', async () => {
+  const savedFlag = process.env.GEMINI_FREE_ADJUDICATION_ENABLED;
+  const savedCandidate = process.env.GEMINI_FREE_CANDIDATE_MODEL;
+  const savedAdjudicator = process.env.GEMINI_FREE_ADJUDICATOR_MODEL;
+  process.env.GEMINI_FREE_ADJUDICATION_ENABLED = 'true';
+  delete process.env.GEMINI_FREE_CANDIDATE_MODEL;
+  delete process.env.GEMINI_FREE_ADJUDICATOR_MODEL;
+  const calls: Array<{ prompt: string; model: string }> = [];
+  const flaky: SemanticModelClient = {
+    classify: async (prompt, model) => {
+      calls.push({ prompt, model });
+      if (calls.length === 1) return { ...unrelatedResult, label: 'AMBIGUOUS', confidence: 60 };
+      return unrelatedResult;
+    },
+  };
+  try {
+    const [item] = await new GeminiFreeSemanticProvider(flaky).collectEvidence(input, {} as any);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].model, 'gemini-2.5-flash-lite');
+    assert.equal(calls[1].model, 'gemini-2.5-flash-lite');
+    assert.notEqual(calls[0].prompt, calls[1].prompt);
+    assert.equal(item.provenance?.semantic?.taxonomyLabel, 'UNRELATED');
+  } finally {
+    if (savedFlag === undefined) delete process.env.GEMINI_FREE_ADJUDICATION_ENABLED;
+    else process.env.GEMINI_FREE_ADJUDICATION_ENABLED = savedFlag;
+    if (savedCandidate === undefined) delete process.env.GEMINI_FREE_CANDIDATE_MODEL;
+    else process.env.GEMINI_FREE_CANDIDATE_MODEL = savedCandidate;
+    if (savedAdjudicator === undefined) delete process.env.GEMINI_FREE_ADJUDICATOR_MODEL;
+    else process.env.GEMINI_FREE_ADJUDICATOR_MODEL = savedAdjudicator;
+  }
+});
+
+test('decisive candidates still cost exactly one call with adjudication enabled', async () => {
+  const savedFlag = process.env.GEMINI_FREE_ADJUDICATION_ENABLED;
+  process.env.GEMINI_FREE_ADJUDICATION_ENABLED = 'true';
+  let calls = 0;
+  const counting: SemanticModelClient = { classify: async () => { calls += 1; return unrelatedResult; } };
+  try {
+    const [item] = await new GeminiFreeSemanticProvider(counting).collectEvidence(input, {} as any);
+    assert.equal(calls, 1);
+    assert.equal(item.provenance?.semantic?.taxonomyLabel, 'UNRELATED');
+  } finally {
+    if (savedFlag === undefined) delete process.env.GEMINI_FREE_ADJUDICATION_ENABLED;
+    else process.env.GEMINI_FREE_ADJUDICATION_ENABLED = savedFlag;
+  }
+});
+
+test('a stalled cooldown lookup terminates inside the classify timeout', async () => {
+  resetGeminiFreeCooldownForTests();
+  clearGeminiFreeSdkCacheForTests();
+  const savedKey = process.env.GEMINI_FREE_API_KEY;
+  const savedTimeout = process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS;
+  process.env.GEMINI_FREE_API_KEY = 'test-key';
+  process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS = '200';
+  const events: Array<{ status?: string; errorClass?: string }> = [];
+  try {
+    const client = defaultClient(async (event) => { events.push(event as never); }, {
+      persistedCooldownExpiryMs: () => new Promise(() => undefined) as never,
+    });
+    const started = Date.now();
+    const error = await client!.classify('prompt', 'model').then(() => null, (e: unknown) => e);
+    const elapsed = Date.now() - started;
+    assert.ok(error instanceof ProviderCallError && error.errorClass === 'TIMEOUT');
+    assert.ok(elapsed < 600, `classify must respect the 200ms budget, took ${elapsed}ms`);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].status, 'TIMEOUT');
+  } finally {
+    if (savedKey === undefined) delete process.env.GEMINI_FREE_API_KEY;
+    else process.env.GEMINI_FREE_API_KEY = savedKey;
+    if (savedTimeout === undefined) delete process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS;
+    else process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS = savedTimeout;
+    resetGeminiFreeCooldownForTests();
+    clearGeminiFreeSdkCacheForTests();
+  }
 });
