@@ -60,7 +60,9 @@ Already fetched and persisted under current quota flow:
 
 ## 6. Recommended evidence hierarchy
 
-New source **`AGGREGATED_CONTENT_LANGUAGE` at priority 3** (alongside website TLD, below bio): deterministic criteria — eligible language per the approved map (§5), usable videos ≥ 8, dominant share ≥ 80%, single winner, bio empty-or-noncommittal, and tier precedence satisfied (P1–P2 absent or inconclusive; any P3 website evidence agrees — see §11) — confidence from a fixed 2-row table tied to the existing ≥85 gate (100% share → 90, 80–<100% share → 86, always with usable ≥ 8). It can then satisfy `exclusionAuthority` unchanged. Nothing else in the hierarchy moves; P9 stays advisory; forbidden signals (markets, brokers, audience, timezone, external sites, messaging links) remain outside the allowlist.
+New source **`AGGREGATED_CONTENT_LANGUAGE` at priority 3** (alongside website TLD, below bio): deterministic criteria — eligible language per the approved map (§5), usable videos ≥ 8, dominant share ≥ 80%, single winner, bio empty-or-noncommittal, and tier precedence satisfied (P1–P2 absent or inconclusive; P3 website interaction follows the multi-country agreement rule below) — confidence from a fixed 2-row table tied to the existing ≥85 gate (100% share → 90, 80–<100% share → 86, always with usable ≥ 8). It can then satisfy `exclusionAuthority` unchanged. Nothing else in the hierarchy moves; P9 stays advisory; forbidden signals (markets, brokers, audience, timezone, external sites, messaging links) remain outside the allowlist.
+
+**Multi-country representation (Urdu, Bengali).** The evidence carries the language's full candidate-country SET — Urdu→{Pakistan, India}, Bengali→{Bangladesh, India} — never an invented single country. The approved map admits a language only when every set member is excluded, so the set as a whole is rejection-capable. Agreement with P3 website country W is set membership: agree iff W ∈ set (e.g., Urdu + `.pk` or `.in`; Bengali + `.bd` or `.in`); a website country outside the set is disagreement. With no website evidence, rejection requires the all-members-excluded property (true by map construction), recorded with the set named in reasoning rather than a forced single country.
 
 ## 7. Recommended language aggregation approach
 
@@ -85,8 +87,10 @@ YES → follow existing rules (language path skipped; conflict → PROCESS
 NO ↓ Thread already-fetched descriptions/playlists into validator input
 Aggregate per-video language over ≤10 recent videos (titles excluded)
   ↓ Approved-map language AND usable ≥ 8 AND share ≥ 80% AND single winner
-    AND bio empty/non-committal AND (P3 website absent OR agrees)?
-YES → REJECT (new P3 evidence satisfies the unchanged gate unanimously)
+    AND bio empty/non-committal?
+YES → Is there P3 website country evidence?
+      YES → website country ∈ language set? YES → REJECT (agree) / NO → PROCESS
+      NO → all set members excluded (map construction)? YES → REJECT / (cannot happen per map)
 NO ↓ (mixed / multilingual / below-minimum sample / worldwide language /
       P3 website disagreement / conflicting evidence / no data)
 PROCESS via existing UNCERTAIN / NEEDS_REVIEW / CONTINUE paths (unchanged)
@@ -100,7 +104,7 @@ PROCESS via existing UNCERTAIN / NEEDS_REVIEW / CONTINUE paths (unchanged)
 
 ## 11. Conflicting-signal handling
 
-Unchanged mechanics, extended input: official metadata (P1) and bio (P2) outrank language — when conclusive, the language path is skipped before it can compete. Website evidence shares tier P3 with the new language source, so the existing unanimity rule governs their interaction with no new logic: agreement (same country) → gate evaluates unanimously; disagreement → not unanimous → no language-based REJECT (the top-confidence country wins for CONFIRMED/LIKELY, ties stay UNCERTAIN, `countryInference.ts:362-372`). Lower tiers (P4–P9) never block or outvote a decisive P3, exactly as today. `mergeCountryValidationResults` prevents weaker live evidence from overriding; target mismatch can never create REJECTED. Language evidence additionally self-voids on any second eligible language with ≥2 votes. **Non-override rule:** language-based rejection applies only when P1–P2 evidence is absent or inconclusive and P3 website evidence is absent or agrees. If strong country evidence conflicts with the aggregated language evidence, the result is PROCESS unless the existing country-validation rules independently justify REJECT.
+Unchanged mechanics, extended input: official metadata (P1) and bio (P2) outrank language — when conclusive, the language path is skipped before it can compete. Website evidence shares tier P3 with the new language source, so the existing unanimity rule governs their interaction with no new logic: agreement → gate evaluates unanimously; disagreement → not unanimous → no language-based REJECT (the top-confidence country wins for CONFIRMED/LIKELY, ties stay UNCERTAIN, `countryInference.ts:362-372`). **Multi-country agreement:** the language evidence carries its candidate-country set, so “agreement” with P3 website country W means W ∈ set (Urdu + `.pk`/`.in`, Bengali + `.bd`/`.in`); a website country outside the set is disagreement. With no website evidence, the all-members-excluded property (§6) authorizes REJECT with the set named in reasoning — no single country is invented. Lower tiers (P4–P9) never block or outvote a decisive P3, exactly as today. `mergeCountryValidationResults` prevents weaker live evidence from overriding; target mismatch can never create REJECTED. Language evidence additionally self-voids on any second eligible language with ≥2 votes. **Non-override rule:** language-based rejection applies only when P1–P2 evidence is absent or inconclusive and P3 website evidence is absent or agrees per the set rule above. If strong country evidence conflicts with the aggregated language evidence, the result is PROCESS unless the existing country-validation rules independently justify REJECT.
 
 ## 12. Recommended location (safest, smallest change)
 
@@ -113,7 +117,7 @@ Unchanged mechanics, extended input: official metadata (P1) and bio (P2) outrank
 
 1. Extend `CountryInferenceInput` + validator input with `videoDescriptions?: string[]`, `playlists?: {name,description}[]` (thread from candidate; titles stay excluded).
 2. Add per-video language voter (script/diacritic + extended keyword lists + existing vocab packs; abstain on worldwide/unknown).
-3. Add `AGGREGATED_CONTENT_LANGUAGE` evidence (priority 3, 100%→90 / 80–<100%→86 table with usable ≥ 8, approved language map Vietnamese/Tagalog/Hindi/Bengali/Urdu).
+3. Add `AGGREGATED_CONTENT_LANGUAGE` evidence (priority 3, 100%→90 / 80–<100%→86 table with usable ≥ 8, approved language map Vietnamese/Tagalog/Hindi/Bengali/Urdu). Evidence carries the language's candidate-country set; website agreement = set membership; rejection without website requires the all-members-excluded property (see §§6, 11).
 4. No gate/threshold/conflict changes; no new acquisition; no migration; no config format changes.
 5. Estimated surface: ~120 lines in `countryInference.ts`, ~15 in `countryValidator.ts`, keyword-list data additions, tests below.
 
@@ -126,6 +130,7 @@ Unchanged mechanics, extended input: official metadata (P1) and bio (P2) outrank
 - 10/10 Vietnamese + `locationTag` US (or US bio line) → PROCESS/UNCERTAIN (higher-priority evidence takes precedence; no override).
 - P3 website TLD US + 10/10 Vietnamese descriptions → PROCESS (equal-tier disagreement breaks unanimity, no language-based REJECT); P3 website `.vn` + 10/10 Vietnamese → REJECT (agreement, gate evaluates unanimously).
 - Urdu 9/10 → REJECT (PK/IN both excluded); Bengali 8/10 → REJECT (BD/IN both excluded); Hindi + US bio → PROCESS.
+- Multi-country website agreement: Urdu + `.pk` website → REJECT; Urdu + `.in` website → REJECT; Urdu + `.us` website → PROCESS (disagreement); Bengali + `.bd` → REJECT; Bengali + `.in` → REJECT; Bengali + `.de` → PROCESS; Urdu/Bengali alone (no website) → REJECT via the all-members-excluded rule with the set named in reasoning.
 - Pre-enrichment candidate (0–1 descriptions) → behavior unchanged (UNCERTAIN path).
 - Regression: existing 29-country attribution suite, threshold/conflict/merge/boundary tests all green unchanged.
 
