@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { randomUUID } from 'node:crypto';
-import { appendProviderCallEvent, resolveGeminiFreeSemanticCooldownExpiryMs } from '../../db';
+import { appendProviderCallEvent, resolveGeminiFreeSemanticCooldownExpiryMs, GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY } from '../../db';
 import {
   ProviderCallError,
   classifyProviderError,
@@ -279,7 +279,7 @@ export function defaultClient(
           await emit({
             ...base, status: statusFor(typed), latencyMs: Date.now() - started,
             actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
-            ...(deferred ? { requestMetadata: { ...base.requestMetadata, geminiFreeCooldownDeferral: 'true' } } : {}),
+            ...(deferred ? { requestMetadata: { ...base.requestMetadata, [GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY]: 'true' } } : {}),
           });
           throw typed;
         } finally {

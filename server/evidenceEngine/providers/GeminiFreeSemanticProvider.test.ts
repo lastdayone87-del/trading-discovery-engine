@@ -186,9 +186,10 @@ test('persisted free-tier cooldown defers fresh replicas with zero SDK calls', a
 });
 
 test('free cooldown resolver is provider-scoped and excludes deferral echoes', async () => {
-  const { resolveGeminiFreeSemanticCooldownExpiryMs } = await import('../../dbCore');
+  const { resolveGeminiFreeSemanticCooldownExpiryMs, GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY } = await import('../../dbCore');
+  assert.equal(GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY, 'geminiFreeCooldownDeferral');
   const fnStr = resolveGeminiFreeSemanticCooldownExpiryMs.toString();
-  assert.ok(fnStr.includes('geminiFreeCooldownDeferral'), 'resolver must exclude deferral-tagged rows');
+  assert.ok(fnStr.includes('GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY'), 'resolver must reference the shared deferral tag key');
   assert.ok(fnStr.includes("provider='gemini-free'"), 'resolver stays gemini-free-scoped');
   assert.doesNotMatch(fnStr, /provider='gemini'[^_-]/);
 });
@@ -309,6 +310,49 @@ test('free failover stays within free routes and surfaces their results', async 
   });
   assert.equal(value, 'ok-from-free-2');
   assert.deepEqual(order, ['gemini-free-1', 'gemini-free-2']);
+});
+
+test('cooldown deferrals are tagged non-attempts; genuine events stay upstream attempts', async () => {
+  const { isUpstreamProviderCallEvent, GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY } = await import('../../dbCore');
+  assert.equal(GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY, 'geminiFreeCooldownDeferral');
+  // A deferral echo (tagged, no upstream request) is never an upstream attempt.
+  assert.equal(isUpstreamProviderCallEvent({ requestMetadata: { geminiFreeRoute: 'gemini-free-1', [GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY]: 'true' } }), false);
+  // Row shape from the ledger behaves identically.
+  assert.equal(isUpstreamProviderCallEvent({ request_metadata: { [GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY]: 'true' } }), false);
+  // Genuine upstream outcomes — including real 429s — always count.
+  assert.equal(isUpstreamProviderCallEvent({ requestMetadata: { geminiFreeRoute: 'gemini-free-1' } }), true);
+  assert.equal(isUpstreamProviderCallEvent({ provider: 'gemini', requestMetadata: {} } as never), true);
+  assert.equal(isUpstreamProviderCallEvent({} as never), true);
+});
+
+test('a cooldown deferral emits a tagged event that metrics exclude from upstream attempts', async () => {
+  resetGeminiFreeCooldownForTests();
+  const { isUpstreamProviderCallEvent } = await import('../../dbCore');
+  const events: Array<{ status?: string; requestMetadata?: Record<string, unknown> }> = [];
+  const savedKey = process.env.GEMINI_FREE_API_KEY;
+  process.env.GEMINI_FREE_API_KEY = 'test-key';
+  try {
+    const client = defaultClient(async (event) => { events.push(event as never); }, {
+      persistedCooldownExpiryMs: async () => Date.now() + 60_000,
+    });
+    const error = await client!.classify('prompt', 'model').then(() => null, (e: unknown) => e);
+    assert.ok(error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT');
+    // Deferral stays observable (fail-closed signal preserved) but is marked
+    // so upstream-attempt metrics never count it.
+    assert.equal(events.length, 1);
+    assert.equal(events[0].status, 'RATE_LIMITED');
+    assert.equal(isUpstreamProviderCallEvent({ requestMetadata: events[0].requestMetadata }), false);
+  } finally {
+    if (savedKey === undefined) delete process.env.GEMINI_FREE_API_KEY;
+    else process.env.GEMINI_FREE_API_KEY = savedKey;
+    resetGeminiFreeCooldownForTests();
+  }
+});
+
+test('operational metrics exclude deferral echoes from upstream calls', async () => {
+  const { getProviderOperationalMetrics } = await import('../../dbCore');
+  const fnStr = getProviderOperationalMetrics.toString();
+  assert.ok(fnStr.includes('GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY'), 'metrics must reference the shared deferral tag key');
 });
 
 test('enabled adjudication performs the second pass even with same-model defaults', async () => {
