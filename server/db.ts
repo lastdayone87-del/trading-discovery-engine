@@ -3,7 +3,7 @@
 // and independently testable without changing the rest of the database surface.
 export * from './dbCore';
 
-import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs } from './dbCore';
+import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs } from './dbCore';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -37,6 +37,7 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   // route triggers a shared cooldown that blocks all semantic operations.
   let geminiSemanticCooldownExpiryMs: number|undefined=undefined;
   let groqSemanticCooldownExpiryMs: number|undefined=undefined;
+  let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined;
   const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
   if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){
     geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(now);
@@ -46,8 +47,15 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   if(providerReasons.includes('GROQ_RATE_LIMITED')){
     groqSemanticCooldownExpiryMs=await resolveGroqSemanticCooldownExpiryMs(now);
   }
+  // Free-Gemini pool cooldown from its own persisted ledger
+  // (provider='gemini-free'): a free-tier 429 defers the retry past the free
+  // pool's shared window instead of ticking. Never touches the paid 'gemini'
+  // window above.
+  if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){
+    geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(now);
+  }
 
-  const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs);
+  const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);
   const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 

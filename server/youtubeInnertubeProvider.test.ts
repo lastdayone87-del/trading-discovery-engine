@@ -8,13 +8,17 @@ import {
   YOUTUBE_INNERTUBE_COST_DOMAIN,
   YOUTUBE_INNERTUBE_MAX_PAGES,
   INNERTUBE_RATE_LIMITED_CODE,
+  INNERTUBE_TIMEOUT_CODE,
+  INNERTUBE_CONTINUATION_UNAVAILABLE_CODE,
   mapInnertubeChannelsToRaw,
+  mapInnertubeVideosToRaw,
   parseInnertubeCursor,
   innertubeTimeoutMs,
   innertubeCooldownMs,
   innertubeCooldownRemainingMs,
   resetInnertubeCooldownForTests,
   setInnertubeSessionFactoryForTests,
+  withInnertubeDeadline,
   executeInnertubeRetrievalPage,
 } from './youtubeInnertubeProvider';
 
@@ -50,6 +54,45 @@ test('channel mapping falls back to node id and channel id when author is missin
   const [byNode] = mapInnertubeChannelsToRaw([{ id: UC }], 'France');
   assert.equal(byNode.channelId, UC);
   assert.equal(byNode.channelName, UC);
+});
+
+test('channel mapping sets CHANNEL provenance like the official provider', () => {
+  const [mapped] = mapInnertubeChannelsToRaw(
+    [{ author: { id: UC, name: 'Desk' }, description_snippet: { text: 'bio' } }],
+    'US',
+  );
+  assert.deepEqual(mapped.matchedDocument, {
+    type: 'CHANNEL',
+    providerNativeId: UC,
+    title: 'Desk',
+    description: 'bio',
+    locator: `youtube:channel:${UC}`,
+  });
+  assert.equal(mapped.description, 'bio');
+  assert.deepEqual(mapped.videoTitles, []);
+});
+
+test('video mapping attributes author channels with VIDEO provenance', () => {
+  const mapped = mapInnertubeVideosToRaw([
+    { video_id: 'vid1', title: { text: 'Scalp tutorial' }, author: { id: UC, name: 'Desk' }, description_snippet: { text: 'entries' } },
+    { video_id: '', title: { text: 'no id' }, author: { id: UC } },
+    { video_id: 'vid2', title: { text: 't' }, author: { id: 'not-a-channel' } },
+  ]);
+  assert.equal(mapped.length, 1);
+  assert.equal(mapped[0].channelId, UC);
+  assert.deepEqual(mapped[0].videoTitles, ['Scalp tutorial']);
+  assert.deepEqual(mapped[0].videoDescriptions, ['entries']);
+  // VIDEO snippets describe the video; channel bio stays empty until enrichment.
+  assert.equal(mapped[0].description, '');
+  assert.deepEqual(mapped[0].matchedDocument, {
+    type: 'VIDEO',
+    providerNativeId: 'vid1',
+    title: 'Scalp tutorial',
+    description: 'entries',
+    locator: 'youtube:video:vid1',
+  });
+  // No fabricated timestamps: relative display text is never a publishedAt.
+  assert.equal((mapped[0].matchedDocument as Record<string, unknown>).publishedAt, undefined);
 });
 
 test('cursor parsing is bounded to the page cap', () => {
@@ -91,6 +134,166 @@ test('executor returns mapped channels with continuation and zero official cost'
     setInnertubeSessionFactoryForTests(null);
     resetInnertubeCooldownForTests();
   }
+});
+
+test('VIDEO lane performs genuine video search with video provenance', async () => {
+  resetInnertubeCooldownForTests();
+  const seen: Array<{ query: string; filters?: Record<string, unknown> }> = [];
+  const feed = {
+    videos: [{ video_id: 'vid9', title: { text: 'NQ scalp' }, author: { id: UC, name: 'Desk' } }],
+    has_continuation: false,
+  };
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async (query: string, filters?: Record<string, unknown>) => {
+      seen.push({ query, filters });
+      return feed;
+    },
+  }));
+  try {
+    const page = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'scalping',
+      country: 'US',
+      lane: 'VIDEO',
+      cursor: null,
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.deepEqual(seen, [{ query: 'scalping', filters: { type: 'video' } }]);
+    assert.equal(page.channels.length, 1);
+    assert.equal(page.channels[0].matchedDocument?.type, 'VIDEO');
+    assert.equal(page.channels[0].matchedDocument?.locator, 'youtube:video:vid9');
+    assert.equal(page.nextPageToken, null);
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+  }
+});
+
+test('successful runs emit exactly one SUCCESS event under innertube identity', async () => {
+  resetInnertubeCooldownForTests();
+  const events: Array<Record<string, unknown>> = [];
+  const { setInnertubeEmitSinkForTests } = await import('./youtubeInnertubeProvider');
+  setInnertubeEmitSinkForTests(async (event) => { events.push(event as unknown as Record<string, unknown>); });
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => ({
+      channels: [{ author: { id: UC, name: 'Desk' } }],
+      has_continuation: false,
+    }),
+  }));
+  try {
+    await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'trading',
+      country: 'US',
+      lane: 'CHANNEL',
+      cursor: null,
+      ordering: 'RELEVANCE',
+      queryRunId: 'run-1',
+      jobId: 'job-1',
+    } as any);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].provider, 'youtube-innertube');
+    assert.equal(events[0].operation, 'search');
+    assert.equal(events[0].runId, 'run-1');
+    assert.equal(events[0].status, 'SUCCESS');
+  } finally {
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+  }
+});
+
+test('failed runs emit failure telemetry, never SUCCESS', async () => {
+  resetInnertubeCooldownForTests();
+  const events: Array<Record<string, unknown>> = [];
+  const { setInnertubeEmitSinkForTests } = await import('./youtubeInnertubeProvider');
+  setInnertubeEmitSinkForTests(async (event) => { events.push(event as unknown as Record<string, unknown>); });
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('boom'); },
+  }));
+  try {
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'VIDEO',
+        cursor: null,
+        ordering: 'DATE',
+        queryRunId: 'run-2',
+        jobId: 'job-2',
+      } as any),
+    );
+    assert.equal(events.length, 1);
+    assert.equal(events[0].provider, 'youtube-innertube');
+    assert.equal(events[0].runId, 'run-2');
+    assert.notEqual(events[0].status, 'SUCCESS');
+  } finally {
+    setInnertubeEmitSinkForTests(null);
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+  }
+});
+
+test('page-2 null continuation fails instead of returning stale success', async () => {
+  resetInnertubeCooldownForTests();
+  const firstFeed = {
+    channels: [{ author: { id: UC, name: 'Desk' } }],
+    has_continuation: true,
+    getContinuation: async () => null,
+  };
+  setInnertubeSessionFactoryForTests(async () => ({ search: async () => firstFeed }));
+  try {
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'CHANNEL',
+        cursor: '2',
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_CONTINUATION_UNAVAILABLE_CODE,
+    );
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+  }
+});
+
+test('wall-clock deadline races hung session work and classifies timeout', async () => {
+  resetInnertubeCooldownForTests();
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => new Promise(() => undefined) as never,
+  }));
+  const previousTimeout = process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+  process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '30';
+  try {
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'CHANNEL',
+        cursor: null,
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE && error?.retryable === true,
+    );
+  } finally {
+    if (previousTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+    else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = previousTimeout;
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+  }
+});
+
+test('withInnertubeDeadline ignores late losers so no post-timeout success emits', async () => {
+  let settled = '';
+  const slow = new Promise<string>((resolve) => setTimeout(() => { settled = 'late'; resolve('late'); }, 50));
+  await assert.rejects(withInnertubeDeadline(slow, 5), (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(settled, 'late');
 });
 
 test('rate-limit failure arms only the innertube-local cooldown', async () => {

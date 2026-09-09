@@ -1194,6 +1194,7 @@ export async function scheduleAutonomousQueryRuns(
         defaultOrdering: controlSearchOrdering,
         frontierState,
         isSaturating,
+        providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
         clientOverride: client
       });
 
@@ -1219,12 +1220,15 @@ export async function scheduleAutonomousQueryRuns(
       });
 
       const origin = candidate.allocationOrigin || 'LEGACY';
+      // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units;
+      // the official YouTube path keeps its 100-unit page reservation.
+      const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
       let run;
       try {
         run = await client.query(
           `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
-           VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
+           VALUES($1,$2,'automated_query',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,scheduledProviderUnits,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
         );
       } catch (error) { await failStep('query_run_insert', error); }
       const runId = run.rows[0].id;
@@ -1305,7 +1309,7 @@ export async function scheduleAutonomousQueryRuns(
       catch (error) { await failStep('query_run_job_linkage', error); }
 
       try {
-        await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
+        await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:scheduledProviderUnits,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
       } catch (error) { await failStep('decision_event_persistence', error); }
       flushDiagnostic({ selectedQueryId: candidate.query.id, queryRunId: runId, jobId, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'RESERVED', reservationReasonCode: 'QUERY_LIBRARY_RESERVED', schedulingOutcome: 'SCHEDULED', schedulingOperation: 'query_run_job_and_selection_commit', disposition: 'SCHEDULED', reasonCode: 'SCHEDULED' });
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
@@ -2091,12 +2095,19 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const capacity = classifyProviderCapacityFailure(error);
   const capacityMetadata = capacity ? { providerCapacityReason: capacity.reason, providerCapacityRetryable: capacity.retryable, ...(capacity.retryAt ? { providerCapacityRetryAt: capacity.retryAt } : {}) } : {};
   const runProvider = await db.query(`SELECT provider_key FROM query_runs WHERE id=$1`, [runId]);
-  const isYouTubeRun = runProvider.rows[0]?.provider_key === 'youtube-search';
+  // Provider-ledger identity per run: the official path reads provider='youtube',
+  // InnerTube reads its own provider='youtube-innertube' ledger. No run ever
+  // reads the other provider's events. Static queries only (no interpolation).
+  const runProviderKey = String(runProvider.rows[0]?.provider_key || '');
+  const isYouTubeRun = runProviderKey === 'youtube-search';
+  const isInnertubeRun = runProviderKey === 'youtube-innertube';
   const providerCounts = isYouTubeRun
-    ? await db.query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [runId])
-    : { rows: [{}] } as { rows: Array<Record<string, unknown>> };
+    ? await db.query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1 AND provider='youtube' AND operation='search'`, [runId])
+    : isInnertubeRun
+      ? await db.query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1 AND provider='youtube-innertube' AND operation='search'`, [runId])
+      : { rows: [{}] } as { rows: Array<Record<string, unknown>> };
   const counts = providerCounts.rows[0] || {};
-  const hasProviderOutcome = isYouTubeRun && (Boolean(capacity) || Number(counts.attempted || 0) > 0);
+  const hasProviderOutcome = (isYouTubeRun || isInnertubeRun) && (Boolean(capacity) || Number(counts.attempted || 0) > 0);
   const providerRunOutcome = hasProviderOutcome ? classifyProviderRunOutcome({
     rawResults: 0,
     providerRequestsAttempted: Number(counts.attempted || 0),
@@ -2123,11 +2134,11 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':capacity ? 'PROVIDER_CAPACITY' : 'PROVIDER_FAILURE';
   const failureMetadata = JSON.stringify({ failureKind, ...capacityMetadata, ...outcomeMetadata });
   const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
-    provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') ELSE provider_requests_attempted END,
-    provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
-    provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
-    provider_rate_limited=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='RATE_LIMITED') ELSE provider_rate_limited END,
-    provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
+    provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search') ELSE provider_requests_attempted END,
+    provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
+    provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
+    provider_rate_limited=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='RATE_LIMITED') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='RATE_LIMITED') ELSE provider_rate_limited END,
+    provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
     performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
     WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureMetadata]);
   if (run.rowCount) {

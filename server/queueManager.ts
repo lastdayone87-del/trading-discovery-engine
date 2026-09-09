@@ -469,6 +469,7 @@ export async function processNextSearchJob(
     let searchPage: { channels: DiscoveredChannelRaw[]; rawResultCount: number; nextPageToken?: string | null; providerCostUsd?: number; providerRequestId?: string } | null = null;
     let allocatedProvider: ProviderAllocation = YOUTUBE_SEARCH_PROVIDER;
     let braveProvider = false;
+    let quotaFreeInnertubeProvider = false;
     if (queryRunId) {
       allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
       const lineage=await (await getDb()).query(`SELECT provider_allocation_snapshot FROM query_runs WHERE id=$1`,[queryRunId]);
@@ -480,7 +481,7 @@ export async function processNextSearchJob(
       // reserve official YouTube quota units nor accrue USD ledger spend.
       // It shares the quota-free execution path with Brave but keeps its own
       // provider key, cost domain, cooldown, and telemetry throughout.
-      const quotaFreeInnertubeProvider=allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE';
+      quotaFreeInnertubeProvider=allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE';
       let providerRequestId: string | null = null;
       if(braveProvider){
         providerRequestId=`${autonomousOperationId}:provider-request`;
@@ -520,7 +521,10 @@ export async function processNextSearchJob(
         throw error;
       }
     }
-    const extracted = searchPage?.channels || await searchYouTubeChannels(query, country, vocab, retrievalLane);
+    // Quota-free providers never fall back to the official YouTube API: an
+    // empty InnerTube page is an honest empty result, not a trigger to spend
+    // official quota. (The legacy official path keeps its existing behavior.)
+    const extracted = searchPage?.channels || (quotaFreeInnertubeProvider ? [] : await searchYouTubeChannels(query, country, vocab, retrievalLane));
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
@@ -604,7 +608,7 @@ export async function processNextSearchJob(
 
         // Incremental Treatment Page Quota Reservation Boundary
         if (retrievalTreatmentOrigin === 'CANARY_TREATMENT' && pageNumber >= 1) {
-          const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1 });
+          const incRes = await reserveIncrementalTreatmentPageQuota({ queryRunId, pageNumber: pageNumber + 1, providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100 });
           if (!incRes.authorized) {
             console.log(`[Phase 9 Continuation] Incremental page continuation denied by treatment quota caps for run ${queryRunId}: ${incRes.reason}`);
             await completeJob(job.id);
@@ -643,8 +647,13 @@ export async function processNextSearchJob(
         providerPagesRetrieved = Number(totals.provider_pages_retrieved || providerPagesRetrieved);
       }
       let providerRunOutcome: ProviderRunOutcome | undefined;
-      if (allocatedProvider.providerKey !== 'brave-search' && queryRunId) {
-        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [queryRunId]);
+      if (allocatedProvider.providerKey === 'youtube-innertube' && queryRunId) {
+        // InnerTube telemetry lives under its own provider name so the
+        // official provider's run stats stay pure; same outcome math.
+        // Checked BEFORE the official branch: the official predicate below
+        // (`!== 'brave-search'`) also matches innertube and would otherwise
+        // shadow this branch and zero out real InnerTube counts.
+        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube-innertube' AND operation='search'`, [queryRunId]);
         const counts = providerCounts.rows[0] || {};
         providerRequestsAttempted = Number(counts.attempted || 0);
         providerRequestsSucceeded = Number(counts.succeeded || 0);
@@ -658,10 +667,8 @@ export async function processNextSearchJob(
           providerRequestsFailed,
           providerRateLimited
         });
-      } else if (allocatedProvider.providerKey === 'youtube-innertube' && queryRunId) {
-        // InnerTube telemetry lives under its own provider name so the
-        // official provider's run stats stay pure; same outcome math.
-        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube-innertube' AND operation='search'`, [queryRunId]);
+      } else if (allocatedProvider.providerKey !== 'brave-search' && queryRunId) {
+        const providerCounts = await (await getDb()).query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [queryRunId]);
         const counts = providerCounts.rows[0] || {};
         providerRequestsAttempted = Number(counts.attempted || 0);
         providerRequestsSucceeded = Number(counts.succeeded || 0);

@@ -35,3 +35,27 @@ test('canary rows sort behind active rows but stay selectable when alone', () =>
   const canary = { provider_key: 'youtube-innertube', mode: 'CANARY' };
   assert.equal(rotateActiveProviderRow([canary], 'opp-1'), canary);
 });
+
+test('mixed ACTIVE/CANARY registries never route untargeted traffic to canary', () => {
+  const official = { provider_key: 'youtube-search', mode: 'ACTIVE' };
+  const canary = { provider_key: 'youtube-innertube', mode: 'CANARY' };
+  for (let i = 0; i < 50; i++) {
+    assert.equal(
+      rotateActiveProviderRow([official, canary], `opp-${i}`).provider_key,
+      'youtube-search',
+      'canary must not receive ordinary traffic while ACTIVE is eligible',
+    );
+  }
+});
+
+test('mixed ACTIVE/ACTIVE/CANARY registries rotate across active only', () => {
+  const official = { provider_key: 'youtube-search', mode: 'ACTIVE' };
+  const innertube = { provider_key: 'youtube-innertube', mode: 'ACTIVE' };
+  const canary = { provider_key: 'brave-search', mode: 'CANARY' };
+  const picks = new Set<string>();
+  for (let i = 0; i < 50; i++) {
+    picks.add(rotateActiveProviderRow([official, innertube, canary], `opp-${i}`).provider_key);
+  }
+  assert.ok(!picks.has('brave-search'), 'canary must be excluded while ACTIVE rows exist');
+  assert.ok(picks.has('youtube-search') && picks.has('youtube-innertube'));
+});

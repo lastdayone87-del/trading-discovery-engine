@@ -163,6 +163,10 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
     const officialRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube' && isOfficialEnrichmentOperation(row.operation));
     const displayedRows = officialRows;
     const geminiRows = providerRows.filter(row => row.provider.toLowerCase() === 'gemini');
+    // InnerTube (quota-free discovery) rows are namespaced under their own
+    // provider identity; they are shown separately and never folded into the
+    // official YouTube enrichment aggregates above.
+    const innertubeRows = providerRows.filter(row => row.provider.toLowerCase() === 'youtube-innertube');
 
     const sum = (rows: ProviderMetricRow[], key: keyof ProviderMetricRow) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
     const officialCalls = sum(officialRows, 'calls');
@@ -202,7 +206,11 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
       trend,
       delta,
       displayedRows,
-      geminiRows
+      geminiRows,
+      innertubeRows,
+      innertubeCalls: sum(innertubeRows, 'calls'),
+      innertubeSuccesses: sum(innertubeRows, 'successes'),
+      innertubeErrors: sum(innertubeRows, 'errors') + sum(innertubeRows, 'timeouts')
     };
   }, [providerMetrics, metricsUpdatedAt]);
 
@@ -359,6 +367,16 @@ export const QueueMonitor: React.FC<Props> = ({ queueStatus, quotaInfo, onToggle
                 <table className="w-full text-[11px] min-w-[680px]">
                   <thead className="bg-slate-50 dark:bg-slate-800/50 text-slate-500 uppercase tracking-wider"><tr><th className="text-left px-3 py-2">Route</th><th className="text-left px-3 py-2">Operation</th><th className="text-right px-3 py-2">Calls</th><th className="text-right px-3 py-2">Success</th><th className="text-right px-3 py-2">Errors</th><th className="text-right px-3 py-2">Reserved</th><th className="text-right px-3 py-2">Actual</th></tr></thead>
                   <tbody>{enrichmentHealth.geminiRows.map(row => <tr key={`gemini:${row.route || 'legacy'}:${row.operation}`} className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 font-mono">{row.route || 'legacy'}</td><td className="px-3 py-2 font-mono">{row.operation}</td><td className="px-3 py-2 text-right font-mono">{row.calls}</td><td className="px-3 py-2 text-right font-mono">{row.successes}</td><td className="px-3 py-2 text-right font-mono">{Number(row.errors || 0) + Number(row.timeouts || 0)}</td><td className="px-3 py-2 text-right font-mono">{row.reserved_cost}</td><td className="px-3 py-2 text-right font-mono">{row.actual_cost}</td></tr>)}</tbody>
+                </table>
+              </div>
+            )}
+
+            {enrichmentHealth.innertubeRows.length > 0 && (
+              <div className="border-t border-slate-200 dark:border-slate-800 overflow-x-auto">
+                <div className="px-4 py-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">InnerTube quota-free discovery — calls {enrichmentHealth.innertubeCalls}, success {enrichmentHealth.innertubeSuccesses}, errors {enrichmentHealth.innertubeErrors}</div>
+                <table className="w-full text-[11px] min-w-[680px]">
+                  <thead className="bg-slate-50 dark:bg-slate-800/50 text-slate-500 uppercase tracking-wider"><tr><th className="text-left px-3 py-2">Operation</th><th className="text-right px-3 py-2">Calls</th><th className="text-right px-3 py-2">Success</th><th className="text-right px-3 py-2">Errors</th><th className="text-right px-3 py-2">Avg ms</th></tr></thead>
+                  <tbody>{enrichmentHealth.innertubeRows.map(row => <tr key={`innertube:${row.operation}`} className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 font-mono">{row.operation}</td><td className="px-3 py-2 text-right font-mono">{row.calls}</td><td className="px-3 py-2 text-right font-mono">{row.successes}</td><td className="px-3 py-2 text-right font-mono">{Number(row.errors || 0) + Number(row.timeouts || 0)}</td><td className="px-3 py-2 text-right font-mono">{row.average_latency_ms}</td></tr>)}</tbody>
                 </table>
               </div>
             )}

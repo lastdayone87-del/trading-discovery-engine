@@ -2,13 +2,29 @@
  * YouTube.js (InnerTube) discovery provider — fully ACTIVE production retrieval
  * provider alongside the official YouTube Data API v3 path.
  *
- * Isolation contract (the reason for this file's shape): this module shares NO
- * runtime state with server/youtube.ts — no key pool, no scheduler, no quota
- * ledger, no cooldown flags. It spends zero official API quota (own costDomain),
- * emits its own provider_call_events under provider='youtube-innertube' so the
- * official provider's telemetry stays pure, and never falls back to (or borrows
- * from) the official API. Failures are reported with INNERTUBE_* codes and
- * propagate to the caller; Phase 9 treats them like any other provider failure.
+ * Capability contract (mirrors server/youtube.ts discovery behavior):
+ * - CHANNEL lane: genuine InnerTube channel search; bio description,
+ *   matchedDocument{type:'CHANNEL', locator:'youtube:channel:<id>'}.
+ * - VIDEO lane: genuine InnerTube video search; per-video titles/descriptions,
+ *   channels attributed via the video author id, description left empty (the
+ *   About bio is unknown until official enrichment hydrates it — same rule as
+ *   the official provider), matchedDocument{type:'VIDEO', locator:'youtube:video:<id>'}.
+ * - Ordering: InnerTube exposes no sort-by-date; every search runs in native
+ *   relevance order and the actual ordering is recorded truthfully in provider
+ *   event metadata (never misreported as DATE). InnerTube video timestamps are
+ *   relative display text, so matchedDocument.publishedAt is left unset; the
+ *   downstream staleness triage treats a missing timestamp as non-stale
+ *   (fail-open toward inspection, never a wrongful withhold).
+ *
+ * Isolation contract: this module shares NO runtime state with
+ * server/youtube.ts — no key pool, no scheduler, no quota ledger, no cooldown
+ * flags. It spends zero official API quota (own costDomain), emits its own
+ * provider_call_events under provider='youtube-innertube' so the official
+ * provider's telemetry stays pure, and never falls back to (or borrows from)
+ * the official API. Failures are reported with INNERTUBE_* codes and
+ * propagate to the caller; Phase 9 treats them like any other provider
+ * failure. A missing required continuation fails the page — the previous
+ * page is never returned as fresh successful data.
  */
 import { Innertube } from 'youtubei.js';
 import { appendProviderCallEvent } from './db';
@@ -33,13 +49,16 @@ export const YOUTUBE_INNERTUBE_PROVIDER: ProviderAllocation = Object.freeze({
   continuationOwner: 'PHASE_9',
 });
 
-/** Innertube channel-search never needs an API key; sessions are quota-free. */
+/** InnerTube channel/video search never needs an API key; sessions are quota-free. */
 export const YOUTUBE_INNERTUBE_MAX_PAGES = 3;
+/** First-page result count is provider-determined (~20); official pages request up to 25. */
+export const YOUTUBE_INNERTUBE_PAGE_SIZE = 20;
 
 export const INNERTUBE_RATE_LIMITED_CODE = 'INNERTUBE_API_RATE_LIMIT_429';
 export const INNERTUBE_TIMEOUT_CODE = 'INNERTUBE_API_TIMEOUT';
 export const INNERTUBE_NETWORK_FAILURE_CODE = 'INNERTUBE_API_NETWORK_FAILURE';
 export const INNERTUBE_FAILURE_CODE = 'INNERTUBE_API_FAILURE';
+export const INNERTUBE_CONTINUATION_UNAVAILABLE_CODE = 'INNERTUBE_API_CONTINUATION_UNAVAILABLE';
 
 const CHANNEL_ID_PATTERN = /^UC[A-Za-z0-9_-]{22}$/;
 
@@ -63,35 +82,119 @@ export function resetInnertubeCooldownForTests(): void {
   innertubeCooldownUntilMs = 0;
 }
 
+export interface InnertubeTextLike { text?: unknown }
+export interface InnertubeThumbnailLike { url?: unknown; width?: unknown }
+export interface InnertubeAuthorLike {
+  id?: unknown;
+  name?: unknown;
+  thumbnails?: InnertubeThumbnailLike[];
+  avatar_thumbnail_url?: unknown;
+}
 export interface InnertubeChannelLike {
   id?: unknown;
-  author?: { id?: unknown; name?: unknown };
-  subscriber_count?: { text?: unknown };
-  description_snippet?: { text?: unknown };
+  author?: InnertubeAuthorLike;
+  subscriber_count?: InnertubeTextLike;
+  subscribers?: InnertubeTextLike;
+  description_snippet?: InnertubeTextLike;
+}
+export interface InnertubeVideoLike {
+  video_id?: unknown;
+  title?: InnertubeTextLike;
+  author?: InnertubeAuthorLike;
+  description_snippet?: InnertubeTextLike;
+  thumbnails?: InnertubeThumbnailLike[];
 }
 
 function textOf(value: unknown): string {
-  return typeof value === 'string' ? value : '';
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object' && typeof (value as { text?: unknown }).text === 'string') {
+    return (value as { text: string }).text;
+  }
+  return '';
+}
+
+function bestThumbnailUrl(thumbnails: InnertubeThumbnailLike[] | undefined): string {
+  if (!Array.isArray(thumbnails)) return '';
+  let best = '';
+  let bestWidth = -1;
+  for (const thumb of thumbnails) {
+    if (typeof thumb?.url !== 'string' || !thumb.url) continue;
+    const width = Number(thumb.width);
+    if (Number.isFinite(width) ? width > bestWidth : !best) {
+      best = thumb.url;
+      bestWidth = Number.isFinite(width) ? width : 0;
+    }
+  }
+  return best;
+}
+
+function channelIdOf(authorId: string, nodeId: string): string {
+  if (CHANNEL_ID_PATTERN.test(authorId)) return authorId;
+  if (CHANNEL_ID_PATTERN.test(nodeId)) return nodeId;
+  return '';
 }
 
 /**
- * Pure mapping from InnerTube channel-search nodes to DiscoveredChannelRaw.
+ * Pure CHANNEL-lane mapping from InnerTube channel-search nodes.
  * Nodes without a resolvable UC channel id are dropped (never fabricated).
  */
 export function mapInnertubeChannelsToRaw(
   nodes: InnertubeChannelLike[],
-  country: string,
+  _country: string,
 ): DiscoveredChannelRaw[] {
   const out: DiscoveredChannelRaw[] = [];
   for (const node of nodes || []) {
     const authorId = typeof node?.author?.id === 'string' ? node.author.id : '';
     const nodeId = typeof node?.id === 'string' ? node.id : '';
-    const channelId = CHANNEL_ID_PATTERN.test(authorId)
-      ? authorId
-      : CHANNEL_ID_PATTERN.test(nodeId)
-        ? nodeId
-        : '';
+    const channelId = channelIdOf(authorId, nodeId);
     if (!channelId) continue;
+    const authorName = typeof node?.author?.name === 'string' && node.author.name.trim()
+      ? node.author.name.trim()
+      : channelId;
+    const description = textOf(node?.description_snippet);
+    const avatar = typeof node?.author?.avatar_thumbnail_url === 'string'
+      ? node.author.avatar_thumbnail_url
+      : bestThumbnailUrl(node?.author?.thumbnails);
+    out.push({
+      channelId,
+      channelName: authorName,
+      youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
+      description,
+      videoTitles: [],
+      videoDescriptions: [],
+      subscriberCount: textOf(node?.subscriber_count) || textOf(node?.subscribers) || undefined,
+      channelThumbnailUrl: avatar || undefined,
+      matchedDocument: {
+        type: 'CHANNEL',
+        providerNativeId: channelId,
+        title: authorName,
+        description,
+        locator: `youtube:channel:${channelId}`,
+      },
+    });
+  }
+  return out;
+}
+
+/**
+ * Pure VIDEO-lane mapping from InnerTube video-search nodes. Each video
+ * attributes its author channel; videos from the same channel are NOT merged
+ * here (downstream dedupe merges by channelId, mirroring the official path).
+ * matchedDocument.publishedAt is intentionally unset: InnerTube exposes only
+ * relative display text ("3 days ago"), never a timestamp, and a fabricated
+ * timestamp would corrupt the downstream staleness triage (which fail-opens
+ * on a missing value).
+ */
+export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): DiscoveredChannelRaw[] {
+  const out: DiscoveredChannelRaw[] = [];
+  for (const node of nodes || []) {
+    const authorId = typeof node?.author?.id === 'string' ? node.author.id : '';
+    const channelId = channelIdOf(authorId, '');
+    if (!channelId) continue;
+    const videoId = typeof node?.video_id === 'string' ? node.video_id : '';
+    const title = textOf(node?.title);
+    if (!videoId || !title) continue;
+    const videoDescription = textOf(node?.description_snippet);
     const authorName = typeof node?.author?.name === 'string' && node.author.name.trim()
       ? node.author.name.trim()
       : channelId;
@@ -99,9 +202,19 @@ export function mapInnertubeChannelsToRaw(
       channelId,
       channelName: authorName,
       youtubeUrl: `https://www.youtube.com/channel/${channelId}`,
-      description: textOf(node?.description_snippet?.text),
-      videoTitles: [],
-      subscriberCount: textOf(node?.subscriber_count?.text) || undefined,
+      // VIDEO search snippets describe the video; the channel About bio is
+      // unknown until official enrichment hydrates it (official rule).
+      description: '',
+      videoTitles: [title],
+      videoDescriptions: videoDescription ? [videoDescription] : [],
+      channelThumbnailUrl: bestThumbnailUrl(node?.thumbnails) || undefined,
+      matchedDocument: {
+        type: 'VIDEO',
+        providerNativeId: videoId,
+        title,
+        description: videoDescription,
+        locator: `youtube:video:${videoId}`,
+      },
     });
   }
   return out;
@@ -113,12 +226,15 @@ export function parseInnertubeCursor(cursor: string | null | undefined): number 
   return Number.isInteger(page) && page >= 1 ? Math.min(page, YOUTUBE_INNERTUBE_MAX_PAGES) : 1;
 }
 
+type InnertubeFeedLike = {
+  channels?: unknown;
+  videos?: unknown;
+  has_continuation?: boolean;
+  getContinuation?: () => Promise<unknown>;
+};
+
 type InnertubeSession = {
-  search: (query: string, filters?: Record<string, unknown>) => Promise<{
-    channels?: InnertubeChannelLike[] | { length?: number };
-    has_continuation?: boolean;
-    getContinuation?: () => Promise<unknown>;
-  }>;
+  search: (query: string, filters?: Record<string, unknown>) => Promise<InnertubeFeedLike>;
 };
 
 let sessionPromise: Promise<InnertubeSession> | null = null;
@@ -127,6 +243,16 @@ let sessionFactory: (() => Promise<InnertubeSession>) | null = null;
 export function setInnertubeSessionFactoryForTests(factory: (() => Promise<InnertubeSession>) | null): void {
   sessionFactory = factory;
   sessionPromise = null;
+}
+
+type EmitSink = (event: Parameters<typeof appendProviderCallEvent>[0]) => Promise<void>;
+let emitSink: EmitSink | null = null;
+/** Test seam: observe emitted provider_call_events without a database. */
+export function setInnertubeEmitSinkForTests(sink: EmitSink | null): void {
+  emitSink = sink;
+}
+function emit(event: Parameters<typeof appendProviderCallEvent>[0]): Promise<void> {
+  return (emitSink ? emitSink(event) : appendProviderCallEvent(event)).catch(() => undefined);
 }
 
 async function getInnertubeSession(): Promise<InnertubeSession> {
@@ -142,17 +268,43 @@ async function getInnertubeSession(): Promise<InnertubeSession> {
   return sessionPromise;
 }
 
-function classifyInnertubeError(error: unknown, timeoutMs: number): Error & { code?: string; retryable?: boolean } {
+export function innertubeTimeoutError(): Error & { code?: string; retryable?: boolean } {
+  return Object.assign(
+    new Error('YouTube.js InnerTube search exceeded its wall-clock deadline.'),
+    { code: INNERTUBE_TIMEOUT_CODE, retryable: true },
+  );
+}
+
+/**
+ * Races provider work against the wall-clock deadline. Whichever settles
+ * first wins; a late loser is ignored, so a timed-out operation can never
+ * emit success telemetry after the fact. Both sides carry handlers, so late
+ * rejections are never unhandled.
+ */
+export function withInnertubeDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(innertubeTimeoutError()), timeoutMs);
+  });
+  const guarded = work.then(
+    (value) => { if (timer) clearTimeout(timer); return value; },
+    (error) => { if (timer) clearTimeout(timer); throw error; },
+  );
+  return Promise.race([guarded, timeout]);
+}
+
+function classifyInnertubeError(error: unknown): Error & { code?: string; retryable?: boolean } {
+  const existingCode = error instanceof Error ? (error as { code?: unknown }).code : undefined;
+  if (typeof existingCode === 'string' && existingCode.startsWith('INNERTUBE_API_')) {
+    // Provider-raised errors (timeout, missing continuation, cooldown) keep
+    // their specific codes so callers and retry policy can distinguish them.
+    return error as Error & { code?: string; retryable?: boolean };
+  }
   const message = error instanceof Error ? error.message : String(error);
   const typed = new Error(`YouTube.js InnerTube search failed: ${message.slice(0, 300)}`) as Error & {
     code?: string;
     retryable?: boolean;
   };
-  if (error instanceof Error && error.name === 'AbortError') {
-    typed.code = INNERTUBE_TIMEOUT_CODE;
-    typed.retryable = true;
-    return typed;
-  }
   if (/429|too many requests|rate.?limit/i.test(message)) {
     typed.code = INNERTUBE_RATE_LIMITED_CODE;
     typed.retryable = true;
@@ -177,39 +329,63 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
       { code: INNERTUBE_RATE_LIMITED_CODE, retryable: true, retryAfterMs: remainingMs },
     );
   }
+  const lane = request.lane === 'VIDEO' ? 'VIDEO' : 'CHANNEL';
+  const requestedOrdering = request.ordering === 'DATE' ? 'DATE' : 'RELEVANCE';
+  // InnerTube search has no sort-by-date: relevance is the only available
+  // order. Recorded truthfully; never misreported as DATE downstream.
+  const actualOrdering = 'RELEVANCE';
   const pageNumber = parseInnertubeCursor(request.cursor);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const started = Date.now();
   const base = {
-    id: `${request.queryRunId || 'adhoc'}:youtube-innertube:p${pageNumber}:${Date.now()}`,
+    id: `${request.queryRunId || 'adhoc'}:youtube-innertube:${lane.toLowerCase()}:p${pageNumber}:${Date.now()}`,
     provider: 'youtube-innertube',
     operation: 'search',
     runId: request.queryRunId,
     jobId: request.jobId,
-    requestMetadata: { innertubePage: String(pageNumber) },
+    requestMetadata: {
+      innertubePage: String(pageNumber),
+      innertubeLane: lane,
+      requestedOrdering,
+      innertubeOrdering: actualOrdering,
+      ...(requestedOrdering === 'DATE' ? { orderingFallback: 'RELEVANCE_FALLBACK' } : {}),
+    },
     attempt: 1,
     reservedCost: 0,
     policyVersion: 'provider-resilience-v1',
   };
   try {
-    if (controller.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
-    const session = await getInnertubeSession();
+    const session = await withInnertubeDeadline(getInnertubeSession(), timeoutMs);
     // Page walk: InnerTube continuations belong to a live feed object, so page
     // N is reached by re-running the search and advancing N-1 continuations.
     // Bounded to YOUTUBE_INNERTUBE_MAX_PAGES (mirrors the autonomous 3-page cap).
-    let feed = await session.search(request.query, { type: 'channel' });
+    const searchType = lane === 'VIDEO' ? 'video' : 'channel';
+    let feed = await withInnertubeDeadline(session.search(request.query, { type: searchType }), timeoutMs);
     for (let walked = 1; walked < pageNumber; walked++) {
-      if (!feed?.has_continuation || typeof feed.getContinuation !== 'function') break;
-      const next = (await feed.getContinuation()) as typeof feed;
-      if (!next) break;
+      if (!feed?.has_continuation || typeof feed.getContinuation !== 'function') {
+        throw Object.assign(
+          new Error(`YouTube.js InnerTube continuation unavailable for page ${pageNumber} (walk stopped at ${walked}).`),
+          { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+        );
+      }
+      const next = (await withInnertubeDeadline(
+        (feed.getContinuation() as Promise<unknown>).catch(() => null),
+        timeoutMs,
+      )) as InnertubeFeedLike | null;
+      if (!next) {
+        throw Object.assign(
+          new Error(`YouTube.js InnerTube continuation returned no feed for page ${pageNumber}.`),
+          { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+        );
+      }
       feed = next;
     }
-    const rawNodes = (feed?.channels ?? []) as unknown;
-    const nodes: InnertubeChannelLike[] = Array.isArray(rawNodes) ? rawNodes as InnertubeChannelLike[] : [];
-    const channels = mapInnertubeChannelsToRaw(nodes, request.country);
+    const rawNodes = (lane === 'VIDEO' ? feed?.videos : feed?.channels) ?? [];
+    const nodes: Array<InnertubeChannelLike & InnertubeVideoLike> = Array.isArray(rawNodes) ? rawNodes : [];
+    const channels = lane === 'VIDEO'
+      ? mapInnertubeVideosToRaw(nodes)
+      : mapInnertubeChannelsToRaw(nodes, request.country);
     const hasMore = feed?.has_continuation === true && pageNumber < YOUTUBE_INNERTUBE_MAX_PAGES;
-    await appendProviderCallEvent({
+    await emit({
       ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
       actualCost: 0, occurredAt: new Date().toISOString(),
     }).catch(() => undefined);
@@ -218,14 +394,14 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
       rawResultCount: channels.length,
       nextPageToken: hasMore ? String(pageNumber + 1) : null,
       providerCostUsd: 0,
-      providerRequestId: request.queryRunId ? `${request.queryRunId}:youtube-innertube:p${pageNumber}` : undefined,
+      providerRequestId: request.queryRunId ? `${request.queryRunId}:youtube-innertube:${lane.toLowerCase()}:p${pageNumber}` : undefined,
     };
   } catch (error) {
-    const typed = classifyInnertubeError(error, timeoutMs);
+    const typed = classifyInnertubeError(error);
     if (typed.code === INNERTUBE_RATE_LIMITED_CODE && !String(typed.message).includes('cooling down')) {
       innertubeCooldownUntilMs = Date.now() + innertubeCooldownMs();
     }
-    await appendProviderCallEvent({
+    await emit({
       ...base,
       status: typed.code === INNERTUBE_RATE_LIMITED_CODE ? 'RATE_LIMITED' : 'TRANSIENT_ERROR',
       latencyMs: Date.now() - started,
@@ -234,8 +410,6 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
       occurredAt: new Date().toISOString(),
     }).catch(() => undefined);
     throw typed;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
