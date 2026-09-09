@@ -40,7 +40,7 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
       FROM query_runs WHERE COALESCE(completed_at,started_at,scheduled_at) >= now() - ($1::int * interval '1 hour')
       GROUP BY country,retrieval_lane,provider_key,selection_strategy,status ORDER BY country,retrieval_lane,provider_key,status`, params),
     db.query(`SELECT COALESCE(NULLIF(performance_details->>'providerRunOutcome',''),
-        CASE WHEN provider_key='youtube-search' AND COALESCE(provider_requests_attempted,0)>0 THEN 'UNLABELED_PROVIDER_ATTEMPT' ELSE 'NO_PROVIDER_OUTCOME' END) AS provider_outcome,
+        CASE WHEN provider_key IN ('youtube-search','youtube-innertube') AND COALESCE(provider_requests_attempted,0)>0 THEN 'UNLABELED_PROVIDER_ATTEMPT' ELSE 'NO_PROVIDER_OUTCOME' END) AS provider_outcome,
       COUNT(*)::int AS run_count, COALESCE(SUM(raw_results),0)::bigint AS raw_results,
       COALESCE(SUM(unique_channels),0)::bigint AS unique_channels, COALESCE(SUM(quota_used),0)::bigint AS quota_used
       FROM query_runs WHERE COALESCE(completed_at,started_at,scheduled_at) >= now() - ($1::int * interval '1 hour')
@@ -87,7 +87,9 @@ export async function getExecutionLineageMetrics(hours = 168): Promise<Record<st
       COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM discovery_nominations n WHERE n.query_run_id=qr.id))::int AS runs_with_nominations,
       COUNT(*) FILTER (WHERE NULLIF(qr.performance_details->>'providerRunOutcome','') IS NOT NULL)::int AS runs_with_provider_outcome,
       COUNT(*) FILTER (WHERE qr.provider_key='youtube-search' AND COALESCE(qr.provider_requests_attempted,0)>0)::int AS youtube_runs_with_provider_attempt,
-      COUNT(*) FILTER (WHERE qr.provider_key='youtube-search' AND COALESCE(qr.provider_requests_attempted,0)=0)::int AS youtube_runs_without_provider_attempt
+      COUNT(*) FILTER (WHERE qr.provider_key='youtube-search' AND COALESCE(qr.provider_requests_attempted,0)=0)::int AS youtube_runs_without_provider_attempt,
+      COUNT(*) FILTER (WHERE qr.provider_key='youtube-innertube' AND COALESCE(qr.provider_requests_attempted,0)>0)::int AS youtube_innertube_runs_with_provider_attempt,
+      COUNT(*) FILTER (WHERE qr.provider_key='youtube-innertube' AND COALESCE(qr.provider_requests_attempted,0)=0)::int AS youtube_innertube_runs_without_provider_attempt
       FROM query_runs qr WHERE COALESCE(qr.completed_at,qr.started_at,qr.scheduled_at) >= now() - ($1::int * interval '1 hour')`, params),
     db.query(`SELECT COALESCE(country_status,'UNSPECIFIED') AS country_status, COALESCE(trading_status,'UNSPECIFIED') AS trading_status,
       COALESCE(scan_status,'UNSPECIFIED') AS scan_status, COALESCE(discord_status,'UNSPECIFIED') AS discord_status,

@@ -196,6 +196,20 @@ export async function isGroqSemanticCooldownActive(nowMs: number = Date.now()): 
   return expiry !== undefined && expiry > nowMs;
 }
 
+/**
+ * Returns true when the independent free-tier Gemini pool is inside its
+ * shared rate-limit cooldown. Reads ONLY the provider='gemini-free' ledger —
+ * never the paid 'gemini' window — so the two setups gate independently.
+ * Delegates to the persisted-ledger resolver so queue admission and retry
+ * timing read one authoritative state. Dynamic import preserves the
+ * module's existing lazy database boundary.
+ */
+export async function isGeminiFreeSemanticCooldownActive(nowMs: number = Date.now()): Promise<boolean> {
+  const { resolveGeminiFreeSemanticCooldownExpiryMs } = await import('./dbCore');
+  const expiry = await resolveGeminiFreeSemanticCooldownExpiryMs(nowMs);
+  return expiry !== undefined && expiry > nowMs;
+}
+
 function abortError():Error{const error=new Error('aborted');error.name='AbortError';return error;}
 
 function waitForCapacity(ms:number,signal?:AbortSignal):Promise<void>{

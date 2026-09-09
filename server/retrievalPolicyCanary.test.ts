@@ -77,3 +77,54 @@ test('releaseIncrementalTreatmentPageReservation does NOT revert COMMITTED page 
   const released = await releaseIncrementalTreatmentPageReservation('inc-page-res:run_1:2:v1', 'run_1');
   assert.equal(released, false);
 });
+
+test('releaseIncrementalTreatmentPageReservation credits the persisted page units, never a hard-coded 100', async () => {
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const pageUnits = 0; // quota-free provider page
+  const mockRunner = {
+    query: async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params: params || [] });
+      if (sql.includes('SELECT quota_reserved FROM retrieval_canary_page_reservations')) {
+        return { rows: [{ quota_reserved: pageUnits }], rowCount: 1 };
+      }
+      if (sql.includes('SET reservation_status = \'RELEASED\'')) {
+        return { rows: [{ query_run_id: 'run_free' }], rowCount: 1 };
+      }
+      if (sql.includes('retrieval_canary_reservations')) {
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const released = await releaseIncrementalTreatmentPageReservation('inc-page-res:run_free:2:v1', 'run_free', mockRunner);
+  assert.equal(released, true);
+  const parentUpdate = queries.find((q) => q.sql.includes('retrieval_canary_reservations'));
+  assert.ok(parentUpdate, 'parent reservation must be reconciled');
+  // Floor 0 and subtract 0 for quota-free pages: parent untouched, never raised to 100.
+  assert.deepEqual(parentUpdate.params.slice(-2), [0, 0]);
+});
+
+test('releaseIncrementalTreatmentPageReservation preserves the official 100-unit floor', async () => {
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const mockRunner = {
+    query: async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params: params || [] });
+      if (sql.includes('SELECT quota_reserved FROM retrieval_canary_page_reservations')) {
+        return { rows: [{ quota_reserved: 100 }], rowCount: 1 };
+      }
+      if (sql.includes('SET reservation_status = \'RELEASED\'')) {
+        return { rows: [{ query_run_id: 'run_official' }], rowCount: 1 };
+      }
+      if (sql.includes('retrieval_canary_reservations')) {
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const released = await releaseIncrementalTreatmentPageReservation('inc-page-res:run_official:2:v1', 'run_official', mockRunner);
+  assert.equal(released, true);
+  const parentUpdate = queries.find((q) => q.sql.includes('retrieval_canary_reservations'));
+  assert.ok(parentUpdate, 'parent reservation must be reconciled');
+  // Official behavior unchanged: floor 100, subtract exactly the persisted 100.
+  assert.deepEqual(parentUpdate.params.slice(-2), [100, 100]);
+});

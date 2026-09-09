@@ -18,7 +18,8 @@ function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
     case 'discord_metadata': return [{ field: 'discord_invite' }];
     case 'multilingual_context': return [{ field: 'language' }, { field: 'channel_bio' }, { field: 'video_title' }];
     case 'gemini_semantic':
-    case 'groq_semantic': return [{ field: 'channel_title' }, { field: 'channel_bio' }, { field: 'video_title' }, { field: 'video_description' }];
+    case 'groq_semantic':
+    case 'gemini_free_semantic': return [{ field: 'channel_title' }, { field: 'channel_bio' }, { field: 'video_title' }, { field: 'video_description' }];
     default: return [];
   }
 }

@@ -27,7 +27,7 @@ import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance } from './terminologyIntelligence';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -128,7 +128,7 @@ export async function selectDiscordCandidate(channelId:string,candidateId:string
 export async function appendDiscordCheckAttempts(channelId:string,inviteLocator:string,semanticStatus:string,attempts:Array<{attemptNumber:number;operationalOutcome:string;retryable:boolean;httpStatus?:number;providerErrorClass?:string;providerErrorCode?:number;responseContentType?:string;reason:string;checkedAt:string}>,candidate:DiscordAttemptCandidate={}):Promise<void>{const db=await getDb();for(const attempt of attempts)await db.query(`INSERT INTO discord_check_attempts(attempt_key,channel_id,invite_locator,semantic_status,operational_outcome,retryable,attempt_number,http_status,provider_error_class,reason,provenance,policy_version,checked_at,candidate_id,raw_locator,locator_type,resolved_locator,source_surface,source_url,response_content_type,provider_error_code) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'discord-check-policy-v2',$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT(attempt_key) DO NOTHING`,[`${channelId}:${candidate.candidateId||inviteLocator}:${attempt.checkedAt}:${attempt.attemptNumber}`,channelId,inviteLocator,semanticStatus,attempt.operationalOutcome,attempt.retryable,attempt.attemptNumber,attempt.httpStatus||null,attempt.providerErrorClass||null,attempt.reason,JSON.stringify({provider:'discord',operation:'invite-lookup',candidateLocatorPreserved:true}),attempt.checkedAt,candidate.candidateId||null,candidate.rawLocator||null,candidate.locatorType||null,candidate.resolvedLocator||inviteLocator,candidate.sourceSurface||null,candidate.sourceUrl||null,attempt.responseContentType||null,attempt.providerErrorCode||null]);}
 export async function countDiscordInvalidObservations(channelId:string,candidateId:string|undefined,inviteLocator:string):Promise<number>{const db=await getDb();const result=await db.query(`SELECT count(*)::int count FROM discord_check_attempts WHERE channel_id=$1 AND (candidate_id=$2 OR (candidate_id IS NULL AND invite_locator=$3)) AND operational_outcome IN('INVALID_OBSERVED','CONFIRMED_INVALID')`,[channelId,candidateId||null,inviteLocator]);return Number(result.rows[0]?.count||0);}
 export async function appendExternalAcquisitionObservations(channelId:string,observations:Array<{requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:string;required:boolean;outcome:string;retryable:boolean;httpStatus?:number;failureClass?:string;detail:string;observedAt:string;telemetry?:CrawlerTelemetry}>):Promise<void>{const db=await getDb();for(const [index,observation] of observations.entries()){const telemetry=safeCrawlerTelemetry(observation.telemetry);await db.query(`INSERT INTO external_acquisition_observations(observation_key,channel_id,requested_url,final_url,outcome,retryable,http_status,failure_class,detail,provenance,policy_version,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'external-community-acquisition-v2',$11) ON CONFLICT(observation_key) DO NOTHING`,[`${channelId}:${observation.observedAt}:${index}:${observation.requestedUrl}`,channelId,observation.requestedUrl,observation.finalUrl||null,observation.outcome,observation.retryable,observation.httpStatus||null,observation.failureClass||null,observation.detail,JSON.stringify({provider:'external-link',boundedDepth:2,surface:observation.surface,required:observation.required,wrapperUrl:observation.wrapperUrl||null,...(telemetry?{crawlerTelemetry:telemetry}:{})}),observation.observedAt]);}}
-export async function getProviderOperationalMetrics(hours=24):Promise<any>{const db=await getDb();const bounded=Math.min(Math.max(hours,1),720);const [summary,queue]=await Promise.all([db.query(`SELECT provider,operation,CASE WHEN provider='gemini' THEN COALESCE(NULLIF(request_metadata->>'geminiRoute',''),'legacy') ELSE NULL END route,COUNT(*)::int calls,COUNT(*) FILTER(WHERE status='SUCCESS')::int successes,COUNT(*) FILTER(WHERE status='TIMEOUT')::int timeouts,COUNT(*) FILTER(WHERE status NOT IN('SUCCESS','TIMEOUT'))::int errors,ROUND(AVG(latency_ms))::int average_latency_ms,COALESCE(SUM(reserved_cost),0)::float reserved_cost,COALESCE(SUM(actual_cost),0)::float actual_cost FROM provider_call_events WHERE occurred_at>=now()-($1||' hours')::interval GROUP BY provider,operation,route ORDER BY provider,operation,route`,[String(bounded)]),db.query(`SELECT type,COUNT(*)::int depth,COUNT(*) FILTER(WHERE run_after<=now())::int runnable_depth,COUNT(*) FILTER(WHERE run_after>now())::int deferred_depth,MIN(run_after) FILTER(WHERE run_after>now()) next_run_at,COALESCE(ROUND(AVG(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint average_age_ms,COALESCE(ROUND(MAX(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint oldest_age_ms FROM jobs WHERE status='PENDING' GROUP BY type ORDER BY type`)]);return {windowHours:bounded,policyVersion:'provider-resilience-v1',providers:summary.rows,queueLatency:queue.rows,alertThresholds:{timeoutRate:Number(process.env.PROVIDER_TIMEOUT_ALERT_RATE||'0.05'),errorRate:Number(process.env.PROVIDER_ERROR_ALERT_RATE||'0.10')},runbook:'docs/phase-2-provider-resilience.md'};}
+export async function getProviderOperationalMetrics(hours=24):Promise<any>{const db=await getDb();const bounded=Math.min(Math.max(hours,1),720);const [summary,queue]=await Promise.all([db.query(`SELECT provider,operation,CASE WHEN provider='gemini' THEN COALESCE(NULLIF(request_metadata->>'geminiRoute',''),'legacy') ELSE NULL END route,COUNT(*)::int calls,COUNT(*) FILTER(WHERE status='SUCCESS')::int successes,COUNT(*) FILTER(WHERE status='TIMEOUT')::int timeouts,COUNT(*) FILTER(WHERE status NOT IN('SUCCESS','TIMEOUT'))::int errors,ROUND(AVG(latency_ms))::int average_latency_ms,COALESCE(SUM(reserved_cost),0)::float reserved_cost,COALESCE(SUM(actual_cost),0)::float actual_cost FROM provider_call_events WHERE occurred_at>=now()-($1||' hours')::interval AND COALESCE(request_metadata->>'${GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY}','') <> 'true' GROUP BY provider,operation,route ORDER BY provider,operation,route`,[String(bounded)]),db.query(`SELECT type,COUNT(*)::int depth,COUNT(*) FILTER(WHERE run_after<=now())::int runnable_depth,COUNT(*) FILTER(WHERE run_after>now())::int deferred_depth,MIN(run_after) FILTER(WHERE run_after>now()) next_run_at,COALESCE(ROUND(AVG(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint average_age_ms,COALESCE(ROUND(MAX(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint oldest_age_ms FROM jobs WHERE status='PENDING' GROUP BY type ORDER BY type`)]);return {windowHours:bounded,policyVersion:'provider-resilience-v1',providers:summary.rows,queueLatency:queue.rows,alertThresholds:{timeoutRate:Number(process.env.PROVIDER_TIMEOUT_ALERT_RATE||'0.05'),errorRate:Number(process.env.PROVIDER_ERROR_ALERT_RATE||'0.10')},runbook:'docs/phase-2-provider-resilience.md'};}
 
 export async function getCrawlerReliabilityMetrics(hours=24):Promise<any>{const db=await getDb();const bounded=Math.min(Math.max(Number(hours)||24,1),720);const [result,breakdown]=await Promise.all([db.query(`WITH observations AS (SELECT COALESCE(provenance->>'surface','UNKNOWN') AS surface,outcome,retryable,provenance->'crawlerTelemetry' AS telemetry FROM external_acquisition_observations WHERE observed_at>=now()-($1||' hours')::interval), grouped AS (SELECT surface,COUNT(*)::int observations,COUNT(*) FILTER(WHERE outcome='FOUND')::int found,COUNT(*) FILTER(WHERE outcome='INSPECTED_NO_MATCH')::int inspected_no_match,COUNT(*) FILTER(WHERE outcome IN('PARTIALLY_INSPECTED','ACQUISITION_FAILED'))::int incomplete_or_failed,COUNT(*) FILTER(WHERE retryable)::int retryable,COUNT(*) FILTER(WHERE telemetry IS NOT NULL)::int telemetry_observations,COALESCE(SUM(CASE WHEN telemetry->>'redirectsFollowed'~'^[0-9]+$' THEN (telemetry->>'redirectsFollowed')::int ELSE 0 END),0)::int redirects_followed,COALESCE(SUM(CASE WHEN telemetry->>'pagesInspected'~'^[0-9]+$' THEN (telemetry->>'pagesInspected')::int ELSE 0 END),0)::int pages_inspected,COUNT(*) FILTER(WHERE telemetry->>'budgetExhausted'='true')::int budget_exhausted,COALESCE(SUM(CASE WHEN telemetry->>'clicksStarted'~'^[0-9]+$' THEN (telemetry->>'clicksStarted')::int ELSE 0 END),0)::int clicks_started,COALESCE(SUM(CASE WHEN telemetry->>'clicksSucceeded'~'^[0-9]+$' THEN (telemetry->>'clicksSucceeded')::int ELSE 0 END),0)::int clicks_succeeded,COALESCE(SUM(CASE WHEN telemetry->>'clicksFailed'~'^[0-9]+$' THEN (telemetry->>'clicksFailed')::int ELSE 0 END),0)::int clicks_failed,COALESCE(SUM(CASE WHEN telemetry->>'requestsFailed'~'^[0-9]+$' THEN (telemetry->>'requestsFailed')::int ELSE 0 END),0)::int requests_failed,COALESCE(SUM(CASE WHEN telemetry->>'navigationTimeouts'~'^[0-9]+$' THEN (telemetry->>'navigationTimeouts')::int ELSE 0 END),0)::int navigation_timeouts,COALESCE(SUM(CASE WHEN telemetry->>'blockedRequests'~'^[0-9]+$' THEN (telemetry->>'blockedRequests')::int ELSE 0 END),0)::int blocked_requests,COALESCE(SUM(CASE WHEN telemetry->>'hostBackoffsApplied'~'^[0-9]+$' THEN (telemetry->>'hostBackoffsApplied')::int ELSE 0 END),0)::int host_backoffs_applied FROM observations GROUP BY surface) SELECT surface,observations,found,inspected_no_match,incomplete_or_failed,retryable,telemetry_observations,redirects_followed,pages_inspected,budget_exhausted,clicks_started,clicks_succeeded,clicks_failed,requests_failed,navigation_timeouts,blocked_requests,host_backoffs_applied FROM grouped ORDER BY surface`,[String(bounded)]),db.query(`SELECT COALESCE(provenance->>'surface','UNKNOWN') AS surface,COALESCE(provenance->>'required','false')='true' AS required,outcome,retryable,COALESCE(NULLIF(failure_class,''),'UNCLASSIFIED') AS failure_class,COUNT(*)::int observations,COALESCE(SUM(CASE WHEN provenance->'crawlerTelemetry'->>'requestsFailed'~'^[0-9]+$' THEN (provenance->'crawlerTelemetry'->>'requestsFailed')::int ELSE 0 END),0)::int requests_failed,COALESCE(SUM(CASE WHEN provenance->'crawlerTelemetry'->>'navigationTimeouts'~'^[0-9]+$' THEN (provenance->'crawlerTelemetry'->>'navigationTimeouts')::int ELSE 0 END),0)::int navigation_timeouts,COALESCE(SUM(CASE WHEN provenance->'crawlerTelemetry'->>'blockedRequests'~'^[0-9]+$' THEN (provenance->'crawlerTelemetry'->>'blockedRequests')::int ELSE 0 END),0)::int blocked_requests,COUNT(*) FILTER(WHERE provenance->'crawlerTelemetry'->>'budgetExhausted'='true')::int budget_exhausted FROM external_acquisition_observations WHERE observed_at>=now()-($1||' hours')::interval GROUP BY surface,required,outcome,retryable,failure_class ORDER BY surface,required,outcome,retryable,failure_class`,[String(bounded)])]);const totals=result.rows.reduce((acc,row)=>{for(const key of Object.keys(row).filter(key=>key!=='surface'))acc[key]=(acc[key]||0)+Number(row[key]||0);return acc;},{surface:'ALL'} as Record<string,unknown>);return {windowHours:bounded,policyVersion:'external-community-acquisition-v2',surfaces:result.rows,totals,outcomeBreakdown:breakdown.rows};}
 
@@ -779,6 +779,40 @@ const TRANSIENT_HTTP_STATUS=new Set([408,425,429,500,502,503,504]);
 const MAX_TRANSIENT_RETRY_AGE_MS=(()=>{const raw=process.env.MAX_TRANSIENT_RETRY_AGE_MS;if(raw===undefined||raw===null||raw==='')return 6*60*60_000;const parsed=Number(raw);return Number.isFinite(parsed)&&parsed>=60_000?parsed:6*60*60_000;})();
 export function geminiSemanticCooldownMs():number{const raw=process.env.GEMINI_SEMANTIC_RATE_LIMIT_COOLDOWN_MS;if(raw===undefined||raw===null||raw==='')return 90_000;const parsed=Number(raw);return Number.isFinite(parsed)&&parsed>=0?parsed:90_000;}
 export function groqSemanticCooldownMs():number{const raw=process.env.GROQ_RATE_LIMIT_COOLDOWN_MS;if(raw===undefined||raw===null||raw==='')return 90_000;const parsed=Number(raw);return Number.isFinite(parsed)&&parsed>=0?parsed:90_000;}
+export function geminiFreeSemanticCooldownMs():number{const raw=process.env.GEMINI_FREE_RATE_LIMIT_COOLDOWN_MS;if(raw===undefined||raw===null||raw==='')return 90_000;const parsed=Number(raw);return Number.isFinite(parsed)&&parsed>=0?parsed:90_000;}
+/**
+ * request_metadata key marking Gemini Free local cooldown-deferral echoes.
+ * A deferral is emitted when classification short-circuits on an active
+ * cooldown WITHOUT any upstream Gemini request, so it must never count as
+ * an upstream attempt in metrics nor re-arm the persisted cooldown window.
+ * Writer (GeminiFreeSemanticProvider), cooldown resolver, and operational
+ * metrics below all reference this constant — never a duplicated literal —
+ * so the tag cannot drift apart across sites.
+ */
+export const GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY='geminiFreeCooldownDeferral';
+/**
+ * True when a provider-call event row represents an actual upstream attempt.
+ * Local cooldown-deferral echoes (tagged, no upstream request) return false;
+ * every untagged row — including genuine upstream 429s from any provider —
+ * returns true. Accepts both client-side (requestMetadata) and row
+ * (request_metadata) shapes. Mirrors the SQL exclusion used by the
+ * cooldown resolver and operational metrics.
+ */
+export function isUpstreamProviderCallEvent(event:{requestMetadata?:unknown;request_metadata?:unknown}):boolean{
+  const meta=((event as {requestMetadata?:unknown}).requestMetadata ?? (event as {request_metadata?:unknown}).request_metadata ?? {}) as Record<string,unknown>;
+  return meta[GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY]!=='true';
+}
+export async function resolveGeminiFreeSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{
+  const cooldownMs=geminiFreeSemanticCooldownMs();
+  try{
+    const db=await getDb();
+    const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini-free' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'${GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY}','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`);
+    if(!res.rows[0]?.occurred_at)return undefined;
+    const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
+    if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;
+    return lastRateLimitMs+cooldownMs;
+  }catch{return undefined;}
+}
 export async function resolveGeminiSemanticCooldownExpiryMs(nowMs:number=Date.now()):Promise<number|undefined>{
   const cooldownMs=geminiSemanticCooldownMs();
   try{
@@ -822,7 +856,7 @@ export function isRetryableInfrastructureFailure(error:any):boolean{
   if(error?.retryable===true&&['TIMEOUT','CANCELLED','RATE_LIMIT','TRANSIENT','CREDENTIALS_EXHAUSTED'].includes(errorClass))return true;
   return false;
 }
-export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now,geminiSemanticCooldownExpiryMs?:number,groqSemanticCooldownExpiryMs?:number):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
+export function decideJobFailure(error:any,attempts:number,maxAttempts:number,now=Date.now(),firstFailureAt=now,geminiSemanticCooldownExpiryMs?:number,groqSemanticCooldownExpiryMs?:number,geminiFreeSemanticCooldownExpiryMs?:number):{disposition:JobFailureDisposition;runAfter?:number;operationallyBlocked?:boolean}{
   if(String(error?.code||'')==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
   if(isRetryableInfrastructureFailure(error)){
     if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
@@ -842,11 +876,15 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
     if(isGroqRateLimited&&typeof groqSemanticCooldownExpiryMs==='number'&&Number.isFinite(groqSemanticCooldownExpiryMs)&&groqSemanticCooldownExpiryMs>now){
       scheduled=Math.max(scheduled,groqSemanticCooldownExpiryMs);
     }
+    const isGeminiFreeRateLimited=providerReasons.includes('GEMINI_FREE_RATE_LIMITED');
+    if(isGeminiFreeRateLimited&&typeof geminiFreeSemanticCooldownExpiryMs==='number'&&Number.isFinite(geminiFreeSemanticCooldownExpiryMs)&&geminiFreeSemanticCooldownExpiryMs>now){
+      scheduled=Math.max(scheduled,geminiFreeSemanticCooldownExpiryMs);
+    }
     return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:scheduled};
   }
   return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
 }
-export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GROQ_RATE_LIMITED')){groqSemanticCooldownExpiryMs=await resolveGroqSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
+export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GROQ_RATE_LIMITED')){groqSemanticCooldownExpiryMs=await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval RETURNING id`,[String(staleAfterMinutes)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[res.rows.map(row=>row.id)]); await client.query('COMMIT'); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 export async function heartbeatJob(jobId:string,workerId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET locked_at=now(),updated_at=now() WHERE id=$1 AND status='PROCESSING' AND locked_by=$2`,[jobId,workerId]);}
 
@@ -1047,6 +1085,37 @@ export async function scheduleAutonomousQueryRuns(
       candidateDiagnostic = {};
       activeOperation = 'provider_lineage_lookup';
       let allocatedProvider=providerSnapshot(candidate.provider||YOUTUBE_SEARCH_PROVIDER);
+      if (!candidate.provider && !candidate.frontierDecisionId) {
+        // Ordinary (non-frontier) allocations carry no explicit provider and
+        // would otherwise always default to the official API, leaving
+        // YouTube.js idle whenever the frontier gate rejects. Rotate across
+        // ACTIVE SEARCH_YOUTUBE providers instead (stable per query), so even
+        // a single eligible ACTIVE provider is selected explicitly rather
+        // than inherited from the default; official default preserved only on
+        // query failure or an empty registry. Cooling providers (recent
+        // RATE_LIMITED ledger rows) are excluded while a healthy alternative
+        // remains; the lookup fails open to the full pool.
+        try {
+          const rotationRes = await client.query(
+            `SELECT provider_key,provider_family,capabilities,quota_domain,mode FROM discovery_provider_registry WHERE mode='ACTIVE' AND capabilities ? 'SEARCH_YOUTUBE' ORDER BY provider_key FOR SHARE`
+          );
+          const coolingRes = await client.query(
+            `SELECT DISTINCT provider FROM provider_call_events WHERE provider IN ('youtube','youtube-innertube') AND status='RATE_LIMITED' AND occurred_at > now() - ($1||' seconds')::interval`,
+            [String(providerCooldownObservationWindowSecs())]
+          ).catch(() => ({ rows: [] as any[] }));
+          const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
+          if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {
+            const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
+            // Registry rows carry quota_domain (there is no cost_domain
+            // column); providerSnapshotFromRegistryRow derives the allocation
+            // costDomain from it and validates the snapshot, so a bad column
+            // fails loudly here instead of silently pinning traffic to official.
+            allocatedProvider = providerSnapshotFromRegistryRow(picked, 'SEARCH_YOUTUBE');
+          }
+        } catch {
+          allocatedProvider = providerSnapshot(YOUTUBE_SEARCH_PROVIDER);
+        }
+      }
       if(candidate.frontierDecisionId){
         const lineage=await client.query(`SELECT provider_key,retrieval_surface,provider_capability,cost_domain,continuation_owner FROM frontier_allocation_decisions WHERE decision_id=$1 FOR UPDATE`,[candidate.frontierDecisionId]);
         if(!lineage.rowCount)throw new Error('PROVIDER_ALLOCATION_LINEAGE_MISSING');
@@ -1178,6 +1247,7 @@ export async function scheduleAutonomousQueryRuns(
         defaultOrdering: controlSearchOrdering,
         frontierState,
         isSaturating,
+        providerQuotaUnits: allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100,
         clientOverride: client
       });
 
@@ -1196,6 +1266,67 @@ export async function scheduleAutonomousQueryRuns(
         throw new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
       }
 
+      // DATE-ordering capability guard: InnerTube exposes no sort-by-date, so
+      // a DATE allocation served by YouTube.js would execute relevance order
+      // while labeled DATE (mislabeled retrieval experiments). Re-target such
+      // runs to the official provider explicitly; RELEVANCE runs are
+      // unaffected. The switch re-checks daily caps with the official 100
+      // units BEFORE any reservation is amended, and amends amount fields so
+      // canary, run, and consumption records agree on the official amount. A
+      // cap breach fails this candidate's scheduling loudly (same backpressure
+      // semantics as every other cap) instead of silently over-allocating.
+      // Frontier lineage note: frontier_allocation_decisions provider identity
+      // columns are trigger-immutable (migration 111
+      // protect_provider_allocation_lineage), so the frontier row keeps the
+      // Phase 8-authorized innertube identity while its amount fields reflect
+      // actual official consumption; the run row carries official identity.
+      if (searchOrdering === 'DATE' && allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE') {
+        activeOperation = 'date_ordering_provider_guard';
+        const guarded = applyDateOrderingProviderGuard(allocatedProvider, searchOrdering);
+        allocatedProvider = guarded.provider;
+        const recheck = await client.query(
+          `SELECT mode FROM discovery_provider_registry WHERE provider_key=$1 AND (mode IN ('ACTIVE','ACTIVE_GLOBAL','CANARY')) AND quota_domain=$2 AND capabilities ? $3 FOR SHARE`,
+          [allocatedProvider.providerKey, allocatedProvider.costDomain, allocatedProvider.capability]
+        );
+        if (!recheck.rowCount) await failStep('provider_registry_eligibility', new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE'));
+        // Frontier caps/amounts apply only to frontier-authorized runs: legacy
+        // runs have no frontier decision row and consume no frontier allowance.
+        if (candidate.frontierDecisionId) {
+          const [frontierCapRes, frontierUseRes] = await Promise.all([
+            client.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_allocation_daily_quota_cap'`),
+            client.query(
+              `SELECT COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
+               FROM frontier_allocation_decisions
+               WHERE quota_day = $1 AND allocation_origin = 'FRONTIER_CANARY' AND decision_status IN ('RESERVED', 'COMMITTED')`,
+              [getYouTubeQuotaDay(new Date())]
+            ),
+          ]);
+          const frontierQuotaCap = Number(frontierCapRes.rows[0]?.setting_value ?? 1000);
+          if (Number(frontierUseRes.rows[0]?.daily_quota_used || 0) + 100 > frontierQuotaCap) {
+            await failStep('provider_guard_quota', new Error(`FRONTIER_CANARY_DAILY_CAP_EXCEEDED (date-ordering retarget needs official units)`));
+          }
+          await client.query(
+            `UPDATE frontier_allocation_decisions SET quota_reserved=100, provider_reserved_amount=100 WHERE decision_id=$1 AND decision_status IN ('RESERVED','COMMITTED')`,
+            [candidate.frontierDecisionId]
+          );
+        }
+        if (canaryReservationId) {
+          const canaryCapRes = await client.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'retrieval_canary_daily_quota_cap'`);
+          const canaryUseRes = await client.query(
+            `SELECT COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
+             FROM retrieval_canary_reservations
+             WHERE quota_day = $1 AND reservation_status IN ('RESERVED', 'COMMITTED')`,
+            [getYouTubeQuotaDay(new Date())]
+          );
+          const canaryQuotaCap = Number(canaryCapRes.rows[0]?.setting_value ?? 1000);
+          if (Number(canaryUseRes.rows[0]?.daily_quota_used || 0) + 100 > canaryQuotaCap) {
+            await failStep('provider_guard_quota', new Error(`RETRIEVAL_CANARY_DAILY_CAP_EXCEEDED (date-ordering retarget needs official units)`));
+          }
+          await client.query(`UPDATE retrieval_canary_reservations SET quota_reserved = quota_reserved + 100 WHERE reservation_id=$1`, [canaryReservationId]);
+        }
+        setDiagnostic({ provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, providerRegistryReasonCode: 'DATE_ORDERING_RETARGETED_OFFICIAL' });
+      }
+
       const executedConfig = buildRetrievalConfiguration({
         searchOrdering,
         retrievalLane,
@@ -1203,12 +1334,15 @@ export async function scheduleAutonomousQueryRuns(
       });
 
       const origin = candidate.allocationOrigin || 'LEGACY';
+      // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units;
+      // the official YouTube path keeps its 100-unit page reservation.
+      const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
       let run;
       try {
         run = await client.query(
           `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
-           VALUES($1,$2,'automated_query',$3,$4,$5,$6,100,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
+           VALUES($1,$2,'automated_query',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,scheduledProviderUnits,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
         );
       } catch (error) { await failStep('query_run_insert', error); }
       const runId = run.rows[0].id;
@@ -1289,7 +1423,7 @@ export async function scheduleAutonomousQueryRuns(
       catch (error) { await failStep('query_run_job_linkage', error); }
 
       try {
-        await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:100,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
+        await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:scheduledProviderUnits,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
       } catch (error) { await failStep('decision_event_persistence', error); }
       flushDiagnostic({ selectedQueryId: candidate.query.id, queryRunId: runId, jobId, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'RESERVED', reservationReasonCode: 'QUERY_LIBRARY_RESERVED', schedulingOutcome: 'SCHEDULED', schedulingOperation: 'query_run_job_and_selection_commit', disposition: 'SCHEDULED', reasonCode: 'SCHEDULED' });
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
@@ -2006,9 +2140,17 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
+    // Frontier consumption attributes by run linkage, not by provider
+    // equality: same-provider runs always match, and the documented
+    // DATE-ordering retarget (frontier decision keeps its immutable
+    // youtube-innertube identity while the run executes/consumes as official
+    // youtube-search) must also attribute — otherwise retargeted consumption
+    // is silently dropped (under-count). Every other provider mismatch still
+    // attributes nothing. Mirrors frontierCompletionMatchesRun in
+    // providerAwareRetrieval.ts; keep the two in sync.
     if(run.rowCount)await client.query(`UPDATE frontier_allocation_decisions
       SET quota_consumed=$2::int,provider_consumed_amount=$3::bigint
-      WHERE query_run_id=$1 AND decision_status='COMMITTED' AND provider_key=(SELECT provider_key FROM query_runs WHERE id=$1)`,[runId,metrics.quotaUsed,metrics.quotaUsed]);
+      WHERE query_run_id=$1 AND decision_status='COMMITTED' AND (provider_key=(SELECT provider_key FROM query_runs WHERE id=$1) OR (provider_key='youtube-innertube' AND (SELECT provider_key FROM query_runs WHERE id=$1)='youtube-search'))`,[runId,metrics.quotaUsed,metrics.quotaUsed]);
     await client.query('COMMIT');
 
     // Await post-commit best-effort observation analytics (Phases 2-4).
@@ -2075,12 +2217,19 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const capacity = classifyProviderCapacityFailure(error);
   const capacityMetadata = capacity ? { providerCapacityReason: capacity.reason, providerCapacityRetryable: capacity.retryable, ...(capacity.retryAt ? { providerCapacityRetryAt: capacity.retryAt } : {}) } : {};
   const runProvider = await db.query(`SELECT provider_key FROM query_runs WHERE id=$1`, [runId]);
-  const isYouTubeRun = runProvider.rows[0]?.provider_key === 'youtube-search';
+  // Provider-ledger identity per run: the official path reads provider='youtube',
+  // InnerTube reads its own provider='youtube-innertube' ledger. No run ever
+  // reads the other provider's events. Static queries only (no interpolation).
+  const runProviderKey = String(runProvider.rows[0]?.provider_key || '');
+  const isYouTubeRun = runProviderKey === 'youtube-search';
+  const isInnertubeRun = runProviderKey === 'youtube-innertube';
   const providerCounts = isYouTubeRun
-    ? await db.query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1::text AND provider='youtube' AND operation='search'`, [runId])
-    : { rows: [{}] } as { rows: Array<Record<string, unknown>> };
+    ? await db.query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1 AND provider='youtube' AND operation='search'`, [runId])
+    : isInnertubeRun
+      ? await db.query(`SELECT COUNT(*)::int AS attempted, COUNT(*) FILTER (WHERE status='SUCCESS')::int AS succeeded, COUNT(*) FILTER (WHERE status NOT IN ('SUCCESS','RATE_LIMITED'))::int AS failed, COUNT(*) FILTER (WHERE status='RATE_LIMITED')::int AS rate_limited FROM provider_call_events WHERE run_id=$1 AND provider='youtube-innertube' AND operation='search'`, [runId])
+      : { rows: [{}] } as { rows: Array<Record<string, unknown>> };
   const counts = providerCounts.rows[0] || {};
-  const hasProviderOutcome = isYouTubeRun && (Boolean(capacity) || Number(counts.attempted || 0) > 0);
+  const hasProviderOutcome = (isYouTubeRun || isInnertubeRun) && (Boolean(capacity) || Number(counts.attempted || 0) > 0);
   const providerRunOutcome = hasProviderOutcome ? classifyProviderRunOutcome({
     rawResults: 0,
     providerRequestsAttempted: Number(counts.attempted || 0),
@@ -2107,11 +2256,11 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':capacity ? 'PROVIDER_CAPACITY' : 'PROVIDER_FAILURE';
   const failureMetadata = JSON.stringify({ failureKind, ...capacityMetadata, ...outcomeMetadata });
   const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
-    provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') ELSE provider_requests_attempted END,
-    provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
-    provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
-    provider_rate_limited=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='RATE_LIMITED') ELSE provider_rate_limited END,
-    provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
+    provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search') ELSE provider_requests_attempted END,
+    provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
+    provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
+    provider_rate_limited=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='RATE_LIMITED') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='RATE_LIMITED') ELSE provider_rate_limited END,
+    provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
     performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
     WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureMetadata]);
   if (run.rowCount) {

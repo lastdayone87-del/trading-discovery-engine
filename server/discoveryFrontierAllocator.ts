@@ -9,7 +9,7 @@ import {
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
 import { isOsintSnapshotFresh } from './externalOsint';
-import { isShadowBraveCanaryAllowed, providerSnapshot, type ProviderAllocation } from './providerAwareRetrieval';
+import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 
 export const PERSISTENT_RESEARCH_PHASE8_VERSION = 'discovery-frontier-allocator-v1';
 
@@ -658,7 +658,29 @@ export async function evaluateFrontierCanaryAllocation(input: {
          ORDER BY CASE WHEN mode = 'ACTIVE' THEN 1 ELSE 2 END, provider_key FOR SHARE`;
     const providerParams = targetProviderKey ? [targetProviderKey, allowShadowBraveCanary] : [requiredCapability];
     const providerResult = await runner.query(providerQuery, providerParams);
-    const providerRow = providerResult.rows[0];
+    // Fully-active multi-provider sharing: with a single eligible row this
+    // resolves to rows[0] exactly as before. With several equally-eligible
+    // ACTIVE rows (official API + YouTube.js), allocations spread
+    // deterministically across all of them by opportunityKey hash — no shared
+    // state, no caps, and the official path is never modified or bypassed.
+    // Providers with recent RATE_LIMITED ledger rows are excluded while a
+    // healthy alternative remains, so a cooling provider stops receiving new
+    // opportunities; the lookup fails open to the full pool.
+    let coolingKeys: string[] = [];
+    if (!targetProviderKey && providerResult.rows.length > 0) {
+      try {
+        const coolingRes = await runner.query(
+          `SELECT DISTINCT provider FROM provider_call_events WHERE provider IN ('youtube','youtube-innertube') AND status='RATE_LIMITED' AND occurred_at > now() - ($1||' seconds')::interval`,
+          [String(providerCooldownObservationWindowSecs())]
+        );
+        coolingKeys = coolingRes.rows.map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
+      } catch {
+        coolingKeys = [];
+      }
+    }
+    const providerRow = !targetProviderKey && providerResult.rows.length > 0
+      ? rotateActiveProviderRow(providerResult.rows, input.opportunityKey, coolingKeys)
+      : providerResult.rows[0];
 
     if (!providerRow || !Array.isArray(providerRow.capabilities) || !providerRow.capabilities.includes(requiredCapability) ||
       (providerRow.mode === 'SHADOW' && !isShadowBraveCanaryAllowed({ mode: providerRow.mode, providerKey: providerRow.provider_key, capability: requiredCapability, allowShadowProvider: input.allowShadowProvider }))) {
@@ -680,6 +702,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
       if (client) await runner.query('COMMIT');
       return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'PROVIDER_INELIGIBLE_OR_CAPABILITY_MISMATCH' };
     }
+
+    // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units at
+    // every frontier accounting site below; the official path keeps 100.
+    const providerQuotaUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : estimatedQuota;
 
     // A process can die after Phase 8 reserves but before the scheduling transaction.
     // Expire those orphaned reservations under the allocation authority lock.
@@ -715,13 +741,13 @@ export async function evaluateFrontierCanaryAllocation(input: {
     const dailyAssignments = Number(usageRes.rows[0]?.daily_assignments || 0);
     const dailyQuotaUsed = Number(usageRes.rows[0]?.daily_quota_used || 0);
 
-    if (dailyAssignments >= assignmentCap || dailyQuotaUsed + estimatedQuota > quotaCap) {
+    if (dailyAssignments >= assignmentCap || dailyQuotaUsed + providerQuotaUnits > quotaCap) {
       if (client) await runner.query('COMMIT');
       return {
         authorized: false,
         allocationOrigin: 'LEGACY',
         country: input.legacyCountry,
-        reason: `FRONTIER_CANARY_DAILY_CAP_EXCEEDED (assignments: ${dailyAssignments}/${assignmentCap}, quota: ${dailyQuotaUsed + estimatedQuota}/${quotaCap})`
+        reason: `FRONTIER_CANARY_DAILY_CAP_EXCEEDED (assignments: ${dailyAssignments}/${assignmentCap}, quota: ${dailyQuotaUsed + providerQuotaUnits}/${quotaCap})`
       };
     }
 
@@ -871,7 +897,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
       rejectionReasons,
       agreedWithLegacy,
       deferred: false,
-      quotaReserved: estimatedQuota,
+      quotaReserved: providerQuotaUnits,
       quotaConsumed: 0,
       quotaDay,
       policyVersion: PERSISTENT_RESEARCH_PHASE8_VERSION,

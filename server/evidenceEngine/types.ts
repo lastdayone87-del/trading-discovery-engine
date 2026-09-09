@@ -10,24 +10,26 @@ export type EvidenceSourceType =
   | 'evidence_graph'
   | 'gemini_semantic'
   | 'groq_semantic'
+  | 'gemini_free_semantic'
   | 'discord_metadata';
 
 export type EvidencePolarity = 'POSITIVE' | 'NEGATIVE';
 
 /**
- * Governed semantic-classification providers. Both share the production
+ * Governed semantic-classification providers. All share the production
  * prompt, parser, calibration, and terminal-reject gates, so every
- * semantic-source check must admit both — never Gemini alone.
+ * semantic-source check must admit all of them — never one alone.
  */
 export const SEMANTIC_CLASSIFICATION_SOURCES: readonly EvidenceSourceType[] = [
   'gemini_semantic',
   'groq_semantic',
+  'gemini_free_semantic',
 ];
 
 export function isSemanticClassificationSource(
   source: unknown,
-): source is 'gemini_semantic' | 'groq_semantic' {
-  return source === 'gemini_semantic' || source === 'groq_semantic';
+): source is 'gemini_semantic' | 'groq_semantic' | 'gemini_free_semantic' {
+  return source === 'gemini_semantic' || source === 'groq_semantic' || source === 'gemini_free_semantic';
 }
 
 export type EvidenceCategory =

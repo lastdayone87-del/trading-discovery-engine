@@ -111,6 +111,12 @@ export async function reserveRetrievalCanaryTreatment(input: {
   isSaturating?: boolean;
   now?: Date;
   clientOverride?: any;
+  /**
+   * Official YouTube units this reservation accounts for. Quota-free
+   * providers (YouTube.js/InnerTube) pass 0; defaults to 100 preserving all
+   * existing callers (official path).
+   */
+  providerQuotaUnits?: number;
 }): Promise<{
   authorized: boolean;
   reservation?: CanaryTreatmentReservation;
@@ -119,6 +125,9 @@ export async function reserveRetrievalCanaryTreatment(input: {
 }> {
   const now = input.now || new Date();
   const quotaDay = getYouTubeQuotaDay(now);
+  const treatmentUnits = Number.isSafeInteger(input.providerQuotaUnits) && (input.providerQuotaUnits as number) >= 0
+    ? (input.providerQuotaUnits as number)
+    : 100;
 
   const runner = input.clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) {
@@ -253,11 +262,11 @@ export async function reserveRetrievalCanaryTreatment(input: {
     const dailyAssignments = Number(usageRes.rows[0]?.daily_assignments || 0);
     const dailyQuotaUsed = Number(usageRes.rows[0]?.daily_quota_used || 0);
 
-    if (dailyAssignments >= assignmentCap || dailyQuotaUsed + 100 > quotaCap) {
+    if (dailyAssignments >= assignmentCap || dailyQuotaUsed + treatmentUnits > quotaCap) {
       if (client) await activeRunner.query('COMMIT');
       return {
         authorized: false,
-        reason: `RETRIEVAL_CANARY_DAILY_CAP_EXCEEDED (assignments: ${dailyAssignments}/${assignmentCap}, quota: ${dailyQuotaUsed + 100}/${quotaCap})`
+        reason: `RETRIEVAL_CANARY_DAILY_CAP_EXCEEDED (assignments: ${dailyAssignments}/${assignmentCap}, quota: ${dailyQuotaUsed + treatmentUnits}/${quotaCap})`
       };
     }
 
@@ -268,7 +277,7 @@ export async function reserveRetrievalCanaryTreatment(input: {
       opportunityKey: input.opportunityKey,
       neighborhoodKey: input.neighborhoodKey,
       reservationStatus: 'RESERVED',
-      quotaReserved: 100,
+      quotaReserved: treatmentUnits,
       quotaConsumed: 0,
       quotaDay,
       policyVersion: CURRENT_RETRIEVAL_POLICY_VERSION,
@@ -378,6 +387,12 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
   pageNumber: number;
   now?: Date;
   clientOverride?: any;
+  /**
+   * Official YouTube units this page accounts for. Quota-free providers
+   * (YouTube.js/InnerTube) pass 0; defaults to 100 preserving all existing
+   * callers (official path).
+   */
+  providerQuotaUnits?: number;
 }): Promise<{
   authorized: boolean;
   pageReservationId?: string;
@@ -386,6 +401,9 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
   const now = input.now || new Date();
   const quotaDay = getYouTubeQuotaDay(now);
   const pageReservationId = `inc-page-res:${input.queryRunId}:${input.pageNumber}:${CURRENT_RETRIEVAL_POLICY_VERSION}`;
+  const pageUnits = Number.isSafeInteger(input.providerQuotaUnits) && (input.providerQuotaUnits as number) >= 0
+    ? (input.providerQuotaUnits as number)
+    : 100;
 
   const runner = input.clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return { authorized: false, reason: 'DATABASE_UNAVAILABLE' };
@@ -445,11 +463,11 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
     const liveIncPageQuota = Number(livePageRes.rows[0]?.live_inc_page_quota || 0);
     const totalAutonomousUsage = schedulingSnapshot.autonomousUnitsUsed + schedulingSnapshot.autonomousUnitsReserved + liveIncPageQuota;
 
-    if (totalAutonomousUsage + 100 > autonomousLimit) {
+    if (totalAutonomousUsage + pageUnits > autonomousLimit) {
       if (client) await activeRunner.query('COMMIT');
       return {
         authorized: false,
-        reason: `GLOBAL_AUTONOMOUS_QUOTA_EXHAUSTED (${totalAutonomousUsage + 100}/${autonomousLimit})`
+        reason: `GLOBAL_AUTONOMOUS_QUOTA_EXHAUSTED (${totalAutonomousUsage + pageUnits}/${autonomousLimit})`
       };
     }
 
@@ -482,11 +500,11 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
     const dailyQuotaUsed = Number(usageRes.rows[0]?.daily_quota_used || 0);
     const extraPagesReserved = Number(pageRes.rows[0]?.extra_pages_reserved || 0);
 
-    if (dailyQuotaUsed + 100 > quotaCap || extraPagesReserved >= maxAdditionalPages) {
+    if (dailyQuotaUsed + pageUnits > quotaCap || extraPagesReserved >= maxAdditionalPages) {
       if (client) await activeRunner.query('COMMIT');
       return {
         authorized: false,
-        reason: `INCREMENTAL_CANARY_QUOTA_CAP_EXCEEDED (quota: ${dailyQuotaUsed + 100}/${quotaCap}, extra pages: ${extraPagesReserved}/${maxAdditionalPages})`
+        reason: `INCREMENTAL_CANARY_QUOTA_CAP_EXCEEDED (quota: ${dailyQuotaUsed + pageUnits}/${quotaCap}, extra pages: ${extraPagesReserved}/${maxAdditionalPages})`
       };
     }
 
@@ -496,12 +514,13 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
          page_reservation_id, query_run_id, page_number, reservation_status,
          quota_reserved, quota_consumed, quota_day, policy_version, created_at
        )
-       VALUES($1, $2, $3, 'RESERVED', 100, 0, $4, $5, now())
+       VALUES($1, $2, $3, 'RESERVED', $4, 0, $5, $6, now())
        ON CONFLICT(page_reservation_id) DO NOTHING`,
       [
         pageReservationId,
         input.queryRunId,
         input.pageNumber,
+        pageUnits,
         quotaDay,
         CURRENT_RETRIEVAL_POLICY_VERSION
       ]
@@ -510,9 +529,9 @@ export async function reserveIncrementalTreatmentPageQuota(input: {
     // Update main reservation quota_reserved
     await activeRunner.query(
       `UPDATE retrieval_canary_reservations
-       SET quota_reserved = quota_reserved + 100
+       SET quota_reserved = quota_reserved + $2
        WHERE query_run_id = $1 AND reservation_status IN ('RESERVED', 'COMMITTED')`,
-      [input.queryRunId]
+      [input.queryRunId, pageUnits]
     );
 
     if (client) await activeRunner.query('COMMIT');
@@ -573,7 +592,15 @@ export async function releaseIncrementalTreatmentPageReservation(
   try {
     if (client) await activeRunner.query('BEGIN');
 
-    // Only RESERVED page reservations can be released on enqueue failure; COMMITTED reservations are preserved
+    // Only RESERVED page reservations can be released on enqueue failure; COMMITTED reservations are preserved.
+    // Read the persisted units first so the parent is credited by exactly what
+    // this page reserved (0 for quota-free providers) instead of a hard-coded
+    // 100 that would invent official quota on free runs.
+    const prior = await activeRunner.query(
+      `SELECT quota_reserved FROM retrieval_canary_page_reservations WHERE page_reservation_id = $1 FOR UPDATE`,
+      [pageReservationId]
+    );
+    const releasedUnits = Math.max(0, Math.floor(Number(prior.rows[0]?.quota_reserved ?? 0)) || 0);
     const res = await activeRunner.query(
       `UPDATE retrieval_canary_page_reservations
        SET reservation_status = 'RELEASED',
@@ -587,9 +614,9 @@ export async function releaseIncrementalTreatmentPageReservation(
     if (res.rowCount > 0) {
       await activeRunner.query(
         `UPDATE retrieval_canary_reservations
-         SET quota_reserved = GREATEST(100, quota_reserved - 100)
+         SET quota_reserved = GREATEST($2, quota_reserved - $3)
          WHERE query_run_id = $1 AND reservation_status IN ('RESERVED', 'COMMITTED')`,
-        [queryRunId]
+        [queryRunId, releasedUnits > 0 ? 100 : 0, releasedUnits]
       );
     }
 

@@ -19,6 +19,167 @@ export const YOUTUBE_SEARCH_PROVIDER: ProviderAllocation = Object.freeze({
 });
 
 /**
+ * Floor (seconds) for the provider-level cooldown observation window. A
+ * provider with a recent RATE_LIMITED ledger row is treated as cooling.
+ */
+export const PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS = 300;
+
+/**
+ * Rotation exclusion window (seconds) for recent RATE_LIMITED ledger rows.
+ * Tracks the configured InnerTube cooldown
+ * (YOUTUBE_INNERTUBE_COOLDOWN_MS, default 90s) with the 300s floor above as
+ * a conservative minimum, so allocation health can never disagree with the
+ * provider's actual cooldown in the dangerous direction: if an operator
+ * raises the provider cooldown beyond the floor, rotation excludes the
+ * cooling provider for at least that long instead of re-including it early.
+ * Lowering the provider cooldown below the floor keeps the conservative
+ * exclusion (fail-open to the full pool when every provider is cooling, so
+ * traffic is never blocked).
+ *
+ * Reads env directly here (same pattern as the provider's own
+ * innertubeCooldownMs) rather than importing the provider module, keeping
+ * the dispatch boundary free of a provider import cycle and provider
+ * isolation intact: allocation never touches provider runtime state.
+ */
+export function providerCooldownObservationWindowSecs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.YOUTUBE_INNERTUBE_COOLDOWN_MS);
+  const innertubeSecs = Number.isFinite(parsed) && parsed > 0 ? Math.ceil(parsed / 1000) : 0;
+  return Math.max(PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, innertubeSecs);
+}
+
+/**
+ * Maps provider_call_events provider names to discovery provider keys.
+ * Unknown ledger names pass through unchanged (never silently dropped).
+ */
+export function ledgerProviderToRegistryKey(ledgerProvider: string): string {
+  if (ledgerProvider === 'youtube') return 'youtube-search';
+  if (ledgerProvider === 'youtube-innertube') return 'youtube-innertube';
+  return ledgerProvider;
+}
+
+/**
+ * Deterministic traffic sharing across equally-eligible provider rows.
+ * Single-row registries resolve to that row. With several ACTIVE rows
+ * sharing a capability (official YouTube API + YouTube.js), the rotation key
+ * hash spreads allocations across all of them with no shared state and no
+ * caps. Providers in `unhealthyKeys` (e.g. recent RATE_LIMITED ledger rows =
+ * cooling down) are excluded while at least one healthy row remains, so a
+ * cooling provider stops receiving new opportunities while a healthy
+ * alternative is available; if every row is unhealthy (or none are), the
+ * pool degrades to the full set rather than failing. CANARY rows never
+ * receive ordinary traffic while any ACTIVE row is eligible; they serve only
+ * when no ACTIVE row exists (or via explicit targeting upstream). Ordering
+ * is ACTIVE-first then provider_key so the spread is stable regardless of
+ * database return order.
+ */
+export function rotateActiveProviderRow<T extends { provider_key: string; mode: string }>(
+  rows: T[],
+  rotationKey: string,
+  unhealthyKeys?: Iterable<string>,
+): T {
+  if (!rows.length) throw new Error('NO_ELIGIBLE_PROVIDER_ROWS');
+  const active = rows.filter((row) => row.mode === 'ACTIVE');
+  const pool = active.length ? active : rows;
+  const unhealthy = new Set(unhealthyKeys || []);
+  const healthy = pool.filter((row) => !unhealthy.has(row.provider_key));
+  const candidates = healthy.length ? healthy : pool;
+  const ordered = [...candidates].sort((a, b) => {
+    const rankA = a.mode === 'ACTIVE' ? 0 : 1;
+    const rankB = b.mode === 'ACTIVE' ? 0 : 1;
+    if (rankA !== rankB) return rankA - rankB;
+    return String(a.provider_key).localeCompare(String(b.provider_key));
+  });
+  if (ordered.length === 1) return ordered[0];
+  let hash = 0x811c9dc5;
+  const key = String(rotationKey || '');
+  for (let i = 0; i < key.length; i++) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return ordered[(hash >>> 0) % ordered.length];
+}
+
+/**
+ * Minimal shape of a discovery_provider_registry row as returned by the
+ * allocation queries (real column names: provider_key, provider_family,
+ * capabilities, quota_domain, mode). The registry has NO cost_domain column —
+ * the allocation-level costDomain is derived from quota_domain, so readers
+ * must use row.quota_domain (never row.cost_domain, which is undefined and
+ * would fail providerSnapshot validation, silently disabling rotation).
+ */
+export interface RegistryProviderRow {
+  provider_key: string;
+  provider_family: string;
+  capabilities?: unknown;
+  quota_domain: string;
+  mode: string;
+}
+
+/**
+ * Maps a registry row to a validated ProviderAllocation snapshot. Surface
+ * derivation mirrors the frontier allocator exactly: family 'youtube' serves
+ * YOUTUBE_NATIVE, every other family serves <FAMILY>_NATIVE.
+ */
+export function providerSnapshotFromRegistryRow(
+  row: RegistryProviderRow,
+  capability = 'SEARCH_YOUTUBE',
+): ProviderAllocation {
+  const family = String(row.provider_family || '');
+  return providerSnapshot({
+    providerKey: String(row.provider_key),
+    retrievalSurface: family === 'youtube' ? 'YOUTUBE_NATIVE' : `${family.toUpperCase()}_NATIVE`,
+    capability,
+    costDomain: String(row.quota_domain),
+    continuationOwner: 'PHASE_9',
+  });
+}
+
+/**
+ * Frontier-completion attribution predicate (mirrors the provider_key guard in
+ * completeQueryRun's frontier UPDATE). Same-provider runs always attribute.
+ * The ONLY allowed divergence is the documented DATE-ordering retarget: the
+ * frontier decision keeps its immutable innertube identity while the run
+ * executes (and consumes) as official youtube-search. Every other mismatch
+ * attributes nothing, so cross-provider misattribution still fails closed.
+ */
+export function frontierCompletionMatchesRun(
+  decisionProviderKey: string,
+  runProviderKey: string,
+): boolean {
+  if (decisionProviderKey === runProviderKey) return true;
+  return decisionProviderKey === 'youtube-innertube' && runProviderKey === 'youtube-search';
+}
+
+/**
+ * Capability guard for DATE-ordered retrieval. InnerTube exposes no
+ * sort-by-date (verified against the youtubei.js surface: SearchFilters
+ * carries only recency filters, never sort), so a DATE allocation served by
+ * a quota-free InnerTube run would execute relevance order while the run is
+ * labeled DATE — mislabeling retrieval experiments. DATE runs are therefore
+ * re-targeted to the official YouTube provider, which honors order=date.
+ * RELEVANCE runs are unaffected. Returns the (possibly re-targeted)
+ * provider plus whether a switch occurred.
+ */
+export function applyDateOrderingProviderGuard(
+  provider: ProviderAllocation,
+  searchOrdering: string,
+): { provider: ProviderAllocation; switched: boolean } {
+  if (searchOrdering === 'DATE' && provider.costDomain === 'YOUTUBE_INNERTUBE_FREE') {
+    return {
+      provider: providerSnapshot({
+        providerKey: 'youtube-search',
+        retrievalSurface: 'YOUTUBE_NATIVE',
+        capability: 'SEARCH_YOUTUBE',
+        costDomain: 'YOUTUBE_DATA_API',
+        continuationOwner: 'PHASE_9',
+      }),
+      switched: true,
+    };
+  }
+  return { provider, switched: false };
+}
+
+/**
  * SHADOW is never eligible for ordinary allocation. The only exception is the
  * explicitly admin-gated, exactly-one-run Brave direct-search canary path.
  */
