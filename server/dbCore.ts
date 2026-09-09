@@ -27,7 +27,7 @@ import { updateNeighborhoodFrontierStatePostRun } from './discoveryFrontierState
 import { calculateQueryFunnel, isQualityCreator, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance } from './terminologyIntelligence';
 import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNativeIntelligence';
-import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, type ProviderAllocation } from './providerAwareRetrieval';
+import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
@@ -1084,13 +1084,11 @@ export async function scheduleAutonomousQueryRuns(
           const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
           if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {
             const picked = rotateActiveProviderRow(rotationRes.rows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
-            allocatedProvider = providerSnapshot({
-              providerKey: picked.provider_key,
-              retrievalSurface: picked.provider_family === 'youtube' ? 'YOUTUBE_NATIVE' : `${String(picked.provider_family).toUpperCase()}_NATIVE`,
-              capability: 'SEARCH_YOUTUBE',
-              costDomain: picked.cost_domain,
-              continuationOwner: 'PHASE_9',
-            });
+            // Registry rows carry quota_domain (there is no cost_domain
+            // column); providerSnapshotFromRegistryRow derives the allocation
+            // costDomain from it and validates the snapshot, so a bad column
+            // fails loudly here instead of silently pinning traffic to official.
+            allocatedProvider = providerSnapshotFromRegistryRow(picked, 'SEARCH_YOUTUBE');
           }
         } catch {
           allocatedProvider = providerSnapshot(YOUTUBE_SEARCH_PROVIDER);
@@ -2120,9 +2118,17 @@ export async function completeQueryRun(runId: string, metrics: {
       `UPDATE quota_reservations SET status='CONSUMED',consumed_at=now()
        WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]
     );
+    // Frontier consumption attributes by run linkage, not by provider
+    // equality: same-provider runs always match, and the documented
+    // DATE-ordering retarget (frontier decision keeps its immutable
+    // youtube-innertube identity while the run executes/consumes as official
+    // youtube-search) must also attribute — otherwise retargeted consumption
+    // is silently dropped (under-count). Every other provider mismatch still
+    // attributes nothing. Mirrors frontierCompletionMatchesRun in
+    // providerAwareRetrieval.ts; keep the two in sync.
     if(run.rowCount)await client.query(`UPDATE frontier_allocation_decisions
       SET quota_consumed=$2::int,provider_consumed_amount=$3::bigint
-      WHERE query_run_id=$1 AND decision_status='COMMITTED' AND provider_key=(SELECT provider_key FROM query_runs WHERE id=$1)`,[runId,metrics.quotaUsed,metrics.quotaUsed]);
+      WHERE query_run_id=$1 AND decision_status='COMMITTED' AND (provider_key=(SELECT provider_key FROM query_runs WHERE id=$1) OR (provider_key='youtube-innertube' AND (SELECT provider_key FROM query_runs WHERE id=$1)='youtube-search'))`,[runId,metrics.quotaUsed,metrics.quotaUsed]);
     await client.query('COMMIT');
 
     // Await post-commit best-effort observation analytics (Phases 2-4).

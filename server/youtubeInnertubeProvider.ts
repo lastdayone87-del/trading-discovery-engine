@@ -124,7 +124,27 @@ async function pacedContinuation(
   return withInnertubeDeadline(feed.getContinuation!(), timeoutMs);
 }
 
-/** In-process backpressure flag. Module-private: the official provider's pool cannot see it. */
+/**
+ * In-process (replica-local) backpressure flag. Module-private: the official
+ * provider's pool cannot see it.
+ *
+ * Replica-locality is intentional and matches the official YouTube provider's
+ * model (server/youtubeProviderCooldown.ts keeps per-key rate-limit, daily,
+ * and suspension state in memory Maps): a 429 arms a short local quarantine
+ * so the hot replica stops hammering the endpoint immediately, without a
+ * cross-replica round-trip on the failure path.
+ *
+ * Cross-replica safety and observability come from the persisted ledger, not
+ * this flag: every InnerTube attempt (SUCCESS, TRANSIENT_ERROR, RATE_LIMITED)
+ * is appended to provider_call_events under provider='youtube-innertube' with
+ * zero official cost, and both allocation sites (frontier allocator rotation
+ * and ordinary scheduling rotation) exclude providers with a recent
+ * RATE_LIMITED ledger row while a healthy alternative remains
+ * (PROVIDER_COOLDOWN_OBSERVATION_WINDOW_SECS window, fail-open to the full
+ * pool). Persisted events therefore remain the sufficient, queryable record
+ * for dashboards, rotation, and post-incident review; this flag is only the
+ * fast local backpressure layer on top.
+ */
 let innertubeCooldownUntilMs = 0;
 export function innertubeCooldownRemainingMs(nowMs: number = Date.now()): number {
   return Math.max(0, innertubeCooldownUntilMs - nowMs);

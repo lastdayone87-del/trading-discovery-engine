@@ -77,6 +77,57 @@ export function rotateActiveProviderRow<T extends { provider_key: string; mode: 
 }
 
 /**
+ * Minimal shape of a discovery_provider_registry row as returned by the
+ * allocation queries (real column names: provider_key, provider_family,
+ * capabilities, quota_domain, mode). The registry has NO cost_domain column —
+ * the allocation-level costDomain is derived from quota_domain, so readers
+ * must use row.quota_domain (never row.cost_domain, which is undefined and
+ * would fail providerSnapshot validation, silently disabling rotation).
+ */
+export interface RegistryProviderRow {
+  provider_key: string;
+  provider_family: string;
+  capabilities?: unknown;
+  quota_domain: string;
+  mode: string;
+}
+
+/**
+ * Maps a registry row to a validated ProviderAllocation snapshot. Surface
+ * derivation mirrors the frontier allocator exactly: family 'youtube' serves
+ * YOUTUBE_NATIVE, every other family serves <FAMILY>_NATIVE.
+ */
+export function providerSnapshotFromRegistryRow(
+  row: RegistryProviderRow,
+  capability = 'SEARCH_YOUTUBE',
+): ProviderAllocation {
+  const family = String(row.provider_family || '');
+  return providerSnapshot({
+    providerKey: String(row.provider_key),
+    retrievalSurface: family === 'youtube' ? 'YOUTUBE_NATIVE' : `${family.toUpperCase()}_NATIVE`,
+    capability,
+    costDomain: String(row.quota_domain),
+    continuationOwner: 'PHASE_9',
+  });
+}
+
+/**
+ * Frontier-completion attribution predicate (mirrors the provider_key guard in
+ * completeQueryRun's frontier UPDATE). Same-provider runs always attribute.
+ * The ONLY allowed divergence is the documented DATE-ordering retarget: the
+ * frontier decision keeps its immutable innertube identity while the run
+ * executes (and consumes) as official youtube-search. Every other mismatch
+ * attributes nothing, so cross-provider misattribution still fails closed.
+ */
+export function frontierCompletionMatchesRun(
+  decisionProviderKey: string,
+  runProviderKey: string,
+): boolean {
+  if (decisionProviderKey === runProviderKey) return true;
+  return decisionProviderKey === 'youtube-innertube' && runProviderKey === 'youtube-search';
+}
+
+/**
  * Capability guard for DATE-ordered retrieval. InnerTube exposes no
  * sort-by-date (verified against the youtubei.js surface: SearchFilters
  * carries only recency filters, never sort), so a DATE allocation served by
