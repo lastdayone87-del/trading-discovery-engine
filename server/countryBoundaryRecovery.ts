@@ -1,9 +1,10 @@
 import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb, enqueueJob, upsertChannel, getChannelById } from './db';
 import { canonicalCountry, inferChannelCountry } from './countryInference';
+import { normalizeCountryName } from './countryExclusionRules';
 import { creatorLevelCountryEvidence } from './countryValidator';
 import type { ChannelRecord, CountryVocabulary } from '../src/types';
 
-export const COUNTRY_BOUNDARY_RECOVERY_VERSION = 'country-boundary-nonexcluded-v3';
+export const COUNTRY_BOUNDARY_RECOVERY_VERSION = 'country-boundary-nonexcluded-v4';
 export const COUNTRY_BOUNDARY_RECOVERY_JOB = 'COUNTRY_BOUNDARY_REPROCESS';
 
 export type ReconciliationState =
@@ -44,6 +45,123 @@ export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, _excluded
  * - INSUFFICIENT_EVIDENCE: No creator-level country evidence exists to resolve the boundary.
  * - LEGITIMATE_REJECTION: The rejection was not a false target boundary mismatch (e.g. explicitly rejected by policy).
  */
+/**
+ * Parses an aggregated-content-language rejection from a channel's inspection
+ * trail. Record-scoped: only the LATEST rejected COUNTRY_VALIDATION entry is
+ * inspected. The candidate-country set prefers the structured
+ * `candidateCountries` persisted on that step (immune to evidence-prose
+ * formatting, truncation, or localization changes); rows predating it fall
+ * back to parsing the set (`candidate countries [A, B]`) from that same
+ * entry's details. Older/unrelated validation records (including earlier
+ * language lines and Discord re-check entries) can never contaminate the
+ * parse. Returns null when the latest rejected validation carries no language
+ * rejection, so reconciliation falls through to normal creator-evidence
+ * re-evaluation.
+ *
+ * Fail-closed: when a language rejection IS confirmed (structured set or
+ * marker present) but the set is missing/unparseable, countries is null
+ * instead of silently falling back to the lone representative — callers must
+ * retain the rejection rather than risk a wrongful restore from an incomplete
+ * parse.
+ */
+export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
+  representative: string;
+  countries: string[] | null;
+} | null {
+  const trail = channel.inspection_trail || [];
+  const rejectedValidations = trail.filter(step =>
+    step.step === 'COUNTRY_VALIDATION' && /REJECTED/i.test(String((step as { status?: unknown }).status || ''))
+  );
+  // Deterministic recency: select by timestamp, not array position, so
+  // reordered historical trails cannot promote stale rejection evidence.
+  // Entries without a parseable timestamp never displace a timestamped one;
+  // all-unparseable trails keep first-in-array order (previous behavior).
+  const latest = latestRejectedValidation(rejectedValidations);
+  if (!latest) return null;
+  const details = String(latest.details || '');
+  const structured = readStepCandidateCountries(latest);
+  if (!structured && !details.includes('AGGREGATED_CONTENT_LANGUAGE')) return null;
+  const representative = readStepRepresentative(latest, channel.country);
+  if (!representative) return null;
+  if (structured) return { representative, countries: structured };
+  const setMatch = details.match(/candidate countries \[([^\]]+)\]/);
+  if (!setMatch) return { representative, countries: null };
+  const countries = setMatch[1].split(',').map(part => part.trim()).filter(Boolean);
+  if (countries.length === 0) return { representative, countries: null };
+  return { representative, countries };
+}
+
+/** Validated structured candidate set persisted on a trail step, if any. */
+function readStepCandidateCountries(step: ChannelRecord['inspection_trail'][number]): string[] | null {
+  const raw = (step as { candidateCountries?: unknown }).candidateCountries;
+  if (!Array.isArray(raw)) return null;
+  const countries = raw.map(part => String(part || '').trim()).filter(Boolean);
+  return countries.length > 0 ? countries : null;
+}
+
+/**
+ * Latest rejected COUNTRY_VALIDATION entry by timestamp. Strictly greater
+ * timestamps displace; ties and unparseable timestamps keep first-in-array
+ * order, so selection stays deterministic on any trail shape.
+ */
+function latestRejectedValidation(
+  entries: Array<ChannelRecord['inspection_trail'][number]>
+): ChannelRecord['inspection_trail'][number] | null {
+  let best: ChannelRecord['inspection_trail'][number] | null = null;
+  let bestTime = Number.NEGATIVE_INFINITY;
+  for (const entry of entries) {
+    const observed = Date.parse(String((entry as { timestamp?: unknown }).timestamp || ''));
+    const time = Number.isFinite(observed) ? observed : Number.NEGATIVE_INFINITY;
+    if (!best || time > bestTime) {
+      best = entry;
+      bestTime = time;
+    }
+  }
+  return best;
+}
+
+/**
+ * Representative country for a language rejection, most-structured first:
+ * rendered evidence line, stored row country (set to the representative at
+ * rejection time), then the step title. 'Unknown'/empty values never count.
+ */
+function readStepRepresentative(
+  step: ChannelRecord['inspection_trail'][number],
+  storedCountry?: string | null
+): string {
+  const usable = (value: unknown): string | null => {
+    const text = String(value || '').trim();
+    return text && text.toLowerCase() !== 'unknown' ? text : null;
+  };
+  const details = String(step.details || '');
+  const lineMatch = details.match(/AGGREGATED_CONTENT_LANGUAGE:\s*([^\n(]+?)\s*\(/);
+  const fromLine = lineMatch ? usable(lineMatch[1]) : null;
+  if (fromLine) return fromLine;
+  const stored = usable(storedCountry);
+  if (stored) return stored;
+  const titleMatch = String(step.title || '').match(/\(\s*([^)]+?)\s*\)/);
+  const fromTitle = titleMatch ? usable(titleMatch[1]) : null;
+  return fromTitle || '';
+}
+
+/**
+ * Only explicitly persisted creator-authored text may stand in for the About
+ * bio during recovery. Inspection-trail details are crawler prose — website
+ * URLs, acquisition logs, Discord observations, validation logs — and
+ * production validation never accepts them as bio (queue provenance
+ * boundary), so they must not gain P2 authority here either. The sole
+ * exception is the 'Historical Creator Evidence' BIO record synthesized from
+ * sighting metadata at cohort load. Anything else yields no bio text, failing
+ * closed toward INSUFFICIENT_EVIDENCE.
+ */
+export function trustedCreatorBioText(channel: ChannelRecord): string {
+  return (channel.inspection_trail || [])
+    .filter(step => step.step === 'BIO' && step.title === 'Historical Creator Evidence')
+    .map(step => step.details || '')
+    .join(' ')
+    .trim();
+}
+
 export function classifyReconciliationState(
   channel: ChannelRecord,
   excludedCountries: Array<{ country_name: string; reason?: string }>,
@@ -56,22 +174,62 @@ export function classifyReconciliationState(
 } {
   const hasBoundaryRejection = hasPinnedBoundaryRejection(channel);
   if (!hasBoundaryRejection && channel.country_status === 'REJECTED') {
-    return {
-      state: 'LEGITIMATE_REJECTION',
-      detectedCountry: channel.country || null,
-      reasoning: 'Channel was rejected by policy or explicit country match, not target boundary mismatch.',
-      confidence: 100
-    };
+    const isLiveExcluded = (country: string): boolean =>
+      excludedCountries.some(item => normalizeCountryName(item.country_name) === normalizeCountryName(country));
+    // Aggregated-language rejections carry their candidate-country set in the
+    // trail: restore the row unless every set member is still excluded.
+    // Set membership (not the mechanical representative) decides, so removing
+    // a non-representative member still catches the row.
+    const languageRejection = parseAggregatedLanguageRejection(channel);
+    if (languageRejection) {
+      // Unparseable set (countries null): the language rejection is confirmed
+      // but its membership is unknown — retain rather than restore. Precision
+      // first: a truncated/reformatted trail must never manufacture recovery.
+      if (languageRejection.countries === null) {
+        return {
+          state: 'RETAIN_EXCLUDED',
+          detectedCountry: languageRejection.representative,
+          reasoning: `Aggregated language rejection for ${languageRejection.representative} has an unparseable candidate set; retaining until the live list can be evaluated against complete evidence.`,
+          confidence: 86
+        };
+      }
+      if (languageRejection.countries.every(isLiveExcluded)) {
+        return {
+          state: 'RETAIN_EXCLUDED',
+          detectedCountry: languageRejection.representative,
+          reasoning: `Aggregated language candidate countries [${languageRejection.countries.join(', ')}] remain fully excluded.`,
+          confidence: 86
+        };
+      }
+      return {
+        state: 'RECOVERABLE_NON_EXCLUDED',
+        detectedCountry: null,
+        reasoning: `Aggregated language candidate countries [${languageRejection.countries.join(', ')}] are no longer fully excluded by the live list.`,
+        confidence: 86
+      };
+    }
+    // Explicit single-country rejections stand only while the recorded
+    // country is still excluded; otherwise fall through to re-evaluation
+    // against the live list below.
+    if (channel.country && isLiveExcluded(channel.country)) {
+      return {
+        state: 'LEGITIMATE_REJECTION',
+        detectedCountry: channel.country || null,
+        reasoning: 'Channel was rejected by policy or explicit country match, not target boundary mismatch.',
+        confidence: 100
+      };
+    }
   }
 
   // Re-evaluate creator-level evidence using standard production extraction path.
   // Explicitly exclude channel.country location tag to prevent search target contamination.
+  // The bio below is ONLY explicitly persisted creator-authored text
+  // (trustedCreatorBioText): flattened inspection-trail details are crawler
+  // prose (URLs, acquisition logs, Discord observations) and must never gain
+  // bio authority in recovery, mirroring the queue provenance boundary.
   const creatorEvidence = creatorLevelCountryEvidence({
     channelName: channel.channel_name,
-    description: (channel.inspection_trail || [])
-      .filter(t => t.step !== 'COUNTRY_VALIDATION')
-      .map(t => t.details || '')
-      .join(' ') || channel.channel_name,
+    description: trustedCreatorBioText(channel),
     videoTitles: [channel.channel_name],
     externalLinks: channel.discord_invite ? [channel.discord_invite] : [],
     metadataStatus: channel.country_metadata_status
@@ -362,6 +520,12 @@ export async function processCountryBoundaryReprocessJob(
 
   if (!channel) return { channelId, recovered: false, reconciliationState: 'INSUFFICIENT_EVIDENCE', newCountryStatus: 'MISSING' };
 
+  // Human decisions are final: a HUMAN_REJECTED row is never machine-restored,
+  // regardless of how the live exclusion list moves. No mutation, no event.
+  if (channel.trading_status === 'HUMAN_REJECTED') {
+    return { channelId, recovered: false, reconciliationState: 'LEGITIMATE_REJECTION', newCountryStatus: channel.country_status };
+  }
+
   const now = new Date().toISOString();
   const eventKey = `recovery:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:${channelId}`;
 
@@ -426,13 +590,23 @@ export async function processCountryBoundaryReprocessJob(
     return { channelId, recovered: false, reconciliationState: classification.state, newCountryStatus: channel.country_status };
   }
 
-  // RECOVERABLE_NON_EXCLUDED: Restore machine-owned state safely
+  // RECOVERABLE_NON_EXCLUDED: Restore machine-owned state safely.
+  // When reconciliation carries a replacement country, project it as
+  // CONFIRMED. When a language-set invalidation carries NO replacement
+  // country (detectedCountry null), the stale excluded representative must be
+  // CLEARED — not retained — or the row stays hidden behind old country
+  // metadata despite reporting recovery. UNCERTAIN reopens normal processing
+  // instead of projecting confidence without evidence.
   const priorCountryStatus = channel.country_status;
   const priorScanStatus = channel.scan_status;
-  channel.country_status = 'CONFIRMED';
-  channel.confidence_score = classification.confidence;
   if (classification.detectedCountry) {
+    channel.country_status = 'CONFIRMED';
     channel.country = classification.detectedCountry;
+    channel.confidence_score = classification.confidence;
+  } else {
+    channel.country_status = 'UNCERTAIN';
+    channel.country = null;
+    channel.confidence_score = classification.confidence;
   }
   channel.scan_status = 'PENDING';
   channel.last_checked = now;

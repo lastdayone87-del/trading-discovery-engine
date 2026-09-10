@@ -24,6 +24,25 @@ export function formatCountryEvidenceLine(item: CountryInferenceEvidence): strin
   return `  [P${item.priority}] ${item.source}: ${item.detectedCountry} (${item.confidence}/100) — ${item.reasoning}${suffix}`;
 }
 
+/**
+ * Extracts the aggregated-content-language candidate-country set from already
+ * computed country evidence. Returns the full structured set (single-country
+ * languages resolve to their detected country, mirroring the rendered
+ * evidence line which always names the set), or null when no language evidence exists.
+ * Producers persist this on the COUNTRY_VALIDATION trail step so recovery can
+ * reconcile without parsing rendered prose.
+ */
+export function aggregatedLanguageCandidateSet(
+  evidence?: Array<Pick<CountryInferenceEvidence, 'source' | 'candidateCountries' | 'detectedCountry'> | undefined | null> | null
+): string[] | null {
+  const item = (evidence || []).find(entry => entry?.source === 'AGGREGATED_CONTENT_LANGUAGE');
+  if (!item) return null;
+  const structured = (item.candidateCountries || []).map(part => String(part || '').trim()).filter(Boolean);
+  if (structured.length > 0) return structured;
+  const single = String(item.detectedCountry || '').trim();
+  return single ? [single] : null;
+}
+
 export interface ValidationResult {
   score: number;
   status: CountryStatus;
@@ -51,6 +70,25 @@ export function creatorLevelCountryEvidence(channelData: {
   externalLinks?: string[];
   socialBios?: string[];
   metadataStatus?: CountryMetadataStatus;
+  /**
+   * Already-fetched creator-written video descriptions. Used ONLY by the
+   * aggregated-content-language voter (never joined into bio text, never
+   * matched by P2/P5–P8 matchers). Titles stay excluded per the boundary
+   * below; descriptions are long-form creator prose, not retrieval-selected
+   * query echoes, so the circularity concern does not apply.
+   */
+  videoDescriptions?: string[];
+  /**
+   * Provenance gate for the aggregated-content-language voter. True ONLY for
+   * an authoritative recent-channel sample. Search-selected snippets must
+   * pass false/undefined so they can never manufacture a language majority.
+   */
+  videoDescriptionsAuthoritative?: boolean;
+  /**
+   * Already-fetched playlist names/descriptions. Corroboration veto only
+   * (see aggregateContentLanguage); never decisive alone.
+   */
+  playlists?: Array<{ name?: string; description?: string }>;
 }) {
   const socialLinks = (channelData.externalLinks || []).filter(link =>
     /(?:instagram|twitter|x|facebook|linkedin|tiktok)\.com/i.test(link)
@@ -61,11 +99,16 @@ export function creatorLevelCountryEvidence(channelData: {
     channelName: channelData.channelName,
     // Provenance boundary: description and socialBios stay separate fields so
     // P2 evidence records exactly which one produced it. Crawler trail prose,
-    // video metadata, and discovery context must never be passed here.
+    // video TITLES, and discovery context must never be passed here.
+    // Video DESCRIPTIONS travel in their own field for the aggregated-language
+    // voter only (see CountryInferenceInput.videoDescriptions).
     aboutBio: channelData.description || '',
     socialBios: channelData.socialBios || [],
     officialWebsiteLinks: websiteLinks,
     verifiedSocialLinks: socialLinks,
+    videoDescriptions: Array.isArray(channelData.videoDescriptions) ? channelData.videoDescriptions : [],
+    videoDescriptionsAuthoritative: channelData.videoDescriptionsAuthoritative === true,
+    playlists: Array.isArray(channelData.playlists) ? channelData.playlists : [],
     // Deliberately exclude videoTitles from country attribution. A creator may
     // cover any country's instrument/market, and discovery-selected titles are
     // especially vulnerable to circular query evidence.
@@ -159,6 +202,9 @@ export async function validateChannelCountry(
     externalLinks?: string[];
     socialBios?: string[];
     metadataStatus?: CountryMetadataStatus;
+    videoDescriptions?: string[];
+    videoDescriptionsAuthoritative?: boolean;
+    playlists?: Array<{ name?: string; description?: string }>;
   },
   targetCountryName?: string | null
 ): Promise<ValidationResult> {

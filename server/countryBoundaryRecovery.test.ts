@@ -75,7 +75,35 @@ test('cohort worker keeps quota reservation before claim and bounded backoff on 
   assert.match(cohortSource, /preventReopen: true/);
 });
 
-test('TEST C: Reconciliation classification - RECOVERABLE_NON_EXCLUDED', async () => {
+test('TEST C: untitled trail prose cannot manufacture creator recovery evidence', async () => {
+  const { classifyReconciliationState } = await import('./countryBoundaryRecovery');
+  const { INITIAL_EXCLUDED_COUNTRIES, INITIAL_COUNTRY_VOCABULARIES } = await import('../src/data/initial_countries');
+  const excluded = INITIAL_EXCLUDED_COUNTRIES;
+  const vocabularies = INITIAL_COUNTRY_VOCABULARIES;
+
+  const excludedSet = new Set(excluded.map(e => e.country_name.toLowerCase()));
+  const nonExcludedVocab = vocabularies.find(v => !excludedSet.has(v.country.toLowerCase()) && v.local_market_phrases?.length >= 2);
+  assert.ok(nonExcludedVocab, 'A non-excluded country vocabulary with market phrases must exist');
+
+  const terms = nonExcludedVocab.local_market_phrases.slice(0, 2);
+
+  // Crawler prose (website/acquisition logs quoted into a BIO step) naming a
+  // non-excluded country must NOT become bio evidence: without trustworthy
+  // creator text the row is unresolved, never recovered on prose alone.
+  const channel = candidate({
+    country_status: 'REJECTED',
+    channel_name: `Trader Channel`,
+    inspection_trail: [
+      { step: 'COUNTRY_VALIDATION', details: 'Target Country Boundary: REJECTED — creator country differs from discovery target.' },
+      { step: 'BIO', details: `Trading analysis and market strategy covering ${terms.join(' and ')}` }
+    ]
+  });
+
+  const res = classifyReconciliationState(channel, excluded, vocabularies);
+  assert.equal(res.state, 'INSUFFICIENT_EVIDENCE');
+});
+
+test('TEST C2: persisted Historical Creator Evidence still drives recovery', async () => {
   const { classifyReconciliationState } = await import('./countryBoundaryRecovery');
   const { INITIAL_EXCLUDED_COUNTRIES, INITIAL_COUNTRY_VOCABULARIES } = await import('../src/data/initial_countries');
   const excluded = INITIAL_EXCLUDED_COUNTRIES;
@@ -88,18 +116,85 @@ test('TEST C: Reconciliation classification - RECOVERABLE_NON_EXCLUDED', async (
   const nonExcludedCountry = nonExcludedVocab.country;
   const terms = nonExcludedVocab.local_market_phrases.slice(0, 2);
 
+  // The cohort-load BIO record synthesized from sighting metadata IS
+  // trustworthy creator evidence, so it still resolves (TEST H mechanism).
   const channel = candidate({
     country_status: 'REJECTED',
     channel_name: `Trader Channel`,
     inspection_trail: [
       { step: 'COUNTRY_VALIDATION', details: 'Target Country Boundary: REJECTED — creator country differs from discovery target.' },
-      { step: 'BIO', details: `Trading analysis and market strategy covering ${terms.join(' and ')}` }
+      { step: 'BIO', title: 'Historical Creator Evidence', status: 'FOUND', details: `Trading analysis and market strategy covering ${terms.join(' and ')}` }
     ]
   });
 
   const res = classifyReconciliationState(channel, excluded, vocabularies);
   assert.equal(res.state, 'RECOVERABLE_NON_EXCLUDED');
   assert.equal(res.detectedCountry, nonExcludedCountry);
+});
+
+test('TEST C3: website URLs and acquisition logs cannot retain or redirect recovery', async () => {
+  const { classifyReconciliationState, trustedCreatorBioText } = await import('./countryBoundaryRecovery');
+  const { INITIAL_EXCLUDED_COUNTRIES, INITIAL_COUNTRY_VOCABULARIES } = await import('../src/data/initial_countries');
+  const excluded = INITIAL_EXCLUDED_COUNTRIES;
+  const vocabularies = INITIAL_COUNTRY_VOCABULARIES;
+
+  const stillExcluded = excluded.find(e => e.country_name.toLowerCase() === 'vietnam') || excluded[0];
+  const withoutIndia = excluded.filter(e => e.country_name.toLowerCase() !== 'india');
+
+  // Devin's example: India-recorded row, website step mentions Vietnam.
+  // India leaves the live list; Vietnam prose must not retain the rejection.
+  const websiteRow = candidate({
+    country: 'India',
+    country_status: 'REJECTED',
+    channel_name: 'Trader Channel',
+    inspection_trail: [
+      { step: 'COUNTRY_VALIDATION', details: 'India is excluded by policy: Regional Exclusion' },
+      { step: 'EXTERNAL_LINKS', details: `Crawled https://${stillExcluded.country_name.toLowerCase()}-trading.example signals` },
+      { step: 'VIDEO_DESCRIPTIONS', details: `Acquisition log: observed ${stillExcluded.country_name} market references` },
+    ]
+  });
+  assert.equal(trustedCreatorBioText(websiteRow), '');
+  const retained = classifyReconciliationState(websiteRow, withoutIndia, vocabularies);
+  assert.notEqual(retained.state, 'RETAIN_EXCLUDED');
+  assert.notEqual(retained.detectedCountry, stillExcluded.country_name);
+
+  // False-replacement direction: non-excluded country prose must not mint a
+  // recovered country either.
+  const nonExcluded = vocabularies.map(v => v.country).find(c => !excluded.some(e => e.country_name.toLowerCase() === String(c).toLowerCase()));
+  assert.ok(nonExcluded, 'A non-excluded country must exist');
+  const redirectRow = candidate({
+    country: 'India',
+    country_status: 'REJECTED',
+    channel_name: 'Trader Channel',
+    inspection_trail: [
+      { step: 'COUNTRY_VALIDATION', details: 'India is excluded by policy: Regional Exclusion' },
+      { step: 'EXTERNAL_LINKS', details: `Crawled https://${String(nonExcluded).toLowerCase()}-trading.example` },
+    ]
+  });
+  const redirected = classifyReconciliationState(redirectRow, withoutIndia, vocabularies);
+  assert.notEqual(redirected.state, 'RECOVERABLE_NON_EXCLUDED');
+});
+
+test('trustedCreatorBioText admits only the Historical Creator Evidence record', async () => {
+  const { trustedCreatorBioText } = await import('./countryBoundaryRecovery');
+  assert.equal(trustedCreatorBioText({ inspection_trail: [] } as any), '');
+  assert.equal(
+    trustedCreatorBioText({
+      inspection_trail: [
+        { step: 'BIO', title: 'Step 1 — Channel Bio & About Panel', status: 'NOT_FOUND', details: 'Vietnam trading community join now', timestamp: '2026-01-01T00:00:00.000Z' },
+        { step: 'VIDEO_DESCRIPTIONS', details: 'Vietnam scalp tutorial', timestamp: '2026-01-01T00:00:00.000Z' },
+      ]
+    } as any),
+    ''
+  );
+  assert.equal(
+    trustedCreatorBioText({
+      inspection_trail: [
+        { step: 'BIO', title: 'Historical Creator Evidence', status: 'FOUND', details: 'France trading journal', timestamp: '2026-01-01T00:00:00.000Z' },
+      ]
+    } as any),
+    'France trading journal'
+  );
 });
 
 test('TEST D: Reconciliation classification - RETAIN_EXCLUDED', async () => {

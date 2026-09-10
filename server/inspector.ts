@@ -2,13 +2,67 @@ import * as cheerio from 'cheerio';
 import { decodeEmbeddedMarkup, extractDynamicTargetValues, extractEmbeddedUrls, extractYouTubeVideoIds } from './crawlerExtraction';
 import { InspectionStep } from '../src/types';
 import { getChannelById } from './db';
-import { fetchRecentVideoDescriptionsFromAPI } from './youtube';
+import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, type CrawlerTelemetry} from './crawlerTelemetry';
 import { readBoundedResponseText } from './crawlResponseBounds';
+
+export type SampledVideoInput =
+  | string
+  | { videoId?: string | null; description?: string | null }
+  | null
+  | undefined;
+
+/** Normalize a mixed loader/scrape sample to trimmed, non-empty (id, text) pairs. */
+export function normalizeSampledVideoDescriptions(
+  input: SampledVideoInput[] | null | undefined
+): RecentVideoDescription[] {
+  const out: RecentVideoDescription[] = [];
+  for (const entry of input || []) {
+    if (typeof entry === 'string') {
+      const description = entry.trim();
+      if (description) out.push({ videoId: null, description });
+    } else if (entry && typeof entry === 'object') {
+      const description = String(entry.description || '').trim();
+      if (!description) continue;
+      out.push({ videoId: entry.videoId ? String(entry.videoId) : null, description });
+    }
+  }
+  return out;
+}
+
+/**
+ * Merge channel-sampled descriptions by video. Entries carrying the same
+ * video ID represent one upload observed twice (API + keyless scrape with
+ * different encoding, truncation, or appended links), so the first text wins
+ * and the duplicate never votes. ID-less entries keep exact-text dedupe.
+ * Distinct videos with identical text still count separately. Order-preserving.
+ */
+export function mergeSampledVideoDescriptions(
+  current: RecentVideoDescription[],
+  incoming: RecentVideoDescription[]
+): RecentVideoDescription[] {
+  const seenIds = new Set(
+    current.filter(item => item.videoId).map(item => item.videoId as string)
+  );
+  const seenTexts = new Set(current.filter(item => !item.videoId).map(item => item.description));
+  const merged = [...current];
+  for (const item of incoming) {
+    if (item.videoId) {
+      if (seenIds.has(item.videoId)) continue;
+      seenIds.add(item.videoId);
+      merged.push(item);
+    } else {
+      if (seenTexts.has(item.description)) continue;
+      seenTexts.add(item.description);
+      merged.push(item);
+    }
+  }
+  return merged;
+}
 
 export interface InspectionResult {
   debugLog?: any;
@@ -18,6 +72,21 @@ export interface InspectionResult {
   extractedThumbnailUrl?: string;
   observedAboutBio: string;
   observedChannelLinks: string[];
+  /**
+   * Fresh channel-sampled video descriptions acquired during THIS inspection
+   * (recent-uploads API fetch and/or channel /videos scrape, newest first,
+   * capped at 10). Preloaded search-selected snippets are deliberately
+   * EXCLUDED: only independently-sampled recent-channel output may feed the
+   * aggregated-content-language country voter downstream.
+   */
+  observedVideoDescriptions?: string[];
+  /**
+   * True when observedVideoDescriptions holds at least one channel-sampled
+   * description (authoritative provenance for the country voter). False or
+   * absent means no fresh sample was acquired and the country voter must
+   * abstain rather than evaluate stale/search-selected input.
+   */
+  observedVideoDescriptionsAuthoritative?: boolean;
   acquisitionStatus?: ExternalAcquisitionStatus;
   acquisitionOutcomes?: ExternalAcquisitionObservation[];
   retryDirective?: CommunityRetryDirective;
@@ -225,8 +294,8 @@ export async function crawlMessagingPreview(seedUrl:string,logDetails:string[]=[
 async function crawlSocialBios(socialUrls:string[],logDetails:string[]=[],debugLog?:any):Promise<ExternalDiscordCrawlResult>{return crawlExternalLinks(socialUrls,logDetails,debugLog,fetch,'SOCIAL_PROFILES');}
 
 export async function scrapeRecentVideoDescriptions(youtubeUrl:string):Promise<string[]>{return (await scrapeRecentVideoDescriptionsWithCoverage(youtubeUrl)).descriptions;}
-async function scrapeRecentVideoDescriptionsWithCoverage(youtubeUrl:string):Promise<{descriptions:string[];attempted:number;acquired:number}>{
-  if(!youtubeUrl||!youtubeUrl.startsWith('http'))return {descriptions:[],attempted:0,acquired:0};const videosPageUrl=youtubeUrl.endsWith('/videos')?youtubeUrl:`${youtubeUrl.replace(/\/+$/,'')}/videos`;const page=await fetchWithTimeout(videosPageUrl,0);if(!page)throw new Error('Recent-video page acquisition failed');const html=page.html;const videoIds=extractYouTubeVideoIds(html,5);if(videoIds.length===0)throw new Error('Recent-video page schema was not recognized; absence is not confirmed');const descriptions:string[]=[];let acquired=0;for(const vId of videoIds.slice(0,5)){const watchUrl=`https://www.youtube.com/watch?v=${vId}`,vPage=await fetchWithTimeout(watchUrl,0);if(vPage){acquired++;const metaDesc=vPage.html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)||vPage.html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);let desc=metaDesc?metaDesc[1]:'';const cleanVHtml=decodeEmbeddedMarkup(vPage.html);const extInVid=extractExternalUrlsFromText(cleanVHtml),invs=extractDiscordCandidates(cleanVHtml,'RECENT_VIDEO_DESCRIPTIONS',watchUrl).filter(candidate=>candidate.nativeInviteCode);for(const inv of invs)desc+=` ${inv.normalizedLocator}`;if(extInVid.length>0)desc+=` ${extInVid.join(' ')}`;if(desc.trim())descriptions.push(desc.trim());}}if(videoIds.length>0&&acquired===0)throw new Error('Recent-video descriptions could not be acquired');return {descriptions,attempted:videoIds.length,acquired};
+async function scrapeRecentVideoDescriptionsWithCoverage(youtubeUrl:string):Promise<{descriptions:string[];items:RecentVideoDescription[];attempted:number;acquired:number}>{
+  if(!youtubeUrl||!youtubeUrl.startsWith('http'))return {descriptions:[],items:[],attempted:0,acquired:0};const videosPageUrl=youtubeUrl.endsWith('/videos')?youtubeUrl:`${youtubeUrl.replace(/\/+$/,'')}/videos`;const page=await fetchWithTimeout(videosPageUrl,0);if(!page)throw new Error('Recent-video page acquisition failed');const html=page.html;const videoIds=extractYouTubeVideoIds(html,10);if(videoIds.length===0)throw new Error('Recent-video page schema was not recognized; absence is not confirmed');const descriptions:string[]=[];const items:RecentVideoDescription[]=[];let acquired=0;for(const vId of videoIds.slice(0,10)){const watchUrl=`https://www.youtube.com/watch?v=${vId}`,vPage=await fetchWithTimeout(watchUrl,0);if(vPage){acquired++;const metaDesc=vPage.html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)||vPage.html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);let desc=metaDesc?metaDesc[1]:'';const cleanVHtml=decodeEmbeddedMarkup(vPage.html);const extInVid=extractExternalUrlsFromText(cleanVHtml),invs=extractDiscordCandidates(cleanVHtml,'RECENT_VIDEO_DESCRIPTIONS',watchUrl).filter(candidate=>candidate.nativeInviteCode);for(const inv of invs)desc+=` ${inv.normalizedLocator}`;if(extInVid.length>0)desc+=` ${extInVid.join(' ')}`;if(desc.trim()){descriptions.push(desc.trim());items.push({videoId:vId,description:desc.trim()});}}}if(videoIds.length>0&&acquired===0)throw new Error('Recent-video descriptions could not be acquired');return {descriptions,items,attempted:videoIds.length,acquired};
 }
 
 async function fetchLiveYouTubeChannelData(youtubeUrl:string,enableDebug?:boolean):Promise<{rawHtml?:string;fetchLog?:string;bio?:string;channelLinks?:string[];videoDescriptions?:string[];thumbnailUrl?:string;truncated?:boolean;}|null>{
@@ -402,12 +471,32 @@ export function formatLinkedWebsiteAcquisitionSummary(summary: LinkedWebsiteAcqu
   return `Linked website acquisition: ${parts.join('; ')}.`;
 }
 
-export async function runChannelInspection(channelData:{enableDebug?:boolean;channelId:string;channelName?:string;channelBio:string;channelLinks?:string[];pinnedComment?:string;videoDescriptions?:string[];socialLinks?:string[];youtubeUrl?:string;forceLiveFetch?:boolean;liveChannelDataLoader?:typeof fetchLiveYouTubeChannelData;recentVideoDescriptionsLoader?:typeof fetchRecentVideoDescriptionsFromAPI;externalFetchImpl?:typeof fetch;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string)=>Promise<BrowserFallbackResult>;}):Promise<InspectionResult>{
+export async function runChannelInspection(channelData:{enableDebug?:boolean;channelId:string;channelName?:string;channelBio:string;channelLinks?:string[];pinnedComment?:string;videoDescriptions?:string[];socialLinks?:string[];youtubeUrl?:string;forceLiveFetch?:boolean;liveChannelDataLoader?:typeof fetchLiveYouTubeChannelData;recentVideoDescriptionsLoader?:(channelId:string)=>Promise<Array<string|{videoId?:string|null;description?:string|null}>>;externalFetchImpl?:typeof fetch;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string)=>Promise<BrowserFallbackResult>;}):Promise<InspectionResult>{
   const steps:InspectionStep[]=[];const now=new Date().toISOString();let extractedThumbnailUrl:string|undefined;const acquisitionOutcomes:ExternalAcquisitionObservation[]=[];let acquiredAboutUrl:string|undefined;const acquiredRecentDescriptionSurfaces:string[]=[];let debugLog:any=channelData.enableDebug?{rawAboutPageHtml:null,fetchLog:null,extractedUrls:[],redirectsFollowed:[],discordRegexAttempts:[],failureStep:null}:undefined;let bio=channelData.channelBio||'',links=channelData.channelLinks||[],videoDescs=channelData.videoDescriptions||[];let creatorLikelyTrading=channelData.creatorLikelyTrading,creatorName=channelData.channelName||'';
   if((creatorLikelyTrading===undefined||!creatorName)&&channelData.channelId){try{const stored=await getChannelById(channelData.channelId);if(creatorLikelyTrading===undefined)creatorLikelyTrading=stored?.trading_status==='TRADING_CONFIRMED';if(!creatorName)creatorName=stored?.channel_name||'';}catch{if(creatorLikelyTrading===undefined)creatorLikelyTrading=false;}}creatorLikelyTrading=creatorLikelyTrading===true;
+  // Channel-sampled descriptions acquired during THIS inspection, kept
+  // separate from preloaded search-selected snippets. Only this collection
+  // carries authoritative provenance for the aggregated-language country
+  // voter (see observedVideoDescriptions): preloaded discovery input must
+  // never become the language sample merely because it was passed in.
+  // Tracked as (videoId, text) pairs: API and keyless scrape sample the same
+  // newest uploads, so merging by video ID keeps one upload from voting twice
+  // when its two observed texts differ in encoding or appended links.
+  let channelSampled: RecentVideoDescription[] = [];
+  const channelSampledDescs = (): string[] => channelSampled.map(item => item.description);
+  const trackChannelSampled = (input: SampledVideoInput[] | null | undefined): void => {
+    channelSampled = mergeSampledVideoDescriptions(channelSampled, normalizeSampledVideoDescriptions(input));
+  };
   if(channelData.youtubeUrl||channelData.channelId){const shouldRefreshAbout=Boolean(channelData.youtubeUrl&&(channelData.forceLiveFetch||creatorLikelyTrading||links.length===0||bio.length<20));if(shouldRefreshAbout&&channelData.youtubeUrl){try{const liveData=await (channelData.liveChannelDataLoader||fetchLiveYouTubeChannelData)(channelData.youtubeUrl,channelData.enableDebug);if(liveData){acquiredAboutUrl=channelData.youtubeUrl;if(liveData.bio)bio=`${bio} ${liveData.bio}`.trim();if(liveData.channelLinks?.length)links=Array.from(new Set([...links,...liveData.channelLinks]));if(liveData.thumbnailUrl)extractedThumbnailUrl=liveData.thumbnailUrl;if(debugLog){debugLog.rawAboutPageHtml=liveData.rawHtml;debugLog.fetchLog=liveData.fetchLog;}}else acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'YOUTUBE_ABOUT_ACQUISITION_FAILED',retryAt:undefined,detail:'YouTube About page could not be acquired',observedAt:now});}catch(e){acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'YOUTUBE_ABOUT_ACQUISITION_FAILED',retryAt:retryAtFromUnknown(e),detail:e instanceof Error?e.message:String(e),observedAt:now});}}
-    const preloaded=[...videoDescs];let authoritative=false;if(channelData.channelId&&(creatorLikelyTrading||channelData.forceLiveFetch)){try{const apiDescs=await (channelData.recentVideoDescriptionsLoader||fetchRecentVideoDescriptionsFromAPI)(channelData.channelId);acquiredRecentDescriptionSurfaces.push(`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`);authoritative=true;if(apiDescs.length)videoDescs=Array.from(new Set([...apiDescs,...preloaded]));}catch(e){acquisitionOutcomes.push({requestedUrl:`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_API_FAILED',retryAt:retryAtFromUnknown(e),detail:e instanceof Error?e.message:String(e),observedAt:now});}}else if(videoDescs.length<5&&channelData.channelId){try{const apiDescs=await (channelData.recentVideoDescriptionsLoader||fetchRecentVideoDescriptionsFromAPI)(channelData.channelId);acquiredRecentDescriptionSurfaces.push(`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`);authoritative=true;if(apiDescs.length)videoDescs=Array.from(new Set([...apiDescs,...videoDescs]));}catch(e){acquisitionOutcomes.push({requestedUrl:`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_API_FAILED',retryAt:retryAtFromUnknown(e),detail:e instanceof Error?e.message:String(e),observedAt:now});}}
-    if(videoDescs.length<5&&channelData.youtubeUrl){try{const scraped=await scrapeRecentVideoDescriptionsWithCoverage(channelData.youtubeUrl);acquiredRecentDescriptionSurfaces.push(`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`);if(scraped.acquired<scraped.attempted)acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_PARTIAL',detail:`Acquired ${scraped.acquired} of ${scraped.attempted} sampled recent-video descriptions`,observedAt:now});if(scraped.descriptions.length)videoDescs=Array.from(new Set([...(authoritative?[]:scraped.descriptions),...videoDescs,...(authoritative?scraped.descriptions:[])]));}catch(e){acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_SCRAPE_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});}}
+    const preloaded=[...videoDescs];let authoritative=false;if(channelData.channelId&&(creatorLikelyTrading||channelData.forceLiveFetch)){try{const apiDescs=await (channelData.recentVideoDescriptionsLoader||fetchRecentVideoDescriptionsWithIds)(channelData.channelId);acquiredRecentDescriptionSurfaces.push(`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`);authoritative=true;trackChannelSampled(apiDescs);const apiTexts=normalizeSampledVideoDescriptions(apiDescs).map(item=>item.description);if(apiTexts.length)videoDescs=Array.from(new Set([...apiTexts,...preloaded]));}catch(e){acquisitionOutcomes.push({requestedUrl:`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_API_FAILED',retryAt:retryAtFromUnknown(e),detail:e instanceof Error?e.message:String(e),observedAt:now});}}else if(videoDescs.length<5&&channelData.channelId){try{const apiDescs=await (channelData.recentVideoDescriptionsLoader||fetchRecentVideoDescriptionsWithIds)(channelData.channelId);acquiredRecentDescriptionSurfaces.push(`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`);authoritative=true;trackChannelSampled(apiDescs);const apiTexts=normalizeSampledVideoDescriptions(apiDescs).map(item=>item.description);if(apiTexts.length)videoDescs=Array.from(new Set([...apiTexts,...videoDescs]));}catch(e){acquisitionOutcomes.push({requestedUrl:`youtube-api:channel:${channelData.channelId}:recent-video-descriptions`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_API_FAILED',retryAt:retryAtFromUnknown(e),detail:e instanceof Error?e.message:String(e),observedAt:now});}}
+  // Channel-sample continuation: the aggregated-language voter needs ≥8
+  // usable authoritative descriptions, so keep sampling (keyless scrape tops
+  // up a short API sample) until the channel-sampled collection — not the
+  // merged preloaded-inclusive list — reaches that minimum. Counts are
+  // distinct videos (API/scrape overlap merges by video ID), never duplicate
+  // observations. API and scrape each supply up to 10;
+  // observedVideoDescriptions stays capped at 10.
+    if(channelSampled.length<8&&channelData.youtubeUrl){try{const scraped=await scrapeRecentVideoDescriptionsWithCoverage(channelData.youtubeUrl);acquiredRecentDescriptionSurfaces.push(`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`);if(scraped.acquired<scraped.attempted)acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_PARTIAL',detail:`Acquired ${scraped.acquired} of ${scraped.attempted} sampled recent-video descriptions`,observedAt:now});trackChannelSampled(scraped.items);if(scraped.descriptions.length)videoDescs=Array.from(new Set([...(authoritative?[]:scraped.descriptions),...videoDescs,...(authoritative?scraped.descriptions:[])]));}catch(e){acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_SCRAPE_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});}}
   }
 
   function addStep(stepName:InspectionStep['step'],title:string,status:InspectionStep['status'],detailsArr:string[],foundInvite:string|null=null,inviteLocation:string|undefined=undefined,foundInvites:string[]=[]){steps.push({step:stepName,title,status,details:detailsArr.join('\n'),detectedInvite:foundInvite||undefined,detectedInvites:foundInvites.length?foundInvites:foundInvite?[foundInvite]:undefined,inviteLocation,timestamp:now});if(debugLog&&status==='NOT_FOUND'&&!debugLog.failureStep)debugLog.failureStep=stepName;}
@@ -467,5 +556,5 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // the definitive negative instead of manufacturing UNCERTAIN work. The
   // dotless note remains in the step logs for audit; no retry is ever owned
   // (communityRequired is empty, so no directive is built).
-  acquisitionStatus:ExternalAcquisitionStatus=failed&&inspected||partialCoverage?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective(communityRequired),discordCandidates:mergedCandidates};
+  acquisitionStatus:ExternalAcquisitionStatus=failed&&inspected||partialCoverage?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,10),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective(communityRequired),discordCandidates:mergedCandidates};
 }

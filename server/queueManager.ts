@@ -6,7 +6,6 @@ import {
   completeJob,
   failJob,
   recoverStaleJobs,
-  getAllChannels,
   getChannelById,
   getQueriesByCountry,
   upsertChannel,
@@ -38,7 +37,7 @@ import {
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
-import { mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
+import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { validateDiscordInvite } from './discordValidator';
@@ -850,6 +849,28 @@ export function nextChannelScanAttempts(current:number,terminalSemanticOrSuccess
 }
 
 /**
+ * Projects a live post-inspection country rejection onto the channel row.
+ * Mutates and returns the same row: country_status REJECTED, detected
+ * creator country, fresh live score, terminal scan status, and last_checked.
+ * Trading/Discord ownership and the inspection trail are never touched here —
+ * the caller owns Discord projections and trail assembly. Persistence stays
+ * with the caller's existing finally-block upsert; this helper performs no
+ * writes, mirroring applyGate1CountryRejectionToExisting ownership rules.
+ */
+export function applyLiveCountryRejectionToInspected(
+  channel: ChannelRecord,
+  liveCountry: { detectedCreatorCountry?: string | null; score: number },
+  now: string
+): ChannelRecord {
+  channel.country_status = 'REJECTED';
+  channel.country = liveCountry.detectedCreatorCountry || null;
+  channel.confidence_score = liveCountry.score;
+  channel.scan_status = 'COMPLETED';
+  channel.last_checked = now;
+  return channel;
+}
+
+/**
  * Handles newly discovered YouTube channel via the unified ingestion pipeline.
  */
 export async function processDiscoveredChannel(
@@ -911,11 +932,15 @@ export async function inspectAndValidateChannel(
         videoTitles: rawDetails?.videoTitles || [channel.channel_name],
         locationTag: rawDetails?.locationTag,
         externalLinks: rawDetails?.channelLinks || (channel.discord_invite ? [channel.discord_invite] : []),
-        metadataStatus: rawDetails?.countryMetadataStatus || channel.country_metadata_status
+        metadataStatus: rawDetails?.countryMetadataStatus || channel.country_metadata_status,
+        videoDescriptions: rawDetails?.videoDescriptions,
+        videoDescriptionsAuthoritative: rawDetails?.videoDescriptionsAuthoritative,
+        playlists: rawDetails?.playlists
       },
       rawDetails?.locationTag || null
     );
 
+    const preInspectionLanguageSet = aggregatedLanguageCandidateSet(valRes.evidence);
     const countryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
       title: `Country Validation (${channel.country || 'Unknown'})`,
@@ -925,6 +950,8 @@ export async function inspectAndValidateChannel(
         ? 'FOUND'
         : 'NOT_FOUND',
       details: valRes.decisionLogs,
+      // Structured candidate set for recovery reconciliation (no prose parsing).
+      ...(preInspectionLanguageSet ? { candidateCountries: preInspectionLanguageSet } : {}),
       timestamp: now
     };
 
@@ -962,11 +989,18 @@ export async function inspectAndValidateChannel(
 
     // Live About-page hydration can reveal stronger country evidence than the
     // search snippet. Re-evaluate before persisting any discovered community.
+    // The country voter receives the FRESH channel-sampled descriptions
+    // acquired during this inspection (authoritative provenance) — never the
+    // stale pre-inspection rawDetails sample, which may be search-selected or
+    // absent on retries. When inspection acquired nothing fresh, the voter
+    // abstains on descriptions rather than evaluating stale input.
     const rawLiveCountry = await validateChannelCountry({channelName:channel.channel_name,
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
-      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status}, rawDetails?.locationTag || null);
+      metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status,
+      videoDescriptions:inspection.observedVideoDescriptions || [], videoDescriptionsAuthoritative:inspection.observedVideoDescriptionsAuthoritative || false, playlists:rawDetails?.playlists}, rawDetails?.locationTag || null);
     const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
+    const liveLanguageSet = aggregatedLanguageCandidateSet(liveCountry.evidence);
     const liveCountryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
       title: `Country Validation (${rawLiveCountry.detectedCreatorCountry || 'Unknown'}) — Live About`,
@@ -976,10 +1010,15 @@ export async function inspectAndValidateChannel(
         ? 'FOUND'
         : 'NOT_FOUND',
       details: `${rawLiveCountry.decisionLogs}${liveCountry !== rawLiveCountry ? '\\nEffective decision: earlier stronger/conflicting evidence preserved.' : ''}`,
+      // Structured candidate set for recovery reconciliation (no prose parsing).
+      ...(liveLanguageSet ? { candidateCountries: liveLanguageSet } : {}),
       timestamp: now
     };
     if (liveCountry.status === 'REJECTED') {
-      channel.country_status='REJECTED'; channel.country=liveCountry.detectedCreatorCountry || null;
+      // Terminal live rejection: project fresh score/scan/check metadata via
+      // the shared helper (persisted by the finally-block upsert below — no
+      // direct write here), then keep the existing Discord/trail projections.
+      applyLiveCountryRejectionToInspected(channel, liveCountry, now);
       // The live country decision is terminal, but the inspection already ran.
       // Preserve its real steps and only project NOT_FOUND when the inspection
       // actually completed without a candidate or an acquisition failure.
@@ -1224,59 +1263,118 @@ async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,rea
 }
 
 /**
- * Re-tests all existing channels in the database against the updated Hard Exclusion Engine.
+ * Re-tests stored channels in the database against the updated Hard Exclusion Engine.
  * Removes / marks previously accepted excluded-country channels as REJECTED.
+ *
+ * Memory-bounded: only non-REJECTED channels are eligible for country
+ * revalidation (this loop never un-REJECTs, so re-stamping the 195
+ * already-REJECTED rows is idempotent churn), streamed in keyset batches
+ * selecting only the columns the audit reads. A second bounded keyset pass
+ * then restores Discord invite hygiene for REJECTED rows (DEAD/NON_TRADING/
+ * UNCERTAIN with a stored invite) without revalidating their country. The
+ * full row loads only for channels that actually need a write (via
+ * getChannelById + upsertChannel, identical semantics to the previous
+ * full-table loop). Each batch is released before the next is fetched, so at
+ * most one 200-row batch of narrow rows plus one full row is ever retained.
  */
+const EXCLUSION_AUDIT_BATCH_SIZE = 200;
 export async function auditExistingChannelsWithExclusionEngine(): Promise<{ total: number; rejected: number }> {
   try {
-    const allChannels = await getAllChannels();
+    const db = await getDb();
+    let total = 0;
     let rejectedCount = 0;
-
-    for (const channel of allChannels) {
-      // Provenance boundary (see country revalidation above): the bulk audit
-      // has no stored bio text available, and trail prose quotes country names
-      // from prior validation/ acquisition logs. Feeding it as the Bio would
-      // manufacture P2 evidence and terminally REJECT clean channels, so the
-      // audit may only use the creator-level channelName. Unproven → untouched.
-      const valRes = await validateChannelCountry(
-        {
-          channelName: channel.channel_name,
-          description: '',
-          videoTitles: [channel.channel_name],
-          externalLinks: channel.discord_invite ? [channel.discord_invite] : []
-        },
-        null
+    let cursorSeen: string | null = null;
+    let cursorId = '';
+    for (;;) {
+      const batch = await db.query(
+        `SELECT channel_id, channel_name, country, discord_status, discord_invite, first_seen FROM channels WHERE country_status IS DISTINCT FROM 'REJECTED' AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
+        [cursorSeen, cursorId, EXCLUSION_AUDIT_BATCH_SIZE]
       );
+      if (!batch.rowCount) break;
+      for (const candidate of batch.rows) {
+        total++;
+        // Provenance boundary (see country revalidation above): the bulk audit
+        // has no stored bio text available, and trail prose quotes country names
+        // from prior validation/ acquisition logs. Feeding it as the Bio would
+        // manufacture P2 evidence and terminally REJECT clean channels, so the
+        // audit may only use the creator-level channelName. Unproven → untouched.
+        const valRes = await validateChannelCountry(
+          {
+            channelName: candidate.channel_name,
+            description: '',
+            videoTitles: [candidate.channel_name],
+            externalLinks: candidate.discord_invite ? [candidate.discord_invite] : []
+          },
+          null
+        );
 
-      if (valRes.status === 'REJECTED') {
-        rejectedCount++;
-        channel.country_status = 'REJECTED';
-        channel.confidence_score = valRes.score;
-        channel.scan_status = 'COMPLETED';
+        if (valRes.status === 'REJECTED') {
+          rejectedCount++;
+          const channel = await getChannelById(candidate.channel_id);
+          if (!channel) continue;
+          channel.country_status = 'REJECTED';
+          channel.confidence_score = valRes.score;
+          channel.scan_status = 'COMPLETED';
 
-        const countryStep: InspectionStep = {
-          step: 'COUNTRY_VALIDATION',
-          title: `Database Country Exclusion Audit (${channel.country})`,
-          status: 'REJECTED',
-          details: valRes.decisionLogs,
-          timestamp: new Date().toISOString()
-        };
+          const countryStep: InspectionStep = {
+            step: 'COUNTRY_VALIDATION',
+            title: `Database Country Exclusion Audit (${channel.country})`,
+            status: 'REJECTED',
+            details: valRes.decisionLogs,
+            timestamp: new Date().toISOString()
+          };
 
-        const otherSteps = (channel.inspection_trail || []).filter(s => s.step !== 'COUNTRY_VALIDATION');
-        channel.inspection_trail = [countryStep, ...otherSteps];
+          const otherSteps = (channel.inspection_trail || []).filter(s => s.step !== 'COUNTRY_VALIDATION');
+          channel.inspection_trail = [countryStep, ...otherSteps];
 
-        await upsertChannel(channel);
-      } else if (channel.discord_status === 'DEAD' || channel.discord_status === 'NON_TRADING' || channel.discord_status === 'UNCERTAIN') {
-        // Enforce persistence rule: never store invite URLs for DEAD, NON_TRADING, or UNCERTAIN channels
-        if (channel.discord_invite !== null) {
-          channel.discord_invite = null;
           await upsertChannel(channel);
+        } else if (candidate.discord_status === 'DEAD' || candidate.discord_status === 'NON_TRADING' || candidate.discord_status === 'UNCERTAIN') {
+          // Enforce persistence rule: never store invite URLs for DEAD, NON_TRADING, or UNCERTAIN channels
+          if (candidate.discord_invite !== null) {
+            const channel = await getChannelById(candidate.channel_id);
+            if (!channel) continue;
+            channel.discord_invite = null;
+            await upsertChannel(channel);
+          }
         }
       }
+
+      if (batch.rows.length < EXCLUSION_AUDIT_BATCH_SIZE) break;
+      const last = batch.rows[batch.rows.length - 1];
+      cursorSeen = last.first_seen instanceof Date ? last.first_seen.toISOString() : String(last.first_seen);
+      cursorId = String(last.channel_id);
     }
 
-    console.log(`[Database Audit] Re-tested ${allChannels.length} stored channels: ${rejectedCount} excluded channels marked REJECTED.`);
-    return { total: allChannels.length, rejected: rejectedCount };
+    // Rejected-row Discord hygiene: the country pass above intentionally skips
+    // REJECTED rows (never un-REJECTs, memory-bounded keyset), but those rows
+    // must still reach invite cleanup. This separate bounded keyset pass
+    // selects only narrow cleanup-eligible columns and performs no country
+    // validation — full rows load only for rows that actually need the write.
+    let cleanedInvites = 0;
+    let cleanupSeen: string | null = null;
+    let cleanupId = '';
+    for (;;) {
+      const stale = await db.query(
+        `SELECT channel_id, discord_status, discord_invite, first_seen FROM channels WHERE country_status = 'REJECTED' AND discord_status IN ('DEAD','NON_TRADING','UNCERTAIN') AND discord_invite IS NOT NULL AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
+        [cleanupSeen, cleanupId, EXCLUSION_AUDIT_BATCH_SIZE]
+      );
+      if (!stale.rowCount) break;
+      for (const candidate of stale.rows) {
+        const channel = await getChannelById(candidate.channel_id);
+        if (!channel) continue;
+        if (channel.discord_invite == null) continue;
+        channel.discord_invite = null;
+        await upsertChannel(channel);
+        cleanedInvites++;
+      }
+      if (stale.rows.length < EXCLUSION_AUDIT_BATCH_SIZE) break;
+      const lastStale = stale.rows[stale.rows.length - 1];
+      cleanupSeen = lastStale.first_seen instanceof Date ? lastStale.first_seen.toISOString() : String(lastStale.first_seen);
+      cleanupId = String(lastStale.channel_id);
+    }
+
+    console.log(`[Database Audit] Re-tested ${total} stored channels: ${rejectedCount} excluded channels marked REJECTED; cleared ${cleanedInvites} stale invites from rejected rows.`);
+    return { total, rejected: rejectedCount };
   } catch (err) {
     console.error('Error during database channel exclusion audit:', err);
     return { total: 0, rejected: 0 };

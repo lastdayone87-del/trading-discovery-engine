@@ -11,6 +11,7 @@ export type CountryEvidenceSource =
   | 'PHONE_NUMBER'
   | 'PHYSICAL_ADDRESS'
   | 'NATIVE_LANGUAGE'
+  | 'AGGREGATED_CONTENT_LANGUAGE'
   | 'DISCOVERY_CONTEXT'
   | 'EXCLUSION_POLICY';
 
@@ -34,6 +35,13 @@ export interface CountryInferenceEvidence {
   reasoning: string;
   matchedValue?: string;
   matchedContext?: string;
+  /**
+   * Candidate creator countries for aggregated-language evidence (Urdu,
+   * Bengali). Single-country languages omit this field. Recorded so
+   * policy-edit reconciliation can match rows by set membership when an
+   * exclusion is removed.
+   */
+  candidateCountries?: string[];
   /**
    * Provenance boundary: the exact creator-level input field that produced
    * this evidence. P2 CHANNEL_ABOUT_BIO evidence must only ever carry
@@ -63,6 +71,30 @@ export interface CountryInferenceInput {
   officialWebsiteLinks?: string[];
   verifiedSocialLinks?: string[];
   videoTitles?: string[];
+  /**
+   * Already-fetched creator-written video descriptions (up to 10 recent).
+   * Used ONLY by the aggregated-content-language voter below — never joined
+   * into bio text, never matched by P2/P5–P8 matchers. Titles stay excluded
+   * (retrieval-selected, circular). Empty at pre-enrichment Gate 1, so
+   * behavior there is unchanged.
+   */
+  videoDescriptions?: string[];
+  /**
+   * Provenance gate for the aggregated-content-language voter. True ONLY when
+   * the descriptions are an authoritative recent-channel sample (channel
+   * enrichment recent-uploads fetch or live revalidation fetch).
+   * Search-selected / retrieval-selected snippets, playlist-adapter
+   * observations, and any other discovery-selected subsets are
+   * non-authoritative and can never vote, so a query-biased subset cannot
+   * manufacture a language majority. Titles stay excluded regardless.
+   */
+  videoDescriptionsAuthoritative?: boolean;
+  /**
+   * Already-fetched playlist names/descriptions (stage 2+). Corroboration
+   * veto only: a playlist voting a different eligible language voids
+   * dominance, but playlists can never create a rejection on their own.
+   */
+  playlists?: Array<{ name?: string; description?: string }>;
   discoveryCountry?: string;
   metadataStatus?: CountryMetadataStatus;
 }
@@ -95,7 +127,8 @@ const CREATOR_EVIDENCE_SOURCES: Set<CountryEvidenceSource> = new Set([
   'BROKER_REFERENCE',
   'PHONE_NUMBER',
   'PHYSICAL_ADDRESS',
-  'NATIVE_LANGUAGE'
+  'NATIVE_LANGUAGE',
+  'AGGREGATED_CONTENT_LANGUAGE'
 ]);
 
 const COUNTRY_ALIASES: Record<string, string> = {
@@ -225,6 +258,211 @@ function hostname(link: string): string {
  * Perform country assessment separating discovery context from creator-level evidence.
  * Structurally guarantees DISCOVERY_CONTEXT can NEVER populate detectedCreatorCountry or trigger REJECTED.
  */
+/**
+ * Approved aggregated-language definitions: dominant content language →
+ * candidate creator countries plus the deterministic signals that identify
+ * the language in one video description. A language is listed only when
+ * every strongly-associated country is on the excluded-country list
+ * (single-country languages, or multi-country languages whose members are
+ * all excluded). Worldwide or ambiguous languages (English, French, Spanish,
+ * Portuguese, Arabic, Bahasa) are deliberately absent and can never vote.
+ *
+ * Data-driven by design: supporting an additional excluded-country language
+ * means adding one entry here — no per-language code branches exist. A new
+ * entry whose signals overlap an existing language degrades both to
+ * abstention (see voteVideoDescriptionLanguage), so overlapping signals must
+ * ship with distinguishing signals or stay out.
+ */
+export interface AggregatedLanguageDefinition {
+  countries: string[];
+  /** Unicode scripts whose presence votes (use only for scripts unique to excluded-country languages). */
+  scripts?: string[];
+  /** Distinctive characters with a minimum count (e.g. Vietnamese diacritics). */
+  diacritics?: { chars: string; threshold: number };
+  /** High-precision phrases; ANY single hit votes. */
+  phraseKeywords?: string[];
+  /** Function words; require minHits DISTINCT word-boundary hits to vote. */
+  wordKeywords?: { words: string[]; minHits: number };
+  /**
+   * Arabic-script gate: when set, the 'Arabic' script votes only with one of
+   * these marker characters present (Arabic script alone is worldwide and
+   * shared vocabulary would misattribute e.g. Arabic news content).
+   */
+  arabicMarkers?: string;
+  /**
+   * Generic conjunction guard: when true, a scripts-only match abstains — at
+   * least one non-script signal group must also match. For scripts shared
+   * across languages (e.g. Devanagari), the script identifies the script
+   * family only; a language-specific corroborating signal is required before
+   * any country attribution. Data-driven (no per-language code branches).
+   */
+  scriptNeedsCorroboration?: boolean;
+  /**
+   * Generic whole-word vetoes evaluated for any language: ANY hit makes one
+   * description abstain from this language. Used to separate closely-related
+   * languages sharing a script (e.g. Nepali-specific markers veto Hindi so
+   * Devanagari content is never misattributed by default). Precision-first:
+   * when in doubt the voter abstains rather than guessing.
+   */
+  vetoWords?: string[];
+}
+
+export const AGGREGATED_CONTENT_LANGUAGES: Record<string, AggregatedLanguageDefinition> = {
+  Vietnamese: {
+    countries: ['Vietnam'],
+    // Vietnamese-specific characters ONLY: đ/Đ, ă/Ă, ơ/Ơ, ư/Ư and the
+    // U+1EA0–U+1EF9 precomposed tone vowels (Vietnamese-only codepoints).
+    // Shared Latin diacritics such as â/ê/ô/Â/Ê/Ô also occur naturally in
+    // French and other languages, so they are deliberately excluded here:
+    // ordinary French text must abstain, never vote Vietnamese.
+    diacritics: { chars: 'đĐăĂơƠưƯẠ-ỹ', threshold: 3 },
+    phraseKeywords: ['chứng khoán', 'phân tích kỹ thuật', 'giao dịch', 'thị trường', 'cổ phiếu', 'đầu tư']
+  },
+  Tagalog: {
+    countries: ['Philippines'],
+    wordKeywords: { words: ['ang', 'ng', 'mga', 'nang', 'ito', 'niya', 'kanila', 'natin', 'huwag', 'araw'], minHits: 2 }
+  },
+  Hindi: {
+    // Devanagari is shared by Hindi, Marathi, Nepali and others, so the
+    // script alone NEVER votes (scriptNeedsCorroboration). Hindi-specific
+    // function words must corroborate, and Nepali-specific markers veto, so
+    // Nepali content abstains instead of misattributing to India. The
+    // approved Hindi → India mapping is retained; only the evidence bar is
+    // language-specific now. Nepal is deliberately NOT added to the candidate
+    // set: the objective is to distinguish Hindi from Nepali, not to blur
+    // them into one set.
+    countries: ['India'],
+    scripts: ['Devanagari'],
+    scriptNeedsCorroboration: true,
+    wordKeywords: { words: ['है', 'हैं', 'हूँ', 'था', 'थी', 'थे', 'यह', 'ये', 'वह', 'वे', 'क्या', 'मैं', 'हम', 'मुझे', 'नहीं', 'वाला', 'वाले', 'वाली', 'करना', 'करता', 'करते', 'होगा', 'होगी', 'चाहिए', 'सकते', 'सकता'], minHits: 2 },
+    vetoWords: ['छ', 'छन्', 'छैन', 'होइन', 'थियो', 'थिइन्', 'नेप्से', 'लागि', 'बाट', 'तपाईं', 'तपाई', 'हामी', 'गरेको', 'भएको', 'हुने']
+  },
+  Bengali: {
+    // Bengali script is unique to Bengali/Assamese (Bangladesh/India, excluded).
+    countries: ['Bangladesh', 'India'],
+    scripts: ['Bengali']
+  },
+  Urdu: {
+    countries: ['Pakistan', 'India'],
+    scripts: ['Arabic'],
+    arabicMarkers: '\u0688\u0679\u0691\u06be\u06c1\u06d2'
+  }
+};
+
+/** Minimum usable (non-empty) descriptions for a language rejection. */
+export const AGGREGATED_LANGUAGE_MIN_USABLE = 8;
+/** Minimum dominant-language share of usable descriptions. */
+export const AGGREGATED_LANGUAGE_MIN_SHARE = 0.8;
+
+function countPatternMatches(text: string, pattern: RegExp): number {
+  const matches = text.match(pattern);
+  return matches ? matches.length : 0;
+}
+
+/**
+ * Single-video language vote over one creator-written description. Returns
+ * the approved language key or null (abstain). Generic over
+ * AGGREGATED_CONTENT_LANGUAGES: every defined signal group can vote, veto
+ * words suppress attribution for any language, and a video matching more
+ * than one eligible language abstains rather than guessing. Deterministic,
+ * no libraries. Precision-first: shared/ambiguous signals abstain.
+ */
+export function voteVideoDescriptionLanguage(text: string): string | null {
+  const value = (text || '').trim();
+  if (!value) return null;
+  const lower = value.toLocaleLowerCase('en');
+  // \p{Mark} stays inside tokens so dependent vowel signs never shatter
+  // Indic words (Devanagari है must remain one token, not 'ह' + fragment).
+  // Latin tokenization is unaffected.
+  const tokens = new Set(lower.split(/[^\p{Letter}\p{Number}\p{Mark}]+/u).filter(Boolean));
+  const votes = new Set<string>();
+  for (const [language, definition] of Object.entries(AGGREGATED_CONTENT_LANGUAGES)) {
+    // Generic veto: a closely-related language's markers suppress this
+    // language so shared-script content is never misattributed by default.
+    if (definition.vetoWords?.some(word => tokens.has(word.toLocaleLowerCase('en')))) continue;
+    const groupVotes = { script: false, chars: false, phrase: false, words: false };
+    if (definition.scripts) {
+      groupVotes.script = definition.scripts.some(script => {
+        if (script === 'Arabic' && definition.arabicMarkers) {
+          return new RegExp(`\\p{Script=${script}}`, 'u').test(value) &&
+            new RegExp(`[${definition.arabicMarkers}]`).test(value);
+        }
+        return new RegExp(`\\p{Script=${script}}`, 'u').test(value);
+      });
+    }
+    if (definition.diacritics) {
+      groupVotes.chars = countPatternMatches(value, new RegExp(`[${definition.diacritics.chars}]`, 'g')) >= definition.diacritics.threshold;
+    }
+    if (definition.phraseKeywords) {
+      groupVotes.phrase = definition.phraseKeywords.some(keyword => lower.includes(keyword));
+    }
+    if (definition.wordKeywords) {
+      groupVotes.words = definition.wordKeywords.words.filter(keyword => tokens.has(keyword)).length >= definition.wordKeywords.minHits;
+    }
+    if (!groupVotes.script && !groupVotes.chars && !groupVotes.phrase && !groupVotes.words) continue;
+    // Shared-script guard: the script alone identifies the script family,
+    // not the language — without a corroborating language-specific signal
+    // the description abstains instead of guessing.
+    if (definition.scriptNeedsCorroboration && groupVotes.script && !groupVotes.chars && !groupVotes.phrase && !groupVotes.words) continue;
+    votes.add(language);
+  }
+  if (votes.size !== 1) return null;
+  return [...votes][0];
+}
+
+export interface AggregatedContentLanguage {
+  language: string;
+  countries: string[];
+  usable: number;
+  votes: number;
+  share: number;
+  confidence: number;
+}
+
+/**
+ * Aggregates per-video language votes over already-fetched descriptions.
+ * Returns null unless ALL high-confidence conditions hold: ≥8 usable
+ * descriptions, ≥80% share for a single winner, no second eligible language
+ * with ≥2 votes, and no playlist corroboration veto. Playlists can only veto
+ * (a playlist voting a different eligible language voids dominance), never
+ * decide. Pure function — no I/O, no quota.
+ */
+export function aggregateContentLanguage(
+  descriptions: string[],
+  playlists: Array<{ name?: string; description?: string }> = []
+): AggregatedContentLanguage | null {
+  const usableTexts = (descriptions || []).map(text => (text || '').trim()).filter(Boolean).slice(0, 10);
+  if (usableTexts.length < AGGREGATED_LANGUAGE_MIN_USABLE) return null;
+  const tally = new Map<string, number>();
+  for (const text of usableTexts) {
+    const vote = voteVideoDescriptionLanguage(text);
+    if (vote) tally.set(vote, (tally.get(vote) || 0) + 1);
+  }
+  const ranked = [...tally.entries()].sort((a, b) => b[1] - a[1]);
+  if (ranked.length === 0) return null;
+  const [language, votes] = ranked[0];
+  const share = votes / usableTexts.length;
+  if (share < AGGREGATED_LANGUAGE_MIN_SHARE) return null;
+  if (ranked.length > 1 && ranked[1][1] >= 2) return null;
+  const playlistTexts = (playlists || [])
+    .flatMap(item => [item?.name || '', item?.description || ''])
+    .filter(text => text.trim());
+  for (const text of playlistTexts) {
+    const vote = voteVideoDescriptionLanguage(text);
+    if (vote && vote !== language) return null;
+  }
+  const spec = AGGREGATED_CONTENT_LANGUAGES[language];
+  if (!spec) return null;
+  return {
+    language,
+    countries: [...spec.countries],
+    usable: usableTexts.length,
+    votes,
+    share,
+    confidence: share === 1 ? 90 : 86
+  };
+}
+
 export function assessChannelCountry(
   input: CountryInferenceInput,
   exclusions: ExcludedCountry[] = [],
@@ -339,6 +577,69 @@ export function assessChannelCountry(
       sourceField: 'discoveryCountry',
       reasoning: `Discovery context suggests ${discoveryCountry}; no creator-level attribution is implied.`
     });
+  }
+
+  // AGGREGATED_CONTENT_LANGUAGE (P3): dominant creator-written language across
+  // already-fetched video descriptions. Evaluated only when no P1/P2 evidence
+  // exists (those tiers outrank unconditionally, so a conclusive bio or
+  // official country skips this path entirely) AND the descriptions carry an
+  // authoritative recent-channel provenance flag (see
+  // videoDescriptionsAuthoritative). Search-selected / retrieval-selected
+  // snippets can never vote, no matter how dominant they look.
+  //
+  // The linked website plays NO role here — it must not select from a
+  // multi-country set, nor enable, confirm, or block the language decision: a
+  // website could be an affiliate, broker, or unrelated third party. A valid
+  // language signal therefore decides on its own, website agreement or
+  // disagreement notwithstanding. Website evidence remains in the audit trail
+  // below but is excluded from this decision by construction.
+  if (!evidence.some(item => item.source === 'OFFICIAL_YOUTUBE_METADATA' || item.source === 'CHANNEL_ABOUT_BIO')) {
+    if (input.videoDescriptionsAuthoritative === true) {
+      const aggregated = aggregateContentLanguage(input.videoDescriptions || [], input.playlists || []);
+      if (aggregated) {
+        const isLiveExcluded = (country: string): boolean =>
+          exclusions.some(item => normalizeCountryName(item.country_name) === normalizeCountryName(country));
+        // Language-only rejection requires every candidate country currently
+        // excluded. If any set member is not excluded, emit nothing.
+        if (aggregated.countries.every(isLiveExcluded)) {
+          const representative = [...aggregated.countries].sort((a, b) => a.localeCompare(b))[0];
+          const firstVoting = (input.videoDescriptions || []).map(text => (text || '').trim()).filter(Boolean)
+            .find(text => voteVideoDescriptionLanguage(text) === aggregated.language) || '';
+          const setLabel = `candidate countries [${aggregated.countries.join(', ')}]`;
+          const languageItem: CountryInferenceEvidence = {
+            source: 'AGGREGATED_CONTENT_LANGUAGE' as const,
+            priority: 3,
+            detectedCountry: representative,
+            confidence: aggregated.confidence,
+            ...(aggregated.countries.length > 1 ? { candidateCountries: [...aggregated.countries] } : {}),
+            matchedValue: `${aggregated.votes}/${aggregated.usable} ${aggregated.language}`,
+            matchedContext: firstVoting.slice(0, 160),
+            sourceField: 'videoDescriptions',
+            reasoning: `${aggregated.votes}/${aggregated.usable} recent video descriptions in ${aggregated.language} (${setLabel}, all currently excluded).`
+          };
+          const policy: CountryInferenceEvidence = {
+            source: 'EXCLUSION_POLICY',
+            priority: 0,
+            detectedCountry: representative,
+            confidence: aggregated.confidence,
+            reasoning: `${representative} is excluded by policy: ${(exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(representative))?.reason) || 'Excluded by policy'}.`
+          };
+          return {
+            discoveryCountry,
+            detectedCreatorCountry: representative,
+            countryEvidence: [policy, languageItem, ...evidence],
+            countryStatus: 'REJECTED',
+            evidenceAvailability,
+            gateDisposition: 'REJECT_EXCLUDED',
+            confidence: aggregated.confidence,
+            reasoning: policy.reasoning,
+            decisiveEvidence: [languageItem],
+            rejectionReason: policy.reasoning
+          };
+        }
+        // Map invalid under the live list: fall through with no language item.
+      }
+    }
   }
 
   // STRICT CREATOR EVIDENCE ALLOWLIST:
