@@ -13,3 +13,19 @@ test('canary assignment is deterministic, bounded, and defaults to control',()=>
 test('quota and completed stages fail closed to review',()=>{const plan=planEvidenceAction({decision:decision(),rawInput:{channel_name:'Spent',description:'',enrichment_stage:2},mode:'CANARY',providerQuotaRemaining:0});assert.equal(plan.selectedAction,'HUMAN_REVIEW');assert.equal(plan.appliedAction,'HUMAN_REVIEW');assert.ok(plan.assessments.VIDEO_PLAYLIST_CORROBORATION.violations.includes('PROVIDER_QUOTA'));});
 test('a hard policy violation cannot fall through to an infeasible action',()=>assert.throws(()=>planEvidenceAction({decision:decision(),rawInput:{channel_name:'Blocked',description:'',enrichment_stage:0},mode:'CANARY',providerQuotaRemaining:1000,countryAllowed:false}),/NO_FEASIBLE_EVIDENCE_ACTION/));
 test('migration and integration remain immutable, off by default, and action bounded',()=>{const migration=readFileSync(new URL('./db/migrations/038_voi_evidence_controller.sql',import.meta.url),'utf8'),controller=readFileSync(new URL('./voiEvidenceController.ts',import.meta.url),'utf8');assert.match(migration,/voi_evidence_controller_mode','OFF'/);assert.match(migration,/voi_evidence_canary_basis_points','0'/);assert.match(migration,/reject_immutable_event_mutation/);for(const action of ['CHANNEL_RECENT_METADATA','VIDEO_PLAYLIST_CORROBORATION','HUMAN_REVIEW'])assert.match(migration,new RegExp(action));assert.match(controller,/plan\.appliedAction=controllerAssigned\?plan\.selectedAction:input\.legacyAction/);assert.doesNotMatch(controller,/selectedAction.*trading_status/);});
+
+test('stage-two degraded collection routes legacy action to bounded provider retry',()=>{
+  const d=decision({evidenceCollection:{sufficiency:'SUFFICIENT',sparseMetadata:false,degraded:true,fieldsPresent:['channel_bio'],reasonCodes:['PROVIDER_COVERAGE_DEGRADED'],providers:[{provider:'gemini_semantic',availability:'FAILED',evidenceCount:0,outcome:'FAILED_PROVIDER',reasonCodes:['PROVIDER_RATE_LIMIT']}]}});
+  const plan=planEvidenceAction({decision:d,rawInput:{channel_name:'Degraded',description:'rich enough bio text for review',enrichment_stage:2},mode:'CANARY',providerQuotaRemaining:1000});
+  assert.equal(plan.legacyAction,'PROVIDER_RETRY');
+});
+
+test('stage-two fallback-covered collection preserves human review instead of provider retry',()=>{
+  const d=decision({evidenceCollection:{sufficiency:'SUFFICIENT',sparseMetadata:false,degraded:true,fieldsPresent:['channel_bio'],reasonCodes:['PROVIDER_COVERAGE_DEGRADED'],providers:[
+    {provider:'gemini_semantic',availability:'FAILED',evidenceCount:0,outcome:'FAILED_PROVIDER',reasonCodes:['PROVIDER_RATE_LIMIT']},
+    {provider:'groq_semantic',availability:'AVAILABLE',evidenceCount:0,outcome:'ABSTAINED_LOW_CONFIDENCE',reasonCodes:['SEMANTIC_MODEL_ABSTAINED','SEMANTIC_FALLBACK_SUCCEEDED']},
+  ]}});
+  const plan=planEvidenceAction({decision:d,rawInput:{channel_name:'Covered',description:'rich enough bio text for review',enrichment_stage:2},mode:'CANARY',providerQuotaRemaining:1000});
+  assert.equal(plan.legacyAction,'HUMAN_REVIEW');
+  assert.ok(!plan.reasonCodes.includes('DEGRADED_PROVIDER_BOUNDED_RETRY'));
+});
