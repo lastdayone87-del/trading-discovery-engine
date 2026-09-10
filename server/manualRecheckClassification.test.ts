@@ -29,8 +29,15 @@ test('manual recheck preserves existing classification when fresh YouTube acquis
 
 test('manual recheck still fails closed on degraded classifier provider coverage before diagnostic writes', () => {
   const classify = ingestion.indexOf('const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);');
-  const guard = ingestion.indexOf("source === 'recheck' && isManualScan && productionClassification.decision.evidenceCollection.degraded");
+  const guard = ingestion.indexOf('manualRecheckDegradedError(productionClassification.decision.evidenceCollection)');
   const diagnostic = ingestion.indexOf('observeProductionDiagnosticReliably', classify);
   assert.ok(classify >= 0 && guard > classify && diagnostic > guard);
-  assert.match(ingestion, /MANUAL_RESCAN_CLASSIFICATION_DEGRADED/);
+  const gate = readFileSync(new URL('./enrichmentOperationalFailure.ts', import.meta.url), 'utf8');
+  assert.match(gate, /MANUAL_RESCAN_CLASSIFICATION_DEGRADED/);
+});
+
+test('manual recheck proceeds when a served fallback covers the degraded providers', () => {
+  const gate = readFileSync(new URL('./enrichmentOperationalFailure.ts', import.meta.url), 'utf8');
+  assert.match(gate, /isFallbackCovered\(collection\)/);
+  assert.match(gate, /uncovered\.length === 0/);
 });

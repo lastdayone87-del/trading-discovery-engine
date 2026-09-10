@@ -12,6 +12,25 @@ const OPERATIONAL_PROVIDER_REASONS = new Set([
   'GEMINI_CAPACITY_DEFERRED'
 ]);
 
+const SEMANTIC_PROVIDER_KEYS = new Set(['gemini_semantic', 'groq_semantic', 'gemini_free_semantic']);
+
+/**
+ * True when a semantic fallback served this evaluation after an earlier
+ * semantic provider failed (see executeSemanticChain: the winning report
+ * carries SEMANTIC_FALLBACK_SUCCEEDED). The original failure stays in the
+ * provider ledger for telemetry — this only records that coverage was
+ * restored, so downstream gates treat the served result (including a valid
+ * non-terminal one) as operationally successful instead of retrying a
+ * provider outage that has already been routed around.
+ */
+export function isFallbackCovered(report: EvidenceCollectionReport): boolean {
+  return (report.providers || []).some(provider => (provider.reasonCodes || []).includes('SEMANTIC_FALLBACK_SUCCEEDED'));
+}
+
+function isSemanticProviderKey(provider: string): boolean {
+  return SEMANTIC_PROVIDER_KEYS.has(provider);
+}
+
 export interface OperationalProviderFailure {
   provider: string;
   reasonCodes: string[];
@@ -98,5 +117,37 @@ export function enrichmentOperationalFailure(
     }))
     .filter(provider => provider.reasonCodes.length > 0);
   if (!providerFailures.length) return null;
+  // A served semantic fallback covers the semantic outage: the evaluation
+  // proceeds on its merits (including UNCERTAIN → review/deeper stages)
+  // instead of defer-retrying a routed-around failure. Non-semantic
+  // operational failures still throw; the failed primary stays recorded.
+  if (isFallbackCovered(report)) {
+    const uncovered = providerFailures.filter(failure => !isSemanticProviderKey(failure.provider));
+    if (uncovered.length === 0) return null;
+    return new OperationalEnrichmentProviderError(uncovered);
+  }
   return new OperationalEnrichmentProviderError(providerFailures);
+}
+
+/**
+ * Manual-recheck degraded-coverage gate, extracted for testability. Returns
+ * the retryable error when failed providers remain uncovered, or null when
+ * the evaluation may proceed. A served semantic fallback covers semantic
+ * failures exactly like the enrichment gate above.
+ */
+export function manualRecheckDegradedError(
+  collection: EvidenceCollectionReport
+): (Error & { code?: string; retryable?: boolean; providerReasons?: string[] }) | null {
+  if (!collection.degraded) return null;
+  const failedProviders = collection.providers.filter(provider => provider.availability === 'FAILED');
+  if (failedProviders.length === 0) return null;
+  const uncovered = isFallbackCovered(collection)
+    ? failedProviders.filter(provider => !isSemanticProviderKey(provider.provider))
+    : failedProviders;
+  if (uncovered.length === 0) return null;
+  const reasonCodes = uncovered.flatMap(provider => provider.reasonCodes || []);
+  return Object.assign(
+    new Error(`Manual recheck classification provider coverage is degraded: ${uncovered.map(provider => provider.provider).join(', ') || 'unknown provider'}.`),
+    { code: 'MANUAL_RESCAN_CLASSIFICATION_DEGRADED', retryable: true, providerReasons: reasonCodes }
+  );
 }

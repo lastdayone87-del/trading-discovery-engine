@@ -188,11 +188,12 @@ const chainKnowledge = {} as never;
 test('chain falls back on primary failure and records both attempts', async () => {
   const calls: string[] = [];
   const primary = stubProvider('gemini_semantic', { fail: 'boom' });
+  const groqStub = stubProvider('groq_semantic', {});
   const fallback = {
-    ...stubProvider('groq_semantic', {}),
-    collectEvidence: async (...args: never[]) => {
+    ...groqStub,
+    collectEvidence: async (input: never, knowledge: never) => {
       calls.push('fallback');
-      return stubProvider('groq_semantic', {}).collectEvidence(...args);
+      return groqStub.collectEvidence(input as never, knowledge as never);
     },
   } as EvidenceProvider;
   const result = await executeSemanticChain([primary, fallback], chainInput, chainKnowledge);
@@ -208,11 +209,12 @@ test('chain falls back on primary failure and records both attempts', async () =
 test('chain stops at abstention and never shops for a second opinion', async () => {
   let fallbackCalls = 0;
   const primary = stubProvider('gemini_semantic', { abstain: true });
+  const groqStub = stubProvider('groq_semantic', {});
   const fallback = {
-    ...stubProvider('groq_semantic', {}),
-    collectEvidence: async (...args: never[]) => {
+    ...groqStub,
+    collectEvidence: async (input: never, knowledge: never) => {
       fallbackCalls += 1;
-      return stubProvider('groq_semantic', {}).collectEvidence(...args);
+      return groqStub.collectEvidence(input as never, knowledge as never);
     },
   } as EvidenceProvider;
   const result = await executeSemanticChain([primary, fallback], chainInput, chainKnowledge);

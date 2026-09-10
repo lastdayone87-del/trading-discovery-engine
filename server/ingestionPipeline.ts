@@ -23,7 +23,7 @@ import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type Ev
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
-import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders } from './enrichmentOperationalFailure';
+import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
@@ -500,13 +500,8 @@ export async function processChannelThroughPipeline(
   );
   if(enrichmentProviderFailure) throw enrichmentProviderFailure;
   if (source === 'recheck' && isManualScan && productionClassification.decision.evidenceCollection.degraded) {
-    const failedProviders = productionClassification.decision.evidenceCollection.providers.filter(provider => provider.availability === 'FAILED');
-    const reasonCodes = failedProviders.flatMap(provider => provider.reasonCodes || []);
-    const error = Object.assign(
-      new Error(`Manual recheck classification provider coverage is degraded: ${failedProviders.map(provider => provider.provider).join(', ') || 'unknown provider'}.`),
-      { code: 'MANUAL_RESCAN_CLASSIFICATION_DEGRADED', retryable: true, providerReasons: reasonCodes }
-    );
-    throw error;
+    const recheckError = manualRecheckDegradedError(productionClassification.decision.evidenceCollection);
+    if (recheckError) throw recheckError;
   }
   const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:candidate.discoveryJobId,queryRunId:candidate.queryRunId,nominationId:candidate.nominationId}})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
