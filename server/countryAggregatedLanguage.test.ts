@@ -600,3 +600,89 @@ test('human-rejected rows are never machine-restored', () => {
   const source = readFileSync(new URL('./countryBoundaryRecovery.ts', import.meta.url), 'utf8');
   assert.match(source, /channel\.trading_status === 'HUMAN_REJECTED'/);
 });
+
+// ---------------------------------------------------------------------------
+// Finding 2: authoritative live sample must reach the 8-description minimum
+// ---------------------------------------------------------------------------
+
+test('live API sample requests up to 10 recent descriptions', () => {
+  const source = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const recent = source.slice(
+    source.indexOf('export async function fetchRecentVideoDescriptionsFromAPI'),
+    source.indexOf('/**\n * Fetches richer official channel metadata'),
+  );
+  assert.match(recent, /maxResults:\s*10/);
+});
+
+test('live inspection continues channel sampling until 8 authoritative descriptions', () => {
+  const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
+  assert.match(source, /channelSampledDescs\.length\s*<\s*8/);
+});
+
+test('8+ usable live descriptions reach aggregation; fewer than 8 abstains', async () => {
+  const eight = Array.from({ length: 8 }, (_, i) => `${VI} — bản tin ${i + 1}`);
+  const full = await runChannelInspection({
+    channelId: 'UCvvvvvvvvvvvvvvvvvvvvvv',
+    channelName: 'Test Channel',
+    channelBio: 'Trading creator',
+    channelLinks: [],
+    videoDescriptions: [],
+    creatorLikelyTrading: true,
+    recentVideoDescriptionsLoader: async () => eight,
+  });
+  assert.equal(full.observedVideoDescriptions?.length, 8);
+  assert.equal(full.observedVideoDescriptionsAuthoritative, true);
+  const decided = assess({
+    videoDescriptions: full.observedVideoDescriptions || [],
+    videoDescriptionsAuthoritative: full.observedVideoDescriptionsAuthoritative,
+  });
+  assert.equal(decided.countryStatus, 'REJECTED');
+
+  const five = Array.from({ length: 5 }, (_, i) => `${VI} — bản tin ${i + 1}`);
+  const short = await runChannelInspection({
+    channelId: 'UCwwwwwwwwwwwwwwwwwwwwxx',
+    channelName: 'Test Channel',
+    channelBio: 'Trading creator',
+    channelLinks: [],
+    videoDescriptions: [],
+    creatorLikelyTrading: true,
+    recentVideoDescriptionsLoader: async () => five,
+  });
+  assert.equal(short.observedVideoDescriptions?.length, 5);
+  const abstained = assess({
+    videoDescriptions: short.observedVideoDescriptions || [],
+    videoDescriptionsAuthoritative: short.observedVideoDescriptionsAuthoritative,
+  });
+  assert.notEqual(abstained.countryStatus, 'REJECTED');
+});
+
+test('dominant preloaded search snippets alone cannot satisfy the authoritative requirement', async () => {
+  const preloaded = Array.from({ length: 10 }, () => VI);
+  const result = await runChannelInspection({
+    channelId: 'UCxxxxxxxxxxxxxxxxxxxxxq',
+    channelName: 'Test Channel',
+    channelBio: 'Trading creator',
+    channelLinks: [],
+    videoDescriptions: preloaded,
+    creatorLikelyTrading: true,
+    recentVideoDescriptionsLoader: async () => [],
+  });
+  assert.deepEqual(result.observedVideoDescriptions, []);
+  assert.equal(result.observedVideoDescriptionsAuthoritative, false);
+  const stale = assess({ videoDescriptions: preloaded, videoDescriptionsAuthoritative: false });
+  assert.notEqual(stale.countryStatus, 'REJECTED');
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3: recovery version invalidation
+// ---------------------------------------------------------------------------
+
+test('recovery version is v4 so prior v3 events/jobs reconsider current rejection state', async () => {
+  const { COUNTRY_BOUNDARY_RECOVERY_VERSION, countryBoundaryRecoveryKey } = await import('./countryBoundaryRecovery');
+  assert.equal(COUNTRY_BOUNDARY_RECOVERY_VERSION, 'country-boundary-nonexcluded-v4');
+  const key = countryBoundaryRecoveryKey('channel-123');
+  assert.equal(key, 'country-boundary-reprocess:country-boundary-nonexcluded-v4:channel-123');
+  assert.notEqual(key, 'country-boundary-reprocess:country-boundary-nonexcluded-v3:channel-123');
+  const source = readFileSync(new URL('./countryBoundaryRecovery.ts', import.meta.url), 'utf8');
+  assert.match(source, /`recovery:\$\{COUNTRY_BOUNDARY_RECOVERY_VERSION\}:\$\{channelId\}`/);
+});

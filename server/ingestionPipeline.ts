@@ -69,13 +69,34 @@ export function isTerminalState(channel: ChannelRecord): boolean {
 /**
  * SINGLE UNIFIED INGESTION PIPELINE
  * Centralized, modular validation flow for ALL discovery sources (YouTube search, manual search, automated query, future sources).
- * 
+ *
  * Pipeline Flow:
  * 0. Terminal State & Deduplication Check (True terminal states: REJECTED & NON_TRADING are NEVER rescanned)
  * 1. Gate 1: Country Validation Hard Gate (Rejects excluded countries immediately)
  * 2. Gate 2: Trading Relevance Classifier (Fast Heuristic -> Gemini AI Semantic Classifier for UNCERTAIN)
  * 3. Gate 3: Channel Inspection, Discord Crawler & Creator Quality Analysis
  */
+/**
+ * Projects a Gate-1 hard exclusion onto an already-known channel row.
+ * Mutates and returns the same row: country_status REJECTED, detected
+ * creator country, confidence, terminal scan status, audit trail append, and
+ * last_checked. Trading/discord ownership is never touched — this is a
+ * country-policy projection only, mirroring the NEEDS_REVIEW branch shape.
+ */
+export function applyGate1CountryRejectionToExisting(
+  row: ChannelRecord,
+  rejection: { creatorCountry: string | null; score: number; validationStep: ChannelRecord['inspection_trail'][number]; now: string },
+  candidate: IngestionCandidate
+): ChannelRecord {
+  row.country_status = 'REJECTED';
+  row.country = rejection.creatorCountry;
+  row.confidence_score = rejection.score;
+  row.scan_status = 'COMPLETED';
+  row.last_checked = rejection.now;
+  row.inspection_trail = [...(row.inspection_trail || []), rejection.validationStep];
+  applyCandidateObservability(row, candidate);
+  return row;
+}
 export async function processChannelThroughPipeline(
   candidate: IngestionCandidate,
   targetCountry: string,
@@ -311,6 +332,32 @@ export async function processChannelThroughPipeline(
     void recordAdmissionShadow({channelId:candidate.channelId,priorState:'NOT_EVALUATED',classificationStatus:'COUNTRY_REJECTED',
       investigationState:'POLICY_REJECTED',terminalCountryPolicy:true,candidateHypothesis:{},evidenceCoverage:{countryDecision:countryVal.status}})
       .catch(error=>console.warn(`[CandidateAdmission] country-policy shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+    // Enrichment-hardening: an authoritative language rejection must durably
+    // project onto an already-known row. Without this, an existing UNCERTAIN
+    // channel stays UNCERTAIN after the ENRICH_CHANNEL job completes and can
+    // reenter processing. No-row candidates stay write-free by design.
+    if (existing) {
+      applyGate1CountryRejectionToExisting(
+        existing,
+        { creatorCountry, score: countryVal.score, validationStep: countryValidationStep, now },
+        candidate
+      );
+      await upsertChannel(existing);
+      return {
+        channelId: candidate.channelId,
+        channelName: candidate.channelName,
+        isNew: false,
+        wasKnown: true,
+        persisted: true,
+        countryStatus: 'REJECTED',
+        detectedCountry: creatorCountry,
+        rejectionReason: countryVal.rejectionReason,
+        tradingStatus: 'UNCERTAIN',
+        discordStatus: 'NOT_FOUND',
+        discordInvite: null,
+        channelRecord: existing
+      };
+    }
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,

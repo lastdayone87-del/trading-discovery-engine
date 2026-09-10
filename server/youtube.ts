@@ -627,7 +627,7 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
     const apiKey = keyPool[currentIndex];
 
     try {
-      const searchUrl = buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,order:'date',type:'video',maxResults:5});
+      const searchUrl = buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,order:'date',type:'video',maxResults:10});
       const res = await youtubeFetch(searchUrl,'recent-videos-search',100,attempt+1,acquisition,'enrichment',apiKey);
 
       if (res.ok) {
