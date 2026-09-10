@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 // budgets themselves are unchanged (rendered 6/5/4, 60s timeout).
 import {
   COMMUNITY_HINTS,
+  resolveRenderedCompletionState,
 } from './browserCommunityFallback';
 import {
   communityNavigationScore,
@@ -138,4 +139,77 @@ test('direct Discord invite in URL is captured without crawling', () => {
   );
   assert.match(direct, /if\(direct\.length\)/);
   assert.match(direct, /outcome:'FOUND'/);
+});
+
+test('depth-two unvisited children are counted as depth-limit drops', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://depth.test/') return htmlResponse('<a href="/level1">Community hub</a>');
+    if (url === 'https://depth.test/level1') return htmlResponse('<a href="/level2">Members area</a>');
+    if (url === 'https://depth.test/level2')
+      return htmlResponse('<a href="/deep-a">Join chat</a><a href="/deep-b">Community group</a><a href="/deep-c">VIP room</a>');
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://depth.test/'], [], undefined, fakeFetch);
+  assert.equal(result.outcome, 'PARTIALLY_INSPECTED');
+  const seed = result.observations.find(
+    item => item.requestedUrl === 'https://depth.test/' && item.outcome === 'PARTIALLY_INSPECTED'
+  );
+  assert.ok(seed, 'expected a partial seed summary observation');
+  // Three eligible depth-3 links were discarded at the depth boundary without
+  // ever entering the queue — all three must be counted, not just noted.
+  assert.deepEqual(seed?.telemetry?.dropReasons?.['depth-limit'], 3);
+});
+
+test('measured page-budget cutoff marks otherwise-clean crawls incomplete', () => {
+  const telemetry = {
+    requestsStarted: 6,
+    requestsFinished: 6,
+    requestsFailed: 0,
+    unresolvedFailedRequests: 0,
+  } as never;
+  const clean = resolveRenderedCompletionState({ inspectedPages: 6, timedOut: false, telemetry });
+  assert.equal(clean.complete, true);
+  assert.equal(clean.retryable, false);
+  const cut = resolveRenderedCompletionState({
+    inspectedPages: 6,
+    timedOut: false,
+    telemetry,
+    pageBudgetExhausted: true,
+  });
+  // A successful final response is not coverage proof while eligible
+  // requests remained queued: incomplete and retryable, with no failure
+  // class (nothing failed — coverage is what is missing).
+  assert.equal(cut.complete, false);
+  assert.equal(cut.retryable, true);
+  assert.equal(cut.failureClass, undefined);
+});
+
+test('page-budget cutoff is measured from the isolated queue, not inferred', () => {
+  const source = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.ok(source.includes('getPendingCount'), 'queue pending count must be read after the crawl');
+  assert.ok(source.includes('pageBudgetExhausted'), 'measured flag must flow into completion');
+  assert.ok(source.includes("drops.count('page-budget')"));
+});
+
+test('constructors sanitize drop reasons and scroll usage at construction time', () => {
+  const dirty = renderedCrawlerTelemetry({
+    inspectedPages: 1,
+    clicks: 0,
+    complete: true,
+    dropReasons: { 'bogus-reason': 5, 'score-zero': 2.7, duplicate: -3 } as never,
+    scrollsUsed: NaN,
+  });
+  assert.deepEqual(dirty.dropReasons, { 'score-zero': 2 });
+  assert.equal(dirty.scrollsUsed, undefined);
+  const dirtyStatic = staticCrawlerTelemetry({
+    redirectsFollowed: 0,
+    pagesInspected: 1,
+    budgetExhausted: false,
+    dropReasons: { 'queue-cap': 1e12 } as never,
+  });
+  assert.deepEqual(dirtyStatic.dropReasons, { 'queue-cap': 999999 });
 });

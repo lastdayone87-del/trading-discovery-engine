@@ -372,14 +372,22 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   // The normal view positively applies the operator-visible serving predicate
   // (rejected/excluded rows are never part of it); diagnostics-only returns
   // its exact complement, and includeRejected alone is the explicit
-  // all-channel escape hatch. An explicit countryStatus=REJECTED selection
-  // without diagnosticsOnly is a deliberate opt-in to rejected records (the
-  // dashboard exposes it as a status filter), so it reads the same rejected
-  // corpus instead of returning a silently empty view.
+  // all-channel escape hatch. Explicit selections of statuses the serving
+  // predicate excludes (REJECTED country status, NON_TRADING trading status,
+  // SKIPPED_EXCLUDED scan status) are deliberate opt-ins to those diagnostic
+  // slices — the dashboard exposes each as a filter — so they read the same
+  // rejected corpus instead of returning silently empty views. Combinations
+  // intersect naturally: every explicit filter still applies as an AND
+  // clause on whichever corpus the base selects.
   const viewingRejectedSlice = !args.diagnosticsOnly && !args.includeRejected && args.countryStatus === 'REJECTED';
-  const clauses=[(args.diagnosticsOnly || viewingRejectedSlice)?`NOT (${defaultServing.predicate})`:args.includeRejected?'TRUE':`(${defaultServing.predicate})`]; const values:string[]=[];
+  const viewingNonTradingSlice = !args.diagnosticsOnly && !args.includeRejected && args.tradingStatus === 'NON_TRADING';
+  const viewingSkippedExcludedSlice = !args.diagnosticsOnly && !args.includeRejected && args.scanStatus === 'SKIPPED_EXCLUDED';
+  const viewingDiagnosticSlice = viewingRejectedSlice || viewingNonTradingSlice || viewingSkippedExcludedSlice;
+  const clauses=[(args.diagnosticsOnly || viewingDiagnosticSlice)?`NOT (${defaultServing.predicate})`:args.includeRejected?'TRUE':`(${defaultServing.predicate})`]; const values:string[]=[];
   const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
-  if(!args.includeRejected&&!args.diagnosticsOnly&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT ${KNOWN_LOW_AUDIENCE_SQL}`);
+  // Diagnostic slices read the rejected corpus deliberately, so the audience
+  // filter (a normal-view concern) does not apply to them either.
+  if(!args.includeRejected&&!args.diagnosticsOnly&&!viewingDiagnosticSlice&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT ${KNOWN_LOW_AUDIENCE_SQL}`);
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
@@ -388,7 +396,7 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
     values.push(args.scanStatus);
     clauses.push(`(scan_status=$${values.length} OR ${KNOWN_LOW_AUDIENCE_SQL})`);
   }else add('scan_status',args.scanStatus);
-  return {where:clauses.join(' AND '),values,scope:args.diagnosticsOnly?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'};
+  return {where:clauses.join(' AND '),values,scope:(args.diagnosticsOnly || viewingDiagnosticSlice)?`DIAGNOSTICS_ONLY:${defaultServing.scope}`:args.includeRejected?'ALL_CHANNELS':defaultServing.scope};
 }
 async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelListingFilter):Promise<{where:string;values:string[];scope:string}> {
   return buildChannelListingWhere(await dashboardServingPredicate(db),args);

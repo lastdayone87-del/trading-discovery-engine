@@ -231,6 +231,12 @@ export function resolveRenderedCompletionState(input: {
   inspectedPages: number;
   timedOut: boolean;
   telemetry: BrowserFallbackTelemetry;
+  /**
+   * Explicit request-budget cutoff: eligible requests remained queued when
+   * maxRequestsPerCrawl stopped the crawl. A successful final HTTP response
+   * is not coverage proof in that case.
+   */
+  pageBudgetExhausted?: boolean;
 }): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   // Processed means actual successfully inspected page evidence — a request
   // merely starting (admitted but never inspected) is zero-page evidence.
@@ -251,7 +257,12 @@ export function resolveRenderedCompletionState(input: {
   // since a recovered request processes its page; the clause keeps partial
   // telemetry from resolving clean).
   const failedWithNoPages = (input.telemetry?.requestsFailed || 0) > 0 && input.inspectedPages === 0;
-  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages;
+  // maxRequestsPerCrawl can stop a crawl whose every started request
+  // succeeded: success of the final response must not mask eligible requests
+  // still queued, so an explicit budget cutoff keeps the result incomplete
+  // and retryable even when nothing failed.
+  const pageBudgetCutoff = input.pageBudgetExhausted === true;
+  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages || pageBudgetCutoff;
   return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
@@ -614,19 +625,30 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'CRAWLER_RUNNING');
         await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
         markBrowserCapabilityReady();
+        // Request-budget cutoff must be measured from the queue itself: when
+        // maxRequestsPerCrawl stops the crawl, eligible requests remain
+        // pending and coverage is incomplete even if every started request
+        // succeeded. Best-effort read (queue drops in the finally below), so
+        // an unreadable queue simply yields no flag rather than failing.
+        let pendingEligibleRequests = 0;
+        try {
+          const pending = await (isolated.queue as unknown as { getPendingCount?: () => Promise<number> }).getPendingCount?.();
+          if (typeof pending === 'number' && Number.isFinite(pending)) pendingEligibleRequests = Math.max(0, Math.floor(pending));
+        } catch { pendingEligibleRequests = 0; }
+        const pageBudgetExhausted = pendingEligibleRequests > 0 && telemetry.requestsStarted >= limits.maxPages;
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
-        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
         // Terminal stop attribution: a complete crawl below the page budget
-        // ended for lack of enqueueable links; an incomplete crawl that
-        // started at least maxPages requests hit the request budget.
-        if (completion.complete && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
-        if (!completion.complete && telemetry.requestsStarted >= limits.maxPages) drops.count('page-budget');
+        // with nothing still queued ended for lack of enqueueable links;
+        // eligible requests still queued mean the request budget cut coverage.
+        if (completion.complete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
+        if (pageBudgetExhausted) drops.count('page-budget');
         return {
           foundInvite:first?.nativeInviteCode||null,
           foundLocation:first?.sourceUrl,

@@ -122,8 +122,7 @@ test('country name in unrelated context never becomes domicile evidence', () => 
   assert.ok(!res.countryEvidence.some(item => item.source === 'EXCLUSION_POLICY'));
 });
 
-test('non-excluded P2 behavior is unchanged', () => {
-  const res = assessChannelCountry(
+test('non-excluded P2 behavior is unchanged', () => {  const res = assessChannelCountry(
     {
       channelName: 'Edge Trading Journal',
       aboutBio: 'Trader based in the United States trading equity index futures.',
@@ -137,4 +136,54 @@ test('non-excluded P2 behavior is unchanged', () => {
   );
   assert.equal(res.countryStatus, 'CONFIRMED');
   assert.equal(res.detectedCreatorCountry, 'United States');
+});
+
+test('localized bare country names never authorize exclusion alone', () => {
+  const ivory = assessChannelCountry(
+    {
+      channelName: 'Market Notes',
+      aboutBio: "Weekly cocoa and equity notes with Côte d'Ivoire market coverage for context.",
+      videoTitles: [],
+      videoDescriptions: [],
+      videoDescriptionsAuthoritative: false,
+      playlists: [],
+    } as never,
+    [{ country_name: 'Ivory Coast', reason: 'test exclusion' }] as never,
+    [],
+  );
+  assert.equal(ivory.detectedCreatorCountry, 'Ivory Coast');
+  assert.notEqual(ivory.countryStatus, 'REJECTED');
+  assert.notEqual(ivory.gateDisposition, 'REJECT_EXCLUDED');
+  const czech = assessChannelCountry(
+    {
+      channelName: 'Market Notes',
+      aboutBio: 'European session recap including ceska republika index movers.',
+      videoTitles: [],
+      videoDescriptions: [],
+      videoDescriptionsAuthoritative: false,
+      playlists: [],
+    } as never,
+    [{ country_name: 'Czechia', reason: 'test exclusion' }] as never,
+    [],
+  );
+  assert.notEqual(czech.countryStatus, 'REJECTED');
+  assert.notEqual(czech.gateDisposition, 'REJECT_EXCLUDED');
+});
+
+test('explicit domicile with localized country context still rejects', () => {
+  const res = assessChannelCountry(
+    {
+      channelName: 'Market Notes',
+      aboutBio: 'Desk based in Ivory Coast covering West African cocoa futures.',
+      videoTitles: [],
+      videoDescriptions: [],
+      videoDescriptionsAuthoritative: false,
+      playlists: [],
+    } as never,
+    [{ country_name: 'Ivory Coast', reason: 'test exclusion' }] as never,
+    [],
+  );
+  assert.equal(res.countryStatus, 'REJECTED');
+  assert.equal(res.detectedCreatorCountry, 'Ivory Coast');
+  assert.equal(res.gateDisposition, 'REJECT_EXCLUDED');
 });

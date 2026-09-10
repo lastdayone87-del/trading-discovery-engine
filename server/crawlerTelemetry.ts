@@ -25,6 +25,29 @@ export function isCrawlDropReason(value: unknown): value is CrawlDropReason {
   return typeof value === 'string' && (CRAWL_DROP_REASONS as readonly string[]).includes(value);
 }
 
+/** Shared taxonomy/bound enforcement for drop counters, used both when
+ * telemetry objects are constructed and when ledger rows are persisted, so
+ * direct in-process consumers never receive invalid reason keys or
+ * unbounded/non-integer counters either. */
+export function sanitizeDropReasons(input: unknown): Partial<Record<CrawlDropReason, number>> {
+  const drops: Partial<Record<CrawlDropReason, number>> = {};
+  if (input && typeof input === 'object') {
+    for (const [key, value] of Object.entries(input)) {
+      if (isCrawlDropReason(key) && typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        drops[key] = Math.min(999999, Math.floor(value));
+      }
+    }
+  }
+  return drops;
+}
+
+/** Shared bound for scroll usage counters (positive ints, capped). */
+export function sanitizeScrollsUsed(input: unknown): number {
+  return typeof input === 'number' && Number.isFinite(input) && input > 0
+    ? Math.min(999999, Math.floor(input))
+    : 0;
+}
+
 /** Tiny bounded counter for per-crawl drop/stop reasons (ints only). */
 export interface DropCounter {
   count(reason: CrawlDropReason, n?: number): void;
@@ -206,8 +229,8 @@ export function renderedCrawlerTelemetry(input: {
     // in-process per crawl, so a spread-carried id could only ever be stale.
     workerInstanceId: workerInstanceId(),
     mode: 'RENDERED',
-    ...(input.dropReasons && Object.keys(input.dropReasons).length ? { dropReasons: input.dropReasons } : {}),
-    ...(typeof input.scrollsUsed === 'number' && input.scrollsUsed > 0 ? { scrollsUsed: Math.floor(input.scrollsUsed) } : {}),
+    ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
+    ...(sanitizeScrollsUsed(input.scrollsUsed) > 0 ? { scrollsUsed: sanitizeScrollsUsed(input.scrollsUsed) } : {}),
   };
 }
 
@@ -223,7 +246,7 @@ export function staticCrawlerTelemetry(input: {
     pagesInspected: Math.max(0, Math.floor(input.pagesInspected)),
     budgetExhausted: input.budgetExhausted === true,
     workerInstanceId: workerInstanceId(),
-    ...(input.dropReasons && Object.keys(input.dropReasons).length ? { dropReasons: input.dropReasons } : {}),
+    ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
   };
 }
 
@@ -252,17 +275,10 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   // taxonomy (no URLs/payloads); unknown keys, non-finite, and non-positive
   // values are dropped rather than stored. Allowed on both modes: static
   // records enqueue/drop reasons, rendered records those plus scroll usage.
-  const drops: Partial<Record<CrawlDropReason, number>> = {};
-  if (candidate.dropReasons && typeof candidate.dropReasons === 'object') {
-    for (const [key, value] of Object.entries(candidate.dropReasons)) {
-      if (isCrawlDropReason(key) && typeof value === 'number' && Number.isFinite(value) && value > 0) {
-        drops[key] = Math.min(999999, Math.floor(value));
-      }
-    }
-  }
-  const scrolls = typeof candidate.scrollsUsed === 'number' && Number.isFinite(candidate.scrollsUsed) && candidate.scrollsUsed > 0
-    ? Math.min(999999, Math.floor(candidate.scrollsUsed))
-    : 0;
+  // Shared with the constructors so direct consumers get the same bounds as
+  // persisted rows.
+  const drops = sanitizeDropReasons(candidate.dropReasons);
+  const scrolls = sanitizeScrollsUsed(candidate.scrollsUsed);
   const instance = text(candidate.workerInstanceId, 120);
   return {
     ...emptyCrawlerTelemetry(candidate.mode),

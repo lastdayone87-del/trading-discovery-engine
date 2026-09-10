@@ -250,18 +250,34 @@ function includesSignal(text: string, signals: string[]): string | null {
 }
 
 /**
+ * Bare country-name spellings that never read as domicile assertions on
+ * their own: localized/exonym variants absent from COUNTRY_ALIASES (which
+ * bioFieldHasStrongAssertion already resolves through canonicalCountry).
+ * A bio containing ONLY one of these stays mention-grade — it is an
+ * alternate name, not a descriptive or domicile assertion.
+ */
+const BARE_COUNTRY_NAME_VARIANTS: Record<string, string[]> = {
+  'Ivory Coast': ["côte d'ivoire", 'côte d’ivoire', "cote d'ivoire", 'cote divoire'],
+  Czechia: ['česká republika', 'ceska republika'],
+};
+
+/**
  * True when a bio field's text asserts the country descriptively rather than
- * merely mentioning it: any multi-word bio signal that is not just the
- * country name itself ('Nigerian trader', 'based in Vietnam' — but not
- * 'south africa' for South Africa). Single-token signals are bare references
- * by construction of the signal lists (names, demonyms, native spellings).
+ * merely mentioning it: any multi-word bio signal that is neither the
+ * country name itself (in any modeled spelling) nor a bare-name variant.
+ * Single-token signals are bare references by construction of the signal
+ * lists (names, demonyms, native spellings).
  */
 function bioFieldHasStrongAssertion(fieldTextLower: string, country: string): boolean {
   const signals = COUNTRY_SIGNALS[country]?.bio || [];
+  const bareVariants = (BARE_COUNTRY_NAME_VARIANTS[country] || []).map(variant =>
+    variant.toLocaleLowerCase('en')
+  );
   return signals.some(signal => {
     const lowered = signal.toLocaleLowerCase('en');
     if (!lowered.includes(' ')) return false;
     if (canonicalCountry(lowered) === canonicalCountry(country)) return false;
+    if (bareVariants.includes(lowered)) return false;
     return fieldTextLower.includes(lowered);
   });
 }

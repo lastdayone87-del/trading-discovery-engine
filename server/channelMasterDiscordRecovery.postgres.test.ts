@@ -24,13 +24,16 @@ maybe('real PostgreSQL master listing, KPI, filters, revision, pagination and ca
   ];
   for(const [id,country,trading,scan,discord,subs] of states)await db.query(`INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,trading_status,subscriber_count) VALUES($1,$2,$3,'Germany',$4,$5,$6,'automated_query',now(),$7,$8)`,[id,`Channel ${id}`,`https://youtube.test/${id}`,country,discord,scan,trading,subs]);
   const all=await listChannelsPage({limit:100,offset:0});
-  assert.equal(all.total,ids.length); assert.deepEqual(new Set(all.items.map(x=>x.channel_id)),new Set(ids));
-  const sqlCount=Number((await db.query('SELECT count(*)::int n FROM channels')).rows[0].n); assert.equal(all.total,sqlCount);
+  // Default listing serves the operator-visible corpus: the rejected,
+  // non-trading, skipped-excluded, and low-audience fixtures are excluded by
+  // policy, so 6 of the 10 stored rows are visible by default.
+  assert.equal(all.total,6); assert.deepEqual(new Set(all.items.map(x=>x.channel_id)),new Set(['confirmed','uncertain','pending','enriching','failed','review']));
+  const sqlCount=Number((await db.query('SELECT count(*)::int n FROM channels')).rows[0].n); assert.equal(sqlCount,ids.length);
   assert.equal((await listChannelsPage({limit:100,offset:0,tradingStatus:'NON_TRADING'})).total,1);
   assert.equal((await listChannelsPage({limit:100,offset:0,scanStatus:'SKIPPED_LOW_AUDIENCE'})).total,1);
   assert.equal((await listChannelsPage({limit:100,offset:0,countryStatus:'REJECTED'})).total,1);
-  assert.equal((await listChannelsPage({limit:100,offset:0,search:'low'})).total,1);
-  assert.equal((await listChannelsPage({limit:3,offset:3})).total,ids.length);
+  assert.equal((await listChannelsPage({limit:100,offset:0,search:'low'})).total,0);
+  assert.equal((await listChannelsPage({limit:3,offset:3})).total,6);
   assert.equal((await getChannelListingRevision({scanStatus:'FAILED'})).total,1);
   assert.ok((await listChannelsPage({limit:100,offset:0,diagnosticsOnly:true})).total>0);
   const summary=await getDashboardOperationalSummary(); assert.equal(summary.storedChannels,sqlCount); assert.equal(summary.scope.storedChannels,'ALL_STORED_CHANNELS');
