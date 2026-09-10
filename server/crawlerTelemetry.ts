@@ -97,7 +97,7 @@ export interface CrawlerTelemetry {
   hostBackoffsApplied: number;
   /**
    * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
-   * (ints only, taxonomy-bounded to 13 keys — never URLs or payloads).
+   * (ints only, taxonomy-bounded to 12 keys — never URLs or payloads).
    * Tells future investigations where candidate URLs were lost. Sparse:
    * absent when nothing was dropped.
    */

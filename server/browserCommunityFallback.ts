@@ -625,17 +625,26 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'CRAWLER_RUNNING');
         await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
         markBrowserCapabilityReady();
-        // Request-budget cutoff must be measured from the queue itself: when
-        // maxRequestsPerCrawl stops the crawl, eligible requests remain
-        // pending and coverage is incomplete even if every started request
-        // succeeded. Best-effort read (queue drops in the finally below), so
-        // an unreadable queue simply yields no flag rather than failing.
-        let pendingEligibleRequests = 0;
+        // Request-budget cutoff is measured from the supported queue-info API:
+        // after the run, pendingRequestCount reports eligible requests that
+        // maxRequestsPerCrawl left unstarted, so a successful final response
+        // cannot prove complete coverage while work remains queued. When the
+        // stat is unreadable AND the crawl reached maxPages, fail
+        // conservatively (assume cutoff) rather than proving completion.
+        // Best-effort read only (the queue drops in the finally below): it
+        // never throws into the crawl result.
+        let pendingEligibleRequests: number | null = null;
         try {
-          const pending = await (isolated.queue as unknown as { getPendingCount?: () => Promise<number> }).getPendingCount?.();
-          if (typeof pending === 'number' && Number.isFinite(pending)) pendingEligibleRequests = Math.max(0, Math.floor(pending));
-        } catch { pendingEligibleRequests = 0; }
-        const pageBudgetExhausted = pendingEligibleRequests > 0 && telemetry.requestsStarted >= limits.maxPages;
+          const info = await (isolated.queue as unknown as { getInfo?: () => Promise<{ pendingRequestCount?: unknown }> }).getInfo?.();
+          const pending = (info as { pendingRequestCount?: unknown } | null | undefined)?.pendingRequestCount;
+          if (typeof pending === 'number' && Number.isFinite(pending)) {
+            pendingEligibleRequests = Math.max(0, Math.floor(pending));
+          }
+        } catch { pendingEligibleRequests = null; }
+        const reachedPageBudget = telemetry.requestsStarted >= limits.maxPages;
+        const pageBudgetExhausted = pendingEligibleRequests === null
+          ? reachedPageBudget
+          : pendingEligibleRequests > 0 && reachedPageBudget;
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
         const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted});

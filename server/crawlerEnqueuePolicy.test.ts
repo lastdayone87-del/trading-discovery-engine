@@ -200,7 +200,9 @@ test('measured page-budget cutoff marks otherwise-clean crawls incomplete', () =
 
 test('page-budget cutoff is measured from the isolated queue, not inferred', () => {
   const source = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
-  assert.ok(source.includes('getPendingCount'), 'queue pending count must be read after the crawl');
+  assert.ok(source.includes('getInfo'), 'supported queue-info API must be read after the crawl');
+  assert.ok(source.includes('pendingRequestCount'), 'pending eligible requests come from queue info');
+  assert.ok(!source.includes('getPendingCount'), 'heuristic pending count must not be used');
   assert.ok(source.includes('pageBudgetExhausted'), 'measured flag must flow into completion');
   assert.ok(source.includes("drops.count('page-budget')"));
 });
@@ -247,5 +249,25 @@ test('allowed cross-origin community link is navigated without drop counting', a
   const seed = result.observations.find(item => item.requestedUrl === 'https://creator.test/');
   const drops = (seed?.telemetry as { dropReasons?: Record<string, number> } | undefined)?.dropReasons || {};
   assert.equal(drops['cross-origin-allowed'], undefined);
+  assert.equal(drops['cross-origin-disallowed'], 1);
+});
+
+test('fragment variants of one disallowed URL count as a single drop', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://creator.test/')
+      return htmlResponse(
+        '<a href="https://outside.test/community#top">External community</a>' +
+        '<a href="https://outside.test/community#join">External community</a>'
+      );
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://creator.test/'], [], undefined, fakeFetch);
+  const seed = result.observations.find(item => item.requestedUrl === 'https://creator.test/');
+  const drops = (seed?.telemetry as { dropReasons?: Record<string, number> } | undefined)?.dropReasons || {};
+  // Both fragments target the same fetched resource: one candidate, one drop.
   assert.equal(drops['cross-origin-disallowed'], 1);
 });

@@ -187,3 +187,35 @@ test('explicit domicile with localized country context still rejects', () => {
   assert.equal(res.detectedCreatorCountry, 'Ivory Coast');
   assert.equal(res.gateDisposition, 'REJECT_EXCLUDED');
 });
+
+test('localized suffix-form domicile is authoritative (Unicode boundaries)', () => {
+  const suffix = assessChannelCountry(
+    {
+      channelName: 'Market Notes',
+      aboutBio: 'česká republika-based trader sharing EU index setups.',
+      videoTitles: [],
+      videoDescriptions: [],
+      videoDescriptionsAuthoritative: false,
+      playlists: [],
+    } as never,
+    [{ country_name: 'Czechia', reason: 'test exclusion' }] as never,
+    [],
+  );
+  assert.equal(suffix.countryStatus, 'REJECTED');
+  assert.equal(suffix.detectedCreatorCountry, 'Czechia');
+  assert.equal(suffix.gateDisposition, 'REJECT_EXCLUDED');
+  const preposition = assessChannelCountry(
+    {
+      channelName: 'Market Notes',
+      aboutBio: 'Desk based in Česká republika covering EU indices.',
+      videoTitles: [],
+      videoDescriptions: [],
+      videoDescriptionsAuthoritative: false,
+      playlists: [],
+    } as never,
+    [{ country_name: 'Czechia', reason: 'test exclusion' }] as never,
+    [],
+  );
+  assert.equal(preposition.countryStatus, 'REJECTED');
+  assert.equal(preposition.detectedCreatorCountry, 'Czechia');
+});
