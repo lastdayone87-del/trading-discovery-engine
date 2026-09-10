@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
-import { hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
+import { dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
 
 export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
 
@@ -47,9 +47,14 @@ function isWeakVideoTerminologyEvidence(item: EvidenceItem): boolean {
   return fields.length > 0 && fields.every(field => field.field === 'video_title');
 }
 
-function terminalContradictionWeights(negative: EvidenceItem[], positiveWeight: number) {
+function terminalContradictionWeights(negative: EvidenceItem[], positive: EvidenceItem[]) {
   const terminalNegative = negative.filter(item => item.category === 'IRRELEVANT_DOMAIN' && !isPromotionalOrAdjacentNegative(item));
-  const terminalNegativeWeight = terminalNegative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
+  // Same observation-aware weights as the final policy (see
+  // dedupeWeightByFieldGroup): stage dispositions and the terminal decision
+  // must agree, so a withheld case routes to ENRICH/REVIEW in both layers
+  // instead of staging REJECT while the policy returns UNCERTAIN.
+  const terminalNegativeWeight = dedupeWeightByFieldGroup(terminalNegative);
+  const positiveWeight = dedupeWeightByFieldGroup(positive.filter(item => item.rawMatches.length));
   const materiallyDominant = terminalNegativeWeight >= 25 && (positiveWeight === 0 || terminalNegativeWeight > positiveWeight * 1.5);
   return { terminalNegative, terminalNegativeWeight, materiallyDominant };
 }
@@ -83,7 +88,7 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const independentDimensions = new Set(corroborating.map(item => item.category));
   const negativeWeight = negative.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
   const positiveWeight = positive.reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
-  const {terminalNegative,terminalNegativeWeight,materiallyDominant}=terminalContradictionWeights(negative,positiveWeight);
+  const {terminalNegative,terminalNegativeWeight,materiallyDominant}=terminalContradictionWeights(negative,positive);
   const terminalNegativeSufficient=collection.terminalNegativeSufficiency?.status==='SUFFICIENT';
   const semanticUnrelatedCandidate=hasCreatorLevelSemanticUnrelatedCandidate(negative,collection);
   const dominantContradiction = materiallyDominant && terminalNegativeSufficient;

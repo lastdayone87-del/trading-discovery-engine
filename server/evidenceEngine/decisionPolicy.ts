@@ -32,40 +32,78 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
-function fieldGroupKey(field: { field?: string; sourceId?: string | null; index?: number | null }): string {
-  // Video fields keep per-video identity (different videos are independent
-  // observations); every other field groups by field name alone, so two
-  // providers interpreting the same bio text share one voice regardless of
-  // family-wrapper differences in their provenance records.
+function observationGroupKey(field: { field?: string; sourceFamilyId?: string | null; sourceId?: string | null; index?: number | null }): string | null {
+  // Canonical source identity first: fields from one underlying video share
+  // its source family even when each field carries its own document ID
+  // (title vs description), while independent links/playlists/videos keep
+  // distinct families and stay separate observations.
+  if (field.sourceFamilyId) return `family:${field.sourceFamilyId}`;
   if (field.field === 'video_title' || field.field === 'video_description') {
-    return `video:${field.sourceId ?? field.index ?? ''}`;
+    const id = field.sourceId ?? field.index;
+    return id !== undefined && id !== null && id !== '' ? `video:${id}` : null;
   }
-  return `field:${field.field || ''}`;
+  if (field.field) return `field:${field.field}`;
+  return null;
 }
 
 /**
- * Deduplicate evidence weight by observed field group. Multiple providers may
- * interpret the same document (e.g. the channel bio matched by both the
+ * Deduplicate evidence weight by canonical observed group. Multiple providers
+ * may interpret the same document (e.g. the channel bio matched by both the
  * global and the country knowledge provider); without dedup the same token's
- * weight counts two or three times toward terminal thresholds. Items sharing
- * an identical field group collapse to the strongest, so corroboration still
- * requires genuinely independent observations (different fields/videos).
- * Items without any attributable field are never merged.
+ * weight counts two or three times toward terminal thresholds.
+ *
+ * Groups merge by shared observation keys (connected components): items
+ * citing overlapping field sets describe overlapping observations, so each
+ * connected component contributes its single strongest weight instead of
+ * every member's full weight. Disjoint groups — independent links,
+ * playlists, videos, fields — stay separate, so corroboration still
+ * requires genuinely independent observations. Items without any
+ * attributable field are never merged.
+ * Shared with staged classification so stage dispositions and the final
+ * policy always agree on terminal weight.
  */
-function dedupeWeightByFieldGroup<T extends { provenance?: { fields?: Array<{ field?: string; sourceId?: string | null; index?: number | null }> }; finalWeight: number }>(items: T[]): number {
-  const best = new Map<string, number>();
-  let ungrouped = 0;
+export function dedupeWeightByFieldGroup<T extends { provenance?: { fields?: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null; index?: number | null }> }; finalWeight: number }>(items: T[]): number {
+  const itemKeys: Array<{ item: T; keys: Set<string> }> = [];
   for (const item of items) {
-    const fields = item.provenance?.fields || [];
-    if (fields.length === 0) {
-      ungrouped += Math.abs(item.finalWeight);
-      continue;
-    }
-    const key = fields.map(fieldGroupKey).sort().join('+');
-    best.set(key, Math.max(best.get(key) || 0, Math.abs(item.finalWeight)));
+    const keys = new Set(
+      (item.provenance?.fields || [])
+        .map(observationGroupKey)
+        .filter((value): value is string => value !== null)
+    );
+    if (keys.size === 0) continue;
+    itemKeys.push({ item, keys });
   }
+  const ungrouped = items
+    .filter(item => !itemKeys.some(entry => entry.item === item))
+    .reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
+  // Union-find over shared keys: overlapping groups are one observation.
+  const parent = new Map<number, number>();
+  const find = (id: number): number => {
+    let root = id;
+    while (parent.get(root) !== root) root = parent.get(root) as number;
+    return root;
+  };
+  itemKeys.forEach((_, index) => parent.set(index, index));
+  const keyOwners = new Map<string, number>();
+  itemKeys.forEach((entry, index) => {
+    for (const key of entry.keys) {
+      const owner = keyOwners.get(key);
+      if (owner === undefined) {
+        keyOwners.set(key, index);
+      } else {
+        const a = find(index);
+        const b = find(owner);
+        if (a !== b) parent.set(a, b);
+      }
+    }
+  });
+  const componentBest = new Map<number, number>();
+  itemKeys.forEach((entry, index) => {
+    const root = find(index);
+    componentBest.set(root, Math.max(componentBest.get(root) || 0, Math.abs(entry.item.finalWeight)));
+  });
   let total = ungrouped;
-  for (const weight of best.values()) total += weight;
+  for (const weight of componentBest.values()) total += weight;
   return total;
 }
 

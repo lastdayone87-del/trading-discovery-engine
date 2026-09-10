@@ -12,6 +12,7 @@ const engine = new EvidenceBasedTradingEngine();
 
 function evaluate(channelName: string, description: string, country = 'UNKNOWN') {
   return engine.evaluateChannel({
+    channel_id: 'UCtesttesttesttesttest01',
     channel_name: channelName,
     description,
     video_titles: [],
@@ -19,6 +20,12 @@ function evaluate(channelName: string, description: string, country = 'UNKNOWN')
     external_links: [],
     country,
     enrichment_stage: 0,
+    // Production-shaped identity: ingestion always stamps deterministic
+    // channel/entity IDs, so provider provenance shares one channel family.
+    // Without them the test would exercise an unrealistic split-identity
+    // path that production inputs never take.
+    channel_source_family_id: 'chanfam-test-01',
+    channel_entity_id: 'ent-test-01',
   } as RawChannelInput);
 }
 
@@ -255,4 +262,99 @@ test('chain skips unconfigured providers and stops at not-applicable input', asy
   assert.equal(naResult.items.length, 0);
   assert.equal(naResult.reports.length, 1);
   assert.equal(naResult.reports[0].outcome, 'NOT_APPLICABLE');
+});
+
+test('same-family title and description collapse to one observation voice', async () => {
+  const { dedupeWeightByFieldGroup } = await import('./decisionPolicy');
+  const makeItem = (fields: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null }>, finalWeight: number) => ({
+    provenance: { fields }, finalWeight,
+  });
+  // One video's title + description share a family: single voice (max kept).
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem([{ field: 'video_title', sourceFamilyId: 'fam-v1' }], -8),
+      makeItem([{ field: 'video_description', sourceFamilyId: 'fam-v1' }], -12),
+    ] as never),
+    12
+  );
+  // Independent links keep separate voices even under one field name.
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem([{ field: 'external_link_domain', sourceFamilyId: 'fam-l1' }], -20),
+      makeItem([{ field: 'external_link_domain', sourceFamilyId: 'fam-l2' }], -20),
+    ] as never),
+    40
+  );
+  // Same bio interpreted twice collapses; fieldless items are never merged.
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem([{ field: 'channel_bio', sourceFamilyId: 'fam-c' }], -10),
+      makeItem([{ field: 'channel_bio', sourceFamilyId: 'fam-c' }], -7),
+      makeItem([], -5),
+    ] as never),
+    15
+  );
+});
+
+test('staged contradiction agrees with the final policy on duplicate evidence', async () => {
+  const engine = new EvidenceBasedTradingEngine();
+  const decision = await engine.evaluateChannel({
+    channel_name: 'Garden Desk',
+    description: 'Stocks and ETFs education. Visit us at Am Geus Garten 22 for seminars.',
+    video_titles: [],
+    video_descriptions: [],
+    external_links: [],
+    country: 'Germany',
+    enrichment_stage: 0,
+  } as never);
+  assert.equal(decision.status, 'UNCERTAIN');
+  const contradiction = decision.stagedClassification?.stages.find(stage => stage.stage === 'CONTRADICTION');
+  assert.notEqual(contradiction?.disposition, 'FAIL');
+});
+
+test('FORCE_GEMINI custom Groq primary never executes', async () => {
+  let groqCalls = 0;
+  const groqStub = {
+    name: 'groq_semantic',
+    availability: () => ({ availability: 'AVAILABLE' as const }),
+    collectEvidence: async () => {
+      groqCalls += 1;
+      return [];
+    },
+  } as never;
+  const { EvidenceBasedTradingEngine: Engine } = await import('./index');
+  const scoped = new Engine([groqStub] as never);
+  const saved = process.env.SEMANTIC_PROVIDER_FORCE_GEMINI;
+  process.env.SEMANTIC_PROVIDER_FORCE_GEMINI = 'true';
+  try {
+    const decision = await scoped.evaluateChannel({
+      channel_name: 'T',
+      description: 'Day trading education with charts and risk management for beginners.',
+      video_titles: [],
+      video_descriptions: [],
+      external_links: [],
+      country: 'UNKNOWN',
+      enrichment_stage: 0,
+    } as never);
+    assert.equal(groqCalls, 0);
+    assert.ok(!decision.evidenceCollection.providers.some(p => (p as { provider: string }).provider === 'groq_semantic'));
+    assert.ok(decision.evidenceCollection.providers.some(p => (p as { provider: string }).provider === 'gemini_semantic'));
+  } finally {
+    if (saved === undefined) delete process.env.SEMANTIC_PROVIDER_FORCE_GEMINI;
+    else process.env.SEMANTIC_PROVIDER_FORCE_GEMINI = saved;
+  }
+});
+
+test('match collection collapses case and format variants of one token', async () => {
+  const { normalizeMatchToken, pushUniqueMatch } = await import('./utils/textMatching');
+  assert.equal(normalizeMatchToken('Garten'), 'garten');
+  assert.equal(normalizeMatchToken('  HOSE  '), 'hose');
+  const collected: string[] = [];
+  assert.equal(pushUniqueMatch(collected, 'garten'), true);
+  assert.equal(pushUniqueMatch(collected, 'Garten'), false);
+  assert.equal(pushUniqueMatch(collected, 'GARTEN'), false);
+  assert.equal(pushUniqueMatch(collected, 'vlog'), true);
+  assert.equal(pushUniqueMatch(collected, ''), false);
+  assert.equal(pushUniqueMatch(collected, '   '), false);
+  assert.deepEqual(collected, ['garten', 'vlog']);
 });

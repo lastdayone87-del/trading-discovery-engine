@@ -166,8 +166,14 @@ export class EvidenceBasedTradingEngine {
     // Semantic providers run as an ordered resilience chain (configured
     // primary, then keyed fallbacks) rather than a single slot: one provider
     // outage must not stall classification. Deterministic providers keep the
-    // existing parallel fan-out, untouched.
-    const semanticPrimary = providers.find(provider => isSemanticProviderName(provider.name));
+    // existing parallel fan-out, untouched. SEMANTIC_PROVIDER_FORCE_GEMINI is
+    // an operational safety switch: it pins Gemini-only execution, so a
+    // custom Groq/free-tier primary is replaced (never executed) and no
+    // fallback chain is built.
+    const forceGeminiOnly = process.env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true';
+    const semanticPrimary = forceGeminiOnly
+      ? (providers.find(provider => provider.name === 'gemini_semantic') || new GeminiSemanticProvider())
+      : providers.find(provider => isSemanticProviderName(provider.name));
     const deterministicProviders = providers.filter(provider => !isSemanticProviderName(provider.name));
     const semanticChain: EvidenceProvider[] = semanticPrimary
       ? [semanticPrimary, ...resolveSemanticProviderChain(semanticPrimary.name)

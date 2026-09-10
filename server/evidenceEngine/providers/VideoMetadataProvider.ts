@@ -1,5 +1,5 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
-import { textMatchesTerm } from '../utils/textMatching';
+import { pushUniqueMatch, textMatchesTerm } from '../utils/textMatching';
 import { isTradingFocusedText } from '../multilingualTerminology';
 
 /**
@@ -73,32 +73,32 @@ export class VideoMetadataProvider implements EvidenceProvider {
 
       // Collect specific instrument references
       for (const inst of knowledgeContext.globalInstruments) {
-        if (textMatchesTerm(combo, inst) && !matchedInstrumentsInVideos.includes(inst)) {
-          matchedInstrumentsInVideos.push(inst);
+        if (textMatchesTerm(combo, inst)) {
+          pushUniqueMatch(matchedInstrumentsInVideos, inst);
         }
       }
 
       // Collect specific platform references
       for (const plat of knowledgeContext.globalPlatformsPropFirms) {
-        if (textMatchesTerm(combo, plat) && !matchedPlatformsInVideos.includes(plat)) {
-          matchedPlatformsInVideos.push(plat);
+        if (textMatchesTerm(combo, plat)) {
+          pushUniqueMatch(matchedPlatformsInVideos, plat);
         }
       }
 
       // Collect educational concepts & trading methodology references
       for (const concept of knowledgeContext.globalAdvancedConcepts) {
-        if (textMatchesTerm(combo, concept) && !matchedConceptsInVideos.includes(concept)) {
-          matchedConceptsInVideos.push(concept);
+        if (textMatchesTerm(combo, concept)) {
+          pushUniqueMatch(matchedConceptsInVideos, concept);
         }
       }
       for (const langTerm of (knowledgeContext.languageKnowledgePacks||[knowledgeContext.languageKnowledge]).flatMap(pack=>pack?.positiveTerms||[])) {
-        if (textMatchesTerm(combo, langTerm) && !matchedConceptsInVideos.includes(langTerm)) {
-          matchedConceptsInVideos.push(langTerm);
+        if (textMatchesTerm(combo, langTerm)) {
+          pushUniqueMatch(matchedConceptsInVideos, langTerm);
         }
       }
       for (const countryTerm of knowledgeContext.countryKnowledge?.nativeTradingTerminology || []) {
-        if (textMatchesTerm(combo, countryTerm) && !matchedConceptsInVideos.includes(countryTerm)) {
-          matchedConceptsInVideos.push(countryTerm);
+        if (textMatchesTerm(combo, countryTerm)) {
+          pushUniqueMatch(matchedConceptsInVideos, countryTerm);
         }
       }
     }
