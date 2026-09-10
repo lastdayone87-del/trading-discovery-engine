@@ -991,24 +991,39 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             if (Date.now() - startedAt >= limits.totalTimeoutMs) return;
             telemetry.requestsStarted++;
             try {
+            // Snapshot lifetime: candidates are extracted from the FULL page
+            // source (never truncated before extraction) and the multi-MB
+            // string is released before any scroll/click work, so at most one
+            // snapshot is ever retained. URL and markup are scanned in
+            // separate retain() calls: invite patterns exclude whitespace, so
+            // no match can span the former "\n" join — identical recall with
+            // half the peak transient (no url+html duplicate string).
             const inspect = async () => {
-              const url=page.url(),html=await page.content();
-              retain(`${url}\n${html}`,url);
+              const url = page.url();
+              let html: string | null = await page.content();
               try {
-                // Request and final-page identities share one evidence bucket
-                // (see visitIdentityKeys): for a redirected request both
-                // identities were terminally inspected, so required-closure
-                // and shared-evidence decisions stay correct whichever
-                // identity a later seed presents.
-                for (const identity of visitIdentityKeys(request.url, url)) {
-                  let bucket = pageHintLinks.get(identity);
-                  if (!bucket) {
-                    bucket = new Set<string>();
-                    pageHintLinks.set(identity, bucket);
-                  }
-                  for (const link of discoverRequiredSeedLinks(html, url)) bucket.add(link);
+                retain(url, url);
+                if (html !== null) {
+                  retain(html, url);
+                  try {
+                    // Request and final-page identities share one evidence bucket
+                    // (see visitIdentityKeys): for a redirected request both
+                    // identities were terminally inspected, so required-closure
+                    // and shared-evidence decisions stay correct whichever
+                    // identity a later seed presents.
+                    for (const identity of visitIdentityKeys(request.url, url)) {
+                      let bucket = pageHintLinks.get(identity);
+                      if (!bucket) {
+                        bucket = new Set<string>();
+                        pageHintLinks.set(identity, bucket);
+                      }
+                      for (const link of discoverRequiredSeedLinks(html, url)) bucket.add(link);
+                    }
+                  } catch { /* hint inventory never breaks inspection */ }
                 }
-              } catch { /* hint inventory never breaks inspection */ }
+              } finally {
+                html = null;
+              }
             };
             // Page evidence counts only after the required extraction actually
             // succeeds: a throw here leaves zero processed evidence (finding:
@@ -1109,6 +1124,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             for (const identity of visitIdentityKeys(request.url, page.url())) {
               if (!terminalSuccessUrls.includes(identity)) terminalSuccessUrls.push(identity);
             }
+            } catch (attemptError) {
+              // Release only the failed page; Crawlee still classifies the
+              // original error and retries with a fresh page per
+              // maxRequestRetries/maxSessionRotations. The close is
+              // best-effort and never masks the error: classification, the
+              // errorHandler accounting above, and retry see attemptError
+              // unchanged, and a failed page is never referenced afterwards.
+              await page.close().catch(() => undefined);
+              throw attemptError;
             } finally {
               telemetry.requestsFinished++;
             }
