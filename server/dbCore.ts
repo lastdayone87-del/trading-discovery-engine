@@ -369,7 +369,15 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   // rows are retained for auditability, but are not part of the normal view.
   // An explicit scan-status selection (or the explicit diagnostics corpus)
   // opts into those stored rows without changing their status or qualification.
-  const clauses=[args.diagnosticsOnly?`NOT (${defaultServing.predicate})`:'TRUE']; const values:string[]=[];
+  // The normal view positively applies the operator-visible serving predicate
+  // (rejected/excluded rows are never part of it); diagnostics-only returns
+  // its exact complement, and includeRejected alone is the explicit
+  // all-channel escape hatch. An explicit countryStatus=REJECTED selection
+  // without diagnosticsOnly is a deliberate opt-in to rejected records (the
+  // dashboard exposes it as a status filter), so it reads the same rejected
+  // corpus instead of returning a silently empty view.
+  const viewingRejectedSlice = !args.diagnosticsOnly && !args.includeRejected && args.countryStatus === 'REJECTED';
+  const clauses=[(args.diagnosticsOnly || viewingRejectedSlice)?`NOT (${defaultServing.predicate})`:args.includeRejected?'TRUE':`(${defaultServing.predicate})`]; const values:string[]=[];
   const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
   if(!args.includeRejected&&!args.diagnosticsOnly&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT ${KNOWN_LOW_AUDIENCE_SQL}`);
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};

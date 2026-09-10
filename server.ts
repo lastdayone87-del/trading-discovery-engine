@@ -271,7 +271,9 @@ async function startServer() {
     res.status(capability.status === 'UNAVAILABLE' ? 503 : 200).json(capability);
   });
 
-  // 1. Get all channels (returns active validated channels by default; include_rejected=true returns all)
+  // 1. Get channels (default: operator-visible corpus, rejected/excluded rows
+  // excluded; include_rejected=true returns all stored channels;
+  // diagnostics_only=true returns the rejected/diagnostic complement)
   app.get('/api/channels', async (req, res) => {
     try {
       const includeRejected = req.query.include_rejected === 'true';
