@@ -8,7 +8,6 @@ export type CrawlerAcquisitionMode = 'STATIC' | 'RENDERED';
 export const CRAWL_DROP_REASONS = [
   'invalid-protocol',
   'cross-origin-disallowed',
-  'cross-origin-allowed',
   'score-zero',
   'hint-rejected',
   'duplicate',
@@ -51,15 +50,29 @@ export function sanitizeScrollsUsed(input: unknown): number {
 /** Tiny bounded counter for per-crawl drop/stop reasons (ints only). */
 export interface DropCounter {
   count(reason: CrawlDropReason, n?: number): void;
+  /**
+   * Count once per key (typically the candidate URL): the anchor and dynamic
+   * extraction passes can evaluate the same discovered link twice, and a
+   * twice-seen candidate is still one lost candidate.
+   */
+  countUnique(reason: CrawlDropReason, key: string): void;
   snapshot(): Partial<Record<CrawlDropReason, number>>;
 }
 export function createDropCounter(): DropCounter {
   const counts = new Map<CrawlDropReason, number>();
+  const seen = new Set<string>();
   return {
     count(reason, n = 1) {
       if (!isCrawlDropReason(reason)) return;
       if (!Number.isFinite(n) || n <= 0) return;
       counts.set(reason, (counts.get(reason) || 0) + Math.floor(n));
+    },
+    countUnique(reason, key) {
+      if (!isCrawlDropReason(reason)) return;
+      const marker = `${reason}\n${key}`;
+      if (seen.has(marker)) return;
+      seen.add(marker);
+      counts.set(reason, (counts.get(reason) || 0) + 1);
     },
     snapshot() {
       return Object.fromEntries(counts);

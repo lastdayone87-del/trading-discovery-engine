@@ -261,6 +261,32 @@ const BARE_COUNTRY_NAME_VARIANTS: Record<string, string[]> = {
   Czechia: ['česká republika', 'ceska republika'],
 };
 
+/** Escape a literal for RegExp construction (country names carry apostrophes, dots, and non-ASCII). */
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Every spelling under which an excluded country may appear in an explicit
+ * domicile phrase: the canonical exclusion name, all COUNTRY_ALIASES spellings
+ * resolving to it, and the modeled localized variants above. Each entry
+ * stays bound to the same canonical country — aliases never create new
+ * country identities. Short codes (<3 chars) are excluded as before.
+ */
+function domicileNameVariants(country: string): string[] {
+  const canonical = canonicalCountry(country);
+  const fromAliases = Object.entries(COUNTRY_ALIASES)
+    .filter(([, target]) => canonicalCountry(target) === canonical)
+    .map(([alias]) => alias.trim().toLocaleLowerCase('en'));
+  const localized = (BARE_COUNTRY_NAME_VARIANTS[canonical] || []).map(variant =>
+    variant.trim().toLocaleLowerCase('en')
+  );
+  const base = country.trim().toLocaleLowerCase('en');
+  const names = [...new Set([base, ...fromAliases, ...localized])].filter(name => name.length >= 3);
+  // Longest first so 'czech republic' wins over its 'czech' prefix in matches.
+  return names.sort((a, b) => b.length - a.length);
+}
+
 /**
  * True when a bio field's text asserts the country descriptively rather than
  * merely mentioning it: any multi-word bio signal that is neither the
@@ -554,10 +580,16 @@ export function assessChannelCountry(
   // An optional article ("based in the Philippines") and activity-location
   // phrasing ("active in", "operates from") still assert where the creator
   // operates, so they count the same as bare-preposition domicile.
+  // Name matching covers the canonical exclusion name plus every modeled
+  // alias/localized spelling bound to the same canonical country, so explicit
+  // domicile using an alias ("based in Côte d'Ivoire", "based in Czech
+  // Republic") attributes to the right country instead of being missed.
   for (const item of exclusions) {
-    const name = item.country_name.toLocaleLowerCase('en');
-    if (name.length < 3) continue;
-    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|lives in|live in|operates from|operating from|active in|trader from|from|trader in)\\s+(?:the\\s+)?${name}\\b|\\b${name}(?:\\s+|-)(?:based|headquartered|trader|forex trader|crypto trader)\\b`, 'i');
+    const canonical = canonicalCountry(item.country_name);
+    const names = domicileNameVariants(canonical);
+    if (names.length === 0) continue;
+    const namePattern = names.map(escapeRegExpLiteral).join('|');
+    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|lives in|live in|operates from|operating from|active in|trader from|from|trader in)\\s+(?:the\\s+)?(?:${namePattern})\\b|\\b(?:${namePattern})(?:\\s+|-)(?:based|headquartered|trader|forex trader|crypto trader)\\b`, 'i');
     for (const field of bioFields) {
       if (!field.text.trim()) continue;
       const match = field.text.match(domicileRegex);

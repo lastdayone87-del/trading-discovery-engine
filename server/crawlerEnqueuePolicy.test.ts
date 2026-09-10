@@ -65,7 +65,15 @@ test('drop counter tallies taxonomy reasons only', () => {
   assert.deepEqual(drops.snapshot(), { 'score-zero': 2, 'queue-cap': 1 });
   assert.ok(isCrawlDropReason('score-zero'));
   assert.ok(!isCrawlDropReason('bogus-reason'));
-  assert.equal(CRAWL_DROP_REASONS.length, 13);
+  assert.ok(!isCrawlDropReason('cross-origin-allowed'));
+});
+
+test('per-link drops are deduped across extraction passes', () => {
+  const drops = createDropCounter();
+  drops.countUnique('score-zero', 'https://example.com/blog');
+  drops.countUnique('score-zero', 'https://example.com/blog');
+  drops.countUnique('score-zero', 'https://example.com/pricing');
+  assert.deepEqual(drops.snapshot(), { 'score-zero': 2 });
 });
 
 test('sanitizer keeps compact counters, strips unknown and non-positive values', () => {
@@ -105,19 +113,21 @@ test('static exploration bound is 12 with drop accounting at every rule', () => 
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   assert.match(source, /while\(queue\.length&&explored<12\)/);
   for (const marker of [
-    "drops.count('invalid-protocol')",
-    "drops.count('cross-origin-disallowed')",
-    "drops.count('cross-origin-allowed')",
-    "drops.count('score-zero')",
+    "countUnique('invalid-protocol'",
+    "countUnique('cross-origin-disallowed'",
+    "countUnique('score-zero'",
     "drops.count('duplicate'",
     "drops.count('queue-cap'",
-    "drops.count('depth-limit')",
+    "drops.count('depth-limit'",
     "drops.count('already-visited')",
     "drops.count('exploration-limit'",
     'dropReasons:drops.snapshot()',
   ]) {
     assert.ok(source.includes(marker), `missing static wiring: ${marker}`);
   }
+  // Accepted cross-origin links are navigated, never counted as drops.
+  assert.ok(!source.includes("drops.count('cross-origin-allowed')"));
+  assert.equal(CRAWL_DROP_REASONS.length, 12);
 });
 
 test('rendered control-slice, hint-reject, scroll, and stop accounting are wired', () => {
@@ -212,4 +222,30 @@ test('constructors sanitize drop reasons and scroll usage at construction time',
     dropReasons: { 'queue-cap': 1e12 } as never,
   });
   assert.deepEqual(dirtyStatic.dropReasons, { 'queue-cap': 999999 });
+});
+
+test('allowed cross-origin community link is navigated without drop counting', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const calls: string[] = [];
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    calls.push(url);
+    if (url === 'https://creator.test/')
+      return htmlResponse(
+        '<a href="https://linktr.ee/creator">Linktree community</a>' +
+        '<a href="https://evil.test/community">External community</a>'
+      );
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://creator.test/'], [], undefined, fakeFetch);
+  // The allowlisted cross-origin link is eligible and fetched…
+  assert.ok(calls.includes('https://linktr.ee/creator'), 'allowlisted cross-origin link must be navigated');
+  // …while the disallowed one is neither fetched nor silently ignored.
+  assert.ok(!calls.includes('https://evil.test/community'), 'disallowed cross-origin link must not be fetched');
+  const seed = result.observations.find(item => item.requestedUrl === 'https://creator.test/');
+  const drops = (seed?.telemetry as { dropReasons?: Record<string, number> } | undefined)?.dropReasons || {};
+  assert.equal(drops['cross-origin-allowed'], undefined);
+  assert.equal(drops['cross-origin-disallowed'], 1);
 });
