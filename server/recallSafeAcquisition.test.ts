@@ -96,7 +96,7 @@ test('the complete ranked candidate list is attempted with no URL cap', async ()
 });
 
 test('exhausted static child budget is recorded as partial, never as clean', async () => {
-  const rootLinks = Array.from({ length: 12 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
+  const rootLinks = Array.from({ length: 16 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
   const result = await crawlExternalLinks(
     ['https://budget.test/'],
     [],
@@ -384,7 +384,7 @@ test('messaging bridge evidence escalates even when the creator is not classifie
 });
 
 test('exhausted crawl budget produces PARTIALLY_INSPECTED at channel level', async () => {
-  const rootLinks = Array.from({ length: 12 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
+  const rootLinks = Array.from({ length: 16 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
   const result = await runChannelInspection({
     channelId: 'UCbudget00000000000000001',
     channelName: 'Budget Channel',

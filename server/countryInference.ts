@@ -50,6 +50,18 @@ export interface CountryInferenceEvidence {
    * prose must never appear here.
    */
   sourceField?: string;
+  /**
+   * Mention-grade domicile marker. Set ONLY on P2 CHANNEL_ABOUT_BIO items
+   * whose matched signal is a bare country reference (the country name
+   * itself in any script, or a bare demonym without descriptive context).
+   * A passing mention is not domicile: such items still corroborate and
+   * score, but can never independently authorize a hard excluded-country
+   * rejection. Multi-word descriptive phrases ('Nigerian trader',
+   * 'based in Vietnam') and explicit domicile-phrase hits never carry it.
+   * Absent = authoritative exactly as before (P1, P3, domicile phrases,
+   * website domains, and directly constructed test evidence).
+   */
+  domicileMention?: boolean;
 }
 
 export interface CountryInferenceInput {
@@ -235,6 +247,65 @@ function includesSignal(text: string, signals: string[]): string | null {
     }
     return text.includes(lower);
   }) || null;
+}
+
+/**
+ * Bare country-name spellings that never read as domicile assertions on
+ * their own: localized/exonym variants absent from COUNTRY_ALIASES (which
+ * bioFieldHasStrongAssertion already resolves through canonicalCountry).
+ * A bio containing ONLY one of these stays mention-grade — it is an
+ * alternate name, not a descriptive or domicile assertion.
+ */
+const BARE_COUNTRY_NAME_VARIANTS: Record<string, string[]> = {
+  'Ivory Coast': ["côte d'ivoire", 'côte d’ivoire', "cote d'ivoire", 'cote divoire'],
+  Czechia: ['česká republika', 'ceska republika'],
+};
+
+/** Escape a literal for RegExp construction (country names carry apostrophes, dots, and non-ASCII). */
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Every spelling under which an excluded country may appear in an explicit
+ * domicile phrase: the canonical exclusion name, all COUNTRY_ALIASES spellings
+ * resolving to it, and the modeled localized variants above. Each entry
+ * stays bound to the same canonical country — aliases never create new
+ * country identities. Short codes (<3 chars) are excluded as before.
+ */
+function domicileNameVariants(country: string): string[] {
+  const canonical = canonicalCountry(country);
+  const fromAliases = Object.entries(COUNTRY_ALIASES)
+    .filter(([, target]) => canonicalCountry(target) === canonical)
+    .map(([alias]) => alias.trim().toLocaleLowerCase('en'));
+  const localized = (BARE_COUNTRY_NAME_VARIANTS[canonical] || []).map(variant =>
+    variant.trim().toLocaleLowerCase('en')
+  );
+  const base = country.trim().toLocaleLowerCase('en');
+  const names = [...new Set([base, ...fromAliases, ...localized])].filter(name => name.length >= 3);
+  // Longest first so 'czech republic' wins over its 'czech' prefix in matches.
+  return names.sort((a, b) => b.length - a.length);
+}
+
+/**
+ * True when a bio field's text asserts the country descriptively rather than
+ * merely mentioning it: any multi-word bio signal that is neither the
+ * country name itself (in any modeled spelling) nor a bare-name variant.
+ * Single-token signals are bare references by construction of the signal
+ * lists (names, demonyms, native spellings).
+ */
+function bioFieldHasStrongAssertion(fieldTextLower: string, country: string): boolean {
+  const signals = COUNTRY_SIGNALS[country]?.bio || [];
+  const bareVariants = (BARE_COUNTRY_NAME_VARIANTS[country] || []).map(variant =>
+    variant.toLocaleLowerCase('en')
+  );
+  return signals.some(signal => {
+    const lowered = signal.toLocaleLowerCase('en');
+    if (!lowered.includes(' ')) return false;
+    if (canonicalCountry(lowered) === canonicalCountry(country)) return false;
+    if (bareVariants.includes(lowered)) return false;
+    return fieldTextLower.includes(lowered);
+  });
 }
 
 function matchWindow(text: string, match: string, radius = 80): string {
@@ -491,18 +562,48 @@ export function assessChannelCountry(
   ];
   for (const field of bioFields) {
     if (!field.text.trim()) continue;
+    const before = evidence.length;
     addTextEvidence(evidence, 'CHANNEL_ABOUT_BIO', 2, 92, field.text, 'bio', 'Channel About/Bio location', field.sourceField);
+    // Bare country references are mention-grade, never domicile: a field whose
+    // only basis is a passing mention ('vietnam') must not decide alone,
+    // while fields carrying a descriptive phrase ('Nigerian trader') or an
+    // explicit domicile hit below stay fully authoritative.
+    for (let i = before; i < evidence.length; i++) {
+      const item = evidence[i];
+      if (!bioFieldHasStrongAssertion(field.text, item.detectedCountry)) item.domicileMention = true;
+    }
   }
 
-  // Match explicit domicile phrases (e.g. "based in Nigeria", "located in Kenya", "trader from Ghana")
+  // Match explicit domicile phrases (e.g. "based in Nigeria", "located in Kenya", "trader from Ghana",
+  // "operates from Vietnam", "Vietnam-based trader", "trader active in South Africa"). These are assertions of
+  // creator location — not passing mentions — so they stay fully authoritative.
+  // An optional article ("based in the Philippines") and activity-location
+  // phrasing ("active in", "operates from") still assert where the creator
+  // operates, so they count the same as bare-preposition domicile.
+  // Name matching covers the canonical exclusion name plus every modeled
+  // alias/localized spelling bound to the same canonical country, so explicit
+  // domicile using an alias ("based in Côte d'Ivoire", "based in Czech
+  // Republic") attributes to the right country instead of being missed.
   for (const item of exclusions) {
-    const name = item.country_name.toLocaleLowerCase('en');
-    if (name.length < 3) continue;
-    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|trader from|from|trader in)\\s+${name}\\b|\\b${name}\\s+(?:based|trader|forex trader|crypto trader)\\b`, 'i');
+    const canonical = canonicalCountry(item.country_name);
+    const names = domicileNameVariants(canonical);
+    if (names.length === 0) continue;
+    // Unicode-aware word boundaries around the name alternation: JS \b is
+    // ASCII-only, so a localized name starting (or ending) in a non-ASCII
+    // letter ('česká republika-based') would never match with \b. The
+    // preposition keywords themselves stay ASCII-\b-anchored. Requires the
+    // 'u' flag for \p{} classes.
+    const boundaryBefore = '(?<![\\p{L}\\p{N}_])';
+    const boundaryAfter = '(?![\\p{L}\\p{N}_])';
+    const namePattern = names.map(escapeRegExpLiteral).join('|');
+    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|lives in|live in|operates from|operating from|active in|trader from|from|trader in)\\s+(?:the\\s+)?(?:${namePattern})${boundaryAfter}|${boundaryBefore}(?:${namePattern})(?:\\s+|-)(?:based|headquartered|trader|forex trader|crypto trader)\\b`, 'iu');
     for (const field of bioFields) {
       if (!field.text.trim()) continue;
       const match = field.text.match(domicileRegex);
-      if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
+      // Deduplicate against an already-authoritative item only: a
+      // mention-grade item for the same country must never suppress the
+      // explicit domicile assertion that actually authorizes exclusion.
+      if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && !e.domicileMention && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
         evidence.push({
           source: 'CHANNEL_ABOUT_BIO',
           priority: 2,
@@ -669,8 +770,15 @@ export function assessChannelCountry(
   const conflict = ranked.length > 1 && ranked[1][1] === topConfidence;
   const confidence = conflict ? Math.min(49, topConfidence) : topConfidence;
   const excluded = exclusions.find(item => normalizeCountryName(item.country_name) === normalizeCountryName(detectedCreatorCountry));
+  // Hard-exclusion authority additionally requires at least one decisive item
+  // stronger than a bare mention: a passing country-name mention in a bio is
+  // not domicile and can never independently justify REJECT_EXCLUDED, while
+  // official metadata, explicit domicile phrases, website domains, and the
+  // aggregated-language path keep their existing authority. Scoring,
+  // conflict, and CONFIRMED/LIKELY semantics below are untouched.
   const exclusionAuthority = decisiveEvidence.every(item => item.detectedCountry === detectedCreatorCountry) &&
-    decisivePriority <= 3 && topConfidence >= 85 && !conflict;
+    decisivePriority <= 3 && topConfidence >= 85 && !conflict &&
+    decisiveEvidence.some(item => !item.domicileMention);
 
   if (excluded && exclusionAuthority) {
     const policy: CountryInferenceEvidence = {

@@ -378,8 +378,27 @@ let emitSink: EmitSink | null = null;
 export function setInnertubeEmitSinkForTests(sink: EmitSink | null): void {
   emitSink = sink;
 }
-function emit(event: Parameters<typeof appendProviderCallEvent>[0]): Promise<void> {
-  return (emitSink ? emitSink(event) : appendProviderCallEvent(event)).catch(() => undefined);
+/**
+ * Persist one provider_call_events row. Never rejects — not even when the
+ * sink throws synchronously — so a telemetry outage can never turn a
+ * successful provider retrieval into a provider failure. Failures are logged
+ * with correlation identity (provider/operation/run/page) instead of being
+ * swallowed, keeping the observability chain diagnosable in production logs.
+ */
+async function emit(event: Parameters<typeof appendProviderCallEvent>[0]): Promise<void> {
+  try {
+    await (emitSink ? emitSink(event) : appendProviderCallEvent(event));
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: 'innertube_telemetry_persist_failed',
+      provider: event.provider,
+      operation: event.operation,
+      runId: event.runId ?? null,
+      jobId: event.jobId ?? null,
+      status: event.status,
+      error: error instanceof Error ? error.message : String(error ?? 'unknown'),
+    }));
+  }
 }
 
 /**
@@ -611,7 +630,7 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     await emit({
       ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
       actualCost: 0, occurredAt: new Date().toISOString(),
-    }).catch(() => undefined);
+    });
     return {
       channels,
       rawResultCount,
@@ -631,7 +650,7 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
       actualCost: 0,
       errorClass: typed.code === INNERTUBE_RATE_LIMITED_CODE ? 'RATE_LIMIT' : 'TRANSIENT',
       occurredAt: new Date().toISOString(),
-    }).catch(() => undefined);
+    });
     throw typed;
   }
 }

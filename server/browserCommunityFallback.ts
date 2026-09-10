@@ -1,7 +1,7 @@
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
-import type { RenderedLifecycleStage, RenderedZeroPageReason } from './crawlerTelemetry';
-import { redactCauseSnippet } from './crawlerTelemetry';
+import type { RenderedLifecycleStage, RenderedZeroPageReason, CrawlDropReason } from './crawlerTelemetry';
+import { redactCauseSnippet, createDropCounter } from './crawlerTelemetry';
 import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
   DEFAULT_RENDERED_MAX_SESSION_ROTATIONS,
@@ -97,6 +97,12 @@ export interface BrowserFallbackResult {
   failureClass?: BrowserFailureClass | 'NO_PAGE_PROCESSED' | 'RENDERED_FALLBACK_SATURATED';
   telemetry?: BrowserFallbackTelemetry;
   detail: string;
+  /**
+   * Compact per-crawl drop/stop counters (ints only, no URLs/payloads).
+   * Records where candidate links/pages were lost: hint-rejected enqueues,
+   * control-slice cuts, page-budget and queue-exhausted stops. Sparse.
+   */
+  dropReasons?: Partial<Record<CrawlDropReason, number>>;
 }
 
 export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
@@ -109,7 +115,7 @@ export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
   totalTimeoutMs: 60_000,
 };
 
-const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about/i;
+export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about/i;
 
 /**
  * Telegram channel pages contain a link for virtually every message. Those
@@ -225,6 +231,12 @@ export function resolveRenderedCompletionState(input: {
   inspectedPages: number;
   timedOut: boolean;
   telemetry: BrowserFallbackTelemetry;
+  /**
+   * Explicit request-budget cutoff: eligible requests remained queued when
+   * maxRequestsPerCrawl stopped the crawl. A successful final HTTP response
+   * is not coverage proof in that case.
+   */
+  pageBudgetExhausted?: boolean;
 }): { complete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   // Processed means actual successfully inspected page evidence — a request
   // merely starting (admitted but never inspected) is zero-page evidence.
@@ -245,7 +257,12 @@ export function resolveRenderedCompletionState(input: {
   // since a recovered request processes its page; the clause keeps partial
   // telemetry from resolving clean).
   const failedWithNoPages = (input.telemetry?.requestsFailed || 0) > 0 && input.inspectedPages === 0;
-  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages;
+  // maxRequestsPerCrawl can stop a crawl whose every started request
+  // succeeded: success of the final response must not mask eligible requests
+  // still queued, so an explicit budget cutoff keeps the result incomplete
+  // and retryable even when nothing failed.
+  const pageBudgetCutoff = input.pageBudgetExhausted === true;
+  const incomplete = !processed || input.timedOut || terminalFailures > 0 || failedWithNoPages || pageBudgetCutoff;
   return { complete: !incomplete, retryable: incomplete, failureClass: !processed ? 'NO_PAGE_PROCESSED' : undefined };
 }
 
@@ -438,6 +455,10 @@ export async function dropIsolatedRenderedQueue(
 export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Partial<BrowserFallbackBudget> = {}): Promise<BrowserFallbackResult> {
   const limits = { ...DEFAULT_BROWSER_FALLBACK_BUDGET, ...budget };
   let inspectedPages = 0, scrolls = 0, clicks = 0;
+  // Per-crawl drop accounting (compact ints only): where candidate links or
+  // pages were lost to enqueue/click/budget rules. Attached to the result for
+  // ledger persistence; never URLs or payloads.
+  const drops = createDropCounter();
   const telemetry: BrowserFallbackTelemetry = {
     requestsStarted: 0,
     requestsFinished: 0,
@@ -558,6 +579,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               const re = new RegExp(pattern, 'i');
               return nodes.map((node, index) => ({index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`})).filter(item => re.test(item.text)).slice(0, 12);
             }, COMMUNITY_HINTS.source);
+            // Controls beyond the per-page click slice can never be attempted
+            // on this page (the slice binds before the timeout check below).
+            drops.count('control-slice', Math.max(0, controls.length - limits.maxClicksPerPage));
 
             for (const control of controls.slice(0, limits.maxClicksPerPage)) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -579,7 +603,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
-              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>shouldEnqueueRenderedCommunityLink(req.url)?req:false});
+              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>{if(shouldEnqueueRenderedCommunityLink(req.url))return req;drops.count('hint-rejected');return false;}});
             }
             // Success is recorded only after the request's full page-processing
             // lifecycle completes (load, scroll traversal, control enumeration,
@@ -601,14 +625,39 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'CRAWLER_RUNNING');
         await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
         markBrowserCapabilityReady();
+        // Request-budget cutoff is measured from the supported queue-info API:
+        // after the run, pendingRequestCount reports eligible requests that
+        // maxRequestsPerCrawl left unstarted, so a successful final response
+        // cannot prove complete coverage while work remains queued. When the
+        // stat is unreadable AND the crawl reached maxPages, fail
+        // conservatively (assume cutoff) rather than proving completion.
+        // Best-effort read only (the queue drops in the finally below): it
+        // never throws into the crawl result.
+        let pendingEligibleRequests: number | null = null;
+        try {
+          const info = await (isolated.queue as unknown as { getInfo?: () => Promise<{ pendingRequestCount?: unknown }> }).getInfo?.();
+          const pending = (info as { pendingRequestCount?: unknown } | null | undefined)?.pendingRequestCount;
+          if (typeof pending === 'number' && Number.isFinite(pending)) {
+            pendingEligibleRequests = Math.max(0, Math.floor(pending));
+          }
+        } catch { pendingEligibleRequests = null; }
+        const reachedPageBudget = telemetry.requestsStarted >= limits.maxPages;
+        const pageBudgetExhausted = pendingEligibleRequests === null
+          ? reachedPageBudget
+          : pendingEligibleRequests > 0 && reachedPageBudget;
         const timedOut=Date.now()-startedAt>=limits.totalTimeoutMs;
         telemetry.unresolvedFailedRequests=renderedUnresolvedFailureCount(requestTracker);
-        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry});
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
         const candidates=mergeDiscordCandidates(discovered);
         const first=candidates[0];
+        // Terminal stop attribution: a complete crawl below the page budget
+        // with nothing still queued ended for lack of enqueueable links;
+        // eligible requests still queued mean the request budget cut coverage.
+        if (completion.complete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
+        if (pageBudgetExhausted) drops.count('page-budget');
         return {
           foundInvite:first?.nativeInviteCode||null,
           foundLocation:first?.sourceUrl,
@@ -619,6 +668,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           timedOut,
           failureClass:completion.failureClass,
           telemetry,
+          dropReasons:drops.snapshot(),
           detail:candidates.length
             ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
             : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,
@@ -633,7 +683,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         if (causeSnippet) telemetry.launchCauseSnippet=causeSnippet;
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut:false,saturated:false,browserLaunchFailed,thrown:true,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;
-        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
+        return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,candidates,inspectedPages,scrolls,clicks,complete:false,retryable:true,timedOut:false,failureClass,telemetry,dropReasons:drops.snapshot(),detail:`Rendered acquisition unavailable or failed${causeSnippet?` (cause: ${causeSnippet})`:''}: ${browserFallbackTelemetrySummary(telemetry)}`};
       } finally {
         // The isolated queue must never outlive its crawl: drop it on success,
         // failure, and unexpected throws alike so named queues cannot

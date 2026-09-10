@@ -10,8 +10,8 @@ const migration=readFileSync('server/db/migrations/110_discord_candidates.sql','
 const ui=readFileSync('src/components/ResultsTable.tsx','utf8');
 
 test('master listing retains rows but excludes low-audience skips unless explicitly selected',()=>{
-  assert.match(dbCore,/const clauses=\[args\.diagnosticsOnly\?[\s\S]+:'TRUE'\]/);
-  assert.match(dbCore,/scope:args\.diagnosticsOnly\?'DIAGNOSTICS_ONLY':'ALL_STORED_CHANNELS'/);
+  assert.match(dbCore,/const clauses=\[\(args\.diagnosticsOnly \|\| viewingDiagnosticSlice\)\?`NOT \(\$\{defaultServing\.predicate\}\)`:args\.includeRejected\?'TRUE':`\(\$\{defaultServing\.predicate\}\)`\]/);
+  assert.match(dbCore,/scope:\(args\.diagnosticsOnly \|\| viewingDiagnosticSlice\)\?`DIAGNOSTICS_ONLY:\$\{defaultServing\.scope\}`:args\.includeRejected\?'ALL_CHANNELS':defaultServing\.scope/);
   assert.match(dbCore,/const explicitlyViewingLowAudience=args\.scanStatus==='SKIPPED_LOW_AUDIENCE'/);
   assert.match(dbCore,/!explicitlyViewingLowAudience\)clauses\.push\(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT \$\{KNOWN_LOW_AUDIENCE_SQL\}`\)/);
 });

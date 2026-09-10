@@ -1,5 +1,85 @@
 export type CrawlerAcquisitionMode = 'STATIC' | 'RENDERED';
 
+/**
+ * Closed taxonomy of why a discovered URL/page was not pursued. Counters
+ * only — never URLs, HTML, or payloads — so retention stays memory-bounded
+ * under the existing OOM protections.
+ */
+export const CRAWL_DROP_REASONS = [
+  'invalid-protocol',
+  'cross-origin-disallowed',
+  'score-zero',
+  'hint-rejected',
+  'duplicate',
+  'queue-cap',
+  'depth-limit',
+  'exploration-limit',
+  'already-visited',
+  'control-slice',
+  'page-budget',
+  'queue-exhausted',
+] as const;
+export type CrawlDropReason = typeof CRAWL_DROP_REASONS[number];
+export function isCrawlDropReason(value: unknown): value is CrawlDropReason {
+  return typeof value === 'string' && (CRAWL_DROP_REASONS as readonly string[]).includes(value);
+}
+
+/** Shared taxonomy/bound enforcement for drop counters, used both when
+ * telemetry objects are constructed and when ledger rows are persisted, so
+ * direct in-process consumers never receive invalid reason keys or
+ * unbounded/non-integer counters either. */
+export function sanitizeDropReasons(input: unknown): Partial<Record<CrawlDropReason, number>> {
+  const drops: Partial<Record<CrawlDropReason, number>> = {};
+  if (input && typeof input === 'object') {
+    for (const [key, value] of Object.entries(input)) {
+      if (isCrawlDropReason(key) && typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        drops[key] = Math.min(999999, Math.floor(value));
+      }
+    }
+  }
+  return drops;
+}
+
+/** Shared bound for scroll usage counters (positive ints, capped). */
+export function sanitizeScrollsUsed(input: unknown): number {
+  return typeof input === 'number' && Number.isFinite(input) && input > 0
+    ? Math.min(999999, Math.floor(input))
+    : 0;
+}
+
+/** Tiny bounded counter for per-crawl drop/stop reasons (ints only). */
+export interface DropCounter {
+  count(reason: CrawlDropReason, n?: number): void;
+  /**
+   * Count once per key (typically the candidate URL): the anchor and dynamic
+   * extraction passes can evaluate the same discovered link twice, and a
+   * twice-seen candidate is still one lost candidate.
+   */
+  countUnique(reason: CrawlDropReason, key: string): void;
+  snapshot(): Partial<Record<CrawlDropReason, number>>;
+}
+export function createDropCounter(): DropCounter {
+  const counts = new Map<CrawlDropReason, number>();
+  const seen = new Set<string>();
+  return {
+    count(reason, n = 1) {
+      if (!isCrawlDropReason(reason)) return;
+      if (!Number.isFinite(n) || n <= 0) return;
+      counts.set(reason, (counts.get(reason) || 0) + Math.floor(n));
+    },
+    countUnique(reason, key) {
+      if (!isCrawlDropReason(reason)) return;
+      const marker = `${reason}\n${key}`;
+      if (seen.has(marker)) return;
+      seen.add(marker);
+      counts.set(reason, (counts.get(reason) || 0) + 1);
+    },
+    snapshot() {
+      return Object.fromEntries(counts);
+    },
+  };
+}
+
 export interface CrawlerTelemetry {
   mode: CrawlerAcquisitionMode;
   redirectsFollowed: number;
@@ -15,6 +95,18 @@ export interface CrawlerTelemetry {
   blockedRequests: number;
   rateLimitedRequests: number;
   hostBackoffsApplied: number;
+  /**
+   * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
+   * (ints only, taxonomy-bounded to 12 keys — never URLs or payloads).
+   * Tells future investigations where candidate URLs were lost. Sparse:
+   * absent when nothing was dropped.
+   */
+  dropReasons?: Partial<Record<CrawlDropReason, number>>;
+  /**
+   * Rendered scroll iterations actually executed this crawl. Answers whether
+   * maxScrollsPerPage binds. Sparse: absent when zero/unapplicable (static).
+   */
+  scrollsUsed?: number;
   /**
    * Stable worker-instance attribution (`hostname:pid`, cached per process).
    * Distinguishes deployment replicas and worker processes in the persisted
@@ -134,6 +226,8 @@ export function renderedCrawlerTelemetry(input: {
   complete: boolean;
   timedOut?: boolean;
   telemetry?: Partial<CrawlerTelemetry>;
+  dropReasons?: Partial<Record<CrawlDropReason, number>>;
+  scrollsUsed?: number;
 }): CrawlerTelemetry {
   return {
     ...emptyCrawlerTelemetry('RENDERED'),
@@ -148,6 +242,8 @@ export function renderedCrawlerTelemetry(input: {
     // in-process per crawl, so a spread-carried id could only ever be stale.
     workerInstanceId: workerInstanceId(),
     mode: 'RENDERED',
+    ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
+    ...(sanitizeScrollsUsed(input.scrollsUsed) > 0 ? { scrollsUsed: sanitizeScrollsUsed(input.scrollsUsed) } : {}),
   };
 }
 
@@ -155,6 +251,7 @@ export function staticCrawlerTelemetry(input: {
   redirectsFollowed: number;
   pagesInspected: number;
   budgetExhausted: boolean;
+  dropReasons?: Partial<Record<CrawlDropReason, number>>;
 }): CrawlerTelemetry {
   return {
     ...emptyCrawlerTelemetry('STATIC'),
@@ -162,6 +259,7 @@ export function staticCrawlerTelemetry(input: {
     pagesInspected: Math.max(0, Math.floor(input.pagesInspected)),
     budgetExhausted: input.budgetExhausted === true,
     workerInstanceId: workerInstanceId(),
+    ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
   };
 }
 
@@ -186,6 +284,14 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   const stage = candidate.mode === 'RENDERED' ? text(candidate.lastLifecycleStage, 40) : undefined;
   const reason = candidate.mode === 'RENDERED' ? text(candidate.zeroPageReason, 40) : undefined;
   const cause = candidate.mode === 'RENDERED' ? redactCauseSnippet(candidate.launchCauseSnippet) : undefined;
+  // Drop-reason counters and scroll usage are compact ints under a closed
+  // taxonomy (no URLs/payloads); unknown keys, non-finite, and non-positive
+  // values are dropped rather than stored. Allowed on both modes: static
+  // records enqueue/drop reasons, rendered records those plus scroll usage.
+  // Shared with the constructors so direct consumers get the same bounds as
+  // persisted rows.
+  const drops = sanitizeDropReasons(candidate.dropReasons);
+  const scrolls = sanitizeScrollsUsed(candidate.scrollsUsed);
   const instance = text(candidate.workerInstanceId, 120);
   return {
     ...emptyCrawlerTelemetry(candidate.mode),
@@ -206,6 +312,8 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(isRenderedZeroPageReason(reason) ? { zeroPageReason: reason } : {}),
     ...(cause ? { launchCauseSnippet: cause } : {}),
     ...(instance ? { workerInstanceId: instance } : {}),
+    ...(Object.keys(drops).length ? { dropReasons: drops } : {}),
+    ...(scrolls > 0 ? { scrollsUsed: scrolls } : {}),
   };
 }
 
