@@ -2,8 +2,8 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import {
-  getAllChannels,
   getChannelById,
+  listRejectedChannelDiagnostics,
   getCountryVocabularies,
   saveCountryVocabulary,
   getExcludedCountries,
@@ -289,17 +289,11 @@ async function startServer() {
   app.get('/api/diagnostics/crawler-reliability',async(req,res)=>{try{res.json(await getCrawlerReliabilityMetrics(Number(req.query.hours||24)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/diagnostics/execution-lineage',async(req,res)=>{try{res.json(await getExecutionLineageMetrics(Number(req.query.hours||168)));}catch(err:any){sendOperationError(res,err);}});
 
-  // Dedicated diagnostics view for rejected / excluded channels
-  app.get('/api/channels/diagnostics/rejected', async (req, res) => {
+  // Dedicated diagnostics view for rejected / excluded channels.
+  // SQL-filtered, never a full-table load into Node memory.
+  app.get('/api/channels/diagnostics/rejected', async (_req, res) => {
     try {
-      const allChannels = await getAllChannels();
-      const rejectedChannels = allChannels.filter(c =>
-        c.country_status === 'REJECTED' ||
-        c.scan_status === 'SKIPPED_EXCLUDED' ||
-        c.trading_status === 'NON_TRADING' ||
-        c.discord_status === 'NON_TRADING'
-      );
-      res.json(rejectedChannels);
+      res.json(await listRejectedChannelDiagnostics());
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

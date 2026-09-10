@@ -322,6 +322,15 @@ export async function getAllChannels(): Promise<ChannelRecord[]> {
   return res.rows.map(rowToChannel);
 }
 
+// Memory-bounded rejected-view: same predicate the
+// /api/channels/diagnostics/rejected route previously applied in Node after
+// loading every stored channel. Same order, no full-table load into memory.
+export async function listRejectedChannelDiagnostics(): Promise<ChannelRecord[]> {
+  const db = await getDb();
+  const res = await db.query(`SELECT * FROM channels WHERE country_status='REJECTED' OR scan_status='SKIPPED_EXCLUDED' OR trading_status='NON_TRADING' OR discord_status='NON_TRADING' ORDER BY first_seen DESC`);
+  return res.rows.map(rowToChannel);
+}
+
 export interface ChannelListingFilter {includeRejected?:boolean;diagnosticsOnly?:boolean;search?:string;country?:string;countryStatus?:string;tradingStatus?:string;discordStatus?:string;scanStatus?:string}
 // This is the single definition of the operator-visible discovery corpus. Keep
 // both the paginated listing and dashboard aggregates anchored to this policy.
