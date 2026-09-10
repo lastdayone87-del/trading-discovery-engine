@@ -90,6 +90,14 @@ export interface InspectionStep {
   detectedInvites?: string[];
   inviteLocation?: string;
   timestamp: string;
+  /**
+   * Structured candidate-country set for aggregated-content-language
+   * rejections, persisted alongside the rendered details. Lets recovery
+   * reconcile against the live exclusion list without depending on evidence
+   * prose formatting. Optional: older rows predate it and fall back to the
+   * hardened text parse. JSONB passthrough — no migration.
+   */
+  candidateCountries?: string[];
 }
 
 export type QueryCollection = 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED';

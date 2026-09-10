@@ -24,6 +24,25 @@ export function formatCountryEvidenceLine(item: CountryInferenceEvidence): strin
   return `  [P${item.priority}] ${item.source}: ${item.detectedCountry} (${item.confidence}/100) — ${item.reasoning}${suffix}`;
 }
 
+/**
+ * Extracts the aggregated-content-language candidate-country set from already
+ * computed country evidence. Returns the full structured set (single-country
+ * languages resolve to their detected country, mirroring the rendered
+ * evidence line which always names the set), or null when no language evidence exists.
+ * Producers persist this on the COUNTRY_VALIDATION trail step so recovery can
+ * reconcile without parsing rendered prose.
+ */
+export function aggregatedLanguageCandidateSet(
+  evidence?: Array<Pick<CountryInferenceEvidence, 'source' | 'candidateCountries' | 'detectedCountry'> | undefined | null> | null
+): string[] | null {
+  const item = (evidence || []).find(entry => entry?.source === 'AGGREGATED_CONTENT_LANGUAGE');
+  if (!item) return null;
+  const structured = (item.candidateCountries || []).map(part => String(part || '').trim()).filter(Boolean);
+  if (structured.length > 0) return structured;
+  const single = String(item.detectedCountry || '').trim();
+  return single ? [single] : null;
+}
+
 export interface ValidationResult {
   score: number;
   status: CountryStatus;

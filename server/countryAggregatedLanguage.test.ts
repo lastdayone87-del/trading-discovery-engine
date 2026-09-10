@@ -735,3 +735,107 @@ test('complete candidate sets still reconcile both directions after the hardenin
   const restored = classifyReconciliationState(row as never, withoutPakistan as never, []);
   assert.equal(restored.state, 'RECOVERABLE_NON_EXCLUDED');
 });
+
+// ---------------------------------------------------------------------------
+// Structured candidate set: producers persist it on the step; the parser
+// prefers it over rendered prose so formatting changes cannot silently
+// disable set-aware reconciliation.
+// ---------------------------------------------------------------------------
+
+test('structured candidate set is extracted from language evidence', async () => {
+  const { aggregatedLanguageCandidateSet } = await import('./countryValidator');
+  assert.deepEqual(
+    aggregatedLanguageCandidateSet([
+      { source: 'AGGREGATED_CONTENT_LANGUAGE', candidateCountries: ['Pakistan', 'India'], detectedCountry: 'India' },
+    ] as never),
+    ['Pakistan', 'India'],
+  );
+  // Single-country languages omit candidateCountries; resolve to the country.
+  assert.deepEqual(
+    aggregatedLanguageCandidateSet([
+      { source: 'AGGREGATED_CONTENT_LANGUAGE', detectedCountry: 'Vietnam' },
+    ] as never),
+    ['Vietnam'],
+  );
+  assert.equal(aggregatedLanguageCandidateSet([]), null);
+  assert.equal(
+    aggregatedLanguageCandidateSet([{ source: 'CHANNEL_ABOUT_BIO', detectedCountry: 'India' }] as never),
+    null,
+  );
+});
+
+test('rejection steps persist the structured candidate set', () => {
+  const ingestion = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  assert.match(ingestion, /aggregatedLanguageCandidateSet\(countryVal\.evidence\)/);
+  assert.match(ingestion, /candidateCountries: languageCandidateCountries/);
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /aggregatedLanguageCandidateSet\(valRes\.evidence\)/);
+  assert.match(queue, /aggregatedLanguageCandidateSet\(liveCountry\.evidence\)/);
+});
+
+test('structured set wins when the rendered set label is lost', () => {
+  const row = {
+    channel_id: 'UCtesttesttesttesttest06',
+    channel_name: 'Test',
+    country: 'India',
+    country_status: 'REJECTED',
+    trading_status: 'UNKNOWN',
+    inspection_trail: [
+      {
+        step: 'COUNTRY_VALIDATION',
+        title: 'Country Validation (India)',
+        status: 'REJECTED',
+        // Marker and representative survive; the set label was reformatted away.
+        details: '  [P3] AGGREGATED_CONTENT_LANGUAGE: India (86/100) — 9/10 recent video descriptions in Urdu. [field: videoDescriptions]',
+        candidateCountries: ['Pakistan', 'India'],
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+    ],
+  };
+  assert.deepEqual(parseAggregatedLanguageRejection(row as never), {
+    representative: 'India',
+    countries: ['Pakistan', 'India'],
+  });
+  const kept = classifyReconciliationState(row as never, EXCLUDED as never, []);
+  assert.equal(kept.state, 'RETAIN_EXCLUDED');
+  const withoutPakistan = EXCLUDED.filter(e => e.country_name !== 'Pakistan');
+  const restored = classifyReconciliationState(row as never, withoutPakistan as never, []);
+  assert.equal(restored.state, 'RECOVERABLE_NON_EXCLUDED');
+  assert.equal(restored.detectedCountry, null);
+});
+
+test('structured set alone confirms the rejection when prose carries no marker', () => {
+  const row = {
+    channel_id: 'UCtesttesttesttesttest07',
+    channel_name: 'Test',
+    country: 'Vietnam',
+    country_status: 'REJECTED',
+    trading_status: 'UNKNOWN',
+    inspection_trail: [
+      {
+        step: 'COUNTRY_VALIDATION',
+        title: 'Country Validation (Vietnam)',
+        status: 'REJECTED',
+        details: 'Excluded by policy: Regional Exclusion',
+        candidateCountries: ['Vietnam'],
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+    ],
+  };
+  assert.deepEqual(parseAggregatedLanguageRejection(row as never), {
+    representative: 'Vietnam',
+    countries: ['Vietnam'],
+  });
+});
+
+test('invalid structured sets fall back to the hardened text parse', () => {
+  const row = languageRow(['Pakistan', 'India'], 'India') as {
+    inspection_trail: Array<Record<string, unknown>>;
+  };
+  (row.inspection_trail[0] as Record<string, unknown>).candidateCountries = [];
+  // Empty structured array is ignored; the complete text label still parses.
+  assert.deepEqual(parseAggregatedLanguageRejection(row as never), {
+    representative: 'India',
+    countries: ['Pakistan', 'India'],
+  });
+});

@@ -1,6 +1,6 @@
 import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
 import { DiscoveredChannelRaw, fetchYouTubeChannelCountryMetadata } from './youtube';
-import { validateChannelCountry } from './countryValidator';
+import { aggregatedLanguageCandidateSet, validateChannelCountry } from './countryValidator';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
 import { inspectAndValidateChannel } from './queueManager';
@@ -303,6 +303,7 @@ export async function processChannelThroughPipeline(
   // targetCountry is retrieval context and NEVER populates creatorCountry or channels.country.
   const creatorCountry = countryVal.detectedCreatorCountry || null;
 
+  const languageCandidateCountries = aggregatedLanguageCandidateSet(countryVal.evidence);
   const countryValidationStep = {
     step: 'COUNTRY_VALIDATION' as const,
     title: `Country Validation (${creatorCountry || 'Unknown'})`,
@@ -312,6 +313,8 @@ export async function processChannelThroughPipeline(
       ? ('FOUND' as const)
       : ('NOT_FOUND' as const),
     details: `${countryVal.decisionLogs}${(candidate as any).publicAboutAttempted ? '\nPublic About page attempted.' : ''}`,
+    // Structured candidate set for recovery reconciliation (no prose parsing).
+    ...(languageCandidateCountries ? { candidateCountries: languageCandidateCountries } : {}),
     timestamp: now
   };
 

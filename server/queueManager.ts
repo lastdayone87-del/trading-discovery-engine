@@ -37,7 +37,7 @@ import {
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
-import { mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
+import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { validateDiscordInvite } from './discordValidator';
@@ -940,6 +940,7 @@ export async function inspectAndValidateChannel(
       rawDetails?.locationTag || null
     );
 
+    const preInspectionLanguageSet = aggregatedLanguageCandidateSet(valRes.evidence);
     const countryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
       title: `Country Validation (${channel.country || 'Unknown'})`,
@@ -949,6 +950,8 @@ export async function inspectAndValidateChannel(
         ? 'FOUND'
         : 'NOT_FOUND',
       details: valRes.decisionLogs,
+      // Structured candidate set for recovery reconciliation (no prose parsing).
+      ...(preInspectionLanguageSet ? { candidateCountries: preInspectionLanguageSet } : {}),
       timestamp: now
     };
 
@@ -997,6 +1000,7 @@ export async function inspectAndValidateChannel(
       metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status,
       videoDescriptions:inspection.observedVideoDescriptions || [], videoDescriptionsAuthoritative:inspection.observedVideoDescriptionsAuthoritative || false, playlists:rawDetails?.playlists}, rawDetails?.locationTag || null);
     const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
+    const liveLanguageSet = aggregatedLanguageCandidateSet(liveCountry.evidence);
     const liveCountryStep: InspectionStep = {
       step: 'COUNTRY_VALIDATION',
       title: `Country Validation (${rawLiveCountry.detectedCreatorCountry || 'Unknown'}) — Live About`,
@@ -1006,6 +1010,8 @@ export async function inspectAndValidateChannel(
         ? 'FOUND'
         : 'NOT_FOUND',
       details: `${rawLiveCountry.decisionLogs}${liveCountry !== rawLiveCountry ? '\\nEffective decision: earlier stronger/conflicting evidence preserved.' : ''}`,
+      // Structured candidate set for recovery reconciliation (no prose parsing).
+      ...(liveLanguageSet ? { candidateCountries: liveLanguageSet } : {}),
       timestamp: now
     };
     if (liveCountry.status === 'REJECTED') {

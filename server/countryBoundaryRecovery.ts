@@ -48,21 +48,21 @@ export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, _excluded
 /**
  * Parses an aggregated-content-language rejection from a channel's inspection
  * trail. Record-scoped: only the LATEST rejected COUNTRY_VALIDATION entry is
- * inspected, and the representative plus the full candidate-country set
- * (`candidate countries [A, B]`) are parsed from THAT SAME entry's details.
- * Older/unrelated validation records (including earlier language lines and
- * Discord re-check entries) can never contaminate the parse. Returns null
- * when the latest rejected validation carries no language rejection, so
- * reconciliation falls through to normal creator-evidence re-evaluation.
+ * inspected. The candidate-country set prefers the structured
+ * `candidateCountries` persisted on that step (immune to evidence-prose
+ * formatting, truncation, or localization changes); rows predating it fall
+ * back to parsing the set (`candidate countries [A, B]`) from that same
+ * entry's details. Older/unrelated validation records (including earlier
+ * language lines and Discord re-check entries) can never contaminate the
+ * parse. Returns null when the latest rejected validation carries no language
+ * rejection, so reconciliation falls through to normal creator-evidence
+ * re-evaluation.
  *
- * No structured row field carries the candidate set (InspectionStep details
- * text is the only durable record; channel.country holds just the
- * representative), so the set is read from the rendered evidence line the
- * producer always emits. Fail-closed: when the language marker IS present but
- * the set is missing/unparseable (truncated, reformatted, or relocalized
- * trail), countries is null instead of silently falling back to the lone
- * representative — callers must retain the rejection rather than risk a
- * wrongful restore from an incomplete parse.
+ * Fail-closed: when a language rejection IS confirmed (structured set or
+ * marker present) but the set is missing/unparseable, countries is null
+ * instead of silently falling back to the lone representative — callers must
+ * retain the rejection rather than risk a wrongful restore from an incomplete
+ * parse.
  */
 export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
   representative: string;
@@ -75,15 +75,48 @@ export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
   const latest = rejectedValidations[rejectedValidations.length - 1];
   if (!latest) return null;
   const details = String(latest.details || '');
-  if (!details.includes('AGGREGATED_CONTENT_LANGUAGE')) return null;
-  const representativeMatch = details.match(/AGGREGATED_CONTENT_LANGUAGE:\s*([^\n(]+?)\s*\(/);
-  const representative = (representativeMatch?.[1] || '').trim();
+  const structured = readStepCandidateCountries(latest);
+  if (!structured && !details.includes('AGGREGATED_CONTENT_LANGUAGE')) return null;
+  const representative = readStepRepresentative(latest, channel.country);
   if (!representative) return null;
+  if (structured) return { representative, countries: structured };
   const setMatch = details.match(/candidate countries \[([^\]]+)\]/);
   if (!setMatch) return { representative, countries: null };
   const countries = setMatch[1].split(',').map(part => part.trim()).filter(Boolean);
   if (countries.length === 0) return { representative, countries: null };
   return { representative, countries };
+}
+
+/** Validated structured candidate set persisted on a trail step, if any. */
+function readStepCandidateCountries(step: ChannelRecord['inspection_trail'][number]): string[] | null {
+  const raw = (step as { candidateCountries?: unknown }).candidateCountries;
+  if (!Array.isArray(raw)) return null;
+  const countries = raw.map(part => String(part || '').trim()).filter(Boolean);
+  return countries.length > 0 ? countries : null;
+}
+
+/**
+ * Representative country for a language rejection, most-structured first:
+ * rendered evidence line, stored row country (set to the representative at
+ * rejection time), then the step title. 'Unknown'/empty values never count.
+ */
+function readStepRepresentative(
+  step: ChannelRecord['inspection_trail'][number],
+  storedCountry?: string | null
+): string {
+  const usable = (value: unknown): string | null => {
+    const text = String(value || '').trim();
+    return text && text.toLowerCase() !== 'unknown' ? text : null;
+  };
+  const details = String(step.details || '');
+  const lineMatch = details.match(/AGGREGATED_CONTENT_LANGUAGE:\s*([^\n(]+?)\s*\(/);
+  const fromLine = lineMatch ? usable(lineMatch[1]) : null;
+  if (fromLine) return fromLine;
+  const stored = usable(storedCountry);
+  if (stored) return stored;
+  const titleMatch = String(step.title || '').match(/\(\s*([^)]+?)\s*\)/);
+  const fromTitle = titleMatch ? usable(titleMatch[1]) : null;
+  return fromTitle || '';
 }
 
 export function classifyReconciliationState(
