@@ -54,10 +54,19 @@ export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, _excluded
  * Discord re-check entries) can never contaminate the parse. Returns null
  * when the latest rejected validation carries no language rejection, so
  * reconciliation falls through to normal creator-evidence re-evaluation.
+ *
+ * No structured row field carries the candidate set (InspectionStep details
+ * text is the only durable record; channel.country holds just the
+ * representative), so the set is read from the rendered evidence line the
+ * producer always emits. Fail-closed: when the language marker IS present but
+ * the set is missing/unparseable (truncated, reformatted, or relocalized
+ * trail), countries is null instead of silently falling back to the lone
+ * representative — callers must retain the rejection rather than risk a
+ * wrongful restore from an incomplete parse.
  */
 export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
   representative: string;
-  countries: string[];
+  countries: string[] | null;
 } | null {
   const trail = channel.inspection_trail || [];
   const rejectedValidations = trail.filter(step =>
@@ -69,11 +78,11 @@ export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
   if (!details.includes('AGGREGATED_CONTENT_LANGUAGE')) return null;
   const representativeMatch = details.match(/AGGREGATED_CONTENT_LANGUAGE:\s*([^\n(]+?)\s*\(/);
   const representative = (representativeMatch?.[1] || '').trim();
+  if (!representative) return null;
   const setMatch = details.match(/candidate countries \[([^\]]+)\]/);
-  const countries = setMatch
-    ? setMatch[1].split(',').map(part => part.trim()).filter(Boolean)
-    : (representative ? [representative] : []);
-  if (!representative || countries.length === 0) return null;
+  if (!setMatch) return { representative, countries: null };
+  const countries = setMatch[1].split(',').map(part => part.trim()).filter(Boolean);
+  if (countries.length === 0) return { representative, countries: null };
   return { representative, countries };
 }
 
@@ -97,6 +106,17 @@ export function classifyReconciliationState(
     // a non-representative member still catches the row.
     const languageRejection = parseAggregatedLanguageRejection(channel);
     if (languageRejection) {
+      // Unparseable set (countries null): the language rejection is confirmed
+      // but its membership is unknown — retain rather than restore. Precision
+      // first: a truncated/reformatted trail must never manufacture recovery.
+      if (languageRejection.countries === null) {
+        return {
+          state: 'RETAIN_EXCLUDED',
+          detectedCountry: languageRejection.representative,
+          reasoning: `Aggregated language rejection for ${languageRejection.representative} has an unparseable candidate set; retaining until the live list can be evaluated against complete evidence.`,
+          confidence: 86
+        };
+      }
       if (languageRejection.countries.every(isLiveExcluded)) {
         return {
           state: 'RETAIN_EXCLUDED',

@@ -849,6 +849,28 @@ export function nextChannelScanAttempts(current:number,terminalSemanticOrSuccess
 }
 
 /**
+ * Projects a live post-inspection country rejection onto the channel row.
+ * Mutates and returns the same row: country_status REJECTED, detected
+ * creator country, fresh live score, terminal scan status, and last_checked.
+ * Trading/Discord ownership and the inspection trail are never touched here —
+ * the caller owns Discord projections and trail assembly. Persistence stays
+ * with the caller's existing finally-block upsert; this helper performs no
+ * writes, mirroring applyGate1CountryRejectionToExisting ownership rules.
+ */
+export function applyLiveCountryRejectionToInspected(
+  channel: ChannelRecord,
+  liveCountry: { detectedCreatorCountry?: string | null; score: number },
+  now: string
+): ChannelRecord {
+  channel.country_status = 'REJECTED';
+  channel.country = liveCountry.detectedCreatorCountry || null;
+  channel.confidence_score = liveCountry.score;
+  channel.scan_status = 'COMPLETED';
+  channel.last_checked = now;
+  return channel;
+}
+
+/**
  * Handles newly discovered YouTube channel via the unified ingestion pipeline.
  */
 export async function processDiscoveredChannel(
@@ -987,7 +1009,10 @@ export async function inspectAndValidateChannel(
       timestamp: now
     };
     if (liveCountry.status === 'REJECTED') {
-      channel.country_status='REJECTED'; channel.country=liveCountry.detectedCreatorCountry || null;
+      // Terminal live rejection: project fresh score/scan/check metadata via
+      // the shared helper (persisted by the finally-block upsert below — no
+      // direct write here), then keep the existing Discord/trail projections.
+      applyLiveCountryRejectionToInspected(channel, liveCountry, now);
       // The live country decision is terminal, but the inspection already ran.
       // Preserve its real steps and only project NOT_FOUND when the inspection
       // actually completed without a candidate or an acquisition failure.

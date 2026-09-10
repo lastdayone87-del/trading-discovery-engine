@@ -352,9 +352,12 @@ export async function processChannelThroughPipeline(
         countryStatus: 'REJECTED',
         detectedCountry: creatorCountry,
         rejectionReason: countryVal.rejectionReason,
-        tradingStatus: 'UNCERTAIN',
-        discordStatus: 'NOT_FOUND',
-        discordInvite: null,
+        // The row keeps its own trading/Discord ownership (never mutated
+        // above); the outcome must mirror the persisted record so enrichment
+        // and investigation consumers never contradict the channelRecord.
+        tradingStatus: existing.trading_status || 'UNCERTAIN',
+        discordStatus: existing.discord_status,
+        discordInvite: existing.discord_invite || null,
         channelRecord: existing
       };
     }

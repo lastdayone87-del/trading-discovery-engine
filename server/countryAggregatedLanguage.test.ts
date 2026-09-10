@@ -686,3 +686,52 @@ test('recovery version is v4 so prior v3 events/jobs reconsider current rejectio
   const source = readFileSync(new URL('./countryBoundaryRecovery.ts', import.meta.url), 'utf8');
   assert.match(source, /`recovery:\$\{COUNTRY_BOUNDARY_RECOVERY_VERSION\}:\$\{channelId\}`/);
 });
+
+// ---------------------------------------------------------------------------
+// Recovery text-parse hardening: an unparseable candidate set retains (fail
+// closed) instead of silently restoring from an incomplete parse. No
+// structured row field carries the set — InspectionStep details text is the
+// only durable record — so a confirmed language rejection with a missing set
+// must never manufacture recovery.
+// ---------------------------------------------------------------------------
+
+test('language rejection with a truncated/unparseable candidate set is retained, not restored', () => {
+  const row = {
+    channel_id: 'UCtesttesttesttesttest05',
+    channel_name: 'Test',
+    country: 'Vietnam',
+    country_status: 'REJECTED',
+    trading_status: 'UNKNOWN',
+    inspection_trail: [
+      {
+        step: 'COUNTRY_VALIDATION',
+        title: 'Country Validation',
+        status: 'REJECTED',
+        // Marker present, set label lost (truncation/reformat/relocalization).
+        details: '  [P3] AGGREGATED_CONTENT_LANGUAGE: Vietnam (90/100) — 10/10 recent video descriptions in Vietnamese. [field: videoDescriptions]',
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+    ],
+  };
+  const parsed = parseAggregatedLanguageRejection(row as never);
+  assert.deepEqual(parsed, { representative: 'Vietnam', countries: null });
+  // Even with the representative itself removed from the live list, the row
+  // must not restore from an incomplete parse.
+  const withoutVietnam = EXCLUDED.filter(e => e.country_name !== 'Vietnam');
+  const res = classifyReconciliationState(row as never, withoutVietnam as never, []);
+  assert.equal(res.state, 'RETAIN_EXCLUDED');
+  assert.equal(res.detectedCountry, 'Vietnam');
+});
+
+test('complete candidate sets still reconcile both directions after the hardening', () => {
+  const row = languageRow(['Pakistan', 'India'], 'India');
+  assert.deepEqual(parseAggregatedLanguageRejection(row as never), {
+    representative: 'India',
+    countries: ['Pakistan', 'India'],
+  });
+  const kept = classifyReconciliationState(row as never, EXCLUDED as never, []);
+  assert.equal(kept.state, 'RETAIN_EXCLUDED');
+  const withoutPakistan = EXCLUDED.filter(e => e.country_name !== 'Pakistan');
+  const restored = classifyReconciliationState(row as never, withoutPakistan as never, []);
+  assert.equal(restored.state, 'RECOVERABLE_NON_EXCLUDED');
+});
