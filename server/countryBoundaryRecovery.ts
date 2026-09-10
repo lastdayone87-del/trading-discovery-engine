@@ -144,6 +144,24 @@ function readStepRepresentative(
   return fromTitle || '';
 }
 
+/**
+ * Only explicitly persisted creator-authored text may stand in for the About
+ * bio during recovery. Inspection-trail details are crawler prose — website
+ * URLs, acquisition logs, Discord observations, validation logs — and
+ * production validation never accepts them as bio (queue provenance
+ * boundary), so they must not gain P2 authority here either. The sole
+ * exception is the 'Historical Creator Evidence' BIO record synthesized from
+ * sighting metadata at cohort load. Anything else yields no bio text, failing
+ * closed toward INSUFFICIENT_EVIDENCE.
+ */
+export function trustedCreatorBioText(channel: ChannelRecord): string {
+  return (channel.inspection_trail || [])
+    .filter(step => step.step === 'BIO' && step.title === 'Historical Creator Evidence')
+    .map(step => step.details || '')
+    .join(' ')
+    .trim();
+}
+
 export function classifyReconciliationState(
   channel: ChannelRecord,
   excludedCountries: Array<{ country_name: string; reason?: string }>,
@@ -205,12 +223,13 @@ export function classifyReconciliationState(
 
   // Re-evaluate creator-level evidence using standard production extraction path.
   // Explicitly exclude channel.country location tag to prevent search target contamination.
+  // The bio below is ONLY explicitly persisted creator-authored text
+  // (trustedCreatorBioText): flattened inspection-trail details are crawler
+  // prose (URLs, acquisition logs, Discord observations) and must never gain
+  // bio authority in recovery, mirroring the queue provenance boundary.
   const creatorEvidence = creatorLevelCountryEvidence({
     channelName: channel.channel_name,
-    description: (channel.inspection_trail || [])
-      .filter(t => t.step !== 'COUNTRY_VALIDATION')
-      .map(t => t.details || '')
-      .join(' ') || channel.channel_name,
+    description: trustedCreatorBioText(channel),
     videoTitles: [channel.channel_name],
     externalLinks: channel.discord_invite ? [channel.discord_invite] : [],
     metadataStatus: channel.country_metadata_status
