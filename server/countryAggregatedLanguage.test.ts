@@ -13,6 +13,10 @@ import {
   classifyReconciliationState,
 } from './countryBoundaryRecovery';
 import { runChannelInspection } from './inspector';
+import {
+  mergeSampledVideoDescriptions,
+  normalizeSampledVideoDescriptions,
+} from './inspector';
 import { extractDiscoveredChannels } from './youtube';
 import { mapInnertubeVideosToRaw } from './youtubeInnertubeProvider';
 
@@ -616,7 +620,9 @@ test('live API sample requests up to 10 recent descriptions', () => {
 
 test('live inspection continues channel sampling until 8 authoritative descriptions', () => {
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
-  assert.match(source, /channelSampledDescs\.length\s*<\s*8/);
+  // Distinct-video count (API/scrape overlap merges by video ID).
+  assert.match(source, /channelSampled\.length\s*<\s*8/);
+  assert.match(source, /mergeSampledVideoDescriptions\(channelSampled/);
 });
 
 test('8+ usable live descriptions reach aggregation; fewer than 8 abstains', async () => {
@@ -835,6 +841,167 @@ test('invalid structured sets fall back to the hardened text parse', () => {
   (row.inspection_trail[0] as Record<string, unknown>).candidateCountries = [];
   // Empty structured array is ignored; the complete text label still parses.
   assert.deepEqual(parseAggregatedLanguageRejection(row as never), {
+    representative: 'India',
+    countries: ['Pakistan', 'India'],
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Distinct-video sampling: API/scrape overlap merges by video ID so one
+// upload can never vote twice toward the 8-description threshold.
+// ---------------------------------------------------------------------------
+
+test('same video observed twice votes once; distinct videos vote separately', () => {
+  const api = normalizeSampledVideoDescriptions([
+    { videoId: 'v1', description: VI },
+    { videoId: 'v2', description: VI },
+  ]);
+  // Same two videos rescraped with reformatted text (entities/links differ).
+  const scrape = normalizeSampledVideoDescriptions([
+    { videoId: 'v1', description: `${VI} https://discord.gg/abc` },
+    { videoId: 'v2', description: `  ${VI}  ` },
+  ]);
+  const merged = mergeSampledVideoDescriptions(api, scrape);
+  assert.equal(merged.length, 2);
+  assert.deepEqual(
+    merged.map(item => item.videoId).sort(),
+    ['v1', 'v2'],
+  );
+  // First-observed text wins; the reformatted duplicate never votes.
+  assert.ok(!merged.some(item => item.description.includes('discord.gg')));
+  // Distinct videos sharing identical text still count separately.
+  const twins = mergeSampledVideoDescriptions(
+    normalizeSampledVideoDescriptions([{ videoId: 'v3', description: EN }]),
+    normalizeSampledVideoDescriptions([{ videoId: 'v4', description: EN }]),
+  );
+  assert.equal(twins.length, 2);
+});
+
+test('overlapping API/scrape samples cannot manufacture 8 votes from 5 videos', async () => {
+  const apiPairs = Array.from({ length: 5 }, (_, i) => ({
+    videoId: `vid-${i + 1}`,
+    description: `${VI} — bản tin ${i + 1}`,
+  }));
+  const result = await runChannelInspection({
+    channelId: 'UCvvvvvvvvvvvvvvvvvvvvvd',
+    channelName: 'Test Channel',
+    channelBio: 'Trading creator',
+    channelLinks: [],
+    videoDescriptions: [],
+    creatorLikelyTrading: true,
+    recentVideoDescriptionsLoader: async () => apiPairs,
+  });
+  assert.equal(result.observedVideoDescriptions?.length, 5);
+  const vote = assess({
+    videoDescriptions: result.observedVideoDescriptions || [],
+    videoDescriptionsAuthoritative: result.observedVideoDescriptionsAuthoritative,
+  });
+  assert.notEqual(vote.countryStatus, 'REJECTED');
+});
+
+test('live sampling merges by video ID through the ID-aware API path', () => {
+  const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
+  assert.match(source, /fetchRecentVideoDescriptionsWithIds/);
+  assert.match(source, /mergeSampledVideoDescriptions\(channelSampled, normalizeSampledVideoDescriptions/);
+  assert.match(source, /trackChannelSampled\(scraped\.items\)/);
+  const apiSource = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const recent = apiSource.slice(
+    apiSource.indexOf('export async function fetchRecentVideoDescriptionsWithIds'),
+    apiSource.indexOf('/**\n * Fetches richer official channel metadata'),
+  );
+  assert.match(recent, /videoId/);
+});
+
+// ---------------------------------------------------------------------------
+// Timestamp-ordered recovery selection: reordered trails select by timestamp,
+// not array position.
+// ---------------------------------------------------------------------------
+
+test('reordered trails select rejection evidence by timestamp', () => {
+  const older = {
+    step: 'COUNTRY_VALIDATION',
+    title: 'Country Validation',
+    status: 'REJECTED',
+    details:
+      '  [P3] AGGREGATED_CONTENT_LANGUAGE: India (86/100) — 9/10 recent video descriptions in Urdu (candidate countries [Pakistan, India], all currently excluded). [field: videoDescriptions]',
+    timestamp: '2026-01-01T00:00:00.000Z',
+  };
+  const newer = {
+    step: 'COUNTRY_VALIDATION',
+    title: 'Country Validation (Vietnam) — Live About',
+    status: 'REJECTED',
+    details:
+      '  [P3] AGGREGATED_CONTENT_LANGUAGE: Vietnam (90/100) — 10/10 recent video descriptions in Vietnamese (candidate countries [Vietnam], all currently excluded). [field: videoDescriptions]',
+    timestamp: '2026-03-01T00:00:00.000Z',
+  };
+  // Newest entry stored FIRST (reordered historical trail).
+  const row = {
+    channel_id: 'UCtesttesttesttesttest08',
+    channel_name: 'Test',
+    country: 'Vietnam',
+    country_status: 'REJECTED',
+    trading_status: 'UNKNOWN',
+    inspection_trail: [newer, older],
+  };
+  assert.deepEqual(parseAggregatedLanguageRejection(row as never), {
+    representative: 'Vietnam',
+    countries: ['Vietnam'],
+  });
+  // Array order alone would have selected the stale India evidence.
+  const rowOrdered = { ...row, inspection_trail: [older, newer] };
+  assert.deepEqual(parseAggregatedLanguageRejection(rowOrdered as never), {
+    representative: 'Vietnam',
+    countries: ['Vietnam'],
+  });
+});
+
+test('timestamp ties and missing timestamps keep deterministic order', () => {
+  const first = {
+    step: 'COUNTRY_VALIDATION',
+    title: 'Country Validation',
+    status: 'REJECTED',
+    details:
+      '  [P3] AGGREGATED_CONTENT_LANGUAGE: India (86/100) — 9/10 recent video descriptions in Urdu (candidate countries [Pakistan, India], all currently excluded). [field: videoDescriptions]',
+    timestamp: '2026-01-01T00:00:00.000Z',
+  };
+  const tied = {
+    step: 'COUNTRY_VALIDATION',
+    title: 'Country Validation (Vietnam)',
+    status: 'REJECTED',
+    details:
+      '  [P3] AGGREGATED_CONTENT_LANGUAGE: Vietnam (90/100) — 10/10 recent video descriptions in Vietnamese (candidate countries [Vietnam], all currently excluded). [field: videoDescriptions]',
+    timestamp: '2026-01-01T00:00:00.000Z',
+  };
+  const tiedRow = {
+    channel_id: 'UCtesttesttesttesttest09',
+    channel_name: 'Test',
+    country: 'India',
+    country_status: 'REJECTED',
+    trading_status: 'UNKNOWN',
+    inspection_trail: [first, tied],
+  };
+  // Tie → first-in-array wins deterministically.
+  assert.deepEqual(parseAggregatedLanguageRejection(tiedRow as never), {
+    representative: 'India',
+    countries: ['Pakistan', 'India'],
+  });
+  const undated = {
+    step: 'COUNTRY_VALIDATION',
+    title: 'Country Validation (Vietnam)',
+    status: 'REJECTED',
+    details:
+      '  [P3] AGGREGATED_CONTENT_LANGUAGE: Vietnam (90/100) — 10/10 recent video descriptions in Vietnamese (candidate countries [Vietnam], all currently excluded). [field: videoDescriptions]',
+  };
+  const mixedRow = {
+    channel_id: 'UCtesttesttesttesttest10',
+    channel_name: 'Test',
+    country: 'Vietnam',
+    country_status: 'REJECTED',
+    trading_status: 'UNKNOWN',
+    // Undated entry first; timestamped entry still wins.
+    inspection_trail: [undated, first],
+  };
+  assert.deepEqual(parseAggregatedLanguageRejection(mixedRow as never), {
     representative: 'India',
     countries: ['Pakistan', 'India'],
   });

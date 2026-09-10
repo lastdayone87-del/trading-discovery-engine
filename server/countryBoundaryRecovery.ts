@@ -72,7 +72,11 @@ export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
   const rejectedValidations = trail.filter(step =>
     step.step === 'COUNTRY_VALIDATION' && /REJECTED/i.test(String((step as { status?: unknown }).status || ''))
   );
-  const latest = rejectedValidations[rejectedValidations.length - 1];
+  // Deterministic recency: select by timestamp, not array position, so
+  // reordered historical trails cannot promote stale rejection evidence.
+  // Entries without a parseable timestamp never displace a timestamped one;
+  // all-unparseable trails keep first-in-array order (previous behavior).
+  const latest = latestRejectedValidation(rejectedValidations);
   if (!latest) return null;
   const details = String(latest.details || '');
   const structured = readStepCandidateCountries(latest);
@@ -93,6 +97,27 @@ function readStepCandidateCountries(step: ChannelRecord['inspection_trail'][numb
   if (!Array.isArray(raw)) return null;
   const countries = raw.map(part => String(part || '').trim()).filter(Boolean);
   return countries.length > 0 ? countries : null;
+}
+
+/**
+ * Latest rejected COUNTRY_VALIDATION entry by timestamp. Strictly greater
+ * timestamps displace; ties and unparseable timestamps keep first-in-array
+ * order, so selection stays deterministic on any trail shape.
+ */
+function latestRejectedValidation(
+  entries: Array<ChannelRecord['inspection_trail'][number]>
+): ChannelRecord['inspection_trail'][number] | null {
+  let best: ChannelRecord['inspection_trail'][number] | null = null;
+  let bestTime = Number.NEGATIVE_INFINITY;
+  for (const entry of entries) {
+    const observed = Date.parse(String((entry as { timestamp?: unknown }).timestamp || ''));
+    const time = Number.isFinite(observed) ? observed : Number.NEGATIVE_INFINITY;
+    if (!best || time > bestTime) {
+      best = entry;
+      bestTime = time;
+    }
+  }
+  return best;
 }
 
 /**

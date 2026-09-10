@@ -86,3 +86,23 @@ test('existing-row Gate-1 outcome mirrors the preserved trading/Discord record',
   assert.match(branch, /applyGate1CountryRejectionToExisting/);
   assert.equal(branch.match(/await upsertChannel\(existing\)/g)?.length, 1);
 });
+
+test('startup audit restores Discord cleanup for rejected rows in a bounded pass', () => {
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const fn = source.slice(
+    source.indexOf('export async function auditExistingChannelsWithExclusionEngine'),
+    source.indexOf('export type ManualRecheckErrorClass'),
+  );
+  // Country revalidation still skips REJECTED rows (never un-REJECTs).
+  assert.match(fn, /WHERE country_status IS DISTINCT FROM 'REJECTED'/);
+  // A second bounded keyset pass covers rejected rows for invite hygiene only.
+  assert.match(fn, /WHERE country_status = 'REJECTED' AND discord_status IN \('DEAD','NON_TRADING','UNCERTAIN'\) AND discord_invite IS NOT NULL/);
+  assert.match(fn, /LIMIT \$3/);
+  assert.match(fn, /cleanedInvites\+\+/);
+  // The cleanup pass performs no country validation and clears only the
+  // stale invite through the standard full-row write path.
+  const cleanup = fn.slice(fn.indexOf("country_status = 'REJECTED'"));
+  assert.doesNotMatch(cleanup, /validateChannelCountry/);
+  assert.match(cleanup, /channel\.discord_invite = null/);
+  assert.match(cleanup, /await upsertChannel\(channel\)/);
+});

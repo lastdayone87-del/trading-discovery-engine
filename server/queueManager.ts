@@ -1266,11 +1266,14 @@ async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,rea
  * Re-tests stored channels in the database against the updated Hard Exclusion Engine.
  * Removes / marks previously accepted excluded-country channels as REJECTED.
  *
- * Memory-bounded: only non-REJECTED channels are eligible (this loop never
- * un-REJECTs, so re-stamping the 195 already-REJECTED rows is idempotent
- * churn), streamed in keyset batches selecting only the columns the audit
- * reads. The full row loads only for channels that actually need a write
- * (via getChannelById + upsertChannel, identical semantics to the previous
+ * Memory-bounded: only non-REJECTED channels are eligible for country
+ * revalidation (this loop never un-REJECTs, so re-stamping the 195
+ * already-REJECTED rows is idempotent churn), streamed in keyset batches
+ * selecting only the columns the audit reads. A second bounded keyset pass
+ * then restores Discord invite hygiene for REJECTED rows (DEAD/NON_TRADING/
+ * UNCERTAIN with a stored invite) without revalidating their country. The
+ * full row loads only for channels that actually need a write (via
+ * getChannelById + upsertChannel, identical semantics to the previous
  * full-table loop). Each batch is released before the next is fetched, so at
  * most one 200-row batch of narrow rows plus one full row is ever retained.
  */
@@ -1342,7 +1345,35 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
       cursorId = String(last.channel_id);
     }
 
-    console.log(`[Database Audit] Re-tested ${total} stored channels: ${rejectedCount} excluded channels marked REJECTED.`);
+    // Rejected-row Discord hygiene: the country pass above intentionally skips
+    // REJECTED rows (never un-REJECTs, memory-bounded keyset), but those rows
+    // must still reach invite cleanup. This separate bounded keyset pass
+    // selects only narrow cleanup-eligible columns and performs no country
+    // validation — full rows load only for rows that actually need the write.
+    let cleanedInvites = 0;
+    let cleanupSeen: string | null = null;
+    let cleanupId = '';
+    for (;;) {
+      const stale = await db.query(
+        `SELECT channel_id, discord_status, discord_invite, first_seen FROM channels WHERE country_status = 'REJECTED' AND discord_status IN ('DEAD','NON_TRADING','UNCERTAIN') AND discord_invite IS NOT NULL AND ($1::timestamptz IS NULL OR (first_seen, channel_id) < ($1::timestamptz, $2::text)) ORDER BY first_seen DESC, channel_id DESC LIMIT $3`,
+        [cleanupSeen, cleanupId, EXCLUSION_AUDIT_BATCH_SIZE]
+      );
+      if (!stale.rowCount) break;
+      for (const candidate of stale.rows) {
+        const channel = await getChannelById(candidate.channel_id);
+        if (!channel) continue;
+        if (channel.discord_invite == null) continue;
+        channel.discord_invite = null;
+        await upsertChannel(channel);
+        cleanedInvites++;
+      }
+      if (stale.rows.length < EXCLUSION_AUDIT_BATCH_SIZE) break;
+      const lastStale = stale.rows[stale.rows.length - 1];
+      cleanupSeen = lastStale.first_seen instanceof Date ? lastStale.first_seen.toISOString() : String(lastStale.first_seen);
+      cleanupId = String(lastStale.channel_id);
+    }
+
+    console.log(`[Database Audit] Re-tested ${total} stored channels: ${rejectedCount} excluded channels marked REJECTED; cleared ${cleanedInvites} stale invites from rejected rows.`);
     return { total, rejected: rejectedCount };
   } catch (err) {
     console.error('Error during database channel exclusion audit:', err);

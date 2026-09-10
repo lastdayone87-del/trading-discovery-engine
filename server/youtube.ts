@@ -614,7 +614,23 @@ export async function searchYouTubeChannelPage(
  * Fetches recent video titles and descriptions for a channel using YouTube Data API.
  * Rotates API key pool automatically.
  */
+export interface RecentVideoDescription {
+  /** Search-result video ID; null only when the API response omits it. */
+  videoId: string | null;
+  description: string;
+}
 export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Promise<string[]> {
+  return (await fetchRecentVideoDescriptionsWithIds(channelId)).map(item => item.description);
+}
+
+/**
+ * ID-aware variant of the recent-video description fetch. Returns the same
+ * description set as fetchRecentVideoDescriptionsFromAPI, each paired with
+ * its source video ID so overlapping acquisitions (API vs keyless scrape of
+ * the same uploads) merge by video instead of by exact text. Quota, rotation,
+ * retry, and error semantics are identical — this is the same code path.
+ */
+export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Promise<RecentVideoDescription[]> {
   const keyPool = getYouTubeKeyPool();
   if (!channelId) return [];
   if (keyPool.length === 0) throw new Error('Recent-video description API is unavailable because no provider is configured.');
@@ -634,14 +650,14 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
         acquiredResponse = true;
         await incrementQuota(100, getYouTubeResponseProviderKey(res));
         const data = await readYouTubeJsonObject(res, 'recent-videos-search');
+        const searchItems: RecentVideoDescription[] = [];
         const videoIds: string[] = [];
-        const snippets: string[] = [];
 
         for (const item of data.items || []) {
-          const vId = item.id?.videoId;
+          const vId = item.id?.videoId ?? null;
           if (vId) videoIds.push(vId);
           if (item.snippet?.description) {
-            snippets.push(item.snippet.description);
+            searchItems.push({ videoId: vId, description: item.snippet.description });
           }
         }
 
@@ -651,17 +667,17 @@ export async function fetchRecentVideoDescriptionsFromAPI(channelId: string): Pr
           if (vRes.ok) {
             await incrementQuota(1, getYouTubeResponseProviderKey(vRes));
             const vData = await readYouTubeJsonObject(vRes, 'video-details');
-            const fullDescs: string[] = [];
+            const fullItems: RecentVideoDescription[] = [];
             for (const item of vData.items || []) {
               if (item.snippet?.description) {
-                fullDescs.push(item.snippet.description);
+                fullItems.push({ videoId: item.id ?? null, description: item.snippet.description });
               }
             }
-            if (fullDescs.length > 0) return fullDescs;
+            if (fullItems.length > 0) return fullItems;
           }
         }
 
-        if (snippets.length > 0) return snippets;
+        if (searchItems.length > 0) return searchItems;
       }
     } catch (e) {
       recordProviderFailure(apiKey,e);
