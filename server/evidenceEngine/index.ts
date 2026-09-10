@@ -1,4 +1,4 @@
-import { EvidenceCollectionReport, EvidenceItem, EvidenceProvider, RawChannelInput, VerificationDecision, ScoringEngineConfig } from './types';
+import { EvidenceCollectionReport, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, ProviderExecutionReport, RawChannelInput, VerificationDecision, ScoringEngineConfig } from './types';
 import { getLayeredKnowledgeContext, LANGUAGE_KNOWLEDGE_PACKS } from './knowledgePacks';
 import { ChannelMetadataProvider } from './providers/ChannelMetadataProvider';
 import { VideoMetadataProvider } from './providers/VideoMetadataProvider';
@@ -27,6 +27,96 @@ function safeProviderFailureReasonCodes(err: any, timeout: boolean): string[] {
     ? err.providerReasons.map(String).filter((value: string) => /^[A-Z0-9_.:-]{1,80}$/.test(value)).slice(0, 6)
     : [];
   return [primary, ...providerReasons.filter((value: string) => value !== primary)];
+}
+
+const SEMANTIC_PROVIDER_NAMES = ['gemini_semantic', 'groq_semantic', 'gemini_free_semantic'] as const;
+type SemanticProviderName = typeof SEMANTIC_PROVIDER_NAMES[number];
+
+function isSemanticProviderName(name: string): name is SemanticProviderName {
+  return (SEMANTIC_PROVIDER_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * Ordered semantic provider chain for one evaluation. The configured primary
+ * (current selection semantics, unchanged) runs first; when it is
+ * unconfigured or fails, the remaining keyed providers are tried in a fixed
+ * resilience order (Groq, then free-tier Gemini) so a single provider outage
+ * cannot stall classification. An explicit SEMANTIC_PROVIDER_FORCE_GEMINI
+ * pins Gemini-only behavior and disables fallback. Pure function of env for
+ * testability; key presence is checked per provider at execution.
+ */
+export function resolveSemanticProviderChain(
+  primaryName: string,
+  env: NodeJS.ProcessEnv = process.env
+): SemanticProviderName[] {
+  const chain: SemanticProviderName[] = isSemanticProviderName(primaryName) ? [primaryName] : [];
+  if (env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return chain;
+  const probe = (name: SemanticProviderName, selectorEnv: NodeJS.ProcessEnv): boolean => {
+    if (chain.includes(name)) return false;
+    if (name === 'groq_semantic') return shouldUseGroqSemantic(selectorEnv);
+    if (name === 'gemini_free_semantic') return shouldUseGeminiFreeSemantic(selectorEnv);
+    return false;
+  };
+  if (probe('groq_semantic', { ...env, SEMANTIC_PROVIDER: 'groq' })) chain.push('groq_semantic');
+  if (probe('gemini_free_semantic', { ...env, SEMANTIC_PROVIDER: 'gemini-free' })) chain.push('gemini_free_semantic');
+  return chain;
+}
+
+type SemanticChainResult = {
+  items: EvidenceItem[];
+  reports: ProviderExecutionReport[];
+};
+
+/**
+ * Execute an ordered semantic chain. Stops at the first provider that
+ * returns a verdict — including abstention, which is a valid model verdict,
+ * never a reason to shop for a second opinion. Unconfigured providers are
+ * skipped silently; failed providers are recorded and the next keyed
+ * provider is tried. Never throws: total provider outage degrades to empty
+ * evidence with FAILED reports, exactly as a single-provider failure does.
+ */
+export async function executeSemanticChain(
+  candidates: EvidenceProvider[],
+  input: RawChannelInput,
+  knowledgeContext: LayeredKnowledgeContext
+): Promise<SemanticChainResult> {
+  const items: EvidenceItem[] = [];
+  const reports: SemanticChainResult['reports'] = [];
+  let priorFailed = false;
+  for (const provider of candidates) {
+    const started = Date.now();
+    const declared = provider.availability?.(input) || { availability: 'AVAILABLE' as const };
+    if (declared.availability === 'NOT_APPLICABLE') {
+      reports.push({ provider: provider.name, availability: 'NOT_APPLICABLE', evidenceCount: 0,
+        outcome: 'NOT_APPLICABLE', reasonCodes: ['PROVIDER_INPUT_NOT_APPLICABLE'], reason: (declared as { reason?: string }).reason, durationMs: Date.now() - started });
+      return { items, reports };
+    }
+    if (declared.availability !== 'AVAILABLE') {
+      reports.push({ provider: provider.name, availability: 'UNAVAILABLE', evidenceCount: 0,
+        outcome: 'UNAVAILABLE_CONFIGURATION', reasonCodes: ['PROVIDER_CONFIGURATION_UNAVAILABLE'], reason: (declared as { reason?: string }).reason, durationMs: Date.now() - started });
+      continue;
+    }
+    try {
+      const collected = await provider.collectEvidence(input, knowledgeContext);
+      const abstention = collected.find(item => item.category === 'SEMANTIC_ABSTENTION');
+      const semanticReasons = abstention?.provenance?.semantic?.reasonCodes || [];
+      const unsupported = semanticReasons.some(code => /UNSUPPORTED_LANGUAGE|LANGUAGE.*UNSUPPORTED/.test(code));
+      const extraCodes = priorFailed ? ['SEMANTIC_FALLBACK_SUCCEEDED'] : [];
+      reports.push({ provider: provider.name, availability: 'AVAILABLE', evidenceCount: collected.filter(item => item.rawMatches.length > 0).length,
+        outcome: abstention ? (unsupported ? 'ABSTAINED_UNSUPPORTED_LANGUAGE' : 'ABSTAINED_LOW_CONFIDENCE') : collected.length ? 'EXECUTED_WITH_EVIDENCE' : 'EXECUTED_NO_MATCH',
+        reasonCodes: [...(abstention ? semanticReasons : [collected.length ? 'PROVIDER_EVIDENCE_EMITTED' : 'PROVIDER_NO_GOVERNED_MATCH']), ...extraCodes], durationMs: Date.now() - started });
+      return { items: collected, reports };
+    } catch (err: any) {
+      console.warn(`[EvidenceEngine] Semantic provider ${provider.name} error:`, err?.message || err);
+      const timeout = err?.errorClass === 'TIMEOUT' || /timeout|timed out|abort/i.test(String(err?.message || err));
+      reports.push({ provider: provider.name, availability: 'FAILED', evidenceCount: 0,
+        outcome: timeout ? 'FAILED_TIMEOUT' : 'FAILED_PROVIDER',
+        reasonCodes: safeProviderFailureReasonCodes(err, timeout),
+        reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')}).`, durationMs: Date.now() - started });
+      priorFailed = true;
+    }
+  }
+  return { items, reports };
 }
 
 export class EvidenceBasedTradingEngine {
@@ -73,7 +163,18 @@ export class EvidenceBasedTradingEngine {
       : shouldUseGroqSemantic()
       ? this.providers.map(provider => provider.name === 'gemini_semantic' ? new GroqSemanticProvider() : provider)
       : this.providers;
-    const providerPromises = providers.map(async provider => {
+    // Semantic providers run as an ordered resilience chain (configured
+    // primary, then keyed fallbacks) rather than a single slot: one provider
+    // outage must not stall classification. Deterministic providers keep the
+    // existing parallel fan-out, untouched.
+    const semanticPrimary = providers.find(provider => isSemanticProviderName(provider.name));
+    const deterministicProviders = providers.filter(provider => !isSemanticProviderName(provider.name));
+    const semanticChain: EvidenceProvider[] = semanticPrimary
+      ? [semanticPrimary, ...resolveSemanticProviderChain(semanticPrimary.name)
+          .filter(name => name !== semanticPrimary.name)
+          .map(name => name === 'groq_semantic' ? new GroqSemanticProvider() : new GeminiFreeSemanticProvider())]
+      : [];
+    const providerPromises = deterministicProviders.map(async provider => {
       const started = Date.now();
       const declared = provider.availability?.(input) || { availability: 'AVAILABLE' as const };
       if (declared.availability !== 'AVAILABLE') {
@@ -100,7 +201,22 @@ export class EvidenceBasedTradingEngine {
       }
     });
 
-    const providerResults = await Promise.all(providerPromises);
+    const [deterministicResults, semanticResult] = await Promise.all([
+      Promise.all(providerPromises),
+      semanticPrimary
+        ? executeSemanticChain(semanticChain, input, knowledgeContext)
+        : Promise.resolve({ items: [] as EvidenceItem[], reports: [] as SemanticChainResult['reports'] }),
+    ]);
+    // Flatten chain attempts into the providers ledger: only the winning
+    // (last) report carries items; every attempt stays visible for
+    // provenance, metrics, and recovery decisions.
+    const providerResults = [
+      ...deterministicResults,
+      ...semanticResult.reports.map((report, index) => ({
+        items: index === semanticResult.reports.length - 1 ? semanticResult.items : ([] as EvidenceItem[]),
+        report,
+      })),
+    ];
     const allEvidence = providerResults.flatMap(result => result.items);
     const provenanceErrors=validateEvidenceProvenance(allEvidence);
     const fieldsPresent = [

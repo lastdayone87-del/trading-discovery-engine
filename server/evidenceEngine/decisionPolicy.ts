@@ -32,10 +32,47 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
+function fieldGroupKey(field: { field?: string; sourceId?: string | null; index?: number | null }): string {
+  // Video fields keep per-video identity (different videos are independent
+  // observations); every other field groups by field name alone, so two
+  // providers interpreting the same bio text share one voice regardless of
+  // family-wrapper differences in their provenance records.
+  if (field.field === 'video_title' || field.field === 'video_description') {
+    return `video:${field.sourceId ?? field.index ?? ''}`;
+  }
+  return `field:${field.field || ''}`;
+}
+
+/**
+ * Deduplicate evidence weight by observed field group. Multiple providers may
+ * interpret the same document (e.g. the channel bio matched by both the
+ * global and the country knowledge provider); without dedup the same token's
+ * weight counts two or three times toward terminal thresholds. Items sharing
+ * an identical field group collapse to the strongest, so corroboration still
+ * requires genuinely independent observations (different fields/videos).
+ * Items without any attributable field are never merged.
+ */
+function dedupeWeightByFieldGroup<T extends { provenance?: { fields?: Array<{ field?: string; sourceId?: string | null; index?: number | null }> }; finalWeight: number }>(items: T[]): number {
+  const best = new Map<string, number>();
+  let ungrouped = 0;
+  for (const item of items) {
+    const fields = item.provenance?.fields || [];
+    if (fields.length === 0) {
+      ungrouped += Math.abs(item.finalWeight);
+      continue;
+    }
+    const key = fields.map(fieldGroupKey).sort().join('+');
+    best.set(key, Math.max(best.get(key) || 0, Math.abs(item.finalWeight)));
+  }
+  let total = ungrouped;
+  for (const weight of best.values()) total += weight;
+  return total;
+}
+
 function qualifiesDominantAttributedContradiction(evidence:EvidenceItem[],collection:EvidenceCollectionReport):boolean{
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT')return false;
-  const positiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
-  const terminalNegativeWeight=evidence.filter(item=>item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN').reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  const positiveWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length));
+  const terminalNegativeWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'));
   return terminalNegativeWeight>=25&&(positiveWeight===0||terminalNegativeWeight>positiveWeight*1.5);
 }
 

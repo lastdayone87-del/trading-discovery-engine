@@ -1,5 +1,6 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
 import { documentRef } from '../canonicalEvidencePlane';
+import { pushUniqueMatch } from '../utils/textMatching';
 
 export class ExternalLinkProvider implements EvidenceProvider {
   name = 'external_links' as const;
@@ -35,12 +36,12 @@ export class ExternalLinkProvider implements EvidenceProvider {
       const l = link.toLowerCase();
       for (const domain of TRADING_DOMAINS) {
         if (l.includes(domain)) {
-          if (!matchedTradingSites.includes(domain)) matchedTradingSites.push(domain);
+          pushUniqueMatch(matchedTradingSites, domain);
         }
       }
 
       if (l.includes('topstep') || l.includes('apex') || l.includes('ftmo') || l.includes('funding')) {
-        if (!matchedPropFirms.includes(link)) matchedPropFirms.push(link);
+        pushUniqueMatch(matchedPropFirms, link);
       }
     }
 
