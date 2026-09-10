@@ -213,6 +213,7 @@ export async function processChannelThroughPipeline(
       externalLinks: candidate.channelLinks,
       metadataStatus: candidate.countryMetadataStatus,
       videoDescriptions: candidate.videoDescriptions,
+      videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
       playlists: candidate.playlists
     },
     targetCountry
@@ -227,7 +228,7 @@ export async function processChannelThroughPipeline(
     const hydrated = await fetchYouTubeChannelCountryMetadata(candidate.channelId, candidate);
     Object.assign(candidate, hydrated);
     countryVal = await validateChannelCountry({ channelName:candidate.channelName, description:candidate.description,
-      videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus, videoDescriptions:candidate.videoDescriptions, playlists:candidate.playlists }, targetCountry);
+      videoTitles:candidate.videoTitles, locationTag:candidate.locationTag, externalLinks:candidate.channelLinks, metadataStatus:candidate.countryMetadataStatus, videoDescriptions:candidate.videoDescriptions, videoDescriptionsAuthoritative:candidate.videoDescriptionsAuthoritative, playlists:candidate.playlists }, targetCountry);
   }
 
   // Gate 1 evidence-only fallback: if country remains uncertain and candidate lacks usable About text,
@@ -264,6 +265,7 @@ export async function processChannelThroughPipeline(
           externalLinks: candidate.channelLinks,
           metadataStatus: candidate.countryMetadataStatus,
           videoDescriptions: candidate.videoDescriptions,
+          videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
           playlists: candidate.playlists,
         }, targetCountry);
       } else {

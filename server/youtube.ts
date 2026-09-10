@@ -99,6 +99,14 @@ export interface DiscoveredChannelRaw {
   channelLinks?: string[];
   pinnedComment?: string;
   videoDescriptions?: string[];
+  /**
+   * Provenance gate for the aggregated-content-language country voter. True
+   * ONLY when videoDescriptions are an authoritative recent-channel sample
+   * (channel enrichment recent-uploads fetch). Search-selected snippets,
+   * playlist-adapter observations, and any other discovery-selected subsets
+   * are non-authoritative and can never vote for a country rejection.
+   */
+  videoDescriptionsAuthoritative?: boolean;
   subscriberCount?: string;
   channelThumbnailUrl?: string;
   countryMetadataStatus?: CountryMetadataStatus;
@@ -459,6 +467,9 @@ export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, san
       description: lane === 'VIDEO' ? '' : (item.snippet?.description || ''),
       videoTitles: videoTitle ? [videoTitle] : [sanitizedQuery],
       videoDescriptions: videoDescription ? [videoDescription] : [],
+      // VIDEO-search snippets are retrieval-selected, not a recent-channel
+      // sample: they must never vote in the aggregated-language country path.
+      videoDescriptionsAuthoritative: false,
       locationTag: item.snippet?.country || undefined,
       channelLinks: [],
       channelThumbnailUrl: thumb,
@@ -755,6 +766,10 @@ export async function fetchYouTubeChannelEnrichment(
         description,
         videoTitles: recentItems.map((item: any) => item.snippet?.title || ''),
         videos,playlists,videoDescriptions:videos.map(video=>video.description||''),
+        // Authoritative recent-channel sample (order=date recent uploads):
+        // the only discovery-side descriptions permitted to vote in the
+        // aggregated-content-language country path.
+        videoDescriptionsAuthoritative: true,
         locationTag: officialCountry || fallback.locationTag,
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED',
         countryMetadataCheckedAt: observedAt.toISOString(),

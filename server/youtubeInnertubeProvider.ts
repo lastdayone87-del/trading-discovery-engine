@@ -329,6 +329,9 @@ export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): Discovered
       // Index-parallel with videoTitles from the start: a missing first
       // description is '' rather than omitted (see the merge branch above).
       videoDescriptions: [videoDescription],
+      // VIDEO-search snippets are retrieval-selected, not a recent-channel
+      // sample: they must never vote in the aggregated-language country path.
+      videoDescriptionsAuthoritative: false,
       channelThumbnailUrl: bestThumbnailUrl(node?.thumbnails) || undefined,
       matchedDocument: {
         type: 'VIDEO',

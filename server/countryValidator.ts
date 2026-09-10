@@ -60,6 +60,12 @@ export function creatorLevelCountryEvidence(channelData: {
    */
   videoDescriptions?: string[];
   /**
+   * Provenance gate for the aggregated-content-language voter. True ONLY for
+   * an authoritative recent-channel sample. Search-selected snippets must
+   * pass false/undefined so they can never manufacture a language majority.
+   */
+  videoDescriptionsAuthoritative?: boolean;
+  /**
    * Already-fetched playlist names/descriptions. Corroboration veto only
    * (see aggregateContentLanguage); never decisive alone.
    */
@@ -82,6 +88,7 @@ export function creatorLevelCountryEvidence(channelData: {
     officialWebsiteLinks: websiteLinks,
     verifiedSocialLinks: socialLinks,
     videoDescriptions: Array.isArray(channelData.videoDescriptions) ? channelData.videoDescriptions : [],
+    videoDescriptionsAuthoritative: channelData.videoDescriptionsAuthoritative === true,
     playlists: Array.isArray(channelData.playlists) ? channelData.playlists : [],
     // Deliberately exclude videoTitles from country attribution. A creator may
     // cover any country's instrument/market, and discovery-selected titles are
@@ -177,6 +184,7 @@ export async function validateChannelCountry(
     socialBios?: string[];
     metadataStatus?: CountryMetadataStatus;
     videoDescriptions?: string[];
+    videoDescriptionsAuthoritative?: boolean;
     playlists?: Array<{ name?: string; description?: string }>;
   },
   targetCountryName?: string | null

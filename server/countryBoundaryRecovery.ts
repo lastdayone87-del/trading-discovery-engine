@@ -47,21 +47,29 @@ export function isNonExcludedBoundaryCandidate(channel: ChannelRecord, _excluded
  */
 /**
  * Parses an aggregated-content-language rejection from a channel's inspection
- * trail. The language evidence line carries the source marker plus the full
- * candidate-country set (`candidate countries [A, B]`), so reconciliation
- * can match rows by set membership when an exclusion is removed — not only
- * by the mechanical representative string. Returns null when the trail
- * carries no language rejection.
+ * trail. Record-scoped: only the LATEST rejected COUNTRY_VALIDATION entry is
+ * inspected, and the representative plus the full candidate-country set
+ * (`candidate countries [A, B]`) are parsed from THAT SAME entry's details.
+ * Older/unrelated validation records (including earlier language lines and
+ * Discord re-check entries) can never contaminate the parse. Returns null
+ * when the latest rejected validation carries no language rejection, so
+ * reconciliation falls through to normal creator-evidence re-evaluation.
  */
 export function parseAggregatedLanguageRejection(channel: ChannelRecord): {
   representative: string;
   countries: string[];
 } | null {
-  const text = trailText(channel);
-  if (!text.includes('AGGREGATED_CONTENT_LANGUAGE')) return null;
-  const representativeMatch = text.match(/AGGREGATED_CONTENT_LANGUAGE:\s*([^\n(]+?)\s*\(/);
+  const trail = channel.inspection_trail || [];
+  const rejectedValidations = trail.filter(step =>
+    step.step === 'COUNTRY_VALIDATION' && /REJECTED/i.test(String((step as { status?: unknown }).status || ''))
+  );
+  const latest = rejectedValidations[rejectedValidations.length - 1];
+  if (!latest) return null;
+  const details = String(latest.details || '');
+  if (!details.includes('AGGREGATED_CONTENT_LANGUAGE')) return null;
+  const representativeMatch = details.match(/AGGREGATED_CONTENT_LANGUAGE:\s*([^\n(]+?)\s*\(/);
   const representative = (representativeMatch?.[1] || '').trim();
-  const setMatch = text.match(/candidate countries \[([^\]]+)\]/);
+  const setMatch = details.match(/candidate countries \[([^\]]+)\]/);
   const countries = setMatch
     ? setMatch[1].split(',').map(part => part.trim()).filter(Boolean)
     : (representative ? [representative] : []);
@@ -415,6 +423,12 @@ export async function processCountryBoundaryReprocessJob(
 
   if (!channel) return { channelId, recovered: false, reconciliationState: 'INSUFFICIENT_EVIDENCE', newCountryStatus: 'MISSING' };
 
+  // Human decisions are final: a HUMAN_REJECTED row is never machine-restored,
+  // regardless of how the live exclusion list moves. No mutation, no event.
+  if (channel.trading_status === 'HUMAN_REJECTED') {
+    return { channelId, recovered: false, reconciliationState: 'LEGITIMATE_REJECTION', newCountryStatus: channel.country_status };
+  }
+
   const now = new Date().toISOString();
   const eventKey = `recovery:${COUNTRY_BOUNDARY_RECOVERY_VERSION}:${channelId}`;
 
@@ -479,13 +493,23 @@ export async function processCountryBoundaryReprocessJob(
     return { channelId, recovered: false, reconciliationState: classification.state, newCountryStatus: channel.country_status };
   }
 
-  // RECOVERABLE_NON_EXCLUDED: Restore machine-owned state safely
+  // RECOVERABLE_NON_EXCLUDED: Restore machine-owned state safely.
+  // When reconciliation carries a replacement country, project it as
+  // CONFIRMED. When a language-set invalidation carries NO replacement
+  // country (detectedCountry null), the stale excluded representative must be
+  // CLEARED — not retained — or the row stays hidden behind old country
+  // metadata despite reporting recovery. UNCERTAIN reopens normal processing
+  // instead of projecting confidence without evidence.
   const priorCountryStatus = channel.country_status;
   const priorScanStatus = channel.scan_status;
-  channel.country_status = 'CONFIRMED';
-  channel.confidence_score = classification.confidence;
   if (classification.detectedCountry) {
+    channel.country_status = 'CONFIRMED';
     channel.country = classification.detectedCountry;
+    channel.confidence_score = classification.confidence;
+  } else {
+    channel.country_status = 'UNCERTAIN';
+    channel.country = null;
+    channel.confidence_score = classification.confidence;
   }
   channel.scan_status = 'PENDING';
   channel.last_checked = now;
