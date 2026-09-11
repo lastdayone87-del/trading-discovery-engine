@@ -401,7 +401,10 @@ export class RenderedFallbackGate {
 }
 
 export const renderedFallbackGate = new RenderedFallbackGate(
-  boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, 1, 1, 2),
+  // Default 2 (design max, enforced by the min/max bounds): ~23% of
+  // enrichments use rendered fallback, so 3 workers need 2 browser slots to
+  // avoid serializing on this gate. Env override still wins.
+  boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, 2, 1, 2),
   boundedEnvInt(process.env.RENDERED_FALLBACK_MAX_PENDING, 8, 0, 32),
 );
 
