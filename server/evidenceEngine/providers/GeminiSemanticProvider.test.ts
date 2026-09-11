@@ -236,10 +236,10 @@ test('error-carried account identity skips that account even from another route'
   assert.deepEqual(calls, ['gemini-1']);
 });
 
-test('paid semantic defaults are the 2.5 family on every route', async () => {
+test('paid semantic defaults are the proven 3.6-flash models on every route', async () => {
   const { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } = await import('./GeminiSemanticProvider');
-  assert.equal(DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, 'gemini-2.5-flash-lite');
-  assert.equal(DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL, 'gemini-2.5-flash');
+  assert.equal(DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, 'gemini-3.6-flash');
+  assert.equal(DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL, 'gemini-3.6-flash');
 });
 
 test('candidate classification uses the 2.5 default when no model env is set', async () => {
@@ -251,7 +251,7 @@ test('candidate classification uses the 2.5 default when no model env is set', a
     const client: SemanticModelClient = { classify: async (_prompt, model) => { models.push(model); return unrelatedResult; } };
     const provider = new GeminiSemanticProvider(client);
     await provider.collectEvidence(input, {} as any);
-    assert.deepEqual(models, ['gemini-2.5-flash-lite']);
+    assert.deepEqual(models, ['gemini-3.6-flash']);
   } finally {
     restore();
     if (savedAdjudication === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
@@ -272,8 +272,8 @@ test('explicit model env still wins; the key never determines the model', async 
   }
 });
 
-test('adjudication second pass uses the 2.5-flash default', async () => {
-  const restore = withModelOverrides(undefined, undefined);
+test('adjudication second pass uses the configured adjudicator model', async () => {
+  const restore = withModelOverrides(undefined, 'custom-adjudicator');
   process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
   try {
     const models: string[] = [];
@@ -281,7 +281,7 @@ test('adjudication second pass uses the 2.5-flash default', async () => {
     const client: SemanticModelClient = { classify: async (_prompt, model) => { models.push(model); return low; } };
     const provider = new GeminiSemanticProvider(client);
     await provider.collectEvidence(input, {} as any);
-    assert.deepEqual(models, ['gemini-2.5-flash-lite', 'gemini-2.5-flash']);
+    assert.deepEqual(models, ['gemini-3.6-flash', 'custom-adjudicator']);
   } finally {
     restore();
     delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
