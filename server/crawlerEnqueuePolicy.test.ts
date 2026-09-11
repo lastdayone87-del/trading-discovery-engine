@@ -127,7 +127,7 @@ test('static exploration bound is 12 with drop accounting at every rule', () => 
   }
   // Accepted cross-origin links are navigated, never counted as drops.
   assert.ok(!source.includes("drops.count('cross-origin-allowed')"));
-  assert.equal(CRAWL_DROP_REASONS.length, 12);
+  assert.equal(CRAWL_DROP_REASONS.length, 13);
 });
 
 test('rendered control-slice, hint-reject, scroll, and stop accounting are wired', () => {
@@ -330,4 +330,29 @@ test('first ceiling wins when a crawl trips several caps', async () => {
   assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'queue-cap' });
   assert.ok((seed?.telemetry?.dropReasons?.['queue-cap'] || 0) > 0);
   assert.ok((seed?.telemetry?.dropReasons?.['depth-limit'] || 0) > 0, 'later caps stay counted in dropReasons');
+});
+
+test('later response-cap truncation is counted even when another ceiling claimed the label', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const { MAX_CRAWL_RESPONSE_CHARS } = await import('./crawlResponseBounds');
+  const padding = 'v '.repeat(MAX_CRAWL_RESPONSE_CHARS / 2 + 50_000);
+  const bigHtml = `<html><body>${padding}</body></html>`;
+  assert.ok(bigHtml.length > MAX_CRAWL_RESPONSE_CHARS);
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const links = Array.from({ length: 13 }, (_, index) => `<a href="/hub-${index}">Community hub ${index}</a>`).join('');
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://multi.test/') return htmlResponse(links);
+    if (url === 'https://multi.test/hub-0') return htmlResponse(bigHtml);
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://multi.test/'], [], undefined, fakeFetch);
+  const seed = result.observations.find(
+    item => item.requestedUrl === 'https://multi.test/' && item.outcome === 'PARTIALLY_INSPECTED'
+  );
+  assert.ok(seed, 'expected a partial seed summary observation');
+  assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'queue-cap' });
+  assert.ok((seed?.telemetry?.dropReasons?.['queue-cap'] || 0) > 0);
+  assert.ok((seed?.telemetry?.dropReasons?.['response-cap'] || 0) > 0, 'child truncation survives alongside the primary label');
 });

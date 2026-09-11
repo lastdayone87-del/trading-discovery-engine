@@ -18,6 +18,13 @@ export const CRAWL_DROP_REASONS = [
   'control-slice',
   'page-budget',
   'queue-exhausted',
+  /**
+   * Bounded-response-cap truncation. Counted whenever a fetched response is
+   * cut at MAX_CRAWL_RESPONSE_CHARS, independent of the single primary
+   * ceiling label — so a later truncation is never lost when an earlier,
+   * different cap already claimed `ceiling`.
+   */
+  'response-cap',
 ] as const;
 export type CrawlDropReason = typeof CRAWL_DROP_REASONS[number];
 export function isCrawlDropReason(value: unknown): value is CrawlDropReason {
@@ -128,7 +135,7 @@ export interface CrawlerTelemetry {
   hostBackoffsApplied: number;
   /**
    * Compact per-crawl drop/stop counters keyed by CRAWL_DROP_REASONS
-   * (ints only, taxonomy-bounded to 12 keys — never URLs or payloads).
+   * (ints only, taxonomy-bounded to 13 keys — never URLs or payloads).
    * Tells future investigations where candidate URLs were lost. Sparse:
    * absent when nothing was dropped.
    */
