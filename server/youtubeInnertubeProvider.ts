@@ -795,9 +795,17 @@ export async function fetchChannelVideoDescriptionsViaInnertube(
         const description = String((info as any)?.basic_info?.short_description || '').trim();
         if (description) items.push({ videoId: ref.id, description });
       } catch (error) {
-        const status = Number((error as { status?: unknown })?.status);
+        // Order matters: service-level failures must never read as
+        // per-video unavailability. A numeric non-404 status, or a message
+        // carrying transient markers ('Service Unavailable' included),
+        // aborts the whole fetch so pressure signals and retries survive.
+        // Only a bare 404/private/deleted/removed signal skips one video.
+        const status = (error as { status?: unknown })?.status;
+        const statusCode = typeof status === 'number' ? status : Number(status);
         const message = String((error as Error)?.message || error || '');
-        if (status === 404 || /not.?found|private|deleted|unavailable/i.test(message)) continue;
+        if (Number.isFinite(statusCode) && statusCode !== 0 && statusCode !== 404) throw error;
+        if (/service|server|transient|timeout|network|rate.?limit|too many requests|quota|429|500|502|503|504/i.test(message)) throw error;
+        if (/not.?found|private|deleted|removed|unavailable/i.test(message) || statusCode === 404) continue;
         throw error;
       }
     }

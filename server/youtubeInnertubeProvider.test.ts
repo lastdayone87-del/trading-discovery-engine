@@ -1003,3 +1003,77 @@ test('non-tab errors mentioning videos still propagate', async () => {
     resetInnertubePacingForTests();
   }
 });
+
+test('service-level outage is never mistaken for unavailable videos', async () => {
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('unused'); },
+    getChannel: async () => ({
+      getVideos: async () => ({ videos: [{ content_id: 'vid1' }, { content_id: 'vid2' }] }),
+    }),
+    getBasicInfo: async () => { throw Object.assign(new Error('Service Unavailable'), { status: 503 }); },
+  }));
+  try {
+    const { fetchChannelVideoDescriptionsViaInnertube } = await import('./youtubeInnertubeProvider');
+    await assert.rejects(
+      fetchChannelVideoDescriptionsViaInnertube('UCtestchannel'),
+      (error: any) => error?.retryable === true && String(error?.message || '').includes('Service Unavailable'),
+    );
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    setInnertubeEmitSinkForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('unstatused service outage message still aborts instead of skipping', async () => {
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('unused'); },
+    getChannel: async () => ({
+      getVideos: async () => ({ videos: [{ content_id: 'vid1' }] }),
+    }),
+    getBasicInfo: async () => { throw new Error('Service Unavailable'); },
+  }));
+  try {
+    const { fetchChannelVideoDescriptionsViaInnertube } = await import('./youtubeInnertubeProvider');
+    await assert.rejects(fetchChannelVideoDescriptionsViaInnertube('UCtestchannel'));
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    setInnertubeEmitSinkForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('genuinely unavailable videos still skip quietly', async () => {
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('unused'); },
+    getChannel: async () => ({
+      getVideos: async () => ({ videos: [{ content_id: 'vid1' }, { content_id: 'vid2' }] }),
+    }),
+    getBasicInfo: async (videoId: string) => {
+      if (videoId === 'vid1') throw new Error('This video is unavailable');
+      return { basic_info: { short_description: 'Kept description' } };
+    },
+  }));
+  try {
+    const { fetchChannelVideoDescriptionsViaInnertube } = await import('./youtubeInnertubeProvider');
+    const result = await fetchChannelVideoDescriptionsViaInnertube('UCtestchannel');
+    assert.equal(result.items.length, 1);
+    assert.equal(result.items[0].description, 'Kept description');
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    setInnertubeEmitSinkForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});

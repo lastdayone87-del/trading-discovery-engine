@@ -854,3 +854,40 @@ test('non-retryable innertube failure records retryable false without retryAt', 
     resetInnertubePacingForTests();
   }
 });
+
+test('empty innertube result records no surface and leaves no inspected-match trace', async () => {
+  const { setInnertubeSessionFactoryForTests, resetInnertubeCooldownForTests, resetInnertubePacingForTests } = await import('./youtubeInnertubeProvider');
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('unused'); },
+    getChannel: async () => ({
+      getVideos: async () => { throw new Error('Tab "videos" not found'); },
+    }),
+    getBasicInfo: async () => ({ basic_info: { short_description: 'x' } }),
+  }));
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('static down'); }) as unknown as typeof fetch;
+  try {
+    const result = await runChannelInspection({
+      channelId: 'UCinnertubeempty000000001',
+      channelName: 'Innertube Empty Channel',
+      channelBio: 'Trading notes trader forex',
+      youtubeUrl: 'https://www.youtube.com/channel/UCinnertubeempty000000001',
+      channelLinks: [],
+      videoDescriptions: [],
+      creatorLikelyTrading: false,
+      forceLiveFetch: true,
+      recentVideoDescriptionsLoader: async () => { throw new Error('API down'); },
+      liveChannelDataLoader: async () => null,
+      externalFetchImpl: (async () => { throw new Error('static down'); }) as typeof fetch,
+    });
+    const innertubeObs = (result.acquisitionOutcomes || []).filter(item => String(item.requestedUrl || '').startsWith('innertube:channel'));
+    assert.equal(innertubeObs.length, 0, 'empty innertube must not fabricate an inspected surface');
+  } finally {
+    globalThis.fetch = savedFetch;
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});

@@ -516,8 +516,8 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     if(channelData.channelId){try{
       const {fetchChannelVideoDescriptionsViaInnertube}=await import('./youtubeInnertubeProvider');
       const fetched=await fetchChannelVideoDescriptionsViaInnertube(channelData.channelId,{maxVideos:10});
-      acquiredRecentDescriptionSurfaces.push(`innertube:channel:${channelData.channelId}:recent-video-descriptions`);
       if(fetched.items.length){
+      acquiredRecentDescriptionSurfaces.push(`innertube:channel:${channelData.channelId}:recent-video-descriptions`);
         if(fetched.items.length<fetched.videosAttempted)acquisitionOutcomes.push({requestedUrl:`innertube:channel:${channelData.channelId}:recent-video-descriptions`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'INNERTUBE_DESCRIPTION_PARTIAL',detail:`Acquired ${fetched.items.length} of ${fetched.videosAttempted} sampled recent-video descriptions`,observedAt:now});
         trackChannelSampled(fetched.items);
         const innertubeTexts=normalizeSampledVideoDescriptions(fetched.items).map(item=>item.description);
