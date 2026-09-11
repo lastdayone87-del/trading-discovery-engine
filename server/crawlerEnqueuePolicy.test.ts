@@ -308,3 +308,26 @@ test('oversized navigation queue names queue-cap on the partial seed', async () 
   assert.ok(seed, 'expected a partial seed summary observation');
   assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'queue-cap' });
 });
+
+test('first ceiling wins when a crawl trips several caps', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const links = Array.from({ length: 13 }, (_, index) => `<a href="/hub-${index}">Community hub ${index}</a>`).join('');
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://multi.test/') return htmlResponse(links);
+    if (url === 'https://multi.test/hub-0') return htmlResponse('<a href="/hub-0/deep">Join the Discord community room</a>');
+    if (url === 'https://multi.test/hub-0/deep') return htmlResponse('<a href="/hub-0/deep/deeper">VIP inner circle</a>');
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://multi.test/'], [], undefined, fakeFetch);
+  const seed = result.observations.find(
+    item => item.requestedUrl === 'https://multi.test/' && item.outcome === 'PARTIALLY_INSPECTED'
+  );
+  assert.ok(seed, 'expected a partial seed summary observation');
+  // Queue-cap trips at dedup time, before the loop reaches depth-limit territory.
+  assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'queue-cap' });
+  assert.ok((seed?.telemetry?.dropReasons?.['queue-cap'] || 0) > 0);
+  assert.ok((seed?.telemetry?.dropReasons?.['depth-limit'] || 0) > 0, 'later caps stay counted in dropReasons');
+});
