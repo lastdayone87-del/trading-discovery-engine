@@ -99,7 +99,7 @@ test('sanitizer keeps compact counters, strips unknown and non-positive values',
 });
 
 test('telemetry constructors carry drops and scroll usage', () => {
-  const stat = staticCrawlerTelemetry({ redirectsFollowed: 0, pagesInspected: 2, budgetExhausted: false, dropReasons: { 'score-zero': 2 } });
+  const stat = staticCrawlerTelemetry({ redirectsFollowed: 0, pagesInspected: 2, dropReasons: { 'score-zero': 2 } });
   assert.deepEqual(stat.dropReasons, { 'score-zero': 2 });
   const rendered = renderedCrawlerTelemetry({ inspectedPages: 2, clicks: 1, complete: true, scrollsUsed: 4, dropReasons: { 'hint-rejected': 1 } });
   assert.equal(rendered.scrollsUsed, 4);
@@ -127,7 +127,7 @@ test('static exploration bound is 12 with drop accounting at every rule', () => 
   }
   // Accepted cross-origin links are navigated, never counted as drops.
   assert.ok(!source.includes("drops.count('cross-origin-allowed')"));
-  assert.equal(CRAWL_DROP_REASONS.length, 12);
+  assert.equal(CRAWL_DROP_REASONS.length, 13);
 });
 
 test('rendered control-slice, hint-reject, scroll, and stop accounting are wired', () => {
@@ -145,7 +145,7 @@ test('direct Discord invite in URL is captured without crawling', () => {
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   const direct = source.slice(
     source.indexOf('const seedLocators=extractDiscordCandidates(url,surface,url)'),
-    source.indexOf('let pagesInspected=0,redirectsFollowed=0,budgetExhausted=false;')
+    source.indexOf('let pagesInspected=0,redirectsFollowed=0,seedCeiling:CeilingKind|undefined;')
   );
   assert.match(direct, /if\(direct\.length\)/);
   assert.match(direct, /outcome:'FOUND'/);
@@ -220,7 +220,6 @@ test('constructors sanitize drop reasons and scroll usage at construction time',
   const dirtyStatic = staticCrawlerTelemetry({
     redirectsFollowed: 0,
     pagesInspected: 1,
-    budgetExhausted: false,
     dropReasons: { 'queue-cap': 1e12 } as never,
   });
   assert.deepEqual(dirtyStatic.dropReasons, { 'queue-cap': 999999 });
@@ -270,4 +269,90 @@ test('fragment variants of one disallowed URL count as a single drop', async () 
   const drops = (seed?.telemetry as { dropReasons?: Record<string, number> } | undefined)?.dropReasons || {};
   // Both fragments target the same fetched resource: one candidate, one drop.
   assert.equal(drops['cross-origin-disallowed'], 1);
+});
+
+test('depth-limit ceiling is named on the partial seed without touching terminal failures', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://depth.test/') return htmlResponse('<a href="/level1">Community hub</a>');
+    if (url === 'https://depth.test/level1') return htmlResponse('<a href="/level2">Members area</a>');
+    if (url === 'https://depth.test/level2')
+      return htmlResponse('<a href="/deep-a">Join chat</a><a href="/deep-b">Community group</a><a href="/deep-c">VIP room</a>');
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://depth.test/'], [], undefined, fakeFetch);
+  const seed = result.observations.find(
+    item => item.requestedUrl === 'https://depth.test/' && item.outcome === 'PARTIALLY_INSPECTED'
+  );
+  assert.ok(seed, 'expected a partial seed summary observation');
+  assert.equal(seed?.telemetry?.budgetExhausted, true);
+  assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'depth-limit' });
+});
+
+test('oversized navigation queue names queue-cap on the partial seed', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const links = Array.from({ length: 14 }, (_, index) => `<a href="/hub-${index}">Community hub ${index}</a>`).join('');
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const rootFetch = (async (input: RequestInfo | URL) => {
+    if (String(input) === 'https://wide.test/') return htmlResponse(links);
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://wide.test/'], [], undefined, rootFetch);
+  const seed = result.observations.find(
+    item => item.requestedUrl === 'https://wide.test/' && item.outcome === 'PARTIALLY_INSPECTED'
+  );
+  assert.ok(seed, 'expected a partial seed summary observation');
+  assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'queue-cap' });
+});
+
+test('first ceiling wins when a crawl trips several caps', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const links = Array.from({ length: 13 }, (_, index) => `<a href="/hub-${index}">Community hub ${index}</a>`).join('');
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://multi.test/') return htmlResponse(links);
+    if (url === 'https://multi.test/hub-0') return htmlResponse('<a href="/hub-0/deep">Join the Discord community room</a>');
+    if (url === 'https://multi.test/hub-0/deep') return htmlResponse('<a href="/hub-0/deep/deeper">VIP inner circle</a>');
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://multi.test/'], [], undefined, fakeFetch);
+  const seed = result.observations.find(
+    item => item.requestedUrl === 'https://multi.test/' && item.outcome === 'PARTIALLY_INSPECTED'
+  );
+  assert.ok(seed, 'expected a partial seed summary observation');
+  // Queue-cap trips at dedup time, before the loop reaches depth-limit territory.
+  assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'queue-cap' });
+  assert.ok((seed?.telemetry?.dropReasons?.['queue-cap'] || 0) > 0);
+  assert.ok((seed?.telemetry?.dropReasons?.['depth-limit'] || 0) > 0, 'later caps stay counted in dropReasons');
+});
+
+test('later response-cap truncation is counted even when another ceiling claimed the label', async () => {
+  const { crawlExternalLinks } = await import('./inspector');
+  const { MAX_CRAWL_RESPONSE_CHARS } = await import('./crawlResponseBounds');
+  const padding = 'v '.repeat(MAX_CRAWL_RESPONSE_CHARS / 2 + 50_000);
+  const bigHtml = `<html><body>${padding}</body></html>`;
+  assert.ok(bigHtml.length > MAX_CRAWL_RESPONSE_CHARS);
+  const htmlResponse = (html: string) =>
+    new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const links = Array.from({ length: 13 }, (_, index) => `<a href="/hub-${index}">Community hub ${index}</a>`).join('');
+  const fakeFetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://multi.test/') return htmlResponse(links);
+    if (url === 'https://multi.test/hub-0') return htmlResponse(bigHtml);
+    return htmlResponse('<p>Leaf page without invite.</p>');
+  }) as typeof fetch;
+  const result = await crawlExternalLinks(['https://multi.test/'], [], undefined, fakeFetch);
+  const seed = result.observations.find(
+    item => item.requestedUrl === 'https://multi.test/' && item.outcome === 'PARTIALLY_INSPECTED'
+  );
+  assert.ok(seed, 'expected a partial seed summary observation');
+  assert.deepEqual((seed?.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'queue-cap' });
+  assert.ok((seed?.telemetry?.dropReasons?.['queue-cap'] || 0) > 0);
+  assert.ok((seed?.telemetry?.dropReasons?.['response-cap'] || 0) > 0, 'child truncation survives alongside the primary label');
 });

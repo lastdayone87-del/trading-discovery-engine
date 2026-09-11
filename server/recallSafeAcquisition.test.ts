@@ -694,3 +694,21 @@ test('video-description URLs remain eligible for discovery and crawling', async 
   assert.equal(result.foundInvite, 'vid-room');
   assert.equal(result.acquisitionStatus, 'FOUND');
 });
+
+test('truncated messaging preview that finds an invite stays FOUND with response-cap ceiling', async () => {
+  const { MAX_CRAWL_RESPONSE_CHARS } = await import('./crawlResponseBounds');
+  const padding = 'v '.repeat(MAX_CRAWL_RESPONSE_CHARS / 2 + 50_000);
+  const bigHtml = `<html><body>Join https://discord.gg/trunc-room ${padding}</body></html>`;
+  assert.ok(bigHtml.length > MAX_CRAWL_RESPONSE_CHARS);
+  const found = await crawlMessagingPreview(
+    'https://t.me/trunc-invite',
+    [],
+    undefined,
+    (async () => html(`Join https://discord.gg/trunc-room ${padding}`)) as typeof fetch,
+  );
+  assert.equal(found.outcome, 'FOUND');
+  assert.equal(found.foundInvite, 'trunc-room');
+  const observation = found.observations[0];
+  assert.equal(observation.telemetry?.budgetExhausted, true);
+  assert.deepEqual((observation.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'response-cap' });
+});
