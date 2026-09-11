@@ -1,4 +1,4 @@
-import { isFallbackCovered } from '../enrichmentOperationalFailure';
+import { uncoveredFailedProviders } from '../enrichmentOperationalFailure';
 import type { EvidenceCollectionReport } from '../evidenceEngine';
 export const REVIEW_ELIGIBILITY_POLICY_VERSION='review-eligibility-v2-serving-1';
 export type ReviewEligibilityStatus='ELIGIBLE'|'NOT_ELIGIBLE'|'DEFERRED';
@@ -13,6 +13,6 @@ export interface ReviewEligibilityDecision{status:ReviewEligibilityStatus;reason
  * truthful in telemetry/shadow writes; only the policy decision is exempt.
  */
 export function resolveReviewProviderDegraded(collection: Pick<EvidenceCollectionReport, 'degraded' | 'providers'>): boolean {
-  return collection.degraded && !isFallbackCovered(collection as EvidenceCollectionReport);
+  return uncoveredFailedProviders(collection).length > 0;
 }
 export function evaluateReviewEligibilityV2(input:ReviewEligibilityInput):ReviewEligibilityDecision{let status:ReviewEligibilityStatus='NOT_ELIGIBLE',reasonCodes:string[],reasonFamily:ReviewReasonFamily='NOT_A_REVIEW_CANDIDATE';if(!input.countryAllowed){reasonCodes=['COUNTRY_POLICY_TERMINAL'];reasonFamily='TERMINAL_OR_POLICY';}else if(input.terminalDecision||['TRADING_CONFIRMED','NON_TRADING','HUMAN_REJECTED'].includes(input.classificationStatus)){reasonCodes=['TERMINAL_DECISION_NOT_REVIEWABLE'];reasonFamily='TERMINAL_OR_POLICY';}else if(input.operationalFailure){status='DEFERRED';reasonCodes=['OPERATIONAL_RECOVERY_REQUIRED'];reasonFamily='OPERATIONAL_FAILURE';}else if(input.investigationState==='ACTIVE'){status='DEFERRED';reasonCodes=['INVESTIGATION_NOT_EXHAUSTED'];reasonFamily='INVESTIGATION_ACTIVE';}else if(input.providerDegraded){status='DEFERRED';reasonCodes=['PROVIDER_RECOVERY_REQUIRED'];reasonFamily='PROVIDER_RECOVERY_REQUIRED';}else if(input.unsupportedLanguage){status='DEFERRED';reasonCodes=['LANGUAGE_CAPABILITY_REQUIRED'];reasonFamily='LANGUAGE_CAPABILITY_REQUIRED';}else if(!input.plausibleTradingHypothesis){reasonCodes=['PLAUSIBLE_TRADING_HYPOTHESIS_REQUIRED'];reasonFamily='NOT_A_REVIEW_CANDIDATE';}else if(!input.evidenceSufficient||!input.independentEvidence){status='DEFERRED';reasonCodes=['EVIDENCE_ACQUISITION_REQUIRED'];reasonFamily='MORE_EVIDENCE_REQUIRED';}else if(input.classificationStatus==='UNCERTAIN'&&['UNRESOLVED','REVIEW_ELIGIBLE','NEEDS_REVIEW'].includes(input.investigationState)){status='ELIGIBLE';reasonCodes=['AMBIGUITY_REQUIRES_HUMAN_JUDGMENT'];reasonFamily='HUMAN_AMBIGUITY';}else{reasonCodes=['REVIEW_POLICY_ABSTAINED'];reasonFamily='NOT_A_REVIEW_CANDIDATE';}return {status,reasonCodes,reasonFamily,servingAuthority:true,policyVersion:REVIEW_ELIGIBILITY_POLICY_VERSION};}

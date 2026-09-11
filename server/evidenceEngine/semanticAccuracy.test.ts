@@ -296,6 +296,45 @@ test('same-family title and description collapse to one observation voice', asyn
   );
 });
 
+test('multi-video aggregate keeps per-video support instead of collapsing it', async () => {
+  const { dedupeWeightByFieldGroup } = await import('./decisionPolicy');
+  const makeItem = (fields: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null }>, finalWeight: number) => ({
+    provenance: { fields }, finalWeight,
+  });
+  // Two independent videos at 20 each plus a consistency aggregate of 18
+  // spanning both: per-key max keeps 20 + 20 (aggregate shares 9 per key).
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem([{ field: 'video_title', sourceFamilyId: 'fam-v0' }], 20),
+      makeItem([{ field: 'video_title', sourceFamilyId: 'fam-v1' }], 20),
+      makeItem(
+        [{ field: 'video_title', sourceFamilyId: 'fam-v0' }, { field: 'video_title', sourceFamilyId: 'fam-v1' }],
+        18
+      ),
+    ] as never),
+    40
+  );
+});
+
+test('partially overlapping field sets share only the overlapping voice', async () => {
+  const { dedupeWeightByFieldGroup } = await import('./decisionPolicy');
+  const makeItem = (fields: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null }>, finalWeight: number) => ({
+    provenance: { fields }, finalWeight,
+  });
+  // Country item {bio} at 10 and semantic item {bio, video:0} at 18: the bio
+  // voice collapses to max(10, 9) = 10 while video:0 keeps its 9 share.
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem([{ field: 'channel_bio', sourceFamilyId: 'fam-c' }], 10),
+      makeItem(
+        [{ field: 'channel_bio', sourceFamilyId: 'fam-c' }, { field: 'video_title', sourceFamilyId: 'fam-v0' }],
+        18
+      ),
+    ] as never),
+    19
+  );
+});
+
 test('staged contradiction agrees with the final policy on duplicate evidence', async () => {
   const engine = new EvidenceBasedTradingEngine();
   const decision = await engine.evaluateChannel({

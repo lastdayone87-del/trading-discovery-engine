@@ -8,11 +8,25 @@ test('review eligibility separates evidence, provider, language and active-inves
 test('fallback-covered provider degradation does not defer human review', async () => {
   const { resolveReviewProviderDegraded } = await import('./policy');
   const covered = { degraded: true, providers: [
-    { provider: 'gemini_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT'] },
-    { provider: 'groq_semantic', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED', 'SEMANTIC_FALLBACK_SUCCEEDED'] },
+    { provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] },
+    { provider: 'groq_semantic', availability: 'AVAILABLE', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED', 'SEMANTIC_FALLBACK_SUCCEEDED'] },
   ] };
   assert.equal(resolveReviewProviderDegraded(covered as never), false);
-  const uncovered = { degraded: true, providers: [{ provider: 'gemini_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT'] }] };
+  const uncovered = { degraded: true, providers: [{ provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] }] };
   assert.equal(resolveReviewProviderDegraded(uncovered as never), true);
   assert.equal(resolveReviewProviderDegraded({ degraded: false, providers: [] } as never), false);
+});
+
+test('fallback coverage with an unrelated failed provider still defers review', async () => {
+  const { resolveReviewProviderDegraded } = await import('./policy');
+  const { evaluateReviewEligibilityV2 } = await import('./policy');
+  const collection = { degraded: true, providers: [
+    { provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] },
+    { provider: 'groq_semantic', availability: 'AVAILABLE', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED', 'SEMANTIC_FALLBACK_SUCCEEDED'] },
+    { provider: 'discord_metadata', availability: 'FAILED', reasonCodes: ['PROVIDER_TIMEOUT'] },
+  ] };
+  assert.equal(resolveReviewProviderDegraded(collection as never), true);
+  const decision = evaluateReviewEligibilityV2({ classificationStatus:'UNCERTAIN', investigationState:'UNRESOLVED', plausibleTradingHypothesis:true, evidenceSufficient:true, independentEvidence:true, countryAllowed:true, operationalFailure:false, providerDegraded:resolveReviewProviderDegraded(collection as never), unsupportedLanguage:false, terminalDecision:false });
+  assert.equal(decision.status, 'DEFERRED');
+  assert.equal(decision.reasonFamily, 'PROVIDER_RECOVERY_REQUIRED');
 });

@@ -29,3 +29,29 @@ test('stage-two fallback-covered collection preserves human review instead of pr
   assert.equal(plan.legacyAction,'HUMAN_REVIEW');
   assert.ok(!plan.reasonCodes.includes('DEGRADED_PROVIDER_BOUNDED_RETRY'));
 });
+
+test('stage-two fallback coverage with an unrelated failed provider still retries',()=>{
+  const d=decision({evidenceCollection:{sufficiency:'SUFFICIENT',sparseMetadata:false,degraded:true,fieldsPresent:['channel_bio'],reasonCodes:['PROVIDER_COVERAGE_DEGRADED'],providers:[
+    {provider:'gemini_semantic',availability:'FAILED',evidenceCount:0,outcome:'FAILED_PROVIDER',reasonCodes:['PROVIDER_RATE_LIMIT']},
+    {provider:'groq_semantic',availability:'AVAILABLE',evidenceCount:0,outcome:'ABSTAINED_LOW_CONFIDENCE',reasonCodes:['SEMANTIC_MODEL_ABSTAINED','SEMANTIC_FALLBACK_SUCCEEDED']},
+    {provider:'discord_metadata',availability:'FAILED',evidenceCount:0,outcome:'FAILED_PROVIDER',reasonCodes:['PROVIDER_TIMEOUT']},
+  ]}});
+  const plan=planEvidenceAction({decision:d,rawInput:{channel_name:'CoveredPlusDiscord',description:'rich enough bio text for review',enrichment_stage:2},mode:'CANARY',providerQuotaRemaining:1000});
+  assert.equal(plan.legacyAction,'PROVIDER_RETRY');
+});
+
+test('fallback-covered degradation emits no provider gap for canary selection', () => {
+  const covered = {
+    sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: true, fieldsPresent: ['channel_bio'], reasonCodes: [],
+    providers: [
+      { provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] },
+      { provider: 'groq_semantic', availability: 'AVAILABLE', reasonCodes: ['SEMANTIC_FALLBACK_SUCCEEDED'] },
+    ],
+  };
+  assert.ok(!deriveEvidenceGaps({ evidenceCollection: covered } as never).includes('PROVIDER_DEGRADED'));
+  const uncovered = {
+    sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: true, fieldsPresent: ['channel_bio'], reasonCodes: [],
+    providers: [{ provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] }],
+  };
+  assert.ok(deriveEvidenceGaps({ evidenceCollection: uncovered } as never).includes('PROVIDER_DEGRADED'));
+});

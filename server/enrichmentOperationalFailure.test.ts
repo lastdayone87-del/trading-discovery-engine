@@ -162,3 +162,18 @@ test('manual recheck gate still rejects non-semantic failures despite coverage',
   });
   assert.ok(manualRecheckDegradedError(collection));
 });
+
+test('uncoveredFailedProviders exempts only covered semantic failures', async () => {
+  const { uncoveredFailedProviders } = await import('./enrichmentOperationalFailure');
+  const coveredOnly = fallbackReport();
+  assert.deepEqual(uncoveredFailedProviders(coveredOnly), []);
+  const withDiscord = fallbackReport();
+  withDiscord.providers.push({
+    provider: 'discord_metadata', availability: 'FAILED', evidenceCount: 0, outcome: 'FAILED_PROVIDER',
+    reasonCodes: ['PROVIDER_TIMEOUT'], durationMs: 3,
+  });
+  assert.deepEqual(uncoveredFailedProviders(withDiscord), ['discord_metadata']);
+  const plain = report(true, ['PROVIDER_RATE_LIMIT']);
+  assert.deepEqual(uncoveredFailedProviders(plain), ['gemini_semantic']);
+  assert.deepEqual(uncoveredFailedProviders(report(false)), []);
+});

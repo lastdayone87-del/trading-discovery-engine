@@ -38,6 +38,6 @@ test('manual recheck still fails closed on degraded classifier provider coverage
 
 test('manual recheck proceeds when a served fallback covers the degraded providers', () => {
   const gate = readFileSync(new URL('./enrichmentOperationalFailure.ts', import.meta.url), 'utf8');
-  assert.match(gate, /isFallbackCovered\(collection\)/);
-  assert.match(gate, /uncovered\.length === 0/);
+  assert.match(gate, /uncoveredFailedProviders\(report\)/);
+  assert.match(gate, /uncoveredFailedProviders\(collection\)/);
 });

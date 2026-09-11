@@ -52,58 +52,35 @@ function observationGroupKey(field: { field?: string; sourceFamilyId?: string | 
  * global and the country knowledge provider); without dedup the same token's
  * weight counts two or three times toward terminal thresholds.
  *
- * Groups merge by shared observation keys (connected components): items
- * citing overlapping field sets describe overlapping observations, so each
- * connected component contributes its single strongest weight instead of
- * every member's full weight. Disjoint groups — independent links,
- * playlists, videos, fields — stay separate, so corroboration still
- * requires genuinely independent observations. Items without any
- * attributable field are never merged.
+ * Weight is attributed per observation key: an item spanning several keys
+ * contributes an equal share to each (so single items keep their exact total
+ * however many documents they cite), and each key keeps the strongest share
+ * covering it. Fully overlapping interpretations therefore collapse to one
+ * voice, while independent links, playlists, videos — and multi-video
+ * aggregates alongside per-video items — keep their support. Items without
+ * any attributable field are never merged.
  * Shared with staged classification so stage dispositions and the final
  * policy always agree on terminal weight.
  */
 export function dedupeWeightByFieldGroup<T extends { provenance?: { fields?: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null; index?: number | null }> }; finalWeight: number }>(items: T[]): number {
-  const itemKeys: Array<{ item: T; keys: Set<string> }> = [];
+  const keyShare = new Map<string, number>();
+  let ungrouped = 0;
   for (const item of items) {
-    const keys = new Set(
-      (item.provenance?.fields || [])
-        .map(observationGroupKey)
-        .filter((value): value is string => value !== null)
-    );
-    if (keys.size === 0) continue;
-    itemKeys.push({ item, keys });
-  }
-  const ungrouped = items
-    .filter(item => !itemKeys.some(entry => entry.item === item))
-    .reduce((sum, item) => sum + Math.abs(item.finalWeight), 0);
-  // Union-find over shared keys: overlapping groups are one observation.
-  const parent = new Map<number, number>();
-  const find = (id: number): number => {
-    let root = id;
-    while (parent.get(root) !== root) root = parent.get(root) as number;
-    return root;
-  };
-  itemKeys.forEach((_, index) => parent.set(index, index));
-  const keyOwners = new Map<string, number>();
-  itemKeys.forEach((entry, index) => {
-    for (const key of entry.keys) {
-      const owner = keyOwners.get(key);
-      if (owner === undefined) {
-        keyOwners.set(key, index);
-      } else {
-        const a = find(index);
-        const b = find(owner);
-        if (a !== b) parent.set(a, b);
-      }
+    const keys = (item.provenance?.fields || [])
+      .map(observationGroupKey)
+      .filter((value): value is string => value !== null);
+    if (keys.length === 0) {
+      ungrouped += Math.abs(item.finalWeight);
+      continue;
     }
-  });
-  const componentBest = new Map<number, number>();
-  itemKeys.forEach((entry, index) => {
-    const root = find(index);
-    componentBest.set(root, Math.max(componentBest.get(root) || 0, Math.abs(entry.item.finalWeight)));
-  });
+    const uniqueKeys = [...new Set(keys)];
+    const share = Math.abs(item.finalWeight) / uniqueKeys.length;
+    for (const key of uniqueKeys) {
+      keyShare.set(key, Math.max(keyShare.get(key) || 0, share));
+    }
+  }
   let total = ungrouped;
-  for (const weight of componentBest.values()) total += weight;
+  for (const weight of keyShare.values()) total += weight;
   return total;
 }
 
