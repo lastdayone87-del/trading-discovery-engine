@@ -76,7 +76,7 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { isGeminiSemanticCooldownActive, isGroqSemanticCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
-import { shouldUseGroqSemantic, configuredGroqRoutes } from './evidenceEngine/providers/GroqSemanticProvider';
+import { shouldUseGroqSemantic, configuredGroqRoutes, groqCooldownRemainingMs } from './evidenceEngine/providers/GroqSemanticProvider';
 import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
@@ -218,6 +218,18 @@ export function enrichChannelClaimableDuringCooldown(input: {
 }
 
 /**
+ * Groq fallback cooldown composition for the ENRICH claim gate.
+ * Groq is usable as a fallback only when BOTH cooldown mechanisms are clear:
+ * the persisted shared cooldown (cross-replica ledger) AND the current
+ * process's local in-process cooldown. Either one alone blocks the fallback
+ * claim so a 429 whose ledger write failed cannot recreate a claim/defer loop.
+ * Pure and unit-testable; callers pass the two existing mechanism reads.
+ */
+export function groqFallbackCoolingDown(persistedCooldownActive: boolean, localCooldownRemainingMs: number): boolean {
+  return persistedCooldownActive || localCooldownRemainingMs > 0;
+}
+
+/**
  * Durable job types claimable through processNextSearchJob overrides.
  * RELATIONSHIP_CANARY_EXPANSION rides the existing SEARCH pool (same YouTube
  * provider profile, same tick lifecycle) behind its own settings gate, so no
@@ -256,8 +268,9 @@ export async function processNextSearchJob(
   // the Groq cooldown, free-Gemini-selected claims consult the free-Gemini
   // cooldown, and paid-Gemini claims consult the paid cooldown, so a stale
   // cooldown on any idle route can never stall the serving one. When paid
-  // Gemini is cooling down, a configured and healthy Groq fallback route
-  // still allows the claim so jobs can reach the already-working fallback.
+  // Gemini is cooling down, a configured Groq fallback route that is clear of
+  // BOTH its persisted shared cooldown and its process-local cooldown still
+  // allows the claim so jobs can reach the already-working fallback.
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
@@ -268,7 +281,7 @@ export async function processNextSearchJob(
     let groqFallbackCooldownActive = false;
     if (!groqSelected && !geminiFreeSelected && geminiCooldownActive) {
       groqFallbackConfigured = configuredGroqRoutes().length > 0 && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true';
-      if (groqFallbackConfigured) groqFallbackCooldownActive = await isGroqSemanticCooldownActive();
+      if (groqFallbackConfigured) groqFallbackCooldownActive = groqFallbackCoolingDown(await isGroqSemanticCooldownActive(), groqCooldownRemainingMs());
     }
     if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
   }
