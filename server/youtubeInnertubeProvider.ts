@@ -360,6 +360,10 @@ type InnertubeFeedLike = {
 
 type InnertubeSession = {
   search: (query: string, filters?: Record<string, unknown>) => Promise<InnertubeFeedLike>;
+  getChannel?: (channelId: string) => Promise<{
+    getVideos?: () => Promise<{ videos?: unknown }>;
+  }>;
+  getBasicInfo?: (videoId: string) => Promise<{ basic_info?: { short_description?: unknown } }>;
 };
 
 let sessionPromise: Promise<InnertubeSession> | null = null;
@@ -656,3 +660,153 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
 }
 
 registerRetrievalExecutor(YOUTUBE_INNERTUBE_PROVIDER, executeInnertubeRetrievalPage);
+
+export interface InnertubeVideoDescription {
+  videoId: string;
+  description: string;
+}
+
+export interface InnertubeChannelDescriptions {
+  items: InnertubeVideoDescription[];
+  videosListed: number;
+  videosAttempted: number;
+  listingNote?: string;
+}
+
+function innertubeVideoText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') {
+    const text = (value as { text?: unknown }).text;
+    if (typeof text === 'string') return text;
+  }
+  return '';
+}
+
+/**
+ * Keyless recent-video descriptions for one channel over the shared
+ * InnerTube session (pacing, cooldown, deadlines, and telemetry identical to
+ * retrieval pages). One channel browse plus one metadata call per video,
+ * bounded by maxVideos. Per-video 404/private/deleted videos are skipped,
+ * never fatal; a 429 aborts the whole fetch so the caller can fall back.
+ * Never touches the browser runtime or the YouTube Data API quota pool.
+ */
+export async function fetchChannelVideoDescriptionsViaInnertube(
+  channelId: string,
+  opts: { maxVideos?: number; jobId?: string } = {},
+): Promise<InnertubeChannelDescriptions> {
+  if (!channelId?.trim()) {
+    throw Object.assign(new Error('InnerTube description fetch requires a channel id.'), {
+      code: INNERTUBE_FAILURE_CODE,
+      retryable: false,
+    });
+  }
+  const maxVideos = Math.min(10, Math.max(1, Math.floor(opts.maxVideos ?? 10) || 10));
+  const timeoutMs = innertubeTimeoutMs();
+  const deadlineAtMs = Date.now() + timeoutMs;
+  const remainingMs = innertubeCooldownRemainingMs();
+  if (remainingMs > 0) {
+    throw Object.assign(
+      new Error(`YouTube.js provider cooling down for ${remainingMs}ms.`),
+      { code: INNERTUBE_RATE_LIMITED_CODE, retryable: true, retryAfterMs: remainingMs },
+    );
+  }
+  const started = Date.now();
+  const base = {
+    id: `adhoc:youtube-innertube:channel-descriptions:${channelId}:${Date.now()}`,
+    provider: 'youtube-innertube',
+    operation: 'channel-video-descriptions',
+    runId: undefined,
+    jobId: opts.jobId,
+    requestMetadata: { channelId },
+    attempt: 1,
+    reservedCost: 0,
+    policyVersion: 'provider-resilience-v1',
+  };
+  const pacedCall = <T>(work: () => Promise<T>): Promise<T> =>
+    withInnertubeRemaining(
+      paceInnertubeRequest(innertubeMinIntervalMs()).then(() => work()),
+      deadlineAtMs,
+    );
+  let videosListed = 0;
+  let videosAttempted = 0;
+  const items: InnertubeVideoDescription[] = [];
+  try {
+    const sessionAttempt = getInnertubeSession();
+    let session: InnertubeSession;
+    try {
+      session = await withInnertubeRemaining(sessionAttempt, deadlineAtMs);
+    } catch (error) {
+      invalidateStuckSessionAttempt(sessionAttempt);
+      throw error;
+    }
+    const rawChannel = session.getChannel;
+    const rawBasicInfo = session.getBasicInfo;
+    if (typeof rawChannel !== 'function' || typeof rawBasicInfo !== 'function') {
+      throw Object.assign(new Error('InnerTube session cannot list channel videos.'), {
+        code: INNERTUBE_FAILURE_CODE,
+        retryable: false,
+      });
+    }
+    const getChannel = rawChannel.bind(session);
+    const getBasicInfo = rawBasicInfo.bind(session);
+    let nodes: unknown[];
+    try {
+      const channel = await pacedCall<{ getVideos?: () => Promise<{ videos?: unknown }> }>(() => getChannel(channelId));
+      let tab: { videos?: unknown } | null = null;
+      try {
+        tab = await pacedCall<{ videos?: unknown } | null>(() => channel.getVideos?.() ?? Promise.resolve(null));
+      } catch (error) {
+        if (/tab|videos/i.test(String((error as Error)?.message || ''))) {
+          tab = null;
+        } else {
+          throw error;
+        }
+      }
+      const raw = tab?.videos;
+      nodes = Array.isArray(raw) ? raw : [];
+    } catch (error) {
+      throw error;
+    }
+    const refs = nodes
+      .map((node: any) => ({
+        id: String(node?.content_id || node?.id || node?.video_id || ''),
+        title: innertubeVideoText(node?.metadata?.title).slice(0, 120),
+      }))
+      .filter(ref => ref.id);
+    videosListed = refs.length;
+    for (const ref of refs.slice(0, maxVideos)) {
+      videosAttempted += 1;
+      try {
+        const info = await pacedCall(() => getBasicInfo(ref.id));
+        const description = String((info as any)?.basic_info?.short_description || '').trim();
+        if (description) items.push({ videoId: ref.id, description });
+      } catch (error) {
+        const status = Number((error as { status?: unknown })?.status);
+        const message = String((error as Error)?.message || error || '');
+        if (status === 404 || /not.?found|private|deleted|unavailable/i.test(message)) continue;
+        throw error;
+      }
+    }
+    await emit({
+      ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
+      actualCost: 0, occurredAt: new Date().toISOString(),
+      requestMetadata: { ...base.requestMetadata, videosListed: String(videosListed), videosAttempted: String(videosAttempted), descriptionsRecovered: String(items.length) },
+    });
+    return { items, videosListed, videosAttempted };
+  } catch (error) {
+    const typed = classifyInnertubeError(error);
+    if (typed.code === INNERTUBE_RATE_LIMITED_CODE && !String(typed.message).includes('cooling down')) {
+      innertubeCooldownUntilMs = Date.now() + innertubeCooldownMs();
+    }
+    await emit({
+      ...base,
+      status: typed.code === INNERTUBE_RATE_LIMITED_CODE ? 'RATE_LIMITED' : 'TRANSIENT_ERROR',
+      latencyMs: Date.now() - started,
+      actualCost: 0,
+      errorClass: typed.code === INNERTUBE_RATE_LIMITED_CODE ? 'RATE_LIMIT' : 'TRANSIENT',
+      occurredAt: new Date().toISOString(),
+      requestMetadata: { ...base.requestMetadata, videosListed: String(videosListed), videosAttempted: String(videosAttempted), descriptionsRecovered: String(items.length) },
+    });
+    throw typed;
+  }
+}
