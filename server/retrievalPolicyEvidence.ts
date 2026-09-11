@@ -48,7 +48,7 @@ export async function recomputeNeighborhoodRetrievalEvidence(
          po.query_run_id,
          ran.neighborhood_key,
          COALESCE(po.retrieval_config_key, qr.retrieval_config_key) AS config_key,
-         qr.created_at AS run_created_at
+          qr.scheduled_at AS run_created_at
        FROM autonomous_query_page_observations po
        JOIN query_runs qr ON qr.id = po.query_run_id
        JOIN retrieval_action_neighborhoods ran ON ran.query_run_id = po.query_run_id
