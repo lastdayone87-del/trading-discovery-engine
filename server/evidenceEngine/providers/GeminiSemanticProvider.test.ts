@@ -306,3 +306,35 @@ test('key failover threads one model value across routes', async () => {
   assert.deepEqual(seen, [['gemini-1', model], ['gemini-2', model]]);
   assert.deepEqual(result, { route: 'gemini-2', model });
 });
+
+test('cooling shared account is skipped before any API path: A1/A2 cooling, B served', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const calls: string[] = [];
+  const result = await runGeminiRouteFailover(
+    [
+      { id: 'gemini-1', key: 'hidden-a', orgId: 'proj-a' },
+      { id: 'gemini-2', key: 'hidden-b', orgId: 'proj-a' },
+      { id: 'gemini-3', key: 'hidden-c', orgId: 'proj-b' },
+    ],
+    async route => {
+      calls.push(route.id);
+      return { route: route.id };
+    },
+    { isOrgCooling: orgId => orgId === 'proj-a' },
+  );
+  assert.deepEqual(calls, ['gemini-3']);
+  assert.deepEqual(result, { route: 'gemini-3' });
+});
+
+test('resolveCoolingGeminiOrgs maps persisted windows to a cooling set, failing open', async () => {
+  const { resolveCoolingGeminiOrgs } = await import('./GeminiSemanticProvider');
+  const now = Date.now();
+  assert.deepEqual(
+    [...await resolveCoolingGeminiOrgs(['proj-a', 'proj-b'], async org => (org === 'proj-a' ? now + 60_000 : undefined), now)],
+    ['proj-a']
+  );
+  assert.deepEqual(
+    [...await resolveCoolingGeminiOrgs(['proj-a'], async () => { throw new Error('ledger down'); }, now)],
+    []
+  );
+});

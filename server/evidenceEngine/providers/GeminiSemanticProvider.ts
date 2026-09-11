@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { appendProviderCallEvent } from '../../db';
-import { executeProviderCall, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
+import { executeProviderCall, getGeminiOrgSemanticCooldownExpiry, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { documentRef } from '../canonicalEvidencePlane';
@@ -48,6 +48,26 @@ export function geminiRouteOrg(route: { orgId?: unknown }): string {
   // fixtures, never production-configured routes) are assumed to share one
   // quota pool, preserving the pre-multi-account no-spill behavior.
   return label || 'shared';
+}
+
+/** Configured key slot numbers (1-based) with a non-empty key. */
+export function geminiConfiguredSlotNumbers(env: NodeJS.ProcessEnv = process.env): number[] {
+  return Object.keys(env)
+    .filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name))
+    .map(name => (name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length))))
+    .filter(slot => String(env[slot === 1 ? 'GEMINI_API_KEY' : `GEMINI_API_KEY_${slot}`] || '').trim())
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Env var names that must name an explicit org for production quota
+ * separation (one per configured key slot). Empty means every route is
+ * labeled; production startup rejects a non-empty result.
+ */
+export function missingGeminiOrgLabels(env: NodeJS.ProcessEnv = process.env): string[] {
+  return geminiConfiguredSlotNumbers(env)
+    .filter(slot => !String(env[slot === 1 ? 'GEMINI_ORG_ID' : `GEMINI_ORG_ID_${slot}`] || '').trim())
+    .map(slot => (slot === 1 ? 'GEMINI_ORG_ID' : `GEMINI_ORG_ID_${slot}`));
 }
 
 /** Return only ordered, non-empty route slots; credentials never leave this process. */
@@ -125,6 +145,29 @@ export async function runGeminiRouteFailover<T>(
 }
 
 const sdkByRoute = new Map<string, GoogleGenAI>();
+
+/**
+ * Persisted per-account cooling set for route selection. Reads each org's
+ * ledger window in parallel; any read failure fails open to "not cooling"
+ * for that org (the per-route capacity check inside each attempt still
+ * guards). Pure apart from the injected reader, so unit-testable without a
+ * database.
+ */
+export async function resolveCoolingGeminiOrgs(
+  orgIds: string[],
+  readExpiry: (orgId: string) => Promise<number | undefined>,
+  nowMs: number = Date.now(),
+): Promise<Set<string>> {
+  const states = await Promise.all(orgIds.map(async orgId => {
+    try {
+      const expiry = await readExpiry(orgId);
+      return { orgId, cooling: expiry !== undefined && expiry > nowMs };
+    } catch {
+      return { orgId, cooling: false };
+    }
+  }));
+  return new Set(states.filter(state => state.cooling).map(state => state.orgId));
+}
 function defaultClient(): SemanticModelClient | undefined {
   const routes = configuredGeminiRoutes();
   if (!routes.length) return undefined;
@@ -136,6 +179,16 @@ function defaultClient(): SemanticModelClient | undefined {
     return created;
   };
   return { classify: async (prompt, model) => {
+    // Enter through a healthy account: accounts already cooling in the
+    // persisted ledger are deprioritized before any API call path, so a
+    // cooling account's sibling is never pointlessly deferred. Single-org
+    // deployments skip the extra reads; ledger errors fail open (the
+    // per-route capacity check inside each attempt still guards).
+    const orgIds = [...new Set(routes.map(route => geminiRouteOrg(route)))];
+    let coolingOrgs = new Set<string>();
+    if (orgIds.length > 1) {
+      coolingOrgs = await resolveCoolingGeminiOrgs(orgIds, orgId => getGeminiOrgSemanticCooldownExpiry(orgId));
+    }
     const response = await runGeminiRouteFailover(routes, async route => {
       try {
         return await executeProviderCall({
@@ -154,7 +207,7 @@ function defaultClient(): SemanticModelClient | undefined {
         }
         throw error;
       }
-    });
+    }, { isOrgCooling: orgId => coolingOrgs.has(orgId) });
     return JSON.parse(response.text || '{}');
   }};
 }

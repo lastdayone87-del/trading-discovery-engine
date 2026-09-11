@@ -247,3 +247,18 @@ test('per-org cooldown resolvers scope by org label, not route', async () => {
   const geminiFn = dbCore.resolveGeminiOrgSemanticCooldownExpiryMs.toString();
   assert.ok(geminiFn.includes("request_metadata->>'geminiOrg'"), 'gemini resolver must scope by org tag');
 });
+
+test('exhausted groq org survives wrapping with its rate-limit reason for org-scoped retry', async () => {
+  const { failedProviderOrg } = await import('./dbCore');
+  const r = report(true, ['PROVIDER_RATE_LIMIT', 'GROQ_RATE_LIMITED'], 'SUFFICIENT');
+  r.providers[0].provider = 'groq_semantic';
+  (r.providers[0] as { orgId?: string }).orgId = 'slot-2';
+  const error = enrichmentOperationalFailure(r, true, false);
+  assert.ok(error, 'groq outage without decision-grade support must throw');
+  assert.ok(error!.providerReasons.includes('GROQ_RATE_LIMITED'), 'rate-limit reason must survive wrapping for retry alignment');
+  assert.equal(
+    failedProviderOrg(error, ['GROQ_RATE_LIMITED']),
+    'slot-2',
+    'retry scheduling must resolve the failed org, not a pool-wide window'
+  );
+});

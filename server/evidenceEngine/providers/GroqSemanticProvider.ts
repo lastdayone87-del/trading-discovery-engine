@@ -48,6 +48,26 @@ export function groqRouteOrg(route: { orgId?: unknown }): string {
   return label || 'shared';
 }
 
+/** Configured key slot numbers (1-based) with a non-empty key. */
+export function groqConfiguredSlotNumbers(env: NodeJS.ProcessEnv = process.env): number[] {
+  return Object.keys(env)
+    .filter(name => name === 'GROQ_API_KEY' || /^GROQ_API_KEY_[2-9][0-9]*$/.test(name))
+    .map(name => (name === 'GROQ_API_KEY' ? 1 : Number(name.slice('GROQ_API_KEY_'.length))))
+    .filter(slot => String(env[slot === 1 ? 'GROQ_API_KEY' : `GROQ_API_KEY_${slot}`] || '').trim())
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Env var names that must name an explicit org for production quota
+ * separation (one per configured key slot). Empty means every route is
+ * labeled; production startup rejects a non-empty result.
+ */
+export function missingGroqOrgLabels(env: NodeJS.ProcessEnv = process.env): string[] {
+  return groqConfiguredSlotNumbers(env)
+    .filter(slot => !String(env[slot === 1 ? 'GROQ_ORG_ID' : `GROQ_ORG_ID_${slot}`] || '').trim())
+    .map(slot => (slot === 1 ? 'GROQ_ORG_ID' : `GROQ_ORG_ID_${slot}`));
+}
+
 /** Return only ordered, non-empty route slots; credentials never leave this process. */
 export function configuredGroqRoutes(env: NodeJS.ProcessEnv = process.env): GroqRoute[] {
   const names = Object.keys(env).filter(name => name === 'GROQ_API_KEY' || /^GROQ_API_KEY_[2-9][0-9]*$/.test(name));

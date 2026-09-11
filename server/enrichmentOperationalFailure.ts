@@ -9,7 +9,11 @@ const OPERATIONAL_PROVIDER_REASONS = new Set([
   'PROVIDER_CANCELLED',
   'PROVIDER_EXECUTION_FAILED',
   'SEMANTIC_DEFERRED_RATE_PRESSURE',
-  'GEMINI_CAPACITY_DEFERRED'
+  'GEMINI_CAPACITY_DEFERRED',
+  // Preserved (not filtered out) so retry scheduling can align with the
+  // failed Groq org's cooldown via failedProviderOrg() instead of falling
+  // back to a generic delay.
+  'GROQ_RATE_LIMITED'
 ]);
 
 const SEMANTIC_PROVIDER_KEYS = new Set(['gemini_semantic', 'groq_semantic', 'gemini_free_semantic']);
