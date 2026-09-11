@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
 import { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 import { assertCountryAllowed, getCountryExclusion } from './countryExclusion';
+import { buildOperationalEnrichmentRecoveryPayload } from './queueManager';
+import type { DiscoverySource } from '../src/types';
 
 const exclusions = [
   { country_name: 'South Africa', reason: 'Regional exclusion' },
@@ -49,14 +50,33 @@ test('ENRICH worker gate passes targetCountry null instead of throwing TypeError
   await assertCountryAllowed(null, 'enrichment_worker:regression-job-id');
 });
 
-test('operational recovery still passes channel.country through without inventing a default', () => {
-  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.ok(
-    source.includes('targetCountry:channel.country'),
-    'recovery enqueue must keep passing the nullable channel.country straight through'
-  );
-  assert.ok(
-    !source.includes('targetCountry:channel.country||') && !source.includes('targetCountry:channel.country ??'),
-    'recovery must not invent a default country'
-  );
+test('operational recovery with unknown channel country yields a claimable null-target payload', async () => {
+  const payload = buildOperationalEnrichmentRecoveryPayload({
+    channel_id: 'UC-jzTZ9mii7weX9XvUxPswA',
+    channel_name: 'Trade Vision',
+    youtube_url: 'https://www.youtube.com/channel/UC-jzTZ9mii7weX9XvUxPswA',
+    country: null,
+    discovery_source: 'recovery' as DiscoverySource,
+    subscriber_count: '1840',
+    channel_thumbnail_url: null
+  }, ['OPERATIONAL_RECOVERY_COOLDOWN_EXPIRED']);
+  assert.equal(payload.targetCountry, null);
+  assert.equal(payload.candidate.locationTag, null);
+  assert.ok(!JSON.stringify(payload).includes('United States'), 'no default country may be invented anywhere in the payload');
+  // The resulting payload must pass the same country gate the ENRICH worker enforces.
+  await assertCountryAllowed(payload.targetCountry, 'enrichment_worker:recovery-regression');
+});
+
+test('operational recovery preserves a known channel country verbatim', () => {
+  const payload = buildOperationalEnrichmentRecoveryPayload({
+    channel_id: 'UC-known',
+    channel_name: 'Known Creator',
+    youtube_url: 'https://www.youtube.com/channel/UC-known',
+    country: 'Germany',
+    discovery_source: 'recovery' as DiscoverySource,
+    subscriber_count: '100',
+    channel_thumbnail_url: null
+  }, ['OPERATIONAL_RECOVERY_COOLDOWN_EXPIRED']);
+  assert.equal(payload.targetCountry, 'Germany');
+  assert.equal(payload.candidate.locationTag, 'Germany');
 });
