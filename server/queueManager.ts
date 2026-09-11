@@ -1795,6 +1795,12 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
   return { session, traceId, message: 'Manual discovery is queued; page 1 and all continuation pages will run in the high-priority durable queue.' };
 }
 
+/** Default enrichment workers when ENRICHMENT_WORKER_CONCURRENCY is unset. */
+export const ENRICHMENT_WORKER_CONCURRENCY_DEFAULT = 3;
+/** Resolve the enrichment worker count from env (pure; env override wins). */
+export function resolveEnrichmentWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.max(1, Number(env.ENRICHMENT_WORKER_CONCURRENCY || ENRICHMENT_WORKER_CONCURRENCY_DEFAULT));
+}
 function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = []): void {
   const safeConcurrency = Math.min(20, Math.max(1, Math.floor(concurrency) || 1));
   for (let index = 0; index < safeConcurrency; index++) {
@@ -1828,5 +1834,9 @@ export function startSearchWorkers(): void {
   // closed unless explicitly enabled, so default pool behavior is identical.
   startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)), ['RELATIONSHIP_CANARY_EXPANSION']);
   startWorkerPool('MANUAL_SEARCH_PAGE', Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1)));
-  startWorkerPool('ENRICH_CHANNEL', Math.max(1, Number(process.env.ENRICHMENT_WORKER_CONCURRENCY || 1)));
+  // Enrichment defaults to 3 workers: measured service demand is ~334s mean
+  // per completion (~10.8/hr per worker), so 3 workers burst ~30/hr against
+  // ample provider headroom while staying within daily YouTube (~107k/day at
+  // full tilt vs 300k pool) and browser-gate bounds. Env override still wins.
+  startWorkerPool('ENRICH_CHANNEL', resolveEnrichmentWorkerCount());
 }

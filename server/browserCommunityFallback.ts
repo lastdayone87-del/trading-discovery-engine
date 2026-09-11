@@ -401,6 +401,10 @@ export class RenderedFallbackGate {
 }
 
 export const renderedFallbackGate = new RenderedFallbackGate(
+  // Stays at 1: withBrowserRuntimeLease serializes every crawler.run() onto
+  // one process-wide lease, and each crawl's total-budget clock starts at
+  // gate acquisition — admitting 2 would let the second burn its budget
+  // waiting for the lease. Env override still wins within the 1..2 bounds.
   boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, 1, 1, 2),
   boundedEnvInt(process.env.RENDERED_FALLBACK_MAX_PENDING, 8, 0, 32),
 );
