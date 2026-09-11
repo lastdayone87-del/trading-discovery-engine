@@ -338,3 +338,44 @@ test('resolveCoolingGeminiOrgs maps persisted windows to a cooling set, failing 
     []
   );
 });
+
+test('production defaults adjudicate low-confidence results with two 3.6-flash calls', async () => {
+  const restore = withModelOverrides(undefined, undefined);
+  process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  try {
+    const calls: Array<{ prompt: string; model: string }> = [];
+    const low = { ...unrelatedResult, confidence: 10 };
+    const client: SemanticModelClient = { classify: async (prompt, model) => { calls.push({ prompt, model }); return low; } };
+    const provider = new GeminiSemanticProvider(client);
+    await provider.collectEvidence(input, {} as any);
+    assert.equal(calls.length, 2, 'candidate + adjudication passes must both run on identical defaults');
+    assert.ok(calls[0].prompt.includes('"task":"CANDIDATE"'));
+    assert.ok(calls[1].prompt.includes('"task":"ADJUDICATION"'));
+    assert.deepEqual(calls.map(call => call.model), ['gemini-3.6-flash', 'gemini-3.6-flash']);
+  } finally {
+    restore();
+    delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  }
+});
+
+test('404 fallback to the adjudicator model still skips a redundant second pass', async () => {
+  const restore = withModelOverrides('gone-model', 'other-model');
+  process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  try {
+    const models: string[] = [];
+    const low = { ...unrelatedResult, confidence: 10 };
+    const client: SemanticModelClient = {
+      classify: async (_prompt, model) => {
+        models.push(model);
+        if (models.length === 1) throw new ProviderCallError('model unavailable', 'PERMANENT_INPUT', false, { status: 404 });
+        return low;
+      },
+    };
+    const provider = new GeminiSemanticProvider(client);
+    await provider.collectEvidence(input, {} as any);
+    assert.deepEqual(models, ['gone-model', 'other-model']);
+  } finally {
+    restore();
+    delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  }
+});

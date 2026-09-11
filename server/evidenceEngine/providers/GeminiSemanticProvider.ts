@@ -323,7 +323,11 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     let result = parse(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && model !== adjudicatorModel) {
+    // Second pass runs unless adjudication already occurred (candidate served
+    // from the adjudicator model via 404 fallback). Gated on occurrence, not
+    // on model-name inequality, so identical candidate/adjudicator defaults
+    // still adjudicate low-confidence results.
+    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
       result = parse(await client.classify(prompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);

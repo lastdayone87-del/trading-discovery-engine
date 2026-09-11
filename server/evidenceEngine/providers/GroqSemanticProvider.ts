@@ -497,7 +497,11 @@ export class GroqSemanticProvider implements EvidenceProvider {
     // replaces the result drops the code with it. Evaluated below, after
     // adjudication has had its chance to replace the result.
     const repairSurvived = () => repairUsed && repairedCitations !== null && result.citations === repairedCitations;
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && model !== adjudicatorModel) {
+    // Second pass runs unless adjudication already occurred (candidate served
+    // from the adjudicator model via 404 fallback). Gated on occurrence, not
+    // on model-name inequality, so identical candidate/adjudicator defaults
+    // still adjudicate low-confidence results.
+    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
       result = parseSemanticResult(await client.classify(buildSemanticPrompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
