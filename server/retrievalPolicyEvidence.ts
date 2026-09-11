@@ -48,17 +48,22 @@ export async function recomputeNeighborhoodRetrievalEvidence(
          po.query_run_id,
          ran.neighborhood_key,
          COALESCE(po.retrieval_config_key, qr.retrieval_config_key) AS config_key,
-         qr.created_at AS run_created_at
+         -- Evidence time, not queue time: completed runs count at completion,
+         -- started-but-incomplete runs fall back to start. Scheduled runs
+         -- that never started produce no page observations, and the explicit
+         -- predicate below excludes them even if that ever changes.
+         COALESCE(qr.completed_at, qr.started_at) AS run_tested_at
        FROM autonomous_query_page_observations po
        JOIN query_runs qr ON qr.id = po.query_run_id
        JOIN retrieval_action_neighborhoods ran ON ran.query_run_id = po.query_run_id
        WHERE ran.neighborhood_key = $1
          AND COALESCE(po.retrieval_config_key, qr.retrieval_config_key) = $2
+         AND qr.started_at IS NOT NULL
      ),
      run_totals AS (
        SELECT
          cr.query_run_id,
-         cr.run_created_at,
+         cr.run_tested_at,
          COALESCE(SUM(po.quota_units), 100)::int AS run_quota,
          COALESCE(SUM(po.distinct_creator_count), 0)::int AS distinct_creators,
          COALESCE(SUM(po.new_creators), 0)::int AS new_creators,
@@ -68,7 +73,7 @@ export async function recomputeNeighborhoodRetrievalEvidence(
          AVG(po.duplicate_ratio)::float AS avg_dup_ratio
        FROM canonical_runs cr
        JOIN autonomous_query_page_observations po ON po.query_run_id = cr.query_run_id
-       GROUP BY cr.query_run_id, cr.run_created_at
+       GROUP BY cr.query_run_id, cr.run_tested_at
      ),
      page_breakdown AS (
        SELECT
@@ -85,13 +90,13 @@ export async function recomputeNeighborhoodRetrievalEvidence(
      )
      SELECT
        COUNT(DISTINCT cr.query_run_id)::int AS execution_count,
-       COUNT(DISTINCT cr.query_run_id) FILTER (WHERE cr.run_created_at >= now() - interval '7 days')::int AS recent_execution_count,
+       COUNT(DISTINCT cr.query_run_id) FILTER (WHERE cr.run_tested_at >= now() - interval '7 days')::int AS recent_execution_count,
        COALESCE(AVG(rt.run_quota), 100)::float AS avg_quota_cost,
        COALESCE(AVG(CASE WHEN rt.distinct_creators > 0 THEN rt.confirmed_creators::float / rt.distinct_creators ELSE 0 END), 0)::float AS relevant_new_yield,
        COALESCE(AVG(CASE WHEN rt.distinct_creators > 0 THEN rt.quality_creators::float / rt.distinct_creators ELSE 0 END), 0)::float AS quality_new_yield,
        COALESCE(AVG(rt.avg_dup_ratio), 0)::float AS duplicate_rate,
        COALESCE(AVG(CASE WHEN rt.distinct_creators > 0 THEN rt.known_creators::float / rt.distinct_creators ELSE 0 END), 0)::float AS known_creator_rate,
-       MAX(cr.run_created_at)::text AS last_tested_at,
+       MAX(cr.run_tested_at)::text AS last_tested_at,
        (SELECT COALESCE(jsonb_agg(jsonb_build_object(
           'pageNumber', pb.page_number,
           'avgNewCreators', ROUND(pb.avg_new::numeric, 2),
