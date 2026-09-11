@@ -3,7 +3,7 @@
 // and independently testable without changing the rest of the database surface.
 export * from './dbCore';
 
-import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiRouteSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs } from './dbCore';
+import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -41,16 +41,16 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined;
   const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
   if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){
-    const failedGeminiRoute=(error as any)?.geminiRoute;
-    geminiSemanticCooldownExpiryMs=typeof failedGeminiRoute==='string'&&failedGeminiRoute?await resolveGeminiRouteSemanticCooldownExpiryMs(failedGeminiRoute,now):await resolveGeminiSemanticCooldownExpiryMs(now);
+    const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED']);
+    geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,now):await resolveGeminiSemanticCooldownExpiryMs(now);
   }
   // Groq cooldown from the same persisted ledger (provider='groq'), scoped to
   // the failed organization when the error carries one: a Groq 429 defers the
   // retry past that org's window instead of ticking, and never penalizes
   // healthy orgs. Without an org tag, the pool-wide window applies as before.
   if(providerReasons.includes('GROQ_RATE_LIMITED')){
-    const failedGroqOrg=(error as any)?.groqOrg;
-    groqSemanticCooldownExpiryMs=typeof failedGroqOrg==='string'&&failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,now):await resolveGroqSemanticCooldownExpiryMs(now);
+    const failedGroqOrg=failedProviderOrg(error,['GROQ_RATE_LIMITED']);
+    groqSemanticCooldownExpiryMs=failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,now):await resolveGroqSemanticCooldownExpiryMs(now);
   }
   // Free-Gemini pool cooldown from its own persisted ledger
   // (provider='gemini-free'): a free-tier 429 defers the retry past the free

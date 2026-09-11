@@ -923,3 +923,51 @@ test('groq 429 on org 1 arms only org 1: org 2 serves without fetching twice', a
     resetGroqCooldownForTests();
   }
 });
+
+test('shared-org groq 429 cools the whole account, independent orgs unaffected', async () => {
+  resetGroqCooldownForTests();
+  const savedFetch = globalThis.fetch;
+  const saved: Record<string, string | undefined> = {};
+  for (const name of ['GROQ_API_KEY', 'GROQ_API_KEY_2', 'GROQ_ORG_ID', 'GROQ_ORG_ID_2']) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  globalThis.fetch = (async () => {
+    return new Response('{"error":{"message":"Rate limit reached"}}', { status: 429, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'shared-key-one';
+  process.env.GROQ_API_KEY_2 = 'shared-key-two';
+  process.env.GROQ_ORG_ID = 'acme';
+  process.env.GROQ_ORG_ID_2 = 'acme';
+  try {
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
+    await assert.rejects(client!.classify('prompt', 'model'));
+    assert.ok(groqOrgCooldownRemainingMs('acme') > 0, 'shared account must be cooling');
+    assert.equal(groqOrgCooldownRemainingMs('slot-9'), 0, 'unrelated orgs must stay clear');
+  } finally {
+    globalThis.fetch = savedFetch;
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name] as string;
+    }
+    resetGroqCooldownForTests();
+  }
+});
+
+test('A1 → A2 → B never retries the exhausted same-org sibling', async () => {
+  const order: string[] = [];
+  const result = await runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'org-a' },
+      { id: 'groq-2', key: 'k2', orgId: 'org-a' },
+      { id: 'groq-3', key: 'k3', orgId: 'org-b' },
+    ],
+    async route => {
+      order.push(route.id);
+      if (route.id !== 'groq-3') throw new ProviderCallError('Rate limit reached.', 'RATE_LIMIT', true, { status: 429 });
+      return { route: route.id };
+    },
+  );
+  assert.deepEqual(order, ['groq-1', 'groq-3']);
+  assert.deepEqual(result, { route: 'groq-3' });
+});

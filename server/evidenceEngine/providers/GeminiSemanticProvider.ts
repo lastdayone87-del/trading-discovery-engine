@@ -8,8 +8,8 @@ import { documentRef } from '../canonicalEvidencePlane';
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = ['ACTIVE_TRADING', 'INVESTING_EDUCATION', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'HYPE', 'UNRELATED', 'AMBIGUOUS'] as const;
-export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
-export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
+export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-2.5-flash-lite';
+export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-2.5-flash';
 type SemanticLabel = typeof SEMANTIC_TAXONOMY[number];
 
 export interface SemanticModelResult {
@@ -97,6 +97,9 @@ export async function runGeminiRouteFailover<T>(
     (a, b) => Number(isCooling(geminiRouteOrg(a))) - Number(isCooling(geminiRouteOrg(b))),
   );
   for (const route of ordered) {
+    // A 429 marks its whole account tried (see catch below), so this
+    // head-pick always lands on the next eligible independent account — a
+    // same-account sibling of an exhausted account is never retried.
     if (tried.has(route)) continue;
     tried.add(route);
     try {
@@ -105,13 +108,14 @@ export async function runGeminiRouteFailover<T>(
       lastError = error;
       if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
         const failedOrg = failedGeminiOrg(error, route);
-        // Same-account routes share one quota pool: never spill a rate
-        // limit into them. Different-account routes hold independent quotas
-        // and are safe to try next; skip accounts already known-cooling.
-        const next = ordered.find(
-          candidate => !tried.has(candidate) && geminiRouteOrg(candidate) !== failedOrg && !isCooling(geminiRouteOrg(candidate)),
-        );
-        if (!next) throw error;
+        // Same-account routes share one quota pool: mark them all tried so
+        // the loop head selects the next independent account
+        // (burst-multiplication protection). Different-account routes hold
+        // independent quotas.
+        for (const candidate of ordered) {
+          if (geminiRouteOrg(candidate) === failedOrg) tried.add(candidate);
+        }
+        if (!ordered.some(candidate => !tried.has(candidate))) throw error;
         continue;
       }
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
@@ -135,17 +139,18 @@ function defaultClient(): SemanticModelClient | undefined {
     const response = await runGeminiRouteFailover(routes, async route => {
       try {
         return await executeProviderCall({
-          context: { provider: 'gemini', operation: 'multilingual-semantic-classification', requestMetadata: { geminiRoute: route.id } },
+          context: { provider: 'gemini', operation: 'multilingual-semantic-classification', requestMetadata: { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) } },
           timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
           enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent,
           call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
         });
       } catch (error) {
-        // Carry the failing route for per-account failover and retry
-        // scheduling. The ledger already tags rows with geminiRoute; this
-        // sidecar covers errors that never reach persistence.
+        // Carry the failing route AND its account for per-account failover
+        // and retry scheduling. The ledger tags rows with both; these
+        // sidecars cover errors that never reach persistence.
         if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
           (error as { geminiRoute?: string }).geminiRoute ??= route.id;
+          (error as { geminiOrg?: string }).geminiOrg ??= geminiRouteOrg(route);
         }
         throw error;
       }

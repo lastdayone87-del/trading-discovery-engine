@@ -157,6 +157,9 @@ export async function runGroqRouteFailover<T>(
     (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
   );
   for (const route of ordered) {
+    // A 429 marks its whole organization tried (see catch below), so this
+    // head-pick always lands on the next eligible independent org — a
+    // same-org sibling of an exhausted account is never retried.
     if (tried.has(route)) continue;
     tried.add(route);
     try {
@@ -165,14 +168,13 @@ export async function runGroqRouteFailover<T>(
       lastError = error;
       if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
         const failedOrg = failedGroqOrg(error, route);
-        // Same-org routes share one quota pool: never spill a rate limit
-        // into them (burst-multiplication protection). Different-org routes
-        // hold independent quotas and are safe to try next; skip orgs that
-        // are already known-cooling.
-        const next = ordered.find(
-          candidate => !tried.has(candidate) && groqRouteOrg(candidate) !== failedOrg && !isCooling(groqRouteOrg(candidate)),
-        );
-        if (!next) throw error;
+        // Same-org routes share one quota pool: mark them all tried so the
+        // loop head selects the next independent org (burst-multiplication
+        // protection). Different-org routes hold independent quotas.
+        for (const candidate of ordered) {
+          if (groqRouteOrg(candidate) === failedOrg) tried.add(candidate);
+        }
+        if (!ordered.some(candidate => !tried.has(candidate))) throw error;
         continue;
       }
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;

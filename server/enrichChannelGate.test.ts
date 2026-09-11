@@ -56,6 +56,12 @@ test('fallback claim gate consults both persisted and local groq cooldowns per o
   assert.ok(source.includes('allRoutesCoolingDown('), 'fallback must stay blocked only while every org is cooling');
 });
 
+test('gemini claim gate consults per-account cooldowns, never a global window', () => {
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.ok(source.includes('isGeminiOrgCooldownActive('), 'gemini gate must read the per-account cooldown');
+  assert.ok(source.includes('geminiRouteOrg('), 'gemini gate must resolve the account identity per route');
+});
+
 test('process-local groq cooldown starts clear in test runtime', async () => {
   const { groqCooldownRemainingMs, resetGroqCooldownForTests } = await import('./evidenceEngine/providers/GroqSemanticProvider');
   resetGroqCooldownForTests();

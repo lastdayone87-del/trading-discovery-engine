@@ -52,6 +52,12 @@ export function uncoveredFailedProviders(
 export interface OperationalProviderFailure {
   provider: string;
   reasonCodes: string[];
+  /**
+   * Quota-organization that produced this failure, when the evidence report
+   * carried one. Lets retry scheduling align with the failed account's
+   * cooldown. Absent for legacy callers and non-scoped failures.
+   */
+  orgId?: string;
 }
 
 /**
@@ -136,7 +142,8 @@ export function enrichmentOperationalFailure(
     .filter(provider => provider.availability === 'FAILED' && uncovered.includes(provider.provider))
     .map(provider => ({
       provider: provider.provider,
-      reasonCodes: [...new Set((provider.reasonCodes || []).filter(code => OPERATIONAL_PROVIDER_REASONS.has(code)))]
+      reasonCodes: [...new Set((provider.reasonCodes || []).filter(code => OPERATIONAL_PROVIDER_REASONS.has(code)))],
+      ...(typeof provider.orgId === 'string' && provider.orgId ? { orgId: provider.orgId } : {})
     }))
     .filter(provider => provider.reasonCodes.length > 0);
   if (!providerFailures.length) return null;

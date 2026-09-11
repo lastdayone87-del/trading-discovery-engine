@@ -194,3 +194,115 @@ test('gemini 429 carries its route for per-account retry scheduling', async () =
   assert.equal((caught as any)?.geminiRoute, 'gemini-2');
   assert.deepEqual(calls, ['gemini-2']);
 });
+
+test('A1 → A2 → B never retries the exhausted same-account sibling', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const calls: string[] = [];
+  const result = await runGeminiRouteFailover(
+    [
+      { id: 'gemini-1', key: 'hidden-a', orgId: 'proj-a' },
+      { id: 'gemini-2', key: 'hidden-b', orgId: 'proj-a' },
+      { id: 'gemini-3', key: 'hidden-c', orgId: 'proj-b' },
+    ],
+    async route => {
+      calls.push(route.id);
+      if (route.id !== 'gemini-3') throw new ProviderCallError('rate pressure', 'RATE_LIMIT', true, { status: 429 });
+      return { route: route.id };
+    },
+  );
+  assert.deepEqual(calls, ['gemini-1', 'gemini-3']);
+  assert.deepEqual(result, { route: 'gemini-3' });
+});
+
+test('error-carried account identity skips that account even from another route', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const calls: string[] = [];
+  const thrown = Object.assign(new ProviderCallError('rate pressure', 'RATE_LIMIT', true, { status: 429 }), { geminiOrg: 'proj-b' });
+  const caught = await runGeminiRouteFailover(
+    [
+      { id: 'gemini-1', key: 'hidden-a', orgId: 'proj-a' },
+      { id: 'gemini-2', key: 'hidden-b', orgId: 'proj-b' },
+    ],
+    async route => {
+      calls.push(route.id);
+      if (route.id === 'gemini-1') throw thrown;
+      return { route: route.id };
+    },
+  ).then(() => null, (error: any) => error);
+  // The sidecar blames proj-b while gemini-1 is already tried: no eligible
+  // account remains, so the original error surfaces without spending a fetch
+  // against the blamed account.
+  assert.equal(caught, thrown);
+  assert.deepEqual(calls, ['gemini-1']);
+});
+
+test('paid semantic defaults are the 2.5 family on every route', async () => {
+  const { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } = await import('./GeminiSemanticProvider');
+  assert.equal(DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, 'gemini-2.5-flash-lite');
+  assert.equal(DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL, 'gemini-2.5-flash');
+});
+
+test('candidate classification uses the 2.5 default when no model env is set', async () => {
+  const restore = withModelOverrides(undefined, undefined);
+  const savedAdjudication = process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  try {
+    const models: string[] = [];
+    const client: SemanticModelClient = { classify: async (_prompt, model) => { models.push(model); return unrelatedResult; } };
+    const provider = new GeminiSemanticProvider(client);
+    await provider.collectEvidence(input, {} as any);
+    assert.deepEqual(models, ['gemini-2.5-flash-lite']);
+  } finally {
+    restore();
+    if (savedAdjudication === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+    else process.env.MULTILINGUAL_ADJUDICATION_ENABLED = savedAdjudication;
+  }
+});
+
+test('explicit model env still wins; the key never determines the model', async () => {
+  const restore = withModelOverrides('custom-candidate', 'custom-adjudicator');
+  try {
+    const models: string[] = [];
+    const client: SemanticModelClient = { classify: async (_prompt, model) => { models.push(model); return unrelatedResult; } };
+    const provider = new GeminiSemanticProvider(client);
+    await provider.collectEvidence(input, {} as any);
+    assert.deepEqual(models, ['custom-candidate']);
+  } finally {
+    restore();
+  }
+});
+
+test('adjudication second pass uses the 2.5-flash default', async () => {
+  const restore = withModelOverrides(undefined, undefined);
+  process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  try {
+    const models: string[] = [];
+    const low = { ...unrelatedResult, confidence: 10 };
+    const client: SemanticModelClient = { classify: async (_prompt, model) => { models.push(model); return low; } };
+    const provider = new GeminiSemanticProvider(client);
+    await provider.collectEvidence(input, {} as any);
+    assert.deepEqual(models, ['gemini-2.5-flash-lite', 'gemini-2.5-flash']);
+  } finally {
+    restore();
+    delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  }
+});
+
+test('key failover threads one model value across routes', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const seen: Array<[string, string]> = [];
+  const model = 'gemini-2.5-flash-lite';
+  const result = await runGeminiRouteFailover(
+    [
+      { id: 'gemini-1', key: 'hidden-a', orgId: 'slot-1' },
+      { id: 'gemini-2', key: 'hidden-b', orgId: 'slot-2' },
+    ],
+    async route => {
+      seen.push([route.id, model]);
+      if (route.id === 'gemini-1') throw new ProviderCallError('connection reset', 'TRANSIENT', true);
+      return { route: route.id, model };
+    },
+  );
+  assert.deepEqual(seen, [['gemini-1', model], ['gemini-2', model]]);
+  assert.deepEqual(result, { route: 'gemini-2', model });
+});

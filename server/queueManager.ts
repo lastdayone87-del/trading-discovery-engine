@@ -75,9 +75,9 @@ import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWorker';
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
-import { isGeminiSemanticCooldownActive, isGeminiRouteCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
-import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs } from './evidenceEngine/providers/GroqSemanticProvider';
-import { configuredGeminiRoutes } from './evidenceEngine/providers/GeminiSemanticProvider';
+import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
+import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
+import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
@@ -288,11 +288,11 @@ export async function processNextSearchJob(
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
     const geminiRoutes = !groqSelected && !geminiFreeSelected ? configuredGeminiRoutes() : [];
     const geminiCooldownActive = geminiRoutes.length > 0
-      ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiRouteCooldownActive(route.id))))
+      ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
       : (!groqSelected && !geminiFreeSelected ? await isGeminiSemanticCooldownActive() : false);
     const groqRoutes = groqSelected ? configuredGroqRoutes() : [];
     const groqCooldownActive = groqRoutes.length > 0
-      ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(route.orgId), groqOrgCooldownRemainingMs(route.orgId)))))
+      ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))))
       : (groqSelected ? await isGroqSemanticCooldownActive() : false);
     const geminiFreeCooldownActive = geminiFreeSelected ? await isGeminiFreeSemanticCooldownActive() : false;
     let groqFallbackConfigured = false;
@@ -300,7 +300,7 @@ export async function processNextSearchJob(
     if (!groqSelected && !geminiFreeSelected && geminiCooldownActive) {
       const fallbackRoutes = configuredGroqRoutes();
       groqFallbackConfigured = fallbackRoutes.length > 0 && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true';
-      if (groqFallbackConfigured) groqFallbackCooldownActive = allRoutesCoolingDown(await Promise.all(fallbackRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(route.orgId), groqOrgCooldownRemainingMs(route.orgId)))));
+      if (groqFallbackConfigured) groqFallbackCooldownActive = allRoutesCoolingDown(await Promise.all(fallbackRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
     }
     if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
   }

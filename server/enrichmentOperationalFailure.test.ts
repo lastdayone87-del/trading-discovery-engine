@@ -177,3 +177,73 @@ test('uncoveredFailedProviders exempts only covered semantic failures', async ()
   assert.deepEqual(uncoveredFailedProviders(plain), ['gemini_semantic']);
   assert.deepEqual(uncoveredFailedProviders(report(false)), []);
 });
+
+test('failed semantic report preserves its quota org into the operational wrapper', () => {
+  const r = report(true, ['PROVIDER_RATE_LIMIT'], 'SUFFICIENT');
+  r.providers[0].provider = 'groq_semantic';
+  (r.providers[0] as { orgId?: string }).orgId = 'slot-2';
+  const error = enrichmentOperationalFailure(r, true, false);
+  assert.ok(error, 'degraded enrichment without decision-grade support must throw');
+  const failures = (error as unknown as { providerFailures: Array<{ provider: string; reasonCodes: string[]; orgId?: string }> }).providerFailures;
+  assert.equal(failures[0].orgId, 'slot-2');
+  assert.match(error!.message, /groq_semantic\[PROVIDER_RATE_LIMIT\]/, 'message shape unchanged by org tracking');
+});
+
+test('reports without an org produce wrapper entries without an org', () => {
+  const r = report(true, ['PROVIDER_RATE_LIMIT'], 'SUFFICIENT');
+  const error = enrichmentOperationalFailure(r, true, false);
+  assert.ok(error);
+  const failures = (error as unknown as { providerFailures: Array<{ orgId?: string }> }).providerFailures;
+  assert.equal('orgId' in failures[0], false);
+});
+
+test('failedProviderOrg prefers wrapper entries, then sidecars, then undefined', async () => {
+  const { failedProviderOrg } = await import('./dbCore');
+  assert.equal(
+    failedProviderOrg({ providerFailures: [{ provider: 'groq_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT', 'GROQ_RATE_LIMITED'], orgId: 'slot-2' }] }, ['GROQ_RATE_LIMITED']),
+    'slot-2'
+  );
+  assert.equal(
+    failedProviderOrg({ providerFailures: [{ provider: 'groq_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT', 'GROQ_RATE_LIMITED'], orgId: 'slot-2' }], groqOrg: 'slot-9' }, ['GROQ_RATE_LIMITED']),
+    'slot-2',
+    'wrapper entry wins over a stale sidecar'
+  );
+  assert.equal(
+    failedProviderOrg({ providerReasons: ['GROQ_RATE_LIMITED'], groqOrg: 'slot-3' }, ['GROQ_RATE_LIMITED']),
+    'slot-3'
+  );
+  assert.equal(
+    failedProviderOrg({ providerFailures: [{ provider: 'gemini_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT', 'SEMANTIC_DEFERRED_RATE_PRESSURE'], orgId: 'slot-1' }] }, ['SEMANTIC_DEFERRED_RATE_PRESSURE']),
+    'slot-1'
+  );
+  assert.equal(failedProviderOrg({ providerReasons: ['GROQ_RATE_LIMITED'] }, ['GROQ_RATE_LIMITED']), undefined);
+  assert.equal(failedProviderOrg({ providerFailures: [{ provider: 'groq_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT'] }] }, ['GROQ_RATE_LIMITED']), undefined);
+});
+
+test('semantic chain FAILED reports carry the failed quota org', async () => {
+  const { executeSemanticChain } = await import('./evidenceEngine');
+  const { ProviderCallError } = await import('./providerResilience');
+  const failing = {
+    name: 'groq_semantic',
+    availability: () => ({ availability: 'AVAILABLE' as const }),
+    collectEvidence: async () => {
+      throw Object.assign(new ProviderCallError('Rate limit reached.', 'RATE_LIMIT', true), { groqOrg: 'slot-2', providerReasons: ['GROQ_RATE_LIMITED'] });
+    },
+  };
+  const { reports } = await executeSemanticChain([failing] as any, {} as any, {} as any);
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].availability, 'FAILED');
+  assert.equal((reports[0] as { orgId?: string }).orgId, 'slot-2');
+});
+
+test('per-org cooldown resolvers scope by org label, not route', async () => {
+  const groq = await import('./evidenceEngine/providers/GroqSemanticProvider') as unknown as Record<string, unknown>;
+  assert.equal(groq.resolveGroqOrgCooldownExpiryMs, undefined, 'resolvers live in dbCore, not the provider module');
+  const dbCore = await import('./dbCore');
+  assert.equal(typeof dbCore.resolveGroqOrgCooldownExpiryMs, 'function');
+  assert.equal(typeof dbCore.resolveGeminiOrgSemanticCooldownExpiryMs, 'function');
+  const groqFn = dbCore.resolveGroqOrgCooldownExpiryMs.toString();
+  assert.ok(groqFn.includes("request_metadata->>'groqOrg'"), 'groq resolver must scope by org tag');
+  const geminiFn = dbCore.resolveGeminiOrgSemanticCooldownExpiryMs.toString();
+  assert.ok(geminiFn.includes("request_metadata->>'geminiOrg'"), 'gemini resolver must scope by org tag');
+});
