@@ -48,3 +48,24 @@ test('startup wires the semantic org-label guardrail first', async () => {
   const source = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
   assert.ok(source.includes('validateSemanticOrgLabels();'), 'boot must enforce explicit org labels');
 });
+
+test('env example documents the enforced production org-label contract', async () => {
+  const { readFileSync } = await import('node:fs');
+  const example = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
+  for (const statement of [
+    'REQUIRED in production for every configured key slot',
+    'GEMINI_ORG_ID[_N]',
+    'GROQ_ORG_ID[_N]',
+    'Production startup refuses',
+    'Identical labels mean',
+    'Different labels mean',
+    'for tests/local',
+    'is rejected for configured production routes',
+  ]) {
+    assert.ok(example.includes(statement), `.env.example must state: ${statement}`);
+  }
+  assert.ok(
+    !/Unnamed slots each form an independent (account|organization)/.test(example),
+    'docs must not imply production can rely on unlabeled slot fallback'
+  );
+});
