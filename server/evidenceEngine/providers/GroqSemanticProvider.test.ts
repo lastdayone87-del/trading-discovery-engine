@@ -971,3 +971,28 @@ test('A1 → A2 → B never retries the exhausted same-org sibling', async () =>
   assert.deepEqual(order, ['groq-1', 'groq-3']);
   assert.deepEqual(result, { route: 'groq-3' });
 });
+
+test('groq defaults adjudicate low-confidence results with two same-model calls', async () => {
+  const saved: Record<string, string | undefined> = {};
+  for (const name of ['GROQ_CANDIDATE_MODEL', 'GROQ_ADJUDICATOR_MODEL', 'MULTILINGUAL_ADJUDICATION_ENABLED']) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  try {
+    const calls: Array<{ prompt: string; model: string }> = [];
+    const low = { ...unrelatedResult, confidence: 10 };
+    const provider = new GroqSemanticProvider({ classify: async (prompt: string, model: string) => { calls.push({ prompt, model }); return low; } });
+    await provider.collectEvidence(input, {} as any);
+    assert.equal(calls.length, 2, 'candidate + adjudication passes must both run on identical defaults');
+    assert.ok(calls[0].prompt.includes('"task":"CANDIDATE"'));
+    assert.ok(calls[1].prompt.includes('"task":"ADJUDICATION"'));
+    assert.deepEqual(calls.map(call => call.model), [DEFAULT_GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_ADJUDICATOR_MODEL]);
+    assert.equal(DEFAULT_GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_ADJUDICATOR_MODEL);
+  } finally {
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name] as string;
+    }
+  }
+});

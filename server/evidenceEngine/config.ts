@@ -1,11 +1,17 @@
 import { ScoringEngineConfig, VerificationEngineVersions } from './types';
+import {
+  DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+  DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+} from './providers/GeminiSemanticProvider';
 
 export const ENGINE_VERSIONS: VerificationEngineVersions = {
   evidenceEngineVersion: '3.0.0',
   decisionEngineVersion: '3.0.0',
   scoringEngineVersion: '3.0.0',
   knowledgePackVersion: '1.2.0',
-  geminiModelVersion: 'gemini-2.5-flash-lite / gemini-2.5-flash adjudicator'
+  // Derived from the paid semantic provider defaults so version/audit
+  // metadata always describes the model configuration that actually ran.
+  geminiModelVersion: `${DEFAULT_MULTILINGUAL_CANDIDATE_MODEL} / ${DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL} adjudicator`
 };
 
 export const EXTERNAL_SCORING_CONFIG: ScoringEngineConfig = {

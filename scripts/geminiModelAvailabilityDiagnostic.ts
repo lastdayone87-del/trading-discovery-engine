@@ -1,9 +1,15 @@
 import 'dotenv/config';
 import { GoogleGenAI } from '@google/genai';
+import {
+  DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+  DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+} from '../server/evidenceEngine/providers/GeminiSemanticProvider.js';
 
+// Diagnostic targets mirror the production semantic defaults (shared
+// constants so they cannot drift); explicit env overrides still win.
 const TARGET_MODELS = [
-  process.env.MULTILINGUAL_CANDIDATE_MODEL || 'gemini-2.5-flash-lite',
-  process.env.MULTILINGUAL_ADJUDICATOR_MODEL || 'gemini-2.5-flash'
+  process.env.MULTILINGUAL_CANDIDATE_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+  process.env.MULTILINGUAL_ADJUDICATOR_MODEL || DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL
 ];
 
 async function main() {

@@ -8,8 +8,8 @@ import { documentRef } from '../canonicalEvidencePlane';
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = ['ACTIVE_TRADING', 'INVESTING_EDUCATION', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'HYPE', 'UNRELATED', 'AMBIGUOUS'] as const;
-export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-2.5-flash-lite';
-export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-2.5-flash';
+export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
+export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
 type SemanticLabel = typeof SEMANTIC_TAXONOMY[number];
 
 export interface SemanticModelResult {
@@ -323,7 +323,11 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     let result = parse(candidate.value);
     let model = candidate.model;
     const fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
-    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && model !== adjudicatorModel) {
+    // Second pass runs unless adjudication already occurred (candidate served
+    // from the adjudicator model via 404 fallback). Gated on occurrence, not
+    // on model-name inequality, so identical candidate/adjudicator defaults
+    // still adjudicate low-confidence results.
+    if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true' && !candidate.fallbackUsed) {
       result = parse(await client.classify(prompt(input, 'ADJUDICATION'), adjudicatorModel)); model = adjudicatorModel;
     }
     const calibrated = calibrateSemanticConfidence(result.confidence);
