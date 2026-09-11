@@ -508,7 +508,29 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // distinct videos (API/scrape overlap merges by video ID), never duplicate
   // observations. API and scrape each supply up to 10;
   // observedVideoDescriptions stays capped at 10.
-    if(channelSampled.length<8&&channelData.youtubeUrl){try{const scraped=await scrapeRecentVideoDescriptionsWithCoverage(channelData.youtubeUrl);acquiredRecentDescriptionSurfaces.push(`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`);if(scraped.acquired<scraped.attempted)acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_PARTIAL',detail:`Acquired ${scraped.acquired} of ${scraped.attempted} sampled recent-video descriptions`,observedAt:now});trackChannelSampled(scraped.items);if(scraped.descriptions.length)videoDescs=Array.from(new Set([...(authoritative?[]:scraped.descriptions),...videoDescs,...(authoritative?scraped.descriptions:[])]));}catch(e){acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_SCRAPE_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});}}
+    if(channelSampled.length<8&&channelData.youtubeUrl){
+    // InnerTube-first: keyless structured metadata over the shared session
+    // (pacing, cooldown, deadlines identical to retrieval pages) — no
+    // browser, no Data API quota. Static scrape still runs below whenever the
+    // merged channel sample remains below the 8-description voter minimum.
+    if(channelData.channelId){try{
+      const {fetchChannelVideoDescriptionsViaInnertube}=await import('./youtubeInnertubeProvider');
+      const fetched=await fetchChannelVideoDescriptionsViaInnertube(channelData.channelId,{maxVideos:10});
+      if(fetched.items.length){
+      acquiredRecentDescriptionSurfaces.push(`innertube:channel:${channelData.channelId}:recent-video-descriptions`);
+        if(fetched.items.length<fetched.videosAttempted)acquisitionOutcomes.push({requestedUrl:`innertube:channel:${channelData.channelId}:recent-video-descriptions`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'INNERTUBE_DESCRIPTION_PARTIAL',detail:`Acquired ${fetched.items.length} of ${fetched.videosAttempted} sampled recent-video descriptions`,observedAt:now});
+        trackChannelSampled(fetched.items);
+        const innertubeTexts=normalizeSampledVideoDescriptions(fetched.items).map(item=>item.description);
+        if(innertubeTexts.length)videoDescs=Array.from(new Set([...(authoritative?[]:innertubeTexts),...videoDescs,...(authoritative?innertubeTexts:[])]));
+      }
+    }catch(e){
+      // Permanent input defects (missing channel id, session without channel
+      // methods) must not schedule futile retries; every other failure keeps
+      // the retryable default so transient outages still recover.
+      const retryable=(e as {retryable?: unknown})?.retryable!==false;
+      acquisitionOutcomes.push({requestedUrl:`innertube:channel:${channelData.channelId}:recent-video-descriptions`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable,failureClass:'INNERTUBE_DESCRIPTION_FAILED',retryAt:retryable?retryAtFromUnknown(e):undefined,detail:e instanceof Error?e.message:String(e),observedAt:now});}}
+    if(channelSampled.length<8){try{const scraped=await scrapeRecentVideoDescriptionsWithCoverage(channelData.youtubeUrl);acquiredRecentDescriptionSurfaces.push(`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`);if(scraped.acquired<scraped.attempted)acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_PARTIAL',detail:`Acquired ${scraped.acquired} of ${scraped.attempted} sampled recent-video descriptions`,observedAt:now});trackChannelSampled(scraped.items);if(scraped.descriptions.length)videoDescs=Array.from(new Set([...(authoritative?[]:scraped.descriptions),...videoDescs,...(authoritative?scraped.descriptions:[])]));}catch(e){acquisitionOutcomes.push({requestedUrl:`${channelData.youtubeUrl.replace(/\/+$/,'')}/videos`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'RECENT_VIDEO_DESCRIPTION_SCRAPE_FAILED',detail:e instanceof Error?e.message:String(e),observedAt:now});}}
+    }
   }
 
   function addStep(stepName:InspectionStep['step'],title:string,status:InspectionStep['status'],detailsArr:string[],foundInvite:string|null=null,inviteLocation:string|undefined=undefined,foundInvites:string[]=[]){steps.push({step:stepName,title,status,details:detailsArr.join('\n'),detectedInvite:foundInvite||undefined,detectedInvites:foundInvites.length?foundInvites:foundInvite?[foundInvite]:undefined,inviteLocation,timestamp:now});if(debugLog&&status==='NOT_FOUND'&&!debugLog.failureStep)debugLog.failureStep=stepName;}
