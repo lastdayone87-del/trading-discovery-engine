@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { enrichChannelClaimableDuringCooldown, groqFallbackCoolingDown } from './queueManager';
+import { enrichChannelClaimableDuringCooldown, groqFallbackCoolingDown, allRoutesCoolingDown } from './queueManager';
 
 test('gemini healthy allows ENRICH claim (fallback absent or present)', () => {
   assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: false, groqCooldownActive: false }), true);
@@ -49,11 +49,11 @@ test('gemini cooldown + both groq cooldowns clear allows ENRICH', () => {
   assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: fallbackCooling }), true);
 });
 
-test('fallback claim gate consults both persisted and local groq cooldowns', () => {
+test('fallback claim gate consults both persisted and local groq cooldowns per org', () => {
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.ok(source.includes('isGroqSemanticCooldownActive()'), 'fallback must read the persisted Groq cooldown');
-  assert.ok(source.includes('groqCooldownRemainingMs()'), 'fallback must read the process-local Groq cooldown');
-  assert.ok(source.includes('groqFallbackCoolingDown(await isGroqSemanticCooldownActive(), groqCooldownRemainingMs())'), 'fallback must block when either cooldown is active');
+  assert.ok(source.includes('isGroqOrgCooldownActive('), 'fallback must read the per-org persisted Groq cooldown');
+  assert.ok(source.includes('groqOrgCooldownRemainingMs('), 'fallback must read the per-org process-local Groq cooldown');
+  assert.ok(source.includes('allRoutesCoolingDown('), 'fallback must stay blocked only while every org is cooling');
 });
 
 test('process-local groq cooldown starts clear in test runtime', async () => {
@@ -83,4 +83,27 @@ test('free-gemini cooldown helper reads only the gemini-free ledger', async () =
   const { isGeminiFreeSemanticCooldownActive } = await import('./providerResilience');
   const fnStr = isGeminiFreeSemanticCooldownActive.toString();
   assert.ok(fnStr.includes('resolveGeminiFreeSemanticCooldownExpiryMs'), 'must resolve via the free-tier resolver');
+});
+
+test('pool cooling composes per-route states: open while any account is healthy', () => {
+  assert.equal(allRoutesCoolingDown([]), true);
+  assert.equal(allRoutesCoolingDown([false]), false);
+  assert.equal(allRoutesCoolingDown([true]), true);
+  assert.equal(allRoutesCoolingDown([true, false]), false);
+  assert.equal(allRoutesCoolingDown([true, true, false, true]), false);
+  assert.equal(allRoutesCoolingDown([true, true]), true);
+});
+
+test('multi-org groq pool keeps the ENRICH claim open while one org is healthy', () => {
+  const poolCooling = allRoutesCoolingDown([true, false]);
+  assert.equal(poolCooling, false);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: poolCooling }), true);
+  const allCooling = allRoutesCoolingDown([true, true]);
+  assert.equal(allCooling, true);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: allCooling }), false);
+});
+
+test('multi-account gemini pool keeps the ENRICH claim open while one account is healthy', () => {
+  assert.equal(allRoutesCoolingDown([true, false, true]), false);
+  assert.equal(allRoutesCoolingDown([true, true, true]), true);
 });

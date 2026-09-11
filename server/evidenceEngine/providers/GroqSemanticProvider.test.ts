@@ -8,6 +8,9 @@ import {
   configuredGroqRoutes,
   defaultClient,
   groqCooldownRemainingMs,
+  groqOrgCooldownRemainingMs,
+  groqOrgIdForSlot,
+  groqRouteOrg,
   groqTimeoutMs,
   isDecisiveButUncited,
   resetGroqCooldownForTests,
@@ -799,5 +802,124 @@ test('adjudication replacing a repaired result drops the repair code', async () 
     else process.env.GROQ_CANDIDATE_MODEL = saved.GROQ_CANDIDATE_MODEL;
     if (saved.GROQ_ADJUDICATOR_MODEL === undefined) delete process.env.GROQ_ADJUDICATOR_MODEL;
     else process.env.GROQ_ADJUDICATOR_MODEL = saved.GROQ_ADJUDICATOR_MODEL;
+  }
+});
+
+test('groq org labels default to slot-unique orgs; explicit labels honored', () => {
+  assert.equal(groqOrgIdForSlot({} as any, 1), 'slot-1');
+  assert.equal(groqOrgIdForSlot({} as any, 3), 'slot-3');
+  assert.equal(groqOrgIdForSlot({ GROQ_ORG_ID: 'acme' } as any, 1), 'acme');
+  assert.equal(groqOrgIdForSlot({ GROQ_ORG_ID_2: 'acme' } as any, 2), 'acme');
+  assert.equal(groqOrgIdForSlot({ GROQ_ORG_ID_2: '  ' } as any, 2), 'slot-2');
+  const routes = configuredGroqRoutes({ GROQ_API_KEY: 'k1', GROQ_API_KEY_2: 'k2', GROQ_API_KEY_3: 'k1' } as any);
+  assert.deepEqual(routes.map(r => r.orgId), ['slot-1', 'slot-2']);
+  const shared = configuredGroqRoutes({ GROQ_API_KEY: 'k1', GROQ_API_KEY_2: 'k2', GROQ_ORG_ID: 'acme', GROQ_ORG_ID_2: 'acme' } as any);
+  assert.deepEqual(shared.map(r => r.orgId), ['acme', 'acme']);
+  assert.equal(groqRouteOrg({}), 'shared');
+  assert.equal(groqRouteOrg({ orgId: 'acme' }), 'acme');
+});
+
+test('429 on one groq org fails over to the next healthy org', async () => {
+  const order: string[] = [];
+  const result = await runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'org-a' },
+      { id: 'groq-2', key: 'k2', orgId: 'org-b' },
+    ],
+    async route => {
+      order.push(route.id);
+      if (route.id === 'groq-1') throw new ProviderCallError('Rate limit reached.', 'RATE_LIMIT', true, { status: 429 });
+      return { route: route.id };
+    },
+  );
+  assert.deepEqual(order, ['groq-1', 'groq-2']);
+  assert.deepEqual(result, { route: 'groq-2' });
+});
+
+test('exhausted groq orgs progress until a healthy org serves', async () => {
+  const order: string[] = [];
+  const result = await runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'org-a' },
+      { id: 'groq-2', key: 'k2', orgId: 'org-b' },
+      { id: 'groq-3', key: 'k3', orgId: 'org-c' },
+    ],
+    async route => {
+      order.push(route.id);
+      if (route.id !== 'groq-3') throw new ProviderCallError('Rate limit reached.', 'RATE_LIMIT', true, { status: 429 });
+      return { route: route.id };
+    },
+  );
+  assert.deepEqual(order, ['groq-1', 'groq-2', 'groq-3']);
+  assert.deepEqual(result, { route: 'groq-3' });
+});
+
+test('all groq orgs exhausted surfaces the last 429 after one attempt each', async () => {
+  const order: string[] = [];
+  const thrown = new ProviderCallError('Rate limit reached.', 'RATE_LIMIT', true, { status: 429 });
+  const caught = await runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'org-a' },
+      { id: 'groq-2', key: 'k2', orgId: 'org-b' },
+    ],
+    async route => {
+      order.push(route.id);
+      throw thrown;
+    },
+  ).then(() => null, (error: unknown) => error);
+  assert.equal(caught, thrown);
+  assert.deepEqual(order, ['groq-1', 'groq-2']);
+});
+
+test('same-org groq 429 never spills into the shared pool', async () => {
+  const order: string[] = [];
+  const thrown = new ProviderCallError('Rate limit reached.', 'RATE_LIMIT', true, { status: 429 });
+  const caught = await runGroqRouteFailover(
+    [
+      { id: 'groq-1', key: 'k1', orgId: 'acme' },
+      { id: 'groq-2', key: 'k2', orgId: 'acme' },
+    ],
+    async route => {
+      order.push(route.id);
+      throw thrown;
+    },
+  ).then(() => null, (error: unknown) => error);
+  assert.equal(caught, thrown);
+  assert.deepEqual(order, ['groq-1']);
+});
+
+test('groq 429 on org 1 arms only org 1: org 2 serves without fetching twice', async () => {
+  resetGroqCooldownForTests();
+  const savedFetch = globalThis.fetch;
+  const saved: Record<string, string | undefined> = {};
+  for (const name of ['GROQ_API_KEY', 'GROQ_API_KEY_2', 'GROQ_ORG_ID', 'GROQ_ORG_ID_2']) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  let fetches = 0;
+  globalThis.fetch = (async (_url: unknown, init: any) => {
+    fetches++;
+    const key = String(init?.headers?.Authorization || '');
+    if (key.includes('key-one')) {
+      return new Response('{"error":{"message":"Rate limit reached"}}', { status: 429, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+  process.env.GROQ_API_KEY = 'key-one';
+  process.env.GROQ_API_KEY_2 = 'key-two';
+  try {
+    const client = defaultClient(async () => undefined, { persistedCooldownExpiryMs: async () => undefined });
+    assert.deepEqual(await client!.classify('prompt', 'model'), { ok: true });
+    assert.equal(fetches, 2);
+    assert.ok(groqOrgCooldownRemainingMs('slot-1') > 0, 'org 1 must be cooling');
+    assert.equal(groqOrgCooldownRemainingMs('slot-2'), 0, 'org 2 must stay clear');
+    assert.ok(groqCooldownRemainingMs() > 0, 'pool aggregate still observes pressure');
+  } finally {
+    globalThis.fetch = savedFetch;
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name] as string;
+    }
+    resetGroqCooldownForTests();
   }
 });

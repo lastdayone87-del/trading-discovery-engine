@@ -841,6 +841,24 @@ export async function resolveGeminiSemanticCooldownExpiryMs(nowMs:number=Date.no
   }catch{return undefined;}
 }
 /**
+ * Per-route Gemini cooldown expiry. Each account's window derives only from
+ * RATE_LIMITED rows tagged with its own route id (untagged legacy rows count
+ * toward the queried route via the COALESCE default, matching
+ * acquireGeminiCapacity). A 429 on one account never affects another's
+ * window. The pool-wide resolver above is retained for legacy callers.
+ */
+export async function resolveGeminiRouteSemanticCooldownExpiryMs(routeId:string,nowMs:number=Date.now()):Promise<number|undefined>{
+  const cooldownMs=geminiSemanticCooldownMs();
+  try{
+    const db=await getDb();
+    const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'geminiRoute',$1)=$1 ORDER BY occurred_at DESC LIMIT 1`,[routeId]);
+    if(!res.rows[0]?.occurred_at)return undefined;
+    const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
+    if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;
+    return lastRateLimitMs+cooldownMs;
+  }catch{return undefined;}
+}
+/**
  * Authoritative Groq semantic cooldown expiry from persisted provider_call_events.
  * Groq rate limits apply to the shared Groq route pool the same way Gemini's
  * project-level limits apply to all Gemini routes: one RATE_LIMITED event on
@@ -855,6 +873,23 @@ export async function resolveGroqSemanticCooldownExpiryMs(nowMs:number=Date.now(
   try{
     const db=await getDb();
     const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`);
+    if(!res.rows[0]?.occurred_at)return undefined;
+    const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
+    if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;
+    return lastRateLimitMs+cooldownMs;
+  }catch{return undefined;}
+}
+/**
+ * Per-organization Groq cooldown expiry. Reads only RATE_LIMITED rows tagged
+ * with this org (plus untagged legacy rows, conservatively, so a cooldown
+ * armed just before a deploy is not forgotten). Deferral echoes stay
+ * excluded. A 429 in one organization never affects another's window.
+ */
+export async function resolveGroqOrgCooldownExpiryMs(orgId:string,nowMs:number=Date.now()):Promise<number|undefined>{
+  const cooldownMs=groqSemanticCooldownMs();
+  try{
+    const db=await getDb();
+    const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true' AND (request_metadata->>'groqOrg'=$1 OR request_metadata->>'groqOrg' IS NULL) ORDER BY occurred_at DESC LIMIT 1`,[orgId]);
     if(!res.rows[0]?.occurred_at)return undefined;
     const lastRateLimitMs=new Date(res.rows[0].occurred_at).getTime();
     if(nowMs-lastRateLimitMs>=cooldownMs)return undefined;
@@ -900,7 +935,7 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
   }
   return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
 }
-export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){geminiSemanticCooldownExpiryMs=await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GROQ_RATE_LIMITED')){groqSemanticCooldownExpiryMs=await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
+export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){const failedGeminiRoute=(error as any)?.geminiRoute;geminiSemanticCooldownExpiryMs=typeof failedGeminiRoute==='string'&&failedGeminiRoute?await resolveGeminiRouteSemanticCooldownExpiryMs(failedGeminiRoute,Date.now()):await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GROQ_RATE_LIMITED')){const failedGroqOrg=(error as any)?.groqOrg;groqSemanticCooldownExpiryMs=typeof failedGroqOrg==='string'&&failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,Date.now()):await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval RETURNING id`,[String(staleAfterMinutes)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[res.rows.map(row=>row.id)]); await client.query('COMMIT'); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 export async function heartbeatJob(jobId:string,workerId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET locked_at=now(),updated_at=now() WHERE id=$1 AND status='PROCESSING' AND locked_by=$2`,[jobId,workerId]);}
 

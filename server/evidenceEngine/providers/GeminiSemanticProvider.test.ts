@@ -130,3 +130,67 @@ test('non-retryable Gemini route failure does not spill into another route',asyn
   }), (error:any)=>error?.status===400);
   assert.deepEqual(calls,['gemini-1']);
 });
+
+test('gemini account labels default to slot-unique accounts; explicit labels honored', async () => {
+  const { configuredGeminiRoutes, geminiOrgIdForSlot, geminiRouteOrg } = await import('./GeminiSemanticProvider');
+  assert.equal(geminiOrgIdForSlot({} as any, 1), 'slot-1');
+  assert.equal(geminiOrgIdForSlot({} as any, 2), 'slot-2');
+  assert.equal(geminiOrgIdForSlot({ GEMINI_ORG_ID: 'proj-a' } as any, 1), 'proj-a');
+  assert.equal(geminiOrgIdForSlot({ GEMINI_ORG_ID_3: 'proj-a' } as any, 3), 'proj-a');
+  const routes = configuredGeminiRoutes({ GEMINI_API_KEY: 'a', GEMINI_API_KEY_2: 'b' } as any);
+  assert.deepEqual(routes.map(route => route.orgId), ['slot-1', 'slot-2']);
+  const shared = configuredGeminiRoutes({ GEMINI_API_KEY: 'a', GEMINI_API_KEY_2: 'b', GEMINI_ORG_ID: 'p', GEMINI_ORG_ID_2: 'p' } as any);
+  assert.deepEqual(shared.map(route => route.orgId), ['p', 'p']);
+  assert.equal(geminiRouteOrg({}), 'shared');
+  assert.equal(geminiRouteOrg({ orgId: 'p' }), 'p');
+});
+
+test('429 on one gemini account fails over to the next healthy account', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const calls: string[] = [];
+  const result = await runGeminiRouteFailover(
+    [
+      { id: 'gemini-1', key: 'hidden-a', orgId: 'slot-1' },
+      { id: 'gemini-2', key: 'hidden-b', orgId: 'slot-2' },
+    ],
+    async route => {
+      calls.push(route.id);
+      if (route.id === 'gemini-1') throw new ProviderCallError('rate pressure', 'RATE_LIMIT', true, { status: 429 });
+      return { route: route.id };
+    },
+  );
+  assert.deepEqual(calls, ['gemini-1', 'gemini-2']);
+  assert.deepEqual(result, { route: 'gemini-2' });
+});
+
+test('same-account gemini 429 never spills into the shared pool', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const calls: string[] = [];
+  const thrown = new ProviderCallError('rate pressure', 'RATE_LIMIT', true, { status: 429 });
+  const caught = await runGeminiRouteFailover(
+    [
+      { id: 'gemini-1', key: 'hidden-a', orgId: 'proj-a' },
+      { id: 'gemini-2', key: 'hidden-b', orgId: 'proj-a' },
+    ],
+    async route => {
+      calls.push(route.id);
+      throw thrown;
+    },
+  ).then(() => null, (error: any) => error);
+  assert.equal(caught, thrown);
+  assert.deepEqual(calls, ['gemini-1']);
+});
+
+test('gemini 429 carries its route for per-account retry scheduling', async () => {
+  const { runGeminiRouteFailover } = await import('./GeminiSemanticProvider');
+  const calls: string[] = [];
+  const caught = await runGeminiRouteFailover(
+    [{ id: 'gemini-2', key: 'hidden-b', orgId: 'slot-2' }],
+    async route => {
+      calls.push(route.id);
+      throw Object.assign(new ProviderCallError('rate pressure', 'RATE_LIMIT', true, { status: 429 }), { geminiRoute: route.id });
+    },
+  ).then(() => null, (error: any) => error);
+  assert.equal((caught as any)?.geminiRoute, 'gemini-2');
+  assert.deepEqual(calls, ['gemini-2']);
+});

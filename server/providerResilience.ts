@@ -176,6 +176,41 @@ export async function isGeminiSemanticCooldownActive(nowMs: number = Date.now())
 }
 
 /**
+ * Per-route Gemini cooldown expiry from the persisted ledger. Each account's
+ * window derives only from RATE_LIMITED rows tagged with its own route id
+ * (untagged legacy rows conservatively count toward the queried route, the
+ * same COALESCE convention acquireGeminiCapacity already uses). A 429 on one
+ * account never affects another account's window.
+ */
+export async function getGeminiRouteSemanticCooldownExpiry(routeId: string, nowMs: number = Date.now()): Promise<number | undefined> {
+  const config = geminiCapacityConfig();
+  try {
+    const { getDb } = await import('./db');
+    const db = await getDb();
+    const res = await db.query(
+      `SELECT occurred_at FROM provider_call_events
+       WHERE provider='gemini' AND status='RATE_LIMITED'
+       AND COALESCE(request_metadata->>'geminiRoute',$1)=$1
+       ORDER BY occurred_at DESC LIMIT 1`,
+      [routeId]
+    );
+    if (!res.rows[0]?.occurred_at) return undefined;
+    const lastRateLimitMs = new Date(res.rows[0].occurred_at).getTime();
+    const elapsed = nowMs - lastRateLimitMs;
+    if (elapsed >= config.semanticRateLimitCooldownMs) return undefined;
+    return lastRateLimitMs + config.semanticRateLimitCooldownMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True while the given Gemini account/route is inside its own rate-limit cooldown. */
+export async function isGeminiRouteCooldownActive(routeId: string, nowMs: number = Date.now()): Promise<boolean> {
+  const expiry = await getGeminiRouteSemanticCooldownExpiry(routeId, nowMs);
+  return expiry !== undefined && expiry > nowMs;
+}
+
+/**
  * Returns the authoritative Gemini semantic cooldown duration in milliseconds.
  * Used by retry scheduling to ensure run_after respects the provider cooldown.
  */
@@ -193,6 +228,17 @@ export function geminiSemanticCooldownMs(): number {
 export async function isGroqSemanticCooldownActive(nowMs: number = Date.now()): Promise<boolean> {
   const { resolveGroqSemanticCooldownExpiryMs } = await import('./dbCore');
   const expiry = await resolveGroqSemanticCooldownExpiryMs(nowMs);
+  return expiry !== undefined && expiry > nowMs;
+}
+
+/**
+ * Per-organization Groq cooldown: true only while THIS org's window is
+ * active. Independent orgs never block each other; routes sharing one org
+ * label share one window.
+ */
+export async function isGroqOrgCooldownActive(orgId: string, nowMs: number = Date.now()): Promise<boolean> {
+  const { resolveGroqOrgCooldownExpiryMs } = await import('./dbCore');
+  const expiry = await resolveGroqOrgCooldownExpiryMs(orgId, nowMs);
   return expiry !== undefined && expiry > nowMs;
 }
 
@@ -286,9 +332,11 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     if(signal?.aborted)throw abortError();
     const [lastAny,lastRate,lastSemantic,lastVocabulary]=await Promise.all([
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND COALESCE(request_metadata->>'geminiRoute',$1)=$1 ORDER BY occurred_at DESC LIMIT 1`,[routeId],signal,deadlineAtMs),
-      // Gemini rate limits are project-level, not API-key-level. Query ALL routes
-      // so a rate limit on any route correctly blocks the shared cooldown.
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' ORDER BY occurred_at DESC LIMIT 1`,[],signal,deadlineAtMs),
+      // Rate limits are per-account: only this route's own RATE_LIMITED rows
+      // feed its cooldown window, so one exhausted account never paces the
+      // healthy ones. (Untagged legacy rows count toward the queried route
+      // via the COALESCE default, matching the per-route reads above.)
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'geminiRoute',$1)=$1 ORDER BY occurred_at DESC LIMIT 1`,[routeId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,routeId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,routeId],signal,deadlineAtMs)
     ]);
@@ -297,7 +345,9 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     if(decision.action==='DEFER'){
       await client.query({text:'SELECT pg_advisory_unlock($1)',values:[GEMINI_CAPACITY_LOCK],query_timeout:1000}).catch(()=>undefined);
       client.release(); client=undefined;
-      throw geminiCapacityDeferralError(context.operation,decision.reasonCode);
+      // Carry the deferring route so retry scheduling can align run_after
+      // with this account's cooldown instead of a global window.
+      throw Object.assign(geminiCapacityDeferralError(context.operation,decision.reasonCode),{geminiRoute:routeId});
     }
     if(decision.waitMs>0) await waitForCapacity(decision.waitMs,signal);
     if(signal?.aborted)throw abortError();
