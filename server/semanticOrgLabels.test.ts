@@ -26,12 +26,20 @@ test('validator passes outside production regardless of labels', () => {
   assert.doesNotThrow(() => validateSemanticOrgLabels({} as any));
 });
 
-test('validator throws in production listing every missing label', () => {
+test('validator throws in production listing every missing Gemini label', () => {
   assert.throws(
-    () => validateSemanticOrgLabels({ NODE_ENV: 'production', GROQ_API_KEY: 'k1', GEMINI_API_KEY: 'a', GEMINI_API_KEY_2: 'b', GEMINI_ORG_ID_2: 'p' } as any),
-    /GROQ_ORG_ID.*GEMINI_ORG_ID[^_]/,
+    () => validateSemanticOrgLabels({ NODE_ENV: 'production', GEMINI_API_KEY: 'a', GEMINI_API_KEY_2: 'b', GEMINI_ORG_ID_2: 'p' } as any),
+    /GEMINI_ORG_ID[^_]/,
     'must name the missing slot vars'
   );
+});
+
+test('validator ignores Groq slots: each key is an independent account by default', () => {
+  assert.doesNotThrow(() => validateSemanticOrgLabels({
+    NODE_ENV: 'production',
+    GROQ_API_KEY: 'k1', GROQ_API_KEY_2: 'k2',
+    GEMINI_API_KEY: 'x', GEMINI_ORG_ID: 'p',
+  } as any));
 });
 
 test('validator passes in production when every route is labeled', () => {
@@ -55,7 +63,8 @@ test('env example documents the enforced production org-label contract', async (
   for (const statement of [
     'REQUIRED in production for every configured key slot',
     'GEMINI_ORG_ID[_N]',
-    'GROQ_ORG_ID[_N]',
+    'OPTIONAL for Groq',
+    'does NOT require GROQ_ORG_ID',
     'Production startup refuses',
     'Identical labels mean',
     'Different labels mean',
