@@ -509,6 +509,12 @@ function classifyInnertubeError(error: unknown): Error & { code?: string; retrya
     // their specific codes so callers and retry policy can distinguish them.
     return error as Error & { code?: string; retryable?: boolean };
   }
+  // Explicitly non-retryable input errors (missing channel id, session
+  // without channel methods) must never be reclassified as retryable:
+  // scheduling futile retries for them wastes queue attempts.
+  if ((error as { retryable?: unknown })?.retryable === false) {
+    return error as Error & { code?: string; retryable?: boolean };
+  }
   const message = error instanceof Error ? error.message : String(error);
   const typed = new Error(`YouTube.js InnerTube search failed: ${message.slice(0, 300)}`) as Error & {
     code?: string;
@@ -722,11 +728,13 @@ export async function fetchChannelVideoDescriptionsViaInnertube(
     reservedCost: 0,
     policyVersion: 'provider-resilience-v1',
   };
-  const pacedCall = <T>(work: () => Promise<T>): Promise<T> =>
-    withInnertubeRemaining(
-      paceInnertubeRequest(innertubeMinIntervalMs()).then(() => work()),
-      deadlineAtMs,
-    );
+  const pacedCall = async <T>(work: () => Promise<T>): Promise<T> => {
+    // Deadline-checked pacing first, then invoke: work must never start
+    // after the absolute deadline already expired (same shape as the
+    // retrieval-page paced helpers — no detached background traffic).
+    await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
+    return withInnertubeRemaining(work(), deadlineAtMs);
+  };
   let videosListed = 0;
   let videosAttempted = 0;
   const items: InnertubeVideoDescription[] = [];
@@ -754,9 +762,15 @@ export async function fetchChannelVideoDescriptionsViaInnertube(
       const channel = await pacedCall<{ getVideos?: () => Promise<{ videos?: unknown }> }>(() => getChannel(channelId));
       let tab: { videos?: unknown } | null = null;
       try {
+        // Missing videos tabs surface as InnertubeError Tab "<name>" not
+        // found; match that shape narrowly so unrelated errors mentioning
+        // videos still propagate.
         tab = await pacedCall<{ videos?: unknown } | null>(() => channel.getVideos?.() ?? Promise.resolve(null));
       } catch (error) {
-        if (/tab|videos/i.test(String((error as Error)?.message || ''))) {
+        // Narrow match on the library's Tab "<name>" not found shape: a
+        // missing videos tab is an empty listing, while any other error
+        // (even one mentioning videos) must propagate.
+        if (/tab\s+"[^"]*"\s+not found/i.test(String((error as Error)?.message || ''))) {
           tab = null;
         } else {
           throw error;

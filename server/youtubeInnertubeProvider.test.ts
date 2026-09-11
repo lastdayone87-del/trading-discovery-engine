@@ -939,3 +939,67 @@ test('session without channel methods fails non-retryable', async () => {
     resetInnertubePacingForTests();
   }
 });
+
+test('expired deadline never starts provider work', async () => {
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  const savedTimeout = process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+  const savedInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  // Pacing (2s) dwarfs the total budget (200ms): the channel call fits, but
+  // the videos call must never start once the deadline expired in the wait.
+  // The settling wait afterwards proves no detached background work fires
+  // late (the old chain-then-race shape would start it here).
+  process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = '200';
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '2000';
+  let videosStarted = false;
+  setInnertubeEmitSinkForTests(async () => undefined);
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('unused'); },
+    getChannel: async () => ({ getVideos: async () => { videosStarted = true; return { videos: [] }; } }),
+    getBasicInfo: async () => ({ basic_info: { short_description: 'x' } }),
+  }));
+  try {
+    const { fetchChannelVideoDescriptionsViaInnertube } = await import('./youtubeInnertubeProvider');
+    await assert.rejects(
+      fetchChannelVideoDescriptionsViaInnertube('UCtestchannel'),
+      (error: any) => error?.code === INNERTUBE_TIMEOUT_CODE,
+    );
+    assert.equal(videosStarted, false, 'no outbound work may start after the deadline expired in pacing');
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    assert.equal(videosStarted, false, 'no detached background work may fire late');
+  } finally {
+    if (savedTimeout === undefined) delete process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS;
+    else process.env.YOUTUBE_INNERTUBE_TIMEOUT_MS = savedTimeout;
+    if (savedInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = savedInterval;
+    setInnertubeSessionFactoryForTests(null);
+    setInnertubeEmitSinkForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('non-tab errors mentioning videos still propagate', async () => {
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('unused'); },
+    getChannel: async () => ({
+      getVideos: async () => { throw new Error('No videos found for this channel'); },
+    }),
+    getBasicInfo: async () => ({ basic_info: { short_description: 'x' } }),
+  }));
+  try {
+    const { fetchChannelVideoDescriptionsViaInnertube } = await import('./youtubeInnertubeProvider');
+    await assert.rejects(
+      fetchChannelVideoDescriptionsViaInnertube('UCtestchannel'),
+      (error: any) => String(error?.message || '').includes('No videos found'),
+    );
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    setInnertubeEmitSinkForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
