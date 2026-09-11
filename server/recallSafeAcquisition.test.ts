@@ -712,3 +712,72 @@ test('truncated messaging preview that finds an invite stays FOUND with response
   assert.equal(observation.telemetry?.budgetExhausted, true);
   assert.deepEqual((observation.telemetry as { ceiling?: unknown })?.ceiling, { kind: 'response-cap' });
 });
+
+test('innertube descriptions are preferred and static scrape is skipped on success', async () => {
+  const { setInnertubeSessionFactoryForTests, resetInnertubeCooldownForTests, resetInnertubePacingForTests } = await import('./youtubeInnertubeProvider');
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => { throw new Error('unused'); },
+    getChannel: async () => ({
+      getVideos: async () => ({ videos: [{ content_id: 'iv1' }, { content_id: 'iv2' }] }),
+    }),
+    getBasicInfo: async (videoId: string) => ({ basic_info: { short_description: `Innertube description ${videoId}` } }),
+  }));
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('static must not run'); }) as unknown as typeof fetch;
+  try {
+    const result = await runChannelInspection({
+      channelId: 'UCinnertube000000000001',
+      channelName: 'Innertube Channel',
+      channelBio: 'Trading notes trader forex',
+      youtubeUrl: 'https://www.youtube.com/channel/UCinnertube000000000001',
+      channelLinks: [],
+      videoDescriptions: [],
+      creatorLikelyTrading: false,
+      forceLiveFetch: true,
+      recentVideoDescriptionsLoader: async () => { throw new Error('API down'); },
+      liveChannelDataLoader: async () => null,
+      externalFetchImpl: (async () => { throw new Error('static must not run'); }) as typeof fetch,
+    });
+    assert.ok((result.observedVideoDescriptions || []).some(text => text.includes('Innertube description iv1')));
+    assert.ok(!(result.acquisitionOutcomes || []).some(item => String(item.requestedUrl || '').endsWith('/videos')), 'static scrape must be skipped after innertube recovery');
+    assert.ok(!(result.acquisitionOutcomes || []).some(item => item.failureClass === 'RECENT_VIDEO_DESCRIPTION_SCRAPE_FAILED'));
+  } finally {
+    globalThis.fetch = savedFetch;
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('innertube failure preserves the static scrape fallback', async () => {
+  const { setInnertubeSessionFactoryForTests, resetInnertubeCooldownForTests, resetInnertubePacingForTests } = await import('./youtubeInnertubeProvider');
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeSessionFactoryForTests(async () => { throw new Error('session down'); });
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('static down'); }) as unknown as typeof fetch;
+  try {
+    const result = await runChannelInspection({
+      channelId: 'UCinnertubefb000000000001',
+      channelName: 'Innertube Fallback Channel',
+      channelBio: 'Trading notes trader forex',
+      youtubeUrl: 'https://www.youtube.com/channel/UCinnertubefb000000000001',
+      channelLinks: [],
+      videoDescriptions: [],
+      creatorLikelyTrading: false,
+      forceLiveFetch: true,
+      recentVideoDescriptionsLoader: async () => { throw new Error('API down'); },
+      liveChannelDataLoader: async () => null,
+      externalFetchImpl: (async () => { throw new Error('static down'); }) as typeof fetch,
+    });
+    assert.ok((result.acquisitionOutcomes || []).some(item => item.failureClass === 'INNERTUBE_DESCRIPTION_FAILED'));
+    assert.ok((result.acquisitionOutcomes || []).some(item => item.failureClass === 'RECENT_VIDEO_DESCRIPTION_SCRAPE_FAILED'), 'static fallback must still run');
+  } finally {
+    globalThis.fetch = savedFetch;
+    setInnertubeSessionFactoryForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
