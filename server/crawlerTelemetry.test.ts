@@ -1,16 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { renderedCrawlerTelemetry, safeCrawlerTelemetry, staticCrawlerTelemetry, workerInstanceId } from './crawlerTelemetry';
+import { isCeilingKind, renderedCrawlerTelemetry, safeCrawlerTelemetry, staticCrawlerTelemetry, workerInstanceId } from './crawlerTelemetry';
 
 test('static telemetry records redirect/page/budget measurements without changing outcome semantics', () => {
-  const telemetry = staticCrawlerTelemetry({ redirectsFollowed: 2, pagesInspected: 3, budgetExhausted: true });
+  const telemetry = staticCrawlerTelemetry({ redirectsFollowed: 2, pagesInspected: 3, ceiling: 'queue-cap' });
   const { workerInstanceId: instance, ...stable } = telemetry;
   assert.deepEqual(stable, {
     mode: 'STATIC',
     redirectsFollowed: 2,
     pagesInspected: 3,
     budgetExhausted: true,
+    ceiling: { kind: 'queue-cap' },
     clicksStarted: 0,
     clicksSucceeded: 0,
     clicksFailed: 0,
@@ -23,6 +24,19 @@ test('static telemetry records redirect/page/budget measurements without changin
     hostBackoffsApplied: 0,
   });
   assert.match(instance || '', /^.+:\d+:[0-9a-f]{8}$/);
+});
+
+test('static telemetry without a ceiling never claims budget exhaustion', () => {
+  const clean = staticCrawlerTelemetry({ redirectsFollowed: 1, pagesInspected: 1 });
+  assert.equal(clean.budgetExhausted, false);
+  assert.equal(clean.ceiling, undefined);
+});
+
+test('ceiling taxonomy rejects unknown kinds', () => {
+  assert.equal(isCeilingKind('queue-cap'), true);
+  assert.equal(isCeilingKind('total-timeout'), true);
+  assert.equal(isCeilingKind('http-error'), false);
+  assert.equal(isCeilingKind(null), false);
 });
 
 test('rendered telemetry preserves bounded click/request counters without mislabeling budget', () => {
@@ -187,4 +201,19 @@ test('sanitizer redacts sensitive cause text independently of callers', () => {
   assert.match(snippet, /Bearer \*\*\*/);
   assert.match(snippet, /Failed to launch/);
   assert.ok(snippet.length <= 500);
+});
+
+test('sanitizer preserves valid ceilings and drops unknown kinds without the flag', () => {
+  const kept = safeCrawlerTelemetry({ mode: 'STATIC', pagesInspected: 2, ceiling: { kind: 'depth-limit' } });
+  assert.deepEqual(kept?.ceiling, { kind: 'depth-limit' });
+  assert.equal(kept?.budgetExhausted, true);
+  const dropped = safeCrawlerTelemetry({ mode: 'STATIC', pagesInspected: 2, ceiling: { kind: 'http-error' } });
+  assert.equal(dropped?.ceiling, undefined);
+  assert.equal(dropped?.budgetExhausted, false);
+});
+
+test('zero-page telemetry without a cap carries no ceiling', () => {
+  const zeroPage = renderedCrawlerTelemetry({ inspectedPages: 0, clicks: 0, complete: false });
+  assert.equal(zeroPage.ceiling, undefined);
+  assert.equal(zeroPage.budgetExhausted, false);
 });

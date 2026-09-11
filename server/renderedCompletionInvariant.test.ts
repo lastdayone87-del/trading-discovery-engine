@@ -439,8 +439,9 @@ test('static clean survives evidence-less rendered failure as retryable partial'
   assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
 });
 
-// Rendered timeout with real pages is partial with budget-expired class.
-test('rendered budget expiry with pages is PARTIALLY_INSPECTED, never unavailable', async () => {
+// Rendered timeout with real pages is partial; without page-budget evidence
+// the timeout is attributed truthfully instead of as budget expiry.
+test('rendered timeout with pages is PARTIALLY_INSPECTED, never unavailable', async () => {
   const result = await runChannelInspection({
     channelId: 'UCtimeoutpages0000000000001',
     channelName: 'Timeout Pages Channel',
@@ -464,8 +465,36 @@ test('rendered budget expiry with pages is PARTIALLY_INSPECTED, never unavailabl
     })) as (seedUrl: string) => Promise<BrowserFallbackResult>,
   });
   const renderedObs = (result.acquisitionOutcomes || []).filter((item) => item.requestedUrl === 'https://slow.example.com/');
-  assert.ok(renderedObs.some((item) => item.outcome === 'PARTIALLY_INSPECTED' && item.failureClass === 'RENDERED_BUDGET_EXPIRED' && item.retryable === true));
+  assert.ok(renderedObs.some((item) => item.outcome === 'PARTIALLY_INSPECTED' && item.failureClass === 'RENDERED_TIMEOUT' && item.retryable === true));
   assert.ok(!renderedObs.some((item) => item.outcome === 'ACQUISITION_FAILED'));
+});
+
+test('rendered timeout with page-budget evidence keeps RENDERED_BUDGET_EXPIRED', async () => {
+  const result = await runChannelInspection({
+    channelId: 'UCtimeoutbudget000000000001',
+    channelName: 'Timeout Budget Channel',
+    channelBio: 'Trading notes',
+    channelLinks: ['https://capped.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => noInviteHtml()) as typeof fetch,
+    renderedFallback: (async (seedUrl: string) => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 2,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: true,
+      dropReasons: { 'page-budget': 3 },
+      telemetry: { ...zeroTelemetry(), requestsStarted: 6, requestsFinished: 2 },
+      detail: 'Rendered acquisition budget expired before coverage completed',
+    })) as (seedUrl: string) => Promise<BrowserFallbackResult>,
+  });
+  const renderedObs = (result.acquisitionOutcomes || []).filter((item) => item.requestedUrl === 'https://capped.example.com/');
+  assert.ok(renderedObs.some((item) => item.outcome === 'PARTIALLY_INSPECTED' && item.failureClass === 'RENDERED_BUDGET_EXPIRED' && item.retryable === true));
 });
 
 // Full candidate set is preserved: failures never drop siblings, dedupe is exact.

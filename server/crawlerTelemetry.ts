@@ -24,6 +24,25 @@ export function isCrawlDropReason(value: unknown): value is CrawlDropReason {
   return typeof value === 'string' && (CRAWL_DROP_REASONS as readonly string[]).includes(value);
 }
 
+/**
+ * Closed taxonomy of ceilings that can truncate crawl coverage. A ceiling
+ * entry means a named cap cut coverage short — never a terminal failure
+ * cause (HTTP, network, content-type, login walls, rate limits, browser
+ * defects), which keep living in failureClass. Absent when no cap tripped.
+ */
+export const CEILING_KINDS = [
+  'page-budget',
+  'depth-limit',
+  'queue-cap',
+  'exploration-limit',
+  'response-cap',
+  'total-timeout',
+] as const;
+export type CeilingKind = typeof CEILING_KINDS[number];
+export function isCeilingKind(value: unknown): value is CeilingKind {
+  return typeof value === 'string' && (CEILING_KINDS as readonly string[]).includes(value);
+}
+
 /** Shared taxonomy/bound enforcement for drop counters, used both when
  * telemetry objects are constructed and when ledger rows are persisted, so
  * direct in-process consumers never receive invalid reason keys or
@@ -84,7 +103,19 @@ export interface CrawlerTelemetry {
   mode: CrawlerAcquisitionMode;
   redirectsFollowed: number;
   pagesInspected: number;
+  /**
+   * True only when a named ceiling actually cut coverage short (see
+   * `ceiling`). Derived, never set directly by crawlers: terminal failures
+   * (HTTP, network, content-type, login walls, rate limits, browser defects)
+   * must not inherit it from seed-level crawl state.
+   */
   budgetExhausted: boolean;
+  /**
+   * The ceiling that truncated coverage, when one did. Absent means no cap
+   * tripped for this observation — including terminal failures, which carry
+   * their cause in failureClass instead.
+   */
+  ceiling?: { kind: CeilingKind };
   clicksStarted: number;
   clicksSucceeded: number;
   clicksFailed: number;
@@ -228,16 +259,28 @@ export function renderedCrawlerTelemetry(input: {
   telemetry?: Partial<CrawlerTelemetry>;
   dropReasons?: Partial<Record<CrawlDropReason, number>>;
   scrollsUsed?: number;
+  ceiling?: CeilingKind;
 }): CrawlerTelemetry {
+  // Ceiling precedence: explicit > page-budget evidence > total timeout.
+  // A timeout alone still records total-timeout (an elapsed budget is a
+  // ceiling), but never inherits an unrelated cap, and terminal failures
+  // without any cap carry no ceiling at all.
+  const ceilingKind = input.ceiling
+    ?? (sanitizeDropReasons(input.dropReasons)['page-budget'] ? 'page-budget' as const : undefined)
+    ?? (input.timedOut ? 'total-timeout' as const : undefined);
+  // A spread-carried ceiling/budget flag could only ever be stale (inner
+  // telemetry never owns the ceiling decision), so both are stripped before
+  // the derived values below are set.
+  const { ceiling: _staleCeiling, budgetExhausted: _staleExhausted, ...restTelemetry } = (input.telemetry || {}) as Partial<CrawlerTelemetry>;
+  void _staleCeiling;
+  void _staleExhausted;
   return {
     ...emptyCrawlerTelemetry('RENDERED'),
-    ...input.telemetry,
+    ...restTelemetry,
     pagesInspected: input.inspectedPages,
     clicksSucceeded: input.clicks,
-    // budgetExhausted must describe the actual budget/time state, never serve
-    // as a generic "incomplete" label: blocked, zero-page, saturation, and
-    // transient failures are incomplete without exhausting any budget.
-    budgetExhausted: input.telemetry?.budgetExhausted === true || input.timedOut === true,
+    budgetExhausted: ceilingKind !== undefined,
+    ...(ceilingKind ? { ceiling: { kind: ceilingKind } } : {}),
     // Instance attribution is always this process: telemetry objects are built
     // in-process per crawl, so a spread-carried id could only ever be stale.
     workerInstanceId: workerInstanceId(),
@@ -250,14 +293,15 @@ export function renderedCrawlerTelemetry(input: {
 export function staticCrawlerTelemetry(input: {
   redirectsFollowed: number;
   pagesInspected: number;
-  budgetExhausted: boolean;
+  ceiling?: CeilingKind;
   dropReasons?: Partial<Record<CrawlDropReason, number>>;
 }): CrawlerTelemetry {
   return {
     ...emptyCrawlerTelemetry('STATIC'),
     redirectsFollowed: Math.max(0, Math.floor(input.redirectsFollowed)),
     pagesInspected: Math.max(0, Math.floor(input.pagesInspected)),
-    budgetExhausted: input.budgetExhausted === true,
+    budgetExhausted: input.ceiling !== undefined,
+    ...(input.ceiling ? { ceiling: { kind: input.ceiling } } : {}),
     workerInstanceId: workerInstanceId(),
     ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
   };
@@ -293,11 +337,18 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   const drops = sanitizeDropReasons(candidate.dropReasons);
   const scrolls = sanitizeScrollsUsed(candidate.scrollsUsed);
   const instance = text(candidate.workerInstanceId, 120);
+  const ceiling = candidate.ceiling && typeof candidate.ceiling === 'object' && isCeilingKind((candidate.ceiling as { kind?: unknown }).kind)
+    ? { kind: (candidate.ceiling as { kind: CeilingKind }).kind }
+    : undefined;
+  // Backward compatibility: rows persisted before ceiling taxonomy keep
+  // their recorded boolean (only new rows are derived strictly). The
+  // constructors above never emit budgetExhausted without a ceiling.
+  const legacyExhausted = candidate.budgetExhausted === true;
   return {
     ...emptyCrawlerTelemetry(candidate.mode),
     redirectsFollowed: number(candidate.redirectsFollowed),
     pagesInspected: number(candidate.pagesInspected),
-    budgetExhausted: candidate.budgetExhausted === true,
+    budgetExhausted: ceiling !== undefined || legacyExhausted,
     clicksStarted: number(candidate.clicksStarted),
     clicksSucceeded: number(candidate.clicksSucceeded),
     clicksFailed: number(candidate.clicksFailed),
@@ -314,6 +365,7 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(instance ? { workerInstanceId: instance } : {}),
     ...(Object.keys(drops).length ? { dropReasons: drops } : {}),
     ...(scrolls > 0 ? { scrollsUsed: scrolls } : {}),
+    ...(ceiling ? { ceiling } : {}),
   };
 }
 
