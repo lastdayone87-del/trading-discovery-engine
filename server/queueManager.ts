@@ -76,7 +76,7 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { isGeminiSemanticCooldownActive, isGroqSemanticCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
-import { shouldUseGroqSemantic } from './evidenceEngine/providers/GroqSemanticProvider';
+import { shouldUseGroqSemantic, configuredGroqRoutes } from './evidenceEngine/providers/GroqSemanticProvider';
 import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
@@ -195,8 +195,11 @@ export function resolveInnertubeRunOutcome(input: {
  * pause while the Groq cooldown is active, free-Gemini-selected claims pause
  * while the free-Gemini cooldown is active, and paid-Gemini claims pause
  * while the paid cooldown is active — a stale cooldown on any idle route
- * never stalls the serving one. Unit-testable without a database; the async
- * cooldown reads stay at the call site.
+ * never stalls the serving one. When paid Gemini is primary but cooling down,
+ * a configured and healthy Groq fallback route still allows the claim so the
+ * job can reach the already-working fallback instead of stalling in queue.
+ * Unit-testable without a database; the async cooldown reads stay at the
+ * call site.
  */
 export function enrichChannelClaimableDuringCooldown(input: {
   groqSelected: boolean;
@@ -204,10 +207,14 @@ export function enrichChannelClaimableDuringCooldown(input: {
   geminiCooldownActive: boolean;
   groqCooldownActive: boolean;
   geminiFreeCooldownActive?: boolean;
+  groqFallbackConfigured?: boolean;
+  groqFallbackCooldownActive?: boolean;
 }): boolean {
   if (input.groqSelected) return !input.groqCooldownActive;
   if (input.geminiFreeSelected) return !(input.geminiFreeCooldownActive ?? false);
-  return !input.geminiCooldownActive;
+  if (!input.geminiCooldownActive) return true;
+  if (input.groqFallbackConfigured && !input.groqFallbackCooldownActive) return true;
+  return false;
 }
 
 /**
@@ -248,14 +255,22 @@ export async function processNextSearchJob(
   // during the active route's cooldown period: Groq-selected claims consult
   // the Groq cooldown, free-Gemini-selected claims consult the free-Gemini
   // cooldown, and paid-Gemini claims consult the paid cooldown, so a stale
-  // cooldown on any idle route can never stall the serving one.
+  // cooldown on any idle route can never stall the serving one. When paid
+  // Gemini is cooling down, a configured and healthy Groq fallback route
+  // still allows the claim so jobs can reach the already-working fallback.
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
     const geminiCooldownActive = !groqSelected && !geminiFreeSelected ? await isGeminiSemanticCooldownActive() : false;
     const groqCooldownActive = groqSelected ? await isGroqSemanticCooldownActive() : false;
     const geminiFreeCooldownActive = geminiFreeSelected ? await isGeminiFreeSemanticCooldownActive() : false;
-    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
+    let groqFallbackConfigured = false;
+    let groqFallbackCooldownActive = false;
+    if (!groqSelected && !geminiFreeSelected && geminiCooldownActive) {
+      groqFallbackConfigured = configuredGroqRoutes().length > 0 && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true';
+      if (groqFallbackConfigured) groqFallbackCooldownActive = await isGroqSemanticCooldownActive();
+    }
+    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
   }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
