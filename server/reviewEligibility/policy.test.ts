@@ -4,3 +4,29 @@ test('review eligibility admits only evidence-complete unresolved human judgment
 test('review eligibility keeps policy and semantic terminal outcomes out of review',()=>{assert.equal(evaluateReviewEligibilityV2({...base,countryAllowed:false}).status,'NOT_ELIGIBLE');assert.equal(evaluateReviewEligibilityV2({...base,terminalDecision:true}).status,'NOT_ELIGIBLE');assert.equal(evaluateReviewEligibilityV2({...base,plausibleTradingHypothesis:false}).status,'NOT_ELIGIBLE');});
 test('operational failures are recovery work, never human review debt',()=>{const result=evaluateReviewEligibilityV2({...base,operationalFailure:true});assert.equal(result.status,'DEFERRED');assert.equal(result.reasonFamily,'OPERATIONAL_FAILURE');assert.deepEqual(result.reasonCodes,['OPERATIONAL_RECOVERY_REQUIRED']);});
 test('review eligibility separates evidence, provider, language and active-investigation deferrals',()=>{const active=evaluateReviewEligibilityV2({...base,investigationState:'ACTIVE'});assert.equal(active.status,'DEFERRED');assert.equal(active.reasonFamily,'INVESTIGATION_ACTIVE');const evidence=evaluateReviewEligibilityV2({...base,evidenceSufficient:false});assert.equal(evidence.status,'DEFERRED');assert.equal(evidence.reasonFamily,'MORE_EVIDENCE_REQUIRED');const provider=evaluateReviewEligibilityV2({...base,providerDegraded:true});assert.equal(provider.status,'DEFERRED');assert.equal(provider.reasonFamily,'PROVIDER_RECOVERY_REQUIRED');const language=evaluateReviewEligibilityV2({...base,unsupportedLanguage:true});assert.equal(language.status,'DEFERRED');assert.equal(language.reasonFamily,'LANGUAGE_CAPABILITY_REQUIRED');});
+
+test('fallback-covered provider degradation does not defer human review', async () => {
+  const { resolveReviewProviderDegraded } = await import('./policy');
+  const covered = { degraded: true, providers: [
+    { provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] },
+    { provider: 'groq_semantic', availability: 'AVAILABLE', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED', 'SEMANTIC_FALLBACK_SUCCEEDED'] },
+  ] };
+  assert.equal(resolveReviewProviderDegraded(covered as never), false);
+  const uncovered = { degraded: true, providers: [{ provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] }] };
+  assert.equal(resolveReviewProviderDegraded(uncovered as never), true);
+  assert.equal(resolveReviewProviderDegraded({ degraded: false, providers: [] } as never), false);
+});
+
+test('fallback coverage with an unrelated failed provider still defers review', async () => {
+  const { resolveReviewProviderDegraded } = await import('./policy');
+  const { evaluateReviewEligibilityV2 } = await import('./policy');
+  const collection = { degraded: true, providers: [
+    { provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] },
+    { provider: 'groq_semantic', availability: 'AVAILABLE', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED', 'SEMANTIC_FALLBACK_SUCCEEDED'] },
+    { provider: 'discord_metadata', availability: 'FAILED', reasonCodes: ['PROVIDER_TIMEOUT'] },
+  ] };
+  assert.equal(resolveReviewProviderDegraded(collection as never), true);
+  const decision = evaluateReviewEligibilityV2({ classificationStatus:'UNCERTAIN', investigationState:'UNRESOLVED', plausibleTradingHypothesis:true, evidenceSufficient:true, independentEvidence:true, countryAllowed:true, operationalFailure:false, providerDegraded:resolveReviewProviderDegraded(collection as never), unsupportedLanguage:false, terminalDecision:false });
+  assert.equal(decision.status, 'DEFERRED');
+  assert.equal(decision.reasonFamily, 'PROVIDER_RECOVERY_REQUIRED');
+});

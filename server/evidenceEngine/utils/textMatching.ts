@@ -8,6 +8,29 @@ function escapeRegExp(string: string): string {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * Canonical form for comparing matched terms: matching itself is
+ * case-insensitive, so 'Garten' and 'garten' (or full-width variants via
+ * NFKC) are the same token. Collectors must use pushUniqueMatch so one token
+ * never counts twice toward weight thresholds.
+ */
+export function normalizeMatchToken(value: string): string {
+  return (value || '').normalize('NFKC').toLocaleLowerCase('en').trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * Append a matched term unless an equivalent token (case/format-insensitive)
+ * is already collected. Returns true when appended. The first-seen spelling
+ * is preserved for display; comparison uses the normalized form.
+ */
+export function pushUniqueMatch(list: string[], value: string): boolean {
+  const normalized = normalizeMatchToken(value);
+  if (!normalized) return false;
+  if (list.some(existing => normalizeMatchToken(existing) === normalized)) return false;
+  list.push(value);
+  return true;
+}
+
 // Check if string contains CJK (Chinese, Japanese, Korean) characters
 function hasCJK(text: string): boolean {
   return /[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\ud7b0-\ud7ff]/.test(text);

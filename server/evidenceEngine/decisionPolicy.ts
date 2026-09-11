@@ -32,10 +32,62 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
+function observationGroupKey(field: { field?: string; sourceFamilyId?: string | null; sourceId?: string | null; index?: number | null }): string | null {
+  // Canonical source identity first: fields from one underlying video share
+  // its source family even when each field carries its own document ID
+  // (title vs description), while independent links/playlists/videos keep
+  // distinct families and stay separate observations.
+  if (field.sourceFamilyId) return `family:${field.sourceFamilyId}`;
+  if (field.field === 'video_title' || field.field === 'video_description') {
+    const id = field.sourceId ?? field.index;
+    return id !== undefined && id !== null && id !== '' ? `video:${id}` : null;
+  }
+  if (field.field) return `field:${field.field}`;
+  return null;
+}
+
+/**
+ * Deduplicate evidence weight by canonical observed group. Multiple providers
+ * may interpret the same document (e.g. the channel bio matched by both the
+ * global and the country knowledge provider); without dedup the same token's
+ * weight counts two or three times toward terminal thresholds.
+ *
+ * Weight is attributed per observation key: an item spanning several keys
+ * contributes an equal share to each (so single items keep their exact total
+ * however many documents they cite), and each key keeps the strongest share
+ * covering it. Fully overlapping interpretations therefore collapse to one
+ * voice, while independent links, playlists, videos — and multi-video
+ * aggregates alongside per-video items — keep their support. Items without
+ * any attributable field are never merged.
+ * Shared with staged classification so stage dispositions and the final
+ * policy always agree on terminal weight.
+ */
+export function dedupeWeightByFieldGroup<T extends { provenance?: { fields?: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null; index?: number | null }> }; finalWeight: number }>(items: T[]): number {
+  const keyShare = new Map<string, number>();
+  let ungrouped = 0;
+  for (const item of items) {
+    const keys = (item.provenance?.fields || [])
+      .map(observationGroupKey)
+      .filter((value): value is string => value !== null);
+    if (keys.length === 0) {
+      ungrouped += Math.abs(item.finalWeight);
+      continue;
+    }
+    const uniqueKeys = [...new Set(keys)];
+    const share = Math.abs(item.finalWeight) / uniqueKeys.length;
+    for (const key of uniqueKeys) {
+      keyShare.set(key, Math.max(keyShare.get(key) || 0, share));
+    }
+  }
+  let total = ungrouped;
+  for (const weight of keyShare.values()) total += weight;
+  return total;
+}
+
 function qualifiesDominantAttributedContradiction(evidence:EvidenceItem[],collection:EvidenceCollectionReport):boolean{
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT')return false;
-  const positiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
-  const terminalNegativeWeight=evidence.filter(item=>item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN').reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
+  const positiveWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length));
+  const terminalNegativeWeight=dedupeWeightByFieldGroup(evidence.filter(item=>item.polarity==='NEGATIVE'&&item.category==='IRRELEVANT_DOMAIN'));
   return terminalNegativeWeight>=25&&(positiveWeight===0||terminalNegativeWeight>positiveWeight*1.5);
 }
 

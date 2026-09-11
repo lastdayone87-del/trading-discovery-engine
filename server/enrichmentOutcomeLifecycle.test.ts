@@ -58,3 +58,32 @@ test('successful fully enriched ambiguity still routes to human review', () => {
   assert.equal(plan.legacyAction, 'HUMAN_REVIEW');
   assert.equal(plan.appliedAction, 'HUMAN_REVIEW');
 });
+
+test('fallback-covered abstention without positives follows healthy-abstention lifecycle', () => {
+  const coveredAbstention = {
+    status: 'UNCERTAIN', positiveEvidence: [], negativeEvidence: [],
+    evidenceCollection: {
+      degraded: true,
+      providers: [
+        { provider: 'gemini_semantic', availability: 'FAILED', reasonCodes: ['PROVIDER_RATE_LIMIT'] },
+        { provider: 'groq_semantic', availability: 'AVAILABLE', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED', 'SEMANTIC_FALLBACK_SUCCEEDED'] },
+      ],
+    },
+    stagedClassification: { stages: [{ stage: 'CANDIDATE_DETECTION', disposition: 'ABSTAIN' }] },
+  } as any;
+  // No positive evidence and no uncovered failure: identical to a healthy
+  // abstention (no invented hypothesis, no retry preservation).
+  assert.equal(hasIndependentTradingHypothesis(coveredAbstention), false);
+  const uncovered = {
+    status: 'UNCERTAIN', positiveEvidence: [], negativeEvidence: [],
+    evidenceCollection: {
+      degraded: true,
+      providers: [
+        { provider: 'gemini_semantic', availability: 'FAILED' },
+        { provider: 'discord_metadata', availability: 'FAILED' },
+      ],
+    },
+    stagedClassification: { stages: [{ stage: 'CANDIDATE_DETECTION', disposition: 'ABSTAIN' }] },
+  } as any;
+  assert.equal(hasIndependentTradingHypothesis(uncovered), true);
+});

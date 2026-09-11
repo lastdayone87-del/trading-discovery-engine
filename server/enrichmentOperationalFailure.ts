@@ -12,6 +12,43 @@ const OPERATIONAL_PROVIDER_REASONS = new Set([
   'GEMINI_CAPACITY_DEFERRED'
 ]);
 
+const SEMANTIC_PROVIDER_KEYS = new Set(['gemini_semantic', 'groq_semantic', 'gemini_free_semantic']);
+
+/**
+ * True when a semantic fallback served this evaluation after an earlier
+ * semantic provider failed (see executeSemanticChain: the winning report
+ * carries SEMANTIC_FALLBACK_SUCCEEDED). The original failure stays in the
+ * provider ledger for telemetry — this only records that coverage was
+ * restored, so downstream gates treat the served result (including a valid
+ * non-terminal one) as operationally successful instead of retrying a
+ * provider outage that has already been routed around.
+ */
+export function isFallbackCovered(report: EvidenceCollectionReport): boolean {
+  return (report.providers || []).some(provider => (provider.reasonCodes || []).includes('SEMANTIC_FALLBACK_SUCCEEDED'));
+}
+
+function isSemanticProviderKey(provider: string): boolean {
+  return SEMANTIC_PROVIDER_KEYS.has(provider);
+}
+
+/**
+ * Failed providers not covered by a served semantic fallback, by provider
+ * name. Single source of truth for every degraded-coverage gate (enrichment,
+ * manual recheck, VOI legacy action, review eligibility): a fallback covers
+ * semantic failures only, so unrelated failed providers always remain
+ * visible. Empty means coverage is operationally complete.
+ */
+export function uncoveredFailedProviders(
+  report: Pick<EvidenceCollectionReport, 'providers'>
+): string[] {
+  const failed = (report.providers || []).filter(provider => provider.availability === 'FAILED');
+  if (failed.length === 0) return [];
+  const covered = isFallbackCovered(report as EvidenceCollectionReport);
+  return failed
+    .filter(provider => !covered || !isSemanticProviderKey(provider.provider))
+    .map(provider => provider.provider);
+}
+
 export interface OperationalProviderFailure {
   provider: string;
   reasonCodes: string[];
@@ -90,8 +127,13 @@ export function enrichmentOperationalFailure(
   decisionReadyWithoutFailedProvider: boolean = false
 ): ProviderCallError | null {
   if (!isEnrichmentPass || !report.degraded || decisionReadyWithoutFailedProvider) return null;
+  // A served semantic fallback covers the semantic outage: the evaluation
+  // proceeds on its merits (including UNCERTAIN → review/deeper stages)
+  // instead of defer-retrying a routed-around failure. Non-semantic
+  // operational failures still throw; the failed primary stays recorded.
+  const uncovered = uncoveredFailedProviders(report);
   const providerFailures = report.providers
-    .filter(provider => provider.availability === 'FAILED')
+    .filter(provider => provider.availability === 'FAILED' && uncovered.includes(provider.provider))
     .map(provider => ({
       provider: provider.provider,
       reasonCodes: [...new Set((provider.reasonCodes || []).filter(code => OPERATIONAL_PROVIDER_REASONS.has(code)))]
@@ -99,4 +141,26 @@ export function enrichmentOperationalFailure(
     .filter(provider => provider.reasonCodes.length > 0);
   if (!providerFailures.length) return null;
   return new OperationalEnrichmentProviderError(providerFailures);
+}
+
+/**
+ * Manual-recheck degraded-coverage gate, extracted for testability. Returns
+ * the retryable error when failed providers remain uncovered, or null when
+ * the evaluation may proceed. A served semantic fallback covers semantic
+ * failures exactly like the enrichment gate above.
+ */
+export function manualRecheckDegradedError(
+  collection: EvidenceCollectionReport
+): (Error & { code?: string; retryable?: boolean; providerReasons?: string[] }) | null {
+  if (!collection.degraded) return null;
+  const uncoveredNames = uncoveredFailedProviders(collection);
+  if (uncoveredNames.length === 0) return null;
+  const uncovered = collection.providers.filter(
+    provider => provider.availability === 'FAILED' && uncoveredNames.includes(provider.provider)
+  );
+  const reasonCodes = uncovered.flatMap(provider => provider.reasonCodes || []);
+  return Object.assign(
+    new Error(`Manual recheck classification provider coverage is degraded: ${uncovered.map(provider => provider.provider).join(', ') || 'unknown provider'}.`),
+    { code: 'MANUAL_RESCAN_CLASSIFICATION_DEGRADED', retryable: true, providerReasons: reasonCodes }
+  );
 }

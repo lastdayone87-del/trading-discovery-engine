@@ -1,5 +1,5 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
-import { textMatchesTerm } from '../utils/textMatching';
+import { pushUniqueMatch, textMatchesTerm } from '../utils/textMatching';
 
 export class ChannelMetadataProvider implements EvidenceProvider {
   name = 'channel_metadata' as const;
@@ -22,7 +22,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
 
     for (const inst of allInstruments) {
       if (textMatchesTerm(textBlob, inst)) {
-        if (!matchedInstruments.includes(inst)) matchedInstruments.push(inst);
+        pushUniqueMatch(matchedInstruments, inst);
       }
     }
 
@@ -59,7 +59,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
 
     for (const platform of allPlatforms) {
       if (textMatchesTerm(textBlob, platform)) {
-        if (!matchedPlatforms.includes(platform)) matchedPlatforms.push(platform);
+        pushUniqueMatch(matchedPlatforms, platform);
       }
     }
 
@@ -96,7 +96,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
 
     for (const concept of allConcepts) {
       if (textMatchesTerm(textBlob, concept)) {
-        if (!matchedConcepts.includes(concept)) matchedConcepts.push(concept);
+        pushUniqueMatch(matchedConcepts, concept);
       }
     }
 
@@ -134,7 +134,7 @@ export class ChannelMetadataProvider implements EvidenceProvider {
 
     for (const neg of allNegative) {
       if (textMatchesTerm(textBlob, neg)) {
-        if (!matchedNegative.includes(neg)) matchedNegative.push(neg);
+        pushUniqueMatch(matchedNegative, neg);
       }
     }
 

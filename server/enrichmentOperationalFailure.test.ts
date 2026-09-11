@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
+import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, isFallbackCovered, isProviderDeferredEnrichmentError, manualRecheckDegradedError } from './enrichmentOperationalFailure';
 import { decideJobFailure } from './db';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
 import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
@@ -102,4 +102,78 @@ test('only machine-owned operational provider errors project PROVIDER_DEFERRED',
   assert.equal(isProviderDeferredEnrichmentError(error),true);
   assert.equal(isProviderDeferredEnrichmentError(new Error('ordinary pipeline failure')),false);
   assert.equal(isProviderDeferredEnrichmentError({name:'ProviderCallError',errorClass:'RATE_LIMIT',retryable:true}),false);
+});
+
+function fallbackReport(): EvidenceCollectionReport {
+  return {
+    sufficiency: 'SUFFICIENT', sparseMetadata: false, degraded: true,
+    fieldsPresent: ['video_titles'], reasonCodes: ['PROVIDER_COVERAGE_DEGRADED'],
+    providers: [
+      { provider: 'gemini_semantic', availability: 'FAILED', evidenceCount: 0, outcome: 'FAILED_PROVIDER', reasonCodes: ['PROVIDER_RATE_LIMIT'], durationMs: 5 },
+      { provider: 'groq_semantic', availability: 'AVAILABLE', evidenceCount: 0, outcome: 'ABSTAINED_LOW_CONFIDENCE', reasonCodes: ['SEMANTIC_MODEL_ABSTAINED', 'SEMANTIC_FALLBACK_SUCCEEDED'], durationMs: 9 },
+    ],
+    terminalNegativeSufficiency: { status: 'INSUFFICIENT', creatorLevelCoverage: false, independentSourceFamilies: 0, independentObservations: 0, reasonCodes: ['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT'] }
+  };
+}
+
+test('served Groq fallback is operationally successful even for non-terminal decisions', () => {
+  const collection = fallbackReport();
+  // The Gemini outage stays visible in telemetry...
+  assert.ok(collection.providers.some(p => p.provider === 'gemini_semantic' && p.availability === 'FAILED'));
+  // ...but the served fallback result is accepted instead of defer-retrying.
+  assert.equal(enrichmentOperationalFailure(collection, true, false), null);
+  assert.equal(isFallbackCovered(collection), true);
+});
+
+test('uncovered Gemini failure still retries on enrichment passes', () => {
+  const d = decision({ lifecycle: 'ENRICH' });
+  assert.equal(isFallbackCovered(d.evidenceCollection), false);
+  assert.ok(enrichmentOperationalFailure(d.evidenceCollection, true, false));
+});
+
+test('non-semantic operational failure still throws despite semantic fallback coverage', () => {
+  const collection = fallbackReport();
+  collection.providers.push({
+    provider: 'discord_metadata', availability: 'FAILED', evidenceCount: 0, outcome: 'FAILED_PROVIDER',
+    reasonCodes: ['PROVIDER_TIMEOUT'], durationMs: 3,
+  });
+  const error = enrichmentOperationalFailure(collection, true, false);
+  assert.ok(error);
+  assert.match(String(error && (error as Error).message), /discord/);
+});
+
+test('manual recheck gate accepts fallback-covered semantic failures', () => {
+  assert.equal(manualRecheckDegradedError(fallbackReport()), null);
+});
+
+test('manual recheck gate still rejects uncovered degradation', () => {
+  const d = decision({ lifecycle: 'ENRICH' });
+  const error = manualRecheckDegradedError(d.evidenceCollection);
+  assert.ok(error);
+  assert.equal((error as { code?: string }).code, 'MANUAL_RESCAN_CLASSIFICATION_DEGRADED');
+  assert.equal((error as { retryable?: boolean }).retryable, true);
+});
+
+test('manual recheck gate still rejects non-semantic failures despite coverage', () => {
+  const collection = fallbackReport();
+  collection.providers.push({
+    provider: 'discord_metadata', availability: 'FAILED', evidenceCount: 0, outcome: 'FAILED_PROVIDER',
+    reasonCodes: ['PROVIDER_TIMEOUT'], durationMs: 3,
+  });
+  assert.ok(manualRecheckDegradedError(collection));
+});
+
+test('uncoveredFailedProviders exempts only covered semantic failures', async () => {
+  const { uncoveredFailedProviders } = await import('./enrichmentOperationalFailure');
+  const coveredOnly = fallbackReport();
+  assert.deepEqual(uncoveredFailedProviders(coveredOnly), []);
+  const withDiscord = fallbackReport();
+  withDiscord.providers.push({
+    provider: 'discord_metadata', availability: 'FAILED', evidenceCount: 0, outcome: 'FAILED_PROVIDER',
+    reasonCodes: ['PROVIDER_TIMEOUT'], durationMs: 3,
+  });
+  assert.deepEqual(uncoveredFailedProviders(withDiscord), ['discord_metadata']);
+  const plain = report(true, ['PROVIDER_RATE_LIMIT']);
+  assert.deepEqual(uncoveredFailedProviders(plain), ['gemini_semantic']);
+  assert.deepEqual(uncoveredFailedProviders(report(false)), []);
 });

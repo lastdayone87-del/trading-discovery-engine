@@ -23,10 +23,10 @@ import { ACTIONS, deriveVitalityScheduling, planAndRecordEvidenceAction, type Ev
 import { INVESTIGATION_POLICY_VERSION, scheduleInvestigationStep } from './investigationWorkflow';
 import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
-import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders } from './enrichmentOperationalFailure';
+import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
-import { evaluateReviewEligibilityV2 } from './reviewEligibility/policy';
+import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
 import { shouldPreserveExistingChannel } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
@@ -500,13 +500,8 @@ export async function processChannelThroughPipeline(
   );
   if(enrichmentProviderFailure) throw enrichmentProviderFailure;
   if (source === 'recheck' && isManualScan && productionClassification.decision.evidenceCollection.degraded) {
-    const failedProviders = productionClassification.decision.evidenceCollection.providers.filter(provider => provider.availability === 'FAILED');
-    const reasonCodes = failedProviders.flatMap(provider => provider.reasonCodes || []);
-    const error = Object.assign(
-      new Error(`Manual recheck classification provider coverage is degraded: ${failedProviders.map(provider => provider.provider).join(', ') || 'unknown provider'}.`),
-      { code: 'MANUAL_RESCAN_CLASSIFICATION_DEGRADED', retryable: true, providerReasons: reasonCodes }
-    );
-    throw error;
+    const recheckError = manualRecheckDegradedError(productionClassification.decision.evidenceCollection);
+    if (recheckError) throw recheckError;
   }
   const classificationDiagnosticId=await observeProductionDiagnosticReliably({type:'PRODUCTION_DIAGNOSTIC',input:{channelId:candidate.channelId,input:productionClassification.input,decision:productionClassification.decision,jobId:candidate.discoveryJobId,queryRunId:candidate.queryRunId,nominationId:candidate.nominationId}})
     .catch(error=>{console.warn(`[ClassificationDiagnostics] write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);return undefined;});
@@ -631,7 +626,7 @@ export async function processChannelThroughPipeline(
     try {const quota=await getQuota();evidencePlan=await planAndRecordEvidenceAction({channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,decision:productionClassification.decision,rawInput:productionClassification.input,legacyAction,providerQuotaRemaining:Math.max(0,quota.dailyLimit-quota.unitsUsed)});} catch(error){console.warn(`[VOI Evidence] Planning failed for ${candidate.channelId}; preserving legacy enrichment.`,error instanceof Error?error.message:error);}
     const appliedAction=evidencePlan?.appliedAction||legacyAction,shouldReview=appliedAction==='HUMAN_REVIEW';
     const corroboration=productionClassification.decision.stagedClassification?.stages.find(stage=>stage.stage==='CORROBORATION');
-    const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
+    const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:resolveReviewProviderDegraded(productionClassification.decision.evidenceCollection),unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
     const reviewEligibility=evaluateReviewEligibilityV2(reviewEligibilityInput);
     const lifecycle = resolveUncertainLifecycle(shouldReview,reviewEligibility);
     // Preserve an evidence-complete human-ambiguity decision as NEEDS_REVIEW.

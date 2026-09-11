@@ -1,5 +1,5 @@
 import { EvidenceItem, EvidenceProvider, RawChannelInput, LayeredKnowledgeContext } from '../types';
-import { textMatchesTerm } from '../utils/textMatching';
+import { pushUniqueMatch, textMatchesTerm } from '../utils/textMatching';
 import { documentRef } from '../canonicalEvidencePlane';
 
 export class CountryKnowledgeProvider implements EvidenceProvider {
@@ -23,7 +23,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
     if (countryPack) {
       for (const exch of countryPack.regionalExchanges) {
         if (textMatchesTerm(textBlob, exch)) {
-          if (!matchedRegionalExchanges.includes(exch)) matchedRegionalExchanges.push(exch);
+          pushUniqueMatch(matchedRegionalExchanges, exch);
         }
       }
     }
@@ -61,7 +61,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
 
     for (const term of nativeTermsList) {
       if (textMatchesTerm(textBlob, term)) {
-        if (!matchedNativeTerms.includes(term)) matchedNativeTerms.push(term);
+        pushUniqueMatch(matchedNativeTerms, term);
       }
     }
 
@@ -97,7 +97,7 @@ export class CountryKnowledgeProvider implements EvidenceProvider {
 
     for (const neg of regionalNegativesList) {
       if (textMatchesTerm(textBlob, neg)) {
-        if (!matchedRegionalNegative.includes(neg)) matchedRegionalNegative.push(neg);
+        pushUniqueMatch(matchedRegionalNegative, neg);
       }
     }
 
