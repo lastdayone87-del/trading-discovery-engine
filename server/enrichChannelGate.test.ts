@@ -1,10 +1,65 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { enrichChannelClaimableDuringCooldown } from './queueManager';
+import { readFileSync } from 'node:fs';
+import { enrichChannelClaimableDuringCooldown, groqFallbackCoolingDown } from './queueManager';
 
-test('gemini route claims only outside its own cooldown', () => {
+test('gemini healthy allows ENRICH claim (fallback absent or present)', () => {
   assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: false, groqCooldownActive: false }), true);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: false, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: false }), true);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: false, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: true }), true);
+});
+
+test('gemini cooldown without fallback stays blocked (legacy behavior unchanged)', () => {
   assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false }), false);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: false, groqFallbackCooldownActive: false }), false);
+});
+
+test('gemini cooldown with healthy groq fallback allows ENRICH claim', () => {
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: false }), true);
+});
+
+test('gemini cooldown with cooling-down groq fallback stays blocked (anti-DEFER-storm)', () => {
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: true }), false);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: false, groqFallbackCooldownActive: true }), false);
+});
+
+test('groq fallback cooling-down composes persisted AND local cooldowns', () => {
+  assert.equal(groqFallbackCoolingDown(false, 0), false);
+  assert.equal(groqFallbackCoolingDown(true, 0), true);
+  assert.equal(groqFallbackCoolingDown(false, 1), true);
+  assert.equal(groqFallbackCoolingDown(false, 90_000), true);
+  assert.equal(groqFallbackCoolingDown(true, 5_000), true);
+});
+
+test('gemini cooldown + persisted groq cooldown blocks ENRICH (ledger 429)', () => {
+  const fallbackCooling = groqFallbackCoolingDown(true, 0);
+  assert.equal(fallbackCooling, true);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: fallbackCooling }), false);
+});
+
+test('gemini cooldown + local groq cooldown blocks ENRICH (unpersisted 429)', () => {
+  const fallbackCooling = groqFallbackCoolingDown(false, 45_000);
+  assert.equal(fallbackCooling, true);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: fallbackCooling }), false);
+});
+
+test('gemini cooldown + both groq cooldowns clear allows ENRICH', () => {
+  const fallbackCooling = groqFallbackCoolingDown(false, 0);
+  assert.equal(fallbackCooling, false);
+  assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: true, groqCooldownActive: false, groqFallbackConfigured: true, groqFallbackCooldownActive: fallbackCooling }), true);
+});
+
+test('fallback claim gate consults both persisted and local groq cooldowns', () => {
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.ok(source.includes('isGroqSemanticCooldownActive()'), 'fallback must read the persisted Groq cooldown');
+  assert.ok(source.includes('groqCooldownRemainingMs()'), 'fallback must read the process-local Groq cooldown');
+  assert.ok(source.includes('groqFallbackCoolingDown(await isGroqSemanticCooldownActive(), groqCooldownRemainingMs())'), 'fallback must block when either cooldown is active');
+});
+
+test('process-local groq cooldown starts clear in test runtime', async () => {
+  const { groqCooldownRemainingMs, resetGroqCooldownForTests } = await import('./evidenceEngine/providers/GroqSemanticProvider');
+  resetGroqCooldownForTests();
+  assert.equal(groqCooldownRemainingMs(), 0);
 });
 
 test('groq route claims only outside its own cooldown', () => {
