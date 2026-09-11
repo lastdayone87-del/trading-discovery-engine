@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { appendProviderCallEvent } from '../../db';
-import { executeProviderCall, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
+import { executeProviderCall, getGeminiOrgSemanticCooldownExpiry, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { documentRef } from '../canonicalEvidencePlane';
@@ -8,8 +8,8 @@ import { documentRef } from '../canonicalEvidencePlane';
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = ['ACTIVE_TRADING', 'INVESTING_EDUCATION', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'HYPE', 'UNRELATED', 'AMBIGUOUS'] as const;
-export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
-export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
+export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-2.5-flash-lite';
+export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-2.5-flash';
 type SemanticLabel = typeof SEMANTIC_TAXONOMY[number];
 
 export interface SemanticModelResult {
@@ -27,7 +27,48 @@ export interface SemanticModelClient {
   classify(prompt: string, model: string): Promise<unknown>;
 }
 
-export interface GeminiRoute { id: string; key: string; }
+export interface GeminiRoute { id: string; key: string; orgId?: string; }
+
+/**
+ * Quota-fate label for a route slot. Slots may name a shared account via
+ * GEMINI_ORG_ID (slot 1) / GEMINI_ORG_ID_2..N; unnamed slots each form their
+ * own independent account (one key per account). Routes sharing an org label
+ * share one quota pool; routes with distinct orgs hold independent quotas.
+ */
+export function geminiOrgIdForSlot(env: NodeJS.ProcessEnv, slotNumber: number): string {
+  const name = slotNumber === 1 ? 'GEMINI_ORG_ID' : `GEMINI_ORG_ID_${slotNumber}`;
+  const label = String(env[name] || '').trim();
+  return label || `slot-${slotNumber}`;
+}
+
+/** Fate-sharing identity consumed by cooldown and failover decisions. */
+export function geminiRouteOrg(route: { orgId?: unknown }): string {
+  const label = String(route.orgId || '').trim();
+  // Fail-closed legacy default: routes without an org label (hand-built test
+  // fixtures, never production-configured routes) are assumed to share one
+  // quota pool, preserving the pre-multi-account no-spill behavior.
+  return label || 'shared';
+}
+
+/** Configured key slot numbers (1-based) with a non-empty key. */
+export function geminiConfiguredSlotNumbers(env: NodeJS.ProcessEnv = process.env): number[] {
+  return Object.keys(env)
+    .filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name))
+    .map(name => (name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length))))
+    .filter(slot => String(env[slot === 1 ? 'GEMINI_API_KEY' : `GEMINI_API_KEY_${slot}`] || '').trim())
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Env var names that must name an explicit org for production quota
+ * separation (one per configured key slot). Empty means every route is
+ * labeled; production startup rejects a non-empty result.
+ */
+export function missingGeminiOrgLabels(env: NodeJS.ProcessEnv = process.env): string[] {
+  return geminiConfiguredSlotNumbers(env)
+    .filter(slot => !String(env[slot === 1 ? 'GEMINI_ORG_ID' : `GEMINI_ORG_ID_${slot}`] || '').trim())
+    .map(slot => (slot === 1 ? 'GEMINI_ORG_ID' : `GEMINI_ORG_ID_${slot}`));
+}
 
 /** Return only ordered, non-empty route slots; credentials never leave this process. */
 export function configuredGeminiRoutes(env: NodeJS.ProcessEnv = process.env): GeminiRoute[] {
@@ -37,28 +78,66 @@ export function configuredGeminiRoutes(env: NodeJS.ProcessEnv = process.env): Ge
     return routeNumber(a) - routeNumber(b);
   });
   const seen = new Set<string>();
-  return names.flatMap(name => {
+  const out: GeminiRoute[] = [];
+  for (const name of names) {
     const key = String(env[name] || '').trim();
-    if (!key || seen.has(key)) return [];
+    if (!key || seen.has(key)) continue;
     seen.add(key);
     const numeric = name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
-    return [{ id: resolveGeminiRouteId(`gemini-${numeric}`), key }];
-  });
+    out.push({ id: resolveGeminiRouteId(`gemini-${numeric}`), key, orgId: geminiOrgIdForSlot(env, numeric) });
+  }
+  return out;
 }
 
-export async function runGeminiRouteFailover<T>(routes: GeminiRoute[], call: (route: GeminiRoute) => Promise<T>): Promise<T> {
+export interface GeminiRouteFailoverOptions {
+  /**
+   * Synchronous per-org cooling read used to prefer healthy accounts.
+   * Same-account 429s never spill regardless of this predicate.
+   */
+  isOrgCooling?: (orgId: string) => boolean;
+}
+
+function failedGeminiOrg(error: unknown, route: GeminiRoute): string {
+  const carried = (error as { geminiOrg?: unknown }).geminiOrg;
+  const label = String(carried || '').trim();
+  return label || geminiRouteOrg(route);
+}
+
+export async function runGeminiRouteFailover<T>(
+  routes: GeminiRoute[],
+  call: (route: GeminiRoute) => Promise<T>,
+  opts?: GeminiRouteFailoverOptions,
+): Promise<T> {
+  const isCooling = opts?.isOrgCooling ?? (() => false);
   let lastError: unknown;
-  for (const route of routes) {
+  const tried = new Set<GeminiRoute>();
+  // Stable order, healthy accounts first: configured order is preserved
+  // within each group, so single-account deployments behave as before.
+  const ordered = [...routes].sort(
+    (a, b) => Number(isCooling(geminiRouteOrg(a))) - Number(isCooling(geminiRouteOrg(b))),
+  );
+  for (const route of ordered) {
+    // A 429 marks its whole account tried (see catch below), so this
+    // head-pick always lands on the next eligible independent account — a
+    // same-account sibling of an exhausted account is never retried.
+    if (tried.has(route)) continue;
+    tried.add(route);
     try {
       return await call(route);
     } catch (error) {
       lastError = error;
-      // Gemini rate limits are project-level, not API-key-level. Failing over to
-      // another key after a 429 can therefore multiply the burst and make the
-      // provider pressure worse. Let providerResilience persist the 429 and
-      // enforce the shared cooldown instead. Failover remains useful for other
-      // retryable failures such as transient transport errors.
-      if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') throw error;
+      if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
+        const failedOrg = failedGeminiOrg(error, route);
+        // Same-account routes share one quota pool: mark them all tried so
+        // the loop head selects the next independent account
+        // (burst-multiplication protection). Different-account routes hold
+        // independent quotas.
+        for (const candidate of ordered) {
+          if (geminiRouteOrg(candidate) === failedOrg) tried.add(candidate);
+        }
+        if (!ordered.some(candidate => !tried.has(candidate))) throw error;
+        continue;
+      }
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
     }
   }
@@ -66,6 +145,29 @@ export async function runGeminiRouteFailover<T>(routes: GeminiRoute[], call: (ro
 }
 
 const sdkByRoute = new Map<string, GoogleGenAI>();
+
+/**
+ * Persisted per-account cooling set for route selection. Reads each org's
+ * ledger window in parallel; any read failure fails open to "not cooling"
+ * for that org (the per-route capacity check inside each attempt still
+ * guards). Pure apart from the injected reader, so unit-testable without a
+ * database.
+ */
+export async function resolveCoolingGeminiOrgs(
+  orgIds: string[],
+  readExpiry: (orgId: string) => Promise<number | undefined>,
+  nowMs: number = Date.now(),
+): Promise<Set<string>> {
+  const states = await Promise.all(orgIds.map(async orgId => {
+    try {
+      const expiry = await readExpiry(orgId);
+      return { orgId, cooling: expiry !== undefined && expiry > nowMs };
+    } catch {
+      return { orgId, cooling: false };
+    }
+  }));
+  return new Set(states.filter(state => state.cooling).map(state => state.orgId));
+}
 function defaultClient(): SemanticModelClient | undefined {
   const routes = configuredGeminiRoutes();
   if (!routes.length) return undefined;
@@ -77,12 +179,35 @@ function defaultClient(): SemanticModelClient | undefined {
     return created;
   };
   return { classify: async (prompt, model) => {
-    const response = await runGeminiRouteFailover(routes, route => executeProviderCall({
-      context: { provider: 'gemini', operation: 'multilingual-semantic-classification', requestMetadata: { geminiRoute: route.id } },
-      timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
-      enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent,
-      call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
-    }));
+    // Enter through a healthy account: accounts already cooling in the
+    // persisted ledger are deprioritized before any API call path, so a
+    // cooling account's sibling is never pointlessly deferred. Single-org
+    // deployments skip the extra reads; ledger errors fail open (the
+    // per-route capacity check inside each attempt still guards).
+    const orgIds = [...new Set(routes.map(route => geminiRouteOrg(route)))];
+    let coolingOrgs = new Set<string>();
+    if (orgIds.length > 1) {
+      coolingOrgs = await resolveCoolingGeminiOrgs(orgIds, orgId => getGeminiOrgSemanticCooldownExpiry(orgId));
+    }
+    const response = await runGeminiRouteFailover(routes, async route => {
+      try {
+        return await executeProviderCall({
+          context: { provider: 'gemini', operation: 'multilingual-semantic-classification', requestMetadata: { geminiRoute: route.id, geminiOrg: geminiRouteOrg(route) } },
+          timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '135000'),
+          enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false', emit: appendProviderCallEvent,
+          call: (signal) => sdkFor(route).models.generateContent({ model, contents: prompt, config: { responseMimeType: 'application/json', temperature: 0, abortSignal: signal } })
+        });
+      } catch (error) {
+        // Carry the failing route AND its account for per-account failover
+        // and retry scheduling. The ledger tags rows with both; these
+        // sidecars cover errors that never reach persistence.
+        if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
+          (error as { geminiRoute?: string }).geminiRoute ??= route.id;
+          (error as { geminiOrg?: string }).geminiOrg ??= geminiRouteOrg(route);
+        }
+        throw error;
+      }
+    }, { isOrgCooling: orgId => coolingOrgs.has(orgId) });
     return JSON.parse(response.text || '{}');
   }};
 }

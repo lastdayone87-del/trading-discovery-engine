@@ -24,7 +24,49 @@ export const DEFAULT_GROQ_CANDIDATE_MODEL = 'openai/gpt-oss-120b';
 export const DEFAULT_GROQ_ADJUDICATOR_MODEL = 'openai/gpt-oss-120b';
 export const GROQ_API_BASE_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-export interface GroqRoute { id: string; key: string; }
+export interface GroqRoute { id: string; key: string; orgId?: string; }
+
+/**
+ * Quota-fate label for a route slot. Slots may name a shared organization via
+ * GROQ_ORG_ID (slot 1) / GROQ_ORG_ID_2..N; unnamed slots each form their own
+ * independent organization (one key per org). Routes sharing an org label
+ * share one quota pool: a 429 on one cools all of them and never fails over
+ * into them. Routes with distinct orgs hold independent quotas.
+ */
+export function groqOrgIdForSlot(env: NodeJS.ProcessEnv, slotNumber: number): string {
+  const name = slotNumber === 1 ? 'GROQ_ORG_ID' : `GROQ_ORG_ID_${slotNumber}`;
+  const label = String(env[name] || '').trim();
+  return label || `slot-${slotNumber}`;
+}
+
+/** Fate-sharing identity consumed by cooldown and failover decisions. */
+export function groqRouteOrg(route: { orgId?: unknown }): string {
+  const label = String(route.orgId || '').trim();
+  // Fail-closed legacy default: routes without an org label (hand-built test
+  // fixtures, never production-configured routes) are assumed to share one
+  // quota pool, preserving the pre-multi-org no-spill behavior.
+  return label || 'shared';
+}
+
+/** Configured key slot numbers (1-based) with a non-empty key. */
+export function groqConfiguredSlotNumbers(env: NodeJS.ProcessEnv = process.env): number[] {
+  return Object.keys(env)
+    .filter(name => name === 'GROQ_API_KEY' || /^GROQ_API_KEY_[2-9][0-9]*$/.test(name))
+    .map(name => (name === 'GROQ_API_KEY' ? 1 : Number(name.slice('GROQ_API_KEY_'.length))))
+    .filter(slot => String(env[slot === 1 ? 'GROQ_API_KEY' : `GROQ_API_KEY_${slot}`] || '').trim())
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Env var names that must name an explicit org for production quota
+ * separation (one per configured key slot). Empty means every route is
+ * labeled; production startup rejects a non-empty result.
+ */
+export function missingGroqOrgLabels(env: NodeJS.ProcessEnv = process.env): string[] {
+  return groqConfiguredSlotNumbers(env)
+    .filter(slot => !String(env[slot === 1 ? 'GROQ_ORG_ID' : `GROQ_ORG_ID_${slot}`] || '').trim())
+    .map(slot => (slot === 1 ? 'GROQ_ORG_ID' : `GROQ_ORG_ID_${slot}`));
+}
 
 /** Return only ordered, non-empty route slots; credentials never leave this process. */
 export function configuredGroqRoutes(env: NodeJS.ProcessEnv = process.env): GroqRoute[] {
@@ -41,7 +83,8 @@ export function configuredGroqRoutes(env: NodeJS.ProcessEnv = process.env): Groq
     if (!key || seen.has(key)) continue;
     seen.add(key);
     counter++;
-    out.push({ id: `groq-${counter}`, key });
+    const slotNumber = name === 'GROQ_API_KEY' ? 1 : Number(name.slice('GROQ_API_KEY_'.length));
+    out.push({ id: `groq-${counter}`, key, orgId: groqOrgIdForSlot(env, slotNumber) });
   }
   return out;
 }
@@ -73,14 +116,33 @@ export function groqRateLimitCooldownMs(env: NodeJS.ProcessEnv = process.env): n
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_GROQ_RATE_LIMIT_COOLDOWN_MS;
 }
 
-let groqCooldownUntilMs = 0;
+/** Per-organization in-process cooldown expiries (ms epoch), keyed by org label. No state is shared across organizations. */
+const groqOrgCooldownUntilMs = new Map<string, number>();
+/** Pool-wide remaining time: the maximum over all per-org windows. */
 export function groqCooldownRemainingMs(nowMs: number = Date.now()): number {
-  return Math.max(0, groqCooldownUntilMs - nowMs);
+  let remaining = 0;
+  for (const untilMs of groqOrgCooldownUntilMs.values()) {
+    remaining = Math.max(remaining, untilMs - nowMs);
+  }
+  return Math.max(0, remaining);
+}
+
+/** In-process cooldown remaining for one quota organization (never shared). */
+export function groqOrgCooldownRemainingMs(orgId: string, nowMs: number = Date.now()): number {
+  return Math.max(0, (groqOrgCooldownUntilMs.get(orgId) || 0) - nowMs);
+}
+
+function armGroqOrgCooldown(orgId: string, nowMs: number = Date.now()): void {
+  groqOrgCooldownUntilMs.set(orgId, nowMs + groqRateLimitCooldownMs());
 }
 
 /** Test-only reset for the in-process cooldown. */
-export function resetGroqCooldownForTests(): void {
-  groqCooldownUntilMs = 0;
+export function resetGroqCooldownForTests(orgId?: string): void {
+  if (orgId === undefined) {
+    groqOrgCooldownUntilMs.clear();
+    return;
+  }
+  groqOrgCooldownUntilMs.delete(orgId);
 }
 
 function groqCooldownDeferredError(remainingMs: number): ProviderCallError {
@@ -92,21 +154,60 @@ function groqCooldownDeferredError(remainingMs: number): ProviderCallError {
   );
 }
 
-export async function runGroqRouteFailover<T>(routes: GroqRoute[], call: (route: GroqRoute) => Promise<T>): Promise<T> {
+export interface GroqRouteFailoverOptions {
+  /**
+   * Synchronous per-org cooling read used to prefer healthy organizations.
+   * Defaults to assuming no org is cooling (failover still advances across
+   * orgs on a 429; same-org 429s never spill regardless of this predicate).
+   */
+  isOrgCooling?: (orgId: string) => boolean;
+}
+
+export async function runGroqRouteFailover<T>(
+  routes: GroqRoute[],
+  call: (route: GroqRoute) => Promise<T>,
+  opts?: GroqRouteFailoverOptions,
+): Promise<T> {
+  const isCooling = opts?.isOrgCooling ?? (() => false);
   let lastError: unknown;
-  for (const route of routes) {
+  const tried = new Set<GroqRoute>();
+  // Stable order, healthy orgs first: configured order is preserved within
+  // each group, so single-org deployments behave exactly as before.
+  const ordered = [...routes].sort(
+    (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
+  );
+  for (const route of ordered) {
+    // A 429 marks its whole organization tried (see catch below), so this
+    // head-pick always lands on the next eligible independent org — a
+    // same-org sibling of an exhausted account is never retried.
+    if (tried.has(route)) continue;
+    tried.add(route);
     try {
       return await call(route);
     } catch (error) {
       lastError = error;
-      // Mirror the Gemini route policy: never fail over on rate limits (burst
-      // multiplication risk on shared/org-level quotas). Failover remains for
-      // other retryable failures such as transient transport errors.
-      if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') throw error;
+      if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') {
+        const failedOrg = failedGroqOrg(error, route);
+        // Same-org routes share one quota pool: mark them all tried so the
+        // loop head selects the next independent org (burst-multiplication
+        // protection). Different-org routes hold independent quotas.
+        for (const candidate of ordered) {
+          if (groqRouteOrg(candidate) === failedOrg) tried.add(candidate);
+        }
+        if (!ordered.some(candidate => !tried.has(candidate))) throw error;
+        continue;
+      }
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
     }
   }
   throw lastError || new ProviderCallError('No configured Groq route is available.', 'TRANSIENT', true);
+}
+
+/** Organization that produced a rate-limit failure: carried on the error when present, else the attempting route's org. */
+function failedGroqOrg(error: unknown, route: GroqRoute): string {
+  const carried = (error as { groqOrg?: unknown }).groqOrg;
+  const label = String(carried || '').trim();
+  return label || groqRouteOrg(route);
 }
 
 function groqRequestExtras(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
@@ -129,18 +230,20 @@ function emitGroqEvent(event: ProviderCallEvent): Promise<void> {
 /** Test seam: the emit sink is injectable so telemetry ordering is unit-testable without a database. */
 export interface GroqDefaultClientDeps {
   /**
-   * Shared-cooldown read, resolving to the persisted expiry (ms epoch) or
-   * undefined when no window is active. Defaults to the persisted ledger so
-   * a 429 seen by any replica (or any earlier process) defers this one too;
-   * tests inject a stub. Fail-open: a ledger outage must never block
-   * classification.
+   * Per-organization persisted-cooldown read, resolving to that org's expiry
+   * (ms epoch) or undefined when no window is active. Defaults to the
+   * persisted ledger so a 429 seen by any replica (or any earlier process)
+   * defers this one too; tests inject a stub. Fail-open: a ledger outage
+   * must never block classification. Existing no-arg stubs remain assignable.
    */
-  persistedCooldownExpiryMs?: () => Promise<number | undefined>;
+  persistedCooldownExpiryMs?: (orgId?: string) => Promise<number | undefined>;
 }
 
-async function defaultPersistedCooldownExpiryMs(): Promise<number | undefined> {
+async function defaultPersistedCooldownExpiryMs(orgId?: string): Promise<number | undefined> {
   try {
-    return await resolveGroqSemanticCooldownExpiryMs();
+    const { resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs } = await import('../../db');
+    if (orgId === undefined) return await resolveGroqSemanticCooldownExpiryMs();
+    return await resolveGroqOrgCooldownExpiryMs(orgId);
   } catch {
     return undefined;
   }
@@ -160,34 +263,37 @@ export function defaultClient(
       const started = Date.now();
       const controller = new AbortController();
       const timer = deadlinesEnabled ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+      const orgId = groqRouteOrg(route);
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
-        requestMetadata: { groqRoute: route.id }, attempt: 1,
+        requestMetadata: { groqRoute: route.id, groqOrg: orgId }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
       try {
-        // Cooldown short-circuit: never spend a fetch while the shared window
-        // is armed. Thrown inside the try so the catch below still emits
-        // exactly one failure event (keeping the persisted ledger fresh) and
-        // the sentinel skips re-arming. Failover policy still applies
-        // (RATE_LIMIT never spills to another route), so concurrent workers
-        // converge on one deferred failure each.
-        const remainingMs = groqCooldownRemainingMs();
+        // Per-org cooldown short-circuit: never spend a fetch while this
+        // organization's window is armed. Thrown inside the try so the catch
+        // below still emits exactly one failure event (keeping the persisted
+        // ledger fresh) and the sentinel skips re-arming. Failover advances
+        // past a cooling org to the next healthy organization; other orgs
+        // are unaffected, so concurrent workers converge instead of storming.
+        const remainingMs = groqOrgCooldownRemainingMs(orgId);
         if (remainingMs > 0) throw groqCooldownDeferredError(remainingMs);
         // Cross-replica gate: the in-process flag above only knows this
         // process. A 429 recorded by another replica (or an earlier process)
-        // lives in the persisted ledger — consult it on every classification
-        // so fresh replicas and queue-bypassing paths (rechecks, shadow
-        // runners) also defer instead of re-hitting the window. Fail-open on
-        // ledger errors; also arms the fast in-process flag for followers.
+        // lives in the persisted ledger — consult this org's window on every
+        // classification so fresh replicas and queue-bypassing paths
+        // (rechecks, shadow runners) also defer instead of re-hitting the
+        // window. Fail-open on ledger errors; also arms the fast in-process
+        // flag for followers of the same org.
         let persistedExpiryMs: number | undefined;
         try {
-          persistedExpiryMs = await persistedCooldownExpiryMs();
+          persistedExpiryMs = await persistedCooldownExpiryMs(orgId);
         } catch {
           persistedExpiryMs = undefined;
         }
         if (persistedExpiryMs !== undefined && persistedExpiryMs > Date.now()) {
-          groqCooldownUntilMs = Math.max(groqCooldownUntilMs, persistedExpiryMs);
+          const known = groqOrgCooldownUntilMs.get(orgId) || 0;
+          groqOrgCooldownUntilMs.set(orgId, Math.max(known, persistedExpiryMs));
           throw groqCooldownDeferredError(persistedExpiryMs - Date.now());
         }
         const res = await fetch(GROQ_API_BASE_URL, {
@@ -238,10 +344,10 @@ export function defaultClient(
           ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
           : classifyProviderError(error);
         if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred !== true) {
-          // Genuine provider 429: arm the shared cooldown once. The deferred
-          // sentinel above is excluded so short-circuits never extend the
-          // window indefinitely.
-          groqCooldownUntilMs = Date.now() + groqRateLimitCooldownMs();
+          // Genuine provider 429: arm only this organization's cooldown. The
+          // deferred sentinel above is excluded so short-circuits never
+          // extend the window indefinitely. Other orgs keep serving.
+          armGroqOrgCooldown(orgId);
         }
         if (typed.errorClass === 'RATE_LIMIT') {
           const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
@@ -250,6 +356,9 @@ export function defaultClient(
           if (!reasons.includes(GROQ_RATE_LIMITED_REASON)) {
             (typed as { providerReasons?: string[] }).providerReasons = [...reasons, GROQ_RATE_LIMITED_REASON];
           }
+          // Carry the failed organization for org-aware failover and
+          // per-org retry scheduling downstream.
+          (typed as { groqOrg?: string }).groqOrg = orgId;
         }
         // Deferred short-circuits stay observable but must never restart the
         // persisted window: the shared expiry derives from the latest
@@ -265,7 +374,7 @@ export function defaultClient(
       } finally {
         if (timer) clearTimeout(timer);
       }
-    });
+    }, { isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0 });
     return response;
   }};
 }

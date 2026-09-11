@@ -75,8 +75,9 @@ import { processPlaylistInspectionJob } from './playlistAdapterWorker';
 import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWorker';
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
-import { isGeminiSemanticCooldownActive, isGroqSemanticCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
-import { shouldUseGroqSemantic, configuredGroqRoutes, groqCooldownRemainingMs } from './evidenceEngine/providers/GroqSemanticProvider';
+import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
+import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
+import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
@@ -230,6 +231,16 @@ export function groqFallbackCoolingDown(persistedCooldownActive: boolean, localC
 }
 
 /**
+ * Pool-level cooling composition over independent routes/orgs: the pool is
+ * cooling only when every known route is cooling (fail-closed on an empty
+ * list). One healthy account keeps enrichment claimable while the others
+ * cool. Pure and unit-testable; async ledger reads stay at the call site.
+ */
+export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
+  return perRouteCooling.length === 0 || perRouteCooling.every(Boolean);
+}
+
+/**
  * Durable job types claimable through processNextSearchJob overrides.
  * RELATIONSHIP_CANARY_EXPANSION rides the existing SEARCH pool (same YouTube
  * provider profile, same tick lifecycle) behind its own settings gate, so no
@@ -264,24 +275,32 @@ export async function processNextSearchJob(
   // enrichment_stage >= 1, so when Gemini is rate-limited every claimed
   // ENRICH_CHANNEL job immediately defers via SEMANTIC_DEFERRED_RATE_PRESSURE,
   // creating a ~1Hz DEFER storm. This gate pauses ENRICH_CHANNEL claims
-  // during the active route's cooldown period: Groq-selected claims consult
-  // the Groq cooldown, free-Gemini-selected claims consult the free-Gemini
-  // cooldown, and paid-Gemini claims consult the paid cooldown, so a stale
-  // cooldown on any idle route can never stall the serving one. When paid
-  // Gemini is cooling down, a configured Groq fallback route that is clear of
-  // BOTH its persisted shared cooldown and its process-local cooldown still
-  // allows the claim so jobs can reach the already-working fallback.
+  // while the serving pool is cooling. Each provider account cools
+  // independently: paid-Gemini claims consult every configured Gemini
+  // account, Groq-selected claims consult every Groq organization, and a
+  // stale cooldown on any idle route or exhausted account never stalls the
+  // healthy ones. When paid Gemini is cooling on all accounts, a configured
+  // Groq organization that is clear of BOTH its persisted cooldown and its
+  // process-local cooldown still allows the claim so jobs can reach the
+  // already-working fallback.
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
-    const geminiCooldownActive = !groqSelected && !geminiFreeSelected ? await isGeminiSemanticCooldownActive() : false;
-    const groqCooldownActive = groqSelected ? await isGroqSemanticCooldownActive() : false;
+    const geminiRoutes = !groqSelected && !geminiFreeSelected ? configuredGeminiRoutes() : [];
+    const geminiCooldownActive = geminiRoutes.length > 0
+      ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
+      : (!groqSelected && !geminiFreeSelected ? await isGeminiSemanticCooldownActive() : false);
+    const groqRoutes = groqSelected ? configuredGroqRoutes() : [];
+    const groqCooldownActive = groqRoutes.length > 0
+      ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))))
+      : (groqSelected ? await isGroqSemanticCooldownActive() : false);
     const geminiFreeCooldownActive = geminiFreeSelected ? await isGeminiFreeSemanticCooldownActive() : false;
     let groqFallbackConfigured = false;
     let groqFallbackCooldownActive = false;
     if (!groqSelected && !geminiFreeSelected && geminiCooldownActive) {
-      groqFallbackConfigured = configuredGroqRoutes().length > 0 && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true';
-      if (groqFallbackConfigured) groqFallbackCooldownActive = groqFallbackCoolingDown(await isGroqSemanticCooldownActive(), groqCooldownRemainingMs());
+      const fallbackRoutes = configuredGroqRoutes();
+      groqFallbackConfigured = fallbackRoutes.length > 0 && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true';
+      if (groqFallbackConfigured) groqFallbackCooldownActive = allRoutesCoolingDown(await Promise.all(fallbackRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
     }
     if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive })) claimableTypes.push('ENRICH_CHANNEL');
   }

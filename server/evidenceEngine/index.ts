@@ -109,10 +109,16 @@ export async function executeSemanticChain(
     } catch (err: any) {
       console.warn(`[EvidenceEngine] Semantic provider ${provider.name} error:`, err?.message || err);
       const timeout = err?.errorClass === 'TIMEOUT' || /timeout|timed out|abort/i.test(String(err?.message || err));
+      // Preserve the failed quota-organization (when the provider error
+      // carries one) so retry scheduling can align with that account's
+      // cooldown. Omitted when absent to keep report shapes stable.
+      const failedOrg = [ (err as { groqOrg?: unknown })?.groqOrg, (err as { geminiOrg?: unknown })?.geminiOrg ]
+        .map(value => String(value || '').trim()).find(Boolean);
       reports.push({ provider: provider.name, availability: 'FAILED', evidenceCount: 0,
         outcome: timeout ? 'FAILED_TIMEOUT' : 'FAILED_PROVIDER',
         reasonCodes: safeProviderFailureReasonCodes(err, timeout),
-        reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')}).`, durationMs: Date.now() - started });
+        reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')}).`, durationMs: Date.now() - started,
+        ...(failedOrg ? { orgId: failedOrg } : {}) });
       priorFailed = true;
     }
   }

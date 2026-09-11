@@ -87,6 +87,7 @@ import { getCommunityRetryWorkerHealth } from './server/operationalMaintenanceWo
 import { dryRunCountryBoundaryCohort, enqueueCountryBoundaryCohort, COUNTRY_BOUNDARY_RECOVERY_VERSION } from './server/countryBoundaryRecovery';
 import { browserCapabilitySnapshot, startBrowserCapabilityMonitor } from './server/browserCapability';
 import { assertProductionCountryArchitecture } from './server/productionCountryArchitecture';
+import { validateSemanticOrgLabels } from './server/semanticOrgLabels';
 import { inspectExecutionTrace, recordExecutionStage, withExecutionTrace } from './server/executionTrace';
 import { getNomination, inspectNominationAttribution, listNominations } from './server/candidateAdmission/store';
 import { getCandidateAdmissionBaseline } from './server/candidateAdmission/metrics';
@@ -106,6 +107,7 @@ import {activateRelease5Capability,inspectRelease5Rollout,repairRelease5Projecti
 async function startServer() {
   assertProductionCountryArchitecture();
   validateOperatorConfiguration();
+  validateSemanticOrgLabels();
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
   const readiness = createReadinessState();

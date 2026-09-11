@@ -229,6 +229,13 @@ export interface ProviderExecutionReport {
   reasonCodes: string[];
   durationMs?: number;
   reason?: string;
+  /**
+   * Quota-organization that produced a FAILED report, when the provider error
+   * carried one (groqOrg/geminiOrg sidecar). Lets retry scheduling align with
+   * the failed account's cooldown instead of a pool-wide window. Absent for
+   * non-failure reports and legacy callers.
+   */
+  orgId?: string;
 }
 
 export interface EvidenceCollectionReport {
