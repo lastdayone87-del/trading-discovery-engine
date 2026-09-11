@@ -238,7 +238,7 @@ existing incompatible legacy operation: it returns an error by design.
 | `DISCOVERY_MANUAL_QUOTA_PERCENT` | Manual reserve; default 10. |
 | `SEARCH_WORKER_CONCURRENCY` | Search worker count; default 1. |
 | `MANUAL_SEARCH_WORKER_CONCURRENCY` | Manual continuation worker count; default 1. |
-| `ENRICHMENT_WORKER_CONCURRENCY` | Enrichment worker count; default 1. |
+| `ENRICHMENT_WORKER_CONCURRENCY` | Enrichment worker count; default 3. |
 | `YOUTUBE_DISCOVERY_MAX_RESULTS` | Results requested per search, clamped 10–50; default 25. |
 | `REVIEW_API_TOKEN` | Required bearer secret for review reads and decisions. |
 

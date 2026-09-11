@@ -1797,6 +1797,10 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
 
 /** Default enrichment workers when ENRICHMENT_WORKER_CONCURRENCY is unset. */
 export const ENRICHMENT_WORKER_CONCURRENCY_DEFAULT = 3;
+/** Resolve the enrichment worker count from env (pure; env override wins). */
+export function resolveEnrichmentWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.max(1, Number(env.ENRICHMENT_WORKER_CONCURRENCY || ENRICHMENT_WORKER_CONCURRENCY_DEFAULT));
+}
 function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = []): void {
   const safeConcurrency = Math.min(20, Math.max(1, Math.floor(concurrency) || 1));
   for (let index = 0; index < safeConcurrency; index++) {
@@ -1834,5 +1838,5 @@ export function startSearchWorkers(): void {
   // per completion (~10.8/hr per worker), so 3 workers burst ~30/hr against
   // ample provider headroom while staying within daily YouTube (~107k/day at
   // full tilt vs 300k pool) and browser-gate bounds. Env override still wins.
-  startWorkerPool('ENRICH_CHANNEL', Math.max(1, Number(process.env.ENRICHMENT_WORKER_CONCURRENCY || ENRICHMENT_WORKER_CONCURRENCY_DEFAULT)));
+  startWorkerPool('ENRICH_CHANNEL', resolveEnrichmentWorkerCount());
 }
