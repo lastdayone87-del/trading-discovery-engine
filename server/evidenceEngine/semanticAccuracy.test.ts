@@ -397,3 +397,85 @@ test('match collection collapses case and format variants of one token', async (
   assert.equal(pushUniqueMatch(collected, '   '), false);
   assert.deepEqual(collected, ['garten', 'vlog']);
 });
+
+test('observation identity matrix: playlists, title+bio, case variants', async () => {
+  const { dedupeWeightByFieldGroup } = await import('./decisionPolicy');
+  const makeItem = (fields: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null }>, finalWeight: number) => ({
+    provenance: { fields }, finalWeight,
+  });
+  // Distinct playlists stay separate observations.
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem([{ field: 'playlist_name', sourceFamilyId: 'fam-p1' }], -14),
+      makeItem([{ field: 'playlist_name', sourceFamilyId: 'fam-p2' }], -14),
+    ] as never),
+    28
+  );
+  // Same channel title+bio under one family: single voice.
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem(
+        [{ field: 'channel_title', sourceFamilyId: 'fam-c' }, { field: 'channel_bio', sourceFamilyId: 'fam-c' }],
+        -16
+      ),
+      makeItem([{ field: 'channel_bio', sourceFamilyId: 'fam-c' }], -10),
+    ] as never),
+    16
+  );
+  // Case variants of one token in one field: single voice.
+  assert.equal(
+    dedupeWeightByFieldGroup([
+      makeItem([{ field: 'channel_bio', sourceFamilyId: 'fam-c' }], -21),
+      makeItem([{ field: 'channel_bio', sourceFamilyId: 'fam-c' }], -14),
+    ] as never),
+    21
+  );
+});
+
+test('multi-video positives survive a bio negative in contradiction math', async () => {
+  const { dedupeWeightByFieldGroup } = await import('./decisionPolicy');
+  const makeItem = (fields: Array<{ field?: string; sourceFamilyId?: string | null; sourceId?: string | null }>, finalWeight: number) => ({
+    provenance: { fields }, finalWeight,
+  });
+  const positives = [
+    makeItem([{ field: 'video_title', sourceFamilyId: 'fam-v0' }], 20),
+    makeItem([{ field: 'video_title', sourceFamilyId: 'fam-v1' }], 20),
+    makeItem(
+      [{ field: 'video_title', sourceFamilyId: 'fam-v0' }, { field: 'video_title', sourceFamilyId: 'fam-v1' }],
+      18
+    ),
+  ] as never;
+  const negatives = [
+    makeItem([{ field: 'channel_bio', sourceFamilyId: 'fam-c' }], 35),
+  ] as never;
+  const positiveWeight = dedupeWeightByFieldGroup(positives);
+  const terminalNegativeWeight = dedupeWeightByFieldGroup(negatives);
+  assert.equal(positiveWeight, 40);
+  assert.equal(terminalNegativeWeight, 35);
+  assert.ok(!(terminalNegativeWeight >= 25 && terminalNegativeWeight > positiveWeight * 1.5));
+});
+
+test('semantic chain worst case fits the worker lease with heartbeats', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { groqTimeoutMs } = await import('./providers/GroqSemanticProvider');
+  const { geminiFreeTimeoutMs } = await import('./providers/GeminiFreeSemanticProvider');
+  const savedGroq = process.env.GROQ_PROVIDER_TIMEOUT_MS;
+  const savedFree = process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS;
+  delete process.env.GROQ_PROVIDER_TIMEOUT_MS;
+  delete process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS;
+  try {
+    // Three sequential provider deadlines (paid Gemini default is a matching
+    // 135s budget) must fit inside the 15-minute stale-job window while the
+    // 60s worker heartbeat keeps refreshing the claim.
+    const chainWorstMs = groqTimeoutMs() + geminiFreeTimeoutMs() + 135000;
+    assert.ok(chainWorstMs < 15 * 60 * 1000, `chain ${chainWorstMs}ms must fit the stale window`);
+    const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
+    assert.match(queue, /setInterval\(\(\) => \{\s*heartbeatJob/s);
+    assert.match(queue, /, 60_000\)/);
+  } finally {
+    if (savedGroq === undefined) delete process.env.GROQ_PROVIDER_TIMEOUT_MS;
+    else process.env.GROQ_PROVIDER_TIMEOUT_MS = savedGroq;
+    if (savedFree === undefined) delete process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS;
+    else process.env.GEMINI_FREE_PROVIDER_TIMEOUT_MS = savedFree;
+  }
+});

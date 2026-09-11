@@ -1,6 +1,7 @@
 import type { DiscoverySource } from '../src/types';
 import type { VerificationDecision } from './evidenceEngine';
 import type { DiscoveredChannelRaw } from './youtube';
+import { uncoveredFailedProviders } from './enrichmentOperationalFailure';
 
 export const CANDIDATE_TRIAGE_POLICY_VERSION = 'candidate-triage-v4-contextual-admission';
 
@@ -191,8 +192,17 @@ export function hasIndependentTradingHypothesis(decision: VerificationDecision):
   if (decision.status === 'TRADING_CONFIRMED') return true;
   // Operational provider failure is not negative evidence. Preserve the case
   // for one bounded retry rather than converting missing provider output into a
-  // durable "no trading hypothesis" withholding decision.
-  if (decision.evidenceCollection.degraded) return true;
+  // durable "no trading hypothesis" withholding decision. A served semantic
+  // fallback counts as coverage restored (only genuinely uncovered failures
+  // preserve the case), so a covered abstention with no positive evidence
+  // follows the same lifecycle as a healthy abstention. Reports without any
+  // provider detail fall back to the raw degraded flag (fail-safe preserve).
+  const providers = decision.evidenceCollection.providers || [];
+  if (providers.length === 0) {
+    if (decision.evidenceCollection.degraded) return true;
+  } else if (uncoveredFailedProviders(decision.evidenceCollection).length > 0) {
+    return true;
+  }
   const substantivePositive = decision.positiveEvidence.some(item =>
     item.rawMatches.length > 0 &&
     item.category !== 'SEMANTIC_ABSTENTION' &&

@@ -55,3 +55,14 @@ test('fallback-covered degradation emits no provider gap for canary selection', 
   };
   assert.ok(deriveEvidenceGaps({ evidenceCollection: uncovered } as never).includes('PROVIDER_DEGRADED'));
 });
+
+test('covered stage-two canary selection never picks provider retry', () => {
+  const d = decision({evidenceCollection:{sufficiency:'SUFFICIENT',sparseMetadata:false,degraded:true,fieldsPresent:['channel_bio'],reasonCodes:['PROVIDER_COVERAGE_DEGRADED'],providers:[
+    {provider:'gemini_semantic',availability:'FAILED',evidenceCount:0,outcome:'FAILED_PROVIDER',reasonCodes:['PROVIDER_RATE_LIMIT']},
+    {provider:'groq_semantic',availability:'AVAILABLE',evidenceCount:0,outcome:'ABSTAINED_LOW_CONFIDENCE',reasonCodes:['SEMANTIC_MODEL_ABSTAINED','SEMANTIC_FALLBACK_SUCCEEDED']},
+  ]}});
+  const plan = planEvidenceAction({decision:d,rawInput:{channel_name:'CoveredCanary',description:'rich enough bio text for review',enrichment_stage:2},mode:'CANARY',providerQuotaRemaining:1000});
+  assert.ok(!plan.gaps.includes('PROVIDER_DEGRADED'));
+  assert.notEqual(plan.selectedAction,'PROVIDER_RETRY');
+  assert.notEqual(plan.appliedAction,'PROVIDER_RETRY');
+});
