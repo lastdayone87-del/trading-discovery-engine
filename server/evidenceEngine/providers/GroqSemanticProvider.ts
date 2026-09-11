@@ -58,9 +58,10 @@ export function groqConfiguredSlotNumbers(env: NodeJS.ProcessEnv = process.env):
 }
 
 /**
- * Env var names that must name an explicit org for production quota
- * separation (one per configured key slot). Empty means every route is
- * labeled; production startup rejects a non-empty result.
+ * Env var names for configured key slots without an explicit org label (one
+ * per configured slot). Used for advisory startup visibility: unlabeled
+ * slots are independent orgs by default, so a non-empty result is logged,
+ * never rejected.
  */
 export function missingGroqOrgLabels(env: NodeJS.ProcessEnv = process.env): string[] {
   return groqConfiguredSlotNumbers(env)
