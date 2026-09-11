@@ -178,9 +178,9 @@ export async function isGeminiSemanticCooldownActive(nowMs: number = Date.now())
 /**
  * Per-account Gemini cooldown expiry from the persisted ledger. Each
  * account's window derives only from RATE_LIMITED rows tagged with its own
- * org label (untagged legacy rows count conservatively toward the queried
- * account for one window after deploy). A 429 on one account never affects
- * another account's window.
+ * org label; untagged rows cool no account (fail-open for at most one window
+ * after deploy, after which every semantic path tags its rows). A 429 on one
+ * account never affects another account's window.
  */
 export async function getGeminiOrgSemanticCooldownExpiry(orgId: string, nowMs: number = Date.now()): Promise<number | undefined> {
   const config = geminiCapacityConfig();
@@ -190,7 +190,7 @@ export async function getGeminiOrgSemanticCooldownExpiry(orgId: string, nowMs: n
     const res = await db.query(
       `SELECT occurred_at FROM provider_call_events
        WHERE provider='gemini' AND status='RATE_LIMITED'
-       AND (request_metadata->>'geminiOrg'=$1 OR request_metadata->>'geminiOrg' IS NULL)
+       AND request_metadata->>'geminiOrg'=$1
        ORDER BY occurred_at DESC LIMIT 1`,
       [orgId]
     );
@@ -337,10 +337,10 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
     const [lastAny,lastRate,lastSemantic,lastVocabulary]=await Promise.all([
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND COALESCE(request_metadata->>'geminiRoute',$1)=$1 ORDER BY occurred_at DESC LIMIT 1`,[routeId],signal,deadlineAtMs),
       // Rate limits are per-account: only this account's own RATE_LIMITED
-      // rows feed its cooldown window (untagged legacy rows count
-      // conservatively toward the queried account for one window after
-      // deploy), so one exhausted account never paces the healthy ones.
-      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND (request_metadata->>'geminiOrg'=$1 OR request_metadata->>'geminiOrg' IS NULL) ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
+      // rows feed its cooldown window (strict org tag match — untagged rows
+      // cool no account), so one exhausted account never paces the healthy
+      // ones.
+      queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,routeId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND COALESCE(request_metadata->>'geminiRoute',$2)=$2 ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,routeId],signal,deadlineAtMs)
     ]);

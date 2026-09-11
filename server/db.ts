@@ -40,8 +40,8 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   let groqSemanticCooldownExpiryMs: number|undefined=undefined;
   let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined;
   const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[];
-  if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')){
-    const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED']);
+  if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||(providerReasons.includes('PROVIDER_RATE_LIMIT')&&failedProviderOrg(error,['PROVIDER_RATE_LIMIT'],['gemini_semantic'])!==undefined)){
+    const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED','PROVIDER_RATE_LIMIT'],['gemini_semantic']);
     geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,now):await resolveGeminiSemanticCooldownExpiryMs(now);
   }
   // Groq cooldown from the same persisted ledger (provider='groq'), scoped to

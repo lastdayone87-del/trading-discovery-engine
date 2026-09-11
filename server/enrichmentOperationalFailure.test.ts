@@ -262,3 +262,53 @@ test('exhausted groq org survives wrapping with its rate-limit reason for org-sc
     'retry scheduling must resolve the failed org, not a pool-wide window'
   );
 });
+
+test('org resolvers scope strictly by org tag: untagged rows cool no account', async () => {
+  const dbCore = await import('./dbCore');
+  for (const fn of [dbCore.resolveGeminiOrgSemanticCooldownExpiryMs, dbCore.resolveGroqOrgCooldownExpiryMs]) {
+    const source = fn.toString();
+    assert.ok(source.includes('request_metadata->>'), 'resolver must scope by metadata tag');
+  }
+  const gemini = dbCore.resolveGeminiOrgSemanticCooldownExpiryMs.toString();
+  assert.ok(gemini.includes("request_metadata->>'geminiOrg'=$1"), 'gemini resolver must match the queried org only');
+  assert.ok(!gemini.includes('IS NULL'), 'untagged gemini rows must not poison explicitly labelled accounts');
+  const groq = dbCore.resolveGroqOrgCooldownExpiryMs.toString();
+  assert.ok(groq.includes("request_metadata->>'groqOrg'=$1"), 'groq resolver must match the queried org only');
+  assert.ok(!groq.includes("groqOrg' IS NULL"), 'untagged groq rows must not poison explicitly labelled orgs');
+});
+
+test('direct gemini PROVIDER_RATE_LIMIT with known org resolves scoped, others do not', async () => {
+  const { failedProviderOrg } = await import('./dbCore');
+  const codes = ['SEMANTIC_DEFERRED_RATE_PRESSURE', 'GEMINI_CAPACITY_DEFERRED', 'PROVIDER_RATE_LIMIT'];
+  const scoped = ['gemini_semantic'];
+  assert.equal(
+    failedProviderOrg({ providerFailures: [{ provider: 'gemini_semantic', reasonCodes: ['PROVIDER_RATE_LIMIT'], orgId: 'slot-2' }] }, codes, scoped),
+    'slot-2',
+    'direct upstream gemini 429 must schedule against its own account cooldown'
+  );
+  assert.equal(
+    failedProviderOrg({ providerReasons: ['PROVIDER_RATE_LIMIT'], geminiOrg: 'slot-1' }, codes, scoped),
+    'slot-1',
+    'raw sidecar path resolves without wrapper entries'
+  );
+  assert.equal(
+    failedProviderOrg({ providerFailures: [{ provider: 'discord_metadata', reasonCodes: ['PROVIDER_RATE_LIMIT'], orgId: 'slot-9' }] }, codes, scoped),
+    undefined,
+    'non-semantic rate limits must never resolve to a gemini account'
+  );
+  assert.equal(
+    failedProviderOrg({ providerReasons: ['PROVIDER_RATE_LIMIT'] }, codes, scoped),
+    undefined,
+    'unattributed rate limits keep generic backoff instead of a global gemini window'
+  );
+});
+
+test('direct gemini rate limit survives the operational wrapper with its org', () => {
+  const r = report(true, ['PROVIDER_RATE_LIMIT'], 'SUFFICIENT');
+  (r.providers[0] as { provider: unknown }).provider = 'gemini_semantic';
+  (r.providers[0] as { orgId?: string }).orgId = 'slot-1';
+  const error = enrichmentOperationalFailure(r, true, false);
+  assert.ok(error, 'gemini outage without decision-grade support must throw');
+  assert.ok(error!.providerReasons.includes('PROVIDER_RATE_LIMIT'));
+  assert.equal((error as unknown as { providerFailures: Array<{ orgId?: string }> }).providerFailures[0].orgId, 'slot-1');
+});
