@@ -36,6 +36,25 @@ test('partner evidence still blocks creator-owned promotion even on a brand-look
   assert.ok(ownership.ownershipReasons?.includes('PARTNER_OR_AFFILIATE_SURFACE'));
 });
 
+test('invite observed on a creator-linked canonical domain is creator-owned',()=>{
+  // creatorWebsiteHosts is wired from channel links by runChannelInspection;
+  // the name here deliberately does NOT brand-match the domain, isolating
+  // the canonical-domain signal (40 base + 55 canonical = 95).
+  const c=candidate('CREATOR_WEBSITES','https://atlasfx.io/community');
+  const without=inferDiscordOwnership(c,{creatorName:'Atlas Trading'});
+  assert.equal(without.ownershipStatus,'UNCERTAIN');
+  const owned=inferDiscordOwnership(c,{creatorName:'Atlas Trading',creatorWebsiteHosts:['atlasfx.io']});
+  assert.equal(owned.ownershipStatus,'CREATOR_OWNED');
+  assert.ok(owned.ownershipReasons?.includes('CREATOR_CANONICAL_DOMAIN'));
+});
+
+test('canonical-domain signal does not rescue partner/affiliate surfaces',()=>{
+  const c=candidate('CREATOR_WEBSITES','https://atlasfx.io/partner-bonus');
+  const ownership=inferDiscordOwnership(c,{creatorName:'Atlas Trading',creatorWebsiteHosts:['atlasfx.io']});
+  assert.notEqual(ownership.ownershipStatus,'CREATOR_OWNED');
+  assert.ok(ownership.ownershipReasons?.includes('PARTNER_OR_AFFILIATE_SURFACE'));
+});
+
 test('public Discord invite landing-page metadata can confirm trading relevance without joining',async()=>{
   const calls:string[]=[];
   const result=await validateDiscordInvite('room',{
