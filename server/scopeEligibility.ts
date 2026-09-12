@@ -23,3 +23,19 @@ export function resolveScopeEligibility(country: string | null | undefined): Sco
   if (!normalized) return 'UNRESOLVED';
   return SUPPORTED.has(normalized) ? 'IN_SCOPE' : 'OUT_OF_SCOPE';
 }
+
+/**
+ * Write-path invariant: final country → final scope_eligibility. ALWAYS
+ * derives from the row's country, ignoring any stale stored value: when the
+ * country changes, scope eligibility must change with it. Callers set the
+ * country first (projections, validation, recovery), then this — never the
+ * reverse, and never a preserved explicit value.
+ */
+export function scopeEligibilityForWrite(channel: {
+  country?: string | null;
+  /** Accepted but deliberately ignored: a stale stored value must never survive. */
+  scope_eligibility?: string | null;
+}): ScopeEligibility {
+  void channel.scope_eligibility;
+  return resolveScopeEligibility(channel.country ?? null);
+}

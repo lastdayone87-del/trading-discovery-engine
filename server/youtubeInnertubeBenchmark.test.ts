@@ -7,7 +7,10 @@ import test from 'node:test';
  * Env-gated: runs ONLY with INNERTUBE_BENCHMARK_LIVE=1, i.e. inside the
  * deployment container when explicitly authorized — never in CI. Executes 250
  * keyless description fetches across a fixed channel list and records
- * success/error/throttle rates plus p50/p99 latency. No assertions on live
+ * success/upstream-throttle/local-cooldown/error rates plus fetch latency.
+ * Local cooldown rejections (no session started, no upstream request) are
+ * reported separately and excluded from latency percentiles: local resilience
+ * behavior must never read as YouTube throttling. No assertions on live
  * outcomes (results are recorded, never fabricated); the test fails only on
  * harness errors. Base suite stays green without the flag.
  */
@@ -21,12 +24,13 @@ const CHANNELS = [
 ];
 
 test('innertube container stability benchmark (live, env-gated)', { skip: !LIVE }, async () => {
-  const { fetchChannelVideoDescriptionsViaInnertube } = await import(
+  const { fetchChannelVideoDescriptionsViaInnertube, classifyBenchmarkOutcome } = await import(
     './youtubeInnertubeProvider'
   );
   const latencies: number[] = [];
   let success = 0;
-  let throttled = 0;
+  let upstreamThrottled = 0;
+  let localCooldown = 0;
   let failed = 0;
   for (let i = 0; i < CALLS; i++) {
     const channelId = CHANNELS[i % CHANNELS.length];
@@ -34,11 +38,18 @@ test('innertube container stability benchmark (live, env-gated)', { skip: !LIVE 
     try {
       await fetchChannelVideoDescriptionsViaInnertube(channelId, { maxVideos: 3 });
       success += 1;
-    } catch (error: any) {
-      if (String(error?.code || '').includes('RATE_LIMITED')) throttled += 1;
-      else failed += 1;
-    } finally {
       latencies.push(Date.now() - started);
+    } catch (error: unknown) {
+      const outcome = classifyBenchmarkOutcome(error);
+      if (outcome === 'LOCAL_COOLDOWN') {
+        localCooldown += 1;
+      } else if (outcome === 'UPSTREAM_THROTTLED') {
+        upstreamThrottled += 1;
+        latencies.push(Date.now() - started);
+      } else {
+        failed += 1;
+        latencies.push(Date.now() - started);
+      }
     }
     if ((i + 1) % 50 === 0) console.log(`[InnerTube Benchmark] progress ${i + 1}/${CALLS}`);
   }
@@ -47,13 +58,15 @@ test('innertube container stability benchmark (live, env-gated)', { skip: !LIVE 
   const report = {
     calls: CALLS,
     success,
-    throttled,
+    upstreamThrottled,
+    localCooldown,
     failed,
+    attemptedFetches: latencies.length,
     successRate: success / CALLS,
-    p50LatencyMs: quantile(0.5),
-    p99LatencyMs: quantile(0.99),
+    p50FetchLatencyMs: latencies.length ? quantile(0.5) : null,
+    p99FetchLatencyMs: latencies.length ? quantile(0.99) : null,
     measuredAt: new Date().toISOString(),
   };
   console.log(`[InnerTube Benchmark] ${JSON.stringify(report)}`);
-  assert.equal(success + throttled + failed, CALLS);
+  assert.equal(success + upstreamThrottled + localCooldown + failed, CALLS);
 });

@@ -7,29 +7,37 @@
 --                 (dormant supported countries included)
 --   OUT_OF_SCOPE  attributed country is outside the supported universe
 --   UNRESOLVED    no country attributed yet
--- The column is nullable with no DEFAULT (metadata-only ADD, no table
--- rewrite). Backfill runs as three small categorized UPDATEs. A CHECK
--- constraint guards the value domain; application writes derive values via
--- resolveScopeEligibility() in server/scopeEligibility.ts.
+--
+-- Operational safety for the single-transaction runner (BEGIN/COMMIT around
+-- the whole file: VALIDATE CONSTRAINT is illegal inside a transaction
+-- block, so no NOT VALID + separate VALIDATE split is used):
+--   * ADD COLUMN nullable with no DEFAULT (metadata-only, no rewrite).
+--   * ONE backfill UPDATE (single sequential scan) with SQL-side
+--     canonicalization matching resolveScopeEligibility(): BTRIM whitespace,
+--     LOWER casefold, empty-after-trim -> UNRESOLVED. (Runtime additionally
+--     applies Unicode NFKC; all 20 registry names are ASCII so the two are
+--     equivalent here.)
+--   * Plain ADD CHECK validated inline over already-backfilled rows. Table is
+--     ~10k rows; the scan is milliseconds under a brief lock.
+-- Application writes derive values via resolveScopeEligibility() in
+-- server/scopeEligibility.ts. The supported list below MUST equal
+-- SUPPORTED_PRODUCTION_COUNTRIES (lowercased); server/scopeRegistry.test.ts
+-- fails on divergence.
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS scope_eligibility TEXT;
 
--- Single-pass backfill (one sequential scan, no per-row locking beyond the
--- statement): supported universe (dormant included) -> IN_SCOPE, any other
--- attributed country -> OUT_OF_SCOPE, unattributed -> UNRESOLVED.
 UPDATE channels SET scope_eligibility = CASE
-  WHEN country IN (
-    'United States','United Kingdom','Germany','France','Spain','Netherlands',
-    'Italy','Australia','Canada','Japan','Switzerland','Denmark','Sweden',
-    'United Arab Emirates','Singapore','New Zealand','Belgium','Luxembourg',
-    'Ireland','Norway'
+  WHEN NULLIF(BTRIM(country), '') IS NULL THEN 'UNRESOLVED'
+  WHEN LOWER(BTRIM(country)) IN (
+    'united states','united kingdom','germany','france','spain','netherlands',
+    'italy','australia','canada','japan','switzerland','denmark','sweden',
+    'united arab emirates','singapore','new zealand','belgium','luxembourg',
+    'ireland','norway'
   ) THEN 'IN_SCOPE'
-  WHEN country IS NOT NULL THEN 'OUT_OF_SCOPE'
-  ELSE 'UNRESOLVED'
+  ELSE 'OUT_OF_SCOPE'
 END
 WHERE scope_eligibility IS NULL;
 
 ALTER TABLE channels DROP CONSTRAINT IF EXISTS channels_scope_eligibility_check;
 ALTER TABLE channels ADD CONSTRAINT channels_scope_eligibility_check
-  CHECK (scope_eligibility IS NULL OR scope_eligibility IN ('IN_SCOPE','OUT_OF_SCOPE','UNRESOLVED')) NOT VALID;
-ALTER TABLE channels VALIDATE CONSTRAINT channels_scope_eligibility_check;
+  CHECK (scope_eligibility IS NULL OR scope_eligibility IN ('IN_SCOPE','OUT_OF_SCOPE','UNRESOLVED'));

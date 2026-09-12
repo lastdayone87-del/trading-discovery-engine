@@ -1389,6 +1389,13 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
           channel.country_status = 'REJECTED';
           channel.confidence_score = valRes.score;
           channel.scan_status = 'COMPLETED';
+          // Project the newly detected creator country (never retain a stale
+          // attribution the fresh validation overturned). scope_eligibility
+          // follows from the final country inside upsertChannel; a missing
+          // detection keeps the prior country rather than nulling truth.
+          if (valRes.detectedCreatorCountry) {
+            channel.country = valRes.detectedCreatorCountry;
+          }
 
           const countryStep: InspectionStep = {
             step: 'COUNTRY_VALIDATION',

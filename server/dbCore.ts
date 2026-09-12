@@ -6,7 +6,7 @@ import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src
 import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
 import { calculateYouTubeDailyBudget } from './quotaPolicy';
-import { resolveScopeEligibility } from './scopeEligibility';
+import { scopeEligibilityForWrite } from './scopeEligibility';
 import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { getConfiguredYouTubeKeys } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
@@ -558,15 +558,11 @@ export async function upsertChannel(channel: ChannelRecord): Promise<void> {
       'SELECT quality_score,trading_status FROM channels WHERE channel_id=$1 FOR UPDATE',
       [channel.channel_id]
     );
-    // Scope eligibility is derived, never caller-asserted country truth: an
-    // explicitly provided value is preserved, otherwise it follows the
-    // attributed country. Country, status and confidence are untouched.
-    const scopeEligibility =
-      channel.scope_eligibility === 'IN_SCOPE' ||
-      channel.scope_eligibility === 'OUT_OF_SCOPE' ||
-      channel.scope_eligibility === 'UNRESOLVED'
-        ? channel.scope_eligibility
-        : resolveScopeEligibility(channel.country);
+    // Write-path invariant (final country → final scope_eligibility): always
+    // derived from the row's country. A stale stored value must never survive
+    // a country attribution change; country, status and confidence flow
+    // through untouched.
+    const scopeEligibility = scopeEligibilityForWrite(channel);
     await client.query(`INSERT INTO channels (
     channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,updated_at
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,now())

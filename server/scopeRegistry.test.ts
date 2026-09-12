@@ -58,11 +58,13 @@ test('scope eligibility separates market validity from country verdicts', () => 
   assert.equal(resolveScopeEligibility('Germany'), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('Norway'), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('Italy'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('  Germany  '), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('GERMANY'), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('Vietnam'), 'OUT_OF_SCOPE');
   assert.equal(resolveScopeEligibility('Brazil'), 'OUT_OF_SCOPE');
   assert.equal(resolveScopeEligibility(null), 'UNRESOLVED');
   assert.equal(resolveScopeEligibility(''), 'UNRESOLVED');
-  assert.equal(resolveScopeEligibility('  germany  '), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('   '), 'UNRESOLVED');
 });
 
 test('autonomous sweep preserves dormant countries but honors explicit targets', () => {
@@ -89,8 +91,30 @@ test('autonomous sweep preserves dormant countries but honors explicit targets',
   );
 });
 
-test('migration 131 adds scope_eligibility non-destructively', () => {
+test('migration supported universe matches the application registry', () => {
+  // Guard against registry/SQL drift: the migration cannot import application
+  // constants, so this test fails loudly on divergence instead.
   const sql = readFileSync('server/db/migrations/131_scope_eligibility.sql', 'utf8');
+  const inList = sql.slice(sql.indexOf('WHEN LOWER(BTRIM(country)) IN ('));
+  const sqlNames = new Set(
+    [...inList.matchAll(/'([a-z][a-z .'-]*)'/g)]
+      .map(match => match[1])
+      .filter(name => !['in_scope', 'out_of_scope', 'unresolved'].includes(name)),
+  );
+  const registryNames = new Set(
+    [...SUPPORTED_PRODUCTION_COUNTRIES].map(country =>
+      country.normalize('NFKC').trim().toLocaleLowerCase('en'),
+    ),
+  );
+  assert.deepEqual([...sqlNames].sort(), [...registryNames].sort());
+});
+test('migration 131 adds scope_eligibility non-destructively', () => {
+  const raw = readFileSync('server/db/migrations/131_scope_eligibility.sql', 'utf8');
+  // Strip SQL line comments so assertions target statements, not prose.
+  const sql = raw
+    .split('\n')
+    .filter(line => !line.trimStart().startsWith('--'))
+    .join('\n');
   assert.match(sql, /ADD COLUMN IF NOT EXISTS scope_eligibility/);
   assert.ok(!/country_status\s*=/.test(sql), 'migration must never write country_status');
   assert.ok(!/confidence_score\s*=/.test(sql), 'migration must never write confidence_score');
@@ -100,9 +124,11 @@ test('migration 131 adds scope_eligibility non-destructively', () => {
     1,
     'backfill must run as a single pass, not repeated full-table updates',
   );
-  assert.ok(sql.includes("'Norway'"), 'backfill IN_SCOPE list must include Norway');
+  assert.ok(!/NOT VALID/i.test(sql), 'no NOT VALID split: runner is single-transaction');
+  assert.ok(!/VALIDATE CONSTRAINT/i.test(sql), 'no separate VALIDATE: illegal inside the migration transaction');
+  assert.ok(sql.includes("'Norway'") || sql.includes("'norway'"), 'backfill IN_SCOPE list must include Norway');
   assert.ok(sql.includes("'IN_SCOPE'") && sql.includes("'OUT_OF_SCOPE'") && sql.includes("'UNRESOLVED'"));
-  assert.match(sql, /NOT VALID/);
+  assert.match(sql, /LOWER\(BTRIM\(country\)\)/, 'backfill must canonicalize case/whitespace like the resolver');
 });
 
 test('unsupported-universe gate rejects CONFIRMED foreign domicile, preserves fail-open', async () => {
@@ -195,4 +221,57 @@ test('alias-covered countries without signal gaps reach the unsupported gate', a
   assert.equal(res.detectedCreatorCountry, 'Mexico');
   assert.equal(res.countryStatus, 'REJECTED');
   assert.equal(res.gateDisposition, 'REJECT_UNSUPPORTED');
+});
+
+test('write-path invariant: final country always determines scope, stale values die', async () => {
+  const { scopeEligibilityForWrite } = await import('./scopeEligibility');
+  assert.equal(
+    scopeEligibilityForWrite({ country: 'Brazil', scope_eligibility: 'IN_SCOPE' }),
+    'OUT_OF_SCOPE',
+  );
+  assert.equal(
+    scopeEligibilityForWrite({ country: 'Germany', scope_eligibility: 'OUT_OF_SCOPE' }),
+    'IN_SCOPE',
+  );
+  assert.equal(
+    scopeEligibilityForWrite({ country: null, scope_eligibility: 'IN_SCOPE' }),
+    'UNRESOLVED',
+  );
+  assert.equal(scopeEligibilityForWrite({ country: 'Germany' }), 'IN_SCOPE');
+});
+
+test('upsertChannel derives scope from the row country and reads no stored value', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const upsert = source.slice(
+    source.indexOf('export async function upsertChannel'),
+    source.indexOf('export async function upsertChannel') + 6000,
+  );
+  assert.match(upsert, /scopeEligibilityForWrite\(channel\)/);
+  assert.ok(
+    !upsert.includes('channel.scope_eligibility'),
+    'upsert must never read a stored eligibility value',
+  );
+});
+
+test('dormant exclusion is intentional and total across scope modes', async () => {
+  // Invariant: dormant supported countries are never swept autonomously in
+  // any mode (they stay valid for manual search, explicit single targets,
+  // and cross-border flows). An operator retaining them in persistent
+  // selection sees the UI note; the scheduler silently ignoring them is
+  // intended, tested behavior — not a bug.
+  const { resolveAutonomousCountries } = await import('./autonomousDiscovery');
+  const { SUPPORTED_PRODUCTION_COUNTRIES, SUPPORTED_DORMANT_COUNTRIES } = await import(
+    '../src/data/initial_countries'
+  );
+  const all = [...SUPPORTED_PRODUCTION_COUNTRIES] as string[];
+  assert.equal(
+    resolveAutonomousCountries(all, [], [], 'GLOBAL').length,
+    all.length - SUPPORTED_DORMANT_COUNTRIES.length,
+  );
+  assert.deepEqual(
+    resolveAutonomousCountries(all, [], [...SUPPORTED_DORMANT_COUNTRIES, 'Germany'], 'SELECTED_COUNTRIES'),
+    ['Germany'],
+  );
+  assert.deepEqual(resolveAutonomousCountries(all, [], [...SUPPORTED_DORMANT_COUNTRIES], 'SELECTED_COUNTRIES'), []);
 });
