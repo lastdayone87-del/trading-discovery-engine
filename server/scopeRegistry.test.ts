@@ -95,6 +95,11 @@ test('migration 131 adds scope_eligibility non-destructively', () => {
   assert.ok(!/country_status\s*=/.test(sql), 'migration must never write country_status');
   assert.ok(!/confidence_score\s*=/.test(sql), 'migration must never write confidence_score');
   assert.ok(!/DROP\s+(COLUMN|TABLE)/i.test(sql), 'migration must not drop columns or tables');
+  assert.equal(
+    (sql.match(/^UPDATE channels/mg) || []).length,
+    1,
+    'backfill must run as a single pass, not repeated full-table updates',
+  );
   assert.ok(sql.includes("'Norway'"), 'backfill IN_SCOPE list must include Norway');
   assert.ok(sql.includes("'IN_SCOPE'") && sql.includes("'OUT_OF_SCOPE'") && sql.includes("'UNRESOLVED'"));
   assert.match(sql, /NOT VALID/);
@@ -170,4 +175,24 @@ test('content-origin phrasing never authorizes rejection', async () => {
     assert.notEqual(res.countryStatus, 'REJECTED', bio);
     assert.notEqual(res.gateDisposition, 'REJECT_UNSUPPORTED', bio);
   }
+});
+
+test('alias-covered countries without signal gaps reach the unsupported gate', async () => {
+  const { assessChannelCountry, canonicalCountry } = await import('./countryInference');
+  assert.equal(canonicalCountry('mx'), 'Mexico');
+  const base: any = {
+    channelName: 'Edge Trading Journal',
+    videoTitles: [],
+    videoDescriptions: [],
+    videoDescriptionsAuthoritative: false,
+    playlists: [],
+  };
+  const res = assessChannelCountry(
+    { ...base, aboutBio: 'Trader based in Mexico covering futures and forex.' },
+    [],
+    [],
+  );
+  assert.equal(res.detectedCreatorCountry, 'Mexico');
+  assert.equal(res.countryStatus, 'REJECTED');
+  assert.equal(res.gateDisposition, 'REJECT_UNSUPPORTED');
 });

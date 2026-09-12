@@ -912,6 +912,7 @@ export function applyLiveCountryRejectionToInspected(
 ): ChannelRecord {
   channel.country_status = 'REJECTED';
   channel.country = liveCountry.detectedCreatorCountry || null;
+  channel.scope_eligibility = resolveScopeEligibility(channel.country);
   channel.confidence_score = liveCountry.score;
   channel.scan_status = 'COMPLETED';
   channel.last_checked = now;
@@ -1010,6 +1011,11 @@ export async function inspectAndValidateChannel(
     if (valRes.status === 'REJECTED') {
       // Excluded country matched — Halt execution immediately! Never reach Discord crawler.
       channel.country_status = 'REJECTED';
+      // Re-attribute the detected country (never retain the previous one) and
+      // re-derive scope from it, so an unsupported-country rejection flips a
+      // stale IN_SCOPE to OUT_OF_SCOPE instead of preserving it.
+      channel.country = valRes.detectedCreatorCountry || null;
+      channel.scope_eligibility = resolveScopeEligibility(channel.country);
       channel.confidence_score = valRes.score;
       channel.scan_status = 'COMPLETED';
       channel.last_checked = now;
@@ -1022,7 +1028,10 @@ export async function inspectAndValidateChannel(
     // Update country status & decision trail
     channel.country_status = valRes.status;
     channel.confidence_score = valRes.score;
-    if (valRes.detectedCreatorCountry !== undefined) channel.country = valRes.detectedCreatorCountry || null;
+    if (valRes.detectedCreatorCountry !== undefined) {
+      channel.country = valRes.detectedCreatorCountry || null;
+      channel.scope_eligibility = resolveScopeEligibility(channel.country);
+    }
 
     // 2. Step-by-step Channel Inspection Engine for Discord Invites (force live YouTube scrape on manual scan)
     inspection = await runChannelInspection({

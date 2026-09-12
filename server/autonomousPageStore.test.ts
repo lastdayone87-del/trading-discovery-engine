@@ -5,5 +5,9 @@ test('scope weighting survives page aggregation; legacy pages stay neutral',()=>
   const legacy=()=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60});
   assert.equal(aggregatePageMetrics([scoped(2),scoped(5)]).inScopeNewChannels,7);
   assert.equal(aggregatePageMetrics([legacy(),legacy()]).inScopeNewChannels,undefined);
-  assert.equal(aggregatePageMetrics([scoped(2),legacy()]).inScopeNewChannels,2);
+  // Mixed-version runs: legacy pages contribute neutral full credit.
+  assert.equal(
+    aggregatePageMetrics([{ ...legacy(), newChannels: 7 }, { ...scoped(2), newChannels: 7 }]).inScopeNewChannels,
+    9,
+  );
 });

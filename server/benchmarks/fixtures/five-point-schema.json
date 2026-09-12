@@ -14,6 +14,7 @@
       "properties": {
         "identityLinkage": { "type": "boolean" },
         "domicile": {
+          "description": "proven: the attributed country itself is evidenced. class: which domicile tier that evidence establishes; UNPROVEN means the country attribution holds but the tier (corporate vs individual vs platform-declared) was not independently attributed. proven:true with class UNPROVEN is valid pipeline-sourced state, never final ground truth.",
           "type": "object",
           "required": ["proven", "class"],
           "properties": {

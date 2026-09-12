@@ -401,6 +401,11 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                   ))
                 )}
               </div>
+              {scopeCountries.some(c => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === c.toLowerCase())) && (
+                <div className="text-amber-300/90 text-[11px] font-medium">
+                  Note: dormant selections ({scopeCountries.filter(c => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === c.toLowerCase())).join(', ')}) are saved but never swept autonomously — manual search and cross-border only.
+                </div>
+              )}
 
               <div className="flex items-center gap-2 pt-1">
                 <select

@@ -14,18 +14,19 @@
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS scope_eligibility TEXT;
 
-UPDATE channels SET scope_eligibility = 'IN_SCOPE'
-WHERE scope_eligibility IS NULL AND country IN (
-  'United States','United Kingdom','Germany','France','Spain','Netherlands',
-  'Italy','Australia','Canada','Japan','Switzerland','Denmark','Sweden',
-  'United Arab Emirates','Singapore','New Zealand','Belgium','Luxembourg',
-  'Ireland','Norway'
-);
-
-UPDATE channels SET scope_eligibility = 'OUT_OF_SCOPE'
-WHERE scope_eligibility IS NULL AND country IS NOT NULL;
-
-UPDATE channels SET scope_eligibility = 'UNRESOLVED'
+-- Single-pass backfill (one sequential scan, no per-row locking beyond the
+-- statement): supported universe (dormant included) -> IN_SCOPE, any other
+-- attributed country -> OUT_OF_SCOPE, unattributed -> UNRESOLVED.
+UPDATE channels SET scope_eligibility = CASE
+  WHEN country IN (
+    'United States','United Kingdom','Germany','France','Spain','Netherlands',
+    'Italy','Australia','Canada','Japan','Switzerland','Denmark','Sweden',
+    'United Arab Emirates','Singapore','New Zealand','Belgium','Luxembourg',
+    'Ireland','Norway'
+  ) THEN 'IN_SCOPE'
+  WHEN country IS NOT NULL THEN 'OUT_OF_SCOPE'
+  ELSE 'UNRESOLVED'
+END
 WHERE scope_eligibility IS NULL;
 
 ALTER TABLE channels DROP CONSTRAINT IF EXISTS channels_scope_eligibility_check;

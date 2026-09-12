@@ -218,6 +218,7 @@ const COUNTRY_SIGNALS: Record<string, {
   Madagascar: { bio: ['madagascar', 'malagasy trader', 'based in madagascar'], tlds: ['.mg'], social: ['madagascar'], exchanges: [], brokers: [], phones: ['+261'], addresses: ['antananarivo'], language: [] },
   Sudan: { bio: ['sudan', 'sudanese trader', 'based in sudan'], tlds: ['.sd'], social: ['sudan'], exchanges: [], brokers: [], phones: ['+249'], addresses: ['khartoum'], language: [] },
   Angola: { bio: ['angola', 'angolan trader', 'based in angola'], tlds: ['.ao'], social: ['angola'], exchanges: [], brokers: [], phones: ['+244'], addresses: ['luanda'], language: [] },
+  Mexico: { bio: ['mexico', 'mexican trader', 'based in mexico', 'trader en méxico'], tlds: ['.mx', '.com.mx'], social: ['mexico', 'cdmx'], exchanges: ['bolsa mexicana de valores', 'bmv', 'mexican stock exchange'], brokers: ['gbm', 'grupo bursátil mexicano', 'kuspit'], phones: ['+52'], addresses: ['ciudad de méxico', 'mexico city', 'monterrey', 'guadalajara'], language: ['bolsa mexicana', 'mercado mexicano'] },
   'Sri Lanka': { bio: ['sri lanka', 'sri lankan trader', 'based in sri lanka'], tlds: ['.lk'], social: ['srilanka'], exchanges: ['colombo stock exchange'], brokers: [], phones: ['+94'], addresses: ['colombo'], language: [] }
 };
 

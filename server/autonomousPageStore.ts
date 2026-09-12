@@ -59,9 +59,13 @@ export function aggregatePageMetrics(pages:QueryFunnelMetrics[]):QueryFunnelMetr
   const sum=(key:keyof QueryFunnelMetrics)=>pages.reduce((n,p)=>n+Number(p[key]||0),0);
   const distinct=sum('distinctResults'); const evaluated=sum('nonTrading')+sum('uncertain')+sum('needsReview')+sum('tradingConfirmed');
   const weighted=(key:keyof QueryFunnelMetrics)=>distinct?pages.reduce((n,p)=>n+p.distinctResults*Number(p[key]||0),0)/distinct:0;
-  // Scope weighting survives aggregation only when at least one page observed
-  // scope; legacy pages without the field leave it absent so downstream
-  // attribution falls back to the unweighted yield (never zero).
+  // Scope weighting survives aggregation: pages carrying scope data sum
+  // their in-scope counts while legacy pages without the field contribute
+  // their full fresh count (neutral handling). The aggregate stays absent
+  // only when NO page observed scope, preserving the legacy fallback.
   const scopedPages=pages.filter(p=>p.inScopeNewChannels!==undefined);
-  return {rawResults:sum('rawResults'),distinctResults:distinct,duplicateResults:sum('duplicateResults'),knownChannels:sum('knownChannels'),newChannels:sum('newChannels'),inScopeNewChannels:scopedPages.length?scopedPages.reduce((n,p)=>n+Number(p.inScopeNewChannels||0),0):undefined,countryRejected:sum('countryRejected'),nonTrading:sum('nonTrading'),uncertain:sum('uncertain'),needsReview:sum('needsReview'),tradingConfirmed:sum('tradingConfirmed'),qualityChannels:sum('qualityChannels'),communitiesDiscovered:sum('communitiesDiscovered'),averageQualityScore:weighted('averageQualityScore'),noveltyRatio:distinct?sum('newChannels')/distinct:0,countryPrecision:distinct?(distinct-sum('countryRejected'))/distinct:0,tradingPrecision:evaluated?sum('tradingConfirmed')/evaluated:0,performanceScore:Math.round(weighted('performanceScore'))};
+  const inScopeAggregate=scopedPages.length
+    ? pages.reduce((n,p)=>n+Number(p.inScopeNewChannels??p.newChannels),0)
+    : undefined;
+  return {rawResults:sum('rawResults'),distinctResults:distinct,duplicateResults:sum('duplicateResults'),knownChannels:sum('knownChannels'),newChannels:sum('newChannels'),inScopeNewChannels:inScopeAggregate,countryRejected:sum('countryRejected'),nonTrading:sum('nonTrading'),uncertain:sum('uncertain'),needsReview:sum('needsReview'),tradingConfirmed:sum('tradingConfirmed'),qualityChannels:sum('qualityChannels'),communitiesDiscovered:sum('communitiesDiscovered'),averageQualityScore:weighted('averageQualityScore'),noveltyRatio:distinct?sum('newChannels')/distinct:0,countryPrecision:distinct?(distinct-sum('countryRejected'))/distinct:0,tradingPrecision:evaluated?sum('tradingConfirmed')/evaluated:0,performanceScore:Math.round(weighted('performanceScore'))};
 }
