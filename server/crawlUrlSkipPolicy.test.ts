@@ -95,3 +95,20 @@ test('rendered zero-page echoes are transparent; pure runs still cap', () => {
   assert.deepEqual(trailingIdenticalFailure(pureZeroPage), { failureClass: 'NO_PAGE_PROCESSED', count: 6 });
   assert.ok(skippedUrlsFromHistory(pureZeroPage).has('https://walled.example/'));
 });
+
+test('leading zero-page run caps on its own; otherwise echoes stay transparent', () => {
+  const leading = [
+    ...Array.from({ length: 5 }, (_, index) =>
+      row('https://echo.example/', 'NO_PAGE_PROCESSED', 'ACQUISITION_FAILED', 4 - index)),
+    row('https://echo.example/', 'HTTP_ERROR', 'ACQUISITION_FAILED', 5),
+  ];
+  assert.deepEqual(trailingIdenticalFailure(leading), { failureClass: 'NO_PAGE_PROCESSED', count: 5 });
+  assert.ok(skippedUrlsFromHistory(leading).has('https://echo.example/'));
+  const short = [
+    ...Array.from({ length: 2 }, (_, index) =>
+      row('https://short.example/', 'NO_PAGE_PROCESSED', 'ACQUISITION_FAILED', 7 - index)),
+    ...Array.from({ length: 6 }, (_, index) =>
+      row('https://short.example/', 'HTTP_ERROR', 'ACQUISITION_FAILED', 6 - index)),
+  ];
+  assert.deepEqual(trailingIdenticalFailure(short), { failureClass: 'HTTP_ERROR', count: 6 });
+});

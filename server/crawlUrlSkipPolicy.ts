@@ -38,20 +38,30 @@ export function normalizeSkipUrl(rawUrl: string): string {
 
 /**
  * Newest-first trailing run of identical ACQUISITION_FAILED for one URL.
- * NO_PAGE_PROCESSED rows are transparent zero-evidence markers (a rendered
- * zero-page echo carries no independent failure information beyond the static
- * outcome it accompanies), so they neither extend nor break a run — except a
- * run consisting solely of them, which still counts as its own streak.
- * Any other outcome, or a different failure class, breaks the run: recovery
- * or drift resets it.
+ *
+ * A leading run of NO_PAGE_PROCESSED echoes is its own streak: zero-page
+ * rows are transparent companions only when they follow real failure
+ * evidence, so a qualifying newest zero-page run counts directly instead of
+ * being filtered away. Otherwise NO_PAGE rows are skipped over and the run
+ * is evaluated on the remaining informative rows; a run consisting solely
+ * of echoes falls back to the raw order. Any other outcome, or a different
+ * failure class, breaks the run — recovery or drift resets it.
  */
 export function trailingIdenticalFailure(rows: UrlFailureRow[]): { failureClass: string; count: number } | undefined {
   const ordered = [...rows].sort(
     (a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt)
   );
-  const informative = ordered.filter(
-    row => row.outcome !== 'ACQUISITION_FAILED' || String(row.failureClass || '') !== 'NO_PAGE_PROCESSED'
-  );
+  const isNoPageEcho = (row: UrlFailureRow): boolean =>
+    row.outcome === 'ACQUISITION_FAILED' && String(row.failureClass || '') === 'NO_PAGE_PROCESSED';
+  let zeroPageRun = 0;
+  for (const row of ordered) {
+    if (isNoPageEcho(row)) zeroPageRun += 1;
+    else break;
+  }
+  if (zeroPageRun >= URL_SKIP_CONSECUTIVE_FAILURE_THRESHOLD) {
+    return { failureClass: 'NO_PAGE_PROCESSED', count: zeroPageRun };
+  }
+  const informative = ordered.filter(row => !isNoPageEcho(row));
   const effective = informative.length > 0 ? informative : ordered;
   const first = effective[0];
   if (!first || first.outcome !== 'ACQUISITION_FAILED') return undefined;

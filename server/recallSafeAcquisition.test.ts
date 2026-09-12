@@ -975,3 +975,26 @@ test('skipped-only inspection stays uncertain instead of resolving clean', async
   assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'));
   assert.ok(!(result.acquisitionOutcomes || []).some(item => String(item.requestedUrl || '').startsWith('https://dead.example') && item.outcome === 'ACQUISITION_FAILED'));
 });
+
+test('skipped URL beside a clean surface keeps the step uncertain, never clean', async () => {
+  const history = Array.from({ length: 5 }, (_, index) => ({
+    requestedUrl: 'https://dead.example/',
+    failureClass: 'HTTP_ERROR',
+    outcome: 'ACQUISITION_FAILED',
+    observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+  }));
+  const result = await runChannelInspection({
+    channelId: 'UCskipmixed00000000000001',
+    channelName: 'Skip Mixed Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://dead.example/', 'https://live.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    liveChannelDataLoader: async () => ({ bio: 'Extended bio', channelLinks: [], thumbnailUrl: null, rawHtml: '', fetchLog: '' }),
+    externalFetchImpl: (async () => new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } })) as typeof fetch,
+    urlFailureHistoryLoader: (async () => history) as any,
+  });
+  const step = (result.steps || []).find(item => item.step === 'CUSTOM_DOMAINS');
+  assert.equal(step?.status, 'PARTIAL', 'a skipped surface alongside clean ones must stay uncertain');
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'));
+});
