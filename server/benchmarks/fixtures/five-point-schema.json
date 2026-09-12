@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FivePointChannelFixture",
+  "description": "Independent 5-point source validation for one benchmark channel. All five facts must be evidenced separately.",
+  "type": "object",
+  "required": ["channelId", "channelName", "market", "facts", "sources"],
+  "properties": {
+    "channelId": { "type": "string", "pattern": "^UC[0-9A-Za-z_-]{22}$" },
+    "channelName": { "type": "string", "minLength": 1 },
+    "market": { "type": "string", "minLength": 1 },
+    "facts": {
+      "type": "object",
+      "required": ["identityLinkage", "domicile", "trading", "marketRelevance", "liveness90d"],
+      "properties": {
+        "identityLinkage": { "type": "boolean" },
+        "domicile": {
+          "type": "object",
+          "required": ["proven", "class"],
+          "properties": {
+            "proven": { "type": "boolean" },
+            "class": { "enum": ["CLASS_B1_CORPORATE", "CLASS_B2_INDIVIDUAL", "CLASS_B3_PLATFORM_DECLARED", "UNPROVEN"] }
+          }
+        },
+        "trading": { "type": "boolean" },
+        "marketRelevance": { "type": "boolean" },
+        "liveness90d": { "type": "boolean" }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 5,
+      "description": "One independent source per fact label A–E (harness must enforce complete coverage).",
+      "allOf": [
+        { "contains": { "required": ["fact"], "properties": { "fact": { "const": "A" } } } },
+        { "contains": { "required": ["fact"], "properties": { "fact": { "const": "B" } } } },
+        { "contains": { "required": ["fact"], "properties": { "fact": { "const": "C" } } } },
+        { "contains": { "required": ["fact"], "properties": { "fact": { "const": "D" } } } },
+        { "contains": { "required": ["fact"], "properties": { "fact": { "const": "E" } } } }
+      ],
+      "items": {
+        "type": "object",
+        "required": ["fact", "kind", "locator"],
+        "properties": {
+          "fact": { "enum": ["A", "B", "C", "D", "E"] },
+          "kind": { "type": "string" },
+          "locator": { "type": "string" }
+        }
+      }
+    }
+  }
+}

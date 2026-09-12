@@ -83,6 +83,8 @@ import {REVIEW_REASON_CATALOG,REVIEW_REASON_CATALOG_VERSION} from './server/revi
 import { resolveReviewerIdentity, reviewerDefaultsAvailable, reviewerTokenIsValid } from './server/reviewerCredentials';
 import { operatorAuthorization, validateOperatorConfiguration } from './server/operatorAuth';
 import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
+import { resolveBuildInfo } from './server/buildInfo';
+import { operationsTelemetrySnapshot } from './server/operationsTelemetry';
 import { getCommunityRetryWorkerHealth } from './server/operationalMaintenanceWorkers';
 import { dryRunCountryBoundaryCohort, enqueueCountryBoundaryCohort, COUNTRY_BOUNDARY_RECOVERY_VERSION } from './server/countryBoundaryRecovery';
 import { browserCapabilitySnapshot, startBrowserCapabilityMonitor } from './server/browserCapability';
@@ -111,6 +113,9 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
   const readiness = createReadinessState();
+  // Resolve build identity once: the startup fallback must stay stable for the
+  // life of the process so successive diagnostics identify one build instance.
+  const versionInfo = resolveBuildInfo();
 
   app.use(express.json());
   app.use('/api', operatorAuthorization(appendOperatorAuditEvent));
@@ -266,6 +271,20 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     const state = readiness.snapshot();
     res.status(state.readiness === 'ready' ? 200 : 503).json(state);
+  });
+
+  // Build identity + process-local operations telemetry (Phase 0 observability).
+  // Read-only diagnostics: never influences scheduling, gating, or retries.
+  app.get('/api/version', (_req, res) => {
+    try {
+      res.json({
+        ...versionInfo,
+        telemetry: operationsTelemetrySnapshot(),
+        telemetryScope: 'process-local (resets on restart)',
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: 'Version diagnostics unavailable.', code: 'VERSION_DIAGNOSTIC_ERROR' });
+    }
   });
 
   app.get('/api/browser-capability', (_req, res) => {

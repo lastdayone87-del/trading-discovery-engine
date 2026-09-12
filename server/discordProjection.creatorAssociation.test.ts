@@ -49,7 +49,10 @@ test('ACTIVE + UNCERTAIN third-party or ambiguous Discord is not promoted',()=>{
     extractionConfidence:'EXPLICIT'
   });
   Object.assign(candidate,inferDiscordOwnership(candidate));
-  assert.equal(candidate.ownershipStatus,'UNCERTAIN');
+  // The 'sponsor-room' locator trips the deliberate PARTNER_OR_AFFILIATE_SURFACE
+  // guard (-80), so this lands THIRD_PARTY rather than merely UNCERTAIN. The
+  // test's intent — no promotion without creator ownership — holds either way.
+  assert.equal(candidate.ownershipStatus,'THIRD_PARTY');
 
   const validation:any={
     status:'UNCERTAIN',confidence:53,inviteUrl:null,candidateInviteUrl:'https://discord.gg/sponsor-room',

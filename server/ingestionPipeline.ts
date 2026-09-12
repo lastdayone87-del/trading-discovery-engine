@@ -1,6 +1,7 @@
 import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
 import { DiscoveredChannelRaw, fetchYouTubeChannelCountryMetadata } from './youtube';
 import { aggregatedLanguageCandidateSet, validateChannelCountry } from './countryValidator';
+import { bumpGate1Evaluation } from './operationsTelemetry';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
 import { inspectAndValidateChannel } from './queueManager';
@@ -319,6 +320,7 @@ export async function processChannelThroughPipeline(
   };
 
   if (countryVal.gateDisposition === 'REJECT_EXCLUDED' || countryVal.status === 'REJECTED') {
+    bumpGate1Evaluation(countryVal.gateDisposition);
     console.log(
       `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`
     );
@@ -381,6 +383,7 @@ export async function processChannelThroughPipeline(
   }
 
   if (countryVal.gateDisposition === 'NEEDS_REVIEW') {
+    bumpGate1Evaluation(countryVal.gateDisposition);
     console.log(`[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' routed to NEEDS_REVIEW by country gate disposition.`);
     const reviewChannel: ChannelRecord = existing || {
       channel_id: candidate.channelId,
@@ -425,6 +428,9 @@ export async function processChannelThroughPipeline(
   }
 
   // Phase 7: Low-Audience Budget Gate
+  // Gate 1 allow-path telemetry: reached only when the channel was neither
+  // rejected nor routed to review above.
+  bumpGate1Evaluation(countryVal.gateDisposition);
   const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
   if (lowAudienceGate.shouldSkipDeepEnrichment) {
     console.log(`[Unified Ingestion Pipeline - Phase 7] Channel '${candidate.channelName}' (${candidate.channelId}) has ${candidate.subscriberCount} subscribers (< 30 threshold). Storing and marking low-audience skip.`);
