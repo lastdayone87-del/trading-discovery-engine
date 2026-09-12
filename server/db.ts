@@ -78,8 +78,10 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
     const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1)));
     await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,first_transient_failure_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
   }
+  // The job-row transition above is the disposition: count it here so a
+  // failure in the secondary attempts bookkeeping below cannot omit it.
 
-  await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);
   bumpDisposition();
+  await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);
   return decision.disposition;
 }
