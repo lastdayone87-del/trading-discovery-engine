@@ -6,6 +6,7 @@ import {
   bumpJobFailureDisposition,
   bumpRepeatFailureHistoryOutage,
   bumpRepeatFailureSkip,
+  markJobDispositionCounted,
   operationsTelemetrySnapshot,
   resetOperationsTelemetry,
 } from './operationsTelemetry';
@@ -52,4 +53,12 @@ test('telemetry snapshots are copies and ignore non-positive skip counts', () =>
   assert.equal(snap.repeatFailureSkipsTotal, 0);
   snap.gate1EvaluationsTotal.ALLOW_NORMAL = 999;
   assert.equal(operationsTelemetrySnapshot().gate1EvaluationsTotal.ALLOW_NORMAL, 0);
+});
+
+test('repeated failJob transitions for one job attempt count exactly once', () => {
+  assert.equal(markJobDispositionCounted('job-1', 2, 'FAILED'), true);
+  assert.equal(markJobDispositionCounted('job-1', 2, 'FAILED'), false);
+  assert.equal(markJobDispositionCounted('job-1', 3, 'FAILED'), true);
+  assert.equal(markJobDispositionCounted('job-2', 2, 'FAILED'), true);
+  assert.equal(markJobDispositionCounted('job-1', 2, 'RETRYING'), true);
 });

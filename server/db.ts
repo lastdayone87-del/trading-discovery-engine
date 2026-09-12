@@ -4,7 +4,7 @@
 export * from './dbCore';
 
 import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
-import { bumpJobFailureDisposition } from './operationsTelemetry';
+import { bumpJobFailureDisposition, markJobDispositionCounted } from './operationsTelemetry';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -63,10 +63,11 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
 
   const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);
   // Operations telemetry lives on the serving facade (this failJob shadows
-  // dbCore.failJob for all worker imports): bumped only after the job-state
-  // UPDATE below persists, so the counter reports transitions that occurred.
+  // dbCore.failJob for all worker imports). The job-row transition below is
+  // the disposition: count it exactly once per (job, attempt) so a worker
+  // retry after a bookkeeping-write failure cannot double-count it.
   // decideJobFailure itself stays pure (unit-tested without side effects).
-  const bumpDisposition=()=>bumpJobFailureDisposition(decision.disposition);
+  const countDisposition=()=>{if(markJobDispositionCounted(jobId,attempts,decision.disposition))bumpJobFailureDisposition(decision.disposition);};
   const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 
@@ -81,7 +82,7 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   // The job-row transition above is the disposition: count it here so a
   // failure in the secondary attempts bookkeeping below cannot omit it.
 
-  bumpDisposition();
+  countDisposition();
   await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);
   return decision.disposition;
 }

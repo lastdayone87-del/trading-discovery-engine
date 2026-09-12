@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 export const GLOBAL_LANGUAGE_POLICY_VERSION = 'global-language-capability-v1';
 export const UNICODE_NORMALIZATION_VERSION = 'unicode-nfkc-casefold-v1';
 
-export type ScriptCode = 'Latn' | 'Arab' | 'Cyrl' | 'Deva' | 'Hang' | 'Hani' | 'Hira' | 'Kana' | 'Zyyy' | 'Zinh' | 'MULTI' | 'UNKNOWN';
+export type ScriptCode = 'Latn' | 'Arab' | 'Cyrl' | 'Deva' | 'Beng' | 'Sinh' | 'Guru' | 'Telu' | 'Thai' | 'Hang' | 'Hani' | 'Hira' | 'Kana' | 'Zyyy' | 'Zinh' | 'MULTI' | 'UNKNOWN';
 export type CapabilityDisposition = 'SUPPORTED' | 'CONTROLLED_TRIAL' | 'ABSTAIN';
 
 export interface LanguageScriptObservation {
@@ -40,12 +40,15 @@ export interface LanguageCapabilityDecision {
 
 const SCRIPT_TESTS: Array<[ScriptCode, RegExp]> = [
   ['Arab', /\p{Script=Arabic}/u], ['Cyrl', /\p{Script=Cyrillic}/u], ['Deva', /\p{Script=Devanagari}/u],
+  ['Beng', /\p{Script=Bengali}/u], ['Sinh', /\p{Script=Sinhala}/u], ['Guru', /\p{Script=Gurmukhi}/u],
+  ['Telu', /\p{Script=Telugu}/u], ['Thai', /\p{Script=Thai}/u],
   ['Hang', /\p{Script=Hangul}/u], ['Hira', /\p{Script=Hiragana}/u], ['Kana', /\p{Script=Katakana}/u],
   ['Hani', /\p{Script=Han}/u], ['Latn', /\p{Script=Latin}/u]
 ];
 const KNOWN_SCRIPTS = new Set<ScriptCode>(SCRIPT_TESTS.map(([script]) => script));
 const LANGUAGE_SCRIPTS: Record<string, ScriptCode[]> = {
   ar: ['Arab'], fa: ['Arab'], ur: ['Arab'], ru: ['Cyrl'], uk: ['Cyrl'], bg: ['Cyrl'], hi: ['Deva'], mr: ['Deva'], ne: ['Deva'],
+  bn: ['Beng'], si: ['Sinh'], pa: ['Guru'], te: ['Telu'], th: ['Thai'],
   ko: ['Hang'], ja: ['Hani', 'Hira', 'Kana'], zh: ['Hani'],
   // Latin-script languages: explicit so Vietnamese/Tagalog/Malay/Indonesian
   // content is never flagged transliterated and never depends on the Latn default.
