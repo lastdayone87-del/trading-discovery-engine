@@ -63,9 +63,10 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
 
   const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);
   // Operations telemetry lives on the serving facade (this failJob shadows
-  // dbCore.failJob for all worker imports): bumping here keeps the public
-  // counters truthful without touching the pure retry-decision function.
-  bumpJobFailureDisposition(decision.disposition);
+  // dbCore.failJob for all worker imports): bumped only after the job-state
+  // UPDATE below persists, so the counter reports transitions that occurred.
+  // decideJobFailure itself stays pure (unit-tested without side effects).
+  const bumpDisposition=()=>bumpJobFailureDisposition(decision.disposition);
   const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 
@@ -79,5 +80,6 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   }
 
   await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);
+  bumpDisposition();
   return decision.disposition;
 }
