@@ -68,6 +68,16 @@ const OBJECTIVES: Partial<Record<QueryIntent, string>> = {
 };
 
 const FORBIDDEN_PROSE = /\b(investor education|regulated trading|stock exchange|rate decision|weekly trade breakdown|market update)\b/i;
+/**
+ * Anti-collision barrier for bare short tickers (P3-03): 2–4 ASCII
+ * alphanumerics as a standalone query (NG, ES, NQ, AI, ICT, SMI) collide
+ * across markets, languages, and country codes (search itself is
+ * case-insensitive, so the barrier is too). Such tokens may only travel
+ * with qualifying market context ("NQ Futures"); the pair templates provide
+ * that, single-token queries never do. Non-Latin short terms (e.g. 板読み)
+ * are genuine vocabulary, not tickers, and are unaffected.
+ */
+const BARE_SHORT_TICKER = /^[A-Z0-9]{2,4}$/i;
 const NON_LATIN = /[\p{Script=Arabic}\p{Script=Cyrillic}\p{Script=Devanagari}\p{Script=Hangul}]/u;
 const JAPANESE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
 
@@ -94,6 +104,7 @@ export function isRetrievalOrientedQuery(country: string, query: string, languag
     ? assessLanguageCapability([{ field: 'query', text: normalized, language: languageContext.contentLanguage }], languageContext).disposition !== 'ABSTAIN'
     : isCountryScriptCompatible(country, normalized);
   return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= (languageContext?.governed?4:3) &&
+    !(queryTokenCount(normalized) === 1 && BARE_SHORT_TICKER.test(normalized)) &&
     !FORBIDDEN_PROSE.test(normalized) && scriptCompatible;
 }
 

@@ -22,7 +22,7 @@ const CHANNELS = [
 
 test('innertube container stability benchmark (live, env-gated)', { skip: !LIVE }, async () => {
   const { fetchChannelVideoDescriptionsViaInnertube } = await import(
-    '../youtubeInnertubeProvider'
+    './youtubeInnertubeProvider'
   );
   const latencies: number[] = [];
   let success = 0;

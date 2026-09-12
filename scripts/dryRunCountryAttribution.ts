@@ -54,7 +54,8 @@ export async function runCountryAttributionDryRun(): Promise<DryRunReport> {
     ALLOW_NORMAL: 0,
     CONTINUE_CRAWLING: 0,
     NEEDS_REVIEW: 0,
-    REJECT_EXCLUDED: 0
+    REJECT_EXCLUDED: 0,
+    REJECT_UNSUPPORTED: 0
   };
 
   const statusBreakdown: Record<CountryStatus, number> = {

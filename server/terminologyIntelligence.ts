@@ -264,7 +264,11 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
   if (!runner) return;
   const terms = await runner.query('SELECT id FROM canonical_trading_terms WHERE country=$1 AND normalized_term=$2', [canonicalCountry(query.country), learned]);
   for (const row of terms.rows) {
-    const yieldScore = metrics.distinctResults ? metrics.newChannels / metrics.distinctResults : 0;
+    // Scope-weighted yield: out-of-scope fresh channels earn no learning
+    // credit. Absent scope data (legacy callers) falls back to the unweighted
+    // yield, preserving historical behavior exactly.
+    const inScopeNew = metrics.inScopeNewChannels ?? metrics.newChannels;
+    const yieldScore = metrics.distinctResults ? inScopeNew / metrics.distinctResults : 0;
     await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
     await refreshTerminologyLifecycle(Number(row.id), DEFAULT_TERMINOLOGY_POLICY, runner);
   }

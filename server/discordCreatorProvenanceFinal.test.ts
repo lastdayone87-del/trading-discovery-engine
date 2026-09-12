@@ -144,3 +144,22 @@ test('runChannelInspection promotes a linked-domain invite with brand corroborat
   assert.equal(owned?.ownershipStatus,'CREATOR_OWNED');
   assert.ok(owned?.ownershipReasons?.includes('CREATOR_CANONICAL_DOMAIN'));
 });
+
+test('link-aggregator pages yield invites without canonical ownership',async()=>{
+  const aggregatorHtml = new Response('<html><body><a href="https://discord.gg/aggro">Discord</a></body></html>',{status:200,headers:{'content-type':'text/html'}});
+  const emptyHtml = new Response('<html><body>No Discord invite here</body></html>',{status:200,headers:{'content-type':'text/html'}});
+  const result = await runChannelInspection({
+    channelId:'aggregator-extraction-channel',
+    channelName:'Some Creator',
+    channelBio:'Trading notes',
+    channelLinks:['https://linktr.ee/somecreator'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:false,
+    externalFetchImpl:(async(input:any)=>String(input).includes('linktr.ee')?aggregatorHtml.clone():emptyHtml) as typeof fetch,
+    renderedFallback:async(seedUrl:string)=>({foundInvite:null,foundLocation:seedUrl,candidates:[],inspectedPages:1,scrolls:0,clicks:0,complete:true,retryable:false,detail:'test rendered without invite'}),
+  });
+  const found=(result.discordCandidates||[]).find(c=>c.nativeInviteCode==='aggro');
+  assert.ok(found,'expected the aggregator destination invite to be extracted');
+  assert.notEqual(found?.ownershipStatus,'CREATOR_OWNED');
+  assert.ok(!found?.ownershipReasons?.includes('CREATOR_CANONICAL_DOMAIN'));
+});

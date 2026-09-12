@@ -102,13 +102,13 @@ test('migration 131 adds scope_eligibility non-destructively', () => {
 
 test('unsupported-universe gate rejects CONFIRMED foreign domicile, preserves fail-open', async () => {
   const { assessChannelCountry } = await import('./countryInference');
-  const base = {
+  const base: any = {
     channelName: 'Edge Trading Journal',
     videoTitles: [],
     videoDescriptions: [],
     videoDescriptionsAuthoritative: false,
     playlists: [],
-  } as never;
+  };
   const confirmed = assessChannelCountry(
     { ...base, aboutBio: 'Trader based in Brazil covering Latin American equity futures.' },
     [],
@@ -146,7 +146,7 @@ test('exclusion gate keeps precedence over unsupported-universe gate', async () 
       videoDescriptions: [],
       videoDescriptionsAuthoritative: false,
       playlists: [],
-    } as never,
+    } as any,
     [{ country_name: 'Vietnam', reason: 'test exclusion' }],
     [],
   );
