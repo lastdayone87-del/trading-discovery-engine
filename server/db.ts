@@ -63,20 +63,20 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
 
   const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);
   // Operations telemetry lives on the serving facade (this failJob shadows
-  // dbCore.failJob for all worker imports). The job-row transition below is
-  // the disposition: count it exactly once per claim execution (open
-  // job_attempts row), so neither a worker retry after a bookkeeping-write
-  // failure (same row) nor attempt-free deferrals (new row per claim) miscount.
-  // decideJobFailure itself stays pure (unit-tested without side effects).
-  const countDisposition=async()=>{
-    let attemptRowId: unknown = null;
-    try {
-      const open = await db.query(
-        `SELECT id FROM job_attempts WHERE job_id=$1 AND finished_at IS NULL ORDER BY started_at DESC LIMIT 1`,
-        [jobId],
-      );
-      attemptRowId = open.rows[0]?.id ?? null;
-    } catch { attemptRowId = null; }
+  // dbCore.failJob for all worker imports). Capture this execution's open
+  // attempt row BEFORE the transition below publishes PENDING: a new claim
+  // afterwards would open a newer row, and keying on that would suppress the
+  // new claim's own disposition. decideJobFailure itself stays pure
+  // (unit-tested without side effects).
+  let attemptRowId: unknown = null;
+  try {
+    const open = await db.query(
+      `SELECT id FROM job_attempts WHERE job_id=$1 AND finished_at IS NULL ORDER BY started_at DESC LIMIT 1`,
+      [jobId],
+    );
+    attemptRowId = open.rows[0]?.id ?? null;
+  } catch { attemptRowId = null; }
+  const countDisposition=()=>{
     if (markJobDispositionCounted(jobDispositionExecutionKey(attemptRowId, jobId, attempts), decision.disposition)) {
       bumpJobFailureDisposition(decision.disposition);
     }
@@ -95,7 +95,7 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   // The job-row transition above is the disposition: count it here so a
   // failure in the secondary attempts bookkeeping below cannot omit it.
 
-  await countDisposition();
+  countDisposition();
   await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);
   return decision.disposition;
 }
