@@ -105,7 +105,14 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   for(const candidateUrl of candidateHosts){
     try{
       const parsed=new URL(candidateUrl),host=parsed.hostname.toLowerCase();
-      if(input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))){score+=55;reasons.push('CREATOR_CANONICAL_DOMAIN');break;}
+      // A canonical-domain match corroborates ownership but can never decide it
+      // alone: a channel link proves reference, not ownership (a linked broker
+      // or sponsor page is a third-party surface). +30 keeps 40-base website
+      // invites below the 75 gate unless brand (+35) or cross-surface (+15)
+      // corroboration is also present. No break here (unlike the branches
+      // below): brand/social identity may still corroborate the same host.
+      // Awarded at most once no matter how many canonical hosts are observed.
+      if(!reasons.includes('CREATOR_CANONICAL_DOMAIN')&&input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))){score+=30;reasons.push('CREATOR_CANONICAL_DOMAIN');}
       if(creatorName){
         const compact=creatorName.replace(/\s+/g,''),hostCompact=host.replace(/[^a-z0-9]/g,'');
         // A brand-matching creator website was already intended as strong

@@ -4,8 +4,35 @@
 export * from './dbCore';
 
 import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
+import { bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositionCounted } from './operationsTelemetry';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
+
+/**
+ * Builds the bookkeeping UPDATE that finalizes a failed execution's attempt
+ * row. Targets the captured attempt row id (the row open when failJob
+ * started): after the job transitions back to PENDING a new worker may claim
+ * it and open a newer row, and a job-scoped `finished_at IS NULL` filter
+ * would then wrongly finalize the new claim's row with this execution's
+ * error. Falls back to the legacy job-scoped filter only when no row was
+ * captured (the row is then necessarily this execution's, or already closed).
+ */
+export function failedAttemptFinalizeQuery(
+  jobId: string,
+  attemptRowId: unknown,
+  error: string,
+): { text: string; values: unknown[] } {
+  if (attemptRowId !== null && attemptRowId !== undefined && String(attemptRowId) !== '') {
+    return {
+      text: `UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$1 WHERE id=$2 AND finished_at IS NULL`,
+      values: [error, String(attemptRowId)],
+    };
+  }
+  return {
+    text: `UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$1 WHERE job_id=$2 AND finished_at IS NULL`,
+    values: [error, jobId],
+  };
+}
 
 export function parseTransientRetryAgeMs(value:unknown,fallback=6*60*60_000):number{
   const parsed=Number(value);
@@ -61,6 +88,25 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   }
 
   const decision=(await import('./dbCore')).decideJobFailure(error,attempts,max_attempts,now,firstFailureAt,geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);
+  // Operations telemetry lives on the serving facade (this failJob shadows
+  // dbCore.failJob for all worker imports). Capture this execution's open
+  // attempt row BEFORE the transition below publishes PENDING: a new claim
+  // afterwards would open a newer row, and keying on that would suppress the
+  // new claim's own disposition. decideJobFailure itself stays pure
+  // (unit-tested without side effects).
+  let attemptRowId: unknown = null;
+  try {
+    const open = await db.query(
+      `SELECT id FROM job_attempts WHERE job_id=$1 AND finished_at IS NULL ORDER BY started_at DESC LIMIT 1`,
+      [jobId],
+    );
+    attemptRowId = open.rows[0]?.id ?? null;
+  } catch { attemptRowId = null; }
+  const countDisposition=()=>{
+    if (markJobDispositionCounted(jobDispositionExecutionKey(attemptRowId, jobId, attempts), decision.disposition)) {
+      bumpJobFailureDisposition(decision.disposition);
+    }
+  };
   const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 
@@ -72,7 +118,13 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
     const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1)));
     await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,first_transient_failure_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
   }
+  // The job-row transition above is the disposition: count it here so a
+  // failure in the secondary attempts bookkeeping below cannot omit it.
 
-  await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);
+  countDisposition();
+  // Finalize THIS execution's captured attempt row by id (never whichever
+  // open row happens to exist now — a post-transition claim opens a new row).
+  const finalize = failedAttemptFinalizeQuery(jobId, attemptRowId, persistedMessage);
+  await db.query(finalize.text, finalize.values as any[]);
   return decision.disposition;
 }

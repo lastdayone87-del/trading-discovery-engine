@@ -35,3 +35,10 @@ test('crawler reliability telemetry is an explicit operator-only read route',()=
  assert.deepEqual(route?.policy,'operator');
  assert.deepEqual(route?.action,'diagnostics.crawler-reliability.read');
 });
+
+test('version diagnostics is an explicit operator-only read route',()=>{
+ const matching=routePolicyInventory.filter(item=>item.method==='GET'&&new RegExp(item.pattern).test('/api/version'));
+ assert.equal(matching.length,1,'/api/version must resolve to exactly one explicit route policy');
+ assert.equal(matching[0].policy,'operator');
+ assert.equal(matching[0].action,'diagnostics.version.read');
+});

@@ -48,7 +48,12 @@ const LANGUAGE_CODES: Record<string, string> = {
   danish: 'da', swedish: 'sv', norwegian: 'no', finnish: 'fi', portuguese: 'pt',
   spanish: 'es', japanese: 'ja', korean: 'ko', arabic: 'ar', hindi: 'hi',
   'mandarin chinese': 'zh', chinese: 'zh', malay: 'ms', tamil: 'ta', irish: 'ga',
-  maori: 'mi', 'māori': 'mi', luxembourgish: 'lb'
+  maori: 'mi', 'māori': 'mi', luxembourgish: 'lb',
+  // Excluded-country languages (forensic: full language names previously
+  // normalized to '' and silently dropped from declared-language routing).
+  vietnamese: 'vi', tagalog: 'tl', filipino: 'tl', urdu: 'ur',
+  bengali: 'bn', bangla: 'bn', nepali: 'ne', sinhala: 'si', sinhalese: 'si',
+  indonesian: 'id', punjabi: 'pa', telugu: 'te', marathi: 'mr', thai: 'th'
 };
 
 const normalizeCountry = (country: string) => country.normalize('NFKC').trim().toLocaleLowerCase('en');
