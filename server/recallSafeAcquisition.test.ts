@@ -891,3 +891,135 @@ test('empty innertube result records no surface and leaves no inspected-match tr
     resetInnertubePacingForTests();
   }
 });
+
+test('repeat-failure-capped URL is skipped while remaining URLs are inspected', async () => {
+  const fetched: string[] = [];
+  const history = [
+    ...Array.from({ length: 5 }, (_, index) => ({
+      requestedUrl: 'https://dead.example/',
+      failureClass: 'HTTP_ERROR',
+      outcome: 'ACQUISITION_FAILED',
+      observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+    })),
+  ];
+  const result = await runChannelInspection({
+    channelId: 'UCskiprepeat0000000000001',
+    channelName: 'Skip Repeat Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://dead.example/', 'https://live.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input: any) => {
+      fetched.push(String(input));
+      return new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch,
+    urlFailureHistoryLoader: async () => history,
+  });
+  assert.ok(!fetched.some(url => url.includes('dead.example')), 'capped URL must never be fetched');
+  assert.ok(fetched.some(url => url.includes('live.example')), 'remaining URLs must still be inspected');
+  const step = (result.steps || []).find(item => item.step === 'CUSTOM_DOMAINS');
+  assert.ok(step && JSON.stringify(step).includes('repeat-failure cap'), 'skip reason must be observable in the trail');
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'), 'skipped URL must not produce failure observations');
+});
+
+test('exempt-class history never skips, even at ten consecutive failures', async () => {
+  const fetched: string[] = [];
+  const history = Array.from({ length: 10 }, (_, index) => ({
+    requestedUrl: 'https://slow.example/',
+    failureClass: 'RENDERED_BUDGET_EXPIRED',
+    outcome: 'ACQUISITION_FAILED',
+    observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+  }));
+  const result = await runChannelInspection({
+    channelId: 'UCskipexempt0000000000001',
+    channelName: 'Skip Exempt Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://slow.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input: any) => {
+      fetched.push(String(input));
+      return new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch,
+    urlFailureHistoryLoader: async () => history,
+  });
+  assert.ok(fetched.some(url => url.includes('slow.example')), 'budget-expired history must stay retryable');
+  assert.ok(result, 'inspection completes normally');
+});
+
+test('skipped-only inspection stays uncertain instead of resolving clean', async () => {
+  const history = Array.from({ length: 5 }, (_, index) => ({
+    requestedUrl: 'https://dead.example/',
+    failureClass: 'HTTP_ERROR',
+    outcome: 'ACQUISITION_FAILED',
+    observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+  }));
+  let loaderArgs: { channelId: string; urls: string[] | undefined } | null = null;
+  const result = await runChannelInspection({
+    channelId: 'UCskiponly00000000000001',
+    channelName: 'Skip Only Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://dead.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    liveChannelDataLoader: async () => ({ bio: 'Extended bio text for coverage purposes', channelLinks: [], thumbnailUrl: null, rawHtml: '', fetchLog: '' }),
+    externalFetchImpl: (async () => { throw new Error('must not fetch skipped URL'); }) as typeof fetch,
+    urlFailureHistoryLoader: (async (channelId: string, urls?: string[]) => {
+      loaderArgs = { channelId, urls };
+      return history;
+    }) as (channelId: string) => Promise<typeof history>,
+  });
+  assert.deepEqual(loaderArgs?.urls, ['https://dead.example/'], 'history read scopes to current candidates');
+  const step = (result.steps || []).find(item => item.step === 'CUSTOM_DOMAINS');
+  assert.equal(step?.status, 'PARTIAL');
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'));
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => String(item.requestedUrl || '').startsWith('https://dead.example') && item.outcome === 'ACQUISITION_FAILED'));
+});
+
+test('skipped URL beside a clean surface keeps the step uncertain, never clean', async () => {
+  const history = Array.from({ length: 5 }, (_, index) => ({
+    requestedUrl: 'https://dead.example/',
+    failureClass: 'HTTP_ERROR',
+    outcome: 'ACQUISITION_FAILED',
+    observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+  }));
+  const result = await runChannelInspection({
+    channelId: 'UCskipmixed00000000000001',
+    channelName: 'Skip Mixed Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://dead.example/', 'https://live.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    liveChannelDataLoader: async () => ({ bio: 'Extended bio', channelLinks: [], thumbnailUrl: null, rawHtml: '', fetchLog: '' }),
+    externalFetchImpl: (async () => new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } })) as typeof fetch,
+    urlFailureHistoryLoader: (async () => history) as any,
+  });
+  const step = (result.steps || []).find(item => item.step === 'CUSTOM_DOMAINS');
+  assert.equal(step?.status, 'PARTIAL', 'a skipped surface alongside clean ones must stay uncertain');
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'));
+});
+
+test('history loader failure warns but never blocks crawling', async () => {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } })) as unknown as typeof fetch;
+  try {
+    const result = await runChannelInspection({
+      channelId: 'UCskiphistoryfail00000001',
+      channelName: 'Skip History Fail Channel',
+      channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+      channelLinks: ['https://live.example/'],
+      videoDescriptions: [],
+      creatorLikelyTrading: false,
+      externalFetchImpl: (async () => new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } })) as typeof fetch,
+      urlFailureHistoryLoader: (async () => { throw new Error('ledger down'); }) as any,
+    });
+    assert.ok(warnings.some(message => message.includes('[RepeatFailureSkip]')), 'loader outage must be observable');
+    assert.ok(result, 'inspection completes without skips');
+  } finally {
+    console.warn = original;
+    globalThis.fetch = savedFetch;
+  }
+});
