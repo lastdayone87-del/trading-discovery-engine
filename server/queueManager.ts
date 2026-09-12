@@ -53,7 +53,7 @@ import { processChannelThroughPipeline, isTerminalState } from './ingestionPipel
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
-import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
+import { ChannelRecord, CountryStatus, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
@@ -920,6 +920,26 @@ export function applyLiveCountryRejectionToInspected(
 }
 
 /**
+ * Projects a live (non-terminal) country revalidation onto the in-memory
+ * channel: factual country, status, confidence AND scope eligibility move
+ * together, so the row can never hold a new country with a stale scope
+ * (e.g. Germany -> Brazil retaining IN_SCOPE). The persisted write follows
+ * in the caller's finally-block upsert, which re-derives scope identically.
+ */
+export function projectLiveCountryAttribution(
+  channel: ChannelRecord,
+  liveCountry: { detectedCreatorCountry?: string | null; status: CountryStatus; score: number },
+): ChannelRecord {
+  if (liveCountry.detectedCreatorCountry !== undefined) {
+    channel.country = liveCountry.detectedCreatorCountry || null;
+    channel.scope_eligibility = resolveScopeEligibility(channel.country);
+    channel.country_status = liveCountry.status;
+    channel.confidence_score = liveCountry.score;
+  }
+  return channel;
+}
+
+/**
  * Handles newly discovered YouTube channel via the unified ingestion pipeline.
  */
 export async function processDiscoveredChannel(
@@ -1101,7 +1121,13 @@ export async function inspectAndValidateChannel(
       channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
       return;
     }
-    if (liveCountry.detectedCreatorCountry !== undefined) { channel.country=liveCountry.detectedCreatorCountry || null; channel.country_status=liveCountry.status; channel.confidence_score=liveCountry.score; }
+    if (liveCountry.detectedCreatorCountry !== undefined) {
+      projectLiveCountryAttribution(channel, {
+        detectedCreatorCountry: liveCountry.detectedCreatorCountry,
+        status: liveCountry.status,
+        score: liveCountry.score,
+      });
+    }
 
     // Combine Country Validation step as Step 1 with Discord Inspection steps
     channel.inspection_trail = [countryStep, ...inspection.steps];

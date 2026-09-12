@@ -64,6 +64,10 @@ test('scope eligibility separates market validity from country verdicts', () => 
   assert.equal(resolveScopeEligibility('NO'), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('norge'), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('GB'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('USA'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('UK'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('Great Britain'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('United States of America'), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('TH'), 'OUT_OF_SCOPE');
   assert.equal(resolveScopeEligibility('Atlantis'), 'OUT_OF_SCOPE');
   assert.equal(resolveScopeEligibility('Vietnam'), 'OUT_OF_SCOPE');
@@ -100,7 +104,7 @@ test('autonomous sweep preserves dormant countries but honors explicit targets',
 test('migration supported universe matches the application registry', async () => {
   // Guard against registry/SQL drift: the migration cannot import application
   // constants, so this test fails loudly on divergence instead.
-  const { canonicalCountry } = await import('./countryInference');
+  const { canonicalCountry, supportedCountryAliasSpellings } = await import('./countryInference');
   const sql = readFileSync('server/db/migrations/131_scope_eligibility.sql', 'utf8');
   const inList = sql.slice(sql.indexOf('WHEN LOWER(BTRIM(country)) IN ('));
   const sqlNames = new Set(
@@ -116,8 +120,12 @@ test('migration supported universe matches the application registry', async () =
   for (const name of registryNames) {
     assert.ok(sqlNames.has(name), `migration IN-list missing registry country '${name}'`);
   }
-  // Every other list entry must be a short code canonicalizing to the registry
-  // (legacy rows store ISO codes like DE/TH); nothing may map outside it.
+  // Every supported alias spelling must also be covered: legacy rows store
+  // aliases (USA, UK, norge, ...), and the migration must agree with runtime.
+  for (const alias of supportedCountryAliasSpellings()) {
+    assert.ok(sqlNames.has(alias), `migration IN-list missing supported alias '${alias}'`);
+  }
+  // Every other list entry must still resolve inside the registry.
   for (const name of sqlNames) {
     const canonical = canonicalCountry(name).normalize('NFKC').trim().toLocaleLowerCase('en');
     assert.ok(

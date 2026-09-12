@@ -15,15 +15,15 @@
 --   * ONE backfill UPDATE (single sequential scan) with SQL-side
 --     canonicalization matching resolveScopeEligibility(): BTRIM whitespace,
 --     LOWER casefold, empty-after-trim -> UNRESOLVED. The list covers
---     canonical names AND two-letter ISO codes (legacy rows store both —
---     e.g. 'DE', 'TH'); exotic aliases canonicalize correctly on the next
---     upsert via the runtime resolver. (Runtime additionally applies Unicode
---     NFKC; all 20 registry names are ASCII so the two are equivalent here.)
+--     canonical names, two-letter ISO codes, AND every supported alias
+--     spelling (legacy rows store all three forms — e.g. 'DE', 'USA', 'UK').
+--     (Runtime additionally applies Unicode NFKC; all registry names and
+--     aliases are ASCII so the two are equivalent here.)
 --   * Plain ADD CHECK validated inline over already-backfilled rows. Table is
 --     ~10k rows; the scan is milliseconds under a brief lock.
 -- Application writes derive values via resolveScopeEligibility() in
 -- server/scopeEligibility.ts. The supported list below MUST equal
--- SUPPORTED_PRODUCTION_COUNTRIES (lowercased) plus their ISO codes;
+-- SUPPORTED_PRODUCTION_COUNTRIES (lowercased) plus supportedCountryAliasSpellings();
 -- server/scopeRegistry.test.ts fails on divergence.
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS scope_eligibility TEXT;
@@ -36,7 +36,8 @@ UPDATE channels SET scope_eligibility = CASE
     'united arab emirates','singapore','new zealand','belgium','luxembourg',
     'ireland','norway',
     'us','gb','de','fr','es','nl','it','au','ca','jp','ch','dk','se','ae',
-    'sg','nz','be','lu','ie','no'
+    'sg','nz','be','lu','ie','no',
+    'usa','united states of america','uk','great britain','norge'
   ) THEN 'IN_SCOPE'
   ELSE 'OUT_OF_SCOPE'
 END

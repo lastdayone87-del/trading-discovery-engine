@@ -56,8 +56,8 @@ test('live rejection helper never touches trading/Discord ownership or the trail
 test('live rejection branch uses the helper and persists via the finally upsert only', () => {
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const branch = source.slice(
-    source.indexOf('if (liveCountry.status ==='),
-    source.indexOf("if (liveCountry.detectedCreatorCountry !== undefined)"),
+    source.indexOf("if (liveCountry.status === 'REJECTED')"),
+    source.indexOf("if (liveCountry.detectedCreatorCountry !== undefined) {", source.indexOf("if (liveCountry.status === 'REJECTED')")),
   );
   assert.match(branch, /applyLiveCountryRejectionToInspected\(channel, liveCountry, now\)/);
   assert.match(branch, /channel\.inspection_trail=\[countryStep, \.\.\.inspection\.steps, liveCountryStep\]/);
@@ -105,4 +105,34 @@ test('startup audit restores Discord cleanup for rejected rows in a bounded pass
   assert.doesNotMatch(cleanup, /validateChannelCountry/);
   assert.match(cleanup, /channel\.discord_invite = null/);
   assert.match(cleanup, /await upsertChannel\(channel\)/);
+});
+
+test('live non-terminal replacement keeps country and scope consistent', async () => {
+  const { projectLiveCountryAttribution } = await import('./queueManager');
+  const row = inspectedRow() as any;
+  row.country = 'Germany';
+  row.country_status = 'CONFIRMED';
+  row.scope_eligibility = 'IN_SCOPE';
+  const out = projectLiveCountryAttribution(row, {
+    detectedCreatorCountry: 'Brazil',
+    status: 'CONFIRMED',
+    score: 92,
+  });
+  assert.equal(out.country, 'Brazil');
+  assert.equal(out.country_status, 'CONFIRMED');
+  assert.equal(out.scope_eligibility, 'OUT_OF_SCOPE');
+});
+
+test('live replacement without a detection leaves country and scope untouched', async () => {
+  const { projectLiveCountryAttribution } = await import('./queueManager');
+  const row = inspectedRow() as any;
+  row.country = 'Germany';
+  row.scope_eligibility = 'IN_SCOPE';
+  const out = projectLiveCountryAttribution(row, {
+    detectedCreatorCountry: undefined,
+    status: 'UNCERTAIN',
+    score: 0,
+  });
+  assert.equal(out.country, 'Germany');
+  assert.equal(out.scope_eligibility, 'IN_SCOPE');
 });

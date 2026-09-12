@@ -238,6 +238,21 @@ export function countryIsoAlias(value: string): string | null {
   return alias ? alias.toUpperCase() : null;
 }
 
+/**
+ * Alias spellings (as stored in COUNTRY_ALIASES keys) that canonicalize to a
+ * supported production country. Single source for scope-eligibility alias
+ * coverage: the runtime resolver, the migration guard test, and registry
+ * audits all derive from these definitions — never from a second list.
+ */
+export function supportedCountryAliasSpellings(): string[] {
+  const supported = new Set(
+    SUPPORTED_PRODUCTION_COUNTRIES.map(country => normalizeCountryName(canonicalCountry(country))),
+  );
+  return Object.keys(COUNTRY_ALIASES).filter(
+    key => supported.has(normalizeCountryName(canonicalCountry(key))),
+  );
+}
+
 function includesSignal(text: string, signals: string[]): string | null {
   return signals.find(signal => {
     const lower = signal.toLocaleLowerCase('en');
