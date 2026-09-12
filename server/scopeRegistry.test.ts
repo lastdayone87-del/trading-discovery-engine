@@ -60,6 +60,12 @@ test('scope eligibility separates market validity from country verdicts', () => 
   assert.equal(resolveScopeEligibility('Italy'), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('  Germany  '), 'IN_SCOPE');
   assert.equal(resolveScopeEligibility('GERMANY'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('DE'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('NO'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('norge'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('GB'), 'IN_SCOPE');
+  assert.equal(resolveScopeEligibility('TH'), 'OUT_OF_SCOPE');
+  assert.equal(resolveScopeEligibility('Atlantis'), 'OUT_OF_SCOPE');
   assert.equal(resolveScopeEligibility('Vietnam'), 'OUT_OF_SCOPE');
   assert.equal(resolveScopeEligibility('Brazil'), 'OUT_OF_SCOPE');
   assert.equal(resolveScopeEligibility(null), 'UNRESOLVED');
@@ -91,9 +97,10 @@ test('autonomous sweep preserves dormant countries but honors explicit targets',
   );
 });
 
-test('migration supported universe matches the application registry', () => {
+test('migration supported universe matches the application registry', async () => {
   // Guard against registry/SQL drift: the migration cannot import application
   // constants, so this test fails loudly on divergence instead.
+  const { canonicalCountry } = await import('./countryInference');
   const sql = readFileSync('server/db/migrations/131_scope_eligibility.sql', 'utf8');
   const inList = sql.slice(sql.indexOf('WHEN LOWER(BTRIM(country)) IN ('));
   const sqlNames = new Set(
@@ -106,7 +113,18 @@ test('migration supported universe matches the application registry', () => {
       country.normalize('NFKC').trim().toLocaleLowerCase('en'),
     ),
   );
-  assert.deepEqual([...sqlNames].sort(), [...registryNames].sort());
+  for (const name of registryNames) {
+    assert.ok(sqlNames.has(name), `migration IN-list missing registry country '${name}'`);
+  }
+  // Every other list entry must be a short code canonicalizing to the registry
+  // (legacy rows store ISO codes like DE/TH); nothing may map outside it.
+  for (const name of sqlNames) {
+    const canonical = canonicalCountry(name).normalize('NFKC').trim().toLocaleLowerCase('en');
+    assert.ok(
+      registryNames.has(name) || registryNames.has(canonical),
+      `migration entry '${name}' matches no registry country`,
+    );
+  }
 });
 test('migration 131 adds scope_eligibility non-destructively', () => {
   const raw = readFileSync('server/db/migrations/131_scope_eligibility.sql', 'utf8');

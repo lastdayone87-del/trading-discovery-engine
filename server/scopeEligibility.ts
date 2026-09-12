@@ -1,4 +1,5 @@
 import { SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
+import { canonicalCountry } from './countryInference';
 
 export type ScopeEligibility = 'IN_SCOPE' | 'OUT_OF_SCOPE' | 'UNRESOLVED';
 
@@ -9,18 +10,20 @@ const SUPPORTED = new Set(
 );
 
 /**
- * Derives catalog scope validity from an attributed country only. Never reads
- * confidence, status, or gate dispositions: UNCERTAIN-with-country stays
- * IN_SCOPE when the country is supported (evidence may still arrive), and
- * only a missing country is UNRESOLVED. Dormant supported countries are
- * IN_SCOPE (dormancy governs autonomous scheduling, not validity).
+ * Derives catalog scope validity from an attributed country only. Aliases
+ * (DE, NO, norge, …) canonicalize first, so supported countries stored under
+ * any modeled spelling stay IN_SCOPE. Never reads confidence, status, or
+ * gate dispositions: UNCERTAIN-with-country stays IN_SCOPE when the country
+ * is supported (evidence may still arrive), and only a missing country is
+ * UNRESOLVED. Dormant supported countries are IN_SCOPE (dormancy governs
+ * autonomous scheduling, not validity).
  */
 export function resolveScopeEligibility(country: string | null | undefined): ScopeEligibility {
-  const normalized = String(country || '')
+  const raw = String(country || '')
     .normalize('NFKC')
-    .trim()
-    .toLocaleLowerCase('en');
-  if (!normalized) return 'UNRESOLVED';
+    .trim();
+  if (!raw) return 'UNRESOLVED';
+  const normalized = canonicalCountry(raw).toLocaleLowerCase('en');
   return SUPPORTED.has(normalized) ? 'IN_SCOPE' : 'OUT_OF_SCOPE';
 }
 

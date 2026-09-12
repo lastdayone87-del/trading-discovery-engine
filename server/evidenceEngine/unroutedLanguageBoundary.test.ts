@@ -26,3 +26,15 @@ for (const language of ['vi', 'tl', 'ur', 'bn', 'ne']) {
     );
   });
 }
+
+test("routed language 'no' yields its Norwegian pack", async () => {
+  const { contentLanguagePacks } = await import('./multilingualTerminology');
+  const { getLayeredKnowledgeContext } = await import('./knowledgePacks');
+  const input = {
+    channel_name: 'Test channel',
+    description: 'lær trading med teknisk analyse og risikostyring',
+    detected_languages: [{ language: 'no', script: 'Latn', confidence: 90, field: 'description' }],
+  } as unknown as Parameters<typeof contentLanguagePacks>[0];
+  const codes = contentLanguagePacks(input, getLayeredKnowledgeContext('Norway')).map(pack => pack.languageCode);
+  assert.ok(codes.includes('no'), 'Norwegian content must resolve its pack');
+});
