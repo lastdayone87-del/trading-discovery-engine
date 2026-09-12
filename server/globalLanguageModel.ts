@@ -46,7 +46,10 @@ const SCRIPT_TESTS: Array<[ScriptCode, RegExp]> = [
 const KNOWN_SCRIPTS = new Set<ScriptCode>(SCRIPT_TESTS.map(([script]) => script));
 const LANGUAGE_SCRIPTS: Record<string, ScriptCode[]> = {
   ar: ['Arab'], fa: ['Arab'], ur: ['Arab'], ru: ['Cyrl'], uk: ['Cyrl'], bg: ['Cyrl'], hi: ['Deva'], mr: ['Deva'], ne: ['Deva'],
-  ko: ['Hang'], ja: ['Hani', 'Hira', 'Kana'], zh: ['Hani']
+  ko: ['Hang'], ja: ['Hani', 'Hira', 'Kana'], zh: ['Hani'],
+  // Latin-script languages: explicit so Vietnamese/Tagalog/Malay/Indonesian
+  // content is never flagged transliterated and never depends on the Latn default.
+  vi: ['Latn'], tl: ['Latn'], ms: ['Latn'], id: ['Latn']
 };
 
 function stable(value: unknown): string {

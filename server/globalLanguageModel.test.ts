@@ -36,3 +36,13 @@ test('Arabic, Cyrillic, Devanagari, and Hangul can enter pinned controlled trial
     assert.equal(decision.disposition, 'CONTROLLED_TRIAL');
   }
 });
+
+test('Vietnamese/Tagalog Latin-script content is not flagged transliterated', () => {
+  // Forensic: vi/tl/ms/id defaulted to Latn via fallback; pin explicit mapping
+  // so diacritic-heavy Vietnamese is never treated as transliterated Latin.
+  const vi = observeLanguageField('title', 'phân tích kỹ thuật chứng khoán', 'vi');
+  assert.equal(vi.transliterated, false);
+  assert.ok(vi.scripts.includes('Latn'));
+  const tl = observeLanguageField('title', 'pamilihan ng stock trading pilipinas', 'tl');
+  assert.equal(tl.transliterated, false);
+});
