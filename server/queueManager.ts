@@ -48,11 +48,12 @@ import './braveSearch';
 import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
+import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
-import { ChannelRecord, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
+import { ChannelRecord, CountryStatus, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
 import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
@@ -634,7 +635,7 @@ export async function processNextSearchJob(
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
       const qualityScore = outcome.channelRecord?.quality_score || 0;
       const hasCommunity = outcome.discordStatus === 'ACTIVE' || outcome.discordStatus === 'ACTIVE_LOW_VOLUME';
-      observations.push({ channelId: outcome.channelId, wasKnown: outcome.wasKnown, persisted: outcome.persisted, funnelOutcome, qualityScore, hasCommunity });
+      observations.push({ channelId: outcome.channelId, wasKnown: outcome.wasKnown, persisted: outcome.persisted, funnelOutcome, qualityScore, hasCommunity, scopeEligibility: resolveScopeEligibility(outcome.channelRecord?.country ?? outcome.detectedCountry ?? null) });
       sightings.push({
         channelId: outcome.channelId, resultRank: index + 1, searchLane: retrievalLane, wasKnown: outcome.wasKnown, persisted: outcome.persisted,
         countryOutcome: outcome.countryStatus, tradingOutcome: outcome.tradingStatus, funnelOutcome,
@@ -911,9 +912,30 @@ export function applyLiveCountryRejectionToInspected(
 ): ChannelRecord {
   channel.country_status = 'REJECTED';
   channel.country = liveCountry.detectedCreatorCountry || null;
+  channel.scope_eligibility = resolveScopeEligibility(channel.country);
   channel.confidence_score = liveCountry.score;
   channel.scan_status = 'COMPLETED';
   channel.last_checked = now;
+  return channel;
+}
+
+/**
+ * Projects a live (non-terminal) country revalidation onto the in-memory
+ * channel: factual country, status, confidence AND scope eligibility move
+ * together, so the row can never hold a new country with a stale scope
+ * (e.g. Germany -> Brazil retaining IN_SCOPE). The persisted write follows
+ * in the caller's finally-block upsert, which re-derives scope identically.
+ */
+export function projectLiveCountryAttribution(
+  channel: ChannelRecord,
+  liveCountry: { detectedCreatorCountry?: string | null; status: CountryStatus; score: number },
+): ChannelRecord {
+  if (liveCountry.detectedCreatorCountry !== undefined) {
+    channel.country = liveCountry.detectedCreatorCountry || null;
+    channel.scope_eligibility = resolveScopeEligibility(channel.country);
+    channel.country_status = liveCountry.status;
+    channel.confidence_score = liveCountry.score;
+  }
   return channel;
 }
 
@@ -984,7 +1006,11 @@ export async function inspectAndValidateChannel(
         videoDescriptionsAuthoritative: rawDetails?.videoDescriptionsAuthoritative,
         playlists: rawDetails?.playlists
       },
-      rawDetails?.locationTag || null
+      // Enrichment revalidation is unscoped: no genuine query target country
+      // exists here. locationTag already enters above as creator-level
+      // official metadata; passing it again as the discovery target would
+      // manufacture false discovery-country context (e.g. 'BR').
+      null
     );
 
     const preInspectionLanguageSet = aggregatedLanguageCandidateSet(valRes.evidence);
@@ -1005,6 +1031,11 @@ export async function inspectAndValidateChannel(
     if (valRes.status === 'REJECTED') {
       // Excluded country matched — Halt execution immediately! Never reach Discord crawler.
       channel.country_status = 'REJECTED';
+      // Re-attribute the detected country (never retain the previous one) and
+      // re-derive scope from it, so an unsupported-country rejection flips a
+      // stale IN_SCOPE to OUT_OF_SCOPE instead of preserving it.
+      channel.country = valRes.detectedCreatorCountry || null;
+      channel.scope_eligibility = resolveScopeEligibility(channel.country);
       channel.confidence_score = valRes.score;
       channel.scan_status = 'COMPLETED';
       channel.last_checked = now;
@@ -1017,7 +1048,10 @@ export async function inspectAndValidateChannel(
     // Update country status & decision trail
     channel.country_status = valRes.status;
     channel.confidence_score = valRes.score;
-    if (valRes.detectedCreatorCountry !== undefined) channel.country = valRes.detectedCreatorCountry || null;
+    if (valRes.detectedCreatorCountry !== undefined) {
+      channel.country = valRes.detectedCreatorCountry || null;
+      channel.scope_eligibility = resolveScopeEligibility(channel.country);
+    }
 
     // 2. Step-by-step Channel Inspection Engine for Discord Invites (force live YouTube scrape on manual scan)
     inspection = await runChannelInspection({
@@ -1045,7 +1079,10 @@ export async function inspectAndValidateChannel(
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
       metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status,
-      videoDescriptions:inspection.observedVideoDescriptions || [], videoDescriptionsAuthoritative:inspection.observedVideoDescriptionsAuthoritative || false, playlists:rawDetails?.playlists}, rawDetails?.locationTag || null);
+      videoDescriptions:inspection.observedVideoDescriptions || [], videoDescriptionsAuthoritative:inspection.observedVideoDescriptionsAuthoritative || false, playlists:rawDetails?.playlists},
+      // Unscoped live revalidation (see above): locationTag is creator-level
+      // input, never the discovery target.
+      null);
     const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
     const liveLanguageSet = aggregatedLanguageCandidateSet(liveCountry.evidence);
     const liveCountryStep: InspectionStep = {
@@ -1084,7 +1121,13 @@ export async function inspectAndValidateChannel(
       channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
       return;
     }
-    if (liveCountry.detectedCreatorCountry !== undefined) { channel.country=liveCountry.detectedCreatorCountry || null; channel.country_status=liveCountry.status; channel.confidence_score=liveCountry.score; }
+    if (liveCountry.detectedCreatorCountry !== undefined) {
+      projectLiveCountryAttribution(channel, {
+        detectedCreatorCountry: liveCountry.detectedCreatorCountry,
+        status: liveCountry.status,
+        score: liveCountry.score,
+      });
+    }
 
     // Combine Country Validation step as Step 1 with Discord Inspection steps
     channel.inspection_trail = [countryStep, ...inspection.steps];
@@ -1372,6 +1415,13 @@ export async function auditExistingChannelsWithExclusionEngine(): Promise<{ tota
           channel.country_status = 'REJECTED';
           channel.confidence_score = valRes.score;
           channel.scan_status = 'COMPLETED';
+          // Project the newly detected creator country (never retain a stale
+          // attribution the fresh validation overturned). scope_eligibility
+          // follows from the final country inside upsertChannel; a missing
+          // detection keeps the prior country rather than nulling truth.
+          if (valRes.detectedCreatorCountry) {
+            channel.country = valRes.detectedCreatorCountry;
+          }
 
           const countryStep: InspectionStep = {
             step: 'COUNTRY_VALIDATION',

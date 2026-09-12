@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const dbSource = fs.readFileSync(path.join(process.cwd(), 'server/db.ts'), 'utf8');
+// Contract assertions target the implementation file: server/db.ts is a thin
+// facade re-exporting dbCore, so persistence code lives in server/dbCore.ts
+// while remaining reachable through the facade at runtime.
+const dbSource = fs.readFileSync(path.join(process.cwd(), 'server/dbCore.ts'), 'utf8');
 const queueSource = fs.readFileSync(path.join(process.cwd(), 'server/queueManager.ts'), 'utf8');
 const migrationSource = fs.readFileSync(path.join(process.cwd(), 'server/db/migrations/117_query_run_accounting_attribution.sql'), 'utf8');
 

@@ -8,7 +8,7 @@ const PRODUCTION_COUNTRY_ISO_CODES: Readonly<Record<string, string>> = Object.fr
   US: 'United States', GB: 'United Kingdom', DE: 'Germany', FR: 'France', ES: 'Spain',
   NL: 'Netherlands', IT: 'Italy', AU: 'Australia', CA: 'Canada', JP: 'Japan', CH: 'Switzerland',
   DK: 'Denmark', SE: 'Sweden', AE: 'United Arab Emirates', SG: 'Singapore', NZ: 'New Zealand',
-  BE: 'Belgium', LU: 'Luxembourg', IE: 'Ireland'
+  BE: 'Belgium', LU: 'Luxembourg', IE: 'Ireland', NO: 'Norway'
 });
 
 function duplicates(values: readonly string[]): string[] {

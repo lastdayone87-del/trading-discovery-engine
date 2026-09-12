@@ -1,4 +1,5 @@
 import type { CountryMetadataStatus, CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
+import { SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
 import { normalizeCountryName } from './countryExclusionRules';
 
 export type CountryEvidenceSource =
@@ -25,7 +26,8 @@ export type GateDisposition =
   | 'ALLOW_NORMAL'
   | 'CONTINUE_CRAWLING'
   | 'NEEDS_REVIEW'
-  | 'REJECT_EXCLUDED';
+  | 'REJECT_EXCLUDED'
+  | 'REJECT_UNSUPPORTED';
 
 export interface CountryInferenceEvidence {
   source: CountryEvidenceSource;
@@ -154,6 +156,7 @@ const COUNTRY_ALIASES: Record<string, string> = {
   ,dz:'Algeria', tn:'Tunisia', et:'Ethiopia', tz:'Tanzania', ug:'Uganda', sn:'Senegal', cm:'Cameroon',
   zw:'Zimbabwe', zm:'Zambia', rw:'Rwanda', ci:'Ivory Coast', mz:'Mozambique', mg:'Madagascar', sd:'Sudan',
   ao:'Angola', lk:'Sri Lanka', cz:'Czechia', czech:'Czechia', 'czech republic':'Czechia'
+  ,no:'Norway', norge:'Norway'
 };
 
 const COUNTRY_SIGNALS: Record<string, {
@@ -180,6 +183,7 @@ const COUNTRY_SIGNALS: Record<string, {
   Switzerland: { bio: ['switzerland', 'schweiz', 'suisse', 'svizzera'], tlds: ['.ch'], social: ['switzerland', 'zurich'], exchanges: ['six swiss exchange', 'swiss market index', 'smi'], brokers: ['swissquote'], phones: ['+41'], addresses: ['zurich', 'zürich', 'geneva', 'genève'], language: ['börsenanalyse schweiz', 'smi analyse'] },
   Denmark: { bio: ['denmark', 'danmark', 'dansk trader'], tlds: ['.dk'], social: ['danmark', 'copenhagen'], exchanges: ['nasdaq copenhagen', 'omxc25'], brokers: ['saxo bank'], phones: ['+45'], addresses: ['copenhagen', 'københavn'], language: ['aktiehandel', 'teknisk analyse', 'børsanalyse'] },
   Sweden: { bio: ['sweden', 'sverige', 'svensk trader'], tlds: ['.se'], social: ['sverige', 'stockholm'], exchanges: ['nasdaq stockholm', 'omxs30'], brokers: ['avanza'], phones: ['+46'], addresses: ['stockholm', 'göteborg'], language: ['aktiehandel', 'teknisk analys', 'börsanalys'] },
+  Norway: { bio: ['norway', 'norge', 'norsk trader'], tlds: ['.no'], social: ['norge', 'oslo'], exchanges: ['oslo børs', 'oslo bors', 'obx'], brokers: ['nordnet', 'saxo bank'], phones: ['+47'], addresses: ['oslo', 'bergen'], language: ['aksjehandel', 'teknisk analyse', 'børsanalyse'] },
   Singapore: { bio: ['singapore', 'singapore trader'], tlds: ['.sg', '.com.sg'], social: ['singapore'], exchanges: ['singapore exchange', 'sgx', 'straits times index'], brokers: ['dbs vickers'], phones: ['+65'], addresses: ['singapore'], language: ['股票交易', '技术分析', 'pasaran saham'] },
   'New Zealand': { bio: ['new zealand', 'kiwi trader'], tlds: ['.nz', '.co.nz'], social: ['newzealand', 'auckland'], exchanges: ['new zealand exchange', 'nzx 50'], brokers: ['sharesies'], phones: ['+64'], addresses: ['auckland', 'wellington'], language: [] },
   Belgium: { bio: ['belgium', 'belgië', 'belgique'], tlds: ['.be'], social: ['belgium', 'brussels'], exchanges: ['euronext brussels', 'bel 20'], brokers: ['bolero', 'keytrade'], phones: ['+32'], addresses: ['brussels', 'bruxelles', 'antwerp'], language: ['beursanalyse belgië', 'analyse boursière belge'] },
@@ -214,6 +218,7 @@ const COUNTRY_SIGNALS: Record<string, {
   Madagascar: { bio: ['madagascar', 'malagasy trader', 'based in madagascar'], tlds: ['.mg'], social: ['madagascar'], exchanges: [], brokers: [], phones: ['+261'], addresses: ['antananarivo'], language: [] },
   Sudan: { bio: ['sudan', 'sudanese trader', 'based in sudan'], tlds: ['.sd'], social: ['sudan'], exchanges: [], brokers: [], phones: ['+249'], addresses: ['khartoum'], language: [] },
   Angola: { bio: ['angola', 'angolan trader', 'based in angola'], tlds: ['.ao'], social: ['angola'], exchanges: [], brokers: [], phones: ['+244'], addresses: ['luanda'], language: [] },
+  Mexico: { bio: ['mexico', 'mexican trader', 'based in mexico', 'trader en méxico'], tlds: ['.mx', '.com.mx'], social: ['mexico', 'cdmx'], exchanges: ['bolsa mexicana de valores', 'bmv', 'mexican stock exchange'], brokers: ['gbm', 'grupo bursátil mexicano', 'kuspit'], phones: ['+52'], addresses: ['ciudad de méxico', 'mexico city', 'monterrey', 'guadalajara'], language: ['bolsa mexicana', 'mercado mexicano'] },
   'Sri Lanka': { bio: ['sri lanka', 'sri lankan trader', 'based in sri lanka'], tlds: ['.lk'], social: ['srilanka'], exchanges: ['colombo stock exchange'], brokers: [], phones: ['+94'], addresses: ['colombo'], language: [] }
 };
 
@@ -231,6 +236,21 @@ export function countryIsoAlias(value: string): string | null {
     key.length === 2 && canonicalCountry(country) === canonical
   )?.[0];
   return alias ? alias.toUpperCase() : null;
+}
+
+/**
+ * Alias spellings (as stored in COUNTRY_ALIASES keys) that canonicalize to a
+ * supported production country. Single source for scope-eligibility alias
+ * coverage: the runtime resolver, the migration guard test, and registry
+ * audits all derive from these definitions — never from a second list.
+ */
+export function supportedCountryAliasSpellings(): string[] {
+  const supported = new Set(
+    SUPPORTED_PRODUCTION_COUNTRIES.map(country => normalizeCountryName(canonicalCountry(country))),
+  );
+  return Object.keys(COUNTRY_ALIASES).filter(
+    key => supported.has(normalizeCountryName(canonicalCountry(key))),
+  );
 }
 
 function includesSignal(text: string, signals: string[]): string | null {
@@ -584,8 +604,29 @@ export function assessChannelCountry(
   // alias/localized spelling bound to the same canonical country, so explicit
   // domicile using an alias ("based in Côte d'Ivoire", "based in Czech
   // Republic") attributes to the right country instead of being missed.
-  for (const item of exclusions) {
-    const canonical = canonicalCountry(item.country_name);
+  // Explicit domicile is modeled for the excluded list, the supported
+  // universe, AND every country with a signal entry (e.g. Brazil, Mexico):
+  // otherwise a phrase like "based in Brazil" (unsupported, non-excluded)
+  // could never produce authoritative domicile evidence, and the
+  // unsupported-universe gate below could never fire from bio text — the
+  // most common domicile signal. Deduplicated by canonical name so no
+  // country is evaluated twice. Supported-country outcomes are unaffected
+  // (their mention-grade items already carried equal confidence); gates
+  // decide what each attribution means.
+  const domicileSubjects: string[] = [];
+  const domicileSeen = new Set<string>();
+  for (const name of [
+    ...exclusions.map(entry => entry.country_name),
+    ...(SUPPORTED_PRODUCTION_COUNTRIES as readonly string[]),
+    ...Object.keys(COUNTRY_SIGNALS),
+  ]) {
+    const canonical = canonicalCountry(name);
+    const key = normalizeCountryName(canonical);
+    if (domicileSeen.has(key)) continue;
+    domicileSeen.add(key);
+    domicileSubjects.push(canonical);
+  }
+  for (const canonical of domicileSubjects) {
     const names = domicileNameVariants(canonical);
     if (names.length === 0) continue;
     // Unicode-aware word boundaries around the name alternation: JS \b is
@@ -596,23 +637,30 @@ export function assessChannelCountry(
     const boundaryBefore = '(?<![\\p{L}\\p{N}_])';
     const boundaryAfter = '(?![\\p{L}\\p{N}_])';
     const namePattern = names.map(escapeRegExpLiteral).join('|');
-    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|lives in|live in|operates from|operating from|active in|trader from|from|trader in)\\s+(?:the\\s+)?(?:${namePattern})${boundaryAfter}|${boundaryBefore}(?:${namePattern})(?:\\s+|-)(?:based|headquartered|trader|forex trader|crypto trader)\\b`, 'iu');
+    // Bare "from <country>" is deliberately NOT authoritative: content-origin
+    // phrasing ("market reports from Brazil", "news from Mexico") describes
+    // where coverage comes from, not where the creator is domiciled. Only
+    // actor-bound forms (trader/creator from, based in, operates from, ...)
+    // assert domicile. A bare mention still contributes mention-grade
+    // evidence through the normal bio path, which can confirm but never
+    // reject on its own.
+    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|lives in|live in|operates from|operating from|active in|trader from|creator from|trader in)\\s+(?:the\\s+)?(?:${namePattern})${boundaryAfter}|${boundaryBefore}(?:${namePattern})(?:\\s+|-)(?:based|headquartered|trader|forex trader|crypto trader)\\b`, 'iu');
     for (const field of bioFields) {
       if (!field.text.trim()) continue;
       const match = field.text.match(domicileRegex);
       // Deduplicate against an already-authoritative item only: a
       // mention-grade item for the same country must never suppress the
       // explicit domicile assertion that actually authorizes exclusion.
-      if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && !e.domicileMention && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
+      if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && !e.domicileMention && normalizeCountryName(e.detectedCountry) === normalizeCountryName(canonical))) {
         evidence.push({
           source: 'CHANNEL_ABOUT_BIO',
           priority: 2,
-          detectedCountry: canonicalCountry(item.country_name),
+          detectedCountry: canonical,
           confidence: 92,
           matchedValue: match[0],
           matchedContext: matchWindow(field.text, match[0]),
           sourceField: field.sourceField,
-          reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonicalCountry(item.country_name)}.`
+          reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonical}.`
         });
       }
     }
@@ -799,6 +847,40 @@ export function assessChannelCountry(
       reasoning: policy.reasoning,
       decisiveEvidence,
       rejectionReason: policy.reasoning
+    };
+  }
+
+  // Unsupported-universe gate: CONFIRMED-level domicile outside the 20
+  // supported countries is rejected with the same authority bar as exclusion
+  // (unanimous decisive evidence, priority <= 3, confidence >= 85, no bare
+  // mention, no conflict). Weaker LIKELY-level evidence stays fail-open:
+  // terminal rejection demands decisive proof, never a bare threshold.
+  const supportedUniverse = new Set(
+    (SUPPORTED_PRODUCTION_COUNTRIES as readonly string[]).map(country =>
+      normalizeCountryName(country),
+    ),
+  );
+  if (
+    !conflict &&
+    topConfidence >= 85 &&
+    decisivePriority <= 3 &&
+    decisiveEvidence.every(item => item.detectedCountry === detectedCreatorCountry) &&
+    decisiveEvidence.some(item => !item.domicileMention) &&
+    !supportedUniverse.has(normalizeCountryName(detectedCreatorCountry))
+  ) {
+    const reasoning =
+      `${detectedCreatorCountry} is outside the supported production universe and cannot enter the catalog.`;
+    return {
+      discoveryCountry,
+      detectedCreatorCountry,
+      countryEvidence: evidence,
+      countryStatus: 'REJECTED',
+      evidenceAvailability,
+      gateDisposition: 'REJECT_UNSUPPORTED',
+      confidence: topConfidence,
+      reasoning,
+      decisiveEvidence,
+      rejectionReason: reasoning
     };
   }
 

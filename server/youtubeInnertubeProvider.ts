@@ -832,3 +832,25 @@ export async function fetchChannelVideoDescriptionsViaInnertube(
     throw typed;
   }
 }
+
+/**
+ * Benchmark outcome classifier: local provider-cooldown rejections (thrown
+ * before any session or upstream request) must never be reported as YouTube
+ * throttling, and their near-zero local latency must never contaminate fetch
+ * latency percentiles. Local cooldown is identified by the provider code
+ * PLUS the 'cooling down' message (upstream 429s share the code but never
+ * the message). Pure and offline-testable.
+ */
+export type BenchmarkFetchOutcome = 'SUCCESS' | 'UPSTREAM_THROTTLED' | 'LOCAL_COOLDOWN' | 'FAILED';
+
+export function classifyBenchmarkOutcome(error: unknown): Exclude<BenchmarkFetchOutcome, 'SUCCESS'> {
+  const code = String((error as { code?: unknown })?.code || '');
+  const message = String(error instanceof Error ? error.message : error || '');
+  if (code === INNERTUBE_RATE_LIMITED_CODE && message.includes('cooling down')) {
+    return 'LOCAL_COOLDOWN';
+  }
+  if (code === INNERTUBE_RATE_LIMITED_CODE || /429|too many requests|rate.?limit/i.test(message)) {
+    return 'UPSTREAM_THROTTLED';
+  }
+  return 'FAILED';
+}

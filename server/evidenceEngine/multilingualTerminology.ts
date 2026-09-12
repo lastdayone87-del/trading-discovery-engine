@@ -6,7 +6,7 @@ import { SUPPORTED_PRODUCTION_COUNTRIES } from '../../src/data/initial_countries
 export const SUPPORTED_CLASSIFICATION_COUNTRIES = SUPPORTED_PRODUCTION_COUNTRIES;
 
 export interface MultilingualClassificationPack {
-  languageCode: 'en' | 'de' | 'fr' | 'es' | 'it' | 'nl' | 'ja' | 'da' | 'sv' | 'ar' | 'zh' | 'ms';
+  languageCode: 'en' | 'de' | 'fr' | 'es' | 'it' | 'nl' | 'ja' | 'da' | 'sv' | 'no' | 'ar' | 'zh' | 'ms';
   executionTerms: string[];
   educationalTerms: string[];
   businessNewsTerms: string[];
@@ -72,6 +72,9 @@ export const MULTILINGUAL_CLASSIFICATION_PACKS: Record<MultilingualClassificatio
   },
   da: {
     languageCode: 'da', executionTerms: ['handelsplan', 'risikostyring', 'indgangspunkt', 'stop loss', 'aktiehandel', 'strategi backtest'], educationalTerms: ['lær trading', 'teknisk analyse', 'handelsstrategi'], businessNewsTerms: ['erhvervsnyheder', 'markedsnyheder'], genericFinanceTerms: ['privatøkonomi', 'passiv indkomst', 'langsigtet investering'], hypeTerms: ['garanteret gevinst', 'bliv rig hurtigt'], motivationTerms: ['millionær tankegang']
+  },
+  no: {
+    languageCode: 'no', executionTerms: ['handelsplan', 'risikostyring', 'inngangspunkt', 'stop loss', 'aksjehandel', 'strategi backtest'], educationalTerms: ['lær trading', 'teknisk analyse', 'handelsstrategi'], businessNewsTerms: ['næringslivsnyheter', 'markedsnyheter'], genericFinanceTerms: ['privatøkonomi', 'passiv inntekt', 'langsiktig investering'], hypeTerms: ['garantert gevinst', 'bli rik fort'], motivationTerms: ['millionærmentalitet']
   },
   sv: {
     languageCode: 'sv', executionTerms: ['handelsplan', 'riskhantering', 'ingångspunkt', 'stop loss', 'aktiehandel', 'strategi backtest'], educationalTerms: ['lär dig trading', 'teknisk analys', 'handelsstrategi'], businessNewsTerms: ['ekonominyheter', 'marknadsnyheter'], genericFinanceTerms: ['privatekonomi', 'passiv inkomst', 'långsiktigt sparande'], hypeTerms: ['garanterad vinst', 'bli rik snabbt'], motivationTerms: ['miljonärstänkande']

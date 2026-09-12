@@ -1,0 +1,186 @@
+[
+  {
+    "channelId": "UCZH9XjihGZGczInZMuXMlfw",
+    "channelName": "日経先物225",
+    "market": "JP",
+    "facts": {
+      "identityLinkage": true,
+      "domicile": {
+        "proven": true,
+        "class": "UNPROVEN"
+      },
+      "trading": true,
+      "marketRelevance": true,
+      "liveness90d": "UNPROVEN"
+    },
+    "sources": [
+      {
+        "fact": "A",
+        "kind": "youtube-channel-url",
+        "locator": "https://www.youtube.com/channel/UCZH9XjihGZGczInZMuXMlfw"
+      },
+      {
+        "fact": "B",
+        "kind": "pipeline-country-verdict",
+        "locator": "production channels row: Japan CONFIRMED 100 (tier attribution pending independent audit)"
+      },
+      {
+        "fact": "C",
+        "kind": "pipeline-trading-verdict",
+        "locator": "production channels row: TRADING_CONFIRMED 82; native title 日経先物225"
+      },
+      {
+        "fact": "D",
+        "kind": "instrument-mention",
+        "locator": "Nikkei 225 futures in channel name"
+      },
+      {
+        "fact": "E",
+        "kind": "pipeline-activity",
+        "locator": "uploads_last_90_days=0 in production snapshot: liveness UNPROVEN"
+      }
+    ],
+    "audit": {
+      "status": "pipeline-sourced",
+      "notes": "Domicile tier (corporate vs individual vs platform-declared) and 90-day liveness require independent audit before published recall claims. proven:true with class UNPROVEN means the country attribution is evidenced while the domicile tier is not independently attributed."
+    }
+  },
+  {
+    "channelId": "UC9H0j31dfspjW-U4EY3fq3Q",
+    "channelName": "ロジャー堀の日経平均株価予報",
+    "market": "JP",
+    "facts": {
+      "identityLinkage": true,
+      "domicile": {
+        "proven": true,
+        "class": "UNPROVEN"
+      },
+      "trading": true,
+      "marketRelevance": true,
+      "liveness90d": "UNPROVEN"
+    },
+    "sources": [
+      {
+        "fact": "A",
+        "kind": "youtube-channel-url",
+        "locator": "https://www.youtube.com/channel/UC9H0j31dfspjW-U4EY3fq3Q"
+      },
+      {
+        "fact": "B",
+        "kind": "pipeline-country-verdict",
+        "locator": "production channels row: Japan CONFIRMED 100 (tier attribution pending independent audit)"
+      },
+      {
+        "fact": "C",
+        "kind": "pipeline-trading-verdict",
+        "locator": "production channels row: TRADING_CONFIRMED 82; native title references 日経平均株価予報"
+      },
+      {
+        "fact": "D",
+        "kind": "instrument-mention",
+        "locator": "Nikkei average forecast in channel name"
+      },
+      {
+        "fact": "E",
+        "kind": "pipeline-activity",
+        "locator": "uploads_last_90_days=0 in production snapshot: liveness UNPROVEN"
+      }
+    ],
+    "audit": {
+      "status": "pipeline-sourced",
+      "notes": "Domicile tier and 90-day liveness require independent audit before published recall claims. proven:true with class UNPROVEN means the country attribution is evidenced while the domicile tier is not independently attributed."
+    }
+  },
+  {
+    "channelId": "UCJdBRGdAz-Or0MwCQoS072Q",
+    "channelName": "KG Trading | Stock Market Analysis",
+    "market": "DE",
+    "facts": {
+      "identityLinkage": true,
+      "domicile": {
+        "proven": true,
+        "class": "UNPROVEN"
+      },
+      "trading": true,
+      "marketRelevance": true,
+      "liveness90d": "UNPROVEN"
+    },
+    "sources": [
+      {
+        "fact": "A",
+        "kind": "youtube-channel-url",
+        "locator": "https://www.youtube.com/channel/UCJdBRGdAz-Or0MwCQoS072Q"
+      },
+      {
+        "fact": "B",
+        "kind": "pipeline-country-verdict",
+        "locator": "production channels row: Germany CONFIRMED 100 (tier attribution pending independent audit)"
+      },
+      {
+        "fact": "C",
+        "kind": "pipeline-trading-verdict",
+        "locator": "production channels row: TRADING_CONFIRMED 96"
+      },
+      {
+        "fact": "D",
+        "kind": "instrument-mention",
+        "locator": "Stock Market Analysis in channel name"
+      },
+      {
+        "fact": "E",
+        "kind": "pipeline-activity",
+        "locator": "uploads_last_90_days=0 in production snapshot: liveness UNPROVEN"
+      }
+    ],
+    "audit": {
+      "status": "pipeline-sourced",
+      "notes": "Domicile tier and 90-day liveness require independent audit before published recall claims. proven:true with class UNPROVEN means the country attribution is evidenced while the domicile tier is not independently attributed."
+    }
+  },
+  {
+    "channelId": "UCkx_QleaqX1OuzQx6B58FXg",
+    "channelName": "LM Trading",
+    "market": "DE",
+    "facts": {
+      "identityLinkage": true,
+      "domicile": {
+        "proven": true,
+        "class": "UNPROVEN"
+      },
+      "trading": true,
+      "marketRelevance": true,
+      "liveness90d": true
+    },
+    "sources": [
+      {
+        "fact": "A",
+        "kind": "youtube-channel-url",
+        "locator": "https://www.youtube.com/channel/UCkx_QleaqX1OuzQx6B58FXg"
+      },
+      {
+        "fact": "B",
+        "kind": "pipeline-country-verdict",
+        "locator": "production channels row: Germany CONFIRMED 100 (tier attribution pending independent audit)"
+      },
+      {
+        "fact": "C",
+        "kind": "pipeline-trading-verdict",
+        "locator": "production channels row: TRADING_CONFIRMED 86"
+      },
+      {
+        "fact": "D",
+        "kind": "instrument-mention",
+        "locator": "Trading in channel name"
+      },
+      {
+        "fact": "E",
+        "kind": "pipeline-activity",
+        "locator": "production snapshot: uploads_last_90_days=9, latest_upload_at=2026-08-01"
+      }
+    ],
+    "audit": {
+      "status": "pipeline-sourced",
+      "notes": "Domicile tier requires independent audit before published recall claims. Liveness supported by production activity counters. proven:true with class UNPROVEN means the country attribution is evidenced while the domicile tier is not independently attributed."
+    }
+  }
+]

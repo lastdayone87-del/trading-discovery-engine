@@ -183,10 +183,20 @@ export const INITIAL_COUNTRY_VOCABULARIES: CountryVocabulary[] = [
   { country: 'Belgium', languages: ['Dutch', 'French', 'German'], native_trading_terminology: ['beursanalyse België', 'technische analyse', 'analyse boursière belge', 'handel in aandelen'], popular_instruments: ['BEL 20', 'EURUSD', 'Euronext Brussels'], local_market_phrases: ['Brusselse beurs', 'Bourse de Bruxelles'], common_content_format_names: ['marktupdate', 'analyse hebdomadaire'] },
   { country: 'Luxembourg', languages: ['Luxembourgish', 'French', 'German'], native_trading_terminology: ['Bourse Luxembourg', 'analyse technique', 'Börsenanalyse', 'Aktienhandel'], popular_instruments: ['LuxX Index', 'EURUSD', 'Eurobonds'], local_market_phrases: ['Bourse de Luxembourg', 'Luxemburger Börse'], common_content_format_names: ['marché hebdomadaire', 'Maartupdate'] },
   { country: 'Ireland', languages: ['English', 'Irish'], native_trading_terminology: ['Irish stock trading', 'technical analysis Ireland', 'forex trading Ireland', 'trádáil scaireanna'], popular_instruments: ['ISEQ 20', 'EURUSD', 'Irish equities'], local_market_phrases: ['Euronext Dublin', 'Dublin market open'], common_content_format_names: ['Irish market wrap', 'weekly trading outlook'] },
+  { country: 'Norway', languages: ['Norwegian'], native_trading_terminology: ['aksjehandel', 'teknisk analyse', 'børsanalyse', 'daytrading', 'handelsstrategi'], popular_instruments: ['OBX', 'Oslo Børs', 'NOK', 'Equinor'], local_market_phrases: ['Oslo Børs åpning', 'Norges Bank rentedecisjon'], common_content_format_names: ['morgenanalyse', 'ukens aksjer'] },
 ];
 
 /** Authoritative production-country registry; all server layers validate against it. */
 export const SUPPORTED_PRODUCTION_COUNTRIES = Object.freeze(INITIAL_COUNTRY_VOCABULARIES.map(item => item.country));
+
+/**
+ * Supported-but-dormant countries: fully supported (registry, inference,
+ * vocabulary, manual search, cross-border) but never swept by the autonomous
+ * producer cycle. An explicit single-target override still processes them.
+ */
+export const SUPPORTED_DORMANT_COUNTRIES: readonly string[] = Object.freeze([
+  'Italy', 'Japan', 'Norway', 'Spain', 'United Arab Emirates'
+]);
 
 export const INITIAL_EXCLUDED_COUNTRIES: ExcludedCountry[] = [
   { country_name: 'South Africa', reason: 'African Region Exclusion' },

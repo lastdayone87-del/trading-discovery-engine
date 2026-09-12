@@ -8,6 +8,7 @@
 
 export type Gate1DispositionKey =
   | 'REJECT_EXCLUDED'
+  | 'REJECT_UNSUPPORTED'
   | 'ALLOW_NORMAL'
   | 'CONTINUE_CRAWLING'
   | 'NEEDS_REVIEW'
@@ -31,6 +32,7 @@ function freshCounters(): OperationsCounters {
   return {
     gate1EvaluationsTotal: {
       REJECT_EXCLUDED: 0,
+      REJECT_UNSUPPORTED: 0,
       ALLOW_NORMAL: 0,
       CONTINUE_CRAWLING: 0,
       NEEDS_REVIEW: 0,
@@ -52,6 +54,7 @@ const counters = freshCounters();
 
 function normalizeGate1(value: unknown): Gate1DispositionKey {
   return value === 'REJECT_EXCLUDED' ||
+    value === 'REJECT_UNSUPPORTED' ||
     value === 'ALLOW_NORMAL' ||
     value === 'CONTINUE_CRAWLING' ||
     value === 'NEEDS_REVIEW'

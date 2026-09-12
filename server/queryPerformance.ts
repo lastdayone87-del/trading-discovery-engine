@@ -16,6 +16,11 @@ export interface QueryObservation {
   funnelOutcome: FunnelOutcome;
   qualityScore: number;
   hasCommunity: boolean;
+  /**
+   * Catalog scope validity for yield weighting. Absent on legacy observations
+   * (treated as scope-neutral, never penalized).
+   */
+  scopeEligibility?: 'IN_SCOPE' | 'OUT_OF_SCOPE' | 'UNRESOLVED';
 }
 
 export interface QueryFunnelMetrics {
@@ -24,6 +29,14 @@ export interface QueryFunnelMetrics {
   duplicateResults: number;
   knownChannels: number;
   newChannels: number;
+  /**
+   * Persisted new channels that are not OUT_OF_SCOPE. Optional for backward
+   * compatibility: absent means unknown scope (treated as all in-scope,
+   * identical to legacy yield). Terminology yield is weighted by this when
+   * present so queries surfacing out-of-scope cohorts earn no learning
+   * credit for them.
+   */
+  inScopeNewChannels?: number;
   countryRejected: number;
   nonTrading: number;
   uncertain: number;
@@ -52,6 +65,18 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
   const tradingConfirmed = count('TRADING_CONFIRMED');
   const evaluated = nonTrading + uncertain + needsReview + tradingConfirmed;
   const persisted = values.filter(value => value.persisted);
+  const fresh = values.filter(value => value.persisted && !value.wasKnown);
+  const scoped = values.filter(value => value.scopeEligibility !== undefined);
+  // Neutral default: with no scope signal anywhere, every fresh channel counts
+  // as in-scope (identical to legacy yield). Once scope is observed, IN_SCOPE
+  // and legacy-missing observations earn credit, while explicitly observed
+  // OUT_OF_SCOPE and UNRESOLVED do not: missing scope stays scope-neutral
+  // (backward compatible), but observed non-eligibility must never train
+  // retrieval. This matches aggregatePageMetrics, where legacy pages
+  // contribute their full fresh count and only scoped pages are filtered.
+  const inScopeFresh = scoped.length === 0
+    ? fresh
+    : fresh.filter(value => value.scopeEligibility === undefined || value.scopeEligibility === 'IN_SCOPE');
   const qualityChannels = values.filter(value => isQualityCreator(value.funnelOutcome, value.qualityScore)).length;
   const communitiesDiscovered = values.filter(value => value.funnelOutcome === 'TRADING_CONFIRMED' && value.hasCommunity).length;
   const averageQualityScore = persisted.length
@@ -76,6 +101,7 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
     duplicateResults: Math.max(0, rawResults - values.length),
     knownChannels: values.filter(value => value.wasKnown).length,
     newChannels: values.filter(value => value.persisted && !value.wasKnown).length,
+    inScopeNewChannels: inScopeFresh.length,
     countryRejected,
     nonTrading,
     uncertain,

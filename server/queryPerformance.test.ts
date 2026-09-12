@@ -64,3 +64,23 @@ test('mixed but useful exploratory retrieval is not prematurely quarantined', ()
   assert.equal(isSeverelyContaminatedQuery(metrics), false);
   assert.notEqual(selectQueryCollection('EXPERIMENTAL', 0, metrics), 'REJECTED');
 });
+
+test('out-of-scope fresh channels earn no learning credit when scope is observed', () => {
+  const base = (channelId: string, scopeEligibility?: 'IN_SCOPE' | 'OUT_OF_SCOPE' | 'UNRESOLVED'): QueryObservation => ({
+    channelId, wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false, scopeEligibility,
+  });
+  const metrics = calculateQueryFunnel(4, [base('a', 'IN_SCOPE'), base('b', 'OUT_OF_SCOPE'), base('c', 'UNRESOLVED'), base('d', undefined)]);
+  assert.equal(metrics.newChannels, 4);
+  // IN_SCOPE earns; legacy-missing stays neutral (backward compatible);
+  // explicitly observed OUT_OF_SCOPE and UNRESOLVED do not.
+  assert.equal(metrics.inScopeNewChannels, 2);
+});
+
+test('scope weighting stays neutral when no observation carries scope', () => {
+  const metrics = calculateQueryFunnel(2, [
+    { channelId: 'a', wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity: false },
+    { channelId: 'b', wasKnown: false, persisted: true, funnelOutcome: 'UNCERTAIN', qualityScore: 40, hasCommunity: false },
+  ]);
+  assert.equal(metrics.newChannels, 2);
+  assert.equal(metrics.inScopeNewChannels, 2);
+});

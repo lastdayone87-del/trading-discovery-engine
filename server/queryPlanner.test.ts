@@ -246,3 +246,29 @@ test('planner produces novel local instrument-market variants when every current
   assert.ok(planned.every(item => item.metadata.queryTemplate === 'INSTRUMENT_MARKET'));
   assert.ok(planned.every(item => /BEL|EURUSD/i.test(item.query)));
 });
+
+test('bare short tickers require qualifying market context', () => {
+  for (const ticker of ['NG', 'ES', 'NQ', 'AI', 'ICT', 'SMI', 'LuxX', 'SEK']) {
+    assert.equal(isRetrievalOrientedQuery('United States', ticker), false, ticker);
+  }
+  assert.equal(isRetrievalOrientedQuery('United States', 'NQ Futures'), true);
+  assert.equal(isRetrievalOrientedQuery('United States', 'ICT strategy'), true);
+  assert.equal(isRetrievalOrientedQuery('Japan', '板読み'), true);
+  assert.equal(isRetrievalOrientedQuery('Germany', 'DAX Trading'), true);
+});
+
+test('short-ticker atoms survive to form qualified pairs but never search alone', () => {
+  assert.equal(isRetrievalOrientedQuery('Norway', 'OBX'), false);
+  const planned = planDiverseQueries({
+    country: 'Norway',
+    count: 12,
+    learnedVocabulary: [],
+    existingQueries: [],
+  });
+  const queries = planned.map(item => item.query);
+  assert.ok(
+    queries.some(query => /\bOBX\b/i.test(query) && query.trim().split(/\s+/).length > 1),
+    `expected a qualified OBX pair among: ${queries.join(' | ')}`,
+  );
+  assert.ok(queries.every(query => isRetrievalOrientedQuery('Norway', query)));
+});

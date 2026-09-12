@@ -87,3 +87,15 @@ test('hard-rejection branch persists known rows and keeps no-row behavior write-
   assert.match(branch, /persisted: true/);
   assert.match(branch, /persisted: false/);
 });
+
+test('Gate-1 rejection re-derives scope eligibility from the new country', () => {
+  const row = existingRow();
+  (row as any).scope_eligibility = 'IN_SCOPE';
+  const out = applyGate1CountryRejectionToExisting(
+    row,
+    { creatorCountry: 'Brazil', score: 92, validationStep, now: '2026-02-01T00:00:00.000Z' },
+    candidate(),
+  );
+  assert.equal(out.country, 'Brazil');
+  assert.equal(out.scope_eligibility, 'OUT_OF_SCOPE');
+});

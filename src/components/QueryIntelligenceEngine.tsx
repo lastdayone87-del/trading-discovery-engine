@@ -1,6 +1,7 @@
 import { apiFetch } from '../apiClient';
 import React, { useState, useEffect } from 'react';
 import { QueryRecord, QueryExecutionLog, ExtractedTermRecord, CountryVocabulary, CanonicalTradingTerm } from '../types';
+import { SUPPORTED_DORMANT_COUNTRIES } from '../data/initial_countries';
 import {
   Brain,
   Sparkles,
@@ -349,6 +350,34 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
             </div>
           </div>
 
+          {/* Scope model: Active Autonomous vs Supported Dormant (display only) */}
+          <div className="pt-2 border-t border-slate-700/60 grid grid-cols-1 md:grid-cols-2 gap-2">
+            <div className="rounded-lg border border-emerald-700/50 bg-emerald-950/40 p-2.5">
+              <div className="text-emerald-300 font-bold text-xs mb-1.5">
+                Active Autonomous ({countryVocabularies.filter(v => !SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === v.country.toLowerCase())).length})
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {countryVocabularies
+                  .filter(v => !SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === v.country.toLowerCase()))
+                  .map(v => (
+                    <span key={v.country} className="px-2 py-0.5 bg-emerald-900/60 border border-emerald-700/50 text-emerald-200 rounded-md text-[11px] font-medium">{v.country}</span>
+                  ))}
+              </div>
+            </div>
+            <div className="rounded-lg border border-slate-600/60 bg-slate-800/40 p-2.5">
+              <div className="text-slate-300 font-bold text-xs mb-1.5" title="Fully supported: manual search and cross-border valid, never swept autonomously">
+                Supported Dormant ({countryVocabularies.filter(v => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === v.country.toLowerCase())).length})
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {countryVocabularies
+                  .filter(v => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === v.country.toLowerCase()))
+                  .map(v => (
+                    <span key={v.country} className="px-2 py-0.5 bg-slate-700/60 border border-slate-600/60 text-slate-300 rounded-md text-[11px] font-medium">{v.country}</span>
+                  ))}
+              </div>
+            </div>
+          </div>
+
           {/* Selected Countries Scope Editor */}
           {scopeMode === 'SELECTED_COUNTRIES' && (
             <div className="pt-2 border-t border-slate-700/60 space-y-2">
@@ -372,6 +401,11 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                   ))
                 )}
               </div>
+              {scopeCountries.some(c => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === c.toLowerCase())) && (
+                <div className="text-amber-300/90 text-[11px] font-medium">
+                  Note: dormant selections ({scopeCountries.filter(c => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === c.toLowerCase())).join(', ')}) are saved but never swept autonomously — manual search and cross-border only.
+                </div>
+              )}
 
               <div className="flex items-center gap-2 pt-1">
                 <select
@@ -386,9 +420,12 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                   <option value="">+ Add Country to Persistent Scope...</option>
                   {countryVocabularies
                     .filter(v => !scopeCountries.some(sc => sc.toLowerCase() === v.country.toLowerCase()))
-                    .map(v => (
-                      <option key={v.country} value={v.country}>{v.country}</option>
-                    ))}
+                    .map(v => {
+                      const dormant = SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === v.country.toLowerCase());
+                      return (
+                        <option key={v.country} value={v.country}>{v.country}{dormant ? ' (dormant — manual only)' : ''}</option>
+                      );
+                    })}
                 </select>
 
                 {scopeSaveMessage && (

@@ -219,3 +219,15 @@ test('localized suffix-form domicile is authoritative (Unicode boundaries)', () 
   assert.equal(preposition.countryStatus, 'REJECTED');
   assert.equal(preposition.detectedCreatorCountry, 'Czechia');
 });
+
+test('bare content-origin "from Vietnam" never hard-rejects', () => {
+  const res = assess('Daily market reports from Vietnam with Asian session recap.');
+  assert.notEqual(res.countryStatus, 'REJECTED');
+  assert.notEqual(res.gateDisposition, 'REJECT_EXCLUDED');
+});
+
+test('actor-bound "creator from Vietnam" remains hard exclusion evidence', () => {
+  const res = assess('Creator from Vietnam covering Asian equity futures.');
+  assert.equal(res.countryStatus, 'REJECTED');
+  assert.equal(res.gateDisposition, 'REJECT_EXCLUDED');
+});

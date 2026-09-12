@@ -5,7 +5,7 @@ import { planDiverseQueries, isCountryScriptCompatible } from './queryPlanner';
 import { getLayeredKnowledgeContext } from './evidenceEngine/knowledgePacks';
 import { inferChannelCountry } from './countryInference';
 
-const added = ['Switzerland', 'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand', 'Belgium', 'Luxembourg', 'Ireland'];
+const added = ['Switzerland', 'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand', 'Belgium', 'Luxembourg', 'Ireland', 'Norway'];
 
 test('new production countries have vocabulary, query, classification, and validation coverage', () => {
   for (const country of added) {
@@ -17,6 +17,7 @@ test('new production countries have vocabulary, query, classification, and valid
   }
   assert.equal(inferChannelCountry({ officialCountry: 'CH' }).detectedCountry, 'Switzerland');
   assert.equal(inferChannelCountry({ officialCountry: 'SG' }).detectedCountry, 'Singapore');
+  assert.equal(inferChannelCountry({ officialCountry: 'NO' }).detectedCountry, 'Norway');
 });
 
 test('Arabic and Singapore Han queries use their governed scripts', () => {

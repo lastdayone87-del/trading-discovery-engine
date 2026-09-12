@@ -15,6 +15,7 @@ import {
 test('telemetry starts at zero and bumps per disposition', () => {
   resetOperationsTelemetry();
   bumpGate1Evaluation('REJECT_EXCLUDED');
+  bumpGate1Evaluation('REJECT_UNSUPPORTED');
   bumpGate1Evaluation('ALLOW_NORMAL');
   bumpGate1Evaluation('CONTINUE_CRAWLING');
   bumpGate1Evaluation('NEEDS_REVIEW');
@@ -29,6 +30,7 @@ test('telemetry starts at zero and bumps per disposition', () => {
   const snap = operationsTelemetrySnapshot();
   assert.deepEqual(snap.gate1EvaluationsTotal, {
     REJECT_EXCLUDED: 1,
+    REJECT_UNSUPPORTED: 1,
     ALLOW_NORMAL: 1,
     CONTINUE_CRAWLING: 1,
     NEEDS_REVIEW: 1,

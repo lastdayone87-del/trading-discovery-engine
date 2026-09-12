@@ -2,6 +2,7 @@ import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
 import { DiscoveredChannelRaw, fetchYouTubeChannelCountryMetadata } from './youtube';
 import { aggregatedLanguageCandidateSet, validateChannelCountry } from './countryValidator';
 import { bumpGate1Evaluation } from './operationsTelemetry';
+import { resolveScopeEligibility } from './scopeEligibility';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
 import { inspectAndValidateChannel } from './queueManager';
@@ -95,6 +96,10 @@ export function applyGate1CountryRejectionToExisting(
   row.scan_status = 'COMPLETED';
   row.last_checked = rejection.now;
   row.inspection_trail = [...(row.inspection_trail || []), rejection.validationStep];
+  // A Gate-1 rejection re-attributes the country, so scope eligibility is
+  // re-derived from the NEW country (never preserved from the old one): an
+  // unsupported-country rejection flips a stale IN_SCOPE to OUT_OF_SCOPE.
+  row.scope_eligibility = resolveScopeEligibility(rejection.creatorCountry);
   applyCandidateObservability(row, candidate);
   return row;
 }
@@ -319,7 +324,7 @@ export async function processChannelThroughPipeline(
     timestamp: now
   };
 
-  if (countryVal.gateDisposition === 'REJECT_EXCLUDED' || countryVal.status === 'REJECTED') {
+  if (countryVal.gateDisposition === 'REJECT_EXCLUDED' || countryVal.gateDisposition === 'REJECT_UNSUPPORTED' || countryVal.status === 'REJECTED') {
     bumpGate1Evaluation(countryVal.gateDisposition);
     console.log(
       `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`

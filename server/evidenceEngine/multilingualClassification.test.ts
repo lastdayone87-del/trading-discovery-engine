@@ -29,6 +29,7 @@ const educatorCases: Array<{ language: string; country: string; description: str
   { language: 'Spanish', country: 'Spain', description: 'Curso de trading con gestión de riesgo y diario de trading.', titles: ['Plan de trading IBEX 35', 'Análisis de operaciones y punto de entrada'] },
   { language: 'Italian', country: 'Italy', description: 'Corso di trading con gestione del rischio e diario di trading.', titles: ['Piano di trading FTSE MIB', 'Analisi delle operazioni e punto di ingresso'] },
   { language: 'Dutch', country: 'Netherlands', description: 'Leren traden met risicomanagement en een tradingdagboek.', titles: ['AEX handelsplan en instappunt', 'Technische analyse van het orderboek'] },
+  { language: 'Norwegian', country: 'Norway', description: 'Lær trading med teknisk analyse og risikostyring.', titles: ['Aksjehandel og stop loss', 'Ukens aksjer med handelsstrategi'] },
   { language: 'Japanese', country: 'Japan', description: '資金管理と損切りを重視するトレード講座。', titles: ['日経225 エントリーポイントとトレード日誌', '板読みとテクニカル分析の手法解説'] }
 ];
 
@@ -76,7 +77,7 @@ for (const example of adjacentCases) {
 }
 
 test('classification knowledge covers every production country', () => {
-  assert.deepEqual([...SUPPORTED_CLASSIFICATION_COUNTRIES], ['United States', 'United Kingdom', 'Germany', 'France', 'Spain', 'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland', 'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand', 'Belgium', 'Luxembourg', 'Ireland']);
+  assert.deepEqual([...SUPPORTED_CLASSIFICATION_COUNTRIES], ['United States', 'United Kingdom', 'Germany', 'France', 'Spain', 'Netherlands', 'Italy', 'Australia', 'Canada', 'Japan', 'Switzerland', 'Denmark', 'Sweden', 'United Arab Emirates', 'Singapore', 'New Zealand', 'Belgium', 'Luxembourg', 'Ireland', 'Norway']);
   assert.equal(getLayeredKnowledgeContext('Brazil').countryKnowledge, undefined);
   assert.equal(getLayeredKnowledgeContext('India').countryKnowledge, undefined);
 });
