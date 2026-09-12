@@ -563,7 +563,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
       ?await channelData.urlFailureHistoryLoader(channelData.channelId,skipCandidateUrls)
       :await fetchUrlFailureHistory(channelData.channelId,skipCandidateUrls);
     skippedRepeatUrls=skippedUrlsFromHistory(historyRows);
-  }catch{skippedRepeatUrls=new Set<string>();}}
+  }catch(error){console.warn(`[RepeatFailureSkip] History load failed for ${channelData.channelId}; crawling without skips:`,error instanceof Error?error.message:String(error));skippedRepeatUrls=new Set<string>();}}
   let repeatSkippedCount=0;
   const repeatSkipLine=(url:string):string|null=>{
     const key=normalizeSkipUrl(url);

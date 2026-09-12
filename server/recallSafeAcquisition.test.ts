@@ -998,3 +998,28 @@ test('skipped URL beside a clean surface keeps the step uncertain, never clean',
   assert.equal(step?.status, 'PARTIAL', 'a skipped surface alongside clean ones must stay uncertain');
   assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'));
 });
+
+test('history loader failure warns but never blocks crawling', async () => {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } })) as unknown as typeof fetch;
+  try {
+    const result = await runChannelInspection({
+      channelId: 'UCskiphistoryfail00000001',
+      channelName: 'Skip History Fail Channel',
+      channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+      channelLinks: ['https://live.example/'],
+      videoDescriptions: [],
+      creatorLikelyTrading: false,
+      externalFetchImpl: (async () => new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } })) as typeof fetch,
+      urlFailureHistoryLoader: (async () => { throw new Error('ledger down'); }) as any,
+    });
+    assert.ok(warnings.some(message => message.includes('[RepeatFailureSkip]')), 'loader outage must be observable');
+    assert.ok(result, 'inspection completes without skips');
+  } finally {
+    console.warn = original;
+    globalThis.fetch = savedFetch;
+  }
+});
