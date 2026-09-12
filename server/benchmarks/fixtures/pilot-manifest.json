@@ -1,0 +1,21 @@
+{
+  "stage": "pilot-1",
+  "markets": ["DE", "NO", "SG", "JP"],
+  "protocol": "Five independent facts (A identity, B domicile, C trading, D market relevance, E 90-day liveness). Regulatory registers alone never suffice.",
+  "auditPolicy": "Entries marked pipeline-sourced carry production-pipeline verdicts only (country + trading decisions with confidence). They validate HARNESS mechanics, never published recall claims. Entries become five-point-audited only after independent per-fact evidence is attached. Anything else is backlog, not ground truth.",
+  "targets": { "DE": 20, "NO": 20, "SG": 20, "JP": 20 },
+  "collected": {
+    "DE": ["UCJdBRGdAz-Or0MwCQoS072Q", "UCkx_QleaqX1OuzQx6B58FXg"],
+    "NO": [],
+    "SG": [],
+    "JP": ["UCZH9XjihGZGczInZMuXMlfw", "UC9H0j31dfspjW-U4EY3fq3Q"]
+  },
+  "backlog": {
+    "DE": 18,
+    "NO": 20,
+    "SG": 20,
+    "JP": 18,
+    "negatives": "distractor set not yet collected (generic finance, news, motivation, gaming)"
+  },
+  "status": "NOT YET MEASURED"
+}
