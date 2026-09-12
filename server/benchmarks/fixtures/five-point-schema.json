@@ -24,7 +24,10 @@
         },
         "trading": { "type": "boolean" },
         "marketRelevance": { "type": "boolean" },
-        "liveness90d": { "type": "boolean" }
+        "liveness90d": {
+          "description": "true = proven live within 90 days; false = proven NOT live (requires disproving evidence); UNPROVEN = insufficient evidence. Never use false for unknown.",
+          "enum": [true, false, "UNPROVEN"]
+        }
       }
     },
     "sources": {

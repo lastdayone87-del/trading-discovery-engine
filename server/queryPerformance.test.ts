@@ -71,7 +71,9 @@ test('out-of-scope fresh channels earn no learning credit when scope is observed
   });
   const metrics = calculateQueryFunnel(4, [base('a', 'IN_SCOPE'), base('b', 'OUT_OF_SCOPE'), base('c', 'UNRESOLVED'), base('d', undefined)]);
   assert.equal(metrics.newChannels, 4);
-  assert.equal(metrics.inScopeNewChannels, 1);
+  // IN_SCOPE earns; legacy-missing stays neutral (backward compatible);
+  // explicitly observed OUT_OF_SCOPE and UNRESOLVED do not.
+  assert.equal(metrics.inScopeNewChannels, 2);
 });
 
 test('scope weighting stays neutral when no observation carries scope', () => {

@@ -25,18 +25,29 @@ export interface YieldBenchDetail extends FrozenYieldCase {
 
 export interface YieldBenchResult {
   evaluated: number;
-  extracted: number;
-  complete: number;
+  /** Expected cases (expectExtracted === true). */
+  expectedCases: number;
+  /** Expected cases successfully extracted. */
+  successfulExpectedExtractions: number;
+  /** Expected cases fully complete (extraction + expected fields). */
+  completeExpectedExtractions: number;
+  /** successfulExpectedExtractions / expectedCases (null when none expected). */
   extractionRate: number | null;
+  /** completeExpectedExtractions / expectedCases (null when none expected). */
   completenessRate: number | null;
+  /** Negative cases (!expectExtracted) unexpectedly extracted. */
+  falsePositives: number;
+  /** falsePositives / negative cases (null when no negative cases). */
+  falsePositiveRate: number | null;
   details: YieldBenchDetail[];
 }
 
 /**
  * Offline E2E yield: frozen YouTube API payloads flow through the real
  * deterministic extraction path (extractDiscoveredChannels) with zero live
- * network calls. Measures parser/extraction yield and field completeness —
- * NOT live enrichment, which requires keys and runs in production.
+ * network calls. Rates use explicit denominators over EXPECTED extractions
+ * only — negative cases never inflate them; unexpected extraction is tracked
+ * separately as false positives. NOT live enrichment (requires keys).
  */
 export function runE2EYield(cases: FrozenYieldCase[]): YieldBenchResult {
   const details: YieldBenchDetail[] = cases.map(item => {
@@ -66,14 +77,20 @@ export function runE2EYield(cases: FrozenYieldCase[]): YieldBenchResult {
       complete,
     };
   });
-  const extracted = details.filter(d => d.extracted).length;
-  const complete = details.filter(d => d.complete).length;
+  const expected = details.filter(d => d.expectExtracted);
+  const negative = details.filter(d => !d.expectExtracted);
+  const successfulExpectedExtractions = expected.filter(d => d.extracted).length;
+  const completeExpectedExtractions = expected.filter(d => d.complete).length;
+  const falsePositives = negative.filter(d => d.extracted).length;
   return {
     evaluated: details.length,
-    extracted,
-    complete,
-    extractionRate: details.length > 0 ? extracted / details.length : null,
-    completenessRate: details.length > 0 ? complete / details.length : null,
+    expectedCases: expected.length,
+    successfulExpectedExtractions,
+    completeExpectedExtractions,
+    extractionRate: expected.length > 0 ? successfulExpectedExtractions / expected.length : null,
+    completenessRate: expected.length > 0 ? completeExpectedExtractions / expected.length : null,
+    falsePositives,
+    falsePositiveRate: negative.length > 0 ? falsePositives / negative.length : null,
     details,
   };
 }

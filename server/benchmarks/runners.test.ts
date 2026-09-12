@@ -63,86 +63,82 @@ test('discovery recall is empty-safe', () => {
   assert.equal(result.recall, null);
 });
 
-test('e2e yield extracts frozen payloads with zero live calls', () => {
-  const result = runE2EYield([
-    {
-      channelId: 'UCaaa',
-      payload: {
-        lane: 'CHANNEL',
-        query: 'DAX Trading',
-        items: [
-          {
-            id: { channelId: 'UCaaa' },
-            snippet: {
-              channelTitle: 'DAX Trader',
-              title: 'DAX Trader',
-              description: 'Trading lernen mit Markttechnik und Risiko pro Trade.',
-              thumbnails: { high: { url: 'https://img/x.jpg' } },
-            },
-          },
-        ],
-      },
-      expectExtracted: true,
-      expectDescription: true,
-      expectVideoTitles: false,
+test('e2e yield uses expected-only denominators with separate false positives', () => {
+  const videoItem = (channelId: string, title?: string, description?: string) => ({
+    snippet: {
+      channelId,
+      channelTitle: 'Test Channel',
+      ...(title === undefined ? {} : { title }),
+      ...(description === undefined ? {} : { description }),
+      thumbnails: { high: { url: 'https://img/x.jpg' } },
     },
-    {
-      channelId: 'UCbbb',
-      payload: {
-        lane: 'VIDEO',
-        query: 'DAX Analyse',
-        items: [
-          {
-            snippet: {
-              channelId: 'UCbbb',
-              channelTitle: 'DAX Trader',
-              title: 'DAX Morgenanalyse',
-              description: 'Tägliche DAX Analyse mit Orderflow',
-              thumbnails: { high: { url: 'https://img/y.jpg' } },
-            },
-          },
-        ],
-      },
+  });
+  const result = runE2EYield([
+    { // 1. expected + successfully extracted (complete: VIDEO lane carries
+      // titles; channel bio only comes from CHANNEL lane or hydration)
+      channelId: 'UCfull',
+      payload: { lane: 'VIDEO', query: 'DAX Analyse', items: [videoItem('UCfull', 'DAX Morgenanalyse', 'Tägliche Analyse')] },
       expectExtracted: true,
       expectDescription: false,
       expectVideoTitles: true,
     },
-    {
-      channelId: 'UCzzz',
+    { // 2. expected + partially extracted (extracted, description missing)
+      channelId: 'UCpart',
+      payload: { lane: 'VIDEO', query: 'DAX Analyse', items: [videoItem('UCpart', 'DAX Analyse')] },
+      expectExtracted: true,
+      expectDescription: true,
+      expectVideoTitles: true,
+    },
+    { // 3. expected + missing (nothing extracted)
+      channelId: 'UCmiss',
+      payload: { lane: 'VIDEO', query: 'DAX Analyse', items: [] },
+      expectExtracted: true,
+      expectDescription: false,
+      expectVideoTitles: false,
+    },
+    { // 4. unexpected extraction on a negative case (false positive)
+      channelId: 'UCghost',
+      payload: { lane: 'VIDEO', query: 'DAX Analyse', items: [videoItem('UCghost', 'Ghost Video')] },
+      expectExtracted: false,
+      expectDescription: false,
+      expectVideoTitles: false,
+    },
+    { // 5. clean negative (correctly absent)
+      channelId: 'UCclean',
       payload: { lane: 'VIDEO', query: 'DAX Analyse', items: [] },
       expectExtracted: false,
       expectDescription: false,
       expectVideoTitles: false,
     },
   ]);
+  assert.equal(result.evaluated, 5);
+  assert.equal(result.expectedCases, 3);
+  assert.equal(result.successfulExpectedExtractions, 2);
+  assert.equal(result.completeExpectedExtractions, 1);
   assert.equal(result.extractionRate, 2 / 3);
-  assert.equal(result.completenessRate, 1);
-  assert.equal(result.details[1].hasVideoTitles, true);
+  assert.equal(result.completenessRate, 1 / 3);
+  assert.equal(result.falsePositives, 1);
+  assert.equal(result.falsePositiveRate, 1 / 2);
 });
 
-test('e2e yield penalizes unexpected extraction and query-echoed titles', () => {
-  const result = runE2EYield([
+test('e2e yield rates are null without expected or negative cases', () => {
+  const empty = runE2EYield([]);
+  assert.equal(empty.extractionRate, null);
+  assert.equal(empty.completenessRate, null);
+  assert.equal(empty.falsePositiveRate, null);
+  const noNegatives = runE2EYield([
     {
-      channelId: 'UCghost',
-      payload: {
-        lane: 'CHANNEL',
-        query: 'DAX Trading',
-        items: [
-          {
-            id: { channelId: 'UCghost' },
-            snippet: {
-              channelTitle: 'Ghost Channel',
-              title: 'Ghost Channel',
-              description: '',
-              thumbnails: { high: { url: 'https://img/z.jpg' } },
-            },
-          },
-        ],
-      },
-      expectExtracted: false,
+      channelId: 'UCa',
+      payload: { lane: 'VIDEO', query: 'x', items: [] },
+      expectExtracted: true,
       expectDescription: false,
       expectVideoTitles: false,
     },
+  ]);
+  assert.equal(noNegatives.falsePositiveRate, null);
+});
+test('channel-lane query-echo titles do not count as title coverage', () => {
+  const result = runE2EYield([
     {
       channelId: 'UCecho',
       payload: {
@@ -165,10 +161,12 @@ test('e2e yield penalizes unexpected extraction and query-echoed titles', () => 
       expectVideoTitles: true,
     },
   ]);
-  // Ghost extracts despite expectExtracted=false; echo's titles are only the
-  // query echo, so title coverage is missing. Neither case is complete.
-  assert.equal(result.complete, 0);
+  // Extracted with a real description, but titles are only the query echo.
+  assert.equal(result.successfulExpectedExtractions, 1);
+  assert.equal(result.completeExpectedExtractions, 0);
+  assert.equal(result.extractionRate, 1);
   assert.equal(result.completenessRate, 0);
+  assert.equal(result.falsePositives, 0);
 });
 
 test('classification recall separates trading education from distractors', () => {
@@ -203,6 +201,20 @@ test('pilot stage-1 fixtures carry per-fact sources and honest audit status', as
   for (const entry of fixtures) {
     for (const fact of ['identityLinkage', 'domicile', 'trading', 'marketRelevance', 'liveness90d']) {
       assert.ok(entry.facts[fact] !== undefined, `${entry.channelId} missing fact ${fact}`);
+    }
+    // Liveness is tri-state: true = proven live, false = proven NOT live
+    // (requires disproving evidence), UNPROVEN = insufficient evidence.
+    // Unknown must never be recorded as false.
+    assert.ok(
+      [true, false, 'UNPROVEN'].includes(entry.facts.liveness90d),
+      `${entry.channelId} has invalid liveness value`,
+    );
+    if (entry.facts.liveness90d === 'UNPROVEN') {
+      const evidence = entry.sources.find((s: any) => s.fact === 'E');
+      assert.ok(
+        evidence && /UNPROVEN|unproven|pending/i.test(JSON.stringify(evidence) + JSON.stringify(entry.audit)),
+        `${entry.channelId} UNPROVEN liveness must say so in its evidence`,
+      );
     }
     const labels = new Set(entry.sources.map((s: any) => s.fact));
     for (const label of ['A', 'B', 'C', 'D', 'E']) {

@@ -11,7 +11,7 @@
       },
       "trading": true,
       "marketRelevance": true,
-      "liveness90d": false
+      "liveness90d": "UNPROVEN"
     },
     "sources": [
       {
@@ -57,7 +57,7 @@
       },
       "trading": true,
       "marketRelevance": true,
-      "liveness90d": false
+      "liveness90d": "UNPROVEN"
     },
     "sources": [
       {
@@ -103,7 +103,7 @@
       },
       "trading": true,
       "marketRelevance": true,
-      "liveness90d": false
+      "liveness90d": "UNPROVEN"
     },
     "sources": [
       {
