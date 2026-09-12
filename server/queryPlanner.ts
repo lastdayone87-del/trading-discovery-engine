@@ -50,7 +50,8 @@ const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryI
   'New Zealand': [['NZX50', 'INSTRUMENT', 'stocks'], ['NZDUSD', 'INSTRUMENT', 'forex'], ['NZX Trading', 'MARKET', 'market_analysis']],
   Belgium: [['BEL20', 'INSTRUMENT', 'stocks'], ['Beursanalyse', 'METHOD', 'education'], ['Euronext Brussels', 'MARKET', 'market_analysis']],
   Luxembourg: [['LuxX', 'INSTRUMENT', 'stocks'], ['Bourse Luxembourg', 'MARKET', 'market_analysis'], ['Börsenanalyse', 'METHOD', 'education']],
-  Ireland: [['ISEQ20', 'INSTRUMENT', 'stocks'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Irish Trading', 'METHOD', 'strategy']]
+  Ireland: [['ISEQ20', 'INSTRUMENT', 'stocks'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Irish Trading', 'METHOD', 'strategy']],
+  Norway: [['OBX', 'INSTRUMENT', 'stocks'], ['Aksjehandel', 'METHOD', 'strategy'], ['Teknisk Analyse', 'METHOD', 'education']]
 };
 
 export function getCuratedQueryCountries(): string[] {

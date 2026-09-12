@@ -154,6 +154,7 @@ const COUNTRY_ALIASES: Record<string, string> = {
   ,dz:'Algeria', tn:'Tunisia', et:'Ethiopia', tz:'Tanzania', ug:'Uganda', sn:'Senegal', cm:'Cameroon',
   zw:'Zimbabwe', zm:'Zambia', rw:'Rwanda', ci:'Ivory Coast', mz:'Mozambique', mg:'Madagascar', sd:'Sudan',
   ao:'Angola', lk:'Sri Lanka', cz:'Czechia', czech:'Czechia', 'czech republic':'Czechia'
+  ,no:'Norway', norge:'Norway'
 };
 
 const COUNTRY_SIGNALS: Record<string, {
@@ -180,6 +181,7 @@ const COUNTRY_SIGNALS: Record<string, {
   Switzerland: { bio: ['switzerland', 'schweiz', 'suisse', 'svizzera'], tlds: ['.ch'], social: ['switzerland', 'zurich'], exchanges: ['six swiss exchange', 'swiss market index', 'smi'], brokers: ['swissquote'], phones: ['+41'], addresses: ['zurich', 'zürich', 'geneva', 'genève'], language: ['börsenanalyse schweiz', 'smi analyse'] },
   Denmark: { bio: ['denmark', 'danmark', 'dansk trader'], tlds: ['.dk'], social: ['danmark', 'copenhagen'], exchanges: ['nasdaq copenhagen', 'omxc25'], brokers: ['saxo bank'], phones: ['+45'], addresses: ['copenhagen', 'københavn'], language: ['aktiehandel', 'teknisk analyse', 'børsanalyse'] },
   Sweden: { bio: ['sweden', 'sverige', 'svensk trader'], tlds: ['.se'], social: ['sverige', 'stockholm'], exchanges: ['nasdaq stockholm', 'omxs30'], brokers: ['avanza'], phones: ['+46'], addresses: ['stockholm', 'göteborg'], language: ['aktiehandel', 'teknisk analys', 'börsanalys'] },
+  Norway: { bio: ['norway', 'norge', 'norsk trader'], tlds: ['.no'], social: ['norge', 'oslo'], exchanges: ['oslo børs', 'oslo bors', 'obx'], brokers: ['nordnet', 'saxo bank'], phones: ['+47'], addresses: ['oslo', 'bergen'], language: ['aksjehandel', 'teknisk analyse', 'børsanalyse'] },
   Singapore: { bio: ['singapore', 'singapore trader'], tlds: ['.sg', '.com.sg'], social: ['singapore'], exchanges: ['singapore exchange', 'sgx', 'straits times index'], brokers: ['dbs vickers'], phones: ['+65'], addresses: ['singapore'], language: ['股票交易', '技术分析', 'pasaran saham'] },
   'New Zealand': { bio: ['new zealand', 'kiwi trader'], tlds: ['.nz', '.co.nz'], social: ['newzealand', 'auckland'], exchanges: ['new zealand exchange', 'nzx 50'], brokers: ['sharesies'], phones: ['+64'], addresses: ['auckland', 'wellington'], language: [] },
   Belgium: { bio: ['belgium', 'belgië', 'belgique'], tlds: ['.be'], social: ['belgium', 'brussels'], exchanges: ['euronext brussels', 'bel 20'], brokers: ['bolero', 'keytrade'], phones: ['+32'], addresses: ['brussels', 'bruxelles', 'antwerp'], language: ['beursanalyse belgië', 'analyse boursière belge'] },

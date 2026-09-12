@@ -12,6 +12,7 @@ import {
   updateSchedulerState,
   getDailyYouTubeQuotaBudget
 } from './db';
+import { SUPPORTED_DORMANT_COUNTRIES } from '../src/data/initial_countries';
 import { assertCountryAllowed } from './countryExclusion';
 import { authorizeCountryNativeAllocationQuery, selectNextQueryForCountry } from './queryIntelligence';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
@@ -110,6 +111,31 @@ export async function pauseQueryIntelligence(): Promise<{ message: string; isPau
 export async function resumeQueryIntelligence(): Promise<{ message: string; isPaused: boolean }> {
   await setAppSetting('query_intelligence_paused', 'false');
   return { message: 'Query Intelligence resumed. Continuing from saved discovery state.', isPaused: false };
+}
+
+/**
+ * Pure autonomous sweep resolution (testable without a database). Applies, in
+ * order: exclusion list, explicit selected-countries scope, dormant-scope
+ * preservation (dormant supported countries are never swept autonomously),
+ * then an explicit single-target override (manual/cross-border stays valid).
+ */
+export function resolveAutonomousCountries(
+  vocabCountries: string[],
+  excludedNames: string[],
+  selectedCountries: string[],
+  scope: DiscoveryScopeMode,
+  targetCountry?: string | null,
+): string[] {
+  const excluded = new Set(excludedNames.map(country => country.toLowerCase()));
+  const selectedScope = new Set(selectedCountries.map(country => country.toLowerCase()));
+  let countries = vocabCountries.filter(country => !excluded.has(country.toLowerCase()));
+  if (scope === 'SELECTED_COUNTRIES' && selectedScope.size > 0) {
+    countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
+  }
+  const dormant = new Set(SUPPORTED_DORMANT_COUNTRIES.map(country => country.toLowerCase()));
+  countries = countries.filter(country => !dormant.has(country.toLowerCase()));
+  if (targetCountry) countries = [targetCountry];
+  return countries;
 }
 
 export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
@@ -217,11 +243,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     ]);
     const excluded = new Set(exclusions.map(item => item.country_name.toLowerCase()));
     const selectedScope = new Set(scope.selectedCountries.map(country => country.toLowerCase()));
-    let countries = vocabs.map(item => item.country).filter(country => !excluded.has(country.toLowerCase()));
-    if (scope.scope === 'SELECTED_COUNTRIES' && selectedScope.size > 0) {
-      countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
-    }
-    if (targetCountry) countries = [targetCountry];
+    let countries = resolveAutonomousCountries(
+      vocabs.map(item => item.country),
+      [...excluded],
+      [...selectedScope],
+      scope.scope,
+      targetCountry,
+    );
     if (countries.length === 0) throw new Error('No eligible countries are available for autonomous discovery.');
 
     // Materialize proposal-only evidence inside the existing producer cycle.

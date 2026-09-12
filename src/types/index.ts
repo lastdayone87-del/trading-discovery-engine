@@ -138,6 +138,14 @@ export interface ChannelRecord {
   youtube_url: string;
   country: string | null;
   country_status: CountryStatus;
+  /**
+   * Catalog scope validity, kept strictly separate from factual
+   * country/country_status: supported-market membership for filtering,
+   * never a second country verdict. IN_SCOPE (supported incl. dormant),
+   * OUT_OF_SCOPE (attributed outside the supported universe),
+   * UNRESOLVED (no country attributed yet).
+   */
+  scope_eligibility?: 'IN_SCOPE' | 'OUT_OF_SCOPE' | 'UNRESOLVED' | null;
   confidence_score: number;
   discord_status: DiscordStatus;
   discord_invite?: string | null;
