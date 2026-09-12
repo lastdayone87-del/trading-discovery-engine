@@ -1023,3 +1023,11 @@ test('history loader failure warns but never blocks crawling', async () => {
     globalThis.fetch = savedFetch;
   }
 });
+
+test('rowToChannel carries stored scope eligibility and sanitizes unknown values', async () => {
+  const { rowToChannel: mapRow } = await import('./dbCore');
+  assert.equal(mapRow({ scope_eligibility: 'IN_SCOPE' } as any).scope_eligibility, 'IN_SCOPE');
+  assert.equal(mapRow({ scope_eligibility: 'OUT_OF_SCOPE' } as any).scope_eligibility, 'OUT_OF_SCOPE');
+  assert.equal(mapRow({} as any).scope_eligibility, null);
+  assert.equal(mapRow({ scope_eligibility: 'SOMEWHERE' } as any).scope_eligibility, null);
+});

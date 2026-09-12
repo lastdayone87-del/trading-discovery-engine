@@ -41,35 +41,59 @@ export function classifyDiscoveryRecall(
 ): DiscoveryBenchResult {
   const expected = new Set(expectedChannelIds);
   const verdicts: Record<string, DiscoveryVerdict> = {};
-  const seen = new Set<string>();
+  // Aggregate occurrences per channel first: page order in a frozen payload
+  // is incidental, so a valid pages-1–3 hit counts even when a later-page
+  // duplicate was recorded first. Duplicate hits still count separately.
+  const byChannel = new Map<string, FrozenSearchHit[]>();
+  for (const hit of payload.results) {
+    const list = byChannel.get(hit.channelId);
+    if (list) list.push(hit);
+    else byChannel.set(hit.channelId, [hit]);
+  }
   let duplicates = 0;
   let wrongMarket = 0;
   let wrongLanguage = 0;
-  for (const hit of payload.results) {
-    if (seen.has(hit.channelId)) {
-      duplicates += 1;
+  const wantMarket = expectedMarket.toLowerCase();
+  const wantLang = expectedLanguage.toLowerCase();
+  for (const [channelId, hits] of byChannel) {
+    duplicates += Math.max(0, hits.length - 1);
+    if (!expected.has(channelId)) continue;
+    const inWindow = hits.some(
+      hit =>
+        hit.page >= 1 &&
+        hit.page <= 3 &&
+        (!hit.market || hit.market.toLowerCase() === wantMarket) &&
+        (!hit.language || hit.language.toLowerCase() === wantLang),
+    );
+    if (inWindow) {
+      verdicts[channelId] = 'FOUND';
       continue;
     }
-    seen.add(hit.channelId);
-    if (!expected.has(hit.channelId)) continue;
-    if (hit.market && hit.market.toLowerCase() !== expectedMarket.toLowerCase()) {
-      verdicts[hit.channelId] = 'WRONG_MARKET';
-      wrongMarket += 1;
+    const wrongContext = hits.find(
+      hit =>
+        (hit.market && hit.market.toLowerCase() !== wantMarket) ||
+        (hit.language && hit.language.toLowerCase() !== wantLang),
+    );
+    if (wrongContext) {
+      if (wrongContext.market && wrongContext.market.toLowerCase() !== wantMarket) {
+        verdicts[channelId] = 'WRONG_MARKET';
+        wrongMarket += 1;
+      } else {
+        verdicts[channelId] = 'WRONG_LANGUAGE';
+        wrongLanguage += 1;
+      }
       continue;
     }
-    if (hit.language && hit.language.toLowerCase() !== expectedLanguage.toLowerCase()) {
-      verdicts[hit.channelId] = 'WRONG_LANGUAGE';
-      wrongLanguage += 1;
-      continue;
-    }
-    verdicts[hit.channelId] = hit.page >= 1 && hit.page <= 3 ? 'FOUND' : 'NOT_FOUND';
+    verdicts[channelId] = 'NOT_FOUND';
   }
   for (const id of expected) {
     if (!(id in verdicts)) verdicts[id] = 'NOT_FOUND';
   }
   const found = Object.values(verdicts).filter(v => v === 'FOUND').length;
+  // Wrong-context hits are misses for recall purposes: expected channels that
+  // never surfaced cleanly belong on the diagnostic list alongside page misses.
   const missed = Object.entries(verdicts)
-    .filter(([, v]) => v === 'NOT_FOUND')
+    .filter(([, v]) => v !== 'FOUND')
     .map(([id]) => id);
   return {
     expected: expected.size,

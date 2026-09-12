@@ -29,8 +29,28 @@ test('discovery recall applies FOUND/DUPLICATE/NOT_FOUND/WRONG ground rules', ()
   assert.equal(result.verdicts['UCeee'], 'NOT_FOUND');
   assert.equal(result.duplicates, 1);
   assert.equal(result.found, 1);
-  assert.deepEqual(result.missed.sort(), ['UCbbb', 'UCeee']);
+  assert.deepEqual(result.missed.sort(), ['UCbbb', 'UCccc', 'UCddd', 'UCeee']);
   assert.equal(result.recall, 1 / 5);
+});
+
+test('discovery recall counts valid hits regardless of page order', () => {
+  const result = classifyDiscoveryRecall(
+    {
+      query: 'DAX Analyse',
+      country: 'Germany',
+      language: 'de',
+      results: [
+        { channelId: 'UClate', page: 5, market: 'Germany', language: 'de' },
+        { channelId: 'UClate', page: 2, market: 'Germany', language: 'de' },
+      ],
+    },
+    ['UClate'],
+    'Germany',
+    'de',
+  );
+  assert.equal(result.verdicts['UClate'], 'FOUND');
+  assert.equal(result.duplicates, 1);
+  assert.deepEqual(result.missed, []);
 });
 
 test('discovery recall is empty-safe', () => {
@@ -98,6 +118,57 @@ test('e2e yield extracts frozen payloads with zero live calls', () => {
   assert.equal(result.extractionRate, 2 / 3);
   assert.equal(result.completenessRate, 1);
   assert.equal(result.details[1].hasVideoTitles, true);
+});
+
+test('e2e yield penalizes unexpected extraction and query-echoed titles', () => {
+  const result = runE2EYield([
+    {
+      channelId: 'UCghost',
+      payload: {
+        lane: 'CHANNEL',
+        query: 'DAX Trading',
+        items: [
+          {
+            id: { channelId: 'UCghost' },
+            snippet: {
+              channelTitle: 'Ghost Channel',
+              title: 'Ghost Channel',
+              description: '',
+              thumbnails: { high: { url: 'https://img/z.jpg' } },
+            },
+          },
+        ],
+      },
+      expectExtracted: false,
+      expectDescription: false,
+      expectVideoTitles: false,
+    },
+    {
+      channelId: 'UCecho',
+      payload: {
+        lane: 'CHANNEL',
+        query: 'DAX Trading',
+        items: [
+          {
+            id: { channelId: 'UCecho' },
+            snippet: {
+              channelTitle: 'Echo Channel',
+              title: 'Echo Channel',
+              description: 'Echte Kanalbeschreibung über Trading.',
+              thumbnails: { high: { url: 'https://img/w.jpg' } },
+            },
+          },
+        ],
+      },
+      expectExtracted: true,
+      expectDescription: true,
+      expectVideoTitles: true,
+    },
+  ]);
+  // Ghost extracts despite expectExtracted=false; echo's titles are only the
+  // query echo, so title coverage is missing. Neither case is complete.
+  assert.equal(result.complete, 0);
+  assert.equal(result.completenessRate, 0);
 });
 
 test('classification recall separates trading education from distractors', () => {

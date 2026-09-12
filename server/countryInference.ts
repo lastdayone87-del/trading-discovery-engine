@@ -621,7 +621,14 @@ export function assessChannelCountry(
     const boundaryBefore = '(?<![\\p{L}\\p{N}_])';
     const boundaryAfter = '(?![\\p{L}\\p{N}_])';
     const namePattern = names.map(escapeRegExpLiteral).join('|');
-    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|lives in|live in|operates from|operating from|active in|trader from|from|trader in)\\s+(?:the\\s+)?(?:${namePattern})${boundaryAfter}|${boundaryBefore}(?:${namePattern})(?:\\s+|-)(?:based|headquartered|trader|forex trader|crypto trader)\\b`, 'iu');
+    // Bare "from <country>" is deliberately NOT authoritative: content-origin
+    // phrasing ("market reports from Brazil", "news from Mexico") describes
+    // where coverage comes from, not where the creator is domiciled. Only
+    // actor-bound forms (trader/creator from, based in, operates from, ...)
+    // assert domicile. A bare mention still contributes mention-grade
+    // evidence through the normal bio path, which can confirm but never
+    // reject on its own.
+    const domicileRegex = new RegExp(`\\b(?:based in|located in|living in|lives in|live in|operates from|operating from|active in|trader from|creator from|trader in)\\s+(?:the\\s+)?(?:${namePattern})${boundaryAfter}|${boundaryBefore}(?:${namePattern})(?:\\s+|-)(?:based|headquartered|trader|forex trader|crypto trader)\\b`, 'iu');
     for (const field of bioFields) {
       if (!field.text.trim()) continue;
       const match = field.text.match(domicileRegex);

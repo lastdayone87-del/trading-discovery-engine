@@ -256,3 +256,19 @@ test('bare short tickers require qualifying market context', () => {
   assert.equal(isRetrievalOrientedQuery('Japan', '板読み'), true);
   assert.equal(isRetrievalOrientedQuery('Germany', 'DAX Trading'), true);
 });
+
+test('short-ticker atoms survive to form qualified pairs but never search alone', () => {
+  assert.equal(isRetrievalOrientedQuery('Norway', 'OBX'), false);
+  const planned = planDiverseQueries({
+    country: 'Norway',
+    count: 12,
+    learnedVocabulary: [],
+    existingQueries: [],
+  });
+  const queries = planned.map(item => item.query);
+  assert.ok(
+    queries.some(query => /\bOBX\b/i.test(query) && query.trim().split(/\s+/).length > 1),
+    `expected a qualified OBX pair among: ${queries.join(' | ')}`,
+  );
+  assert.ok(queries.every(query => isRetrievalOrientedQuery('Norway', query)));
+});

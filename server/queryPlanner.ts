@@ -78,6 +78,12 @@ const FORBIDDEN_PROSE = /\b(investor education|regulated trading|stock exchange|
  * are genuine vocabulary, not tickers, and are unaffected.
  */
 const BARE_SHORT_TICKER = /^[A-Z0-9]{2,4}$/i;
+
+/** True for standalone short tickers (NG, ES, NQ, ICT): only pairable, never searchable alone. */
+export function isBareShortTicker(query: string): boolean {
+  const normalized = query.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  return queryTokenCount(normalized) === 1 && BARE_SHORT_TICKER.test(normalized);
+}
 const NON_LATIN = /[\p{Script=Arabic}\p{Script=Cyrillic}\p{Script=Devanagari}\p{Script=Hangul}]/u;
 const JAPANESE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
 
@@ -104,7 +110,7 @@ export function isRetrievalOrientedQuery(country: string, query: string, languag
     ? assessLanguageCapability([{ field: 'query', text: normalized, language: languageContext.contentLanguage }], languageContext).disposition !== 'ABSTAIN'
     : isCountryScriptCompatible(country, normalized);
   return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= (languageContext?.governed?4:3) &&
-    !(queryTokenCount(normalized) === 1 && BARE_SHORT_TICKER.test(normalized)) &&
+    !isBareShortTicker(normalized) &&
     !FORBIDDEN_PROSE.test(normalized) && scriptCompatible;
 }
 
@@ -247,7 +253,10 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
   ];
   const unique = new Map<string, SearchAtom>();
   for (const candidate of [...curated, ...vocabularyAtoms]) {
-    if (isRetrievalOrientedQuery(country, candidate.term) && !unique.has(normalizeQuery(candidate.term))) unique.set(normalizeQuery(candidate.term), candidate);
+    // Bare short tickers stay pairable here: the ticker barrier applies to
+    // final assembled queries (single-token gate above), so atoms like OBX
+    // or ICT can still form qualified pairs such as "OBX Aksjehandel".
+    if ((isRetrievalOrientedQuery(country, candidate.term) || isBareShortTicker(candidate.term)) && !unique.has(normalizeQuery(candidate.term))) unique.set(normalizeQuery(candidate.term), candidate);
   }
   return [...unique.values()];
 }

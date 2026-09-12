@@ -152,3 +152,22 @@ test('exclusion gate keeps precedence over unsupported-universe gate', async () 
   );
   assert.equal(res.gateDisposition, 'REJECT_EXCLUDED');
 });
+
+test('content-origin phrasing never authorizes rejection', async () => {
+  const { assessChannelCountry } = await import('./countryInference');
+  const base: any = {
+    channelName: 'Edge Trading Journal',
+    videoTitles: [],
+    videoDescriptions: [],
+    videoDescriptionsAuthoritative: false,
+    playlists: [],
+  };
+  for (const bio of [
+    'Daily market reports from Brazil covering Latin American equities.',
+    'Morning news from Brazil with Asian market recap.',
+  ]) {
+    const res = assessChannelCountry({ ...base, aboutBio: bio }, [], []);
+    assert.notEqual(res.countryStatus, 'REJECTED', bio);
+    assert.notEqual(res.gateDisposition, 'REJECT_UNSUPPORTED', bio);
+  }
+});
