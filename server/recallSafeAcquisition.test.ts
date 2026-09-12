@@ -946,3 +946,32 @@ test('exempt-class history never skips, even at ten consecutive failures', async
   assert.ok(fetched.some(url => url.includes('slow.example')), 'budget-expired history must stay retryable');
   assert.ok(result, 'inspection completes normally');
 });
+
+test('skipped-only inspection stays uncertain instead of resolving clean', async () => {
+  const history = Array.from({ length: 5 }, (_, index) => ({
+    requestedUrl: 'https://dead.example/',
+    failureClass: 'HTTP_ERROR',
+    outcome: 'ACQUISITION_FAILED',
+    observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+  }));
+  let loaderArgs: { channelId: string; urls: string[] | undefined } | null = null;
+  const result = await runChannelInspection({
+    channelId: 'UCskiponly00000000000001',
+    channelName: 'Skip Only Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://dead.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    liveChannelDataLoader: async () => ({ bio: 'Extended bio text for coverage purposes', channelLinks: [], thumbnailUrl: null, rawHtml: '', fetchLog: '' }),
+    externalFetchImpl: (async () => { throw new Error('must not fetch skipped URL'); }) as typeof fetch,
+    urlFailureHistoryLoader: (async (channelId: string, urls?: string[]) => {
+      loaderArgs = { channelId, urls };
+      return history;
+    }) as (channelId: string) => Promise<typeof history>,
+  });
+  assert.deepEqual(loaderArgs?.urls, ['https://dead.example/'], 'history read scopes to current candidates');
+  const step = (result.steps || []).find(item => item.step === 'CUSTOM_DOMAINS');
+  assert.equal(step?.status, 'PARTIAL');
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'));
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => String(item.requestedUrl || '').startsWith('https://dead.example') && item.outcome === 'ACQUISITION_FAILED'));
+});

@@ -37,20 +37,28 @@ export function normalizeSkipUrl(rawUrl: string): string {
 }
 
 /**
- * Newest-first trailing run of identical ACQUISITION_FAILED for one URL. Any
- * other outcome (FOUND, INSPECTED_NO_MATCH, PARTIALLY_INSPECTED) or a
- * different failure class breaks the run — recovery or drift resets it.
+ * Newest-first trailing run of identical ACQUISITION_FAILED for one URL.
+ * NO_PAGE_PROCESSED rows are transparent zero-evidence markers (a rendered
+ * zero-page echo carries no independent failure information beyond the static
+ * outcome it accompanies), so they neither extend nor break a run — except a
+ * run consisting solely of them, which still counts as its own streak.
+ * Any other outcome, or a different failure class, breaks the run: recovery
+ * or drift resets it.
  */
 export function trailingIdenticalFailure(rows: UrlFailureRow[]): { failureClass: string; count: number } | undefined {
   const ordered = [...rows].sort(
     (a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt)
   );
-  const first = ordered[0];
+  const informative = ordered.filter(
+    row => row.outcome !== 'ACQUISITION_FAILED' || String(row.failureClass || '') !== 'NO_PAGE_PROCESSED'
+  );
+  const effective = informative.length > 0 ? informative : ordered;
+  const first = effective[0];
   if (!first || first.outcome !== 'ACQUISITION_FAILED') return undefined;
   const failureClass = String(first.failureClass || '');
   if (!failureClass) return undefined;
   let count = 0;
-  for (const row of ordered) {
+  for (const row of effective) {
     if (row.outcome === 'ACQUISITION_FAILED' && String(row.failureClass || '') === failureClass) count += 1;
     else break;
   }
@@ -86,9 +94,35 @@ export function skippedUrlsFromHistory(rows: UrlFailureRow[]): Set<string> {
   return skipped;
 }
 
-/** Bounded per-channel failure history for skip evaluation (fail-open: throws). */
-export async function fetchUrlFailureHistory(channelId: string, limit = 500): Promise<UrlFailureRow[]> {
+/**
+ * Bounded per-channel failure history for skip evaluation (fail-open:
+ * throws). Reads the latest rows per requested URL via a window function so
+ * a busy channel's recent volume can never push a candidate's streak outside
+ * the window. When `urls` is omitted, falls back to the latest channel-wide
+ * rows (legacy behavior for callers without a candidate list).
+ */
+export async function fetchUrlFailureHistory(
+  channelId: string,
+  urls?: string[],
+  limit = 500,
+  perUrlLimit = 12,
+): Promise<UrlFailureRow[]> {
   const db = await getDb();
+  const cleanUrls = [...new Set((urls || []).map(url => String(url || '').trim()).filter(Boolean))];
+  if (cleanUrls.length > 0) {
+    const res = await db.query(
+      `SELECT requested_url AS "requestedUrl", failure_class AS "failureClass",
+              outcome, observed_at AS "observedAt"
+       FROM (SELECT requested_url, failure_class, outcome, observed_at,
+                    ROW_NUMBER() OVER (PARTITION BY requested_url ORDER BY observed_at DESC, id DESC) AS rn
+             FROM external_acquisition_observations
+             WHERE channel_id = $1 AND requested_url = ANY($2::text[])) ranked
+       WHERE rn <= $3
+       ORDER BY requested_url, observed_at DESC`,
+      [channelId, cleanUrls, Math.min(100, Math.max(1, Math.floor(perUrlLimit) || 12))]
+    );
+    return res.rows as UrlFailureRow[];
+  }
   const res = await db.query(
     `SELECT requested_url AS "requestedUrl", failure_class AS "failureClass",
             outcome, observed_at AS "observedAt"

@@ -81,3 +81,17 @@ test('skip evaluation is per-URL and normalizes seed forms', () => {
 test('threshold constant is five', () => {
   assert.equal(URL_SKIP_CONSECUTIVE_FAILURE_THRESHOLD, 5);
 });
+
+test('rendered zero-page echoes are transparent; pure runs still cap', () => {
+  const mixed: UrlFailureRow[] = [
+    row('https://mixed.example/', 'HTTP_ERROR', 'ACQUISITION_FAILED', 0),
+    { ...row('https://mixed.example/', 'NO_PAGE_PROCESSED', 'ACQUISITION_FAILED', 1) },
+    row('https://mixed.example/', 'HTTP_ERROR', 'ACQUISITION_FAILED', 2),
+  ];
+  assert.deepEqual(trailingIdenticalFailure(mixed), { failureClass: 'HTTP_ERROR', count: 2 });
+  const pureZeroPage = Array.from({ length: 6 }, (_, index) =>
+    row('https://walled.example/', 'NO_PAGE_PROCESSED', 'ACQUISITION_FAILED', 6 - index),
+  );
+  assert.deepEqual(trailingIdenticalFailure(pureZeroPage), { failureClass: 'NO_PAGE_PROCESSED', count: 6 });
+  assert.ok(skippedUrlsFromHistory(pureZeroPage).has('https://walled.example/'));
+});
