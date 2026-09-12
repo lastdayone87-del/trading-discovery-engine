@@ -891,3 +891,58 @@ test('empty innertube result records no surface and leaves no inspected-match tr
     resetInnertubePacingForTests();
   }
 });
+
+test('repeat-failure-capped URL is skipped while remaining URLs are inspected', async () => {
+  const fetched: string[] = [];
+  const history = [
+    ...Array.from({ length: 5 }, (_, index) => ({
+      requestedUrl: 'https://dead.example/',
+      failureClass: 'HTTP_ERROR',
+      outcome: 'ACQUISITION_FAILED',
+      observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+    })),
+  ];
+  const result = await runChannelInspection({
+    channelId: 'UCskiprepeat0000000000001',
+    channelName: 'Skip Repeat Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://dead.example/', 'https://live.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input: any) => {
+      fetched.push(String(input));
+      return new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch,
+    urlFailureHistoryLoader: async () => history,
+  });
+  assert.ok(!fetched.some(url => url.includes('dead.example')), 'capped URL must never be fetched');
+  assert.ok(fetched.some(url => url.includes('live.example')), 'remaining URLs must still be inspected');
+  const step = (result.steps || []).find(item => item.step === 'CUSTOM_DOMAINS');
+  assert.ok(step && JSON.stringify(step).includes('repeat-failure cap'), 'skip reason must be observable in the trail');
+  assert.ok(!(result.acquisitionOutcomes || []).some(item => item.requestedUrl === 'https://dead.example/'), 'skipped URL must not produce failure observations');
+});
+
+test('exempt-class history never skips, even at ten consecutive failures', async () => {
+  const fetched: string[] = [];
+  const history = Array.from({ length: 10 }, (_, index) => ({
+    requestedUrl: 'https://slow.example/',
+    failureClass: 'RENDERED_BUDGET_EXPIRED',
+    outcome: 'ACQUISITION_FAILED',
+    observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+  }));
+  const result = await runChannelInspection({
+    channelId: 'UCskipexempt0000000000001',
+    channelName: 'Skip Exempt Channel',
+    channelBio: 'Trading notes trader forex with enough bio text to pass gates',
+    channelLinks: ['https://slow.example/'],
+    videoDescriptions: [],
+    creatorLikelyTrading: false,
+    externalFetchImpl: (async (input: any) => {
+      fetched.push(String(input));
+      return new Response('<html><body>No Discord invite here</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch,
+    urlFailureHistoryLoader: async () => history,
+  });
+  assert.ok(fetched.some(url => url.includes('slow.example')), 'budget-expired history must stay retryable');
+  assert.ok(result, 'inspection completes normally');
+});
