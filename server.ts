@@ -113,6 +113,9 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
   const readiness = createReadinessState();
+  // Resolve build identity once: the startup fallback must stay stable for the
+  // life of the process so successive diagnostics identify one build instance.
+  const versionInfo = resolveBuildInfo();
 
   app.use(express.json());
   app.use('/api', operatorAuthorization(appendOperatorAuditEvent));
@@ -275,7 +278,7 @@ async function startServer() {
   app.get('/api/version', (_req, res) => {
     try {
       res.json({
-        ...resolveBuildInfo(),
+        ...versionInfo,
         telemetry: operationsTelemetrySnapshot(),
         telemetryScope: 'process-local (resets on restart)',
       });

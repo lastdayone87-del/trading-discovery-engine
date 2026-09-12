@@ -182,7 +182,14 @@ export function creatorWebsiteHostsFromLinks(links: Array<string | null | undefi
     let host = '';
     try { host = new URL(normalized.url).hostname.toLowerCase().replace(/^www\./, ''); } catch { continue; }
     if (!host.includes('.')) continue;
-    if (CROSS_DOMAIN_COMMUNITY_HOSTS.has(host) || CROSS_DOMAIN_COMMUNITY_HOSTS.has(`www.${host}`)) continue;
+    // Boundary-safe shared-host exclusion: both the platform host itself and
+    // any tenant subdomain (e.g. community.circle.so) are multi-tenant and
+    // can never be creator-canonical. Exact-match checks alone would admit
+    // every tenant subdomain as owned.
+    const shared = [...CROSS_DOMAIN_COMMUNITY_HOSTS].some(
+      entry => host === entry || host === entry.replace(/^www\./, '') || host.endsWith(`.${entry.replace(/^www\./, '')}`),
+    );
+    if (shared) continue;
     hosts.add(host);
   }
   return Array.from(hosts);
