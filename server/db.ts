@@ -8,6 +8,32 @@ import { bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositi
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
+/**
+ * Builds the bookkeeping UPDATE that finalizes a failed execution's attempt
+ * row. Targets the captured attempt row id (the row open when failJob
+ * started): after the job transitions back to PENDING a new worker may claim
+ * it and open a newer row, and a job-scoped `finished_at IS NULL` filter
+ * would then wrongly finalize the new claim's row with this execution's
+ * error. Falls back to the legacy job-scoped filter only when no row was
+ * captured (the row is then necessarily this execution's, or already closed).
+ */
+export function failedAttemptFinalizeQuery(
+  jobId: string,
+  attemptRowId: unknown,
+  error: string,
+): { text: string; values: unknown[] } {
+  if (attemptRowId !== null && attemptRowId !== undefined && String(attemptRowId) !== '') {
+    return {
+      text: `UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$1 WHERE id=$2 AND finished_at IS NULL`,
+      values: [error, String(attemptRowId)],
+    };
+  }
+  return {
+    text: `UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$1 WHERE job_id=$2 AND finished_at IS NULL`,
+    values: [error, jobId],
+  };
+}
+
 export function parseTransientRetryAgeMs(value:unknown,fallback=6*60*60_000):number{
   const parsed=Number(value);
   return Number.isFinite(parsed)&&parsed>=60_000?parsed:fallback;
@@ -96,6 +122,9 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
   // failure in the secondary attempts bookkeeping below cannot omit it.
 
   countDisposition();
-  await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);
+  // Finalize THIS execution's captured attempt row by id (never whichever
+  // open row happens to exist now — a post-transition claim opens a new row).
+  const finalize = failedAttemptFinalizeQuery(jobId, attemptRowId, persistedMessage);
+  await db.query(finalize.text, finalize.values as any[]);
   return decision.disposition;
 }
