@@ -319,7 +319,7 @@ export async function processChannelThroughPipeline(
     timestamp: now
   };
 
-  if (countryVal.gateDisposition === 'REJECT_EXCLUDED' || countryVal.status === 'REJECTED') {
+  if (countryVal.gateDisposition === 'REJECT_EXCLUDED' || countryVal.gateDisposition === 'REJECT_UNSUPPORTED' || countryVal.status === 'REJECTED') {
     bumpGate1Evaluation(countryVal.gateDisposition);
     console.log(
       `[Unified Ingestion Pipeline - Gate 1] Channel '${candidate.channelName}' REJECTED by Hard Exclusion Engine (${targetCountry}). Halting pipeline immediately.`

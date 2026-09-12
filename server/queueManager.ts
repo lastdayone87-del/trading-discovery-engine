@@ -984,7 +984,11 @@ export async function inspectAndValidateChannel(
         videoDescriptionsAuthoritative: rawDetails?.videoDescriptionsAuthoritative,
         playlists: rawDetails?.playlists
       },
-      rawDetails?.locationTag || null
+      // Enrichment revalidation is unscoped: no genuine query target country
+      // exists here. locationTag already enters above as creator-level
+      // official metadata; passing it again as the discovery target would
+      // manufacture false discovery-country context (e.g. 'BR').
+      null
     );
 
     const preInspectionLanguageSet = aggregatedLanguageCandidateSet(valRes.evidence);
@@ -1045,7 +1049,10 @@ export async function inspectAndValidateChannel(
       description:inspection.observedAboutBio, videoTitles:rawDetails?.videoTitles || [channel.channel_name],
       locationTag:rawDetails?.locationTag, externalLinks:inspection.observedChannelLinks,
       metadataStatus:rawDetails?.countryMetadataStatus || channel.country_metadata_status,
-      videoDescriptions:inspection.observedVideoDescriptions || [], videoDescriptionsAuthoritative:inspection.observedVideoDescriptionsAuthoritative || false, playlists:rawDetails?.playlists}, rawDetails?.locationTag || null);
+      videoDescriptions:inspection.observedVideoDescriptions || [], videoDescriptionsAuthoritative:inspection.observedVideoDescriptionsAuthoritative || false, playlists:rawDetails?.playlists},
+      // Unscoped live revalidation (see above): locationTag is creator-level
+      // input, never the discovery target.
+      null);
     const liveCountry = mergeCountryValidationResults(valRes, rawLiveCountry);
     const liveLanguageSet = aggregatedLanguageCandidateSet(liveCountry.evidence);
     const liveCountryStep: InspectionStep = {

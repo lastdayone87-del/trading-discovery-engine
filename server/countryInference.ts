@@ -1,4 +1,5 @@
 import type { CountryMetadataStatus, CountryStatus, CountryVocabulary, ExcludedCountry } from '../src/types';
+import { SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
 import { normalizeCountryName } from './countryExclusionRules';
 
 export type CountryEvidenceSource =
@@ -25,7 +26,8 @@ export type GateDisposition =
   | 'ALLOW_NORMAL'
   | 'CONTINUE_CRAWLING'
   | 'NEEDS_REVIEW'
-  | 'REJECT_EXCLUDED';
+  | 'REJECT_EXCLUDED'
+  | 'REJECT_UNSUPPORTED';
 
 export interface CountryInferenceEvidence {
   source: CountryEvidenceSource;
@@ -586,8 +588,29 @@ export function assessChannelCountry(
   // alias/localized spelling bound to the same canonical country, so explicit
   // domicile using an alias ("based in Côte d'Ivoire", "based in Czech
   // Republic") attributes to the right country instead of being missed.
-  for (const item of exclusions) {
-    const canonical = canonicalCountry(item.country_name);
+  // Explicit domicile is modeled for the excluded list, the supported
+  // universe, AND every country with a signal entry (e.g. Brazil, Mexico):
+  // otherwise a phrase like "based in Brazil" (unsupported, non-excluded)
+  // could never produce authoritative domicile evidence, and the
+  // unsupported-universe gate below could never fire from bio text — the
+  // most common domicile signal. Deduplicated by canonical name so no
+  // country is evaluated twice. Supported-country outcomes are unaffected
+  // (their mention-grade items already carried equal confidence); gates
+  // decide what each attribution means.
+  const domicileSubjects: string[] = [];
+  const domicileSeen = new Set<string>();
+  for (const name of [
+    ...exclusions.map(entry => entry.country_name),
+    ...(SUPPORTED_PRODUCTION_COUNTRIES as readonly string[]),
+    ...Object.keys(COUNTRY_SIGNALS),
+  ]) {
+    const canonical = canonicalCountry(name);
+    const key = normalizeCountryName(canonical);
+    if (domicileSeen.has(key)) continue;
+    domicileSeen.add(key);
+    domicileSubjects.push(canonical);
+  }
+  for (const canonical of domicileSubjects) {
     const names = domicileNameVariants(canonical);
     if (names.length === 0) continue;
     // Unicode-aware word boundaries around the name alternation: JS \b is
@@ -605,16 +628,16 @@ export function assessChannelCountry(
       // Deduplicate against an already-authoritative item only: a
       // mention-grade item for the same country must never suppress the
       // explicit domicile assertion that actually authorizes exclusion.
-      if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && !e.domicileMention && normalizeCountryName(e.detectedCountry) === normalizeCountryName(item.country_name))) {
+      if (match && !evidence.some(e => e.source === 'CHANNEL_ABOUT_BIO' && !e.domicileMention && normalizeCountryName(e.detectedCountry) === normalizeCountryName(canonical))) {
         evidence.push({
           source: 'CHANNEL_ABOUT_BIO',
           priority: 2,
-          detectedCountry: canonicalCountry(item.country_name),
+          detectedCountry: canonical,
           confidence: 92,
           matchedValue: match[0],
           matchedContext: matchWindow(field.text, match[0]),
           sourceField: field.sourceField,
-          reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonicalCountry(item.country_name)}.`
+          reasoning: `Channel About/Bio location: '${match[0]}' indicates ${canonical}.`
         });
       }
     }
@@ -801,6 +824,40 @@ export function assessChannelCountry(
       reasoning: policy.reasoning,
       decisiveEvidence,
       rejectionReason: policy.reasoning
+    };
+  }
+
+  // Unsupported-universe gate: CONFIRMED-level domicile outside the 20
+  // supported countries is rejected with the same authority bar as exclusion
+  // (unanimous decisive evidence, priority <= 3, confidence >= 85, no bare
+  // mention, no conflict). Weaker LIKELY-level evidence stays fail-open:
+  // terminal rejection demands decisive proof, never a bare threshold.
+  const supportedUniverse = new Set(
+    (SUPPORTED_PRODUCTION_COUNTRIES as readonly string[]).map(country =>
+      normalizeCountryName(country),
+    ),
+  );
+  if (
+    !conflict &&
+    topConfidence >= 85 &&
+    decisivePriority <= 3 &&
+    decisiveEvidence.every(item => item.detectedCountry === detectedCreatorCountry) &&
+    decisiveEvidence.some(item => !item.domicileMention) &&
+    !supportedUniverse.has(normalizeCountryName(detectedCreatorCountry))
+  ) {
+    const reasoning =
+      `${detectedCreatorCountry} is outside the supported production universe and cannot enter the catalog.`;
+    return {
+      discoveryCountry,
+      detectedCreatorCountry,
+      countryEvidence: evidence,
+      countryStatus: 'REJECTED',
+      evidenceAvailability,
+      gateDisposition: 'REJECT_UNSUPPORTED',
+      confidence: topConfidence,
+      reasoning,
+      decisiveEvidence,
+      rejectionReason: reasoning
     };
   }
 

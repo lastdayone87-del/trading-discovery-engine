@@ -1,5 +1,6 @@
 import { getAllChannels, getExcludedCountries, getCountryVocabularies, getDb, enqueueJob, upsertChannel, getChannelById } from './db';
 import { canonicalCountry, inferChannelCountry } from './countryInference';
+import { resolveScopeEligibility } from './scopeEligibility';
 import { normalizeCountryName } from './countryExclusionRules';
 import { creatorLevelCountryEvidence } from './countryValidator';
 import type { ChannelRecord, CountryVocabulary } from '../src/types';
@@ -648,22 +649,22 @@ export async function processCountryBoundaryReprocessJob(
         `INSERT INTO channels (
           channel_id, channel_name, youtube_url, country, country_status, confidence_score,
           discord_status, scan_status, scan_attempts, discovery_source, first_seen, last_checked,
-          inspection_trail, trading_status, country_metadata_status, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+          inspection_trail, trading_status, country_metadata_status, scope_eligibility, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
         ON CONFLICT (channel_id) DO UPDATE SET
           country_status=excluded.country_status, country=excluded.country, confidence_score=excluded.confidence_score,
-          scan_status=excluded.scan_status, last_checked=excluded.last_checked, inspection_trail=excluded.inspection_trail, updated_at=now()`,
+          scan_status=excluded.scan_status, last_checked=excluded.last_checked, inspection_trail=excluded.inspection_trail, scope_eligibility=excluded.scope_eligibility, updated_at=now()`,
         [
           channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status,
           channel.confidence_score, channel.discord_status, channel.scan_status, channel.scan_attempts,
           channel.discovery_source, channel.first_seen, channel.last_checked, JSON.stringify(channel.inspection_trail),
-          channel.trading_status, 'NOT_REQUESTED'
+          channel.trading_status, 'NOT_REQUESTED', resolveScopeEligibility(channel.country)
         ]
       );
     } else {
       await client.query(
-        `UPDATE channels SET country_status=$1, country=$2, confidence_score=$3, scan_status=$4, last_checked=$5, inspection_trail=$6 WHERE channel_id=$7`,
-        [channel.country_status, channel.country, channel.confidence_score, channel.scan_status, channel.last_checked, JSON.stringify(channel.inspection_trail), channelId]
+        `UPDATE channels SET country_status=$1, country=$2, confidence_score=$3, scan_status=$4, last_checked=$5, inspection_trail=$6, scope_eligibility=$7 WHERE channel_id=$8`,
+        [channel.country_status, channel.country, channel.confidence_score, channel.scan_status, channel.last_checked, JSON.stringify(channel.inspection_trail), resolveScopeEligibility(channel.country), channelId]
       );
     }
 

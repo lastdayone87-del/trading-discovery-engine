@@ -99,3 +99,56 @@ test('migration 131 adds scope_eligibility non-destructively', () => {
   assert.ok(sql.includes("'IN_SCOPE'") && sql.includes("'OUT_OF_SCOPE'") && sql.includes("'UNRESOLVED'"));
   assert.match(sql, /NOT VALID/);
 });
+
+test('unsupported-universe gate rejects CONFIRMED foreign domicile, preserves fail-open', async () => {
+  const { assessChannelCountry } = await import('./countryInference');
+  const base = {
+    channelName: 'Edge Trading Journal',
+    videoTitles: [],
+    videoDescriptions: [],
+    videoDescriptionsAuthoritative: false,
+    playlists: [],
+  } as never;
+  const confirmed = assessChannelCountry(
+    { ...base, aboutBio: 'Trader based in Brazil covering Latin American equity futures.' },
+    [],
+    [],
+  );
+  assert.equal(confirmed.detectedCreatorCountry, 'Brazil');
+  assert.equal(confirmed.countryStatus, 'REJECTED');
+  assert.equal(confirmed.gateDisposition, 'REJECT_UNSUPPORTED');
+  const bare = assessChannelCountry(
+    { ...base, aboutBio: 'English-language quant channel. We comment on Brazil market opens for context.' },
+    [],
+    [],
+  );
+  assert.notEqual(bare.countryStatus, 'REJECTED');
+  assert.notEqual(bare.gateDisposition, 'REJECT_UNSUPPORTED');
+  const empty = assessChannelCountry({ ...base, aboutBio: '' }, [], []);
+  assert.equal(empty.countryStatus, 'UNCERTAIN');
+  assert.equal(empty.gateDisposition, 'CONTINUE_CRAWLING');
+  const supported = assessChannelCountry(
+    { ...base, aboutBio: 'Trader based in Germany covering DAX futures.' },
+    [],
+    [],
+  );
+  assert.equal(supported.detectedCreatorCountry, 'Germany');
+  assert.notEqual(supported.gateDisposition, 'REJECT_UNSUPPORTED');
+});
+
+test('exclusion gate keeps precedence over unsupported-universe gate', async () => {
+  const { assessChannelCountry } = await import('./countryInference');
+  const res = assessChannelCountry(
+    {
+      channelName: 'Edge Trading Journal',
+      aboutBio: 'Trader based in Vietnam covering Asian equity futures.',
+      videoTitles: [],
+      videoDescriptions: [],
+      videoDescriptionsAuthoritative: false,
+      playlists: [],
+    } as never,
+    [{ country_name: 'Vietnam', reason: 'test exclusion' }],
+    [],
+  );
+  assert.equal(res.gateDisposition, 'REJECT_EXCLUDED');
+});
