@@ -4,6 +4,7 @@ import { InspectionStep } from '../src/types';
 import { getChannelById } from './db';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
+import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
@@ -163,6 +164,29 @@ const COMMUNITY_PATH_HINTS = ['discord','community','join','chat','member','memb
 const CROSS_DOMAIN_COMMUNITY_HOSTS = new Set(['linktr.ee','www.linktr.ee','beacons.ai','www.beacons.ai','bio.link','www.bio.link','solo.to','www.solo.to','campsite.bio','www.campsite.bio','lnk.bio','www.lnk.bio','skool.com','www.skool.com','whop.com','www.whop.com','circle.so','www.circle.so','patreon.com','www.patreon.com']);
 export function communityNavigationScore(href:string,label:string):number {const haystack=`${href} ${label}`.toLowerCase();let score=0;for(const hint of COMMUNITY_PATH_HINTS)if(haystack.includes(hint))score+=hint==='discord'?100:hint==='community'||hint==='join'?50:10;return score;}
 export function shouldFollowCommunityTarget(url:string,_label:string):boolean {try{return CROSS_DOMAIN_COMMUNITY_HOSTS.has(new URL(url).hostname.toLowerCase());}catch{return false;}}
+
+/**
+ * Derive creator-canonical website hosts from channel links for Discord
+ * ownership inference. Uses the same normalized destinations acquisition
+ * crawls (YouTube redirects unwrapped, tracking params stripped): only
+ * WEBSITE-kind hosts qualify, shared/multi-tenant community hosts are
+ * excluded (a link proves reference, never ownership), and a leading www.
+ * is stripped so aliases match consistently on both comparison sides.
+ */
+export function creatorWebsiteHostsFromLinks(links: Array<string | null | undefined>): string[] {
+  const hosts = new Set<string>();
+  for (const link of links) {
+    if (!link || typeof link !== 'string') continue;
+    const normalized = normalizeExternalUrl(link);
+    if (!normalized || normalized.kind !== 'WEBSITE') continue;
+    let host = '';
+    try { host = new URL(normalized.url).hostname.toLowerCase().replace(/^www\./, ''); } catch { continue; }
+    if (!host.includes('.')) continue;
+    if (CROSS_DOMAIN_COMMUNITY_HOSTS.has(host) || CROSS_DOMAIN_COMMUNITY_HOSTS.has(`www.${host}`)) continue;
+    hosts.add(host);
+  }
+  return Array.from(hosts);
+}
 
 async function fetchExternalPage(url:string,fetchImpl:typeof fetch):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>}> {
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
@@ -542,17 +566,12 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // (YouTube About external links, incl. live-refreshed). Wires the existing
   // CREATOR_CANONICAL_DOMAIN (+55) ownership signal in inferDiscordOwnership,
   // which was previously unreachable because no caller passed
-  // creatorWebsiteHosts. An invite observed on a domain the creator linked is
-  // materially stronger creator-ownership evidence; partner/affiliate links
-  // remain guarded by the -80 PARTNER_OR_AFFILIATE_SURFACE rule.
-  const creatorWebsiteHosts=Array.from(new Set(
-    links.flatMap(link => {
-      try {
-        const host = new URL(link).hostname.toLowerCase();
-        return host && host.includes('.') ? [host] : [];
-      } catch { return []; }
-    })
-  ));
+  // creatorWebsiteHosts. Only normalized WEBSITE-kind destinations qualify:
+  // social profiles, messaging previews, and shared/multi-tenant community
+  // hosts can never confer canonical ownership (a link proves reference, not
+  // ownership), and partner/affiliate links remain guarded by the -80
+  // PARTNER_OR_AFFILIATE_SURFACE rule.
+  const creatorWebsiteHosts = creatorWebsiteHostsFromLinks(links);
   const ownershipInput = { creatorName, creatorWebsiteHosts };
 
   const step1Logs:string[]=[];step1Logs.push(`Inspecting channel bio text (${bio.length} characters) and embedded links.`);const bioCandidates=extractDiscordCandidates(bio,'YOUTUBE_ABOUT',channelData.youtubeUrl).filter(c=>c.nativeInviteCode),directBioInvite=bioCandidates[0]?.nativeInviteCode||null;if(debugLog)debugLog.discordRegexAttempts.push({source:'CHANNEL_ABOUT',textLength:bio.length,result:bioCandidates.map(c=>c.nativeInviteCode)});addExternalUrls(bio,'CHANNEL_ABOUT');retainCandidates(bioCandidates);if(directBioInvite){step1Logs.push(`${bioCandidates.length} direct Discord candidate(s) detected in Channel Bio.`);addStep('BIO','Step 1 — Channel Bio & About Panel','FOUND',step1Logs,directBioInvite,'CHANNEL_ABOUT');acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl||`youtube:channel:${channelData.channelId}`,surface:'YOUTUBE_ABOUT',required:true,outcome:'FOUND',retryable:false,detail:`${bioCandidates.length} Discord candidate(s) discovered in YouTube About content`,observedAt:now});}else{if(acquiredAboutUrl)acquisitionOutcomes.push({requestedUrl:acquiredAboutUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:'YouTube About page acquired and inspected without a Discord invite',observedAt:now});step1Logs.push('No direct Discord invite found in channel bio.');addStep('BIO','Step 1 — Channel Bio & About Panel','NOT_FOUND',step1Logs);}
@@ -579,12 +598,13 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
       ?await channelData.urlFailureHistoryLoader(channelData.channelId,skipCandidateUrls)
       :await fetchUrlFailureHistory(channelData.channelId,skipCandidateUrls);
     skippedRepeatUrls=skippedUrlsFromHistory(historyRows);
-  }catch(error){console.warn(`[RepeatFailureSkip] History load failed for ${channelData.channelId}; crawling without skips:`,error instanceof Error?error.message:String(error));skippedRepeatUrls=new Set<string>();}}
+  }catch(error){console.warn(`[RepeatFailureSkip] History load failed for ${channelData.channelId}; crawling without skips:`,error instanceof Error?error.message:String(error));bumpRepeatFailureHistoryOutage();skippedRepeatUrls=new Set<string>();}}
   let repeatSkippedCount=0;
   const repeatSkipLine=(url:string):string|null=>{
     const key=normalizeSkipUrl(url);
     if(!key||!skippedRepeatUrls.has(key))return null;
     repeatSkippedCount++;
+    bumpRepeatFailureSkip(1);
     return `Skipping repeatedly-failing URL under the repeat-failure cap (5 consecutive identical failures): ${url}; remaining surfaces continue normally.`;
   };
 

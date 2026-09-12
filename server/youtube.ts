@@ -8,6 +8,7 @@ import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler, type YouTubeRequestPriority } from './youtubeRequestScheduler';
 import { youtubeProviderCooldown, YouTubeProvidersCoolingDownError } from './youtubeProviderCooldown';
+import { bumpInvalidApiKeyQuarantine } from './operationsTelemetry';
 import { FEATURED_CHANNEL_PROVIDER_COST, parseFeaturedChannelSections, type FeaturedChannelProviderResult } from './featuredChannelAdapter';
 export type { SearchOrdering } from './searchOrdering';
 export type { RetrievalLane } from './retrievalLanes';
@@ -205,7 +206,7 @@ function throwIfAllProvidersCoolingDown(keys: string[]): void {
   if (retryAt !== null) throw new YouTubeProvidersCoolingDownError(retryAt);
 }
 
-function recordProviderFailure(key: string, error: unknown): void {
+export function recordProviderFailure(key: string, error: unknown): void {
   const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;
   // A rate-limited key is retired for this acquisition, while the bounded
   // outer provider loop may continue with another eligible key. If the whole
@@ -216,6 +217,16 @@ function recordProviderFailure(key: string, error: unknown): void {
   }
   if (isYouTubeRateLimited(error)) {
     if ((error as any)?.providerFailureRecorded !== true) youtubeProviderCooldown.failed(dispatchedKey, 'RATE_LIMITED');
+    return;
+  }
+  // Dead-key quarantine for callers that record failures outside youtubeFetch.
+  // Shares the suspended-key quarantine: the key is unusable until the window
+  // lapses, then gets a single probe attempt on next use.
+  if (isInvalidApiKey(error)) {
+    if ((error as any)?.providerFailureRecorded !== true) {
+      youtubeProviderCooldown.failed(dispatchedKey, 'CONSUMER_SUSPENDED');
+      bumpInvalidApiKeyQuarantine();
+    }
     return;
   }
   if ((error as any)?.providerFailureRecorded === true) return;
@@ -326,6 +337,10 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
             const runtimeRateLimited=isYouTubeRateLimited(error);
             if(!runtimeRateLimited)failedDispatchProviders(acquisition)?.add(dispatchedProviderKey);
             if(consumerSuspended)youtubeProviderCooldown.failed(dispatchedProviderKey,'CONSUMER_SUSPENDED');
+            // A dead API key is unusable like a suspended one: quarantine it for
+            // the same duration so in-loop rotation reaches a healthy key instead
+            // of failing every acquisition against the poisoned key.
+            else if(isInvalidApiKey(error)){youtubeProviderCooldown.failed(dispatchedProviderKey,'CONSUMER_SUSPENDED');bumpInvalidApiKeyQuarantine();}
             else if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');
             else if(runtimeRateLimited)youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');
             if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
@@ -428,7 +443,20 @@ export function isYouTubeRateLimited(error: unknown): boolean {
   return false;
 }
 
-/** Detects YouTube API key suspension (HTTP 403 PERMISSION_DENIED / consumerSuspended). */
+/** Detects YouTube API key rejection (HTTP 400 keyInvalid / API_KEY_INVALID). */
+export function isInvalidApiKey(error: unknown): boolean {
+  let current: any = error;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    if (current.quotaExceeded === true) return false;
+    const is400 = current.status === 400 || /\b400\b/i.test(String(current.message ?? ''));
+    if (!is400) continue;
+    const hasKeyReason = current.providerReasons?.some((reason: unknown) => /^(key_?invalid|api_?key_?invalid)$/i.test(String(reason)))
+      || /\bkey_?invalid\b|\bapi_?key_?invalid\b/i.test(String(current.message ?? ''));
+    if (hasKeyReason) return true;
+  }
+  return false;
+}
+
 export function isConsumerSuspended(error: unknown): boolean {
   let current: any = error;
   for (let depth = 0; current && depth < 5; depth++, current = current.cause) {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {inferDiscordOwnership,makeDiscordCandidate} from './discordCandidates';
 import {validateDiscordInvite} from './discordValidator';
+import {creatorWebsiteHostsFromLinks,runChannelInspection} from './inspector';
 
 const noopEmit=async()=>{};
 const json=(body:any,status=200)=>new Response(JSON.stringify(body),{status,headers:{'content-type':'application/json'}});
@@ -86,4 +87,41 @@ test('public landing-page inspection does not override explicit non-trading nati
   assert.equal(result.relevanceStatus,'NON_TRADING');
   assert.equal(calls,1);
   assert.equal(result.evidenceCoverage?.publicInvitePage,'NOT_ATTEMPTED');
+});
+test('canonical host derivation keeps website domains and drops shared/social/messaging surfaces',()=>{
+  assert.deepEqual(
+    creatorWebsiteHostsFromLinks([
+      'https://atlasfx.io',
+      'https://www.atlasfx.io/about',
+      'https://youtube.com/redirect?q=https%3A%2F%2Fatlasfx.io%2Flinks',
+      'https://instagram.com/atlastrading',
+      'https://linktr.ee/atlastrading',
+      'https://whop.com/atlastrading',
+      'https://t.me/atlastrading',
+      'https://discord.gg/room',
+      'https://g/',
+      null,
+      '',
+    ]),
+    ['atlasfx.io'],
+  );
+});
+
+test('runChannelInspection promotes a linked-domain invite via canonical ownership only',async()=>{
+  const inviteHtml = new Response('<html><body>Join us https://discord.gg/room</body></html>',{status:200,headers:{'content-type':'text/html'}});
+  const emptyHtml = new Response('<html><body>No Discord invite here</body></html>',{status:200,headers:{'content-type':'text/html'}});
+  const result = await runChannelInspection({
+    channelId:'canonical-wiring-channel',
+    channelName:'Atlas Trading',
+    channelBio:'Trading notes',
+    channelLinks:['https://atlasfx.io','https://instagram.com/atlastrading'],
+    videoDescriptions:['one','two','three','four','five'],
+    creatorLikelyTrading:false,
+    externalFetchImpl:(async(input:any)=>String(input).includes('atlasfx.io')?inviteHtml.clone():emptyHtml) as typeof fetch,
+    renderedFallback:async(seedUrl:string)=>({foundInvite:null,foundLocation:seedUrl,candidates:[],inspectedPages:1,scrolls:0,clicks:0,complete:true,retryable:false,detail:'test rendered without invite'}),
+  });
+  const owned=(result.discordCandidates||[]).find(c=>c.nativeInviteCode==='room');
+  assert.ok(owned,'expected the linked-domain invite to be retained');
+  assert.equal(owned?.ownershipStatus,'CREATOR_OWNED');
+  assert.ok(owned?.ownershipReasons?.includes('CREATOR_CANONICAL_DOMAIN'));
 });
