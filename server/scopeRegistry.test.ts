@@ -275,3 +275,14 @@ test('dormant exclusion is intentional and total across scope modes', async () =
   );
   assert.deepEqual(resolveAutonomousCountries(all, [], [...SUPPORTED_DORMANT_COUNTRIES], 'SELECTED_COUNTRIES'), []);
 });
+
+test('custom out-of-registry vocabularies never enter autonomous sweeps', async () => {
+  const { resolveAutonomousCountries } = await import('./autonomousDiscovery');
+  const { SUPPORTED_PRODUCTION_COUNTRIES } = await import('../src/data/initial_countries');
+  const vocabs = [...(SUPPORTED_PRODUCTION_COUNTRIES as readonly string[]), 'Brazil', 'Atlantis'];
+  const swept = resolveAutonomousCountries(vocabs, [], [], 'GLOBAL');
+  assert.ok(!swept.includes('Brazil'), 'custom vocab must not be swept');
+  assert.ok(!swept.includes('Atlantis'), 'unknown vocab must not be swept');
+  // Explicit single-target override stays valid for deliberate cross-border runs.
+  assert.deepEqual(resolveAutonomousCountries(vocabs, [], [], 'GLOBAL', 'Brazil'), ['Brazil']);
+});

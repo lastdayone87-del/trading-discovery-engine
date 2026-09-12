@@ -68,11 +68,13 @@ export function calculateQueryFunnel(rawResults: number, observations: QueryObse
   const fresh = values.filter(value => value.persisted && !value.wasKnown);
   const scoped = values.filter(value => value.scopeEligibility !== undefined);
   // Neutral default: with no scope signal anywhere, every fresh channel counts
-  // as in-scope (identical to legacy yield). OUT_OF_SCOPE fresh channels earn
-  // no learning credit only when scope is actually observed.
+  // as in-scope (identical to legacy yield). Once scope is observed, ONLY
+  // IN_SCOPE fresh channels earn learning credit: OUT_OF_SCOPE is excluded
+  // (wrong market must never train retrieval) and UNRESOLVED is excluded too
+  // (unproven market eligibility must not inflate yield before it exists).
   const inScopeFresh = scoped.length === 0
     ? fresh
-    : fresh.filter(value => value.scopeEligibility !== 'OUT_OF_SCOPE');
+    : fresh.filter(value => value.scopeEligibility === 'IN_SCOPE');
   const qualityChannels = values.filter(value => isQualityCreator(value.funnelOutcome, value.qualityScore)).length;
   const communitiesDiscovered = values.filter(value => value.funnelOutcome === 'TRADING_CONFIRMED' && value.hasCommunity).length;
   const averageQualityScore = persisted.length

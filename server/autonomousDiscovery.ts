@@ -12,7 +12,7 @@ import {
   updateSchedulerState,
   getDailyYouTubeQuotaBudget
 } from './db';
-import { SUPPORTED_DORMANT_COUNTRIES } from '../src/data/initial_countries';
+import { SUPPORTED_DORMANT_COUNTRIES, SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
 import { assertCountryAllowed } from './countryExclusion';
 import { authorizeCountryNativeAllocationQuery, selectNextQueryForCountry } from './queryIntelligence';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
@@ -115,9 +115,13 @@ export async function resumeQueryIntelligence(): Promise<{ message: string; isPa
 
 /**
  * Pure autonomous sweep resolution (testable without a database). Applies, in
- * order: exclusion list, explicit selected-countries scope, dormant-scope
- * preservation (dormant supported countries are never swept autonomously),
- * then an explicit single-target override (manual/cross-border stays valid).
+ * order: supported-registry intersection (custom/stale DB vocabularies outside
+ * the registry can never be swept — their creators could not enter the
+ * catalog since REJECT_UNSUPPORTED), exclusion list, explicit
+ * selected-countries scope, dormant-scope preservation (dormant supported
+ * countries are never swept autonomously), then an explicit single-target
+ * override (manual/cross-border stays valid, including out-of-registry
+ * targets when deliberately requested).
  */
 export function resolveAutonomousCountries(
   vocabCountries: string[],
@@ -126,9 +130,17 @@ export function resolveAutonomousCountries(
   scope: DiscoveryScopeMode,
   targetCountry?: string | null,
 ): string[] {
+  const supported = new Set(
+    (SUPPORTED_PRODUCTION_COUNTRIES as readonly string[]).map(country =>
+      country.normalize('NFKC').trim().toLocaleLowerCase('en'),
+    ),
+  );
   const excluded = new Set(excludedNames.map(country => country.toLowerCase()));
   const selectedScope = new Set(selectedCountries.map(country => country.toLowerCase()));
-  let countries = vocabCountries.filter(country => !excluded.has(country.toLowerCase()));
+  let countries = vocabCountries.filter(country =>
+    supported.has(country.normalize('NFKC').trim().toLocaleLowerCase('en')) &&
+    !excluded.has(country.toLowerCase()),
+  );
   if (scope === 'SELECTED_COUNTRIES' && selectedScope.size > 0) {
     countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
   }
