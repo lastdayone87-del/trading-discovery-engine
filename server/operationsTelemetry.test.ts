@@ -6,6 +6,7 @@ import {
   bumpJobFailureDisposition,
   bumpRepeatFailureHistoryOutage,
   bumpRepeatFailureSkip,
+  jobDispositionExecutionKey,
   markJobDispositionCounted,
   operationsTelemetrySnapshot,
   resetOperationsTelemetry,
@@ -55,10 +56,22 @@ test('telemetry snapshots are copies and ignore non-positive skip counts', () =>
   assert.equal(operationsTelemetrySnapshot().gate1EvaluationsTotal.ALLOW_NORMAL, 0);
 });
 
-test('repeated failJob transitions for one job attempt count exactly once', () => {
-  assert.equal(markJobDispositionCounted('job-1', 2, 'FAILED'), true);
-  assert.equal(markJobDispositionCounted('job-1', 2, 'FAILED'), false);
-  assert.equal(markJobDispositionCounted('job-1', 3, 'FAILED'), true);
-  assert.equal(markJobDispositionCounted('job-2', 2, 'FAILED'), true);
-  assert.equal(markJobDispositionCounted('job-1', 2, 'RETRYING'), true);
+test('repeated failJob transitions for one execution count exactly once', () => {
+  const key = jobDispositionExecutionKey('attempt-row-1', 'job-1', 2);
+  assert.equal(markJobDispositionCounted(key, 'FAILED'), true);
+  assert.equal(markJobDispositionCounted(key, 'FAILED'), false);
+});
+
+test('attempt-free deferrals count every distinct claim execution', () => {
+  // RETRYING_WITHOUT_ATTEMPT decrements the attempt counter, so the next claim
+  // reuses the same attempt number with a NEW job_attempts row: each must count.
+  assert.equal(markJobDispositionCounted(jobDispositionExecutionKey('row-a', 'job-1', 2), 'RETRYING_WITHOUT_ATTEMPT'), true);
+  assert.equal(markJobDispositionCounted(jobDispositionExecutionKey('row-b', 'job-1', 2), 'RETRYING_WITHOUT_ATTEMPT'), true);
+});
+
+test('missing attempt rows fall back to a job+attempt key', () => {
+  const fallback = jobDispositionExecutionKey(null, 'job-9', 4);
+  assert.equal(markJobDispositionCounted(fallback, 'FAILED'), true);
+  assert.equal(markJobDispositionCounted(fallback, 'FAILED'), false);
+  assert.equal(markJobDispositionCounted(jobDispositionExecutionKey(undefined, 'job-9', 5), 'FAILED'), true);
 });

@@ -91,18 +91,17 @@ export function bumpInvalidApiKeyQuarantine(): void {
  * Idempotency guard for job-disposition telemetry. failJob performs its writes
  * outside a transaction: if a secondary bookkeeping write fails after the job
  * row committed, a worker retry re-runs the same transition and must not count
- * it twice. Keyed by job + attempt + disposition; bounded FIFO so the set
+ * it twice. Keyed by the open job_attempts row id (one row per claim), so
+ * attempt-free deferrals — which reuse the same attempt number on the next
+ * claim — still count every distinct persisted transition. Callers without an
+ * open attempt row fall back to a job+attempt key. Bounded FIFO so the set
  * cannot grow without limit. Returns true on first count, false on repeats.
  */
 const countedDispositions = new Map<string, number>();
 const MAX_COUNTED_DISPOSITIONS = 5000;
 
-export function markJobDispositionCounted(
-  jobId: unknown,
-  attempts: unknown,
-  disposition: unknown,
-): boolean {
-  const key = `${String(jobId)}:${String(attempts)}:${normalizeJobFailure(disposition)}`;
+export function markJobDispositionCounted(executionKey: unknown, disposition: unknown): boolean {
+  const key = `${String(executionKey)}:${normalizeJobFailure(disposition)}`;
   if (countedDispositions.has(key)) return false;
   if (countedDispositions.size >= MAX_COUNTED_DISPOSITIONS) {
     const oldest = countedDispositions.keys().next();
@@ -110,6 +109,17 @@ export function markJobDispositionCounted(
   }
   countedDispositions.set(key, Date.now());
   return true;
+}
+
+export function jobDispositionExecutionKey(
+  attemptRowId: unknown,
+  jobId: unknown,
+  attempts: unknown,
+): string {
+  if (attemptRowId !== null && attemptRowId !== undefined && String(attemptRowId) !== '') {
+    return `attempt-row:${String(attemptRowId)}`;
+  }
+  return `job:${String(jobId)}:attempt:${String(attempts)}`;
 }
 
 export function operationsTelemetrySnapshot(): OperationsCounters {
