@@ -2,7 +2,6 @@ import {
   acquireSchedulerLock,
   getAppSetting,
   getCountryVocabularies,
-  getDb,
   getExcludedCountries,
   getSchedulerState,
   recoverStaleJobs,
@@ -187,22 +186,6 @@ export function resolveScopePromotion(
   return null;
 }
 
-/**
- * Pure revocation set for scope-promotion markers (testable without a
- * database). Returns the dormant supported countries that lack an explicit
- * selection under the incoming scope and must therefore lose any stored
- * promotion: GLOBAL mode revokes all dormant markers, SELECTED_COUNTRIES
- * revokes every dormant country outside the new selection.
- */
-export function resolveScopePromotionRevocations(scope: {
-  scope: DiscoveryScopeMode;
-  selectedCountries: string[];
-}): string[] {
-  if (scope.scope !== 'SELECTED_COUNTRIES') return [...SUPPORTED_DORMANT_COUNTRIES];
-  const selectedScope = new Set(scope.selectedCountries.map(country => country.toLowerCase()));
-  return SUPPORTED_DORMANT_COUNTRIES.filter(country => !selectedScope.has(country.toLowerCase()));
-}
-
 export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
   const scopeValue = await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL');
   const scope: DiscoveryScopeMode = scopeValue === 'SELECTED_COUNTRIES' ? 'SELECTED_COUNTRIES' : 'GLOBAL';
@@ -218,20 +201,6 @@ export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCount
   const cleanCountries = Array.from(new Set(selectedCountries.map(country => country.trim()).filter(Boolean)));
   await setAppSetting('query_intelligence_discovery_scope', scope);
   await setAppSetting('query_intelligence_selected_countries', JSON.stringify(cleanCountries));
-  // Revoke stored promotion markers for dormant countries that lose their
-  // explicit selection. Persisted markers would otherwise keep previously
-  // promoted queries sweeping after deselection; clearing them restores the
-  // normal dormant behavior at both planning and execution authority.
-  const revocations = resolveScopePromotionRevocations({ scope, selectedCountries: cleanCountries });
-  if (revocations.length > 0) {
-    const db = await getDb();
-    await db.query(
-      `UPDATE query_library
-          SET generation_metadata = generation_metadata - 'scopePromoted' - 'promotionBasis'
-        WHERE LOWER(country) = ANY($1::text[]) AND generation_metadata ? 'scopePromoted'`,
-      [revocations.map(country => country.toLowerCase())],
-    );
-  }
   return { scope, selectedCountries: cleanCountries };
 }
 
@@ -496,7 +465,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // Every query source is revalidated immediately before scheduling. Stored
       // PROVEN/EXPERIMENTAL queries and research allocations are not grandfathered
       // across retrieval-policy upgrades.
-      const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord);
+      const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord, {
+        scopePromotionActive: scopePromotionBasis != null,
+      });
       candidateDiagnostic = { ...candidateDiagnostic, selectedQueryId: selected.queryRecord.id, authorityOutcome: queryAuthority.eligible ? 'ELIGIBLE' : 'REJECTED', authorityReasonCodes: queryAuthority.reasonCodes };
       diagnostics.candidatesSelected++;
       if (!queryAuthority.eligible) {

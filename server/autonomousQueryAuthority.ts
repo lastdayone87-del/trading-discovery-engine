@@ -27,8 +27,19 @@ const SCOPE_PROMOTED_PAIR_TEMPLATES = new Set(['COMPACT_PAIR', 'INSTRUMENT_MARKE
  * classification (no authorized anchor) would keep overriding the explicit
  * operator selection at execution time too. Standalone retrieval, stale
  * provenance, unsupported countries, and all other gates are unaffected.
+ *
+ * Promotion validity additionally depends on a live scope decision passed by
+ * the caller (see scopePromotionActive): a DIRECT_TARGET promotion authorizes
+ * the explicitly ordered one-shot work for its lifetime, while a persistent
+ * (or legacy unmarked-basis) promotion requires the country to still be
+ * selected. Deselection therefore restores dormant behavior even for already
+ * stored queries, and reselection restores sweeping without burning them.
  */
-function isScopePromotedAnchor(metadata: Record<string, any>, atoms: Array<Record<string, any>>): boolean {
+function isScopePromotedAnchor(
+  metadata: Record<string, any>,
+  atoms: Array<Record<string, any>>,
+  scopePromotionActive?: boolean,
+): boolean {
   if (metadata.scopePromoted !== true) return false;
   if (!SCOPE_PROMOTED_PAIR_TEMPLATES.has(String(metadata.queryTemplate || ''))) return false;
   const primary = atoms[0];
@@ -37,6 +48,9 @@ function isScopePromotedAnchor(metadata: Record<string, any>, atoms: Array<Recor
   if (primaryType !== 'INSTRUMENT' && primaryType !== 'METHOD') return false;
   if (primary.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
   if (!Array.isArray(atoms) || atoms.length < 2) return false;
+  if (String(metadata.promotionBasis || 'PERSISTENT_SCOPE_SELECTION') !== 'DIRECT_TARGET' && scopePromotionActive === false) {
+    return false;
+  }
   return true;
 }
 
@@ -57,7 +71,10 @@ function metadataOf(query: QueryRecord): Record<string, any> {
  * satisfy the current retrieval-shape policy at the moment it is about to spend
  * YouTube quota. This also applies to persistent-research allocations.
  */
-export function evaluateAutonomousQueryAuthority(query: QueryRecord): AutonomousQueryAuthorityDecision {
+export function evaluateAutonomousQueryAuthority(
+  query: QueryRecord,
+  options: { scopePromotionActive?: boolean } = {},
+): AutonomousQueryAuthorityDecision {
   const reasons: string[] = [];
   if (query.collection === 'REJECTED') return { eligible: false, reasonCodes: ['QUERY_ALREADY_REJECTED'] };
   if (!isRetrievalOrientedQuery(query.country, query.query)) return { eligible: false, reasonCodes: ['CURRENT_RETRIEVAL_SHAPE_FAILED'] };
@@ -71,7 +88,7 @@ export function evaluateAutonomousQueryAuthority(query: QueryRecord): Autonomous
   if (specificity.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) {
     return { eligible: false, reasonCodes: ['STALE_RETRIEVAL_POLICY_VERSION'], retrievalPolicyVersion: String(specificity.policyVersion || '') };
   }
-  if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility)) && !isScopePromotedAnchor(metadata, atoms)) {
+  if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)) {
     return { eligible: false, reasonCodes: ['PRIMARY_ATOM_NOT_AUTHORIZED_FOR_RETRIEVAL'], retrievalPolicyVersion: specificity.policyVersion };
   }
 
@@ -79,7 +96,7 @@ export function evaluateAutonomousQueryAuthority(query: QueryRecord): Autonomous
     const staleAtom = atoms.find(atom => atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION);
     if (staleAtom) return { eligible: false, reasonCodes: ['ATOM_POLICY_PROVENANCE_STALE'], retrievalPolicyVersion: specificity.policyVersion };
     const anchor = atoms[0]?.retrievalPolicy?.eligibility;
-    if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor)) && !isScopePromotedAnchor(metadata, atoms)) {
+    if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor)) && !isScopePromotedAnchor(metadata, atoms, options.scopePromotionActive)) {
       return { eligible: false, reasonCodes: ['QUERY_ANCHOR_NOT_CURRENTLY_AUTHORIZED'], retrievalPolicyVersion: specificity.policyVersion };
     }
 

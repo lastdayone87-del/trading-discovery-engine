@@ -3,7 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { planDiverseQueries } from './queryPlanner';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { resolveAutonomousCountries, resolveScopePromotion, resolveScopePromotionRevocations } from './autonomousDiscovery';
+import { resolveAutonomousCountries, resolveScopePromotion } from './autonomousDiscovery';
 import {
   INITIAL_COUNTRY_VOCABULARIES,
   SUPPORTED_DORMANT_COUNTRIES,
@@ -190,26 +190,47 @@ test('scheduler threads scope promotion through selection and generation', () =>
   assert.match(intelligence, /scopePromotionBasis: options\.scopePromotionBasis/);
   const planner = readFileSync(new URL('./queryPlanner.ts', import.meta.url), 'utf8');
   assert.match(planner, /scopePromotionBasis\?: 'PERSISTENT_SCOPE_SELECTION' \| 'DIRECT_TARGET'/);
+  const worker = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(worker, /resolveScopePromotion\(liveScope\.scope, liveScope\.selectedCountries, country\)/);
+  assert.match(worker, /evaluateAutonomousQueryAuthority\(authorityQueryRecord, \{/);
 });
 
-test('deselection revokes stored promotion markers', () => {
-  assert.deepEqual(
-    resolveScopePromotionRevocations({ scope: 'GLOBAL', selectedCountries: [] }).sort(),
-    [...SUPPORTED_DORMANT_COUNTRIES].sort(),
-    'GLOBAL revokes every dormant marker'
+test('stored promotion follows live selection at execution authority', () => {
+  const metadata = {
+    queryTemplate: 'COMPACT_PAIR',
+    scopePromoted: true,
+    promotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+    retrievalSpecificity: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY', specificity: 62, ambiguity: 48, reasonCodes: [] },
+    atoms: [
+      { term: 'OBX', type: 'INSTRUMENT', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } },
+      { term: 'Aksjehandel', type: 'METHOD', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } }
+    ]
+  };
+  const record = asQueryRecord('OBX Aksjehandel', 'Norway', metadata);
+  assert.equal(
+    evaluateAutonomousQueryAuthority(record, { scopePromotionActive: true }).eligible,
+    true,
+    'selected country keeps sweeping on stored queries'
   );
-  assert.deepEqual(
-    resolveScopePromotionRevocations({ scope: 'SELECTED_COUNTRIES', selectedCountries: ['Norway', 'Germany'] }),
-    [...SUPPORTED_DORMANT_COUNTRIES].filter(country => country !== 'Norway'),
-    'retained selections keep their markers'
+  assert.equal(
+    evaluateAutonomousQueryAuthority(record, { scopePromotionActive: false }).eligible,
+    false,
+    'deselected country stops sweeping on stored queries without burning them'
   );
-  assert.deepEqual(
-    resolveScopePromotionRevocations({ scope: 'SELECTED_COUNTRIES', selectedCountries: [...SUPPORTED_DORMANT_COUNTRIES, 'Germany'] }),
-    [],
-    'full dormant selection revokes nothing'
+  assert.equal(
+    evaluateAutonomousQueryAuthority(record).eligible,
+    true,
+    'callers without scope context keep legacy acceptance'
   );
-  const discovery = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  assert.match(discovery, /generation_metadata - 'scopePromoted' - 'promotionBasis'/);
+  // Reselection restores sweeping on the same stored rows (no regeneration,
+  // no REJECTED burn): deselect-then-reselect round-trips cleanly.
+  assert.equal(evaluateAutonomousQueryAuthority(record, { scopePromotionActive: false }).eligible, false);
+  assert.equal(evaluateAutonomousQueryAuthority(record, { scopePromotionActive: true }).eligible, true);
+  // DIRECT_TARGET markers authorize their explicitly ordered one-shot work
+  // for its lifetime so in-flight manual jobs can complete after any scope
+  // change.
+  const direct = asQueryRecord('OBX Aksjehandel', 'Norway', { ...metadata, promotionBasis: 'DIRECT_TARGET' });
+  assert.equal(evaluateAutonomousQueryAuthority(direct, { scopePromotionActive: false }).eligible, true);
 });
 
 test('promotion allowlist matches planner-emitted promoted shapes', () => {

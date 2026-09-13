@@ -59,6 +59,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
+import { getDiscoveryScope, resolveScopePromotion } from './autonomousDiscovery';
 import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
@@ -526,7 +527,19 @@ export async function processNextSearchJob(
         ? await getQueryById(queryId)
         : (await getQueriesByCountry(country)).find(q => q.query.toLowerCase() === query.toLowerCase()) || null;
       if (authorityQueryRecord) {
-        const queryAuthority = evaluateAutonomousQueryAuthority(authorityQueryRecord);
+        // Persistent-scope promotion is re-resolved live: a stored
+        // PERSISTENT_SCOPE_SELECTION marker authorizes only while the country
+        // is still selected (deselection restores dormant behavior, and
+        // reselection restores sweeping without burning stored queries).
+        // DIRECT_TARGET markers authorize their explicitly ordered one-shot
+        // work for its lifetime so in-flight manual jobs can complete.
+        const liveScope = await getDiscoveryScope().catch(() => null);
+        const queryAuthority = evaluateAutonomousQueryAuthority(authorityQueryRecord, {
+          scopePromotionActive:
+            liveScope == null
+              ? undefined
+              : resolveScopePromotion(liveScope.scope, liveScope.selectedCountries, country) != null,
+        });
         if (!queryAuthority.eligible) {
           console.log(`[Unified Query Authority] Withheld automated search job ${job.id} for "${query}" (${country}) before spending YouTube quota: ${queryAuthority.reasonCodes.join(', ')}.`);
           if (queryRunId) await failQueryRun(queryRunId, new Error(`Query authority withheld: ${queryAuthority.reasonCodes.join(', ')}`), true);
