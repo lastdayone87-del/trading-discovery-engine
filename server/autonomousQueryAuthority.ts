@@ -12,6 +12,32 @@ export interface AutonomousQueryAuthorityDecision {
 
 const EXPLICIT_STANDALONE_METHOD_CONTEXT = /\b(trading|trader|day\s*trading|swing\s*trading|forex|futures?|options?|spread\s*betting|prop\s*firm|funded\s*trader|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse\s+schweiz|futures\s*handel|trading\s*psychology)\b/iu;
 
+/** Pair templates in which a scope-promoted vocabulary anchor may lead. Bare SINGLE_ATOM surfaces are never promotable. */
+const SCOPE_PROMOTED_PAIR_TEMPLATES = new Set([
+  'COMPACT_PAIR', 'INSTRUMENT_MARKET', 'MARKET_INSTRUMENT', 'METHOD_INSTRUMENT', 'ANCHOR_LEARNED', 'ANCHOR_ORGANIC'
+]);
+
+/**
+ * Persistent-scope promotion check. A scope-promoted vocabulary INSTRUMENT or
+ * METHOD atom may anchor a paired template when it carries current policy
+ * provenance and is accompanied by at least one companion atom. This is the
+ * counterpart of the planner-side promotion: without it, the dormant
+ * classification (no authorized anchor) would keep overriding the explicit
+ * operator selection at execution time too. Standalone retrieval, stale
+ * provenance, unsupported countries, and all other gates are unaffected.
+ */
+function isScopePromotedAnchor(metadata: Record<string, any>, atoms: Array<Record<string, any>>): boolean {
+  if (metadata.scopePromoted !== true) return false;
+  if (!SCOPE_PROMOTED_PAIR_TEMPLATES.has(String(metadata.queryTemplate || ''))) return false;
+  const primary = atoms[0];
+  if (!primary) return false;
+  const primaryType = String(primary.type || '').toUpperCase();
+  if (primaryType !== 'INSTRUMENT' && primaryType !== 'METHOD') return false;
+  if (primary.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
+  if (!Array.isArray(atoms) || atoms.length < 2) return false;
+  return true;
+}
+
 function metadataOf(query: QueryRecord): Record<string, any> {
   const raw = (query as QueryRecord & { generation_metadata?: unknown }).generation_metadata;
   if (!raw) return {};
@@ -43,7 +69,7 @@ export function evaluateAutonomousQueryAuthority(query: QueryRecord): Autonomous
   if (specificity.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) {
     return { eligible: false, reasonCodes: ['STALE_RETRIEVAL_POLICY_VERSION'], retrievalPolicyVersion: String(specificity.policyVersion || '') };
   }
-  if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility))) {
+  if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(specificity.eligibility)) && !isScopePromotedAnchor(metadata, atoms)) {
     return { eligible: false, reasonCodes: ['PRIMARY_ATOM_NOT_AUTHORIZED_FOR_RETRIEVAL'], retrievalPolicyVersion: specificity.policyVersion };
   }
 
@@ -51,7 +77,7 @@ export function evaluateAutonomousQueryAuthority(query: QueryRecord): Autonomous
     const staleAtom = atoms.find(atom => atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION);
     if (staleAtom) return { eligible: false, reasonCodes: ['ATOM_POLICY_PROVENANCE_STALE'], retrievalPolicyVersion: specificity.policyVersion };
     const anchor = atoms[0]?.retrievalPolicy?.eligibility;
-    if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor))) {
+    if (!['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor)) && !isScopePromotedAnchor(metadata, atoms)) {
       return { eligible: false, reasonCodes: ['QUERY_ANCHOR_NOT_CURRENTLY_AUTHORIZED'], retrievalPolicyVersion: specificity.policyVersion };
     }
 

@@ -118,10 +118,16 @@ export async function resumeQueryIntelligence(): Promise<{ message: string; isPa
  * order: supported-registry intersection (custom/stale DB vocabularies outside
  * the registry can never be swept — their creators could not enter the
  * catalog since REJECT_UNSUPPORTED), exclusion list, explicit
- * selected-countries scope, dormant-scope preservation (dormant supported
- * countries are never swept autonomously), then an explicit single-target
- * override (manual/cross-border stays valid, including out-of-registry
- * targets when deliberately requested).
+ * selected-countries scope, dormant-scope preservation, then an explicit
+ * single-target override (manual/cross-border stays valid, including
+ * out-of-registry targets when deliberately requested).
+ *
+ * Dormant-scope preservation never overrides a direct operator selection: a
+ * dormant supported country that is explicitly present in the persistent
+ * prioritized scope is promoted into active sweeping. Removing it from the
+ * selection restores the normal dormant behavior. Dormant status therefore
+ * gates only unselected sweeping; unsupported (excluded/out-of-registry)
+ * countries can never pass in any mode.
  */
 export function resolveAutonomousCountries(
   vocabCountries: string[],
@@ -145,7 +151,9 @@ export function resolveAutonomousCountries(
     countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
   }
   const dormant = new Set(SUPPORTED_DORMANT_COUNTRIES.map(country => country.toLowerCase()));
-  countries = countries.filter(country => !dormant.has(country.toLowerCase()));
+  countries = countries.filter(
+    country => !dormant.has(country.toLowerCase()) || selectedScope.has(country.toLowerCase()),
+  );
   if (targetCountry) countries = [targetCountry];
   return countries;
 }
@@ -253,12 +261,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     const [vocabs, exclusions, scope] = await Promise.all([
       getCountryVocabularies(), getExcludedCountries(), getDiscoveryScope()
     ]);
-    const excluded = new Set(exclusions.map(item => item.country_name.toLowerCase()));
     const selectedScope = new Set(scope.selectedCountries.map(country => country.toLowerCase()));
+    const selectedCountries = [...selectedScope];
     let countries = resolveAutonomousCountries(
       vocabs.map(item => item.country),
-      [...excluded],
-      [...selectedScope],
+      exclusions.map(item => item.country_name),
+      selectedCountries,
       scope.scope,
       targetCountry,
     );
@@ -290,6 +298,15 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       attempts++;
       diagnostics.candidateAttempts++;
       candidateDiagnosticRecorded = false;
+      // Persistent-scope promotion: an explicitly selected country (persistent
+      // prioritized scope, or a direct on-demand target) is promoted into
+      // active sweeping even when it has no authorized retrieval anchor yet.
+      // Without this, the dormant classification would silently override the
+      // operator selection every cycle. Removing the selection restores
+      // dormant behavior because promotion is granted per selected country.
+      const scopePromoted =
+        (scope.scope === 'SELECTED_COUNTRIES' && selectedScope.has(legacyCountry.toLowerCase())) ||
+        (!!targetCountry && legacyCountry.toLowerCase() === targetCountry.toLowerCase());
       let candidateDiagnostic: CandidateDiagnosticState = { legacyCountry, attempt: attempts, phase8Result: 'NOT_REACHED', providerRegistryOutcome: 'NOT_REACHED', reservationOutcome: 'NOT_REACHED', schedulingOutcome: 'NOT_REACHED' };
       const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
 
@@ -351,7 +368,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         const nativeQuery = nativeAuthorization?.status === 'AUTHORIZED' ? nativeAuthorization.queryRecord : null;
         const targeted = governedConceptProposal
           ? null
-          : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
+          : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions, scopePromoted });
         if (nativeQuery) {
           selected = {
             queryRecord: nativeQuery,
@@ -389,7 +406,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             continue;
           }
           country = legacyCountry;
-          const fallbackSelection = await selectNextQueryForCountry(legacyCountry);
+          const fallbackSelection = await selectNextQueryForCountry(legacyCountry, { scopePromoted });
           if (!fallbackSelection) {
             candidateDiagnostic = {
               ...candidateDiagnostic,
@@ -405,7 +422,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY_FALLBACK', selectedQueryId: selected.queryRecord.id };
         }
       } else {
-        const legacySelection = await selectNextQueryForCountry(country);
+        const legacySelection = await selectNextQueryForCountry(country, { scopePromoted });
         if (!legacySelection) {
           candidateDiagnostic = {
             ...candidateDiagnostic,
