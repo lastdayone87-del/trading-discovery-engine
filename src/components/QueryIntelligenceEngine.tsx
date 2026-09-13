@@ -365,7 +365,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               </div>
             </div>
             <div className="rounded-lg border border-slate-600/60 bg-slate-800/40 p-2.5">
-              <div className="text-slate-300 font-bold text-xs mb-1.5" title="Fully supported: manual search and cross-border valid, never swept autonomously">
+              <div className="text-slate-300 font-bold text-xs mb-1.5" title="Fully supported: manual search and cross-border valid; swept autonomously only while explicitly selected">
                 Supported Dormant ({countryVocabularies.filter(v => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === v.country.toLowerCase())).length})
               </div>
               <div className="flex flex-wrap gap-1.5">
@@ -403,7 +403,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               </div>
               {scopeCountries.some(c => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === c.toLowerCase())) && (
                 <div className="text-amber-300/90 text-[11px] font-medium">
-                  Note: dormant selections ({scopeCountries.filter(c => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === c.toLowerCase())).join(', ')}) are saved but never swept autonomously — manual search and cross-border only.
+                  Note: dormant selections ({scopeCountries.filter(c => SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === c.toLowerCase())).join(', ')}) sweep autonomously while selected — removing them restores dormant (manual search and cross-border only) behavior.
                 </div>
               )}
 
@@ -423,7 +423,7 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                     .map(v => {
                       const dormant = SUPPORTED_DORMANT_COUNTRIES.some(d => d.toLowerCase() === v.country.toLowerCase());
                       return (
-                        <option key={v.country} value={v.country}>{v.country}{dormant ? ' (dormant — manual only)' : ''}</option>
+                        <option key={v.country} value={v.country}>{v.country}{dormant ? ' (dormant unless selected)' : ''}</option>
                       );
                     })}
                 </select>

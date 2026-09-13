@@ -152,8 +152,12 @@ export function resolveAutonomousCountries(
     countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
   }
   const dormant = new Set(SUPPORTED_DORMANT_COUNTRIES.map(country => country.toLowerCase()));
+  // The spare applies only while SELECTED_COUNTRIES carries an explicit
+  // selection: in GLOBAL mode (or with an empty selection) a retained
+  // selected_countries setting must never promote anything.
+  const selectionActive = scope === 'SELECTED_COUNTRIES' && selectedScope.size > 0;
   countries = countries.filter(
-    country => !dormant.has(country.toLowerCase()) || selectedScope.has(country.toLowerCase()),
+    country => !dormant.has(country.toLowerCase()) || (selectionActive && selectedScope.has(country.toLowerCase())),
   );
   if (targetCountry) countries = [targetCountry];
   return countries;
@@ -161,22 +165,26 @@ export function resolveAutonomousCountries(
 
 /**
  * Pure persistent-scope promotion decision (testable without a database).
- * Promotion is granted per explicitly selected country only: persistent
- * SELECTED_COUNTRIES membership, or a direct on-demand targetCountry. GLOBAL
- * sweeping without a manual target never promotes, so dormant behavior is
- * fully restored once the selection is gone.
+ * Returns the promotion basis for an explicitly selected country only:
+ * 'PERSISTENT_SCOPE_SELECTION' for persistent SELECTED_COUNTRIES membership,
+ * 'DIRECT_TARGET' for a direct on-demand targetCountry, null otherwise.
+ * GLOBAL sweeping without a manual target never promotes, so dormant behavior
+ * is fully restored once the selection is gone. The basis (not just a flag)
+ * is threaded into planning metadata so audit records distinguish the
+ * authorization source.
  */
 export function resolveScopePromotion(
   scope: DiscoveryScopeMode,
   selectedCountries: string[],
   legacyCountry: string,
   targetCountry?: string | null,
-): boolean {
+): 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' | null {
   const selectedScope = new Set(selectedCountries.map(country => country.toLowerCase()));
-  return (
-    (scope === 'SELECTED_COUNTRIES' && selectedScope.has(legacyCountry.toLowerCase())) ||
-    (!!targetCountry && legacyCountry.toLowerCase() === targetCountry.toLowerCase())
-  );
+  if (!!targetCountry && legacyCountry.toLowerCase() === targetCountry.toLowerCase()) return 'DIRECT_TARGET';
+  if (scope === 'SELECTED_COUNTRIES' && selectedScope.has(legacyCountry.toLowerCase())) {
+    return 'PERSISTENT_SCOPE_SELECTION';
+  }
+  return null;
 }
 
 /**
@@ -353,7 +361,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // Without this, the dormant classification would silently override the
       // operator selection every cycle. Removing the selection restores
       // dormant behavior because promotion is granted per selected country.
-      const scopePromoted = resolveScopePromotion(scope.scope, scope.selectedCountries, legacyCountry, targetCountry);
+      const scopePromotionBasis = resolveScopePromotion(scope.scope, scope.selectedCountries, legacyCountry, targetCountry);
       let candidateDiagnostic: CandidateDiagnosticState = { legacyCountry, attempt: attempts, phase8Result: 'NOT_REACHED', providerRegistryOutcome: 'NOT_REACHED', reservationOutcome: 'NOT_REACHED', schedulingOutcome: 'NOT_REACHED' };
       const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
 
@@ -415,7 +423,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         const nativeQuery = nativeAuthorization?.status === 'AUTHORIZED' ? nativeAuthorization.queryRecord : null;
         const targeted = governedConceptProposal
           ? null
-          : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions, scopePromoted });
+          : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions, scopePromotionBasis });
         if (nativeQuery) {
           selected = {
             queryRecord: nativeQuery,
@@ -453,7 +461,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             continue;
           }
           country = legacyCountry;
-          const fallbackSelection = await selectNextQueryForCountry(legacyCountry, { scopePromoted });
+          const fallbackSelection = await selectNextQueryForCountry(legacyCountry, { scopePromotionBasis });
           if (!fallbackSelection) {
             candidateDiagnostic = {
               ...candidateDiagnostic,
@@ -469,7 +477,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY_FALLBACK', selectedQueryId: selected.queryRecord.id };
         }
       } else {
-        const legacySelection = await selectNextQueryForCountry(country, { scopePromoted });
+        const legacySelection = await selectNextQueryForCountry(country, { scopePromotionBasis });
         if (!legacySelection) {
           candidateDiagnostic = {
             ...candidateDiagnostic,

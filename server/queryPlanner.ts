@@ -271,16 +271,19 @@ export function planDiverseQueries(args: {
   organicCandidates?: OrganicQueryCandidate[];
   mode?: QueryGenerationMode;
   /**
-   * Persistent-scope promotion. True when the country was explicitly selected
-   * by the operator (persistent prioritized scope, or a direct on-demand
-   * target). A supported country with no authorized (curated/governed) anchor
-   * otherwise plans zero candidates forever, so the dormant classification
-   * would silently override the explicit selection every scheduler cycle.
-   * When promotion applies, vocabulary INSTRUMENT atoms may anchor paired
+   * Persistent-scope promotion basis. Set when the country was explicitly
+   * selected by the operator ('PERSISTENT_SCOPE_SELECTION' for persistent
+   * prioritized scope, 'DIRECT_TARGET' for a direct on-demand target). A
+   * supported country with no authorized (curated/governed) anchor otherwise
+   * plans zero candidates forever, so the dormant classification would
+   * silently override the explicit selection every scheduler cycle. When
+   * promotion applies, vocabulary INSTRUMENT atoms may anchor paired
    * templates only. They are never authorized standalone: bare unanchored
-   * surfaces stay dormant and all retrieval-shape gates still apply.
+   * surfaces stay dormant and all retrieval-shape gates still apply. The
+   * basis is stamped into planned metadata so audit records distinguish the
+   * authorization source.
    */
-  scopePromoted?: boolean;
+  scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
 }): PlannedQuery[] {
   const count = Math.max(1, args.count);
   const mode = args.mode || (args.existingQueries.length ? 'EXPLORATION' : 'COLD_START');
@@ -302,7 +305,7 @@ export function planDiverseQueries(args: {
   // use only truly-authorized atoms, so promotion can never authorize a bare
   // unanchored surface.
   const hasAuthorizedAnchor = authorizedAnchors.length > 0;
-  const promotedAnchors = args.scopePromoted && !hasAuthorizedAnchor
+  const promotedAnchors = args.scopePromotionBasis != null && !hasAuthorizedAnchor
     ? anchors.filter(item => item.type === 'INSTRUMENT' && item.origin === 'COUNTRY_VOCABULARY' && isRetrievalOrientedQuery(args.country, item.term))
     : [];
   const pairingAnchors = hasAuthorizedAnchor ? authorizedAnchors : promotedAnchors;
@@ -426,7 +429,7 @@ export function planDiverseQueries(args: {
         retrievalOptimized: true,
         tokenCount: queryTokenCount(query),
         scriptValidated: true,
-        ...(scopePromotedAnchor ? { scopePromoted: true, promotionBasis: 'PERSISTENT_SCOPE_SELECTION' } : {}),
+        ...(scopePromotedAnchor ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis } : {}),
         retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes},
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,

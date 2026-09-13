@@ -67,7 +67,7 @@ for (const country of DORMANT_FIVE) {
       provenTerminology: [],
       organicCandidates: [],
       mode: 'COLD_START',
-      scopePromoted: true
+      scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION'
     });
     assert.ok(planned.length >= 1, `${country} must plan at least one candidate once promoted`);
     // At least one planned candidate must be sweepable end-to-end. (Some
@@ -107,7 +107,7 @@ test('anchor-less countries stay dormant without selection, sweep once promoted'
     mode: 'COLD_START' as const
   };
   assert.equal(planDiverseQueries(base).length, 0, 'anchor-less country must stay dormant without scope promotion');
-  const promoted = planDiverseQueries({ ...base, scopePromoted: true });
+  const promoted = planDiverseQueries({ ...base, scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION' });
   assert.ok(promoted.length >= 1, 'anchor-less country must plan once promoted');
   assert.ok(promoted.every(item => {
     const metadata = item.metadata as Record<string, unknown>;
@@ -124,7 +124,7 @@ test('anchor-less countries stay dormant without selection, sweep once promoted'
 test('promotion never authorizes a bare standalone vocabulary surface', () => {
   const bare = asQueryRecord('OBX', 'Norway', {
     queryTemplate: 'SINGLE_ATOM',
-    scopePromoted: true,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
     retrievalSpecificity: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY', specificity: 62, ambiguity: 48, reasonCodes: ['UNGOVERNED_ENTITY_REQUIRES_TRADING_ANCHOR'] },
     atoms: [{ term: 'OBX', type: 'INSTRUMENT', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } }]
   });
@@ -136,7 +136,7 @@ test('active countries behave identically with and without promotion (no-op)', (
     const vocab = vocabFor(country);
     const base = { country, count: 4, countryVocabulary: vocab, learnedVocabulary: [], existingQueries: [], provenTerminology: [], organicCandidates: [], mode: 'COLD_START' as const };
     const plain = planDiverseQueries(base).map(item => item.query);
-    const promoted = planDiverseQueries({ ...base, scopePromoted: true }).map(item => item.query);
+    const promoted = planDiverseQueries({ ...base, scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION' }).map(item => item.query);
     assert.deepEqual(promoted, plain, `${country} output must be unchanged by promotion`);
   }
 });
@@ -160,25 +160,36 @@ test('GLOBAL scope keeps supported/excluded distinction; dormant stays dormant',
   assert.equal(resolved.length, ALL_20.length - DORMANT_FIVE.length);
 });
 
+test('GLOBAL with a retained stale selection still sweeps no dormant country', () => {
+  // Production keeps the selected_countries setting after a mode flip to
+  // GLOBAL; the dormant spare must require an active SELECTED scope.
+  const resolved = resolveAutonomousCountries(ALL_20, [], ['Norway', 'Germany'], 'GLOBAL');
+  for (const dormant of DORMANT_FIVE) {
+    assert.ok(!resolved.includes(dormant), `${dormant} must stay dormant in GLOBAL despite a stale selection`);
+  }
+  assert.equal(resolved.length, ALL_20.length - DORMANT_FIVE.length);
+});
+
 test('scheduler threads scope promotion through selection and generation', () => {
   // The per-candidate promotion decision is covered at runtime below; the
   // scheduler loop body itself needs a database, so only the thin wiring
   // (computed flag passed into selection, selection into generation) is
   // asserted here by contract.
-  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Norway', 'Germany'], 'Norway'), true);
-  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Germany'], 'Norway'), false);
-  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway'), false);
-  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway', 'Norway'), true, 'direct on-demand target promotes');
-  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['norway'], 'NORWAY'), true, 'matching is case-insensitive');
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Norway', 'Germany'], 'Norway'), 'PERSISTENT_SCOPE_SELECTION');
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Germany'], 'Norway'), null);
+  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway'), null);
+  assert.equal(resolveScopePromotion('GLOBAL', ['Norway'], 'Norway'), null, 'GLOBAL with a stale selection must never promote');
+  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway', 'Norway'), 'DIRECT_TARGET', 'direct on-demand target promotes');
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['norway'], 'NORWAY'), 'PERSISTENT_SCOPE_SELECTION', 'matching is case-insensitive');
   const scheduler = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  assert.match(scheduler, /const scopePromoted = resolveScopePromotion\(scope\.scope, scope\.selectedCountries, legacyCountry, targetCountry\);/);
-  assert.match(scheduler, /selectNextQueryForCountry\(country, \{[^}]*scopePromoted[^}]*\}\)/);
-  assert.match(scheduler, /selectNextQueryForCountry\(legacyCountry, \{ scopePromoted \}\)/);
+  assert.match(scheduler, /const scopePromotionBasis = resolveScopePromotion\(scope\.scope, scope\.selectedCountries, legacyCountry, targetCountry\);/);
+  assert.match(scheduler, /selectNextQueryForCountry\(country, \{[^}]*scopePromotionBasis[^}]*\}\)/);
+  assert.match(scheduler, /selectNextQueryForCountry\(legacyCountry, \{ scopePromotionBasis \}\)/);
   const intelligence = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
-  assert.match(intelligence, /generateCandidateQueriesForCountry\(country, 4, 'COLD_START', \{ scopePromoted: options\.scopePromoted \}\)/);
-  assert.match(intelligence, /scopePromoted: options\.scopePromoted/);
+  assert.match(intelligence, /generateCandidateQueriesForCountry\(country, 4, 'COLD_START', \{ scopePromotionBasis: options\.scopePromotionBasis \}\)/);
+  assert.match(intelligence, /scopePromotionBasis: options\.scopePromotionBasis/);
   const planner = readFileSync(new URL('./queryPlanner.ts', import.meta.url), 'utf8');
-  assert.match(planner, /scopePromoted\?: boolean/);
+  assert.match(planner, /scopePromotionBasis\?: 'PERSISTENT_SCOPE_SELECTION' \| 'DIRECT_TARGET'/);
 });
 
 test('deselection revokes stored promotion markers', () => {
@@ -218,7 +229,7 @@ test('promotion allowlist matches planner-emitted promoted shapes', () => {
 test('existing country safety and rejection logic remain intact', () => {
   const staleProvenance = asQueryRecord('OBX Aksjehandel', 'Norway', {
     queryTemplate: 'COMPACT_PAIR',
-    scopePromoted: true,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
     retrievalSpecificity: { policyVersion: 'retrieval-specificity-v1', eligibility: 'MODIFIER_ONLY', specificity: 62, ambiguity: 48, reasonCodes: [] },
     atoms: [
       { term: 'OBX', type: 'INSTRUMENT', retrievalPolicy: { policyVersion: 'retrieval-specificity-v1', eligibility: 'MODIFIER_ONLY' } },
@@ -228,7 +239,7 @@ test('existing country safety and rejection logic remain intact', () => {
   assert.equal(evaluateAutonomousQueryAuthority(staleProvenance).eligible, false, 'stale provenance must still reject even when promoted');
   const rejected = asQueryRecord('OBX Aksjehandel', 'Norway', {
     queryTemplate: 'COMPACT_PAIR',
-    scopePromoted: true,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
     retrievalSpecificity: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY', specificity: 62, ambiguity: 48, reasonCodes: [] },
     atoms: [
       { term: 'OBX', type: 'INSTRUMENT', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } },

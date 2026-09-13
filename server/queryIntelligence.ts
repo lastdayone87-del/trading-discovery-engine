@@ -306,11 +306,11 @@ export async function selectNextQueryForCountry(
   options: {
     targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
     /**
-     * Persistent-scope promotion (see planDiverseQueries). True when the
+     * Persistent-scope promotion basis (see planDiverseQueries). Set when the
      * country was explicitly selected by the operator, so an anchor-less
      * supported country can bootstrap instead of staying dormant forever.
      */
-    scopePromoted?: boolean;
+    scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
   } = {}
 ): Promise<{
   queryRecord: QueryRecord;
@@ -331,7 +331,7 @@ export async function selectNextQueryForCountry(
 
   // If no queries exist for country, generate cold-start initial queries
   if (queries.length === 0) {
-    const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START', { scopePromoted: options.scopePromoted });
+    const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START', { scopePromotionBasis: options.scopePromotionBasis });
     const selected = generated[0];
     if (!selected) return null;
     return {
@@ -346,7 +346,7 @@ export async function selectNextQueryForCountry(
   let eligible = limitRepeatedPrimaryTerms(outsideCooldown, queries, now, cooldownMinutes, maxPrimaryUses);
   eligible = rotateAwayFromMostRecentIntent(eligible, queries);
   if (eligible.length === 0) {
-    const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION', { scopePromoted: options.scopePromoted });
+    const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
     const selected = generated[0];
     if (!selected) return null;
     return {
@@ -407,7 +407,7 @@ export async function selectNextQueryForCountry(
       strategy = 'NEIGHBORHOOD_TARGETED';
       reason = `Frontier neighborhood canonical selection for target key "${targetKey}": ${selected.query} (UCB ${selected.ucb_score}).`;
     } else {
-      const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION', { scopePromoted: options.scopePromoted });
+      const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
       const matchingGenerated = generated.find(gen => {
         const genDims: DiscoveryNeighborhoodDimensions = {
           country: target.country || country,
@@ -483,7 +483,7 @@ export async function generateCandidateQueriesForCountry(
   country: string,
   count = 3,
   mode: 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START' = 'EXPLORATION',
-  options: { scopePromoted?: boolean } = {}
+  options: { scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' } = {}
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
   const [vocabs, extractedTerms, existingQueries, provenTerminology, organicCandidates] = await Promise.all([
@@ -503,7 +503,7 @@ export async function generateCandidateQueriesForCountry(
     provenTerminology,
     organicCandidates,
     mode,
-    scopePromoted: options.scopePromoted
+    scopePromotionBasis: options.scopePromotionBasis
   });
   const newQueries: QueryRecord[] = [];
   for (const candidate of planned) {
