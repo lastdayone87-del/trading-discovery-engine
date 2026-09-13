@@ -3,7 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { planDiverseQueries } from './queryPlanner';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { resolveAutonomousCountries } from './autonomousDiscovery';
+import { resolveAutonomousCountries, resolveScopePromotion, resolveScopePromotionRevocations } from './autonomousDiscovery';
 import {
   INITIAL_COUNTRY_VOCABULARIES,
   SUPPORTED_DORMANT_COUNTRIES,
@@ -161,8 +161,17 @@ test('GLOBAL scope keeps supported/excluded distinction; dormant stays dormant',
 });
 
 test('scheduler threads scope promotion through selection and generation', () => {
+  // The per-candidate promotion decision is covered at runtime below; the
+  // scheduler loop body itself needs a database, so only the thin wiring
+  // (computed flag passed into selection, selection into generation) is
+  // asserted here by contract.
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Norway', 'Germany'], 'Norway'), true);
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Germany'], 'Norway'), false);
+  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway'), false);
+  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway', 'Norway'), true, 'direct on-demand target promotes');
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['norway'], 'NORWAY'), true, 'matching is case-insensitive');
   const scheduler = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  assert.match(scheduler, /resolveAutonomousCountries\(/);
+  assert.match(scheduler, /const scopePromoted = resolveScopePromotion\(scope\.scope, scope\.selectedCountries, legacyCountry, targetCountry\);/);
   assert.match(scheduler, /selectNextQueryForCountry\(country, \{[^}]*scopePromoted[^}]*\}\)/);
   assert.match(scheduler, /selectNextQueryForCountry\(legacyCountry, \{ scopePromoted \}\)/);
   const intelligence = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
@@ -170,6 +179,40 @@ test('scheduler threads scope promotion through selection and generation', () =>
   assert.match(intelligence, /scopePromoted: options\.scopePromoted/);
   const planner = readFileSync(new URL('./queryPlanner.ts', import.meta.url), 'utf8');
   assert.match(planner, /scopePromoted\?: boolean/);
+});
+
+test('deselection revokes stored promotion markers', () => {
+  assert.deepEqual(
+    resolveScopePromotionRevocations({ scope: 'GLOBAL', selectedCountries: [] }).sort(),
+    [...SUPPORTED_DORMANT_COUNTRIES].sort(),
+    'GLOBAL revokes every dormant marker'
+  );
+  assert.deepEqual(
+    resolveScopePromotionRevocations({ scope: 'SELECTED_COUNTRIES', selectedCountries: ['Norway', 'Germany'] }),
+    [...SUPPORTED_DORMANT_COUNTRIES].filter(country => country !== 'Norway'),
+    'retained selections keep their markers'
+  );
+  assert.deepEqual(
+    resolveScopePromotionRevocations({ scope: 'SELECTED_COUNTRIES', selectedCountries: [...SUPPORTED_DORMANT_COUNTRIES, 'Germany'] }),
+    [],
+    'full dormant selection revokes nothing'
+  );
+  const discovery = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  assert.match(discovery, /generation_metadata - 'scopePromoted' - 'promotionBasis'/);
+});
+
+test('promotion allowlist matches planner-emitted promoted shapes', () => {
+  const authority = readFileSync(new URL('./autonomousQueryAuthority.ts', import.meta.url), 'utf8');
+  const setLiteral = authority.slice(
+    authority.indexOf('SCOPE_PROMOTED_PAIR_TEMPLATES = new Set('),
+    authority.indexOf(']);', authority.indexOf('SCOPE_PROMOTED_PAIR_TEMPLATES = new Set(')) + 3
+  );
+  const listed = [...setLiteral.matchAll(/'([A-Z_]+)'/g)].map(match => match[1]);
+  assert.deepEqual(
+    [...new Set(listed)].sort(),
+    ['COMPACT_PAIR', 'INSTRUMENT_MARKET'],
+    'authority must accept exactly the pair shapes the planner can emit for promoted anchors'
+  );
 });
 
 test('existing country safety and rejection logic remain intact', () => {

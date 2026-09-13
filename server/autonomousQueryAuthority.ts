@@ -12,10 +12,12 @@ export interface AutonomousQueryAuthorityDecision {
 
 const EXPLICIT_STANDALONE_METHOD_CONTEXT = /\b(trading|trader|day\s*trading|swing\s*trading|forex|futures?|options?|spread\s*betting|prop\s*firm|funded\s*trader|analyse\s*technique|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|technische\s*analyse|teknisk\s*analys|teknisk\s*analyse|b[oö]rsen?analyse\s+schweiz|futures\s*handel|trading\s*psychology)\b/iu;
 
-/** Pair templates in which a scope-promoted vocabulary anchor may lead. Bare SINGLE_ATOM surfaces are never promotable. */
-const SCOPE_PROMOTED_PAIR_TEMPLATES = new Set([
-  'COMPACT_PAIR', 'INSTRUMENT_MARKET', 'MARKET_INSTRUMENT', 'METHOD_INSTRUMENT', 'ANCHOR_LEARNED', 'ANCHOR_ORGANIC'
-]);
+/** Pair templates in which a scope-promoted vocabulary anchor may lead.
+ * This is exactly the set the planner can emit for anchor-less promoted
+ * countries (COMPACT_PAIR plus INSTRUMENT_MARKET; MARKET-led and
+ * learned/organic shapes structurally require an authorized anchor, and bare
+ * SINGLE_ATOM surfaces are never promotable). Keep the two in sync. */
+const SCOPE_PROMOTED_PAIR_TEMPLATES = new Set(['COMPACT_PAIR', 'INSTRUMENT_MARKET']);
 
 /**
  * Persistent-scope promotion check. A scope-promoted vocabulary INSTRUMENT or
