@@ -193,6 +193,17 @@ test('scheduler threads scope promotion through selection and generation', () =>
   const worker = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(worker, /resolveScopePromotion\(liveScope\.scope, liveScope\.selectedCountries, country\)/);
   assert.match(worker, /evaluateAutonomousQueryAuthority\(authorityQueryRecord, \{/);
+  assert.ok(!worker.includes('getDiscoveryScope().catch'), 'a scope-read failure must error the attempt, never silently preserve promotion');
+});
+
+test('scope saves commit atomically so readers never tear mode and countries', () => {
+  const discovery = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  const saver = discovery.slice(discovery.indexOf('export async function setDiscoveryScope'));
+  assert.match(saver, /BEGIN/);
+  assert.match(saver, /COMMIT/);
+  assert.match(saver, /ROLLBACK/);
+  assert.match(saver, /query_intelligence_discovery_scope/);
+  assert.match(saver, /query_intelligence_selected_countries/);
 });
 
 test('stored promotion follows live selection at execution authority', () => {

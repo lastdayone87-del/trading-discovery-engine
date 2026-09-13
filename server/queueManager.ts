@@ -532,13 +532,13 @@ export async function processNextSearchJob(
         // is still selected (deselection restores dormant behavior, and
         // reselection restores sweeping without burning stored queries).
         // DIRECT_TARGET markers authorize their explicitly ordered one-shot
-        // work for its lifetime so in-flight manual jobs can complete.
-        const liveScope = await getDiscoveryScope().catch(() => null);
+        // work for its lifetime so in-flight manual jobs can complete. A
+        // scope-read failure errors the attempt (fail closed, retryable)
+        // rather than spending quota on a stale assumption.
+        const liveScope = await getDiscoveryScope();
         const queryAuthority = evaluateAutonomousQueryAuthority(authorityQueryRecord, {
           scopePromotionActive:
-            liveScope == null
-              ? undefined
-              : resolveScopePromotion(liveScope.scope, liveScope.selectedCountries, country) != null,
+            resolveScopePromotion(liveScope.scope, liveScope.selectedCountries, country) != null,
         });
         if (!queryAuthority.eligible) {
           console.log(`[Unified Query Authority] Withheld automated search job ${job.id} for "${query}" (${country}) before spending YouTube quota: ${queryAuthority.reasonCodes.join(', ')}.`);

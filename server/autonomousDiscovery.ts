@@ -2,6 +2,7 @@ import {
   acquireSchedulerLock,
   getAppSetting,
   getCountryVocabularies,
+  getDb,
   getExcludedCountries,
   getSchedulerState,
   recoverStaleJobs,
@@ -199,8 +200,28 @@ export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; 
 
 export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCountries: string[]): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
   const cleanCountries = Array.from(new Set(selectedCountries.map(country => country.trim()).filter(Boolean)));
-  await setAppSetting('query_intelligence_discovery_scope', scope);
-  await setAppSetting('query_intelligence_selected_countries', JSON.stringify(cleanCountries));
+  // Both settings commit atomically: a worker reading mid-save must never
+  // observe the new mode with the previous country list (or vice versa),
+  // which would tear the live scope decision at execution authority.
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      'INSERT INTO app_settings(setting_key,setting_value) VALUES($1,$2) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value',
+      ['query_intelligence_discovery_scope', scope],
+    );
+    await client.query(
+      'INSERT INTO app_settings(setting_key,setting_value) VALUES($1,$2) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value',
+      ['query_intelligence_selected_countries', JSON.stringify(cleanCountries)],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
   return { scope, selectedCountries: cleanCountries };
 }
 
