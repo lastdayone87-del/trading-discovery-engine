@@ -3,7 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { planDiverseQueries } from './queryPlanner';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { resolveAutonomousCountries, resolveScopePromotion } from './autonomousDiscovery';
+import { resolveAutonomousCountries, resolveScopePromotion, parseDiscoveryScopeSelection } from './autonomousDiscovery';
 import {
   INITIAL_COUNTRY_VOCABULARIES,
   SUPPORTED_DORMANT_COUNTRIES,
@@ -242,6 +242,63 @@ test('stored promotion follows live selection at execution authority', () => {
   // change.
   const direct = asQueryRecord('OBX Aksjehandel', 'Norway', { ...metadata, promotionBasis: 'DIRECT_TARGET' });
   assert.equal(evaluateAutonomousQueryAuthority(direct, { scopePromotionActive: false }).eligible, true);
+});
+
+test('malformed scope selection fails closed instead of collapsing to an empty selection', () => {
+  // Valid states parse normally: genuine intentional deselection ('[]') stays
+  // a valid empty selection, and a real selection round-trips.
+  assert.deepEqual(parseDiscoveryScopeSelection('[]'), []);
+  assert.deepEqual(parseDiscoveryScopeSelection('["Norway", "Germany"]'), ['Norway', 'Germany']);
+  // Malformed / invalid persisted values must throw (fail closed, retryable)
+  // rather than silently becoming [] (which would read as "not authorized"
+  // and let the worker completeJob a promoted job).
+  for (const malformed of ['not-json', '{bad', '', '   ', '"Norway"', '123', 'null', '{"a":1}', '[123]', '[null]', '[["Norway"]]', '["Norway", 123]']) {
+    assert.throws(() => parseDiscoveryScopeSelection(malformed), /DISCOVERY_SCOPE_SELECTION_MALFORMED/, `must fail closed: ${malformed}`);
+  }
+  // Genuine deselection still behaves normally: a valid empty selection means
+  // "not authorized" for persistent promotions (withhold path), not an error.
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', parseDiscoveryScopeSelection('[]'), 'Norway'), null);
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', parseDiscoveryScopeSelection('["Norway"]'), 'Norway'), 'PERSISTENT_SCOPE_SELECTION');
+});
+
+test('scope-read failure cannot complete a promoted job (fail closed, retryable)', () => {
+  // Unit behavior above proves malformed reads throw. This contract proves the
+  // worker cannot turn that throw into a silent completeJob:
+  // - getDiscoveryScope has no broad catch falling back to `selectedCountries: []`;
+  // - the second settings read is awaited outside any try so DB failures propagate;
+  // - the worker awaits getDiscoveryScope directly (no .catch fallback) before
+  //   authority, so any throw reaches the outer catch -> failJob (retryable),
+  //   never the withhold-path completeJob.
+  const discovery = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  const getter = discovery.slice(discovery.indexOf('export async function getDiscoveryScope'));
+  const parser = discovery.slice(
+    discovery.indexOf('export function parseDiscoveryScopeSelection'),
+    discovery.indexOf('export async function getDiscoveryScope'),
+  );
+  assert.match(parser, /DISCOVERY_SCOPE_SELECTION_MALFORMED/);
+  assert.match(getter, /parseDiscoveryScopeSelection/);
+  assert.ok(!getter.includes('selectedCountries: []'), 'malformed scope must throw, never silently return an empty selection');
+  const worker = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(worker, /const liveScope = await getDiscoveryScope\(\);/);
+  assert.ok(!worker.includes('getDiscoveryScope().catch'), 'a scope-read failure must error the attempt, never silently preserve promotion');
+  assert.match(worker, /await failJob\(job\.id, err\)/, 'scope-read failures must take the retryable failJob path via the outer catch');
+  // Both promotion bases are safe: a persistent promotion withholds only on a
+  // successful read showing deselection, while a DIRECT_TARGET one-shot stays
+  // eligible on success — but neither may be consumed when the read itself fails,
+  // because the throw happens before authority is even evaluated.
+  const persistentMetadata = {
+    queryTemplate: 'COMPACT_PAIR',
+    scopePromoted: true,
+    promotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+    retrievalSpecificity: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY', specificity: 62, ambiguity: 48, reasonCodes: [] },
+    atoms: [
+      { term: 'OBX', type: 'INSTRUMENT', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } },
+      { term: 'Aksjehandel', type: 'METHOD', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } }
+    ]
+  };
+  assert.equal(evaluateAutonomousQueryAuthority(asQueryRecord('OBX Aksjehandel', 'Norway', persistentMetadata), { scopePromotionActive: false }).eligible, false);
+  const directMetadata = { ...persistentMetadata, promotionBasis: 'DIRECT_TARGET' };
+  assert.equal(evaluateAutonomousQueryAuthority(asQueryRecord('OBX Aksjehandel', 'Norway', directMetadata), { scopePromotionActive: false }).eligible, true);
 });
 
 test('promotion allowlist matches planner-emitted promoted shapes', () => {

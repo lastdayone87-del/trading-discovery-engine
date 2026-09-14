@@ -187,15 +187,33 @@ export function resolveScopePromotion(
   return null;
 }
 
+export function parseDiscoveryScopeSelection(raw: string): string[] {
+  // Fail closed: a malformed/invalid persisted selection must never silently
+  // become an empty valid selection. An empty array is the only valid empty
+  // state (genuine intentional deselection) and parses cleanly below.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  }
+  if (!Array.isArray(parsed)) throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  for (const entry of parsed) {
+    if (typeof entry !== 'string') throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  }
+  return parsed as string[];
+}
+
 export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
   const scopeValue = await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL');
   const scope: DiscoveryScopeMode = scopeValue === 'SELECTED_COUNTRIES' ? 'SELECTED_COUNTRIES' : 'GLOBAL';
-  try {
-    const selectedCountries = JSON.parse(await getAppSetting('query_intelligence_selected_countries', '[]'));
-    return { scope, selectedCountries: Array.isArray(selectedCountries) ? selectedCountries : [] };
-  } catch {
-    return { scope, selectedCountries: [] };
-  }
+  // Fail closed and retryable: the settings read itself must propagate (so
+  // the worker hits failJob/retry), and malformed/invalid stored values throw
+  // via parseDiscoveryScopeSelection instead of collapsing to []. Either
+  // failure therefore errors the attempt before any completeJob decision, for
+  // both PERSISTENT_SCOPE_SELECTION and DIRECT_TARGET paths.
+  const raw = await getAppSetting('query_intelligence_selected_countries', '[]');
+  return { scope, selectedCountries: parseDiscoveryScopeSelection(raw) };
 }
 
 export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCountries: string[]): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
