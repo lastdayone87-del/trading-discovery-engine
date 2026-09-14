@@ -2,6 +2,7 @@ import {
   acquireSchedulerLock,
   getAppSetting,
   getCountryVocabularies,
+  getDb,
   getExcludedCountries,
   getSchedulerState,
   recoverStaleJobs,
@@ -118,10 +119,16 @@ export async function resumeQueryIntelligence(): Promise<{ message: string; isPa
  * order: supported-registry intersection (custom/stale DB vocabularies outside
  * the registry can never be swept — their creators could not enter the
  * catalog since REJECT_UNSUPPORTED), exclusion list, explicit
- * selected-countries scope, dormant-scope preservation (dormant supported
- * countries are never swept autonomously), then an explicit single-target
- * override (manual/cross-border stays valid, including out-of-registry
- * targets when deliberately requested).
+ * selected-countries scope, dormant-scope preservation, then an explicit
+ * single-target override (manual/cross-border stays valid, including
+ * out-of-registry targets when deliberately requested).
+ *
+ * Dormant-scope preservation never overrides a direct operator selection: a
+ * dormant supported country that is explicitly present in the persistent
+ * prioritized scope is promoted into active sweeping. Removing it from the
+ * selection restores the normal dormant behavior. Dormant status therefore
+ * gates only unselected sweeping; unsupported (excluded/out-of-registry)
+ * countries can never pass in any mode.
  */
 export function resolveAutonomousCountries(
   vocabCountries: string[],
@@ -145,26 +152,94 @@ export function resolveAutonomousCountries(
     countries = countries.filter(country => selectedScope.has(country.toLowerCase()));
   }
   const dormant = new Set(SUPPORTED_DORMANT_COUNTRIES.map(country => country.toLowerCase()));
-  countries = countries.filter(country => !dormant.has(country.toLowerCase()));
+  // The spare applies only while SELECTED_COUNTRIES carries an explicit
+  // selection: in GLOBAL mode (or with an empty selection) a retained
+  // selected_countries setting must never promote anything.
+  const selectionActive = scope === 'SELECTED_COUNTRIES' && selectedScope.size > 0;
+  countries = countries.filter(
+    country => !dormant.has(country.toLowerCase()) || (selectionActive && selectedScope.has(country.toLowerCase())),
+  );
   if (targetCountry) countries = [targetCountry];
   return countries;
+}
+
+/**
+ * Pure persistent-scope promotion decision (testable without a database).
+ * Returns the promotion basis for an explicitly selected country only:
+ * 'PERSISTENT_SCOPE_SELECTION' for persistent SELECTED_COUNTRIES membership,
+ * 'DIRECT_TARGET' for a direct on-demand targetCountry, null otherwise.
+ * GLOBAL sweeping without a manual target never promotes, so dormant behavior
+ * is fully restored once the selection is gone. The basis (not just a flag)
+ * is threaded into planning metadata so audit records distinguish the
+ * authorization source.
+ */
+export function resolveScopePromotion(
+  scope: DiscoveryScopeMode,
+  selectedCountries: string[],
+  legacyCountry: string,
+  targetCountry?: string | null,
+): 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' | null {
+  const selectedScope = new Set(selectedCountries.map(country => country.toLowerCase()));
+  if (!!targetCountry && legacyCountry.toLowerCase() === targetCountry.toLowerCase()) return 'DIRECT_TARGET';
+  if (scope === 'SELECTED_COUNTRIES' && selectedScope.has(legacyCountry.toLowerCase())) {
+    return 'PERSISTENT_SCOPE_SELECTION';
+  }
+  return null;
+}
+
+export function parseDiscoveryScopeSelection(raw: string): string[] {
+  // Fail closed: a malformed/invalid persisted selection must never silently
+  // become an empty valid selection. An empty array is the only valid empty
+  // state (genuine intentional deselection) and parses cleanly below.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  }
+  if (!Array.isArray(parsed)) throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  for (const entry of parsed) {
+    if (typeof entry !== 'string') throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  }
+  return parsed as string[];
 }
 
 export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
   const scopeValue = await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL');
   const scope: DiscoveryScopeMode = scopeValue === 'SELECTED_COUNTRIES' ? 'SELECTED_COUNTRIES' : 'GLOBAL';
-  try {
-    const selectedCountries = JSON.parse(await getAppSetting('query_intelligence_selected_countries', '[]'));
-    return { scope, selectedCountries: Array.isArray(selectedCountries) ? selectedCountries : [] };
-  } catch {
-    return { scope, selectedCountries: [] };
-  }
+  // Fail closed and retryable: the settings read itself must propagate (so
+  // the worker hits failJob/retry), and malformed/invalid stored values throw
+  // via parseDiscoveryScopeSelection instead of collapsing to []. Either
+  // failure therefore errors the attempt before any completeJob decision, for
+  // both PERSISTENT_SCOPE_SELECTION and DIRECT_TARGET paths.
+  const raw = await getAppSetting('query_intelligence_selected_countries', '[]');
+  return { scope, selectedCountries: parseDiscoveryScopeSelection(raw) };
 }
 
 export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCountries: string[]): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
   const cleanCountries = Array.from(new Set(selectedCountries.map(country => country.trim()).filter(Boolean)));
-  await setAppSetting('query_intelligence_discovery_scope', scope);
-  await setAppSetting('query_intelligence_selected_countries', JSON.stringify(cleanCountries));
+  // Both settings commit atomically: a worker reading mid-save must never
+  // observe the new mode with the previous country list (or vice versa),
+  // which would tear the live scope decision at execution authority.
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      'INSERT INTO app_settings(setting_key,setting_value) VALUES($1,$2) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value',
+      ['query_intelligence_discovery_scope', scope],
+    );
+    await client.query(
+      'INSERT INTO app_settings(setting_key,setting_value) VALUES($1,$2) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value',
+      ['query_intelligence_selected_countries', JSON.stringify(cleanCountries)],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
   return { scope, selectedCountries: cleanCountries };
 }
 
@@ -253,12 +328,10 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     const [vocabs, exclusions, scope] = await Promise.all([
       getCountryVocabularies(), getExcludedCountries(), getDiscoveryScope()
     ]);
-    const excluded = new Set(exclusions.map(item => item.country_name.toLowerCase()));
-    const selectedScope = new Set(scope.selectedCountries.map(country => country.toLowerCase()));
     let countries = resolveAutonomousCountries(
       vocabs.map(item => item.country),
-      [...excluded],
-      [...selectedScope],
+      exclusions.map(item => item.country_name),
+      scope.selectedCountries,
       scope.scope,
       targetCountry,
     );
@@ -290,6 +363,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       attempts++;
       diagnostics.candidateAttempts++;
       candidateDiagnosticRecorded = false;
+      // Persistent-scope promotion: an explicitly selected country (persistent
+      // prioritized scope, or a direct on-demand target) is promoted into
+      // active sweeping even when it has no authorized retrieval anchor yet.
+      // Without this, the dormant classification would silently override the
+      // operator selection every cycle. Removing the selection restores
+      // dormant behavior because promotion is granted per selected country.
+      const scopePromotionBasis = resolveScopePromotion(scope.scope, scope.selectedCountries, legacyCountry, targetCountry);
       let candidateDiagnostic: CandidateDiagnosticState = { legacyCountry, attempt: attempts, phase8Result: 'NOT_REACHED', providerRegistryOutcome: 'NOT_REACHED', reservationOutcome: 'NOT_REACHED', schedulingOutcome: 'NOT_REACHED' };
       const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
 
@@ -351,7 +431,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         const nativeQuery = nativeAuthorization?.status === 'AUTHORIZED' ? nativeAuthorization.queryRecord : null;
         const targeted = governedConceptProposal
           ? null
-          : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions });
+          : await selectNextQueryForCountry(country, { targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions, scopePromotionBasis });
         if (nativeQuery) {
           selected = {
             queryRecord: nativeQuery,
@@ -389,7 +469,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             continue;
           }
           country = legacyCountry;
-          const fallbackSelection = await selectNextQueryForCountry(legacyCountry);
+          const fallbackSelection = await selectNextQueryForCountry(legacyCountry, { scopePromotionBasis });
           if (!fallbackSelection) {
             candidateDiagnostic = {
               ...candidateDiagnostic,
@@ -405,7 +485,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY_FALLBACK', selectedQueryId: selected.queryRecord.id };
         }
       } else {
-        const legacySelection = await selectNextQueryForCountry(country);
+        const legacySelection = await selectNextQueryForCountry(country, { scopePromotionBasis });
         if (!legacySelection) {
           candidateDiagnostic = {
             ...candidateDiagnostic,
@@ -424,7 +504,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // Every query source is revalidated immediately before scheduling. Stored
       // PROVEN/EXPERIMENTAL queries and research allocations are not grandfathered
       // across retrieval-policy upgrades.
-      const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord);
+      const queryAuthority = evaluateAutonomousQueryAuthority(selected.queryRecord, {
+        scopePromotionActive: scopePromotionBasis != null,
+      });
       candidateDiagnostic = { ...candidateDiagnostic, selectedQueryId: selected.queryRecord.id, authorityOutcome: queryAuthority.eligible ? 'ELIGIBLE' : 'REJECTED', authorityReasonCodes: queryAuthority.reasonCodes };
       diagnostics.candidatesSelected++;
       if (!queryAuthority.eligible) {
