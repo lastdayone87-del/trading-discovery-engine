@@ -16,7 +16,10 @@ const EXPLICIT_STANDALONE_METHOD_CONTEXT = /\b(trading|trader|day\s*trading|swin
  * This is exactly the set the planner can emit for anchor-less promoted
  * countries (COMPACT_PAIR plus INSTRUMENT_MARKET; MARKET-led and
  * learned/organic shapes structurally require an authorized anchor, and bare
- * SINGLE_ATOM surfaces are never promotable). Keep the two in sync. */
+ * SINGLE_ATOM surfaces are never promotable). Keep the two in sync: the
+ * planner stamps promotion only on COMPACT_PAIR [INSTRUMENT, METHOD] and
+ * INSTRUMENT_MARKET [INSTRUMENT, MARKET] pairs led by a COUNTRY_VOCABULARY
+ * instrument, and the gate below enforces that exact shape. */
 const SCOPE_PROMOTED_PAIR_TEMPLATES = new Set(['COMPACT_PAIR', 'INSTRUMENT_MARKET']);
 
 /**
@@ -41,13 +44,22 @@ function isScopePromotedAnchor(
   scopePromotionActive?: boolean,
 ): boolean {
   if (metadata.scopePromoted !== true) return false;
-  if (!SCOPE_PROMOTED_PAIR_TEMPLATES.has(String(metadata.queryTemplate || ''))) return false;
-  const primary = atoms[0];
-  if (!primary) return false;
-  const primaryType = String(primary.type || '').toUpperCase();
-  if (primaryType !== 'INSTRUMENT' && primaryType !== 'METHOD') return false;
-  if (primary.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
+  const template = String(metadata.queryTemplate || '');
+  if (!SCOPE_PROMOTED_PAIR_TEMPLATES.has(template)) return false;
   if (!Array.isArray(atoms) || atoms.length < 2) return false;
+  // Exact promoted pair shape (mirrors the planner, the sole promotion
+  // writer): a COUNTRY_VOCABULARY INSTRUMENT primary followed by a METHOD
+  // companion for COMPACT_PAIR or a MARKET companion for INSTRUMENT_MARKET.
+  // A marker on any other shape is malformed and must never spend quota.
+  const primary = atoms[0];
+  const companion = atoms[1];
+  if (!primary || !companion) return false;
+  if (String(primary.type || '').toUpperCase() !== 'INSTRUMENT') return false;
+  if (String(primary.origin || '') !== 'COUNTRY_VOCABULARY') return false;
+  const companionType = String(companion.type || '').toUpperCase();
+  if (template === 'COMPACT_PAIR' && companionType !== 'METHOD') return false;
+  if (template === 'INSTRUMENT_MARKET' && companionType !== 'MARKET') return false;
+  if (primary.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION) return false;
   if (String(metadata.promotionBasis || 'PERSISTENT_SCOPE_SELECTION') !== 'DIRECT_TARGET' && scopePromotionActive === false) {
     return false;
   }

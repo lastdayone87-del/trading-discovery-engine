@@ -121,6 +121,108 @@ test('anchor-less countries stay dormant without selection, sweep once promoted'
   }
 });
 
+test('ticker-only anchor-less countries sweep once promoted (pairable short tickers)', () => {
+  // Regression: the promoted-anchor filter tested the bare ticker alone and
+  // rejected it, so a country whose only vocabulary instrument is a short
+  // ticker planned nothing even when selected. Tickers stay pairable (as in
+  // countryAtoms); the assembled pair still passes the retrieval-shape gate.
+  const vocab: CountryVocabulary = {
+    country: 'Tickland',
+    languages: ['Tickish'],
+    native_trading_terminology: ['tickhandel', 'tickanalyse'],
+    popular_instruments: ['TCK'],
+    local_market_phrases: [],
+    common_content_format_names: []
+  };
+  const base = {
+    country: 'Tickland',
+    count: 4,
+    countryVocabulary: vocab,
+    learnedVocabulary: [],
+    existingQueries: [],
+    provenTerminology: [],
+    organicCandidates: [],
+    mode: 'COLD_START' as const
+  };
+  assert.equal(planDiverseQueries(base).length, 0, 'ticker-only country must stay dormant without scope promotion');
+  const promoted = planDiverseQueries({ ...base, scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION' });
+  assert.ok(promoted.length >= 1, 'ticker-only country must plan once promoted');
+  assert.ok(promoted.every(item => {
+    const metadata = item.metadata as Record<string, unknown>;
+    return metadata.scopePromoted === true && metadata.queryTemplate !== 'SINGLE_ATOM';
+  }), 'every promoted candidate must be a marked pair, never a bare standalone');
+  for (const candidate of promoted) {
+    const decision = evaluateAutonomousQueryAuthority(
+      asQueryRecord(candidate.query, 'Tickland', candidate.metadata as Record<string, unknown>),
+      { scopePromotionActive: true },
+    );
+    assert.equal(decision.eligible, true, `promoted "${candidate.query}" must pass authority (${decision.reasonCodes.join(',')})`);
+  }
+});
+
+test('malformed promotion markers never authorize quota spend', () => {
+  // The planner only stamps promotion on COUNTRY_VOCABULARY-INSTRUMENT-led
+  // [INSTRUMENT, METHOD] and [INSTRUMENT, MARKET] pairs. A marker on any
+  // other shape is malformed and must fail the authority gate even while the
+  // country is still selected.
+  const provenance = {
+    policyVersion: 'retrieval-specificity-v2',
+    eligibility: 'MODIFIER_ONLY',
+    specificity: 62,
+    ambiguity: 48,
+    reasonCodes: [],
+  };
+  const instrument = (term: string, origin?: string) => ({
+    term, type: 'INSTRUMENT', ...(origin === undefined ? {} : { origin }),
+    retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' },
+  });
+  const companion = (term: string, type: string) => ({
+    term, type, origin: 'COUNTRY_VOCABULARY',
+    retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' },
+  });
+  const marked = (queryTemplate: string, atoms: Array<Record<string, unknown>>) => asQueryRecord('OBX Aksjehandel', 'Norway', {
+    queryTemplate,
+    scopePromoted: true,
+    promotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+    retrievalSpecificity: provenance,
+    atoms,
+  });
+  const active = { scopePromotionActive: true } as const;
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('COMPACT_PAIR', [instrument('OBX', 'CURATED'), companion('Aksjehandel', 'METHOD')]), active).eligible,
+    false, 'non-vocabulary primary origin must not authorize',
+  );
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('COMPACT_PAIR', [instrument('OBX'), companion('Aksjehandel', 'METHOD')]), active).eligible,
+    false, 'missing primary origin must not authorize',
+  );
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('COMPACT_PAIR', [{ ...instrument('Aksjehandel', 'COUNTRY_VOCABULARY'), type: 'METHOD' }, companion('OBX', 'INSTRUMENT')]), active).eligible,
+    false, 'method-led pairs must not authorize',
+  );
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('COMPACT_PAIR', [instrument('OBX', 'COUNTRY_VOCABULARY'), companion('Euronext', 'MARKET')]), active).eligible,
+    false, 'market companion in a COMPACT_PAIR must not authorize',
+  );
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('INSTRUMENT_MARKET', [instrument('OBX', 'COUNTRY_VOCABULARY'), companion('Aksjehandel', 'METHOD')]), active).eligible,
+    false, 'method companion in an INSTRUMENT_MARKET pair must not authorize',
+  );
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('COMPACT_PAIR', [instrument('OBX', 'COUNTRY_VOCABULARY')]), active).eligible,
+    false, 'lone-atom markers must not authorize',
+  );
+  // The exact planner-emitted shapes still authorize while selected.
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('COMPACT_PAIR', [instrument('OBX', 'COUNTRY_VOCABULARY'), companion('Aksjehandel', 'METHOD')]), active).eligible,
+    true, 'planner COMPACT_PAIR shape must authorize while selected',
+  );
+  assert.equal(
+    evaluateAutonomousQueryAuthority(marked('INSTRUMENT_MARKET', [instrument('OBX', 'COUNTRY_VOCABULARY'), companion('Euronext', 'MARKET')]), active).eligible,
+    true, 'planner INSTRUMENT_MARKET shape must authorize while selected',
+  );
+});
+
 test('promotion never authorizes a bare standalone vocabulary surface', () => {
   const bare = asQueryRecord('OBX', 'Norway', {
     queryTemplate: 'SINGLE_ATOM',
@@ -289,8 +391,8 @@ test('stored promotion follows live selection at execution authority', () => {
     promotionBasis: 'PERSISTENT_SCOPE_SELECTION',
     retrievalSpecificity: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY', specificity: 62, ambiguity: 48, reasonCodes: [] },
     atoms: [
-      { term: 'OBX', type: 'INSTRUMENT', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } },
-      { term: 'Aksjehandel', type: 'METHOD', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } }
+      { term: 'OBX', type: 'INSTRUMENT', origin: 'COUNTRY_VOCABULARY', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } },
+      { term: 'Aksjehandel', type: 'METHOD', origin: 'COUNTRY_VOCABULARY', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } }
     ]
   };
   const record = asQueryRecord('OBX Aksjehandel', 'Norway', metadata);
@@ -394,8 +496,8 @@ test('scope-read failure cannot complete a promoted job (fail closed, retryable)
     promotionBasis: 'PERSISTENT_SCOPE_SELECTION',
     retrievalSpecificity: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY', specificity: 62, ambiguity: 48, reasonCodes: [] },
     atoms: [
-      { term: 'OBX', type: 'INSTRUMENT', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } },
-      { term: 'Aksjehandel', type: 'METHOD', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } }
+      { term: 'OBX', type: 'INSTRUMENT', origin: 'COUNTRY_VOCABULARY', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } },
+      { term: 'Aksjehandel', type: 'METHOD', origin: 'COUNTRY_VOCABULARY', retrievalPolicy: { policyVersion: 'retrieval-specificity-v2', eligibility: 'MODIFIER_ONLY' } }
     ]
   };
   assert.equal(evaluateAutonomousQueryAuthority(asQueryRecord('OBX Aksjehandel', 'Norway', persistentMetadata), { scopePromotionActive: false }).eligible, false);

@@ -301,12 +301,15 @@ export function planDiverseQueries(args: {
   const authorizedAnchors = anchors.filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility));
   // Scope-promoted fallback: a scope-selected country with no authorized anchor
   // (e.g. no curated atoms) borrows its own retrieval-oriented vocabulary
-  // INSTRUMENT atoms as pairing anchors. SINGLE_ATOM candidates above still
-  // use only truly-authorized atoms, so promotion can never authorize a bare
-  // unanchored surface.
+  // INSTRUMENT atoms as pairing anchors. Bare short tickers stay pairable
+  // here (mirroring countryAtoms): the ticker barrier applies to the final
+  // assembled pair below, so a ticker-only country can still bootstrap.
+  // SINGLE_ATOM candidates above still use only truly-authorized atoms, so
+  // promotion can never authorize a bare unanchored surface.
   const hasAuthorizedAnchor = authorizedAnchors.length > 0;
   const promotedAnchors = args.scopePromotionBasis != null && !hasAuthorizedAnchor
-    ? anchors.filter(item => item.type === 'INSTRUMENT' && item.origin === 'COUNTRY_VOCABULARY' && isRetrievalOrientedQuery(args.country, item.term))
+    ? anchors.filter(item => item.type === 'INSTRUMENT' && item.origin === 'COUNTRY_VOCABULARY' &&
+        (isRetrievalOrientedQuery(args.country, item.term) || isBareShortTicker(item.term)))
     : [];
   const pairingAnchors = hasAuthorizedAnchor ? authorizedAnchors : promotedAnchors;
   const compatiblePairs = pairingAnchors
