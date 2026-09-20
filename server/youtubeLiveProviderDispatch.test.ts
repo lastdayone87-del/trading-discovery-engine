@@ -33,5 +33,5 @@ test('youtubeFetch performs live reselection inside scheduler dispatch and rebui
   assert.match(reader,/youtubeProviderCooldown\.succeeded\(context\.providerKey,context\.providerFailureGeneration\)/);
   assert.match(youtubeFetch,/providerFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined/);
   assert.match(reader,/validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
-  assert.match(reader,/if\(validatedIndex>=0\)activeKeyIndex=validatedIndex/);
+  assert.match(reader,/if\(validatedIndex>=0\)activeKeyIndex=advanceYouTubeRotation\(validatedPool\.length,validatedIndex\)/);
 });

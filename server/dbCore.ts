@@ -642,6 +642,85 @@ export async function toggleQueuePause(queueName:string,isPaused:boolean):Promis
 
 export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(); }
 export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);}
+
+export interface YouTubeInvalidInputQuarantine {
+  inputKind: string;
+  inputValue: string;
+  operation: string;
+  firstSeen: string | null;
+  lastSeen: string | null;
+  hits: number;
+  expiresAt: string | null;
+}
+
+/** Durable memory of inputs that recently produced HTTP 400/404/422 from
+ * YouTube (bad channel IDs, invalid query shapes). Readers must treat an
+ * expired row as absent; writers prune expired rows opportunistically. */
+export async function recordYouTubeInvalidInput(inputKind: string, inputValue: string, operation: string, ttlMs: number): Promise<void> {
+  if (!inputKind || !inputValue || !Number.isFinite(ttlMs) || ttlMs <= 0) return;
+  const db = await getDb();
+  await db.query(`INSERT INTO youtube_invalid_input_quarantine(input_kind,input_value,operation,first_seen,last_seen,hits,expires_at)
+    VALUES($1,$2,$3,now(),now(),1,now()+($4||' milliseconds')::interval)
+    ON CONFLICT(input_kind,input_value) DO UPDATE SET operation=excluded.operation,last_seen=now(),hits=youtube_invalid_input_quarantine.hits+1,expires_at=now()+($4||' milliseconds')::interval`,
+    [inputKind, inputValue, operation || '', String(Math.trunc(ttlMs))]);
+  await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE expires_at <= now()`).catch(() => undefined);
+}
+
+export async function isYouTubeInputQuarantined(inputKind: string, inputValue: string): Promise<boolean> {
+  if (!inputKind || !inputValue) return false;
+  const db = await getDb();
+  const res = await db.query(`SELECT 1 FROM youtube_invalid_input_quarantine WHERE input_kind=$1 AND input_value=$2 AND expires_at > now() LIMIT 1`, [inputKind, inputValue]);
+  return (res.rowCount || 0) > 0;
+}
+
+export interface YouTubeProviderSuspensionRow {
+  keyFingerprint: string;
+  keyIndex: number;
+  envName: string;
+  quotaGroup: string;
+  status: string;
+  observedAt: string | null;
+  retryAfter: string | null;
+  reason: string;
+  probeCount: number;
+}
+
+/** Durably records a suspended/dead provider key by fingerprint (never the
+ * key itself) so restarts cannot cause reprobing. Re-recording bumps the
+ * probe count and refreshes the retry horizon. */
+export async function recordYouTubeProviderSuspension(row: { keyFingerprint: string; keyIndex?: number; envName?: string; quotaGroup?: string; status?: string; retryAfterMs?: number; reason?: string }): Promise<void> {
+  if (!row.keyFingerprint) return;
+  const db = await getDb();
+  await db.query(`INSERT INTO youtube_provider_suspension(key_fingerprint,key_index,env_name,quota_group,status,observed_at,retry_after,reason,probe_count)
+    VALUES($1,$2,$3,$4,$5,now(),now()+($6||' milliseconds')::interval,$7,1)
+    ON CONFLICT(key_fingerprint) DO UPDATE SET key_index=excluded.key_index,env_name=excluded.env_name,quota_group=excluded.quota_group,status=excluded.status,observed_at=now(),retry_after=now()+($6||' milliseconds')::interval,reason=excluded.reason,probe_count=youtube_provider_suspension.probe_count+1`,
+    [row.keyFingerprint, row.keyIndex || 0, row.envName || '', row.quotaGroup || '', row.status || 'SUSPENDED', String(Math.trunc(row.retryAfterMs && row.retryAfterMs > 0 ? row.retryAfterMs : 24 * 60 * 60_000)), row.reason || '']);
+}
+
+export async function clearYouTubeProviderSuspension(keyFingerprint: string): Promise<void> {
+  if (!keyFingerprint) return;
+  const db = await getDb();
+  await db.query(`DELETE FROM youtube_provider_suspension WHERE key_fingerprint=$1`, [keyFingerprint]);
+}
+
+/** Suspension rows whose retry horizon has not passed (hydrate at startup).
+ * Prunes ancient rows opportunistically so removed keys do not accumulate. */
+export async function loadActiveYouTubeProviderSuspensions(): Promise<YouTubeProviderSuspensionRow[]> {
+  const db = await getDb();
+  const res = await db.query(`SELECT key_fingerprint,key_index,env_name,quota_group,status,observed_at,retry_after,reason,probe_count FROM youtube_provider_suspension WHERE retry_after > now() ORDER BY observed_at`);
+  await db.query(`DELETE FROM youtube_provider_suspension WHERE retry_after < now() - interval '30 days'`).catch(() => undefined);
+  return res.rows.map(item => ({
+    keyFingerprint: String(item.key_fingerprint),
+    keyIndex: Number(item.key_index || 0),
+    envName: String(item.env_name || ''),
+    quotaGroup: String(item.quota_group || ''),
+    status: String(item.status || 'SUSPENDED'),
+    observedAt: item.observed_at ? new Date(item.observed_at).toISOString() : null,
+    retryAfter: item.retry_after ? new Date(item.retry_after).toISOString() : null,
+    reason: String(item.reason || ''),
+    probeCount: Number(item.probe_count || 0),
+  }));
+}
 export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; remaining:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
 
