@@ -77,20 +77,24 @@ test('scope eligibility separates market validity from country verdicts', () => 
   assert.equal(resolveScopeEligibility('   '), 'UNRESOLVED');
 });
 
-test('autonomous sweep preserves dormant countries but honors explicit targets', () => {
+test('autonomous sweep keeps dormant countries dormant but promotes explicit scope selections', () => {
   const vocabs = [...ALL_20];
   const global = resolveAutonomousCountries(vocabs, [], [], 'GLOBAL');
   assert.equal(global.length, 15);
   for (const dormant of SUPPORTED_DORMANT_COUNTRIES) {
-    assert.ok(!global.includes(dormant), `${dormant} must not be swept`);
+    assert.ok(!global.includes(dormant), `${dormant} must not be swept without selection`);
   }
+  // Persistent scope selection takes precedence over the dormant
+  // classification: an explicitly selected dormant country is promoted into
+  // active sweeping. Removing it restores dormant behavior (covered in
+  // scopePromotedDiscovery.test.ts for all five).
   const selected = resolveAutonomousCountries(
     vocabs,
     [],
     ['Norway', 'Germany'],
     'SELECTED_COUNTRIES',
   );
-  assert.deepEqual(selected, ['Germany']);
+  assert.deepEqual(selected, ['Germany', 'Norway']);
   assert.deepEqual(
     resolveAutonomousCountries(vocabs, [], [], 'GLOBAL', 'Norway'),
     ['Norway'],
@@ -280,12 +284,12 @@ test('upsertChannel derives scope from the row country and reads no stored value
   );
 });
 
-test('dormant exclusion is intentional and total across scope modes', async () => {
-  // Invariant: dormant supported countries are never swept autonomously in
-  // any mode (they stay valid for manual search, explicit single targets,
-  // and cross-border flows). An operator retaining them in persistent
-  // selection sees the UI note; the scheduler silently ignoring them is
-  // intended, tested behavior — not a bug.
+test('dormant exclusion yields to explicit scope selection, never to silence', async () => {
+  // Dormant supported countries are not swept autonomously without an
+  // explicit selection (they stay valid for manual search, explicit single
+  // targets, and cross-border flows). But a persistent scope selection
+  // promotes them into active sweeping — the dormant classification must
+  // never silently override a direct operator selection.
   const { resolveAutonomousCountries } = await import('./autonomousDiscovery');
   const { SUPPORTED_PRODUCTION_COUNTRIES, SUPPORTED_DORMANT_COUNTRIES } = await import(
     '../src/data/initial_countries'
@@ -296,10 +300,10 @@ test('dormant exclusion is intentional and total across scope modes', async () =
     all.length - SUPPORTED_DORMANT_COUNTRIES.length,
   );
   assert.deepEqual(
-    resolveAutonomousCountries(all, [], [...SUPPORTED_DORMANT_COUNTRIES, 'Germany'], 'SELECTED_COUNTRIES'),
-    ['Germany'],
+    resolveAutonomousCountries(all, [], [...SUPPORTED_DORMANT_COUNTRIES, 'Germany'], 'SELECTED_COUNTRIES').sort(),
+    [...SUPPORTED_DORMANT_COUNTRIES, 'Germany'].sort(),
   );
-  assert.deepEqual(resolveAutonomousCountries(all, [], [...SUPPORTED_DORMANT_COUNTRIES], 'SELECTED_COUNTRIES'), []);
+  assert.deepEqual(resolveAutonomousCountries(all, [], [...SUPPORTED_DORMANT_COUNTRIES], 'SELECTED_COUNTRIES').sort(), [...SUPPORTED_DORMANT_COUNTRIES].sort());
 });
 
 test('custom out-of-registry vocabularies never enter autonomous sweeps', async () => {

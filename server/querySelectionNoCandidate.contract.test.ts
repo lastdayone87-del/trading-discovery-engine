@@ -14,7 +14,7 @@ test('query selection returns null when cold-start or exploration generation yie
 
 test('autonomous discovery records no-eligible-query and does not enter authority or scheduling paths', () => {
   assert.match(autonomousDiscovery, /reasonCode: 'QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY'/g);
-  assert.match(autonomousDiscovery, /const fallbackSelection = await selectNextQueryForCountry\(legacyCountry\);\n          if \(!fallbackSelection\)/);
-  assert.match(autonomousDiscovery, /const legacySelection = await selectNextQueryForCountry\(country\);\n        if \(!legacySelection\)/);
-  assert.match(autonomousDiscovery, /if \(!legacySelection\)[\s\S]*?continue;[\s\S]*?evaluateAutonomousQueryAuthority\(selected\.queryRecord\)/);
+  assert.match(autonomousDiscovery, /const fallbackSelection = await selectNextQueryForCountry\(legacyCountry, \{ scopePromotionBasis \}\);\n          if \(!fallbackSelection\)/);
+  assert.match(autonomousDiscovery, /const legacySelection = await selectNextQueryForCountry\(country, \{ scopePromotionBasis \}\);\n        if \(!legacySelection\)/);
+  assert.match(autonomousDiscovery, /if \(!legacySelection\)[\s\S]*?continue;[\s\S]*?evaluateAutonomousQueryAuthority\(selected\.queryRecord, \{/);
 });
