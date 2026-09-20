@@ -232,13 +232,15 @@ test('preferred YouTube provider advances only after validated response success'
   assert.match(reader, /if\(providerSuccessIsCurrent\)/);
   assert.match(reader, /const validatedPool=getYouTubeKeyPool\(\)/);
   assert.match(reader, /const validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
-  assert.match(reader, /if\(validatedIndex>=0\)activeKeyIndex=validatedIndex/);
+  assert.match(reader, /if\(validatedIndex>=0\)activeKeyIndex=advanceYouTubeRotation\(validatedPool\.length,validatedIndex\)/);
 });
 
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey(?:,lifecycle)?\)/);
-  assert.match(source, /youtubeFetch\(recentUrl,'channel-uploads',100,attempt\+1,acquisition,priority,apiKey\)/);
+  // channel-uploads resolves through the 1-unit uploads playlist (channels.list
+  // contentDetails + playlistItems.list), never a 100-unit search.list.
+  assert.match(source, /youtubeFetch\(buildYouTubeApiUrl\('playlistItems',apiKey,\{part:'snippet',playlistId:String\(uploadsPlaylistId\),maxResults:10\}\),'channel-uploads',1,attempt\+1,acquisition,priority,apiKey\)/);
   assert.match(source, /youtubeFetch\(channelUrl,'channel-details',1,attempt\+1,acquisition,priority,apiKey\)/);
 });
 

@@ -154,3 +154,24 @@ test('CONSUMER_SUSPENDED failure places provider into suspended state and exclud
     retryAt: null,
   });
 });
+test('suspended state is readable without consuming it, and restorable with an explicit horizon', () => {
+  let now = 1_000;
+  const providers = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  assert.equal(providers.isSuspended('project-a'), false);
+  providers.failed('project-a', 'CONSUMER_SUSPENDED');
+  assert.equal(providers.isSuspended('project-a'), true);
+  // A fresh instance (post-restart) restores the durable horizon instead of
+  // the default 24h window.
+  const restored = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  assert.equal(restored.restoreSuspended('project-a', now + 7 * 24 * 60 * 60_000), now + 7 * 24 * 60 * 60_000);
+  assert.equal(restored.isSuspended('project-a'), true);
+  assert.equal(restored.eligible('project-a'), false);
+  assert.deepEqual(restored.status('project-a'), { status: 'Suspended', retryAt: now + 7 * 24 * 60 * 60_000 });
+  // A stale horizon falls back to the default window, never to the past.
+  assert.equal(restored.restoreSuspended('project-b', now - 1), now + 24 * 60 * 60_000);
+  assert.equal(restored.isSuspended('project-b'), true);
+  // Success clears suspension like any other quarantine layer.
+  restored.succeeded('project-a');
+  assert.equal(restored.isSuspended('project-a'), false);
+  assert.equal(restored.eligible('project-a'), true);
+});

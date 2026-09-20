@@ -1,5 +1,19 @@
 import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary } from '../src/types';
-import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEvent } from './db';
+import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension, clearYouTubeProviderSuspension } from './db';
+import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
+import { getConfiguredYouTubeProviders, getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
+import {
+  YOUTUBE_INPUT_QUARANTINE_TTL_MS,
+  YOUTUBE_SUSPENSION_RETRY_AFTER_MS,
+  advanceYouTubeRotation,
+  annotateYouTubeErrorMetadata,
+  buildYouTubeTelemetryMetadata,
+  extractYouTubeQuarantineInput,
+  isYouTubeInputFailure,
+  normalizeYouTubeQuarantineInput,
+  youtubeDeploymentId,
+  type YouTubeQuarantineInputKind,
+} from './youtubeKeyHealth';
 import { executeProviderCall, ProviderCallError } from './providerResilience';
 import { RetrievalLane } from './retrievalLanes';
 import { SearchOrdering, youtubeOrder } from './searchOrdering';
@@ -206,13 +220,76 @@ function throwIfAllProvidersCoolingDown(keys: string[]): void {
   if (retryAt !== null) throw new YouTubeProvidersCoolingDownError(retryAt);
 }
 
+/** Thrown before dispatch when an input is durably quarantined after repeated
+ * HTTP 400/404/422 responses. Deliberately carries no status, providerReasons,
+ * or quota flags so no failure classifier (suspension, rate-limit, dead-key,
+ * quota) can mistake a bad input for a bad key. */
+export class YouTubeQuarantinedInputError extends Error {
+  readonly code = 'YOUTUBE_INPUT_QUARANTINED';
+  constructor(
+    readonly inputKind: YouTubeQuarantineInputKind,
+    readonly inputValue: string,
+    readonly operation: string,
+  ) {
+    super(`YouTube ${operation} withheld: ${inputKind} is quarantined after repeated invalid-input responses.`);
+    this.name = 'YouTubeQuarantinedInputError';
+  }
+}
+
+export function isYouTubeQuarantinedInput(error: unknown): boolean {
+  return error instanceof YouTubeQuarantinedInputError
+    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_INPUT_QUARANTINED';
+}
+
+/** Pre-dispatch gate: throws when this call's input is quarantined, before
+ * any key is touched. Callers invoke this once, outside their key-failover
+ * loops, so a bad input aborts instead of burning through every key. */
+export async function throwIfYouTubeInputQuarantined(
+  operation: string,
+  input: { channelId?: string | null; query?: string | null },
+): Promise<void> {
+  const raw = input.channelId || input.query || null;
+  const kind: YouTubeQuarantineInputKind = input.channelId ? 'channelId' : 'searchQuery';
+  const value = normalizeYouTubeQuarantineInput(kind, raw);
+  if (!value) return;
+  if (await isYouTubeInputQuarantined(kind, value)) {
+    throw new YouTubeQuarantinedInputError(kind, value, operation);
+  }
+}
+
+/** Persists a suspended/dead key durably (best effort: never breaks the
+ * failure path). Resolved against the current pool so the stored key_index
+ * and quota group stay interpretable. */
+async function persistYouTubeKeySuspension(providerKey: string, reason: string): Promise<void> {
+  try {
+    const pool = getYouTubeKeyPool();
+    const index = pool.indexOf(providerKey);
+    const configured = getConfiguredYouTubeProviders().find(item => item.key === providerKey);
+    await recordYouTubeProviderSuspension({
+      keyFingerprint: fingerprintYouTubeKey(providerKey),
+      keyIndex: index >= 0 ? index + 1 : 0,
+      envName: configured?.envName || '',
+      quotaGroup: configured?.quotaGroup || getYouTubeQuotaGroupForKey(providerKey) || '',
+      status: reason === 'INVALID_API_KEY' ? 'INVALID_KEY' : 'SUSPENDED',
+      retryAfterMs: YOUTUBE_SUSPENSION_RETRY_AFTER_MS,
+      reason,
+    });
+  } catch {
+    // Durable suspension is telemetry-grade hardening; a write failure must
+    // never mask the original provider error.
+  }
+}
+
 export function recordProviderFailure(key: string, error: unknown): void {
   const dispatchedKey = typeof (error as any)?.providerKey === 'string' ? (error as any).providerKey : key;
   // A rate-limited key is retired for this acquisition, while the bounded
   // outer provider loop may continue with another eligible key. If the whole
   // pool is unavailable, the caller surfaces the governed all-provider cooldown.
   if (isConsumerSuspended(error)) {
-    if ((error as any)?.providerFailureRecorded !== true) youtubeProviderCooldown.failed(dispatchedKey, 'CONSUMER_SUSPENDED');
+    if ((error as any)?.providerFailureRecorded !== true) {
+      youtubeProviderCooldown.failed(dispatchedKey, 'CONSUMER_SUSPENDED');
+      persistYouTubeKeySuspension(dispatchedKey, 'CONSUMER_SUSPENDED').catch(() => undefined);
+    }
     return;
   }
   if (isYouTubeRateLimited(error)) {
@@ -226,6 +303,7 @@ export function recordProviderFailure(key: string, error: unknown): void {
     if ((error as any)?.providerFailureRecorded !== true) {
       youtubeProviderCooldown.failed(dispatchedKey, 'CONSUMER_SUSPENDED');
       bumpInvalidApiKeyQuarantine();
+      persistYouTubeKeySuspension(dispatchedKey, 'INVALID_API_KEY').catch(() => undefined);
     }
     return;
   }
@@ -308,9 +386,21 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
       }
       const providerRequestId = buildYouTubeProviderRequestId(lifecycle?.requestId, dispatchAttempt);
       const dispatchedRequest = new URL(dispatchedUrl);
-      const requestMetadata = {
+      // Per-call attribution for provider_call_events.request_metadata: the
+      // dispatched (not merely preferred) key fingerprint/index/quota group
+      // plus the replica identity, so failures can later be correlated with
+      // specific keys, projects, and deployments. The fingerprint is the
+      // existing non-reversible quota-table hash, never the key itself.
+      const livePoolForTelemetry = dispatchedProviderKey ? getYouTubeKeyPool() : [];
+      const requestMetadata: Record<string, string | null> = {
         regionCode: dispatchedRequest.searchParams.get('regionCode'),
-        relevanceLanguage: dispatchedRequest.searchParams.get('relevanceLanguage')
+        relevanceLanguage: dispatchedRequest.searchParams.get('relevanceLanguage'),
+        ...buildYouTubeTelemetryMetadata({
+          providerKey: dispatchedProviderKey,
+          poolKeys: livePoolForTelemetry,
+          quotaGroup: dispatchedProviderKey ? (getYouTubeQuotaGroupForKey(dispatchedProviderKey) || null) : null,
+          deploymentId: youtubeDeploymentId(),
+        }),
       };
       return executeProviderCall({context:{provider:'youtube',operation,requestId:providerRequestId,runId:lifecycle?.runId,jobId:lifecycle?.jobId,requestMetadata,attempt:dispatchAttempt,reservedCost:actualCost,actualCost},timeoutMs:timeout,enabled:true,emit:appendProviderCallEvent,trace,call:async signal=>{
         trace('before first-request-record at server/youtube.ts:128');
@@ -344,6 +434,18 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
             else if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');
             else if(runtimeRateLimited)youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');
             if(error&&typeof error==='object')Object.assign(error,{providerKey:dispatchedProviderKey,providerFailureRecorded:true});
+            // Failure attribution and durable hardening (best effort, never
+            // masks the original error): stamp the HTTP status/API reasons
+            // into the emitted event, remember bad inputs instead of
+            // retrying them on every rescan, and persist dead keys so a
+            // restart cannot reprobe them.
+            annotateYouTubeErrorMetadata(requestMetadata, error);
+            if(consumerSuspended) await persistYouTubeKeySuspension(dispatchedProviderKey,'CONSUMER_SUSPENDED').catch(()=>undefined);
+            else if(isInvalidApiKey(error)) await persistYouTubeKeySuspension(dispatchedProviderKey,'INVALID_API_KEY').catch(()=>undefined);
+            else if(isYouTubeInputFailure(error)){
+              const input=extractYouTubeQuarantineInput(operation,dispatchedUrl);
+              if(input) await recordYouTubeInvalidInput(input.kind,input.value,operation,YOUTUBE_INPUT_QUARANTINE_TTL_MS).catch(()=>undefined);
+            }
           }
           throw error;
         }
@@ -415,12 +517,19 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
       throw new ProviderCallError(`YouTube ${operation} returned a JSON body without an items array (HTTP ${status}).`, 'TRANSIENT', true, { status });
     }
     if(context?.providerKey){
+      // A rehabilitated key leaves both quarantine layers: clear the durable
+      // row when the key was suspended so it stops accumulating probes.
+      const wasSuspended = youtubeProviderCooldown.isSuspended(context.providerKey);
       const providerSuccessIsCurrent=youtubeProviderCooldown.succeeded(context.providerKey,context.providerFailureGeneration);
       if(providerSuccessIsCurrent){
         const validatedPool=getYouTubeKeyPool();
         const validatedIndex=validatedPool.indexOf(context.providerKey);
-        if(validatedIndex>=0)activeKeyIndex=validatedIndex;
+        // Round-robin advance (not sticky): the next call starts at the
+        // following eligible key so healthy keys share the workload instead
+        // of one key absorbing everything until it fails.
+        if(validatedIndex>=0)activeKeyIndex=advanceYouTubeRotation(validatedPool.length,validatedIndex);
       }
+      if (wasSuspended) clearYouTubeProviderSuspension(fingerprintYouTubeKey(context.providerKey)).catch(() => undefined);
     }
     context?.acquisition?.providerSucceeded();
     return object as T;
@@ -575,6 +684,8 @@ export async function searchYouTubeChannelPage(
 ): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
+  // Fail fast on a durably quarantined query before touching any key.
+  await throwIfYouTubeInputQuarantined('search', { query: sanitizedQuery });
   const searchHints = countrySearchHints(countryName, vocab?.languages || [], lifecycle?.preferredLanguage);
 
   const keyPool = getYouTubeKeyPool();
@@ -662,6 +773,8 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
   const keyPool = getYouTubeKeyPool();
   if (!channelId) return [];
   if (keyPool.length === 0) throw new Error('Recent-video description API is unavailable because no provider is configured.');
+  // Fail fast on a durably quarantined channel before touching any key.
+  await throwIfYouTubeInputQuarantined('recent-videos-search', { channelId });
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
 
@@ -724,6 +837,17 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
   } finally { acquisition.release(); }
 }
 
+/** Adapts a playlistItems.list payload into the search.list item shape the
+ * enrichment activity stats consume ({id.videoId, snippet.title,
+ * snippet.description, snippet.publishedAt}). Pure and unit-tested. */
+export function adaptPlaylistItemsToSearchShape(payload: { items?: Array<Record<string, any>> }): { items: Array<{ id: { videoId: string | null }; snippet: Record<string, any> }> } {
+  return {
+    items: (Array.isArray(payload.items) ? payload.items : []).map(item => ({
+      id: { videoId: item?.snippet?.resourceId?.videoId ?? null },
+      snippet: (item && typeof item.snippet === 'object' ? item.snippet : {}) as Record<string, any>,
+    })),
+  };
+}
 /**
  * Fetches richer official channel metadata and recent uploads for a borderline
  * creator. Unlike discovery search, this is only called by a durable enrichment
@@ -740,6 +864,8 @@ export async function fetchYouTubeChannelEnrichment(
   if (keyPool.length === 0) {
     throw new Error('YouTube enrichment requires at least one configured YouTube API key.');
   }
+  // Fail fast on a durably quarantined channel before touching any key.
+  await throwIfYouTubeInputQuarantined('channel-uploads', { channelId });
   const acquisition = youtubePoolBackoff.beginAcquisition();
 
   let lastError: Error | null = null;
@@ -756,13 +882,27 @@ export async function fetchYouTubeChannelEnrichment(
     const currentIndex = providerIndexes[attempt];
     const apiKey = keyPool[currentIndex];
     try {
-      const channelUrl = buildYouTubeApiUrl('channels',apiKey,{part:'snippet,brandingSettings,statistics',id:channelId});
+      const channelUrl = buildYouTubeApiUrl('channels',apiKey,{part:'snippet,brandingSettings,statistics,contentDetails',id:channelId});
       if(!uploadsCheckpoint){
-        if(attempt>0)await topUp(100);
-        const recentUrl = buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,order:'date',type:'video',maxResults:10});
-        const recentResponse = await youtubeFetch(recentUrl,'channel-uploads',100,attempt+1,acquisition,priority,apiKey);
-        uploadsCheckpoint = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
-        await incrementQuota(100, getYouTubeResponseProviderKey(recentResponse));
+        if(attempt>0)await topUp(1);
+        // Resolve recent uploads through the channel's uploads playlist
+        // (channels.list 1 unit + playlistItems.list 1 unit) instead of a
+        // 100-unit search.list scoped to the channel. The uploads playlist
+        // returns the same snippet fields in reverse-chronological order, so
+        // every activity stat below is preserved while quota burn drops 50x.
+        if(!channelCheckpoint){
+          const channelFirstResponse = await youtubeFetch(channelUrl,'channel-details',1,attempt+1,acquisition,priority,apiKey);
+          channelCheckpoint = await readYouTubeJsonObject(channelFirstResponse, 'channel-details');
+          await incrementQuota(1, getYouTubeResponseProviderKey(channelFirstResponse));
+        }
+        const uploadsPlaylistId = channelCheckpoint.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+        if (uploadsPlaylistId) {
+          const recentResponse = await youtubeFetch(buildYouTubeApiUrl('playlistItems',apiKey,{part:'snippet',playlistId:String(uploadsPlaylistId),maxResults:10}),'channel-uploads',1,attempt+1,acquisition,priority,apiKey);
+          uploadsCheckpoint = adaptPlaylistItemsToSearchShape(await readYouTubeJsonObject(recentResponse, 'channel-uploads'));
+          await incrementQuota(1, getYouTubeResponseProviderKey(recentResponse));
+        } else {
+          uploadsCheckpoint = { items: [] };
+        }
       }
       if(!channelCheckpoint){
         if(attempt>0)await topUp(1);
@@ -847,6 +987,13 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
   if (!keys.length) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
   let acquisition; try { acquisition=youtubePoolBackoff.beginAcquisition(); }
   catch { return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt }; }
+  // A quarantined channel degrades to the fallback (this path never throws);
+  // a gate read failure proceeds best-effort since the call below records it.
+  try {
+    await throwIfYouTubeInputQuarantined('channel-country-metadata', { channelId });
+  } catch (error) {
+    if (isYouTubeQuarantinedInput(error)) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
+  }
   let quotaExceededCount = 0;
   try { const providerIndexes=availableKeyIndexes(keys); for (let attempt = 0; attempt < providerIndexes.length; attempt++) {
     const index = providerIndexes[attempt];
