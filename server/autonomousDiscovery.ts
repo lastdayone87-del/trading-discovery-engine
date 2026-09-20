@@ -127,8 +127,15 @@ export async function resumeQueryIntelligence(): Promise<{ message: string; isPa
  * dormant supported country that is explicitly present in the persistent
  * prioritized scope is promoted into active sweeping. Removing it from the
  * selection restores the normal dormant behavior. Dormant status therefore
- * gates only unselected sweeping; unsupported (excluded/out-of-registry)
- * countries can never pass in any mode.
+ * gates only unselected sweeping.
+ *
+ * A deliberate single-target override (targetCountry) bypasses the
+ * registry/scope/dormant filters by design, including out-of-registry targets
+ * when deliberately requested. Hard-excluded countries can never pass, even
+ * as a direct target: the resolver drops them, runAutonomousDiscoveryCycle
+ * asserts the target via assertCountryAllowed before resolving countries,
+ * and the queue worker asserts every job country again before spending
+ * quota.
  */
 export function resolveAutonomousCountries(
   vocabCountries: string[],
@@ -159,7 +166,12 @@ export function resolveAutonomousCountries(
   countries = countries.filter(
     country => !dormant.has(country.toLowerCase()) || (selectionActive && selectedScope.has(country.toLowerCase())),
   );
-  if (targetCountry) countries = [targetCountry];
+  // A deliberate single target bypasses the registry/scope/dormant filters,
+  // but never the hard-exclusion list: an excluded direct target resolves to
+  // nothing here (in addition to the assertCountryAllowed gates at cycle
+  // entry and in the worker), so no caller can sweep it by requesting it
+  // directly.
+  if (targetCountry) countries = excluded.has(targetCountry.toLowerCase()) ? [] : [targetCountry];
   return countries;
 }
 
@@ -204,16 +216,50 @@ export function parseDiscoveryScopeSelection(raw: string): string[] {
   return parsed as string[];
 }
 
+export function parseDiscoveryScopeMode(raw: unknown): DiscoveryScopeMode {
+  // Fail closed: only values the scope API can persist are valid. A malformed
+  // mode must throw (retryable) rather than collapse to GLOBAL, which would
+  // read a persistent promotion as "deselected" and let the worker
+  // permanently completeJob the promoted job instead of retrying.
+  if (raw !== 'GLOBAL' && raw !== 'SELECTED_COUNTRIES') {
+    throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  }
+  return raw;
+}
+
 export async function getDiscoveryScope(): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
-  const scopeValue = await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL');
-  const scope: DiscoveryScopeMode = scopeValue === 'SELECTED_COUNTRIES' ? 'SELECTED_COUNTRIES' : 'GLOBAL';
-  // Fail closed and retryable: the settings read itself must propagate (so
-  // the worker hits failJob/retry), and malformed/invalid stored values throw
-  // via parseDiscoveryScopeSelection instead of collapsing to []. Either
+  // Single-statement snapshot: both settings are read in one query so a scope
+  // save committing between two reads can never tear the decision (old mode
+  // with a new country list or vice versa). Fail closed and retryable: a
+  // settings-read DB failure propagates (so the worker hits failJob/retry),
+  // and malformed/invalid stored values throw via parseDiscoveryScopeMode /
+  // parseDiscoveryScopeSelection instead of collapsing to defaults. Either
   // failure therefore errors the attempt before any completeJob decision, for
-  // both PERSISTENT_SCOPE_SELECTION and DIRECT_TARGET paths.
-  const raw = await getAppSetting('query_intelligence_selected_countries', '[]');
-  return { scope, selectedCountries: parseDiscoveryScopeSelection(raw) };
+  // both PERSISTENT_SCOPE_SELECTION and DIRECT_TARGET paths. Missing rows
+  // keep the established defaults (GLOBAL / genuine empty selection).
+  const db = await getDb();
+  const res = await db.query(
+    'SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ($1, $2)',
+    ['query_intelligence_discovery_scope', 'query_intelligence_selected_countries'],
+  );
+  const byKey = new Map<string, unknown>(res.rows.map((row: { setting_key: string; setting_value: unknown }) => [row.setting_key, row.setting_value]));
+  const scope = parseDiscoveryScopeMode(byKey.has('query_intelligence_discovery_scope') ? byKey.get('query_intelligence_discovery_scope') : 'GLOBAL');
+  const raw = byKey.has('query_intelligence_selected_countries') ? byKey.get('query_intelligence_selected_countries') : '[]';
+  return { scope, selectedCountries: parseDiscoveryScopeSelection(String(raw)) };
+}
+
+/**
+ * Shared live-scope promotion decision for the scheduler and the queue
+ * worker. Both call sites resolve through this helper (rather than inlining
+ * resolveScopePromotion with different argument shapes) so the value
+ * computation is covered once, at runtime, with realistic scope objects.
+ */
+export function resolveScopePromotionForScope(
+  scope: { scope: DiscoveryScopeMode; selectedCountries: string[] },
+  country: string,
+  targetCountry?: string | null,
+): 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' | null {
+  return resolveScopePromotion(scope.scope, scope.selectedCountries, country, targetCountry);
 }
 
 export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCountries: string[]): Promise<{ scope: DiscoveryScopeMode; selectedCountries: string[] }> {
@@ -369,7 +415,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // Without this, the dormant classification would silently override the
       // operator selection every cycle. Removing the selection restores
       // dormant behavior because promotion is granted per selected country.
-      const scopePromotionBasis = resolveScopePromotion(scope.scope, scope.selectedCountries, legacyCountry, targetCountry);
+      const scopePromotionBasis = resolveScopePromotionForScope(scope, legacyCountry, targetCountry);
       let candidateDiagnostic: CandidateDiagnosticState = { legacyCountry, attempt: attempts, phase8Result: 'NOT_REACHED', providerRegistryOutcome: 'NOT_REACHED', reservationOutcome: 'NOT_REACHED', schedulingOutcome: 'NOT_REACHED' };
       const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
 

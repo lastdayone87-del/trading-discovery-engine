@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { planDiverseQueries } from './queryPlanner';
-import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { resolveAutonomousCountries, resolveScopePromotion, parseDiscoveryScopeSelection } from './autonomousDiscovery';
+import { evaluateAutonomousQueryAuthority, isScopePromotedRecord } from './autonomousQueryAuthority';
+import { resolveAutonomousCountries, resolveScopePromotion, resolveScopePromotionForScope, parseDiscoveryScopeMode, parseDiscoveryScopeSelection } from './autonomousDiscovery';
 import {
   INITIAL_COUNTRY_VOCABULARIES,
   SUPPORTED_DORMANT_COUNTRIES,
@@ -132,7 +132,11 @@ test('promotion never authorizes a bare standalone vocabulary surface', () => {
 });
 
 test('active countries behave identically with and without promotion (no-op)', () => {
-  for (const country of ['Germany', 'United States', 'France']) {
+  // Norway is pinned explicitly here: it carries curated atoms, so its
+  // authorized anchors make the promotion fallback a provable no-op and its
+  // coverage provably comes from the resolver/scope mechanism, not the
+  // planner fallback (which exists generically for anchor-less countries).
+  for (const country of ['Germany', 'United States', 'France', 'Norway']) {
     const vocab = vocabFor(country);
     const base = { country, count: 4, countryVocabulary: vocab, learnedVocabulary: [], existingQueries: [], provenTerminology: [], organicCandidates: [], mode: 'COLD_START' as const };
     const plain = planDiverseQueries(base).map(item => item.query);
@@ -170,19 +174,91 @@ test('GLOBAL with a retained stale selection still sweeps no dormant country', (
   assert.equal(resolved.length, ALL_20.length - DORMANT_FIVE.length);
 });
 
-test('scheduler threads scope promotion through selection and generation', () => {
-  // The per-candidate promotion decision is covered at runtime below; the
-  // scheduler loop body itself needs a database, so only the thin wiring
-  // (computed flag passed into selection, selection into generation) is
-  // asserted here by contract.
-  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Norway', 'Germany'], 'Norway'), 'PERSISTENT_SCOPE_SELECTION');
-  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Germany'], 'Norway'), null);
-  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway'), null);
-  assert.equal(resolveScopePromotion('GLOBAL', ['Norway'], 'Norway'), null, 'GLOBAL with a stale selection must never promote');
-  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway', 'Norway'), 'DIRECT_TARGET', 'direct on-demand target promotes');
+test('deliberate direct targets bypass scope/dormant filters but keep their basis', () => {
+  // Contract: a deliberate single-target override passes the pure resolver by
+  // design (even in GLOBAL, even for a dormant country, even for an
+  // out-of-registry country deliberately requested). Hard-excluded countries
+  // resolve to nothing here, and are additionally blocked outside this pure
+  // function — runAutonomousDiscoveryCycle asserts the target via
+  // assertCountryAllowed before resolving, and the worker asserts every job
+  // country again before spending quota.
+  assert.deepEqual(resolveAutonomousCountries(ALL_20, [], [], 'GLOBAL', 'Norway'), ['Norway']);
+  assert.deepEqual(
+    resolveAutonomousCountries(ALL_20, ['India', 'Norway'], ['Germany'], 'SELECTED_COUNTRIES', 'Norway'),
+    [],
+    'a hard-excluded direct target resolves to nothing (callers also gate via assertCountryAllowed)',
+  );
+  assert.deepEqual(resolveAutonomousCountries(ALL_20, [], [], 'GLOBAL', 'Atlantis'), ['Atlantis']);
+  assert.equal(resolveScopePromotion('GLOBAL', [], 'Norway', 'Norway'), 'DIRECT_TARGET');
+  assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['Germany'], 'Norway', 'Norway'), 'DIRECT_TARGET');
+  assert.equal(resolveScopePromotion('GLOBAL', [], 'Germany', 'Norway'), null, 'a non-target country is never directly promoted');
+});
+
+test('scheduler and worker resolve promotion through one shared helper (runtime arguments)', () => {
+  // The per-candidate promotion decision is resolved through the exact helper
+  // both call sites use, with realistic scope objects as returned by
+  // getDiscoveryScope — so incorrect promotion values fail here instead of
+  // passing behind a source-text match.
+  assert.equal(
+    resolveScopePromotionForScope({ scope: 'SELECTED_COUNTRIES', selectedCountries: ['Norway', 'Germany'] }, 'Norway'),
+    'PERSISTENT_SCOPE_SELECTION',
+  );
+  assert.equal(
+    resolveScopePromotionForScope({ scope: 'SELECTED_COUNTRIES', selectedCountries: ['Germany'] }, 'Norway'),
+    null,
+  );
+  assert.equal(resolveScopePromotionForScope({ scope: 'GLOBAL', selectedCountries: [] }, 'Norway'), null);
+  assert.equal(
+    resolveScopePromotionForScope({ scope: 'GLOBAL', selectedCountries: ['Norway'] }, 'Norway'),
+    null,
+    'GLOBAL with a stale selection must never promote',
+  );
+  assert.equal(
+    resolveScopePromotionForScope({ scope: 'GLOBAL', selectedCountries: [] }, 'Norway', 'Norway'),
+    'DIRECT_TARGET',
+    'direct on-demand target promotes',
+  );
+  // The worker resolves without a targetCountry (one-shot DIRECT_TARGET
+  // lifetime is carried by the stored metadata basis, not live scope), while
+  // the scheduler resolves with it: both shapes are covered through the same
+  // helper.
+  assert.equal(
+    resolveScopePromotionForScope({ scope: 'SELECTED_COUNTRIES', selectedCountries: ['Norway'] }, 'Norway', 'Norway'),
+    'DIRECT_TARGET',
+  );
   assert.equal(resolveScopePromotion('SELECTED_COUNTRIES', ['norway'], 'NORWAY'), 'PERSISTENT_SCOPE_SELECTION', 'matching is case-insensitive');
+  // The generation seam stamps the basis into planned metadata at runtime:
+  // both bases must be distinguishable in audit records.
+  for (const basis of ['PERSISTENT_SCOPE_SELECTION', 'DIRECT_TARGET'] as const) {
+    const planned = planDiverseQueries({
+      country: 'Testland',
+      count: 4,
+      countryVocabulary: {
+        country: 'Testland',
+        languages: ['Testish'],
+        native_trading_terminology: ['testhandel', 'testanalyse'],
+        popular_instruments: ['TSTX', 'Testoil'],
+        local_market_phrases: ['Testland open'],
+        common_content_format_names: ['daily test review'],
+      },
+      learnedVocabulary: [],
+      existingQueries: [],
+      provenTerminology: [],
+      organicCandidates: [],
+      mode: 'COLD_START',
+      scopePromotionBasis: basis,
+    });
+    assert.ok(planned.length >= 1, `${basis} must plan`);
+    assert.ok(
+      planned.every(item => (item.metadata as Record<string, unknown>).promotionBasis === basis),
+      `${basis} must be stamped into every planned candidate`,
+    );
+  }
+  // Narrow change-detectors only: the two call sites must resolve through the
+  // shared helper and thread the basis into selection and generation. The
+  // values themselves are proven at runtime above and below.
   const scheduler = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  assert.match(scheduler, /const scopePromotionBasis = resolveScopePromotion\(scope\.scope, scope\.selectedCountries, legacyCountry, targetCountry\);/);
+  assert.match(scheduler, /const scopePromotionBasis = resolveScopePromotionForScope\(scope, legacyCountry, targetCountry\);/);
   assert.match(scheduler, /selectNextQueryForCountry\(country, \{[^}]*scopePromotionBasis[^}]*\}\)/);
   assert.match(scheduler, /selectNextQueryForCountry\(legacyCountry, \{ scopePromotionBasis \}\)/);
   const intelligence = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
@@ -191,7 +267,7 @@ test('scheduler threads scope promotion through selection and generation', () =>
   const planner = readFileSync(new URL('./queryPlanner.ts', import.meta.url), 'utf8');
   assert.match(planner, /scopePromotionBasis\?: 'PERSISTENT_SCOPE_SELECTION' \| 'DIRECT_TARGET'/);
   const worker = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(worker, /resolveScopePromotion\(liveScope\.scope, liveScope\.selectedCountries, country\)/);
+  assert.match(worker, /resolveScopePromotionForScope\(liveScope, country\)/);
   assert.match(worker, /evaluateAutonomousQueryAuthority\(authorityQueryRecord, \{/);
   assert.ok(!worker.includes('getDiscoveryScope().catch'), 'a scope-read failure must error the attempt, never silently preserve promotion');
 });
@@ -264,11 +340,15 @@ test('malformed scope selection fails closed instead of collapsing to an empty s
 test('scope-read failure cannot complete a promoted job (fail closed, retryable)', () => {
   // Unit behavior above proves malformed reads throw. This contract proves the
   // worker cannot turn that throw into a silent completeJob:
-  // - getDiscoveryScope has no broad catch falling back to `selectedCountries: []`;
-  // - the second settings read is awaited outside any try so DB failures propagate;
+  // - getDiscoveryScope reads both settings in one snapshot statement (no torn
+  //   mode/country combination) and has no broad catch falling back to
+  //   `selectedCountries: []`;
+  // - the settings read is awaited outside any try so DB failures propagate;
   // - the worker awaits getDiscoveryScope directly (no .catch fallback) before
   //   authority, so any throw reaches the outer catch -> failJob (retryable),
   //   never the withhold-path completeJob.
+  // - the live scope read happens only for scope-promoted jobs, so ordinary
+  //   jobs can never burn attempts on a scope misconfiguration.
   const discovery = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
   const getter = discovery.slice(discovery.indexOf('export async function getDiscoveryScope'));
   const parser = discovery.slice(
@@ -277,11 +357,33 @@ test('scope-read failure cannot complete a promoted job (fail closed, retryable)
   );
   assert.match(parser, /DISCOVERY_SCOPE_SELECTION_MALFORMED/);
   assert.match(getter, /parseDiscoveryScopeSelection/);
+  assert.match(getter, /parseDiscoveryScopeMode/);
+  assert.match(getter, /WHERE setting_key IN \(\$1, \$2\)/);
   assert.ok(!getter.includes('selectedCountries: []'), 'malformed scope must throw, never silently return an empty selection');
   const worker = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(worker, /const liveScope = await getDiscoveryScope\(\);/);
+  assert.match(worker, /if \(isScopePromotedRecord\(recordMetadata\)\) \{\s*\n\s*const liveScope = await getDiscoveryScope\(\);/);
   assert.ok(!worker.includes('getDiscoveryScope().catch'), 'a scope-read failure must error the attempt, never silently preserve promotion');
   assert.match(worker, /await failJob\(job\.id, err\)/, 'scope-read failures must take the retryable failJob path via the outer catch');
+  // The gating predicate is proven at runtime: every promoted basis (including
+  // legacy markers without a basis) triggers the live read, while ordinary
+  // records — missing, malformed-string, or unmarked metadata — skip it.
+  assert.equal(isScopePromotedRecord({ scopePromoted: true, promotionBasis: 'PERSISTENT_SCOPE_SELECTION' }), true);
+  assert.equal(isScopePromotedRecord({ scopePromoted: true, promotionBasis: 'DIRECT_TARGET' }), true);
+  assert.equal(isScopePromotedRecord({ scopePromoted: true }), true, 'legacy marker without a basis reads as the persistent form');
+  assert.equal(isScopePromotedRecord(JSON.stringify({ scopePromoted: true })), true, 'string-encoded metadata is honored');
+  assert.equal(isScopePromotedRecord({ scopePromoted: false }), false);
+  assert.equal(isScopePromotedRecord({}), false);
+  assert.equal(isScopePromotedRecord(null), false);
+  assert.equal(isScopePromotedRecord(undefined), false);
+  assert.equal(isScopePromotedRecord('not-json'), false);
+  // Scope-mode parsing is proven at runtime: only persisted-valid modes pass,
+  // so a malformed mode can never demote a promotion into a silent GLOBAL
+  // withhold.
+  assert.equal(parseDiscoveryScopeMode('GLOBAL'), 'GLOBAL');
+  assert.equal(parseDiscoveryScopeMode('SELECTED_COUNTRIES'), 'SELECTED_COUNTRIES');
+  for (const malformed of ['global', '', 'ALL', 'null', 'SELECTED', 'GLOBAL ']) {
+    assert.throws(() => parseDiscoveryScopeMode(malformed), /DISCOVERY_SCOPE_SELECTION_MALFORMED/, `mode must fail closed: ${malformed}`);
+  }
   // Both promotion bases are safe: a persistent promotion withholds only on a
   // successful read showing deselection, while a DIRECT_TARGET one-shot stays
   // eligible on success — but neither may be consumed when the read itself fails,

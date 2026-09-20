@@ -58,8 +58,8 @@ import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from 
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
-import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
-import { getDiscoveryScope, resolveScopePromotion } from './autonomousDiscovery';
+import { evaluateAutonomousQueryAuthority, isScopePromotedRecord } from './autonomousQueryAuthority';
+import { getDiscoveryScope, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership, shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
@@ -532,13 +532,22 @@ export async function processNextSearchJob(
         // is still selected (deselection restores dormant behavior, and
         // reselection restores sweeping without burning stored queries).
         // DIRECT_TARGET markers authorize their explicitly ordered one-shot
-        // work for its lifetime so in-flight manual jobs can complete. A
-        // scope-read failure errors the attempt (fail closed, retryable)
-        // rather than spending quota on a stale assumption.
-        const liveScope = await getDiscoveryScope();
+        // work for its lifetime so in-flight manual jobs can complete. The
+        // live scope read happens only for scope-promoted jobs (either basis,
+        // including legacy markers without a basis): ordinary jobs skip the
+        // settings read entirely, so a malformed/unavailable scope
+        // configuration can never burn their attempts before retrieval. A
+        // scope-read failure for a promoted job errors the attempt (fail
+        // closed, retryable) rather than spending quota on a stale assumption.
+        const recordMetadata = (authorityQueryRecord as { generation_metadata?: unknown }).generation_metadata;
+        let scopePromotionActive: boolean | undefined;
+        if (isScopePromotedRecord(recordMetadata)) {
+          const liveScope = await getDiscoveryScope();
+          scopePromotionActive =
+            resolveScopePromotionForScope(liveScope, country) != null;
+        }
         const queryAuthority = evaluateAutonomousQueryAuthority(authorityQueryRecord, {
-          scopePromotionActive:
-            resolveScopePromotion(liveScope.scope, liveScope.selectedCountries, country) != null,
+          scopePromotionActive,
         });
         if (!queryAuthority.eligible) {
           console.log(`[Unified Query Authority] Withheld automated search job ${job.id} for "${query}" (${country}) before spending YouTube quota: ${queryAuthority.reasonCodes.join(', ')}.`);

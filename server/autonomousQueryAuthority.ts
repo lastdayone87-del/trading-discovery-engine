@@ -64,6 +64,27 @@ function metadataOf(query: QueryRecord): Record<string, any> {
 }
 
 /**
+ * Whether a stored query record carries a scope-promotion marker of any
+ * basis (PERSISTENT_SCOPE_SELECTION, DIRECT_TARGET, or a legacy marker
+ * without promotionBasis, which authorizes as the persistent form). The
+ * queue worker uses this to read live scope only for promoted jobs: ordinary
+ * jobs skip the settings read entirely, so a malformed/unavailable scope
+ * configuration can never burn their attempts before retrieval.
+ */
+export function isScopePromotedRecord(metadata: unknown): boolean {
+  if (!metadata) return false;
+  if (typeof metadata === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(metadata);
+      return typeof parsed === 'object' && parsed !== null && (parsed as Record<string, unknown>).scopePromoted === true;
+    } catch {
+      return false;
+    }
+  }
+  return typeof metadata === 'object' && (metadata as Record<string, unknown>).scopePromoted === true;
+}
+
+/**
  * Execution-time authority gate for every autonomous query source.
  *
  * A query is not grandfathered merely because it is already stored as PROVEN or
