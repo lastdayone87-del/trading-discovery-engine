@@ -20,6 +20,9 @@ maybe('invalid-input quarantine records, reads, and expires', async t => {
   t.after(async () => {
     await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
   });
+  // Establish our own state first: an interrupted previous run may have left
+  // the fixed fixture row behind, which would poison the absence assertion.
+  await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
   assert.equal(await isYouTubeInputQuarantined('channelId', QUARANTINE_VALUE), false);
   await recordYouTubeInvalidInput('channelId', QUARANTINE_VALUE, 'channel-uploads', 60_000);
   assert.equal(await isYouTubeInputQuarantined('channelId', QUARANTINE_VALUE), true);

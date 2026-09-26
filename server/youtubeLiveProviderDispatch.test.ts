@@ -31,7 +31,24 @@ test('youtubeFetch performs live reselection inside scheduler dispatch and rebui
   assert.doesNotMatch(youtubeFetch,/activeKeyIndex=dispatchIndex/);
   assert.doesNotMatch(youtubeFetch,/youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
   assert.match(reader,/youtubeProviderCooldown\.succeeded\(context\.providerKey,context\.providerFailureGeneration\)/);
-  assert.match(youtubeFetch,/providerFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined/);
+  assert.match(youtubeFetch,/dispatchFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined/);
   assert.match(reader,/validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
   assert.match(reader,/if\(validatedIndex>=0\)activeKeyIndex=advanceYouTubeRotation\(validatedPool\.length,validatedIndex\)/);
+});
+
+test('youtubeFetch gates dispatch on suspension hydration and captures generation before fetch', () => {
+  const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
+  // Workers start before DB readiness: dispatch must await the shared
+  // hydration promise so a restart cannot reprobe a durably suspended key.
+  const gate = youtubeFetch.indexOf('await ensureYouTubeSuspensionHydration()');
+  const timeoutRead = youtubeFetch.indexOf('getAppSetting');
+  assert.ok(gate >= 0 && gate < timeoutRead, 'hydration gate must precede all dispatch work');
+  // The failure generation must predate the request: a suspension landing
+  // mid-flight has to compare stale when the response is validated.
+  const genCapture = youtubeFetch.indexOf('dispatchFailureGeneration=dispatchedProviderKey?youtubeProviderCooldown.failureGeneration(dispatchedProviderKey):undefined');
+  const fetchCall = youtubeFetch.indexOf('response=await fetch(dispatchedUrl');
+  assert.ok(genCapture >= 0 && fetchCall > genCapture, 'generation must be captured before fetch resolves');
+  assert.match(youtubeFetch, /providerFailureGeneration:dispatchFailureGeneration/);
+  assert.doesNotMatch(youtubeFetch, /providerFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration/);
 });

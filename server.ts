@@ -57,7 +57,7 @@ import {
   enqueueRelationshipCanaryRun
 } from './server/queueManager';
 import { sanitizeSearchQuery } from './server/youtube';
-import { hydrateYouTubeProviderSuspensions } from './server/youtubeKeyHealth';
+import { ensureYouTubeSuspensionHydration } from './server/youtubeKeyHealth';
 import {
   runAutonomousDiscoveryCycle,
   getAutonomousDiscoveryStatus,
@@ -813,7 +813,7 @@ async function startServer() {
         // cause already-dead keys to be reprobed. Best effort: an empty or
         // unreachable table must never block readiness.
         { name: 'youtube suspension hydration', run: async () => {
-          const summary = await hydrateYouTubeProviderSuspensions().catch(() => ({ restored: 0, skipped: 0 }));
+          const summary = await ensureYouTubeSuspensionHydration();
           if (summary.restored > 0 || summary.skipped > 0) console.log(`[Startup] YouTube suspensions hydrated: ${summary.restored} restored, ${summary.skipped} skipped (pool changed).`);
         } },
         { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } }

@@ -37,9 +37,21 @@ test('a new quota day has zero usage for every configured key while preserving t
 
 test('every durable YouTube API charge receives the actually dispatched response key', () => {
   const source = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
-  const chargeLines = source.split('\n').filter(line => line.includes('incrementQuota('));
+  // Durable charges flow either through incrementQuota directly or through
+  // accountYouTubeQuotaResponse (same-response accounting retry); both must
+  // resolve the key from the actual provider response, never a loop variable.
+  const wrapperStart = source.indexOf('async function accountYouTubeQuotaResponse');
+  assert.ok(wrapperStart >= 0, 'same-response accounting wrapper must exist');
+  const wrapperEnd = source.indexOf('\n}\n', wrapperStart);
+  const wrapper = source.slice(wrapperStart, wrapperEnd);
+  assert.match(wrapper, /getYouTubeResponseProviderKey\(response\)/);
+  assert.match(wrapper, /retryYouTubeQuotaAccounting/);
+  // Outside the wrapper (which resolves the key from the response above),
+  // every durable charge must carry the response-resolved key inline.
+  const outside = source.slice(0, wrapperStart) + source.slice(wrapperEnd);
+  const chargeLines = outside.split('\n').filter(line => line.includes('incrementQuota(') || line.includes('accountYouTubeQuotaResponse('));
   assert.ok(chargeLines.length >= 10);
-  assert.equal(chargeLines.some(line => !line.includes('getYouTubeResponseProviderKey(')), false);
+  assert.equal(chargeLines.some(line => line.includes('incrementQuota(') && !line.includes('getYouTubeResponseProviderKey(')), false);
   assert.match(source, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey/);
 });
 

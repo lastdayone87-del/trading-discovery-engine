@@ -19,16 +19,18 @@ const CHANNEL_ID_PATTERN = /^UC[A-Za-z0-9_-]{22}$/;
 
 /** Normalizes a raw input into its stable quarantine identity, or null when
  * the value is not worth remembering (empty, unparsable). Channel IDs are
- * stored raw (bounded format, not secrets); queries are normalized and
- * truncated for debuggability. */
+ * stored raw (bounded format, not secrets); search queries are normalized in
+ * full and stored as SHA-256 digests so no query text is persisted and
+ * long queries sharing a prefix cannot collide. */
 export function normalizeYouTubeQuarantineInput(kind: YouTubeQuarantineInputKind, raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
   if (kind === 'channelId') {
     const candidate = raw.trim();
     return CHANNEL_ID_PATTERN.test(candidate) ? candidate : null;
   }
-  const candidate = raw.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en').slice(0, 120);
-  return candidate ? candidate : null;
+  const candidate = raw.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en');
+  if (!candidate) return null;
+  return createHash('sha256').update(candidate).digest('hex');
 }
 
 /** Derives the quarantinable input for an operation from its dispatched URL.
@@ -59,6 +61,37 @@ export function isYouTubeInputFailure(error: unknown): boolean {
   return status === 400 || status === 404 || status === 422;
 }
 
+/** Whether a successful response may clear a durable suspension row: only
+ * when the response generation is still current (not overtaken by a newer
+ * suspension event while in flight) AND the request was actually operating
+ * under suspension. A stale success must never rehabilitate the key. */
+export function shouldClearYouTubeSuspension(providerSuccessIsCurrent: boolean, wasSuspended: boolean): boolean {
+  return providerSuccessIsCurrent === true && wasSuspended === true;
+}
+
+/** Retries quota accounting against the SAME successful provider response
+ * instead of issuing another provider request: the quota was already spent
+ * at Google, so a transient accounting failure must not trigger key
+ * failover and a wasteful refetch. Throws after maxAttempts so a persistently
+ * down ledger still surfaces instead of publishing an unaccounted checkpoint.
+ * Pure dependency injection: runtime-testable without a database. */
+export async function retryYouTubeQuotaAccounting(
+  account: (units: number) => Promise<void>,
+  units: number,
+  maxAttempts = 2,
+): Promise<void> {
+  const attempts = Number.isSafeInteger(maxAttempts) && maxAttempts >= 1 ? maxAttempts : 1;
+  let attempt = 0;
+  for (;;) {
+    attempt += 1;
+    try {
+      await account(units);
+      return;
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+    }
+  }
+}
 /** Next rotation slot after a success: healthy keys share the workload in
  * stable order instead of one key absorbing everything until it fails. */
 export function advanceYouTubeRotation(poolLength: number, validatedIndex: number): number {
@@ -112,6 +145,20 @@ export function annotateYouTubeErrorMetadata(metadata: Record<string, string | n
 export interface YouTubeSuspensionHydration {
   restored: number;
   skipped: number;
+}
+
+/** Shared hydration promise: YouTube dispatch awaits the same promise the
+ * startup task triggers, so workers cannot use a durably suspended key
+ * before its cooldown is restored. Resolves (never rejects) with the
+ * fallback result when hydration is unavailable, preserving existing
+ * error behavior. The health endpoint never touches this path. */
+let sharedSuspensionHydration: Promise<YouTubeSuspensionHydration> | null = null;
+
+export function ensureYouTubeSuspensionHydration(): Promise<YouTubeSuspensionHydration> {
+  if (!sharedSuspensionHydration) {
+    sharedSuspensionHydration = hydrateYouTubeProviderSuspensions().catch(() => ({ restored: 0, skipped: 0 }));
+  }
+  return sharedSuspensionHydration;
 }
 
 /** Restores durable suspensions into the in-memory cooldown after a

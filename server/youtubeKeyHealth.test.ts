@@ -7,9 +7,12 @@ import {
   advanceYouTubeRotation,
   annotateYouTubeErrorMetadata,
   buildYouTubeTelemetryMetadata,
+  ensureYouTubeSuspensionHydration,
   extractYouTubeQuarantineInput,
   isYouTubeInputFailure,
   normalizeYouTubeQuarantineInput,
+  retryYouTubeQuotaAccounting,
+  shouldClearYouTubeSuspension,
   youtubeDeploymentId,
 } from './youtubeKeyHealth';
 import {
@@ -36,15 +39,22 @@ test('channel IDs normalize strictly; anything else is not worth remembering', (
   assert.equal(normalizeYouTubeQuarantineInput('channelId', ''), null);
 });
 
-test('search queries normalize case-insensitively and truncate', () => {
-  assert.equal(normalizeYouTubeQuarantineInput('searchQuery', '  OBX   Aksjehandel '), 'obx aksjehandel');
+test('search queries normalize in full, then hash (no cleartext, no prefix collisions)', () => {
+  const a = normalizeYouTubeQuarantineInput('searchQuery', '  OBX   Aksjehandel ');
+  const b = normalizeYouTubeQuarantineInput('searchQuery', 'obx aksjehandel');
+  assert.ok(a && /^[0-9a-f]{64}$/.test(a), 'normalized query must persist as a SHA-256 hex digest');
+  assert.equal(a, b, 'casing/whitespace variants share one identity');
   assert.equal(normalizeYouTubeQuarantineInput('searchQuery', '   '), null);
   assert.equal(normalizeYouTubeQuarantineInput('searchQuery', undefined), null);
-  const long = normalizeYouTubeQuarantineInput('searchQuery', 'x'.repeat(500));
-  assert.ok(long && long.length <= 120);
+  // Distinct long queries sharing the first 120 characters must not collide.
+  const prefix = 'y'.repeat(120);
+  const first = normalizeYouTubeQuarantineInput('searchQuery', `${prefix} one`);
+  const second = normalizeYouTubeQuarantineInput('searchQuery', `${prefix} two`);
+  assert.ok(first && second && /^[0-9a-f]{64}$/.test(first) && /^[0-9a-f]{64}$/.test(second));
+  assert.notEqual(first, second, 'full-query hashing keeps distinct queries distinct');
 });
 
-test('quarantine input extraction prefers channel identity, falls back to query', () => {
+test('quarantine input extraction prefers channel identity, falls back to query hash', () => {
   assert.deepEqual(
     extractYouTubeQuarantineInput('channel-uploads', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&channelId=UCabcdefghijklmnopqrstuv&key=K'),
     { kind: 'channelId', value: 'UCabcdefghijklmnopqrstuv' },
@@ -53,10 +63,10 @@ test('quarantine input extraction prefers channel identity, falls back to query'
     extractYouTubeQuarantineInput('channel-details', 'https://youtube.googleapis.com/youtube/v3/channels?part=snippet&id=UCabcdefghijklmnopqrstuv&key=K'),
     { kind: 'channelId', value: 'UCabcdefghijklmnopqrstuv' },
   );
-  assert.deepEqual(
-    extractYouTubeQuarantineInput('search', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&q=OBX+Aksjehandel&key=K'),
-    { kind: 'searchQuery', value: 'obx aksjehandel' },
-  );
+  const extracted = extractYouTubeQuarantineInput('search', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&q=OBX+Aksjehandel&key=K');
+  assert.equal(extracted?.kind, 'searchQuery');
+  assert.ok(extracted && /^[0-9a-f]{64}$/.test(extracted.value), 'extracted query identity must be the hash');
+  assert.equal(extracted?.value, normalizeYouTubeQuarantineInput('searchQuery', 'OBX Aksjehandel'));
   assert.equal(extractYouTubeQuarantineInput('search', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&key=K'), null);
   assert.equal(extractYouTubeQuarantineInput('channel-uploads', 'not a url'), null);
 });
@@ -152,4 +162,64 @@ test('playlistItems payloads adapt into the search item shape enrichment consume
   assert.equal(adapted.items[1].id.videoId, null);
   assert.deepEqual(adaptPlaylistItemsToSearchShape({}).items, []);
   assert.deepEqual(adaptPlaylistItemsToSearchShape({ items: 'nope' as unknown as [] }).items, []);
+});
+
+test('quota accounting retries the same response, then surfaces persistent failure', async () => {
+  const calls: number[] = [];
+  await retryYouTubeQuotaAccounting(async units => { calls.push(units); }, 100);
+  assert.deepEqual(calls, [100], 'success accounts exactly once');
+  const flaky: number[] = [];
+  let attempts = 0;
+  await retryYouTubeQuotaAccounting(async units => {
+    flaky.push(units);
+    attempts += 1;
+    if (attempts < 2) throw new Error('transient ledger blip');
+  }, 1);
+  assert.deepEqual(flaky, [1, 1], 'a transient failure retries the same units, never a new request');
+  const dead: number[] = [];
+  await assert.rejects(
+    retryYouTubeQuotaAccounting(async units => { dead.push(units); throw new Error('ledger down'); }, 100),
+    /ledger down/,
+  );
+  assert.deepEqual(dead, [100, 100], 'persistent failure retries once, then throws without publishing');
+  const custom: number[] = [];
+  await assert.rejects(retryYouTubeQuotaAccounting(async units => { custom.push(units); throw new Error('x'); }, 5, 1), /x/);
+  assert.deepEqual(custom, [5], 'maxAttempts=1 never retries');
+});
+
+test('durable suspension clears only on a current success under suspension', () => {
+  // Regression: an older in-flight success arriving after a newer suspension
+  // event is stale (providerSuccessIsCurrent=false) and must not clear the
+  // durable row, even though the request ran while suspended.
+  assert.equal(shouldClearYouTubeSuspension(true, true), true);
+  assert.equal(shouldClearYouTubeSuspension(false, true), false, 'stale success must not rehabilitate');
+  assert.equal(shouldClearYouTubeSuspension(true, false), false, 'non-suspended keys have no row to clear');
+  assert.equal(shouldClearYouTubeSuspension(false, false), false);
+});
+
+test('stale generation never validates: older in-flight success after suspension', async () => {
+  const { YouTubeProviderCooldown } = await import('./youtubeProviderCooldown');
+  let now = 1_000;
+  const providers = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  // Older request dispatches first and captures generation 0.
+  const dispatchGeneration = providers.failureGeneration('key-a');
+  // A newer request fails with suspension while the older one is in flight.
+  providers.failed('key-a', 'CONSUMER_SUSPENDED');
+  assert.equal(providers.isSuspended('key-a'), true);
+  // The older response arrives: its captured generation is stale.
+  const providerSuccessIsCurrent = providers.succeeded('key-a', dispatchGeneration);
+  assert.equal(providerSuccessIsCurrent, false, 'older generation must compare stale');
+  assert.equal(shouldClearYouTubeSuspension(providerSuccessIsCurrent, true), false, 'durable row must survive');
+  assert.equal(providers.isSuspended('key-a'), true, 'in-memory suspension must survive');
+  // A genuinely current success still rehabilitates.
+  const currentGeneration = providers.failureGeneration('key-a');
+  assert.equal(providers.succeeded('key-a', currentGeneration), true);
+});
+
+test('hydration gate is shared and never rejects', async () => {
+  const first = ensureYouTubeSuspensionHydration();
+  const second = ensureYouTubeSuspensionHydration();
+  assert.equal(first, second, 'dispatch and startup must await the same promise');
+  const summary = await first;
+  assert.deepEqual(Object.keys(summary).sort(), ['restored', 'skipped']);
 });
