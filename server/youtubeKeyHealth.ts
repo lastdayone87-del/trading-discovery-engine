@@ -61,6 +61,35 @@ export function isYouTubeInputFailure(error: unknown): boolean {
   return status === 400 || status === 404 || status === 422;
 }
 
+const PAGE_TOKEN_REASON_PATTERN = /pagetoken/i;
+
+/** Whether a 400/404/422 was caused by the request's page token rather than
+ * its input: YouTube rejects stale/foreign page tokens with 400
+ * (invalidPageToken), but the query or channel in that URL is still valid.
+ * Quarantining it would suppress a healthy input for 7 days, so token
+ * failures are excluded from input quarantine while every other
+ * invalid-input failure still records. */
+export function isYouTubePageTokenFailure(error: unknown): boolean {
+  const reasons = (error as { providerReasons?: unknown } | null)?.providerReasons;
+  return Array.isArray(reasons) && reasons.some(reason => PAGE_TOKEN_REASON_PATTERN.test(String(reason)));
+}
+
+/** Serializes durable suspension writes (persist + clear) in process
+ * arrival order. The pool runs several clients, so without this a gated
+ * clear issued before a concurrent re-suspension's upsert can still execute
+ * after it and delete the fresh row. Chaining guarantees the upsert lands
+ * after an earlier-issued clear (row recreated) and a later-issued clear
+ * rechecks after the upsert (row preserved). Failures never break the
+ * chain. Cross-replica races are out of scope (single-writer assumption
+ * matches the existing durable-suspension design). */
+let suspensionWriteChain: Promise<unknown> = Promise.resolve();
+
+export function serializeYouTubeSuspensionWrite<T>(task: () => Promise<T>): Promise<T> {
+  const result = suspensionWriteChain.then(() => task());
+  suspensionWriteChain = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 /** Whether a successful response may clear a durable suspension row: only
  * when the response generation is still current (not overtaken by a newer
  * suspension event while in flight) AND the request was actually operating
@@ -73,12 +102,14 @@ export function shouldClearYouTubeSuspension(providerSuccessIsCurrent: boolean, 
  * newer failure was recorded after this response validated. failed() and
  * restoreSuspended() bump the in-memory failure generation synchronously,
  * so any suspension created between validation and this call compares
- * unequal and its fresh durable row survives. The caller awaits this (never
- * fire-and-forget) so the recheck lands as late as possible. Returns false
- * without touching the database when the response is not eligible; errors
- * propagate so the caller decides (read path swallows them: a missed clear
- * only delays rehabilitation, never resurrects a dead key). Dependencies
- * are injectable for unit tests; production callers omit them. */
+ * unequal and its fresh durable row survives. The recheck and the delete
+ * run inside the shared suspension-write chain so a concurrent
+ * re-suspension's upsert cannot slip between them and lose the fresh row.
+ * The caller awaits this (never fire-and-forget). Returns false without
+ * touching the database when the response is not eligible; errors propagate
+ * so the caller decides (read path swallows them: a missed clear only
+ * delays rehabilitation, never resurrects a dead key). Dependencies beyond
+ * the chain are injectable for unit tests; production callers omit them. */
 export async function clearYouTubeSuspensionIfCurrent(
   providerKey: string,
   observedGeneration: number | undefined,
@@ -88,10 +119,12 @@ export async function clearYouTubeSuspensionIfCurrent(
   } = {},
 ): Promise<boolean> {
   if (!providerKey || observedGeneration === undefined) return false;
-  const current = (deps.currentGeneration || ((key: string) => youtubeProviderCooldown.failureGeneration(key)))(providerKey);
-  if (current !== observedGeneration) return false;
-  await (deps.clear || clearYouTubeProviderSuspension)(fingerprintYouTubeKey(providerKey));
-  return true;
+  return serializeYouTubeSuspensionWrite(async () => {
+    const current = (deps.currentGeneration || ((key: string) => youtubeProviderCooldown.failureGeneration(key)))(providerKey);
+    if (current !== observedGeneration) return false;
+    await (deps.clear || clearYouTubeProviderSuspension)(fingerprintYouTubeKey(providerKey));
+    return true;
+  });
 }
 
 /** Retries quota accounting against the SAME successful provider response

@@ -743,6 +743,30 @@ export async function getQuota():Promise<QuotaInfoExtended>{
   return {unitsUsed:Number(row.units_used||0),dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:projection.map((item,index)=>{const key=keys[index];const provider=youtubeProviderCooldown.status(key);return {...item,maskedKey:'****',isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};
 }
 
+/** Claims one accounting operation ID inside the caller's transaction.
+ * Returns true when the caller must proceed with the charge, false when this
+ * operation ID already accounted the response (retry after an unknown commit
+ * outcome: skip the duplicate charge). Uses a savepoint so a guard failure
+ * never poisons the surrounding transaction: without it, any guard error
+ * (notably undefined_table before migration 133 applies) aborts the whole
+ * transaction and every later statement fails with in_failed_sql_transaction.
+ * Pre-migration databases fall through to the plain charge (42P01 only).
+ * Exported for focused regression tests; production callers go through
+ * incrementQuota(). */
+export async function claimYouTubeQuotaOperation(client:QueryExecutor, operationId:string, today:string, keyFingerprint:string, units:number):Promise<boolean>{
+  await client.query('SAVEPOINT youtube_quota_op_guard');
+  try {
+    const seen = await client.query(`INSERT INTO youtube_quota_accounting_ops(op_id,quota_day,key_fingerprint,units) VALUES($1,$2,$3,$4) ON CONFLICT(op_id) DO NOTHING RETURNING op_id`,[operationId,today,keyFingerprint,units]);
+    await client.query('RELEASE SAVEPOINT youtube_quota_op_guard');
+    return (seen.rowCount || 0) > 0;
+  } catch (guardError) {
+    await client.query('ROLLBACK TO SAVEPOINT youtube_quota_op_guard').catch(()=>undefined);
+    await client.query('RELEASE SAVEPOINT youtube_quota_op_guard').catch(()=>undefined);
+    if ((guardError as { code?: unknown } | null)?.code !== '42P01') throw guardError;
+    return true;
+  }
+}
+
 export async function incrementQuota(units:number, providerKey:string, operationId?: string):Promise<void>{
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
@@ -753,15 +777,8 @@ export async function incrementQuota(units:number, providerKey:string, operation
       // Idempotency guard: one row per accounted provider response, written
       // in the same transaction as the charge. A retry after an unknown
       // commit outcome finds its own operation ID and skips the duplicate
-      // charge. Pre-migration databases have no such table: fall through
-      // to the plain charge so accounting keeps working until migration
-      // 133 applies (undefined_table is the only tolerated failure here).
-      try {
-        const seen = await client.query(`INSERT INTO youtube_quota_accounting_ops(op_id,quota_day,key_fingerprint,units) VALUES($1,$2,$3,$4) ON CONFLICT(op_id) DO NOTHING RETURNING op_id`,[operationId,today,fingerprintYouTubeKey(providerKey),units]);
-        if ((seen.rowCount || 0) === 0) { await client.query('COMMIT'); return; }
-      } catch (guardError) {
-        if ((guardError as { code?: unknown } | null)?.code !== '42P01') throw guardError;
-      }
+      // charge instead of double-counting the same response.
+      if (!await claimYouTubeQuotaOperation(client, operationId, today, fingerprintYouTubeKey(providerKey), units)) { await client.query('COMMIT'); return; }
     }
     await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }

@@ -12,10 +12,12 @@ import {
   clearYouTubeSuspensionIfCurrent,
   extractYouTubeQuarantineInput,
   isYouTubeInputFailure,
+  isYouTubePageTokenFailure,
   isYouTubeQuotaAccountingError,
   normalizeYouTubeQuarantineInput,
   retryYouTubeQuotaAccounting,
   ensureYouTubeSuspensionHydration,
+  serializeYouTubeSuspensionWrite,
   shouldClearYouTubeSuspension,
   youtubeDeploymentId,
   type YouTubeQuarantineInputKind,
@@ -272,7 +274,9 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
     const pool = getYouTubeKeyPool();
     const index = pool.indexOf(providerKey);
     const configured = getConfiguredYouTubeProviders().find(item => item.key === providerKey);
-    await recordYouTubeProviderSuspension({
+    // Serialized with gated clears (arrival order): a re-suspension issued
+    // after an in-flight clear executes after it, so the fresh row survives.
+    await serializeYouTubeSuspensionWrite(() => recordYouTubeProviderSuspension({
       keyFingerprint: fingerprintYouTubeKey(providerKey),
       keyIndex: index >= 0 ? index + 1 : 0,
       envName: configured?.envName || '',
@@ -280,7 +284,7 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
       status: reason === 'INVALID_API_KEY' ? 'INVALID_KEY' : 'SUSPENDED',
       retryAfterMs: YOUTUBE_SUSPENSION_RETRY_AFTER_MS,
       reason,
-    });
+    }));
   } catch {
     // Durable suspension is telemetry-grade hardening; a write failure must
     // never mask the original provider error.
@@ -458,7 +462,7 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
             annotateYouTubeErrorMetadata(requestMetadata, error);
             if(consumerSuspended) await persistYouTubeKeySuspension(dispatchedProviderKey,'CONSUMER_SUSPENDED').catch(()=>undefined);
             else if(isInvalidApiKey(error)) await persistYouTubeKeySuspension(dispatchedProviderKey,'INVALID_API_KEY').catch(()=>undefined);
-            else if(isYouTubeInputFailure(error)){
+            else if(isYouTubeInputFailure(error) && !isYouTubePageTokenFailure(error)){
               const input=extractYouTubeQuarantineInput(operation,dispatchedUrl);
               if(input) await recordYouTubeInvalidInput(input.kind,input.value,operation,YOUTUBE_INPUT_QUARANTINE_TTL_MS).catch(()=>undefined);
             }

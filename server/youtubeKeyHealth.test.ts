@@ -13,9 +13,11 @@ import {
   extractYouTubeQuarantineInput,
   hydrateYouTubeProviderSuspensions,
   isYouTubeInputFailure,
+  isYouTubePageTokenFailure,
   isYouTubeQuotaAccountingError,
   normalizeYouTubeQuarantineInput,
   retryYouTubeQuotaAccounting,
+  serializeYouTubeSuspensionWrite,
   shouldClearYouTubeSuspension,
   youtubeDeploymentId,
   YouTubeQuotaAccountingError,
@@ -349,4 +351,79 @@ test('uploads adapter prefers the video publication time over the playlist-add t
   // list-call cost is per call, not per part) so the adapter can see it.
   const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   assert.match(youtube, /buildYouTubeApiUrl\('playlistItems',apiKey,\{part:'snippet,contentDetails',playlistId:String\(uploadsPlaylistId\)/);
+});
+
+test('page-token failures never quarantine the valid input they rode along with', () => {
+  assert.equal(isYouTubePageTokenFailure({ providerReasons: ['invalidPageToken'] }), true);
+  assert.equal(isYouTubePageTokenFailure({ providerReasons: ['quotaExceeded', 'invalidPageToken'] }), true);
+  assert.equal(isYouTubePageTokenFailure({ providerReasons: ['invalidSearchFilter'] }), false);
+  assert.equal(isYouTubePageTokenFailure({ providerReasons: [] }), false);
+  assert.equal(isYouTubePageTokenFailure({}), false);
+  assert.equal(isYouTubePageTokenFailure(null), false);
+  assert.equal(isYouTubePageTokenFailure({ providerReasons: 'invalidPageToken' }), false, 'non-array reasons are ignored');
+  // The hazard this guards: a search URL carrying a page token still
+  // extracts the query identity, so without the guard a stale token would
+  // quarantine a healthy query for 7 days of silent discovery gaps.
+  const extracted = extractYouTubeQuarantineInput('search', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&q=OBX+Aksjehandel&pageToken=CAUQAA&key=K');
+  assert.equal(extracted?.kind, 'searchQuery');
+  assert.equal(extracted?.value, normalizeYouTubeQuarantineInput('searchQuery', 'OBX Aksjehandel'));
+  // The record branch consults the guard; every other 400/404/422 still records.
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  assert.match(youtube, /else if\(isYouTubeInputFailure\(error\) && !isYouTubePageTokenFailure\(error\)\)\{/);
+});
+
+test('suspension writes serialize so a newer durable row survives a gated clear', async () => {
+  const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+  // FIFO under interleaved awaits, and a rejection never breaks the chain.
+  const order: string[] = [];
+  await Promise.all([
+    serializeYouTubeSuspensionWrite(async () => { await tick(); order.push('first'); }),
+    serializeYouTubeSuspensionWrite(async () => { await tick(); order.push('second'); }),
+  ]);
+  assert.deepEqual(order, ['first', 'second']);
+  await assert.rejects(serializeYouTubeSuspensionWrite(async () => { throw new Error('boom'); }), /boom/);
+  const after: string[] = [];
+  await serializeYouTubeSuspensionWrite(async () => { after.push('runs-after-rejection'); });
+  assert.deepEqual(after, ['runs-after-rejection']);
+  // Durable-row model over a Map standing in for the suspension table.
+  // UNSERIALIZED (old behavior), staged deterministically: the recheck
+  // passes, a concurrent record lands during the delete's await, the
+  // delete lands last and wipes the fresh row.
+  const rows = new Map<string, number>();
+  const record = async (fp: string) => { await tick(); rows.set(fp, (rows.get(fp) || 0) + 1); };
+  const remove = async (fp: string) => { await tick(); rows.delete(fp); };
+  rows.set('fp', 1);
+  const staleClear = (async () => { await tick(); await remove('fp'); })();
+  await record('fp');
+  await staleClear;
+  assert.equal(rows.has('fp'), false, 'unserialized clear deletes the fresh row (reproduces the finding)');
+  // SERIALIZED (fixed behavior), same staging: both writes share the
+  // chain, so the record ordered after the clear recreates the row.
+  rows.set('fp', 1);
+  const gatedClear = serializeYouTubeSuspensionWrite(async () => { await tick(); await remove('fp'); });
+  const concurrentRecord = serializeYouTubeSuspensionWrite(() => record('fp'));
+  await Promise.all([gatedClear, concurrentRecord]);
+  assert.equal(rows.get('fp'), 1, 'serialized writes preserve the newer suspension');
+  // Production wiring: the persist path shares the chain with gated clears.
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  assert.match(youtube, /serializeYouTubeSuspensionWrite\(\(\) => recordYouTubeProviderSuspension\(\{/);
+});
+
+test('suspended keys reprobe on a documented daily cadence (durable row is restart backup)', async () => {
+  const { YouTubeProviderCooldown } = await import('./youtubeProviderCooldown');
+  let now = 1_000_000;
+  const cooldown = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  cooldown.failed('key-a', 'CONSUMER_SUSPENDED');
+  assert.equal(cooldown.eligible('key-a'), false);
+  now += 24 * 60 * 60_000 - 1;
+  assert.equal(cooldown.eligible('key-a'), false, 'still suspended just inside the 24h window');
+  now += 1;
+  assert.equal(cooldown.eligible('key-a'), true, 'reprobe due after 24h by design: 4xx probes cost no quota and re-suspend on failure');
+  // The durable horizon stays 7 days: it backs restarts via hydration, it
+  // was never a 7-day dispatch ban (migration 132 keeps in-memory authority
+  // on the hot path), and the probe count exists precisely because periodic
+  // reprobes are the intended liveness cadence.
+  assert.equal(YOUTUBE_SUSPENSION_RETRY_AFTER_MS, 7 * 24 * 60 * 60_000);
+  const migration = readFileSync(new URL('./db/migrations/132_youtube_key_health.sql', import.meta.url), 'utf8');
+  assert.match(migration, /hot-path authority/);
 });
