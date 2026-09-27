@@ -265,6 +265,26 @@ test('accounting wrapper uses one stable operation ID and surfaces accounting er
   assert.match(dbCore, /INSERT INTO youtube_quota_accounting_ops\(op_id,quota_day,key_fingerprint,units\)/);
   assert.match(dbCore, /ON CONFLICT\(op_id\) DO NOTHING RETURNING op_id/);
   assert.ok(existsSync(new URL('./db/migrations/133_youtube_quota_accounting_idempotency.sql', import.meta.url)), 'idempotency table migration must exist');
+  const migration = readFileSync(new URL('./db/migrations/133_youtube_quota_accounting_idempotency.sql', import.meta.url), 'utf8');
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS youtube_quota_accounting_ops/);
+  assert.match(migration, /CREATE INDEX IF NOT EXISTS youtube_quota_accounting_ops_created_at_idx/);
+});
+
+test('idempotency ledger is pruned on a schedule outside the charge path', async () => {
+  const { pruneYouTubeQuotaAccountingOps } = await import('./dbCore');
+  assert.equal(await pruneYouTubeQuotaAccountingOps(0), 0, 'non-positive retention prunes nothing without touching the database');
+  assert.equal(await pruneYouTubeQuotaAccountingOps(NaN), 0);
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const prune = dbCore.slice(dbCore.indexOf('export async function pruneYouTubeQuotaAccountingOps'));
+  assert.match(prune, /DELETE FROM youtube_quota_accounting_ops WHERE created_at </);
+  assert.match(prune, /code === '42P01'/);
+  // Startup (not per-charge) invokes it best-effort; the charge path never
+  // references the prune so accounting transactions scan no history.
+  const startup = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+  const purgeTask = startup.slice(startup.indexOf("'startup maintenance purge'"));
+  assert.match(purgeTask, /pruneYouTubeQuotaAccountingOps\(\)\.catch\(\(\) => 0\)/);
+  const charge = dbCore.slice(dbCore.indexOf('export async function incrementQuota'), dbCore.indexOf('export async function getSchemaInfo'));
+  assert.doesNotMatch(charge, /pruneYouTubeQuotaAccountingOps/);
 });
 
 test('durable clear is generation-gated and awaited, never deleting a newer suspension', async () => {

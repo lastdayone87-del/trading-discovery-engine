@@ -852,6 +852,24 @@ export async function settleProviderRequest(requestId:string,status:'SUCCEEDED'|
   }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 export async function purgeSyntheticTestChannels():Promise<number>{const db=await getDb(); const res=await db.query("DELETE FROM channels WHERE channel_id LIKE 'UC_STRESS_TEST_%' RETURNING channel_id"); return res.rowCount||0;}
+
+/** Retains at most `retentionMs` of quota-accounting idempotency rows (7-day
+ * default). Retries reference an operation ID only within seconds of the
+ * response, so a 7-day buffer is conservative. Runs at startup, never inside
+ * the accounting transaction, and tolerates a pre-migration database
+ * (undefined_table) so pruning can never break accounting. Returns rows
+ * removed for startup logging. */
+export async function pruneYouTubeQuotaAccountingOps(retentionMs = 7 * 24 * 60 * 60_000):Promise<number>{
+  if (!Number.isFinite(retentionMs) || retentionMs <= 0) return 0;
+  const db=await getDb();
+  try {
+    const res=await db.query(`DELETE FROM youtube_quota_accounting_ops WHERE created_at < now() - ($1||' milliseconds')::interval`,[String(Math.trunc(retentionMs))]);
+    return res.rowCount||0;
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
+    throw error;
+  }
+}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
