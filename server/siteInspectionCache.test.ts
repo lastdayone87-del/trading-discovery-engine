@@ -1,0 +1,137 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import {
+  SITE_INSPECTION_FRESH_TTL_MS,
+  SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS,
+  isSiteInspectionReusable,
+  buildBorrowedSiteInspection,
+  needsRenderedRecrawl,
+  checksumSiteFacts,
+  type CachedSiteInspection,
+} from './siteInspectionCache';
+import { pruneSiteInspections } from './dbCore';
+
+const NOW = Date.parse('2026-09-28T00:00:00.000Z');
+const hoursAgo = (hours: number) => new Date(NOW - hours * 3_600_000).toISOString();
+
+function row(partial: Partial<CachedSiteInspection> = {}): CachedSiteInspection {
+  return {
+    siteIdentity: 'apextrader.com',
+    identityTier: 'A',
+    canonicalUrl: 'https://apextrader.com/',
+    finalUrl: 'https://apextrader.com/',
+    outcome: 'FOUND',
+    retryable: false,
+    httpStatus: 200,
+    failureClass: '',
+    detail: 'ok',
+    payloadChecksum: 'abc',
+    candidates: [],
+    observations: [],
+    renderedCovered: true,
+    lastObservedAt: hoursAgo(1),
+    ...partial,
+  };
+}
+
+test('freshness TTLs follow established roadmap semantics', () => {
+  assert.equal(SITE_INSPECTION_FRESH_TTL_MS, 30 * 24 * 60 * 60_000, 'matches COMMUNITY_FRESHNESS_INTERVAL_EXPIRED');
+  assert.equal(SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS, 24 * 60 * 60_000, 'matches activity-cooldown scale');
+});
+
+test('reuse matrix: fresh hits borrow, expired and malformed rows recrawl', () => {
+  assert.equal(isSiteInspectionReusable(row(), NOW), true);
+  assert.equal(isSiteInspectionReusable(row({ lastObservedAt: hoursAgo(24 * 30 - 1) }), NOW), true);
+  assert.equal(isSiteInspectionReusable(row({ lastObservedAt: hoursAgo(24 * 30 + 1) }), NOW), false, 'expired FOUND recrawls');
+  assert.equal(isSiteInspectionReusable(row({ outcome: 'INSPECTED_NO_MATCH', lastObservedAt: hoursAgo(24 * 29) }), NOW), true);
+  assert.equal(
+    isSiteInspectionReusable(row({ outcome: 'ACQUISITION_FAILED', retryable: true, lastObservedAt: hoursAgo(23) }), NOW),
+    true,
+    'retryable failure borrows within 24h',
+  );
+  assert.equal(
+    isSiteInspectionReusable(row({ outcome: 'ACQUISITION_FAILED', retryable: true, lastObservedAt: hoursAgo(25) }), NOW),
+    false,
+    'retryable failure recrawls after 24h',
+  );
+  assert.equal(
+    isSiteInspectionReusable(row({ outcome: 'ACQUISITION_FAILED', retryable: false, lastObservedAt: hoursAgo(24 * 29) }), NOW),
+    true,
+    'non-retryable failure follows the freshness TTL',
+  );
+  assert.equal(
+    isSiteInspectionReusable(row({ outcome: 'PARTIALLY_INSPECTED', lastObservedAt: hoursAgo(1) }), NOW),
+    true,
+    'partial borrows verbatim so retry policy sees the same result a fresh crawl would produce',
+  );
+  assert.equal(isSiteInspectionReusable(null, NOW), false);
+  assert.equal(isSiteInspectionReusable(row({ siteIdentity: '' }), NOW), false);
+  assert.equal(isSiteInspectionReusable(row({ lastObservedAt: null }), NOW), false);
+  assert.equal(isSiteInspectionReusable(row({ lastObservedAt: 'not-a-date' }), NOW), false);
+});
+
+test('borrowed observations refresh the audit trail but preserve site-facts', () => {
+  const source = row({
+    finalUrl: 'https://apextrader.com/home',
+    retryable: false,
+    observations: [
+      { requestedUrl: 'https://apextrader.com/pricing', rootUrl: 'https://apextrader.com/pricing', finalUrl: 'https://apextrader.com/home', surface: 'CREATOR_WEBSITES', required: false, outcome: 'FOUND', retryable: false, httpStatus: 200, detail: 'x', observedAt: hoursAgo(2), telemetry: { pagesInspected: 3 } },
+      { requestedUrl: 'https://apextrader.com/pricing', surface: 'CREATOR_WEBSITES', required: true, outcome: 'FOUND', retryable: false, detail: 'rendered', observedAt: hoursAgo(2) },
+    ],
+    candidates: [{ candidateId: 'c1', nativeInviteCode: 'apexroom', sourceUrl: 'https://apextrader.com/home' }],
+  });
+  const borrowed = buildBorrowedSiteInspection(source, {
+    requestedUrl: 'https://apextrader.com/',
+    surface: 'CREATOR_WEBSITES',
+    required: false,
+    wrapperUrl: undefined,
+    observedAt: new Date(NOW).toISOString(),
+  });
+  assert.equal(borrowed.observations.length, 2);
+  const [first, second] = borrowed.observations as Array<Record<string, unknown>>;
+  assert.equal(first.requestedUrl, 'https://apextrader.com/');
+  assert.equal(first.rootUrl, 'https://apextrader.com/');
+  assert.equal(first.finalUrl, 'https://apextrader.com/home', 'cached final URL carried over');
+  assert.equal(first.observedAt, new Date(NOW).toISOString(), 'fresh audit timestamp');
+  assert.equal(first.outcome, 'FOUND');
+  assert.deepEqual((first.telemetry as Record<string, unknown>).pagesInspected, 3);
+  assert.equal(first.required, false, 'static observation keeps its own required flag');
+  assert.equal(second.required, true, 'rendered observation keeps its required flag (not the borrower default)');
+  assert.equal(first.siteCacheHit, true);
+  assert.equal(first.siteIdentity, 'apextrader.com');
+  assert.equal(first.siteObservedAt, hoursAgo(1));
+  assert.deepEqual(borrowed.candidates, [{ candidateId: 'c1', nativeInviteCode: 'apexroom', sourceUrl: 'https://apextrader.com/home' }]);
+});
+
+test('rendered recrawl rule is conservative toward inspection', () => {
+  const covered = row({ renderedCovered: true });
+  const uncovered = row({ renderedCovered: false });
+  assert.equal(needsRenderedRecrawl(covered, { creatorLikelyTrading: true, staticOutcome: 'INSPECTED_NO_MATCH', hasCreatorOwned: false }), false);
+  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: false, staticOutcome: 'INSPECTED_NO_MATCH', hasCreatorOwned: false }), false);
+  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'INSPECTED_NO_MATCH', hasCreatorOwned: false }), true);
+  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'FOUND', hasCreatorOwned: false }), true, 'FOUND without owned candidate still needs escalation coverage');
+  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'FOUND', hasCreatorOwned: true }), false);
+});
+
+test('site-fact checksum is stable, order-insensitive, and content-sensitive', () => {
+  const a = checksumSiteFacts({ outcome: 'FOUND', inviteCodes: ['b', 'a'], finalUrl: 'https://x/' });
+  const b = checksumSiteFacts({ outcome: 'FOUND', inviteCodes: ['a', 'b', 'a'], finalUrl: 'https://x/' });
+  assert.equal(a, b);
+  assert.notEqual(a, checksumSiteFacts({ outcome: 'FOUND', inviteCodes: ['a'], finalUrl: 'https://x/' }));
+  assert.notEqual(a, checksumSiteFacts({ outcome: 'INSPECTED_NO_MATCH', inviteCodes: ['a', 'b'], finalUrl: 'https://x/' }));
+});
+
+test('migration creates both tables with no creator column on the site cache', () => {
+  const migration = readFileSync(new URL('./db/migrations/134_site_inspection_dedup.sql', import.meta.url), 'utf8');
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS site_inspections/);
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS creator_site_links/);
+  const siteBlock = migration.slice(migration.indexOf('CREATE TABLE IF NOT EXISTS site_inspections'), migration.indexOf('CREATE TABLE IF NOT EXISTS creator_site_links'));
+  assert.doesNotMatch(siteBlock, /channel_id/, 'a cache hit must never import creator attribution by schema construction');
+  assert.match(siteBlock, /site_identity TEXT PRIMARY KEY/);
+});
+
+test('site prune validates input without touching the database', async () => {
+  assert.equal(await pruneSiteInspections(0), 0);
+  assert.equal(await pruneSiteInspections(NaN), 0);
+});

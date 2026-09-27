@@ -757,6 +757,120 @@ export async function settleProviderRequest(requestId:string,status:'SUCCEEDED'|
   }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 export async function purgeSyntheticTestChannels():Promise<number>{const db=await getDb(); const res=await db.query("DELETE FROM channels WHERE channel_id LIKE 'UC_STRESS_TEST_%' RETURNING channel_id"); return res.rowCount||0;}
+
+export interface SiteInspectionRow {
+  siteIdentity: string;
+  identityTier: string;
+  identityBasis: string;
+  canonicalUrl: string;
+  finalUrl: string | null;
+  outcome: string;
+  retryable: boolean;
+  httpStatus: number | null;
+  failureClass: string;
+  detail: string;
+  payloadChecksum: string | null;
+  candidates: Array<Record<string, unknown>>;
+  observations: Array<Record<string, unknown>>;
+  renderedCovered: boolean;
+  provenance: Record<string, unknown>;
+  firstObservedAt: string | null;
+  lastObservedAt: string | null;
+  observedCount: number;
+}
+
+function rowToSiteInspection(item: Record<string, unknown>): SiteInspectionRow {
+  const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+  return {
+    siteIdentity: text(item.site_identity),
+    identityTier: text(item.identity_tier) || 'A',
+    identityBasis: text(item.identity_basis),
+    canonicalUrl: text(item.canonical_url),
+    finalUrl: typeof item.final_url === 'string' ? item.final_url : null,
+    outcome: text(item.outcome) || 'INSPECTED_NO_MATCH',
+    retryable: item.retryable === true,
+    httpStatus: typeof item.http_status === 'number' ? item.http_status : null,
+    failureClass: text(item.failure_class),
+    detail: text(item.detail),
+    payloadChecksum: typeof item.payload_checksum === 'string' ? item.payload_checksum : null,
+    candidates: Array.isArray(item.candidates) ? item.candidates as Array<Record<string, unknown>> : [],
+    observations: Array.isArray(item.observations) ? item.observations as Array<Record<string, unknown>> : [],
+    renderedCovered: item.rendered_covered === true,
+    provenance: (item.provenance && typeof item.provenance === 'object' ? item.provenance : {}) as Record<string, unknown>,
+    firstObservedAt: typeof item.first_observed_at === 'string' ? item.first_observed_at : (item.first_observed_at instanceof Date ? item.first_observed_at.toISOString() : null),
+    lastObservedAt: typeof item.last_observed_at === 'string' ? item.last_observed_at : (item.last_observed_at instanceof Date ? item.last_observed_at.toISOString() : null),
+    observedCount: Number(item.observed_count || 0),
+  };
+}
+
+/** Reads cached site inspections for a batch of site identities. Returns
+ * only rows present; misses are simply absent. Never throws for a missing
+ * table (pre-migration): callers treat that as a full miss and crawl. */
+export async function getSiteInspections(identities: string[]): Promise<SiteInspectionRow[]> {
+  const unique = Array.from(new Set((identities || []).filter(identity => typeof identity === 'string' && identity)));
+  if (!unique.length) return [];
+  const db = await getDb();
+  try {
+    const res = await db.query(`SELECT * FROM site_inspections WHERE site_identity = ANY($1)`, [unique]);
+    return (res.rows || []).map(rowToSiteInspection);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return [];
+    throw error;
+  }
+}
+
+/** Stores the site-facts learned by crawling one site. Last-writer-wins on
+ * repeat crawls (fresher payload replaces older); concurrent first crawls
+ * converge via ON CONFLICT. Never carries creator attribution. */
+export async function upsertSiteInspection(row: {
+  siteIdentity: string; identityTier: string; identityBasis: string;
+  canonicalUrl: string; finalUrl?: string | null; outcome: string; retryable: boolean;
+  httpStatus?: number | null; failureClass?: string; detail?: string; payloadChecksum?: string | null;
+  candidates: Array<Record<string, unknown>>; observations: Array<Record<string, unknown>>;
+  renderedCovered: boolean; provenance?: Record<string, unknown>;
+}): Promise<void> {
+  if (!row.siteIdentity) return;
+  const db = await getDb();
+  await db.query(`INSERT INTO site_inspections(site_identity,identity_tier,identity_basis,canonical_url,final_url,outcome,retryable,http_status,failure_class,detail,payload_checksum,candidates,observations,rendered_covered,provenance,first_observed_at,last_observed_at,observed_count)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),now(),1)
+    ON CONFLICT(site_identity) DO UPDATE SET identity_tier=excluded.identity_tier,identity_basis=excluded.identity_basis,canonical_url=excluded.canonical_url,final_url=excluded.final_url,outcome=excluded.outcome,retryable=excluded.retryable,http_status=excluded.http_status,failure_class=excluded.failure_class,detail=excluded.detail,payload_checksum=excluded.payload_checksum,candidates=excluded.candidates,observations=excluded.observations,rendered_covered=excluded.rendered_covered,provenance=excluded.provenance,last_observed_at=now(),observed_count=site_inspections.observed_count+1`,
+    [row.siteIdentity, row.identityTier || 'A', row.identityBasis || '', row.canonicalUrl, row.finalUrl || null, row.outcome, row.retryable, row.httpStatus ?? null, row.failureClass || '', row.detail || '', row.payloadChecksum || null, JSON.stringify(row.candidates || []), JSON.stringify(row.observations || []), row.renderedCovered, JSON.stringify(row.provenance || {})]);
+}
+
+/** Records creator -> site references (never ownership). Written on every
+ * inspection whether the crawl ran or was served from cache, so association
+ * is complete even on hits. Idempotent per (channel, site, surface). */
+export async function recordCreatorSiteLinks(channelId: string, links: Array<{ siteIdentity: string; sourceSurface: string; sourceUrl: string }>): Promise<void> {
+  if (!channelId || !Array.isArray(links) || !links.length) return;
+  const db = await getDb();
+  for (const link of links) {
+    if (!link || !link.siteIdentity) continue;
+    try {
+      await db.query(`INSERT INTO creator_site_links(channel_id,site_identity,source_surface,source_url,first_seen,last_seen)
+        VALUES($1,$2,$3,$4,now(),now())
+        ON CONFLICT(channel_id,site_identity,source_surface) DO UPDATE SET source_url=excluded.source_url,last_seen=now()`,
+        [channelId, link.siteIdentity, link.sourceSurface || '', link.sourceUrl || '']);
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === '42P01') return;
+      throw error;
+    }
+  }
+}
+
+/** Bounds the site-inspection ledger: removes rows not observed within
+ * retentionMs (default two freshness cycles). Runs at startup, never in a
+ * crawl path. Pre-migration databases resolve to zero pruned. */
+export async function pruneSiteInspections(retentionMs = 2 * 30 * 24 * 60 * 60_000): Promise<number> {
+  if (!Number.isFinite(retentionMs) || retentionMs <= 0) return 0;
+  const db = await getDb();
+  try {
+    const res = await db.query(`DELETE FROM site_inspections WHERE last_observed_at < now() - ($1||' milliseconds')::interval`, [String(Math.trunc(retentionMs))]);
+    return res.rowCount || 0;
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
+    throw error;
+  }
+}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';

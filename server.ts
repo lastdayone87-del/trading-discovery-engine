@@ -19,7 +19,7 @@ import {
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
-  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
+  purgeSyntheticTestChannels, pruneSiteInspections, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
   listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics, getCrawlerReliabilityMetrics
 
 } from './server/db';
@@ -807,7 +807,14 @@ async function startServer() {
       readiness.markDatabaseReady();
       console.log(`[Startup] PostgreSQL ready at schema version ${schema.currentVersion}; ${schema.channelCount} channels available.`);
       launchAfterReadiness([
-        { name: 'startup maintenance purge', run: async () => { await purgeSyntheticTestChannels(); } },
+        { name: 'startup maintenance purge', run: async () => {
+          await purgeSyntheticTestChannels();
+          // Bound the site-inspection ledger (rows unseen for two freshness
+          // cycles). Best effort: pre-migration databases and outages resolve
+          // to zero pruned, never a startup failure.
+          const prunedSites = await pruneSiteInspections().catch(() => 0);
+          if (prunedSites > 0) console.log(`[Startup] Pruned ${prunedSites} stale site inspection rows.`);
+        } },
         { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } }
       ]);
     }).catch(error => {
