@@ -1,5 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { ChannelActivityBand, CountryMetadataStatus, CountryVocabulary } from '../src/types';
-import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension, clearYouTubeProviderSuspension } from './db';
+import { incrementQuota, getAppSetting, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import { getConfiguredYouTubeProviders, getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
 import {
@@ -8,14 +9,17 @@ import {
   advanceYouTubeRotation,
   annotateYouTubeErrorMetadata,
   buildYouTubeTelemetryMetadata,
+  clearYouTubeSuspensionIfCurrent,
   extractYouTubeQuarantineInput,
   isYouTubeInputFailure,
+  isYouTubeQuotaAccountingError,
   normalizeYouTubeQuarantineInput,
   retryYouTubeQuotaAccounting,
   ensureYouTubeSuspensionHydration,
   shouldClearYouTubeSuspension,
   youtubeDeploymentId,
   type YouTubeQuarantineInputKind,
+  YouTubeQuotaAccountingError,
 } from './youtubeKeyHealth';
 import { executeProviderCall, ProviderCallError } from './providerResilience';
 import { RetrievalLane } from './retrievalLanes';
@@ -542,7 +546,12 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
         if(validatedIndex>=0)activeKeyIndex=advanceYouTubeRotation(validatedPool.length,validatedIndex);
       }
       if (shouldClearYouTubeSuspension(providerSuccessIsCurrent, wasSuspended)) {
-        clearYouTubeProviderSuspension(fingerprintYouTubeKey(context.providerKey)).catch(() => undefined);
+        // Generation-gated, awaited clear: another request may have
+        // suspended this key after this response validated. The gate
+        // rechecks the synchronously-bumped failure generation as late as
+        // possible so a newer suspension's fresh durable row survives.
+        // Best effort: a missed clear only delays rehabilitation.
+        await clearYouTubeSuspensionIfCurrent(context.providerKey, context.providerFailureGeneration).catch(() => undefined);
       }
     }
     context?.acquisition?.providerSucceeded();
@@ -853,22 +862,45 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
 
 /** Accounts one successful provider response: the checkpoint that lets later
  * attempts skip this provider call is assigned by callers only after this
- * resolves, so a consumed unit can never go unaccounted. */
+ * resolves, so a consumed unit can never go unaccounted. Each response gets
+ * one stable accounting operation ID (stable across this call's internal
+ * retries, unique per response) so a retry after an unknown commit outcome
+ * cannot charge the same response twice. Exhausted retries throw
+ * YouTubeQuotaAccountingError (never a provider error) so the attempt flow
+ * surfaces it without key failover or a refetch. */
 async function accountYouTubeQuotaResponse(response: Response, units: number): Promise<string> {
   const providerKey = getYouTubeResponseProviderKey(response);
-  await retryYouTubeQuotaAccounting(unitsConsumed => incrementQuota(unitsConsumed, providerKey), units);
+  const operationId = randomUUID();
+  try {
+    await retryYouTubeQuotaAccounting(unitsConsumed => incrementQuota(unitsConsumed, providerKey, operationId), units);
+  } catch (error) {
+    throw new YouTubeQuotaAccountingError(units, providerKey, { cause: error });
+  }
   return providerKey;
 }
 
 /** Adapts a playlistItems.list payload into the search.list item shape the
  * enrichment activity stats consume ({id.videoId, snippet.title,
- * snippet.description, snippet.publishedAt}). Pure and unit-tested. */
+ * snippet.description, snippet.publishedAt}). Pure and unit-tested.
+ * Timestamp fidelity: playlistItem snippet.publishedAt is when the item was
+ * added to the playlist, not when the video was published. Prefer
+ * contentDetails.videoPublishedAt (callers request the contentDetails part
+ * at no extra quota cost), falling back to snippet.publishedAt when absent
+ * so older payloads still adapt. */
 export function adaptPlaylistItemsToSearchShape(payload: { items?: Array<Record<string, any>> }): { items: Array<{ id: { videoId: string | null }; snippet: Record<string, any> }> } {
   return {
-    items: (Array.isArray(payload.items) ? payload.items : []).map(item => ({
-      id: { videoId: item?.snippet?.resourceId?.videoId ?? null },
-      snippet: (item && typeof item.snippet === 'object' ? item.snippet : {}) as Record<string, any>,
-    })),
+    items: (Array.isArray(payload.items) ? payload.items : []).map(item => {
+      const snippet = (item && typeof item.snippet === 'object' ? { ...item.snippet } : {}) as Record<string, any>;
+      const contentDetails = item && typeof item.contentDetails === 'object' ? (item.contentDetails as Record<string, any>) : null;
+      const videoPublishedAt = contentDetails?.videoPublishedAt;
+      if (typeof videoPublishedAt === 'string' && videoPublishedAt && Number.isFinite(Date.parse(videoPublishedAt))) {
+        snippet.publishedAt = videoPublishedAt;
+      }
+      return {
+        id: { videoId: item?.snippet?.resourceId?.videoId ?? null },
+        snippet,
+      };
+    }),
   };
 }
 /**
@@ -921,7 +953,7 @@ export async function fetchYouTubeChannelEnrichment(
         }
         const uploadsPlaylistId = channelCheckpoint.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
         if (uploadsPlaylistId) {
-          const recentResponse = await youtubeFetch(buildYouTubeApiUrl('playlistItems',apiKey,{part:'snippet',playlistId:String(uploadsPlaylistId),maxResults:10}),'channel-uploads',1,attempt+1,acquisition,priority,apiKey);
+          const recentResponse = await youtubeFetch(buildYouTubeApiUrl('playlistItems',apiKey,{part:'snippet,contentDetails',playlistId:String(uploadsPlaylistId),maxResults:10}),'channel-uploads',1,attempt+1,acquisition,priority,apiKey);
           const uploadsPayload = await readYouTubeJsonObject(recentResponse, 'channel-uploads');
           await accountYouTubeQuotaResponse(recentResponse, 1);
           uploadsCheckpoint = adaptPlaylistItemsToSearchShape(uploadsPayload);
@@ -993,6 +1025,10 @@ export async function fetchYouTubeChannelEnrichment(
       };
     } catch (error: any) {
       if(error===quotaAdmissionError)throw error;
+      // Accounting already succeeded at the provider: failing over to
+      // another key would burn a second provider call while the first
+      // call's units stay unrecorded. Surface immediately instead.
+      if(isYouTubeQuotaAccountingError(error))throw error;
       recordProviderFailure(apiKey,error);
       if (isQuotaExceeded(error)) quotaExceededCount++;
       lastError = error instanceof Error ? error : new Error(String(error));

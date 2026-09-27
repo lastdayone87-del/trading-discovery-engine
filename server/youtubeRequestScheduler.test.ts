@@ -240,7 +240,7 @@ test('provider-loop requests carry the selected API key into scheduler dispatch'
   assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey(?:,lifecycle)?\)/);
   // channel-uploads resolves through the 1-unit uploads playlist (channels.list
   // contentDetails + playlistItems.list), never a 100-unit search.list.
-  assert.match(source, /youtubeFetch\(buildYouTubeApiUrl\('playlistItems',apiKey,\{part:'snippet',playlistId:String\(uploadsPlaylistId\),maxResults:10\}\),'channel-uploads',1,attempt\+1,acquisition,priority,apiKey\)/);
+  assert.match(source, /youtubeFetch\(buildYouTubeApiUrl\('playlistItems',apiKey,\{part:'snippet,contentDetails',playlistId:String\(uploadsPlaylistId\),maxResults:10\}\),'channel-uploads',1,attempt\+1,acquisition,priority,apiKey\)/);
   assert.match(source, /youtubeFetch\(channelUrl,'channel-details',1,attempt\+1,acquisition,priority,apiKey\)/);
 });
 

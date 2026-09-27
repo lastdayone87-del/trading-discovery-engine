@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { getYouTubeKeyPool, loadActiveYouTubeProviderSuspensions } from './db';
+import { clearYouTubeProviderSuspension, getYouTubeKeyPool, loadActiveYouTubeProviderSuspensions } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 
@@ -69,6 +69,31 @@ export function shouldClearYouTubeSuspension(providerSuccessIsCurrent: boolean, 
   return providerSuccessIsCurrent === true && wasSuspended === true;
 }
 
+/** Generation-gated durable clear: removes the suspension row only when no
+ * newer failure was recorded after this response validated. failed() and
+ * restoreSuspended() bump the in-memory failure generation synchronously,
+ * so any suspension created between validation and this call compares
+ * unequal and its fresh durable row survives. The caller awaits this (never
+ * fire-and-forget) so the recheck lands as late as possible. Returns false
+ * without touching the database when the response is not eligible; errors
+ * propagate so the caller decides (read path swallows them: a missed clear
+ * only delays rehabilitation, never resurrects a dead key). Dependencies
+ * are injectable for unit tests; production callers omit them. */
+export async function clearYouTubeSuspensionIfCurrent(
+  providerKey: string,
+  observedGeneration: number | undefined,
+  deps: {
+    currentGeneration?: (key: string) => number;
+    clear?: (keyFingerprint: string) => Promise<void>;
+  } = {},
+): Promise<boolean> {
+  if (!providerKey || observedGeneration === undefined) return false;
+  const current = (deps.currentGeneration || ((key: string) => youtubeProviderCooldown.failureGeneration(key)))(providerKey);
+  if (current !== observedGeneration) return false;
+  await (deps.clear || clearYouTubeProviderSuspension)(fingerprintYouTubeKey(providerKey));
+  return true;
+}
+
 /** Retries quota accounting against the SAME successful provider response
  * instead of issuing another provider request: the quota was already spent
  * at Google, so a transient accounting failure must not trigger key
@@ -92,6 +117,30 @@ export async function retryYouTubeQuotaAccounting(
     }
   }
 }
+/** Thrown when quota accounting exhausts its retries after a successful
+ * provider response. Unlike provider failures, this must never trigger key
+ * failover or a refetch: the quota was already spent at Google, another key
+ * would burn a second provider call, and the first call's units would stay
+ * unrecorded. The enrichment attempt flow rethrows these immediately,
+ * mirroring the quotaAdmissionError precedent. */
+export class YouTubeQuotaAccountingError extends Error {
+  readonly code = 'YOUTUBE_QUOTA_ACCOUNTING';
+  constructor(
+    readonly units: number,
+    readonly providerKey: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`YouTube quota accounting failed for ${units} unit(s) after a successful provider response.`);
+    this.name = 'YouTubeQuotaAccountingError';
+    if (options && 'cause' in options) (this as { cause?: unknown }).cause = options.cause;
+  }
+}
+
+export function isYouTubeQuotaAccountingError(error: unknown): boolean {
+  return error instanceof YouTubeQuotaAccountingError
+    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_QUOTA_ACCOUNTING';
+}
+
 /** Next rotation slot after a success: healthy keys share the workload in
  * stable order instead of one key absorbing everything until it fails. */
 export function advanceYouTubeRotation(poolLength: number, validatedIndex: number): number {
@@ -151,12 +200,18 @@ export interface YouTubeSuspensionHydration {
  * startup task triggers, so workers cannot use a durably suspended key
  * before its cooldown is restored. Resolves (never rejects) with the
  * fallback result when hydration is unavailable, preserving existing
- * error behavior. The health endpoint never touches this path. */
+ * error behavior. A failed load is NOT cached: the shared promise is reset
+ * so a later dispatch retries after the database recovers, while successful
+ * loads stay cached for the process lifetime. The health endpoint never
+ * touches this path. */
 let sharedSuspensionHydration: Promise<YouTubeSuspensionHydration> | null = null;
 
 export function ensureYouTubeSuspensionHydration(): Promise<YouTubeSuspensionHydration> {
   if (!sharedSuspensionHydration) {
-    sharedSuspensionHydration = hydrateYouTubeProviderSuspensions().catch(() => ({ restored: 0, skipped: 0 }));
+    sharedSuspensionHydration = hydrateYouTubeProviderSuspensions().catch(() => {
+      sharedSuspensionHydration = null;
+      return { restored: 0, skipped: 0 };
+    });
   }
   return sharedSuspensionHydration;
 }
@@ -164,15 +219,20 @@ export function ensureYouTubeSuspensionHydration(): Promise<YouTubeSuspensionHyd
 /** Restores durable suspensions into the in-memory cooldown after a
  * restart/redeploy. Fingerprints are resolved against the *current* pool:
  * rows whose key is gone (pool edited) are skipped, never applied to the
- * wrong key. Returns counts for startup logging. */
-export async function hydrateYouTubeProviderSuspensions(): Promise<YouTubeSuspensionHydration> {
+ * wrong key. Returns counts for startup logging. Throws when the load
+ * itself fails so ensureYouTubeSuspensionHydration() can retry later
+ * instead of caching the zero-count fallback; callers that need a
+ * non-rejecting gate must use ensureYouTubeSuspensionHydration(). */
+export async function hydrateYouTubeProviderSuspensions(
+  loadRows: () => Promise<Array<{ keyFingerprint: string; retryAfter: string | null }>> = loadActiveYouTubeProviderSuspensions,
+): Promise<YouTubeSuspensionHydration> {
   const summary: YouTubeSuspensionHydration = { restored: 0, skipped: 0 };
   let rows;
   try {
-    rows = await loadActiveYouTubeProviderSuspensions();
+    rows = await loadRows();
   } catch (error) {
     console.warn('[YouTube] Suspension hydration unavailable (migration pending?):', String((error as Error)?.message || error));
-    return summary;
+    throw error;
   }
   if (!rows.length) return summary;
   const pool = getYouTubeKeyPool();

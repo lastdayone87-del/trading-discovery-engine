@@ -1,19 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import {
   YOUTUBE_INPUT_QUARANTINE_TTL_MS,
   YOUTUBE_SUSPENSION_RETRY_AFTER_MS,
   advanceYouTubeRotation,
   annotateYouTubeErrorMetadata,
   buildYouTubeTelemetryMetadata,
+  clearYouTubeSuspensionIfCurrent,
   ensureYouTubeSuspensionHydration,
   extractYouTubeQuarantineInput,
+  hydrateYouTubeProviderSuspensions,
   isYouTubeInputFailure,
+  isYouTubeQuotaAccountingError,
   normalizeYouTubeQuarantineInput,
   retryYouTubeQuotaAccounting,
   shouldClearYouTubeSuspension,
   youtubeDeploymentId,
+  YouTubeQuotaAccountingError,
 } from './youtubeKeyHealth';
 import {
   YouTubeQuarantinedInputError,
@@ -222,4 +227,106 @@ test('hydration gate is shared and never rejects', async () => {
   assert.equal(first, second, 'dispatch and startup must await the same promise');
   const summary = await first;
   assert.deepEqual(Object.keys(summary).sort(), ['restored', 'skipped']);
+});
+
+test('accounting failures are marked so the attempt flow never fails over to another key', () => {
+  const accounting = new YouTubeQuotaAccountingError(100, 'key-a', { cause: new Error('ledger down') });
+  assert.equal(accounting.code, 'YOUTUBE_QUOTA_ACCOUNTING');
+  assert.equal(accounting.units, 100);
+  assert.equal(accounting.providerKey, 'key-a');
+  assert.match(String(accounting.cause), /ledger down/);
+  assert.equal(isYouTubeQuotaAccountingError(accounting), true);
+  assert.equal(isYouTubeQuotaAccountingError({ code: 'YOUTUBE_QUOTA_ACCOUNTING' }), true);
+  assert.equal(isYouTubeQuotaAccountingError(new Error('provider 429')), false);
+  assert.equal(isYouTubeQuotaAccountingError(null), false);
+  // The enrichment catch must surface these before any provider-failure
+  // bookkeeping: a refetch on another key would burn a second provider
+  // call while the first call's units stay unrecorded.
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const attemptCatch = youtube.slice(youtube.indexOf('} catch (error: any) {', youtube.indexOf('export async function fetchYouTubeChannelEnrichment(')));
+  assert.match(attemptCatch, /if\(isYouTubeQuotaAccountingError\(error\)\)throw error;/);
+  const breakout = attemptCatch.indexOf('isYouTubeQuotaAccountingError');
+  const failover = attemptCatch.indexOf('recordProviderFailure(apiKey,error)');
+  assert.ok(breakout >= 0 && breakout < failover, 'accounting breakout must precede provider-failure bookkeeping');
+});
+
+test('accounting wrapper uses one stable operation ID and surfaces accounting errors', () => {
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const wrapper = youtube.slice(youtube.indexOf('async function accountYouTubeQuotaResponse'), youtube.indexOf('/** Adapts a playlistItems.list payload'));
+  // One ID per provider response: stable across that call's internal
+  // retries (generated once), unique per response (fresh UUID per call),
+  // so a retry after an unknown commit outcome cannot double-charge.
+  assert.match(wrapper, /const operationId = randomUUID\(\);/);
+  assert.match(wrapper, /incrementQuota\(unitsConsumed, providerKey, operationId\)/);
+  assert.match(wrapper, /throw new YouTubeQuotaAccountingError\(units, providerKey, \{ cause: error \}\);/);
+  // The ledger honors the ID transactionally, with a pre-migration
+  // fallback so accounting keeps working until migration 133 applies.
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  assert.match(dbCore, /INSERT INTO youtube_quota_accounting_ops\(op_id,quota_day,key_fingerprint,units\)/);
+  assert.match(dbCore, /ON CONFLICT\(op_id\) DO NOTHING RETURNING op_id/);
+  assert.ok(existsSync(new URL('./db/migrations/133_youtube_quota_accounting_idempotency.sql', import.meta.url)), 'idempotency table migration must exist');
+});
+
+test('durable clear is generation-gated and awaited, never deleting a newer suspension', async () => {
+  // A newer suspension recorded after validation compares unequal: the
+  // fresh durable row must survive even though the success was current
+  // when observed.
+  let cleared: string[] = [];
+  assert.equal(await clearYouTubeSuspensionIfCurrent('key-a', 7, { currentGeneration: () => 8, clear: async fp => { cleared.push(fp); } }), false);
+  assert.deepEqual(cleared, [], 'stale validation must not touch the database');
+  assert.equal(await clearYouTubeSuspensionIfCurrent('key-a', undefined, { currentGeneration: () => 7, clear: async fp => { cleared.push(fp); } }), false);
+  assert.equal(await clearYouTubeSuspensionIfCurrent('', 7, { currentGeneration: () => 7, clear: async fp => { cleared.push(fp); } }), false);
+  assert.equal(await clearYouTubeSuspensionIfCurrent('key-a', 7, { currentGeneration: () => 7, clear: async fp => { cleared.push(fp); } }), true);
+  assert.equal(cleared.length, 1);
+  assert.ok(/^[0-9a-f]{32}$/.test(cleared[0]), 'clear addresses the key fingerprint, never the key');
+  // A failing clear propagates so the caller (which swallows it) keeps the
+  // row; a missed clear only delays rehabilitation.
+  await assert.rejects(clearYouTubeSuspensionIfCurrent('key-a', 7, { currentGeneration: () => 7, clear: async () => { throw new Error('db down'); } }), /db down/);
+  // The reader awaits the gated clear with the response generation instead
+  // of fire-and-forget deleting by fingerprint alone.
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const reader = youtube.slice(youtube.indexOf('export async function readYouTubeJsonObject'), youtube.indexOf('/** A request-rate limit'));
+  assert.match(reader, /await clearYouTubeSuspensionIfCurrent\(context\.providerKey, context\.providerFailureGeneration\)\.catch\(\(\) => undefined\)/);
+  assert.doesNotMatch(reader, /clearYouTubeProviderSuspension\(fingerprintYouTubeKey\(context\.providerKey\)\)/);
+});
+
+test('failed hydration loads reject so the gate retries instead of caching zeros', async () => {
+  await assert.rejects(hydrateYouTubeProviderSuspensions(async () => { throw new Error('db down'); }), /db down/);
+  const empty = await hydrateYouTubeProviderSuspensions(async () => []);
+  assert.deepEqual(empty, { restored: 0, skipped: 0 });
+  const unknown = await hydrateYouTubeProviderSuspensions(async () => [
+    { keyFingerprint: 'gone-key-fp', retryAfter: null },
+    { keyFingerprint: 'other-gone-fp', retryAfter: new Date(Date.now() + 60_000).toISOString() },
+  ]);
+  assert.equal(unknown.restored + unknown.skipped, 2, 'unresolvable rows are skipped, never applied to the wrong key');
+  // ensure() drops the fallback after a failed load so a later dispatch
+  // retries once the database recovers; successes stay cached.
+  const health = readFileSync(new URL('./youtubeKeyHealth.ts', import.meta.url), 'utf8');
+  const gate = health.slice(health.indexOf('export function ensureYouTubeSuspensionHydration'), health.indexOf('/** Restores durable suspensions'));
+  assert.match(gate, /sharedSuspensionHydration = null;/);
+});
+
+test('uploads adapter prefers the video publication time over the playlist-add time', () => {
+  const adapted = adaptPlaylistItemsToSearchShape({
+    items: [
+      {
+        snippet: { title: 'v1', publishedAt: '2026-09-10T00:00:00.000Z', resourceId: { videoId: 'vid1' } },
+        contentDetails: { videoPublishedAt: '2026-09-01T00:00:00.000Z' },
+      },
+      {
+        snippet: { title: 'v2', publishedAt: '2026-09-10T00:00:00.000Z', resourceId: { videoId: 'vid2' } },
+      },
+    ],
+  });
+  assert.equal(adapted.items[0].snippet.publishedAt, '2026-09-01T00:00:00.000Z', 'videoPublishedAt wins when present');
+  assert.equal(adapted.items[1].snippet.publishedAt, '2026-09-10T00:00:00.000Z', 'snippet time remains the fallback');
+  assert.equal(adapted.items[0].id.videoId, 'vid1');
+  const invalid = adaptPlaylistItemsToSearchShape({
+    items: [{ snippet: { publishedAt: '2026-09-10T00:00:00.000Z', resourceId: { videoId: 'vid3' } }, contentDetails: { videoPublishedAt: 'not-a-date' } }],
+  });
+  assert.equal(invalid.items[0].snippet.publishedAt, '2026-09-10T00:00:00.000Z', 'unparsable videoPublishedAt keeps the fallback');
+  // The uploads request must fetch the contentDetails part (no extra quota:
+  // list-call cost is per call, not per part) so the adapter can see it.
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  assert.match(youtube, /buildYouTubeApiUrl\('playlistItems',apiKey,\{part:'snippet,contentDetails',playlistId:String\(uploadsPlaylistId\)/);
 });

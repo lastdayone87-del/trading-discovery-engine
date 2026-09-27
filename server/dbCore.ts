@@ -743,11 +743,27 @@ export async function getQuota():Promise<QuotaInfoExtended>{
   return {unitsUsed:Number(row.units_used||0),dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:projection.map((item,index)=>{const key=keys[index];const provider=youtubeProviderCooldown.status(key);return {...item,maskedKey:'****',isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};
 }
 
-export async function incrementQuota(units:number, providerKey:string):Promise<void>{
+export async function incrementQuota(units:number, providerKey:string, operationId?: string):Promise<void>{
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
   const db=await getDb(); const client=await db.connect(); const today=getYouTubeQuotaDay(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey);
-  try{await client.query('BEGIN');await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+  try{
+    await client.query('BEGIN');
+    if (operationId) {
+      // Idempotency guard: one row per accounted provider response, written
+      // in the same transaction as the charge. A retry after an unknown
+      // commit outcome finds its own operation ID and skips the duplicate
+      // charge. Pre-migration databases have no such table: fall through
+      // to the plain charge so accounting keeps working until migration
+      // 133 applies (undefined_table is the only tolerated failure here).
+      try {
+        const seen = await client.query(`INSERT INTO youtube_quota_accounting_ops(op_id,quota_day,key_fingerprint,units) VALUES($1,$2,$3,$4) ON CONFLICT(op_id) DO NOTHING RETURNING op_id`,[operationId,today,fingerprintYouTubeKey(providerKey),units]);
+        if ((seen.rowCount || 0) === 0) { await client.query('COMMIT'); return; }
+      } catch (guardError) {
+        if ((guardError as { code?: unknown } | null)?.code !== '42P01') throw guardError;
+      }
+    }
+    await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
