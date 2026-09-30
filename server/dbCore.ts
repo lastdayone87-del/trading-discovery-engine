@@ -5,10 +5,10 @@ import { ChannelRecord, CountryVocabulary, ExcludedCountry, QueueStatus, QueryRe
 import { INITIAL_COUNTRY_VOCABULARIES, INITIAL_EXCLUDED_COUNTRIES } from '../src/data/initial_countries';
 import { allocateRetrievalLane, RetrievalLane } from './retrievalLanes';
 import { allocateSearchOrdering, SearchOrdering } from './searchOrdering';
-import { calculateYouTubeDailyBudget } from './quotaPolicy';
+import { calculateEffectiveYouTubeBudget, calculateYouTubeDailyBudget, describeQuotaProjectMap } from './quotaPolicy';
 import { scopeEligibilityForWrite } from './scopeEligibility';
 import { getYouTubeQuotaDay } from './youtubeQuotaDay';
-import { getConfiguredYouTubeKeys } from './youtubeKeyPool';
+import { getConfiguredYouTubeKeys, getConfiguredYouTubeProviders } from './youtubeKeyPool';
 import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from './youtubeProviderCooldown';
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
@@ -641,7 +641,14 @@ export async function getQueueStatus(): Promise<QueueStatus> {
 export async function toggleQueuePause(queueName:string,isPaused:boolean):Promise<void>{const db=await getDb(); await db.query('INSERT INTO queue_controls(queue_name,is_paused) VALUES($1,$2) ON CONFLICT(queue_name) DO UPDATE SET is_paused=excluded.is_paused',[queueName,isPaused]);}
 
 export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(); }
-export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);}
+/**
+ * P0 group-aware budget (CORE infrastructure).
+ * Uses distinct QUOTA_GROUP projects + ungrouped keys. Falls back to legacy
+ * per-key sum when no groups are configured, preserving deterministic replay
+ * for existing deployments. Per-key unit value remains E (pilot, not frozen).
+ */
+export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');const providers=getConfiguredYouTubeProviders();const map=describeQuotaProjectMap(providers);if(map.projectCount===0)return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);return calculateEffectiveYouTubeBudget(providers,perKey);}
+export function describeYouTubeQuotaProjectMap(){const providers=getConfiguredYouTubeProviders();const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000'));const map=describeQuotaProjectMap(providers);return {...map,perKey,effectiveBudget:calculateEffectiveYouTubeBudget(providers,perKey),legacyKeySumBudget:calculateYouTubeDailyBudget(providers.length,perKey)};}
 export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; remaining:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
 
@@ -657,7 +664,7 @@ async function ensureYouTubeKeyRows(db:QueryExecutor, today:string, keys:string[
 }
 
 export async function getQuota():Promise<QuotaInfoExtended>{
-  const db=await getDb(); const today=getYouTubeQuotaDay(); const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey);
+  const db=await getDb(); const today=getYouTubeQuotaDay(); const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   await ensureYouTubeQuotaDay(db,today,limit); await ensureYouTubeKeyRows(db,today,keys,perKey);
   const [aggregate,keyRows]=await Promise.all([db.query("SELECT units_used,last_reset FROM quota_tracker WHERE id='youtube'"),db.query('SELECT key_fingerprint,key_index,units_used,daily_limit FROM youtube_key_quota_usage WHERE quota_day=$1 ORDER BY key_index',[today])]);
   const row=aggregate.rows[0]||{units_used:0,last_reset:today}; const projection=projectYouTubeQuotaUsage(keys,keyRows.rows.map(row=>({keyFingerprint:String(row.key_fingerprint),keyIndex:Number(row.key_index),unitsUsed:Number(row.units_used||0),dailyLimit:Number(row.daily_limit||perKey)})),perKey);
@@ -667,7 +674,7 @@ export async function getQuota():Promise<QuotaInfoExtended>{
 export async function incrementQuota(units:number, providerKey:string):Promise<void>{
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
-  const db=await getDb(); const client=await db.connect(); const today=getYouTubeQuotaDay(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey);
+  const db=await getDb(); const client=await db.connect(); const today=getYouTubeQuotaDay(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   try{await client.query('BEGIN');await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 
