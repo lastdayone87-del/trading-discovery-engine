@@ -215,6 +215,14 @@ export async function generateCreatorDerivedProposals(country: string, limit = 1
 }
 
 // 3. CREATOR_NEIGHBORHOOD Generator
+// P1 status: EXPERIMENTAL, source tables creator_featured_channels /
+// creator_playlists were never created (no migration) so this generator
+// resolves to [] via fail-closed catch. Proper rewire to canary lineage
+// (creator_featured_channel_canary_execution_links + shadow proposals with
+// country join via program/hypothesis) is deferred to P3 graph work where
+// country attribution + depth caps + independent>=2 guards are designed and
+// tested together. Do NOT invent titles here. Diagnostic reason preserved.
+export const CREATOR_NEIGHBORHOOD_SOURCE_STATUS = 'P1_SOURCE_TABLE_MISSING_DEFERRED_TO_P3' as const;
 export async function generateCreatorNeighborhoodProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const db = await getDb();
   const res = await db.query(
@@ -225,7 +233,7 @@ export async function generateCreatorNeighborhoodProposals(country: string, limi
      ORDER BY cf.discovered_at DESC
      LIMIT $2`,
     [country.toUpperCase(), limit]
-  ).catch(() => ({ rows: [] }));
+  ).catch(() => ({ rows: [] as Array<Record<string, never>> }));
 
   return res.rows.map(row =>
     buildFrontierProposal({
@@ -241,6 +249,9 @@ export async function generateCreatorNeighborhoodProposals(country: string, limi
 }
 
 // 4. PLAYLIST_TOPIC Generator
+// P1 status: same as CREATOR_NEIGHBORHOOD — source table creator_playlists
+// never created; rewire deferred to P3 with proper provenance. Fail-closed [].
+export const PLAYLIST_TOPIC_SOURCE_STATUS = 'P1_SOURCE_TABLE_MISSING_DEFERRED_TO_P3' as const;
 export async function generatePlaylistTopicProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const db = await getDb();
   const res = await db.query(
@@ -250,7 +261,7 @@ export async function generatePlaylistTopicProposals(country: string, limit = 10
      ORDER BY discovered_at DESC
      LIMIT $2`,
     [country.toUpperCase(), limit]
-  ).catch(() => ({ rows: [] }));
+  ).catch(() => ({ rows: [] as Array<Record<string, never>> }));
 
   return res.rows.map(row =>
     buildFrontierProposal({
