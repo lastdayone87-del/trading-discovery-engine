@@ -156,7 +156,7 @@ test('youtubeFetch reselects from the live provider pool at dispatch and clears 
   assert.match(youtubeFetch, /selectYouTubeDispatchProviderIndex\(livePool,providerKey\)/);
   assert.match(youtubeFetch, /rebuiltUrl\.searchParams\.set\('key',dispatchedProviderKey\)/);
   assert.match(youtubeFetch, /fetch\(dispatchedUrl,\{signal\}\)/);
-  assert.match(youtubeFetch, /providerFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined[\s\S]*youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration\}\)/);
+  assert.match(youtubeFetch, /dispatchFailureGeneration=dispatchedProviderKey\?youtubeProviderCooldown\.failureGeneration\(dispatchedProviderKey\):undefined[\s\S]*fetch\(dispatchedUrl,\{signal\}\)[\s\S]*youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration\}\)/);
   assert.match(youtubeFetch, /Object\.assign\(error,\{providerKey:dispatchedProviderKey/);
 });
 
@@ -206,7 +206,7 @@ test('post-response validation failures preserve the actual dispatched provider 
   const youtubeFetch = source.slice(source.indexOf('async function youtubeFetch'), source.indexOf('export type YouTubeAdditionalQuotaCallback'));
   const reader = source.slice(source.indexOf('export async function readYouTubeJsonObject'), source.indexOf('/** A request-rate limit'));
   assert.match(source, /youtubeResponseProviderContext = new WeakMap<Response/);
-  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration\}\)/);
+  assert.match(youtubeFetch, /youtubeResponseProviderContext\.set\(response,\{providerKey:dispatchedProviderKey,acquisition,providerFailureGeneration:dispatchFailureGeneration\}\)/);
   assert.doesNotMatch(youtubeFetch, /youtubeProviderCooldown\.succeeded\(dispatchedProviderKey\)/);
   assert.match(reader, /const context = youtubeResponseProviderContext\.get\(response\)/);
   assert.match(reader, /failedDispatchProviders\(context\.acquisition\)\?\.add\(context\.providerKey\)/);
@@ -232,13 +232,15 @@ test('preferred YouTube provider advances only after validated response success'
   assert.match(reader, /if\(providerSuccessIsCurrent\)/);
   assert.match(reader, /const validatedPool=getYouTubeKeyPool\(\)/);
   assert.match(reader, /const validatedIndex=validatedPool\.indexOf\(context\.providerKey\)/);
-  assert.match(reader, /if\(validatedIndex>=0\)activeKeyIndex=validatedIndex/);
+  assert.match(reader, /if\(validatedIndex>=0\)activeKeyIndex=advanceYouTubeRotation\(validatedPool\.length,validatedIndex\)/);
 });
 
 test('provider-loop requests carry the selected API key into scheduler dispatch', () => {
   const source = fs.readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   assert.match(source, /youtubeFetch\(searchUrl,'search',100,attempt\+1,acquisition,priority,apiKey(?:,lifecycle)?\)/);
-  assert.match(source, /youtubeFetch\(recentUrl,'channel-uploads',100,attempt\+1,acquisition,priority,apiKey\)/);
+  // channel-uploads resolves through the 1-unit uploads playlist (channels.list
+  // contentDetails + playlistItems.list), never a 100-unit search.list.
+  assert.match(source, /youtubeFetch\(buildYouTubeApiUrl\('playlistItems',apiKey,\{part:'snippet,contentDetails',playlistId:String\(uploadsPlaylistId\),maxResults:10\}\),'channel-uploads',1,attempt\+1,acquisition,priority,apiKey\)/);
   assert.match(source, /youtubeFetch\(channelUrl,'channel-details',1,attempt\+1,acquisition,priority,apiKey\)/);
 });
 

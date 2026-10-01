@@ -11,19 +11,47 @@ export class YouTubeProviderCooldown{
  private readonly localRateLimitedProviders=new Map<string,{retryAt:number;observedAt:number}>();
  private readonly suspendedProviders=new Map<string,{retryAt:number;observedAt:number}>();
  private readonly failureGenerations=new Map<string,number>();
+ /** Keys with a possibly-durable suspension row. Unlike the active
+  * quarantine above, entries are NOT dropped on expiry: a success after
+  * expiry must still clear the durable row, and only a confirmed clear
+  * (or a newer suspension re-adding) changes membership. Bounded by pool
+  * size; entries resolve on confirmed durable clears. */
+ private readonly suspensionCandidates=new Set<string>();
  private runtimeRateLimitRetryAt=0;
  constructor(private readonly options:YouTubeProviderCooldownOptions){}
  private now():number{return(this.options.now??Date.now)();}
  private localConfirmationWindowMs():number{return Math.max(1,Math.min(this.options.initialRateLimitCooldownMs,Math.max(1,this.options.maxRateLimitCooldownMs)));}
  private providerQuarantineMs():number{return Math.max(this.localConfirmationWindowMs(),Math.max(1,this.options.maxRateLimitCooldownMs));}
  private suspendedQuarantineMs():number{return Math.max(1,this.options.suspendedProviderCooldownMs??24*60*60_000);}
+ /** Configured suspension probe interval (default 24h): how long after a
+  * suspension a key becomes probe-eligible. Exposed so restart hydration
+  * restores the same cadence instead of the longer durable horizon. */
+ suspendedProbeIntervalMs():number{return this.suspendedQuarantineMs();}
+ /** Whether the key has a possibly-durable suspension row (active quarantine
+  * or an expired one awaiting success-clear). Non-mutating. */
+ hasSuspensionCandidate(key:string):boolean{return this.suspensionCandidates.has(key);}
+ /** Drops the durable-row candidate after a confirmed clear. Never called on
+  * a failed or generation-rejected clear: a newer suspension's row survives. */
+ resolveSuspensionCandidate(key:string):void{this.suspensionCandidates.delete(key);}
  private activeRuntimeRateLimitRetryAt():number{const now=this.now();if(this.runtimeRateLimitRetryAt<=now){this.runtimeRateLimitRetryAt=0;return 0;}return this.runtimeRateLimitRetryAt;}
  private activeDailyState(key:string):{retryAt:number}|undefined{const state=this.dailyProviders.get(key);if(!state)return undefined;if(this.now()>=state.retryAt){this.dailyProviders.delete(key);return undefined;}return state;}
  private activeLocalRateLimitState(key:string):{retryAt:number;observedAt:number}|undefined{const state=this.localRateLimitedProviders.get(key);if(!state)return undefined;if(this.now()>=state.retryAt){this.localRateLimitedProviders.delete(key);return undefined;}return state;}
  private activeSuspendedState(key:string):{retryAt:number;observedAt:number}|undefined{const state=this.suspendedProviders.get(key);if(!state)return undefined;if(this.now()>=state.retryAt){this.suspendedProviders.delete(key);return undefined;}return state;}
  private recentDistinctLocalRateLimitProvider(excludeKey:string):string|undefined{const now=this.now();const cutoff=now-this.localConfirmationWindowMs();for(const[providerKey,state]of this.localRateLimitedProviders){if(providerKey!==excludeKey&&state.observedAt>=cutoff)return providerKey;}return undefined;}
  eligible(key:string):boolean{if(this.activeRuntimeRateLimitRetryAt()>0)return false;return!this.activeDailyState(key)&&!this.activeLocalRateLimitState(key)&&!this.activeSuspendedState(key);}
- failed(key:string,kind:YouTubeProviderFailureKind):number{const now=this.now();this.failureGenerations.set(key,this.failureGeneration(key)+1);if(kind==='CONSUMER_SUSPENDED'){const retryAt=now+this.suspendedQuarantineMs();this.suspendedProviders.set(key,{retryAt,observedAt:now});this.dailyProviders.delete(key);this.localRateLimitedProviders.delete(key);return retryAt;}if(kind==='DAILY_QUOTA_EXHAUSTED'){const retryAt=nextYouTubeDailyQuotaResetAt(now);this.dailyProviders.set(key,{retryAt});this.localRateLimitedProviders.delete(key);return retryAt;}const corroboratingProvider=this.recentDistinctLocalRateLimitProvider(key);const providerRetryAt=now+this.providerQuarantineMs();this.localRateLimitedProviders.set(key,{retryAt:providerRetryAt,observedAt:now});if(corroboratingProvider){const configuredPause=this.options.runtimeRateLimitPauseMs??this.options.initialRateLimitCooldownMs;const pauseMs=Math.max(1,Math.min(configuredPause,Math.max(1,this.options.maxRateLimitCooldownMs)));this.runtimeRateLimitRetryAt=Math.max(this.runtimeRateLimitRetryAt,now+pauseMs);return this.runtimeRateLimitRetryAt;}return providerRetryAt;}
+ /** Non-mutating read of the suspended quarantine (expired entries are dropped
+  * as a side effect, matching activeSuspendedState semantics). Used to decide
+  * whether a success should clear the *durable* suspension row. */
+ isSuspended(key:string):boolean{return this.activeSuspendedState(key)!==undefined;}
+ /** Restores a durable suspension (e.g. after a restart) with an explicit
+  * retry horizon instead of the default 24h window. Unknown keys are applied
+  * as-is; callers must resolve fingerprints against the current pool first.
+  * An already-due horizon is preserved only with allowDue (hydration
+  * resuming an overdue probe cadence); ordinary callers keep the
+  * stale-horizon fallback to now + quarantine so unknown timestamps never
+  * become immediate eligibility by accident. */
+ restoreSuspended(key:string,retryAtMs:number,options?:{allowDue?:boolean}):number{const now=this.now();const retryAt=Number.isFinite(retryAtMs)&&retryAtMs>now?retryAtMs:Number.isFinite(retryAtMs)&&options?.allowDue===true?now:now+this.suspendedQuarantineMs();this.failureGenerations.set(key,this.failureGeneration(key)+1);this.suspendedProviders.set(key,{retryAt,observedAt:now});this.suspensionCandidates.add(key);this.dailyProviders.delete(key);this.localRateLimitedProviders.delete(key);return retryAt;}
+ failed(key:string,kind:YouTubeProviderFailureKind):number{const now=this.now();this.failureGenerations.set(key,this.failureGeneration(key)+1);if(kind==='CONSUMER_SUSPENDED'){const retryAt=now+this.suspendedQuarantineMs();this.suspendedProviders.set(key,{retryAt,observedAt:now});this.suspensionCandidates.add(key);this.dailyProviders.delete(key);this.localRateLimitedProviders.delete(key);return retryAt;}if(kind==='DAILY_QUOTA_EXHAUSTED'){const retryAt=nextYouTubeDailyQuotaResetAt(now);this.dailyProviders.set(key,{retryAt});this.localRateLimitedProviders.delete(key);return retryAt;}const corroboratingProvider=this.recentDistinctLocalRateLimitProvider(key);const providerRetryAt=now+this.providerQuarantineMs();this.localRateLimitedProviders.set(key,{retryAt:providerRetryAt,observedAt:now});if(corroboratingProvider){const configuredPause=this.options.runtimeRateLimitPauseMs??this.options.initialRateLimitCooldownMs;const pauseMs=Math.max(1,Math.min(configuredPause,Math.max(1,this.options.maxRateLimitCooldownMs)));this.runtimeRateLimitRetryAt=Math.max(this.runtimeRateLimitRetryAt,now+pauseMs);return this.runtimeRateLimitRetryAt;}return providerRetryAt;}
  failureGeneration(key:string):number{return this.failureGenerations.get(key)??0;}
  succeeded(key:string,expectedFailureGeneration?:number):boolean{if(expectedFailureGeneration!==undefined&&this.failureGeneration(key)!==expectedFailureGeneration)return false;this.dailyProviders.delete(key);this.localRateLimitedProviders.delete(key);this.suspendedProviders.delete(key);return true;}
  retryAt(key:string):number{return Math.max(this.activeRuntimeRateLimitRetryAt(),this.activeDailyState(key)?.retryAt??0,this.activeLocalRateLimitState(key)?.retryAt??0,this.activeSuspendedState(key)?.retryAt??0);}

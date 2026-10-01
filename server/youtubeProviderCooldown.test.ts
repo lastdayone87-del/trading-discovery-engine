@@ -154,3 +154,59 @@ test('CONSUMER_SUSPENDED failure places provider into suspended state and exclud
     retryAt: null,
   });
 });
+test('suspended state is readable without consuming it, and restorable with an explicit horizon', () => {
+  let now = 1_000;
+  const providers = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  assert.equal(providers.isSuspended('project-a'), false);
+  providers.failed('project-a', 'CONSUMER_SUSPENDED');
+  assert.equal(providers.isSuspended('project-a'), true);
+  // A fresh instance (post-restart) restores the durable horizon instead of
+  // the default 24h window.
+  const restored = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  assert.equal(restored.restoreSuspended('project-a', now + 7 * 24 * 60 * 60_000), now + 7 * 24 * 60 * 60_000);
+  assert.equal(restored.isSuspended('project-a'), true);
+  assert.equal(restored.eligible('project-a'), false);
+  assert.deepEqual(restored.status('project-a'), { status: 'Suspended', retryAt: now + 7 * 24 * 60 * 60_000 });
+  // A stale horizon falls back to the default window, never to the past.
+  assert.equal(restored.restoreSuspended('project-b', now - 1), now + 24 * 60 * 60_000);
+  assert.equal(restored.isSuspended('project-b'), true);
+  // Success clears suspension like any other quarantine layer.
+  restored.succeeded('project-a');
+  assert.equal(restored.isSuspended('project-a'), false);
+  assert.equal(restored.eligible('project-a'), true);
+});
+
+test('hydration resumption preserves already-due horizons; ordinary callers keep the fallback', () => {
+  let now = 9_000_000;
+  const providers = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  providers.restoreSuspended('due-key', now - 1_000, { allowDue: true });
+  assert.equal(providers.eligible('due-key'), true, 'overdue probe resumes immediately on hydration');
+  assert.equal(providers.hasSuspensionCandidate('due-key'), true, 'resumed key still owns a clearable candidate');
+  providers.restoreSuspended('ordinary-key', now - 1_000);
+  assert.equal(providers.eligible('ordinary-key'), false, 'ordinary stale-horizon fallback unchanged');
+  providers.restoreSuspended('future-key', now + 3_600_000, { allowDue: true });
+  assert.equal(providers.eligible('future-key'), false, 'future horizons pass through in both modes');
+  providers.succeeded('due-key');
+  providers.resolveSuspensionCandidate('due-key');
+  providers.succeeded('ordinary-key');
+  providers.resolveSuspensionCandidate('ordinary-key');
+  providers.succeeded('future-key');
+  providers.resolveSuspensionCandidate('future-key');
+});
+
+test('suspension candidates survive expiry and resolve only on confirmed clears', () => {
+  let now = 3_000_000;
+  const providers = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  assert.equal(providers.hasSuspensionCandidate('key-c'), false);
+  providers.failed('key-c', 'CONSUMER_SUSPENDED');
+  assert.equal(providers.hasSuspensionCandidate('key-c'), true);
+  now += 24 * 60 * 60_000 + 1;
+  assert.equal(providers.isSuspended('key-c'), false, 'active quarantine expired');
+  assert.equal(providers.hasSuspensionCandidate('key-c'), true, 'candidate remembered past expiry for success-clearing');
+  providers.resolveSuspensionCandidate('key-c');
+  assert.equal(providers.hasSuspensionCandidate('key-c'), false);
+  providers.restoreSuspended('key-c', now + 3_600_000);
+  assert.equal(providers.hasSuspensionCandidate('key-c'), true, 'restoration re-marks the candidate');
+  providers.succeeded('key-c');
+  providers.resolveSuspensionCandidate('key-c');
+});

@@ -19,7 +19,7 @@ import {
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
-  purgeSyntheticTestChannels, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
+  purgeSyntheticTestChannels, pruneYouTubeQuotaAccountingOps, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
   listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics, getCrawlerReliabilityMetrics
 
 } from './server/db';
@@ -57,6 +57,7 @@ import {
   enqueueRelationshipCanaryRun
 } from './server/queueManager';
 import { sanitizeSearchQuery } from './server/youtube';
+import { ensureYouTubeSuspensionHydration } from './server/youtubeKeyHealth';
 import {
   runAutonomousDiscoveryCycle,
   getAutonomousDiscoveryStatus,
@@ -807,7 +808,21 @@ async function startServer() {
       readiness.markDatabaseReady();
       console.log(`[Startup] PostgreSQL ready at schema version ${schema.currentVersion}; ${schema.channelCount} channels available.`);
       launchAfterReadiness([
-        { name: 'startup maintenance purge', run: async () => { await purgeSyntheticTestChannels(); } },
+        { name: 'startup maintenance purge', run: async () => {
+          await purgeSyntheticTestChannels();
+          // Bound the accounting idempotency ledger (7-day retention) outside
+          // the charge path. Best effort: pre-migration databases and outages
+          // resolve to zero pruned, never a startup failure.
+          const pruned = await pruneYouTubeQuotaAccountingOps().catch(() => 0);
+          if (pruned > 0) console.log(`[Startup] Pruned ${pruned} expired YouTube quota accounting rows.`);
+        } },
+        // Restore durable YouTube suspensions so a restart/redeploy cannot
+        // cause already-dead keys to be reprobed. Best effort: an empty or
+        // unreachable table must never block readiness.
+        { name: 'youtube suspension hydration', run: async () => {
+          const summary = await ensureYouTubeSuspensionHydration();
+          if (summary.restored > 0 || summary.skipped > 0) console.log(`[Startup] YouTube suspensions hydrated: ${summary.restored} restored, ${summary.skipped} skipped (pool changed).`);
+        } },
         { name: 'country exclusion audit', run: async () => { await auditExistingChannelsWithExclusionEngine(); } }
       ]);
     }).catch(error => {

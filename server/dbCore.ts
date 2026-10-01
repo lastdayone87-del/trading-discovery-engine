@@ -642,6 +642,85 @@ export async function toggleQueuePause(queueName:string,isPaused:boolean):Promis
 
 export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(); }
 export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);}
+
+export interface YouTubeInvalidInputQuarantine {
+  inputKind: string;
+  inputValue: string;
+  operation: string;
+  firstSeen: string | null;
+  lastSeen: string | null;
+  hits: number;
+  expiresAt: string | null;
+}
+
+/** Durable memory of inputs that recently produced HTTP 400/404/422 from
+ * YouTube (bad channel IDs, invalid query shapes). Readers must treat an
+ * expired row as absent; writers prune expired rows opportunistically. */
+export async function recordYouTubeInvalidInput(inputKind: string, inputValue: string, operation: string, ttlMs: number): Promise<void> {
+  if (!inputKind || !inputValue || !Number.isFinite(ttlMs) || ttlMs <= 0) return;
+  const db = await getDb();
+  await db.query(`INSERT INTO youtube_invalid_input_quarantine(input_kind,input_value,operation,first_seen,last_seen,hits,expires_at)
+    VALUES($1,$2,$3,now(),now(),1,now()+($4||' milliseconds')::interval)
+    ON CONFLICT(input_kind,input_value) DO UPDATE SET operation=excluded.operation,last_seen=now(),hits=youtube_invalid_input_quarantine.hits+1,expires_at=now()+($4||' milliseconds')::interval`,
+    [inputKind, inputValue, operation || '', String(Math.trunc(ttlMs))]);
+  await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE expires_at <= now()`).catch(() => undefined);
+}
+
+export async function isYouTubeInputQuarantined(inputKind: string, inputValue: string): Promise<boolean> {
+  if (!inputKind || !inputValue) return false;
+  const db = await getDb();
+  const res = await db.query(`SELECT 1 FROM youtube_invalid_input_quarantine WHERE input_kind=$1 AND input_value=$2 AND expires_at > now() LIMIT 1`, [inputKind, inputValue]);
+  return (res.rowCount || 0) > 0;
+}
+
+export interface YouTubeProviderSuspensionRow {
+  keyFingerprint: string;
+  keyIndex: number;
+  envName: string;
+  quotaGroup: string;
+  status: string;
+  observedAt: string | null;
+  retryAfter: string | null;
+  reason: string;
+  probeCount: number;
+}
+
+/** Durably records a suspended/dead provider key by fingerprint (never the
+ * key itself) so restarts cannot cause reprobing. Re-recording bumps the
+ * probe count and refreshes the retry horizon. */
+export async function recordYouTubeProviderSuspension(row: { keyFingerprint: string; keyIndex?: number; envName?: string; quotaGroup?: string; status?: string; retryAfterMs?: number; reason?: string }): Promise<void> {
+  if (!row.keyFingerprint) return;
+  const db = await getDb();
+  await db.query(`INSERT INTO youtube_provider_suspension(key_fingerprint,key_index,env_name,quota_group,status,observed_at,retry_after,reason,probe_count)
+    VALUES($1,$2,$3,$4,$5,now(),now()+($6||' milliseconds')::interval,$7,1)
+    ON CONFLICT(key_fingerprint) DO UPDATE SET key_index=excluded.key_index,env_name=excluded.env_name,quota_group=excluded.quota_group,status=excluded.status,observed_at=now(),retry_after=now()+($6||' milliseconds')::interval,reason=excluded.reason,probe_count=youtube_provider_suspension.probe_count+1`,
+    [row.keyFingerprint, row.keyIndex || 0, row.envName || '', row.quotaGroup || '', row.status || 'SUSPENDED', String(Math.trunc(row.retryAfterMs && row.retryAfterMs > 0 ? row.retryAfterMs : 24 * 60 * 60_000)), row.reason || '']);
+}
+
+export async function clearYouTubeProviderSuspension(keyFingerprint: string): Promise<void> {
+  if (!keyFingerprint) return;
+  const db = await getDb();
+  await db.query(`DELETE FROM youtube_provider_suspension WHERE key_fingerprint=$1`, [keyFingerprint]);
+}
+
+/** Suspension rows whose retry horizon has not passed (hydrate at startup).
+ * Prunes ancient rows opportunistically so removed keys do not accumulate. */
+export async function loadActiveYouTubeProviderSuspensions(): Promise<YouTubeProviderSuspensionRow[]> {
+  const db = await getDb();
+  const res = await db.query(`SELECT key_fingerprint,key_index,env_name,quota_group,status,observed_at,retry_after,reason,probe_count FROM youtube_provider_suspension WHERE retry_after > now() ORDER BY observed_at`);
+  await db.query(`DELETE FROM youtube_provider_suspension WHERE retry_after < now() - interval '30 days'`).catch(() => undefined);
+  return res.rows.map(item => ({
+    keyFingerprint: String(item.key_fingerprint),
+    keyIndex: Number(item.key_index || 0),
+    envName: String(item.env_name || ''),
+    quotaGroup: String(item.quota_group || ''),
+    status: String(item.status || 'SUSPENDED'),
+    observedAt: item.observed_at ? new Date(item.observed_at).toISOString() : null,
+    retryAfter: item.retry_after ? new Date(item.retry_after).toISOString() : null,
+    reason: String(item.reason || ''),
+    probeCount: Number(item.probe_count || 0),
+  }));
+}
 export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; remaining:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
 
@@ -664,11 +743,44 @@ export async function getQuota():Promise<QuotaInfoExtended>{
   return {unitsUsed:Number(row.units_used||0),dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:projection.map((item,index)=>{const key=keys[index];const provider=youtubeProviderCooldown.status(key);return {...item,maskedKey:'****',isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};
 }
 
-export async function incrementQuota(units:number, providerKey:string):Promise<void>{
+/** Claims one accounting operation ID inside the caller's transaction.
+ * Returns true when the caller must proceed with the charge, false when this
+ * operation ID already accounted the response (retry after an unknown commit
+ * outcome: skip the duplicate charge). Uses a savepoint so a guard failure
+ * never poisons the surrounding transaction: without it, any guard error
+ * (notably undefined_table before migration 133 applies) aborts the whole
+ * transaction and every later statement fails with in_failed_sql_transaction.
+ * Pre-migration databases fall through to the plain charge (42P01 only).
+ * Exported for focused regression tests; production callers go through
+ * incrementQuota(). */
+export async function claimYouTubeQuotaOperation(client:QueryExecutor, operationId:string, today:string, keyFingerprint:string, units:number):Promise<boolean>{
+  await client.query('SAVEPOINT youtube_quota_op_guard');
+  try {
+    const seen = await client.query(`INSERT INTO youtube_quota_accounting_ops(op_id,quota_day,key_fingerprint,units) VALUES($1,$2,$3,$4) ON CONFLICT(op_id) DO NOTHING RETURNING op_id`,[operationId,today,keyFingerprint,units]);
+    await client.query('RELEASE SAVEPOINT youtube_quota_op_guard');
+    return (seen.rowCount || 0) > 0;
+  } catch (guardError) {
+    await client.query('ROLLBACK TO SAVEPOINT youtube_quota_op_guard').catch(()=>undefined);
+    await client.query('RELEASE SAVEPOINT youtube_quota_op_guard').catch(()=>undefined);
+    if ((guardError as { code?: unknown } | null)?.code !== '42P01') throw guardError;
+    return true;
+  }
+}
+
+export async function incrementQuota(units:number, providerKey:string, operationId?: string):Promise<void>{
   if(!Number.isSafeInteger(units)||units<=0)throw new Error('YouTube quota charge must be a positive integer.');
   const keys=getYouTubeKeyPool(); const keyIndex=keys.indexOf(providerKey)+1; if(keyIndex<1)throw new Error('YouTube quota charge provider key is not configured.');
   const db=await getDb(); const client=await db.connect(); const today=getYouTubeQuotaDay(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=calculateYouTubeDailyBudget(keys.length,perKey);
-  try{await client.query('BEGIN');await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+  try{
+    await client.query('BEGIN');
+    if (operationId) {
+      // Idempotency guard: one row per accounted provider response, written
+      // in the same transaction as the charge. A retry after an unknown
+      // commit outcome finds its own operation ID and skips the duplicate
+      // charge instead of double-counting the same response.
+      if (!await claimYouTubeQuotaOperation(client, operationId, today, fingerprintYouTubeKey(providerKey), units)) { await client.query('COMMIT'); return; }
+    }
+    await ensureYouTubeQuotaDay(client,today,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,today,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,today]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,today,fingerprintYouTubeKey(providerKey)]);await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
@@ -757,6 +869,62 @@ export async function settleProviderRequest(requestId:string,status:'SUCCEEDED'|
   }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 export async function purgeSyntheticTestChannels():Promise<number>{const db=await getDb(); const res=await db.query("DELETE FROM channels WHERE channel_id LIKE 'UC_STRESS_TEST_%' RETURNING channel_id"); return res.rowCount||0;}
+
+/** Retains at most `retentionMs` of quota-accounting idempotency rows (7-day
+ * default). Retries reference an operation ID only within seconds of the
+ * response, so a 7-day buffer is conservative. Runs at startup, never inside
+ * the accounting transaction, and tolerates a pre-migration database
+ * (undefined_table) so pruning can never break accounting. Deletes in
+ * oldest-first bounded batches (indexed created_at scan) so a large
+ * accumulated ledger cannot become one unbounded startup statement; each
+ * batch commits independently, so an interrupted prune keeps its progress.
+ * Returns total rows removed for startup logging. */
+const YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_SIZE = 1000;
+const YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_MAX = 10_000;
+
+/** Sanitizes an explicit prune batch size: defaults when absent/invalid,
+ * clamps to the safety maximum. Pure for unit tests. */
+export function quotaAccountingPruneBatchSize(requested?: number): number {
+  if (requested === undefined) return YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_SIZE;
+  if (!Number.isSafeInteger(requested) || requested <= 0) return YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_SIZE;
+  return Math.min(requested, YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_MAX);
+}
+
+type QuotaAccountingPruneDb = {
+  query: (text: string, values?: unknown[]) => Promise<{ rowCount: number | null }>;
+};
+
+/** One bounded prune statement (oldest-first, at most perBatch rows).
+ * Exported for unit tests; production callers use the looping wrapper. */
+export async function deleteQuotaAccountingBatch(db: QuotaAccountingPruneDb, retentionMs: number, perBatch: number): Promise<number> {
+  const res = await db.query(
+    `DELETE FROM youtube_quota_accounting_ops WHERE ctid IN (SELECT ctid FROM youtube_quota_accounting_ops WHERE created_at < now() - ($1||' milliseconds')::interval ORDER BY created_at LIMIT $2)`,
+    [String(Math.trunc(retentionMs)), perBatch],
+  );
+  return res.rowCount || 0;
+}
+
+export async function pruneYouTubeQuotaAccountingOps(
+  retentionMs = 7 * 24 * 60 * 60_000,
+  batchSize?: number,
+  dbOverride?: QuotaAccountingPruneDb,
+):Promise<number>{
+  if (!Number.isFinite(retentionMs) || retentionMs <= 0) return 0;
+  const perBatch = quotaAccountingPruneBatchSize(batchSize);
+  const db = dbOverride || await getDb();
+  let removed = 0;
+  try {
+    for (;;) {
+      const deleted = await deleteQuotaAccountingBatch(db, retentionMs, perBatch);
+      removed += deleted;
+      if (deleted < perBatch) break;
+    }
+    return removed;
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
+    throw error;
+  }
+}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
