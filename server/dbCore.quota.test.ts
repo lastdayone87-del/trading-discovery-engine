@@ -194,3 +194,25 @@ test('prune validates retention before touching the database', async () => {
     assert.equal(db.calls.length, 0, 'invalid retention issues no statements');
   }
 });
+
+test('incrementQuota combines group-aware budgeting with operationId idempotency', async () => {
+  const { readFileSync } = await import('node:fs');
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const start = dbCore.indexOf('export async function incrementQuota');
+  const end = dbCore.indexOf('export async function getSchemaInfo', start);
+  assert.ok(start >= 0 && end > start, 'incrementQuota must remain discoverable');
+  const charge = dbCore.slice(start, end);
+  // QUOTA_GROUP budgeting: the reservation limit must come from the
+  // group-aware budget, never the legacy raw key count.
+  assert.match(charge, /const limit=getDailyYouTubeQuotaBudget\(\)/);
+  assert.doesNotMatch(charge, /calculateYouTubeDailyBudget\(keys\.length/);
+  // Idempotency: the same-transaction operationId guard must survive
+  // alongside group-aware budgeting (neither side taken wholesale).
+  assert.match(charge, /if \(operationId\)/);
+  assert.match(charge, /claimYouTubeQuotaOperation\(client, operationId/);
+  // getQuota reports the same group-aware daily limit.
+  const quotaStart = dbCore.indexOf('export async function getQuota');
+  const quotaEnd = dbCore.indexOf('export async function incrementQuota', quotaStart);
+  const quota = dbCore.slice(quotaStart, quotaEnd);
+  assert.match(quota, /const limit=getDailyYouTubeQuotaBudget\(\)/);
+});

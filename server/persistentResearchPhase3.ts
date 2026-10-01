@@ -5,7 +5,15 @@ import { inferScript } from './terminologyIntelligence';
 import { PERSISTENT_RESEARCH_POLICY_VERSION, researchChecksum } from './persistentResearch';
 
 export const PERSISTENT_RESEARCH_PHASE3_VERSION='persistent-research-phase3-v1';
-export type ResearchCorpusKind='TRANSCRIPT'|'PLAYLIST_TITLE'|'WEBSITE_TEXT'|'UNCERTAIN_CHANNEL'|'REVIEWED_FALSE_NEGATIVE'|'CHANNEL_METADATA';
+/**
+ * P1 surface/corpus kinds (CORE infrastructure, additive).
+ * VIDEO_TAGS | TOPIC_DETAILS | HANDLE_URL | HASHTAG extend the schema-legal
+ * source_type set (TEXT, no CHECK) so P1 extractors feed burst + proposals
+ * through existing paused/budget gates. Gated by corpus_controls.paused +
+ * daily_compute_documents like all other kinds. Which kinds become queries
+ * remains EXPERIMENTAL (E-gated promotion, not implemented here).
+ */
+export type ResearchCorpusKind='TRANSCRIPT'|'PLAYLIST_TITLE'|'WEBSITE_TEXT'|'UNCERTAIN_CHANNEL'|'REVIEWED_FALSE_NEGATIVE'|'CHANNEL_METADATA'|'VIDEO_TAGS'|'TOPIC_DETAILS'|'HANDLE_URL'|'HASHTAG';
 export interface ResearchCorpusInput {sourceType:ResearchCorpusKind;sourceKey:string;creatorChannelId?:string;text:string;language?:string;lineage:'AUTONOMOUS'|'HUMAN_APPROVED';entityClusterKey:string;observedAt:string}
 export function terminologyTrialAssignment(key:string,treatmentBasisPoints=5000){if(treatmentBasisPoints<1||treatmentBasisPoints>9999)throw new Error('INVALID_TERMINOLOGY_TRIAL_ALLOCATION');const bucket=Number.parseInt(researchChecksum({key,policy:PERSISTENT_RESEARCH_PHASE3_VERSION}).slice(0,8),16)%10000;return {arm:bucket<treatmentBasisPoints?'TERMINOLOGY' as const:'BASELINE_CONTROL' as const,propensityBasisPoints:bucket<treatmentBasisPoints?treatmentBasisPoints:10000-treatmentBasisPoints,bucket};}
 export function admitResearchMultilingualSurface(input:{candidateId:string;conceptId:string;surface:string;sourceRefs:string[];independentSourceIds:string[];language:string;script?:string;locale?:string;experimentId:string;assignmentCap:number;quotaCap:number}){const candidate:OrganicQueryCandidate={...input,script:input.script||inferScript(input.surface),sourceType:'CROSS_LANGUAGE_CONCEPT',intent:'strategy',lifecycle:'SEARCH_TRIAL',validation:{language:input.language!=='und',script:true,safety:true,retrievalShape:Array.from(input.surface).length<=80,policyVersion:ORGANIC_QUERY_POLICY_VERSION},trial:{experimentId:input.experimentId,armKey:input.candidateId,assignmentCap:input.assignmentCap,quotaCap:input.quotaCap}};return admitOrganicQueryCandidates([candidate])[0]||null;}
