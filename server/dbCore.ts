@@ -874,14 +874,52 @@ export async function purgeSyntheticTestChannels():Promise<number>{const db=awai
  * default). Retries reference an operation ID only within seconds of the
  * response, so a 7-day buffer is conservative. Runs at startup, never inside
  * the accounting transaction, and tolerates a pre-migration database
- * (undefined_table) so pruning can never break accounting. Returns rows
- * removed for startup logging. */
-export async function pruneYouTubeQuotaAccountingOps(retentionMs = 7 * 24 * 60 * 60_000):Promise<number>{
+ * (undefined_table) so pruning can never break accounting. Deletes in
+ * oldest-first bounded batches (indexed created_at scan) so a large
+ * accumulated ledger cannot become one unbounded startup statement; each
+ * batch commits independently, so an interrupted prune keeps its progress.
+ * Returns total rows removed for startup logging. */
+const YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_SIZE = 1000;
+const YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_MAX = 10_000;
+
+/** Sanitizes an explicit prune batch size: defaults when absent/invalid,
+ * clamps to the safety maximum. Pure for unit tests. */
+export function quotaAccountingPruneBatchSize(requested?: number): number {
+  if (requested === undefined) return YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_SIZE;
+  if (!Number.isSafeInteger(requested) || requested <= 0) return YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_SIZE;
+  return Math.min(requested, YOUTUBE_QUOTA_ACCOUNTING_PRUNE_BATCH_MAX);
+}
+
+type QuotaAccountingPruneDb = {
+  query: (text: string, values?: unknown[]) => Promise<{ rowCount: number | null }>;
+};
+
+/** One bounded prune statement (oldest-first, at most perBatch rows).
+ * Exported for unit tests; production callers use the looping wrapper. */
+export async function deleteQuotaAccountingBatch(db: QuotaAccountingPruneDb, retentionMs: number, perBatch: number): Promise<number> {
+  const res = await db.query(
+    `DELETE FROM youtube_quota_accounting_ops WHERE ctid IN (SELECT ctid FROM youtube_quota_accounting_ops WHERE created_at < now() - ($1||' milliseconds')::interval ORDER BY created_at LIMIT $2)`,
+    [String(Math.trunc(retentionMs)), perBatch],
+  );
+  return res.rowCount || 0;
+}
+
+export async function pruneYouTubeQuotaAccountingOps(
+  retentionMs = 7 * 24 * 60 * 60_000,
+  batchSize?: number,
+  dbOverride?: QuotaAccountingPruneDb,
+):Promise<number>{
   if (!Number.isFinite(retentionMs) || retentionMs <= 0) return 0;
-  const db=await getDb();
+  const perBatch = quotaAccountingPruneBatchSize(batchSize);
+  const db = dbOverride || await getDb();
+  let removed = 0;
   try {
-    const res=await db.query(`DELETE FROM youtube_quota_accounting_ops WHERE created_at < now() - ($1||' milliseconds')::interval`,[String(Math.trunc(retentionMs))]);
-    return res.rowCount||0;
+    for (;;) {
+      const deleted = await deleteQuotaAccountingBatch(db, retentionMs, perBatch);
+      removed += deleted;
+      if (deleted < perBatch) break;
+    }
+    return removed;
   } catch (error) {
     if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
     throw error;

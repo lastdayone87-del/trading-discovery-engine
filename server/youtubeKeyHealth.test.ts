@@ -278,8 +278,11 @@ test('idempotency ledger is pruned on a schedule outside the charge path', async
   assert.equal(await pruneYouTubeQuotaAccountingOps(0), 0, 'non-positive retention prunes nothing without touching the database');
   assert.equal(await pruneYouTubeQuotaAccountingOps(NaN), 0);
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const batch = dbCore.slice(dbCore.indexOf('export async function deleteQuotaAccountingBatch'));
+  assert.match(batch, /DELETE FROM youtube_quota_accounting_ops WHERE ctid IN \(SELECT ctid FROM youtube_quota_accounting_ops WHERE created_at </);
+  assert.match(batch, /ORDER BY created_at LIMIT \$2/, 'oldest-first bounded batches, never one unbounded startup statement');
   const prune = dbCore.slice(dbCore.indexOf('export async function pruneYouTubeQuotaAccountingOps'));
-  assert.match(prune, /DELETE FROM youtube_quota_accounting_ops WHERE created_at </);
+  assert.match(prune, /deleteQuotaAccountingBatch\(db, retentionMs, perBatch\)/, 'wrapper loops over bounded batches');
   assert.match(prune, /code === '42P01'/);
   // Startup (not per-charge) invokes it best-effort; the charge path never
   // references the prune so accounting transactions scan no history.

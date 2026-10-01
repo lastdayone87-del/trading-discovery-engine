@@ -137,3 +137,60 @@ test('claim() propagates non-42P01 guard errors with the transaction intact', as
   await client.query('COMMIT');
   assert.equal(client.state.charges.length, 1, 'rollback-to-savepoint left later work usable');
 });
+
+/** Fake ledger for bounded-prune tests: serves a scripted rowCount per
+ * DELETE batch and records every statement for shape assertions. */
+function makePruneDb(rowCounts: number[], failWith: string | null = null) {
+  const calls: Array<{ text: string; values: unknown[] }> = [];
+  let step = 0;
+  return {
+    calls,
+    async query(text: string, values: unknown[] = []): Promise<{ rowCount: number | null }> {
+      calls.push({ text, values });
+      if (failWith) throw Object.assign(new Error(`mock pg ${failWith}`), { code: failWith });
+      return { rowCount: rowCounts[Math.min(step++, rowCounts.length - 1)] ?? 0 };
+    },
+  };
+}
+
+test('prune batch size defaults, sanitizes, and clamps to the safety maximum', async () => {
+  const { quotaAccountingPruneBatchSize } = await import('./dbCore');
+  assert.equal(quotaAccountingPruneBatchSize(), 1000);
+  assert.equal(quotaAccountingPruneBatchSize(50), 50);
+  for (const bad of [0, -5, NaN, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(quotaAccountingPruneBatchSize(bad), 1000, `invalid batch size ${String(bad)} falls back to default`);
+  }
+  assert.equal(quotaAccountingPruneBatchSize(1_000_000), 10_000, 'oversized batches clamp to the maximum');
+});
+
+test('prune deletes in bounded oldest-first batches until a short batch', async () => {
+  const { pruneYouTubeQuotaAccountingOps } = await import('./dbCore');
+  const db = makePruneDb([2, 2, 1]);
+  assert.equal(await pruneYouTubeQuotaAccountingOps(7 * 24 * 60 * 60_000, 2, db), 5);
+  assert.equal(db.calls.length, 3, 'loops while batches are full, stops on the short batch');
+  for (const call of db.calls) {
+    assert.match(call.text, /WHERE ctid IN \(SELECT ctid FROM youtube_quota_accounting_ops WHERE created_at </);
+    assert.match(call.text, /ORDER BY created_at LIMIT \$2/);
+    assert.deepEqual(call.values[1], 2);
+  }
+});
+
+test('prune stops after an empty batch and tolerates a missing table', async () => {
+  const { pruneYouTubeQuotaAccountingOps } = await import('./dbCore');
+  const exact = makePruneDb([2, 2, 0]);
+  assert.equal(await pruneYouTubeQuotaAccountingOps(1000, 2, exact), 4);
+  assert.equal(exact.calls.length, 3, 'exact multiples terminate on the empty batch');
+  const missing = makePruneDb([], '42P01');
+  assert.equal(await pruneYouTubeQuotaAccountingOps(1000, 2, missing), 0, 'pre-migration database resolves to zero pruned');
+  const broken = makePruneDb([], 'XX000');
+  await assert.rejects(pruneYouTubeQuotaAccountingOps(1000, 2, broken), /XX000/);
+});
+
+test('prune validates retention before touching the database', async () => {
+  const { pruneYouTubeQuotaAccountingOps } = await import('./dbCore');
+  for (const bad of [0, -1, NaN]) {
+    const db = makePruneDb([99]);
+    assert.equal(await pruneYouTubeQuotaAccountingOps(bad, 2, db), 0);
+    assert.equal(db.calls.length, 0, 'invalid retention issues no statements');
+  }
+});
