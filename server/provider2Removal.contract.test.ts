@@ -55,8 +55,8 @@ test('durable autonomous discovery is official API only', () => {
 });
 
 test('channel enrichment remains official and stage-costed', () => {
-  assert.match(queueManager, /const enrichmentQuotaUnits=enrichmentStage>=2\?202:101/);
-  assert.match(queueManager, /fetchYouTubeChannelEnrichment\(channelId, candidate,enrichmentStage\)/);
+  assert.match(queueManager, /const enrichmentQuotaUnits=candidateAlreadyEnriched\?0:\(enrichmentStage>=2\?103:2\)/);
+  assert.match(queueManager, /fetchYouTubeChannelEnrichment\(channelId,candidate,enrichmentStage/);
   assert.match(youtube, /channel-uploads/);
   assert.match(youtube, /enrichment-playlists/);
 });

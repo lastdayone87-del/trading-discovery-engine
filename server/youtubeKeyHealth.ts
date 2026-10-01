@@ -105,8 +105,12 @@ export function shouldClearYouTubeSuspension(providerSuccessIsCurrent: boolean, 
  * unequal and its fresh durable row survives. The recheck and the delete
  * run inside the shared suspension-write chain so a concurrent
  * re-suspension's upsert cannot slip between them and lose the fresh row.
- * A confirmed clear also resolves the in-memory suspension candidate so
- * later successes stop attempting deletes. The caller awaits this (never
+ * A confirmed clear also resolves the in-memory suspension candidate — but
+ * only when the generation still matches the observed one: a failure that
+ * lands while the delete is in flight bumps the generation (and re-marks
+ * the candidate), and resolving then would erase the newer suspension.
+ * The recheck runs synchronously after the delete with no await between,
+ * so nothing can interleave. The caller awaits this (never
  * fire-and-forget). Returns false without touching the database when the
  * response is not eligible; errors propagate so the caller decides
  * (read path swallows them: a missed clear only delays rehabilitation,
@@ -122,10 +126,10 @@ export async function clearYouTubeSuspensionIfCurrent(
 ): Promise<boolean> {
   if (!providerKey || observedGeneration === undefined) return false;
   return serializeYouTubeSuspensionWrite(async () => {
-    const current = (deps.currentGeneration || ((key: string) => youtubeProviderCooldown.failureGeneration(key)))(providerKey);
-    if (current !== observedGeneration) return false;
+    const generationOf = deps.currentGeneration || ((key: string) => youtubeProviderCooldown.failureGeneration(key));
+    if (generationOf(providerKey) !== observedGeneration) return false;
     await (deps.clear || clearYouTubeProviderSuspension)(fingerprintYouTubeKey(providerKey));
-    youtubeProviderCooldown.resolveSuspensionCandidate(providerKey);
+    if (generationOf(providerKey) === observedGeneration) youtubeProviderCooldown.resolveSuspensionCandidate(providerKey);
     return true;
   });
 }
@@ -299,7 +303,7 @@ export async function hydrateYouTubeProviderSuspensions(
     }
     const retryAfterMs = row.retryAfter ? Date.parse(row.retryAfter) : NaN;
     const observedAtMs = row.observedAt ? Date.parse(row.observedAt) : NaN;
-    youtubeProviderCooldown.restoreSuspended(key, suspensionRestoreHorizonMs({ retryAfterMs, observedAtMs, nowMs, probeIntervalMs }));
+    youtubeProviderCooldown.restoreSuspended(key, suspensionRestoreHorizonMs({ retryAfterMs, observedAtMs, nowMs, probeIntervalMs }), { allowDue: true });
     summary.restored += 1;
   }
   return summary;

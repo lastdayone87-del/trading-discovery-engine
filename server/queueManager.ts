@@ -474,11 +474,11 @@ export async function processNextSearchJob(
       const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;
       // Actual request costs after the uploads-playlist optimization (1 unit
       // per list call): stage 1 = channels.list (1) + playlistItems.list (1);
-      // stage 2 adds playlist search (100) + videos.list (1). Reserve exactly
-      // what this job can still spend from its current stage — never the
+      // stage 2 adds playlist search (100) + videos.list (1). Checkpoints are
+      // per-invocation locals, so every stage-2 job re-runs the stage-1
+      // requests first: reserve the true maximum (2 / 103), never the
       // pre-optimization 101/202 totals that could reject a 2-unit job.
-      const currentEnrichmentStage=Number(candidate.enrichmentStage||0);
-      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?(currentEnrichmentStage>=1?101:103):2);
+      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?103:2);
       let quotaReserved=false;
       let acquisitionPersisted=candidateAlreadyEnriched;
       if(!candidateAlreadyEnriched){

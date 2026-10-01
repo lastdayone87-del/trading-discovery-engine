@@ -45,10 +45,11 @@ test('enrichment admission reserves current request costs, not pre-optimization 
   assert.ok(anchor >= 0, 'enrichment admission amount must remain discoverable');
   const admission = queue.slice(anchor, anchor + 800);
   // Stage 1 costs channels.list (1) + playlistItems.list (1); stage 2 adds
-  // playlist search (100) + videos.list (1). The old 101/202 totals would
+  // playlist search (100) + videos.list (1), re-running stage 1 first
+  // (checkpoints are per invocation). The old 101/202 totals would
   // reject a legitimate 2-unit stage-one job near the daily budget.
   assert.doesNotMatch(admission, /\?202:101/, 'pre-optimization totals must not gate admission');
-  assert.match(admission, /enrichmentStage>=2\?\(currentEnrichmentStage>=1\?101:103\):2/, 'stage-aware reservation matches actual request costs');
+  assert.match(admission, /enrichmentStage>=2\?103:2/, 'reservation matches the real maximum cost per stage');
 });
 
 test('stage-one failover tops up both requests when the channel checkpoint is missing', () => {

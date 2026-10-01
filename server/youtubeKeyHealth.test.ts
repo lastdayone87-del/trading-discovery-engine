@@ -529,3 +529,46 @@ test('reader rehabilitates on candidate-aware suspension state', () => {
   const reader = youtube.slice(youtube.indexOf('export async function readYouTubeJsonObject'), youtube.indexOf('/** A request-rate limit'));
   assert.match(reader, /hasSuspensionCandidate\(context\.providerKey\)/);
 });
+
+test('a newer suspension racing the delete keeps its candidate', async () => {
+  const { youtubeProviderCooldown } = await import('./youtubeProviderCooldown');
+  const key = 'race-candidate-key';
+  youtubeProviderCooldown.failed(key, 'CONSUMER_SUSPENDED');
+  const validationGen = youtubeProviderCooldown.failureGeneration(key);
+  // A newer suspension lands after validation but before the post-delete
+  // recheck: the validated delete still runs, but the fresh candidate
+  // must survive it for the next success to clear.
+  let calls = 0;
+  let cleared: string[] = [];
+  try {
+    const result = await clearYouTubeSuspensionIfCurrent(key, validationGen, {
+      currentGeneration: () => (calls++ === 0 ? validationGen : validationGen + 1),
+      clear: async fp => { cleared.push(fp); },
+    });
+    assert.equal(result, true, 'the validated delete still runs');
+    assert.equal(cleared.length, 1);
+    assert.equal(youtubeProviderCooldown.hasSuspensionCandidate(key), true, 'newer suspension candidate survives the stale clear');
+  } finally {
+    youtubeProviderCooldown.succeeded(key);
+    youtubeProviderCooldown.resolveSuspensionCandidate(key);
+  }
+});
+
+test('confirmed clear with a stable generation resolves the candidate', async () => {
+  const { youtubeProviderCooldown } = await import('./youtubeProviderCooldown');
+  const key = 'stable-candidate-key';
+  youtubeProviderCooldown.failed(key, 'CONSUMER_SUSPENDED');
+  const generation = youtubeProviderCooldown.failureGeneration(key);
+  let cleared: string[] = [];
+  try {
+    assert.equal(await clearYouTubeSuspensionIfCurrent(key, generation, {
+      currentGeneration: () => generation,
+      clear: async fp => { cleared.push(fp); },
+    }), true);
+    assert.equal(cleared.length, 1);
+    assert.equal(youtubeProviderCooldown.hasSuspensionCandidate(key), false, 'confirmed clear drops the candidate so later successes stay cheap');
+  } finally {
+    youtubeProviderCooldown.succeeded(key);
+    youtubeProviderCooldown.resolveSuspensionCandidate(key);
+  }
+});
