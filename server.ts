@@ -19,7 +19,7 @@ import {
   getRecentQueryExecutionLogs,
   getExtractedVocabulary,
   setQueryCollection,
-  purgeSyntheticTestChannels, pruneYouTubeQuotaAccountingOps, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
+  purgeSyntheticTestChannels, pruneYouTubeQuotaAccountingOps, pruneSiteInspections, appendOperatorAuditEvent, getOperatorAuditEvents, getProviderOperationalMetrics, getValidationRuns, getReplayReport,
   listChannelsPage, getChannelListingRevision, getDashboardOperationalSummary, getLegacyCommunityRetryDiagnostics, getCrawlerReliabilityMetrics
 
 } from './server/db';
@@ -815,6 +815,11 @@ async function startServer() {
           // resolve to zero pruned, never a startup failure.
           const pruned = await pruneYouTubeQuotaAccountingOps().catch(() => 0);
           if (pruned > 0) console.log(`[Startup] Pruned ${pruned} expired YouTube quota accounting rows.`);
+          // Bound the site-inspection ledger (rows unseen for two freshness
+          // cycles). Best effort: pre-migration databases and outages resolve
+          // to zero pruned, never a startup failure.
+          const prunedSites = await pruneSiteInspections().catch(() => 0);
+          if (prunedSites > 0) console.log(`[Startup] Pruned ${prunedSites} stale site inspection rows.`);
         } },
         // Restore durable YouTube suspensions so a restart/redeploy cannot
         // cause already-dead keys to be reprobed. Best effort: an empty or
