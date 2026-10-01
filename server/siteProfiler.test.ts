@@ -135,7 +135,7 @@ test('head discovery inventories canonicals, feeds, robots meta, and structured 
       <link rel="alternate" type="application/rss+xml" href="/feed">
       <link rel="alternate" type="application/atom+xml" href="https://example.com/atom">
       <meta name="robots" content="noindex, follow">
-      <script type="application/ld+json">{"@type": "NewsArticle", "author": {"@type": "Person"}}</script>
+      <script type="application/ld+json">{"@type": "NewsArticle", "author": {"@type": "Person"}, "sameAs": ["https://shop.example.com/brand", "/relative-sameas"]}</script>
       <script type="application/ld+json">{"@graph": [{"@type": "Organization"}, {"@type": "WebSite"}]}</script>
       <script type="application/ld+json">not json {{{</script>
     </head><body>
@@ -151,6 +151,7 @@ test('head discovery inventories canonicals, feeds, robots meta, and structured 
   assert.ok(head.jsonLdTypes.includes('NewsArticle'));
   assert.ok(head.jsonLdTypes.includes('Person'));
   assert.ok(head.jsonLdTypes.includes('Organization'));
+  assert.deepEqual(head.jsonLdSameAs, ['https://shop.example.com/brand', 'https://example.com/relative-sameas']);
   assert.equal(head.jsonLdUnparsable, 1);
   assert.equal(head.microdataItems, 1);
   assert.equal(head.rdfaItems, 1);

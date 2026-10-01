@@ -81,6 +81,7 @@ export interface HeadDiscovery {
   feedLinks: Array<{ href: string; type: string }>;
   robotsMeta: string | null;
   jsonLdTypes: string[];
+  jsonLdSameAs: string[];
   jsonLdUnparsable: number;
   microdataItems: number;
   rdfaItems: number;
@@ -405,7 +406,7 @@ export function extractHeadDiscovery(html: string, pageUrl: string): HeadDiscove
   } catch {
     return {
       canonicalHrefs: [], feedLinks: [], robotsMeta: null, jsonLdTypes: [],
-      jsonLdUnparsable: 0, microdataItems: 0, rdfaItems: 0, navSameHostLinks: 0,
+      jsonLdSameAs: [], jsonLdUnparsable: 0, microdataItems: 0, rdfaItems: 0, navSameHostLinks: 0,
     };
   }
   const canonicalHrefs: string[] = [];
@@ -424,13 +425,18 @@ export function extractHeadDiscovery(html: string, pageUrl: string): HeadDiscove
   });
   const robotsMeta = $('meta[name="robots"]').attr('content') || null;
   const jsonLdTypes: string[] = [];
+  const jsonLdSameAs: string[] = [];
   let jsonLdUnparsable = 0;
   $('script[type="application/ld+json"]').slice(0, MAX_JSONLD_BLOCKS).each((_, el) => {
+    let parsed: unknown = null;
     try {
-      collectJsonLdTypes(JSON.parse($(el).html() || 'null'), jsonLdTypes);
+      parsed = JSON.parse($(el).html() || 'null');
     } catch {
       jsonLdUnparsable += 1;
+      return;
     }
+    collectJsonLdTypes(parsed, jsonLdTypes);
+    collectJsonLdSameAs(parsed, pageUrl, jsonLdSameAs);
   });
   const microdataItems = $('[itemscope]').length;
   const rdfaItems = $('[typeof][vocab], [property][typeof]').length;
@@ -451,13 +457,40 @@ export function extractHeadDiscovery(html: string, pageUrl: string): HeadDiscove
     }
   });
   return {
-    canonicalHrefs, feedLinks, robotsMeta, jsonLdTypes, jsonLdUnparsable,
+    canonicalHrefs, feedLinks, robotsMeta, jsonLdTypes, jsonLdSameAs, jsonLdUnparsable,
     microdataItems, rdfaItems, navSameHostLinks,
   };
 }
 
-function collectJsonLdTypes(node: unknown, out: string[]): void {
+/** Collect sameAs URL inventory from JSON-LD blocks (absolute http(s) only,
+ * deduped, capped by block budget upstream). Inventory only: following and
+ * scoring happen in the ladder, merging never happens here. */
+function collectJsonLdSameAs(node: unknown, pageUrl: string, out: string[]): void {
   if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectJsonLdSameAs(item, pageUrl, out);
+    return;
+  }
+  const record = node as Record<string, unknown>;
+  const sameAs = record['sameAs'];
+  const values = Array.isArray(sameAs) ? sameAs : [sameAs];
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    try {
+      const absolute = new URL(value, pageUrl);
+      if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') continue;
+      if (!out.includes(absolute.toString())) out.push(absolute.toString());
+    } catch {
+      // Unresolvable sameAs values contribute nothing to the inventory.
+    }
+  }
+  for (const [key, value] of Object.entries(record)) {
+    if (key === '@context') continue;
+    collectJsonLdSameAs(value, pageUrl, out);
+  }
+}
+
+function collectJsonLdTypes(node: unknown, out: string[]): void {  if (!node || typeof node !== 'object') return;
   if (Array.isArray(node)) {
     for (const item of node) collectJsonLdTypes(item, out);
     return;
