@@ -65,6 +65,9 @@ export interface SitemapInventory {
   urls: Array<{ loc: string; lastmod?: string }>;
   droppedOffHost: number;
   droppedOverCap: number;
+  /** True when the source body was cut by the fetch byte budget: the
+   * inventory below may be missing entries the file actually contains. */
+  bodyTruncated: boolean;
 }
 
 export interface FeedInventoryEntry {
@@ -74,12 +77,17 @@ export interface FeedInventoryEntry {
   selfLink?: string;
   entries: Array<{ url: string; title?: string; published?: string }>;
   truncated: boolean;
+  /** True when the source body was cut by the fetch byte budget: fewer
+   * entries may be visible than the feed actually carries. ORed into
+   * truncated so entry-count checks alone can never claim completeness. */
+  bodyTruncated: boolean;
 }
 
 export interface HeadDiscovery {
   canonicalHrefs: string[];
   feedLinks: Array<{ href: string; type: string }>;
   robotsMeta: string | null;
+  bodyTruncated: boolean;
   jsonLdTypes: string[];
   jsonLdSameAs: string[];
   jsonLdUnparsable: number;
@@ -112,6 +120,9 @@ export interface SiteProfile {
   robotsEvaluation: RobotsEvaluation;
   robotsSitemaps: string[];
   sitemaps: SitemapInventory[];
+  /** Advertised sitemap locations never fetched because the fetch budget
+   * was exhausted first. Distinct from per-file dropped counts. */
+  sitemapLocationsSkipped: number;
   feeds: FeedInventoryEntry[];
   head: HeadDiscovery | null;
   canonicalConflicts: CanonicalConflict[];
@@ -178,37 +189,52 @@ export function parseRobotsTxt(text: string): ParsedRobots {
 }
 
 /** Longest-match Allow/Disallow evaluation for one user-agent and path.
- * Returns nulls (unknown, never negative) when no group applies. */
+ * Group selection is most-specific-token-wins (a longer matching product
+ * token beats an earlier shorter one); the `*` group applies only when no
+ * product token matches. Returns nulls (unknown, never negative) when no
+ * group applies. */
 export function evaluateRobotsForPath(
   parsed: ParsedRobots,
   userAgent: string,
   path: string,
 ): RobotsEvaluation {
   const agent = userAgent.toLowerCase();
-  const group =
-    parsed.groups.find(g => g.agents.some(a => a !== '*' && (agent === a || agent.startsWith(a)))) ||
-    parsed.groups.find(g => g.agents.includes('*')) ||
-    null;
+  let group: RobotsGroup | null = null;
+  let bestSpecificity = -1;
+  for (const candidate of parsed.groups) {
+    for (const token of candidate.agents) {
+      if (token === '*') continue;
+      if (agent !== token && !agent.startsWith(token)) continue;
+      if (token.length > bestSpecificity) {
+        bestSpecificity = token.length;
+        group = candidate;
+      }
+    }
+  }
+  if (!group) group = parsed.groups.find(g => g.agents.includes('*')) || null;
   if (!group) return { allowed: null, crawlDelaySeconds: null, matchedRule: null };
+  const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const matchLen = (pattern: string): number => {
     if (!pattern) return -1;
-    let clean = pattern;
-    let anchoredEnd = false;
-    if (clean.endsWith('$')) {
-      anchoredEnd = true;
-      clean = clean.slice(0, -1);
+    // RFC 9309 path matching: `*` spans any sequence, trailing `$` anchors
+    // the end; otherwise patterns match from the start. The remainder of a
+    // wildcard pattern still constrains the match — `/public/*.html` must
+    // not match `/public/secret`.
+    let anchored = false;
+    let core = pattern;
+    if (core.endsWith('$')) {
+      anchored = true;
+      core = core.slice(0, -1);
     }
-    // RFC 9309 matching is prefix-based with * and $ wildcards; approximate
-    // conservatively: literal prefix wins, *-patterns match minimally.
-    const star = clean.indexOf('*');
-    if (star < 0) {
-      if (!path.startsWith(clean)) return -1;
-      if (anchoredEnd && path !== clean) return -1;
-      return clean.length;
+    let re: RegExp;
+    try {
+      re = new RegExp(`^${core.split('*').map(escapeRegExp).join('.*')}${anchored ? '$' : ''}`);
+    } catch {
+      return -1;
     }
-    const head = clean.slice(0, star);
-    if (!path.startsWith(head)) return -1;
-    return head.length;
+    const hit = re.exec(path);
+    if (!hit) return -1;
+    return hit[0].length;
   };
   let best = -1;
   let allowed = true;
@@ -243,9 +269,10 @@ function crawlDelayOf(group: RobotsGroup): number | null {
 /** Parse a sitemap index or urlset. Same-host rule enforced against the
  * sitemap's own host (off-host entries dropped and counted, never followed).
  * Counts capped; truncation recorded, never silent. */
-export function parseSitemapXml(xml: string, sourceUrl: string): SitemapInventory {
+export function parseSitemapXml(xml: string, sourceUrl: string, bodyTruncated = false): SitemapInventory {
   const empty: SitemapInventory = {
     kind: 'unknown', sourceUrl, nestedSitemaps: [], urls: [], droppedOffHost: 0, droppedOverCap: 0,
+    bodyTruncated,
   };
   let sourceHost = '';
   try {
@@ -309,17 +336,17 @@ export function parseSitemapXml(xml: string, sourceUrl: string): SitemapInventor
  * Entry content is NOT extracted here: entries are discovery nominations
  * (URLs), and item bodies become evidence only through the normal
  * acquisition → extraction → attribution pipeline with feed provenance. */
-export function parseFeedXml(xml: string, feedUrl: string): FeedInventoryEntry {
+export function parseFeedXml(xml: string, feedUrl: string, bodyTruncated = false): FeedInventoryEntry {
   const trimmed = xml.trim();
-  if (trimmed.startsWith('{')) return parseJsonFeed(trimmed);
+  if (trimmed.startsWith('{')) return parseJsonFeed(trimmed, bodyTruncated);
   const isAtom = /<\s*feed[\s>]/.test(trimmed);
   const isRss = /<\s*rss[\s>]/.test(trimmed) || /<\s*(rdf:)?RDF[\s>]/.test(trimmed) || /<\s*channel[\s>]/.test(trimmed);
-  if (!isAtom && !isRss) return { feedUrl, format: 'unknown', entries: [], truncated: false };
+  if (!isAtom && !isRss) return { feedUrl, format: 'unknown', entries: [], truncated: bodyTruncated, bodyTruncated };
   let $: cheerio.CheerioAPI;
   try {
     $ = cheerio.load(xml, { xmlMode: true });
   } catch {
-    return { feedUrl, format: 'unknown', entries: [], truncated: false };
+    return { feedUrl, format: 'unknown', entries: [], truncated: bodyTruncated, bodyTruncated };
   }
   const entries: Array<{ url: string; title?: string; published?: string }> = [];
   let truncated = false;
@@ -342,7 +369,7 @@ export function parseFeedXml(xml: string, feedUrl: string): FeedInventoryEntry {
         $(el).find('published').first().text().trim() || $(el).find('updated').first().text().trim() || undefined,
       );
     });
-    return { feedUrl, format: 'atom', ...(title ? { title } : {}), ...(selfLink ? { selfLink } : {}), entries, truncated };
+    return { feedUrl, format: 'atom', ...(title ? { title } : {}), ...(selfLink ? { selfLink } : {}), entries, truncated: truncated || bodyTruncated, bodyTruncated };
   }
   if ($('rss, rdf\\:RDF, RDF').length > 0 || $('channel').length > 0) {
     const title = $('channel > title').first().text().trim() || undefined;
@@ -354,20 +381,20 @@ export function parseFeedXml(xml: string, feedUrl: string): FeedInventoryEntry {
         $(el).find('pubDate').first().text().trim() || undefined,
       );
     });
-    return { feedUrl, format: 'rss', ...(title ? { title } : {}), entries, truncated };
+    return { feedUrl, format: 'rss', ...(title ? { title } : {}), entries, truncated: truncated || bodyTruncated, bodyTruncated };
   }
-  return { feedUrl, format: 'unknown', entries: [], truncated: false };
+  return { feedUrl, format: 'unknown', entries: [], truncated: bodyTruncated, bodyTruncated };
 }
 
-function parseJsonFeed(text: string): FeedInventoryEntry {
+function parseJsonFeed(text: string, bodyTruncated = false): FeedInventoryEntry {
   let parsed: { version?: unknown; title?: unknown; home_page_url?: unknown; items?: unknown };
   try {
     parsed = JSON.parse(text) as typeof parsed;
   } catch {
-    return { feedUrl: '', format: 'unknown', entries: [], truncated: false };
+    return { feedUrl: '', format: 'unknown', entries: [], truncated: bodyTruncated, bodyTruncated };
   }
   if (typeof parsed.version !== 'string' || !parsed.version.includes('jsonfeed.org')) {
-    return { feedUrl: '', format: 'unknown', entries: [], truncated: false };
+    return { feedUrl: '', format: 'unknown', entries: [], truncated: bodyTruncated, bodyTruncated };
   }
   const entries: Array<{ url: string; title?: string; published?: string }> = [];
   let truncated = false;
@@ -392,20 +419,21 @@ function parseJsonFeed(text: string): FeedInventoryEntry {
     format: 'json',
     ...(typeof parsed.title === 'string' ? { title: parsed.title } : {}),
     entries,
-    truncated,
+    truncated: truncated || bodyTruncated,
+    bodyTruncated,
   };
 }
 
 /** Head-level discovery inventory: canonical declarations (recorded, never
  * resolved here), feed autolinks, robots meta, JSON-LD type presence,
  * microdata/RDFa counts, same-host nav volume. Deterministic over bytes. */
-export function extractHeadDiscovery(html: string, pageUrl: string): HeadDiscovery {
+export function extractHeadDiscovery(html: string, pageUrl: string, bodyTruncated = false): HeadDiscovery {
   let $: cheerio.CheerioAPI;
   try {
     $ = cheerio.load(html);
   } catch {
     return {
-      canonicalHrefs: [], feedLinks: [], robotsMeta: null, jsonLdTypes: [],
+      canonicalHrefs: [], feedLinks: [], robotsMeta: null, bodyTruncated: false, jsonLdTypes: [],
       jsonLdSameAs: [], jsonLdUnparsable: 0, microdataItems: 0, rdfaItems: 0, navSameHostLinks: 0,
     };
   }
@@ -457,7 +485,7 @@ export function extractHeadDiscovery(html: string, pageUrl: string): HeadDiscove
     }
   });
   return {
-    canonicalHrefs, feedLinks, robotsMeta, jsonLdTypes, jsonLdSameAs, jsonLdUnparsable,
+    canonicalHrefs, feedLinks, robotsMeta, bodyTruncated, jsonLdTypes, jsonLdSameAs, jsonLdUnparsable,
     microdataItems, rdfaItems, navSameHostLinks,
   };
 }
@@ -564,10 +592,7 @@ export async function fetchProfilerUrl(
   try {
     const response = await fetchImpl(url, {
       signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
+      headers: profilerFetchHeaders(),
       redirect: 'follow',
     });
     const contentType = response.headers.get('content-type') || '';
@@ -609,6 +634,93 @@ export async function fetchProfilerUrl(
   }
 }
 
+/** Single declared fetch identity: the same user agent is sent on every
+ * profiler request and used for robots group evaluation, so the recorded
+ * policy decision always describes the requests the profiler makes. */
+export const PROFILER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+
+export function profilerFetchHeaders(): Record<string, string> {
+  return {
+    'User-Agent': PROFILER_USER_AGENT,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  };
+}
+
+export type DnsResolver = (hostname: string) => Promise<string[]>;
+
+async function defaultDnsResolve(hostname: string): Promise<string[]> {
+  const { lookup } = await import('node:dns/promises');
+  const records = await lookup(hostname, { all: true });
+  return records.map(record => record.address);
+}
+
+/** True only for globally routable unicast addresses. Everything else —
+ * loopback, link-local, private, carrier-grade NAT, documentation,
+ * multicast, reserved, unspecified — is non-public. Unparsable input
+ * fails closed (false). IPv4-mapped IPv6 is judged by its inner address. */
+export function isPublicIpAddress(host: string): boolean {
+  const lower = host.toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  const v4 = lower.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const octets = v4.slice(1, 5).map(Number);
+    if (octets.some(octet => octet > 255)) return false;
+    const [a, b] = octets;
+    if (a === 10) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 127) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 0) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false;
+    if (a === 192 && b === 0 && (octets[2] === 0 || octets[2] === 2)) return false;
+    if (a === 198 && (b === 18 || b === 19)) return false;
+    if (a === 198 && b === 51 && octets[2] === 100) return false;
+    if (a === 203 && b === 0 && octets[2] === 113) return false;
+    if (a >= 224) return false;
+    return true;
+  }
+  if (!lower.includes(':')) return false;
+  const bare = lower.split('%')[0];
+  if (bare === '::' || bare === '::1') return false;
+  if (bare.startsWith('ff')) return false;
+  if (bare.startsWith('fc') || bare.startsWith('fd')) return false;
+  const first = bare.split(':')[0];
+  const firstValue = parseInt(first || '0', 16);
+  if (Number.isFinite(firstValue) && firstValue >= 0xfe80 && firstValue <= 0xfebf) return false;
+  const mapped = bare.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPublicIpAddress(mapped[1]);
+  if (!/^[0-9a-f:]+$/.test(bare)) return false;
+  return true;
+}
+
+/** Whether fetching this URL stays on the public internet. IP literals are
+ * judged directly; hostnames resolve (every returned address must be
+ * public); resolution failure or unparsable input fails closed. Used for
+ * site-advertised discovery URLs (sitemaps, feeds) and redirect landing
+ * checks so a compromised site cannot aim server-side fetches at private
+ * services. Seed/homepage fetches keep the crawler-wide trust posture. */
+export async function isPublicInternetUrl(raw: string, resolve: DnsResolver = defaultDnsResolve): Promise<boolean> {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const hostname = parsed.hostname;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) || hostname.includes(':')) {
+    return isPublicIpAddress(hostname);
+  }
+  let addresses: string[];
+  try {
+    addresses = await resolve(hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+  if (!addresses.length) return false;
+  return addresses.every(address => isPublicIpAddress(address));
+}
+
 export interface ProfilerInput {
   siteIdentity: string;
   identityTier: string;
@@ -618,6 +730,9 @@ export interface ProfilerInput {
 export interface ProfilerDeps {
   fetchImpl: typeof fetch;
   now?: () => string;
+  /** Hostname-to-address resolver for the SSRF destination guard. Defaults
+   * to system DNS; tests inject fixed answers (never real lookups). */
+  resolveHost?: DnsResolver;
 }
 
 function provenanceFor(sourceUrl: string, fetchedAt: string, method: string): FieldProvenance {
@@ -670,59 +785,89 @@ export async function runSiteProfiler(
       robotsFetch = { state: 'FETCHED', status: fetched.status, fetchedAt: now() };
       parsedRobots = parseRobotsTxt(fetched.text);
       try {
-        robotsEvaluation = evaluateRobotsForPath(parsedRobots, 'trading-discovery-engine', new URL(input.seedUrl).pathname || '/');
+        robotsEvaluation = evaluateRobotsForPath(parsedRobots, PROFILER_USER_AGENT, new URL(input.seedUrl).pathname || '/');
       } catch {
         robotsEvaluation = { allowed: null, crawlDelaySeconds: null, matchedRule: null };
       }
     }
   }
 
+  const allowUrl = (url: string): Promise<boolean> => isPublicInternetUrl(url, deps.resolveHost);
+  const allowFetched = async (finalUrl: string): Promise<boolean> => {
+    // Redirects can land anywhere regardless of where they started: a
+    // private landing discards the body, never enters the inventory.
+    if (!finalUrl) return true;
+    return isPublicInternetUrl(finalUrl, deps.resolveHost);
+  };
+
+  // Robots-gated inventory: a disallowed seed path, a rate limit, or an
+  // unreachable policy file stops further fetching. The policy outcome so
+  // far is still recorded — the profiler reports what it learned, then
+  // yields instead of requesting against the signal.
+  const robotsBlocksFurther = robotsFetch.state === 'RATE_LIMITED' || robotsFetch.state === 'UNREACHABLE';
+  const seedDisallowed = robotsFetch.state === 'FETCHED' && robotsEvaluation.allowed === false;
+
   let head: HeadDiscovery | null = null;
   let canonicalConflicts: CanonicalConflict[] = [];
   const sitemaps: SitemapInventory[] = [];
+  let sitemapLocationsSkipped = 0;
   const feeds: FeedInventoryEntry[] = [];
-  const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
-  stamp('homepage', input.seedUrl, 'profiler:homepage-fetch');
-  if (homeFetched && homeFetched.status >= 200 && homeFetched.status < 300) {
-    head = extractHeadDiscovery(homeFetched.text, homeFetched.finalUrl);
-    for (const href of head.canonicalHrefs) {
-      canonicalConflicts.push({
-        declaredHref: href,
-        source: 'link-tag',
-        kind: classifyCanonicalHref(href, homeFetched.finalUrl),
-        agreesWithObserved: null,
-      });
+  if (!robotsBlocksFurther && !seedDisallowed) {
+    const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
+    stamp('homepage', input.seedUrl, 'profiler:homepage-fetch');
+    if (homeFetched && homeFetched.status >= 200 && homeFetched.status < 300 && await allowFetched(homeFetched.finalUrl)) {
+      head = extractHeadDiscovery(homeFetched.text, homeFetched.finalUrl, homeFetched.truncated);
+      for (const href of head.canonicalHrefs) {
+        canonicalConflicts.push({
+          declaredHref: href,
+          source: 'link-tag',
+          kind: classifyCanonicalHref(href, homeFetched.finalUrl),
+          agreesWithObserved: null,
+        });
+      }
     }
   }
 
-  // Sitemap expansion, bounded: robots-advertised locations first, then the
-  // conventional location. Index children and URL admissions both capped;
-  // off-host entries dropped with counts, never followed.
-  const sitemapCandidates: string[] = [];
+  // Sitemap expansion as a bounded worklist: robots-advertised locations
+  // first, then the conventional location, then discovered index children.
+  // Total fetches capped; locations never reached count as skipped (never
+  // silently absent); off-host entries dropped with counts, never followed.
+  // Every location passes the destination guard; private landings discard.
+  const pendingSitemaps: string[] = [];
   for (const location of parsedRobots.sitemaps) {
-    if (!sitemapCandidates.includes(location)) sitemapCandidates.push(location);
+    if (!pendingSitemaps.includes(location)) pendingSitemaps.push(location);
   }
-  if (origin && !sitemapCandidates.includes(`${origin}/sitemap.xml`)) sitemapCandidates.push(`${origin}/sitemap.xml`);
-  const sitemapQueue = sitemapCandidates.slice(0, MAX_SITEMAP_INDEX_FILES + 1);
-  for (const location of sitemapQueue) {
-    if (sitemaps.length >= MAX_SITEMAP_INDEX_FILES + 1) break;
-    const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
-    stamp(`sitemap:${location}`, location, 'profiler:sitemap-fetch');
-    if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
-    const parsed = parseSitemapXml(fetched.text, location);
-    if (parsed.kind === 'unknown') continue;
-    sitemaps.push(parsed);
-    for (const nested of parsed.nestedSitemaps) {
-      if (!sitemapCandidates.includes(nested) && sitemapQueue.length < MAX_SITEMAP_INDEX_FILES + 1) sitemapQueue.push(nested);
+  if (origin && !pendingSitemaps.includes(`${origin}/sitemap.xml`)) pendingSitemaps.push(`${origin}/sitemap.xml`);
+  const MAX_SITEMAP_FETCHES = MAX_SITEMAP_INDEX_FILES + 1;
+  let sitemapFetches = 0;
+  if (!robotsBlocksFurther && !seedDisallowed) {
+    while (pendingSitemaps.length > 0 && sitemapFetches < MAX_SITEMAP_FETCHES) {
+      const location = pendingSitemaps.shift()!;
+      if (!(await allowUrl(location))) continue;
+      sitemapFetches += 1;
+      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
+      stamp(`sitemap:${location}`, location, 'profiler:sitemap-fetch');
+      if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
+      if (!(await allowFetched(fetched.finalUrl))) continue;
+      const parsed = parseSitemapXml(fetched.text, location, fetched.truncated);
+      if (parsed.kind === 'unknown') continue;
+      sitemaps.push(parsed);
+      for (const nested of parsed.nestedSitemaps) {
+        if (!pendingSitemaps.includes(nested) && !sitemaps.some(entry => entry.sourceUrl === nested)) pendingSitemaps.push(nested);
+      }
     }
+    sitemapLocationsSkipped = pendingSitemaps.length;
+  } else {
+    sitemapLocationsSkipped = pendingSitemaps.length;
   }
 
   // Feed inventory, bounded: autolinked feeds first (first = main feed),
   // then conventional locations. Entry bodies are never extracted here.
+  // Same destination guard and truncation accounting as sitemaps.
   const feedCandidates: string[] = [];
   for (const link of head?.feedLinks || []) {
     try {
-      const absolute = new URL(link.href, homeFetched?.finalUrl || input.seedUrl).toString();
+      const absolute = new URL(link.href, input.seedUrl).toString();
       if (!feedCandidates.includes(absolute)) feedCandidates.push(absolute);
     } catch {
       // Unresolvable autolinks contribute nothing to the inventory.
@@ -733,14 +878,18 @@ export async function runSiteProfiler(
       if (!feedCandidates.includes(conventional)) feedCandidates.push(conventional);
     }
   }
-  for (const location of feedCandidates.slice(0, MAX_FEEDS_PER_SITE + 1)) {
-    if (feeds.length >= MAX_FEEDS_PER_SITE) break;
-    const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
-    stamp(`feed:${location}`, location, 'profiler:feed-fetch');
-    if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
-    const parsed = parseFeedXml(fetched.text, location);
-    if (parsed.format === 'unknown') continue;
-    feeds.push({ ...parsed, feedUrl: location });
+  if (!robotsBlocksFurther && !seedDisallowed) {
+    for (const location of feedCandidates) {
+      if (feeds.length >= MAX_FEEDS_PER_SITE) break;
+      if (!(await allowUrl(location))) continue;
+      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
+      stamp(`feed:${location}`, location, 'profiler:feed-fetch');
+      if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
+      if (!(await allowFetched(fetched.finalUrl))) continue;
+      const parsed = parseFeedXml(fetched.text, location, fetched.truncated);
+      if (parsed.format === 'unknown') continue;
+      feeds.push({ ...parsed, feedUrl: location });
+    }
   }
 
   const sitemapUrls = sitemaps.reduce((count, entry) => count + entry.urls.length, 0);
@@ -768,6 +917,7 @@ export async function runSiteProfiler(
       robotsEvaluation,
       robotsSitemaps: parsedRobots.sitemaps,
       sitemaps,
+      sitemapLocationsSkipped,
       feeds,
       head,
       canonicalConflicts,

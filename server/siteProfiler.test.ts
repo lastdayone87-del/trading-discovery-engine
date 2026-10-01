@@ -286,3 +286,143 @@ test('migration 135 creates the additive site_profiles table only', () => {
   assert.match(ddl, /site_identity TEXT PRIMARY KEY/);
   assert.doesNotMatch(ddl, /DROP TABLE|ALTER TABLE|BACKFILL|UPDATE\s+\w+\s+SET/i);
 });
+
+test('robots group selection prefers the most specific matching token', () => {
+  const parsed = parseRobotsTxt([
+    'User-agent: trade',
+    'Disallow: /everything',
+    'User-agent: trading-discovery-engine',
+    'Disallow: /nothing-here',
+    'User-agent: *',
+    'Disallow: /fallback',
+  ].join('\n'));
+  assert.deepEqual(evaluateRobotsForPath(parsed, 'trading-discovery-engine', '/nothing-here/deep').matchedRule, 'Disallow: /nothing-here');
+  assert.deepEqual(evaluateRobotsForPath(parsed, 'trading-discovery-engine', '/everything'), {
+    allowed: true, crawlDelaySeconds: null, matchedRule: null,
+  }, 'specific group wins: the shorter token group must not govern this agent');
+  assert.deepEqual(evaluateRobotsForPath(parsed, 'trade-winds', '/everything').matchedRule, 'Disallow: /everything');
+  assert.deepEqual(evaluateRobotsForPath(parsed, 'unrelated-bot', '/fallback').matchedRule, 'Disallow: /fallback');
+});
+
+test('robots wildcards constrain the suffix and honor end anchors', () => {
+  const parsed = parseRobotsTxt(['User-agent: *', 'Allow: /public/*.html', 'Disallow: /public/', 'Disallow: /exact$'].join('\n'));
+  assert.equal(evaluateRobotsForPath(parsed, 'x', '/public/page.html').allowed, true);
+  assert.equal(evaluateRobotsForPath(parsed, 'x', '/public/secret').allowed, false, 'suffix after wildcard still constrains');
+  assert.equal(evaluateRobotsForPath(parsed, 'x', '/exact').allowed, false);
+  assert.equal(evaluateRobotsForPath(parsed, 'x', '/exact/more').allowed, true, 'end anchor respected');
+});
+
+test('profiler fetch identity is single-sourced for requests and evaluation', async () => {
+  const { PROFILER_USER_AGENT, profilerFetchHeaders } = await import('./siteProfiler');
+  assert.ok(PROFILER_USER_AGENT.includes('Mozilla'));
+  assert.equal(profilerFetchHeaders()['User-Agent'], PROFILER_USER_AGENT);
+});
+
+test('robots disallow, rate limit, and unreachable states stop further fetching', async () => {
+  const gated = async (robotsBody: string | null, robotsStatus: number | 'throw') => {
+    const fetched: string[] = [];
+    const fetchImpl = (async (url: unknown) => {
+      const target = String(url);
+      fetched.push(target);
+      if (target.endsWith('/robots.txt')) {
+        if (robotsStatus === 'throw') throw new Error('down');
+        return new Response(robotsBody || '', { status: robotsStatus as number, headers: { 'content-type': 'text/plain' } });
+      }
+      return new Response('<html><body>hi</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch;
+    const result = await runSiteProfiler(
+      { siteIdentity: 'example.com', identityTier: 'A', seedUrl: 'https://example.com/' },
+      { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+      async () => true,
+    );
+    return { profile: result.profile!, fetched };
+  };
+  const disallowed = await gated('User-agent: *\nDisallow: /', 200);
+  assert.deepEqual(disallowed.fetched, ['https://example.com/robots.txt'], 'disallowed seed stops everything else');
+  assert.equal(disallowed.profile.head, null);
+  assert.equal(disallowed.profile.sitemaps.length, 0);
+  assert.deepEqual(disallowed.profile.robotsSitemaps, [], 'no sitemap records advertised, none recorded');
+  const limited = await gated('User-agent: *\nAllow: /', 429);
+  assert.equal(limited.profile.robotsFetch.state, 'RATE_LIMITED');
+  assert.deepEqual(limited.fetched, ['https://example.com/robots.txt'], 'rate limit yields instead of hammering on');
+  const down = await gated(null, 'throw');
+  assert.equal(down.profile.robotsFetch.state, 'UNREACHABLE');
+  assert.deepEqual(down.fetched, ['https://example.com/robots.txt']);
+});
+
+test('destination guard blocks private targets while passing public ones', async () => {
+  const { isPublicIpAddress, isPublicInternetUrl } = await import('./siteProfiler');
+  for (const privateIp of ['127.0.0.1', '10.0.0.5', '172.16.0.9', '172.31.255.1', '192.168.1.1', '169.254.169.254', '0.0.0.0', '::1', '::', 'fe80::1', 'fc00::9', 'ff02::1', '::ffff:10.1.2.3', '224.0.0.1', '999.1.1.1']) {
+    assert.equal(isPublicIpAddress(privateIp), false, `${privateIp} is not public`);
+  }
+  for (const publicIp of ['93.184.216.1', '8.8.8.8', '1.1.1.1', '2606:4700:4700::1111']) {
+    assert.equal(isPublicIpAddress(publicIp), true, `${publicIp} is public`);
+  }
+  const resolve = async (host: string) => {
+    if (host === 'internal.example') return ['10.9.9.9'];
+    if (host === 'dead.example') throw new Error('NXDOMAIN');
+    return ['93.184.216.1'];
+  };
+  assert.equal(await isPublicInternetUrl('https://public.example/x', resolve), true);
+  assert.equal(await isPublicInternetUrl('https://internal.example/x', resolve), false, 'resolving private fails closed');
+  assert.equal(await isPublicInternetUrl('https://dead.example/x', resolve), false, 'resolution failure fails closed');
+  assert.equal(await isPublicInternetUrl('http://127.0.0.1/latest/meta-data', resolve), false, 'literal metadata address blocked');
+  assert.equal(await isPublicInternetUrl('ftp://public.example/x', resolve), false, 'non-http schemes rejected');
+  assert.equal(await isPublicInternetUrl('not a url', resolve), false);
+});
+
+test('guard-skipped sitemaps are never fetched; private landings are discarded', async () => {
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    fetched.push(target);
+    if (target.endsWith('/robots.txt')) {
+      return new Response('User-agent: *\nAllow: /\nSitemap: https://example.com/sitemap.xml\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (target.includes('sitemap.xml')) {
+      const response = new Response(`<?xml version="1.0"?><urlset><url><loc>https://example.com/a</loc></url></urlset>`, { status: 200, headers: { 'content-type': 'application/xml' } });
+      Object.defineProperty(response, 'url', { value: 'http://169.254.169.254/stolen' });
+      return response;
+    }
+    return new Response('<html><body>hi</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'example.com', identityTier: 'A', seedUrl: 'https://example.com/' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+    async () => true,
+  );
+  assert.equal(result.profile!.sitemaps.length, 0, 'private-landing sitemap discarded, never inventoried');
+  assert.ok(!fetched.some(url => url.includes('169.254')), 'no request ever addressed the metadata service');
+});
+
+test('sitemap worklist caps total fetches and reports skipped locations', async () => {
+  const advertised = Array.from({ length: MAX_SITEMAP_INDEX_FILES + 6 }, (_, i) => `https://example.com/s${i}.xml`);
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    if (target.endsWith('/robots.txt')) {
+      return new Response(`User-agent: *\nAllow: /\n${advertised.map(location => `Sitemap: ${location}`).join('\n')}\n`, { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (target.endsWith('.xml')) {
+      return new Response(`<?xml version="1.0"?><urlset><url><loc>https://example.com/a</loc></url></urlset>`, { status: 200, headers: { 'content-type': 'application/xml' } });
+    }
+    return new Response('<html><body>hi</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'example.com', identityTier: 'A', seedUrl: 'https://example.com/' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+    async () => true,
+  );
+  const profile = result.profile!;
+  assert.ok(profile.sitemaps.length <= MAX_SITEMAP_INDEX_FILES + 1, 'fetch budget binding');
+  assert.ok(profile.sitemapLocationsSkipped > 0, 'unreached locations counted, never silently absent');
+  assert.equal(profile.sitemaps.length + profile.sitemapLocationsSkipped, advertised.length + 1, 'every advertised location accounted for');
+});
+
+test('truncation flags survive from fetch bytes to inventory records', async () => {
+  const { parseSitemapXml, parseFeedXml, extractHeadDiscovery } = await import('./siteProfiler');
+  assert.equal(parseSitemapXml(`<?xml version="1.0"?><urlset></urlset>`, 'https://example.com/s.xml', true).bodyTruncated, true);
+  assert.equal(parseFeedXml(`<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>`, 'https://example.com/f', true).truncated, true);
+  assert.equal(parseFeedXml(`<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>`, 'https://example.com/f', false).truncated, false);
+  assert.equal(extractHeadDiscovery('<html><head></head><body></body></html>', 'https://example.com/', true).bodyTruncated, true);
+  assert.equal(extractHeadDiscovery('<html><head></head><body></body></html>', 'https://example.com/').bodyTruncated, false);
+});

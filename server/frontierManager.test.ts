@@ -98,6 +98,21 @@ test('arbiter never stops a known-evidence site on floors alone', () => {
   assert.equal(decision.action, 'ACQUIRE');
 });
 
+test('marginal floor waits for a full window before judging', () => {
+  // A clean root with promising undiscovered children must not halt on a
+  // high floor: one sample is variance, not exhaustion.
+  const early = decideFrontierStep(
+    stateful({ acquiredPages: 1, yieldHistory: [0], evidenceUnits: 0 }),
+    { marginalFloor: 1000, remainingValueFloor: 0, marginalWindow: 5 },
+  );
+  assert.equal(early.action, 'ACQUIRE', 'window unfilled: keep exploring');
+  const filled = decideFrontierStep(
+    stateful({ acquiredPages: 5, yieldHistory: [0, 0, 0, 0, 0], evidenceUnits: 0 }),
+    { marginalFloor: 1000, remainingValueFloor: 0, marginalWindow: 5 },
+  );
+  assert.equal(filled.action, 'STOP', 'window filled with zeros: halt with reason');
+});
+
 test('blocked classification separates terminal states without extra fetches', () => {
   assert.equal(classifyBlockedAcquisition({}), 'INCOMPLETE');
   assert.equal(classifyBlockedAcquisition({ processedPages: 0 }), 'INCOMPLETE');

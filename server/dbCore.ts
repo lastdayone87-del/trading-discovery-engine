@@ -1178,6 +1178,20 @@ export async function upsertFrontierQueueItem(row: {
   }
 }
 
+/** Counts queued frontier entries for one site (cap enforcement input).
+ * Zero when unknown or pre-migration. */
+export async function countFrontierQueue(siteIdentity: string): Promise<number> {
+  if (!siteIdentity) return 0;
+  const db = await getDb();
+  try {
+    const res = await db.query(`SELECT count(*)::int n FROM site_frontier WHERE site_identity=$1 AND state='QUEUED'`, [siteIdentity]);
+    return Number(res.rows?.[0]?.n || 0);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
+    throw error;
+  }
+}
+
 /** Reads a site's queued frontier entries in priority order. Empty when
  * unknown or pre-migration: callers fall back to legacy crawl order. */
 export async function getFrontierQueue(siteIdentity: string, limit = 50): Promise<FrontierQueueRow[]> {

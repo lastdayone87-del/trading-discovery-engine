@@ -199,9 +199,17 @@ export function decideFrontierStep(
     return { action: 'STOP', reason: `remaining-value-below-floor: ${remainingValue} < ${policy.remainingValueFloor}` };
   }
   if (state.acquiredPages > 0) {
-    const marginal = marginalEvidenceYield(state.yieldHistory, policy.marginalWindow);
-    if (marginal < policy.marginalFloor) {
-      return { action: 'STOP', reason: `marginal-yield-below-floor: ${marginal} < ${policy.marginalFloor}` };
+    // Warm-up guard: a trailing-window mean over fewer samples than the
+    // window is high-variance noise, not evidence of exhaustion. The floor
+    // applies only once the window is full; caps, budget, and exhaustion
+    // still stop earlier. This preserves the common clean-root →
+    // promising-children shape instead of halting before any child.
+    const winsize = Math.max(1, Math.trunc(policy.marginalWindow) || 1);
+    if (state.yieldHistory.length >= winsize) {
+      const marginal = marginalEvidenceYield(state.yieldHistory, policy.marginalWindow);
+      if (marginal < policy.marginalFloor) {
+        return { action: 'STOP', reason: `marginal-yield-below-floor: ${marginal} < ${policy.marginalFloor}` };
+      }
     }
   }
   return { action: 'ACQUIRE', url: available[0].url, reason: `best-expected-value: ${available[0].expectedValue}` };

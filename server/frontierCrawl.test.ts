@@ -53,7 +53,10 @@ test('arbiter halt is observable, reasoned, and never a clean negative', async (
   const result = await crawlExternalLinks(
     ['https://wired.example/'], [], undefined, fetchImpl,
     'CREATOR_WEBSITES', false, undefined, false,
-    { ...OPTS, marginalFloor: 1000, remainingValueFloor: 0, marginalWindow: 5 },
+    // Window of one: the single root observation completes the window, so
+    // the floor applies immediately. Larger windows warm up first (tested
+    // in frontierManager.test.ts); production defaults never stop early.
+    { ...OPTS, marginalFloor: 1000, remainingValueFloor: 0, marginalWindow: 1 },
   );
   assert.equal(fetched.length, 1, 'only the root fetched once the floor trips');
   assert.equal(result.outcome, 'PARTIALLY_INSPECTED', 'halted crawl reports partial, never clean');

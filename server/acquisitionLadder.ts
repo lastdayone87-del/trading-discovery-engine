@@ -27,6 +27,9 @@ export const ACQUISITION_LADDER_SETTING_KEY = 'acquisition_ladder_enabled';
  * cost/yield measurements; existing crawl ceilings stay hard upper bounds). */
 export const MAX_LADDER_SITEMAP_SEEDS = 5;
 export const MAX_LADDER_STRUCTURED_URLS = 10;
+/** Conservative initial bound (TBD-for-planning): profiler runs per
+ * inspection when the ladder is enabled. Smaller is always acceptable. */
+export const MAX_LADDER_PROFILE_RUNS_PER_INSPECTION = 3;
 
 export type AcquisitionMethod =
   | 'HTTP_STATIC'

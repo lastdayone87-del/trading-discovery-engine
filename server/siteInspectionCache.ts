@@ -118,6 +118,15 @@ export function needsRenderedRecrawl(
   return input.staticOutcome !== 'FOUND' || !input.hasCreatorOwned;
 }
 
+/** Root-page terminal for coverage rows: reflects ONLY the root page's own
+ * evidence (direct-in-URL candidates and children live on their own rows).
+ * An invite found solely on a child never marks the root FOUND. Pure. */
+export function rootCoverageTerminal(rootYield: number, truncated: boolean): 'FOUND' | 'PARTIALLY_INSPECTED' | 'INSPECTED_NO_MATCH' {
+  if (Math.max(0, Math.trunc(rootYield) || 0) > 0) return 'FOUND';
+  if (truncated) return 'PARTIALLY_INSPECTED';
+  return 'INSPECTED_NO_MATCH';
+}
+
 /** Whether a rendered run counts as sufficient rendered coverage for the
  * site cache. Attempted is not covered: timeouts, interruptions, partial
  * page processing, and zero-page runs must never satisfy renderedCovered —

@@ -9,6 +9,7 @@ import {
   needsRenderedRecrawl,
   siteInspectionCoversRequest,
   isSufficientRenderedCoverage,
+  rootCoverageTerminal,
   mergeRedirectBinding,
   redirectBindingFor,
   redirectDestinations,
@@ -151,6 +152,13 @@ test('rendered coverage requires complete processed runs, never attempts', () =>
   assert.equal(isSufficientRenderedCoverage({ complete: false, timedOut: false }, true), false, 'partial page processing is not coverage');
   assert.equal(isSufficientRenderedCoverage({ complete: true, timedOut: false }, false), false, 'zero-page/unprocessed render is not coverage');
   assert.equal(isSufficientRenderedCoverage({ complete: false, timedOut: false }, false), false, 'unprocessed failure is not coverage');
+});
+
+test('root coverage reflects only root-page evidence, never seed aggregates', () => {
+  assert.equal(rootCoverageTerminal(2, false), 'FOUND');
+  assert.equal(rootCoverageTerminal(0, false), 'INSPECTED_NO_MATCH', 'clean root stays clean even when children hold invites');
+  assert.equal(rootCoverageTerminal(0, true), 'PARTIALLY_INSPECTED', 'truncated root is partial, never clean');
+  assert.equal(rootCoverageTerminal(-3, false), 'INSPECTED_NO_MATCH', 'negative counts clamp, never invert');
 });
 
 test('redirect bindings coexist per requested URL and resolve exactly', () => {

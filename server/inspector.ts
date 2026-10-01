@@ -1,16 +1,16 @@
 import * as cheerio from 'cheerio';
 import { decodeEmbeddedMarkup, extractDynamicTargetValues, extractEmbeddedUrls, extractYouTubeVideoIds } from './crawlerExtraction';
 import { InspectionStep } from '../src/types';
-import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, type SiteInspectionRow } from './db';
-import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition, isFrontierEnabled, MAX_FRONTIER_PAGES_PER_SITE, FRONTIER_POLICY_VERSION, type FrontierCrawlOptions } from './frontierManager';
-import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, needsRenderedRecrawl, siteInspectionCoversRequest, isSufficientRenderedCoverage, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
+import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, upsertSiteProfile, type SiteInspectionRow } from './db';
+import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition, isFrontierEnabled, MAX_FRONTIER_PAGES_PER_SITE, MAX_FRONTIER_QUEUE_PER_SITE, FRONTIER_POLICY_VERSION, type FrontierCrawlOptions } from './frontierManager';
+import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, needsRenderedRecrawl, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
-import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
-import { extractHeadDiscovery } from './siteProfiler';
+import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
+import { extractHeadDiscovery, isSiteProfilerEnabled, runSiteProfiler } from './siteProfiler';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, createDropCounter, type CrawlerTelemetry, type CeilingKind} from './crawlerTelemetry';
 import {fetchUrlFailureHistory, skippedUrlsFromHistory, normalizeSkipUrl, type UrlFailureRow} from './crawlUrlSkipPolicy';
@@ -259,12 +259,19 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       if(!frontierOn||!frontier?.siteIdentity)return Promise.resolve();
       return recordPageCoverage({siteIdentity:frontier.siteIdentity,pageKey:pageUrl,pageUrl,terminalState,acquisitionMethod:method,evidenceUnits,policyVersion:FRONTIER_POLICY_VERSION,weightVersion:frontier.weightVersion||''}).catch(()=>undefined);
     };
-    const frontierAdmitChildren=(children:Array<{url:string;score:number}>,depth:number)=>{
-      if(!frontierOn||!frontier?.siteIdentity)return Promise.resolve();
-      return Promise.all(children.slice(0,12).map(child=>{
-        const scored=scoreFrontierCandidate({url:child.url,hintScore:child.score,depth,attempts:0,sitemapListed:false,structuredNominated:false});
-        return upsertFrontierQueueItem({siteIdentity:frontier.siteIdentity!,urlKey:child.url,url:child.url,expectedValue:scored.expectedValue,nominatingSource:'NAVIGATION',sourceDetail:{depth},weightVersion:frontier.weightVersion||'',scorerInputs:{hintScore:child.score,depth},decision:{admittedAt:new Date().toISOString()}}).catch(()=>undefined);
-      })).then(()=>undefined);
+    const frontierAdmitChildren=async (children:Array<{url:string;score:number}>,depth:number)=>{
+      if(!frontierOn||!frontier?.siteIdentity)return;
+      try{
+        // Per-site admission cap: the persisted queue is bounded no matter
+        // how many inspections discover the same site. Skips are silent by
+        // design (in-memory navigation is unaffected).
+        const queued=await countFrontierQueue(frontier.siteIdentity);
+        if(queued>=MAX_FRONTIER_QUEUE_PER_SITE)return;
+        await Promise.all(children.slice(0,12).map(child=>{
+          const scored=scoreFrontierCandidate({url:child.url,hintScore:child.score,depth,attempts:0,sitemapListed:false,structuredNominated:false});
+          return upsertFrontierQueueItem({siteIdentity:frontier.siteIdentity!,urlKey:child.url,url:child.url,expectedValue:scored.expectedValue,nominatingSource:'NAVIGATION',sourceDetail:{depth},weightVersion:frontier.weightVersion||'',scorerInputs:{hintScore:child.score,depth},decision:{admittedAt:new Date().toISOString()}});
+        }));
+      }catch{/* admission is best-effort persistence, never crawl behavior */}
     };
     const acquired=await fetchExternalPage(url,fetchImpl),page=acquired.page;if(acquired.observation)observations.push({...acquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected})});
     // A truncated prefix is incomplete coverage, never a complete inspection:
@@ -308,6 +315,9 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // eligible targets are dropped. Truncation of eligible uniques is itself
     // incomplete coverage.
     const dedupedNavigation=(()=>{const best=new Map<string,{url:string;score:number}>();for(const item of firstNavigation){const prior=best.get(item.url);if(!prior||item.score>prior.score)best.set(item.url,item);}return [...best.values()];})();const duplicateDropped=Math.max(0,firstNavigation.length-dedupedNavigation.length);if(duplicateDropped>0)drops.count('duplicate',duplicateDropped);if(dedupedNavigation.length>12)seedCeiling??='queue-cap';const droppedByCap=Math.max(0,dedupedNavigation.length-12);if(droppedByCap>0)drops.count('queue-cap',droppedByCap);const queue=dedupedNavigation.slice(0,12).map(item=>({...item,depth:1}));let explored=0;
+    // Root-page discovered links enter the persisted queue like any child
+    // page's links, so root-only discoveries are recorded too.
+    if(frontierOn){await frontierAdmitChildren(dedupedNavigation,1);}
     while(queue.length&&explored<12){
     if(frontierOn){
       // P-C stopping arbiter (flag-gated): halts child exploration on
@@ -341,9 +351,11 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
     const foundForSeed=discovered.length>beforeSeed;const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':seedCeiling?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:false,httpStatus:200,detail:foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:seedCeiling?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage${truncatedResponse?'; response truncated at the bounded-response cap before full coverage':''}`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:seedCeiling,dropReasons:drops.snapshot()})});
     if(frontierOn){
-      // P-C root coverage row (flag-gated, best-effort): the seed page
-      // always resolves terminally here; children recorded per page above.
-      await frontierRecordCoverage(url,seedOutcome,'HTTP_STATIC',rootYield);
+      // P-C root coverage row (flag-gated, best-effort): terminal state
+      // reflects the ROOT page's own evidence only (rootCoverageTerminal);
+      // child outcomes live on their own rows, so a child-only invite never
+      // marks the root FOUND and blocked children are never hidden.
+      await frontierRecordCoverage(url,rootCoverageTerminal(rootYield,truncatedResponse),'HTTP_STATIC',rootYield);
     }
     }catch(error:any){logDetails.push(`Isolated acquisition error for ${String(rawUrl)}: ${error instanceof Error?error.message:String(error)}; continuing to next candidate.`);observations.push({requestedUrl:String(rawUrl||'unknown'),wrapperUrl,surface,required,rootUrl:String(rawUrl||'unknown'),outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'ISOLATED_ACQUISITION_ERROR',detail:`Per-URL failure isolated; remaining candidates continue: ${error instanceof Error?error.message:String(error)}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});continue;}
   }
@@ -695,6 +707,52 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         if(identity)seedIdentities.set(seed.url,identity.siteIdentity);
       }
       const profiles=await getSiteProfiles(Array.from(new Set(seedIdentities.values())));
+      // Lazy profile population (ladder-gated): seed identities with no
+      // stored profile are inventoried on demand, bounded per inspection,
+      // best-effort. Without this the profiler could never produce the
+      // inventories the seeding below consumes. Refresh policy belongs to
+      // adaptive revisit (P-D); here absent profiles only are backfilled.
+      try{
+        if(await isSiteProfilerEnabled().catch(()=>false)){
+          const known=new Set(profiles.map(profile=>profile.siteIdentity));
+          let runs=0;
+          for(const seed of websiteUrls){
+            if(runs>=MAX_LADDER_PROFILE_RUNS_PER_INSPECTION)break;
+            const identity=seedIdentities.get(seed.url);
+            if(!identity||known.has(identity))continue;
+            known.add(identity);
+            runs+=1;
+            const tier=canonicalSiteIdentity(seed.url)?.tier||'A';
+            const result=await runSiteProfiler(
+              {siteIdentity:identity,identityTier:tier,seedUrl:seed.url},
+              {fetchImpl:channelData.externalFetchImpl||fetch},
+            );
+            if(result.status!=='PROFILED'||!result.profile)continue;
+            const profile=result.profile;
+            await upsertSiteProfile({
+              siteIdentity:profile.siteIdentity,identityTier:profile.identityTier,
+              robotsState:typeof profile.robotsFetch.state==='string'?profile.robotsFetch.state:'UNKNOWN',
+              robotsFetchedAt:profile.robotsFetch.fetchedAt,
+              sitemapInventory:profile.sitemaps as unknown as Array<Record<string,unknown>>,
+              feedInventory:profile.feeds as unknown as Array<Record<string,unknown>>,
+              structuredData:{jsonLdTypes:profile.head?.jsonLdTypes||[]},
+              pageType:profile.pageType,politeness:profile.politeness as Record<string,unknown>,
+              profile:{provenance:profile.provenance,canonicalConflicts:profile.canonicalConflicts} as Record<string,unknown>,
+              policyVersion:profile.policyVersion,
+            });
+            profiles.push({
+              siteIdentity:profile.siteIdentity,identityTier:profile.identityTier,
+              robotsState:profile.robotsFetch.state,robotsFetchedAt:profile.robotsFetch.fetchedAt,
+              sitemapInventory:profile.sitemaps as unknown as Array<Record<string,unknown>>,
+              feedInventory:profile.feeds as unknown as Array<Record<string,unknown>>,
+              structuredData:{},pageType:profile.pageType,
+              politeness:profile.politeness as Record<string,unknown>,
+              profile:{},policyVersion:profile.policyVersion,
+              firstObservedAt:null,lastObservedAt:null,observedCount:1,
+            });
+          }
+        }
+      }catch{/* lazy profiling never breaks seed selection */}
       const profileByIdentity=new Map(profiles.map(profile=>[profile.siteIdentity,profile]));
       const sitemapSeeds:typeof websiteUrls=[];
       for(const seed of websiteUrls){
