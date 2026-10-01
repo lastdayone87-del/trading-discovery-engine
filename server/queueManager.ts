@@ -472,7 +472,13 @@ export async function processNextSearchJob(
       const dailyBudget = getDailyYouTubeQuotaBudget();
       const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
       const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;
-      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?202:101);
+      // Actual request costs after the uploads-playlist optimization (1 unit
+      // per list call): stage 1 = channels.list (1) + playlistItems.list (1);
+      // stage 2 adds playlist search (100) + videos.list (1). Reserve exactly
+      // what this job can still spend from its current stage — never the
+      // pre-optimization 101/202 totals that could reject a 2-unit job.
+      const currentEnrichmentStage=Number(candidate.enrichmentStage||0);
+      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?(currentEnrichmentStage>=1?101:103):2);
       let quotaReserved=false;
       let acquisitionPersisted=candidateAlreadyEnriched;
       if(!candidateAlreadyEnriched){

@@ -19,6 +19,7 @@ import {
   retryYouTubeQuotaAccounting,
   serializeYouTubeSuspensionWrite,
   shouldClearYouTubeSuspension,
+  suspensionRestoreHorizonMs,
   youtubeDeploymentId,
   YouTubeQuotaAccountingError,
 } from './youtubeKeyHealth';
@@ -426,4 +427,105 @@ test('suspended keys reprobe on a documented daily cadence (durable row is resta
   assert.equal(YOUTUBE_SUSPENSION_RETRY_AFTER_MS, 7 * 24 * 60 * 60_000);
   const migration = readFileSync(new URL('./db/migrations/132_youtube_key_health.sql', import.meta.url), 'utf8');
   assert.match(migration, /hot-path authority/);
+});
+
+test('restart hydration preserves the probe cadence instead of extending to the durable horizon', () => {
+  const DAY = 24 * 60 * 60_000;
+  const suspendedAt = 1_000_000_000;
+  // Suspended 23h ago, restarted now: reprobe lands on the original
+  // schedule (T+24h), not seven days out.
+  assert.equal(
+    suspensionRestoreHorizonMs({ retryAfterMs: suspendedAt + 7 * DAY, observedAtMs: suspendedAt, nowMs: suspendedAt + 23 * 3_600_000, probeIntervalMs: DAY }),
+    suspendedAt + DAY,
+  );
+  // Durable horizon still wins when it arrives first (short custom horizon).
+  assert.equal(
+    suspensionRestoreHorizonMs({ retryAfterMs: suspendedAt + 3_600_000, observedAtMs: suspendedAt, nowMs: suspendedAt, probeIntervalMs: DAY }),
+    suspendedAt + 3_600_000,
+  );
+  // Unknown suspension start falls back to one probe interval from restart.
+  assert.equal(
+    suspensionRestoreHorizonMs({ retryAfterMs: suspendedAt + 7 * DAY, observedAtMs: NaN, nowMs: suspendedAt, probeIntervalMs: DAY }),
+    suspendedAt + DAY,
+  );
+  // Missing durable horizon restores the cadence cap alone.
+  assert.equal(
+    suspensionRestoreHorizonMs({ retryAfterMs: NaN, observedAtMs: suspendedAt, nowMs: suspendedAt, probeIntervalMs: DAY }),
+    suspendedAt + DAY,
+  );
+});
+
+test('hydration restores a pre-restart suspension on its original probe schedule', async () => {
+  const { youtubeProviderCooldown } = await import('./youtubeProviderCooldown');
+  const { fingerprintYouTubeKey } = await import('./youtubeQuotaAttribution');
+  const DAY = 24 * 60 * 60_000;
+  const key = 'test-hydration-cadence-key';
+  const observedAt = new Date(Date.now() - 23 * 3_600_000).toISOString();
+  const retryAfter = new Date(Date.now() + 6 * DAY + 23 * 3_600_000).toISOString();
+  process.env.YOUTUBE_API_KEY = key;
+  try {
+    const summary = await hydrateYouTubeProviderSuspensions(async () => [
+      { keyFingerprint: fingerprintYouTubeKey(key), retryAfter, observedAt },
+    ]);
+    assert.deepEqual(summary, { restored: 1, skipped: 0 });
+    const status = youtubeProviderCooldown.status(key);
+    assert.equal(status.status, 'Suspended');
+    const expected = Date.parse(observedAt) + DAY;
+    assert.ok(
+      status.retryAt !== null && Math.abs(status.retryAt - expected) < 5_000,
+      `hydrated retryAt must track the original probe schedule, got ${status.retryAt} want ~${expected}`,
+    );
+  } finally {
+    delete process.env.YOUTUBE_API_KEY;
+    youtubeProviderCooldown.succeeded(key);
+    youtubeProviderCooldown.resolveSuspensionCandidate(key);
+  }
+});
+
+test('expired suspension still clears its durable row on a genuinely current success', async () => {
+  const { YouTubeProviderCooldown } = await import('./youtubeProviderCooldown');
+  let now = 2_000_000;
+  const cooldown = new YouTubeProviderCooldown({ initialRateLimitCooldownMs: 100, maxRateLimitCooldownMs: 400, now: () => now });
+  cooldown.failed('key-expired', 'CONSUMER_SUSPENDED');
+  assert.equal(cooldown.hasSuspensionCandidate('key-expired'), true);
+  // The 24h quarantine lapses with no restart: active suspension is gone,
+  // but the durable row (7d) is still out there.
+  now += 24 * 60 * 60_000 + 1;
+  assert.equal(cooldown.isSuspended('key-expired'), false, 'in-memory quarantine expired');
+  assert.equal(cooldown.hasSuspensionCandidate('key-expired'), true, 'durable candidate remembered past expiry');
+  // A probe dispatched now succeeds with the current generation.
+  const generation = cooldown.failureGeneration('key-expired');
+  assert.equal(cooldown.succeeded('key-expired', generation), true);
+  const wasSuspended = cooldown.isSuspended('key-expired') || cooldown.hasSuspensionCandidate('key-expired');
+  assert.equal(shouldClearYouTubeSuspension(true, wasSuspended), true, 'expired-then-recovered clears the durable row');
+  // Confirmed clear resolves the candidate so later successes stay cheap.
+  let cleared: string[] = [];
+  assert.equal(await clearYouTubeSuspensionIfCurrent('key-expired', generation, {
+    currentGeneration: () => cooldown.failureGeneration('key-expired'),
+    clear: async fp => { cleared.push(fp); },
+  }), true);
+  assert.equal(cleared.length, 1);
+  cooldown.resolveSuspensionCandidate('key-expired');
+  assert.equal(cooldown.hasSuspensionCandidate('key-expired'), false);
+  // A newer suspension between validation and clear still wins.
+  cooldown.failed('key-expired', 'CONSUMER_SUSPENDED');
+  const staleGeneration = cooldown.failureGeneration('key-expired');
+  cooldown.failed('key-expired', 'CONSUMER_SUSPENDED');
+  cleared = [];
+  assert.equal(await clearYouTubeSuspensionIfCurrent('key-expired', staleGeneration, {
+    currentGeneration: () => cooldown.failureGeneration('key-expired'),
+    clear: async fp => { cleared.push(fp); },
+  }), false, 'newer suspension survives a stale clear');
+  assert.deepEqual(cleared, []);
+  assert.equal(cooldown.hasSuspensionCandidate('key-expired'), true, 'unresolved candidate retained while suspended');
+  cooldown.succeeded('key-expired');
+  cooldown.resolveSuspensionCandidate('key-expired');
+});
+
+test('reader rehabilitates on candidate-aware suspension state', () => {
+  // Production wiring: the success path consults the remembered candidate,
+  // not just the active quarantine, before deciding a durable clear.
+  const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
+  const reader = youtube.slice(youtube.indexOf('export async function readYouTubeJsonObject'), youtube.indexOf('/** A request-rate limit'));
+  assert.match(reader, /hasSuspensionCandidate\(context\.providerKey\)/);
 });

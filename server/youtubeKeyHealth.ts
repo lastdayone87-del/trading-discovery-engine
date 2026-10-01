@@ -105,11 +105,13 @@ export function shouldClearYouTubeSuspension(providerSuccessIsCurrent: boolean, 
  * unequal and its fresh durable row survives. The recheck and the delete
  * run inside the shared suspension-write chain so a concurrent
  * re-suspension's upsert cannot slip between them and lose the fresh row.
- * The caller awaits this (never fire-and-forget). Returns false without
- * touching the database when the response is not eligible; errors propagate
- * so the caller decides (read path swallows them: a missed clear only
- * delays rehabilitation, never resurrects a dead key). Dependencies beyond
- * the chain are injectable for unit tests; production callers omit them. */
+ * A confirmed clear also resolves the in-memory suspension candidate so
+ * later successes stop attempting deletes. The caller awaits this (never
+ * fire-and-forget). Returns false without touching the database when the
+ * response is not eligible; errors propagate so the caller decides
+ * (read path swallows them: a missed clear only delays rehabilitation,
+ * never resurrects a dead key). Dependencies beyond the chain are
+ * injectable for unit tests; production callers omit them. */
 export async function clearYouTubeSuspensionIfCurrent(
   providerKey: string,
   observedGeneration: number | undefined,
@@ -123,6 +125,7 @@ export async function clearYouTubeSuspensionIfCurrent(
     const current = (deps.currentGeneration || ((key: string) => youtubeProviderCooldown.failureGeneration(key)))(providerKey);
     if (current !== observedGeneration) return false;
     await (deps.clear || clearYouTubeProviderSuspension)(fingerprintYouTubeKey(providerKey));
+    youtubeProviderCooldown.resolveSuspensionCandidate(providerKey);
     return true;
   });
 }
@@ -249,15 +252,31 @@ export function ensureYouTubeSuspensionHydration(): Promise<YouTubeSuspensionHyd
   return sharedSuspensionHydration;
 }
 
+/** In-memory restoration horizon for one durable suspension row. A restart
+ * must preserve the normal probe cadence, not extend it: a suspension
+ * observed at T reprobes at T + probe interval with or without a restart,
+ * so the restored horizon is the durable retry_after capped at
+ * observed_at + probe interval (unknown start falls back to now +
+ * interval). The durable 7-day row itself is untouched — it survives for
+ * success-clearing and analytics. Pure and deterministic for tests. */
+export function suspensionRestoreHorizonMs(input: { retryAfterMs: number; observedAtMs: number; nowMs: number; probeIntervalMs: number }): number {
+  const interval = Number.isFinite(input.probeIntervalMs) && input.probeIntervalMs > 0 ? Math.trunc(input.probeIntervalMs) : 24 * 60 * 60_000;
+  const cap = Number.isFinite(input.observedAtMs) ? input.observedAtMs + interval : input.nowMs + interval;
+  return Number.isFinite(input.retryAfterMs) ? Math.min(input.retryAfterMs, cap) : cap;
+}
+
 /** Restores durable suspensions into the in-memory cooldown after a
  * restart/redeploy. Fingerprints are resolved against the *current* pool:
  * rows whose key is gone (pool edited) are skipped, never applied to the
- * wrong key. Returns counts for startup logging. Throws when the load
+ * wrong key. Restoration is capped at the normal probe cadence
+ * (suspensionRestoreHorizonMs): a key suspended shortly before a restart
+ * reprobes on its original schedule instead of waiting out the full
+ * durable horizon. Returns counts for startup logging. Throws when the load
  * itself fails so ensureYouTubeSuspensionHydration() can retry later
  * instead of caching the zero-count fallback; callers that need a
  * non-rejecting gate must use ensureYouTubeSuspensionHydration(). */
 export async function hydrateYouTubeProviderSuspensions(
-  loadRows: () => Promise<Array<{ keyFingerprint: string; retryAfter: string | null }>> = loadActiveYouTubeProviderSuspensions,
+  loadRows: () => Promise<Array<{ keyFingerprint: string; retryAfter: string | null; observedAt?: string | null }>> = loadActiveYouTubeProviderSuspensions,
 ): Promise<YouTubeSuspensionHydration> {
   const summary: YouTubeSuspensionHydration = { restored: 0, skipped: 0 };
   let rows;
@@ -270,6 +289,8 @@ export async function hydrateYouTubeProviderSuspensions(
   if (!rows.length) return summary;
   const pool = getYouTubeKeyPool();
   const byFingerprint = new Map(pool.map(key => [fingerprintYouTubeKey(key), key] as const));
+  const probeIntervalMs = youtubeProviderCooldown.suspendedProbeIntervalMs();
+  const nowMs = Date.now();
   for (const row of rows) {
     const key = byFingerprint.get(row.keyFingerprint);
     if (!key) {
@@ -277,7 +298,8 @@ export async function hydrateYouTubeProviderSuspensions(
       continue;
     }
     const retryAfterMs = row.retryAfter ? Date.parse(row.retryAfter) : NaN;
-    youtubeProviderCooldown.restoreSuspended(key, Number.isFinite(retryAfterMs) ? retryAfterMs : Date.now() + YOUTUBE_SUSPENSION_RETRY_AFTER_MS);
+    const observedAtMs = row.observedAt ? Date.parse(row.observedAt) : NaN;
+    youtubeProviderCooldown.restoreSuspended(key, suspensionRestoreHorizonMs({ retryAfterMs, observedAtMs, nowMs, probeIntervalMs }));
     summary.restored += 1;
   }
   return summary;

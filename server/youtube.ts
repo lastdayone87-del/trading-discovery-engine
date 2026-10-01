@@ -538,8 +538,11 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
     if(context?.providerKey){
       // A rehabilitated key leaves both quarantine layers, but only when this
       // response is still current: an older in-flight success arriving after
-      // a newer suspension event must not clear either layer.
-      const wasSuspended = youtubeProviderCooldown.isSuspended(context.providerKey);
+      // a newer suspension event must not clear either layer. Candidate-aware:
+      // an expired in-memory suspension can still own a durable row, so a
+      // genuinely current success clears it; keys with neither stay cheap
+      // (no database touch at all).
+      const wasSuspended = youtubeProviderCooldown.isSuspended(context.providerKey) || youtubeProviderCooldown.hasSuspensionCandidate(context.providerKey);
       const providerSuccessIsCurrent=youtubeProviderCooldown.succeeded(context.providerKey,context.providerFailureGeneration);
       if(providerSuccessIsCurrent){
         const validatedPool=getYouTubeKeyPool();
@@ -943,7 +946,10 @@ export async function fetchYouTubeChannelEnrichment(
     try {
       const channelUrl = buildYouTubeApiUrl('channels',apiKey,{part:'snippet,brandingSettings,statistics,contentDetails',id:channelId});
       if(!uploadsCheckpoint){
-        if(attempt>0)await topUp(1);
+        // Failover top-up covers what this key is actually about to spend:
+        // both requests (2) when the channel checkpoint is still missing,
+        // only the uploads request (1) when it can be reused.
+        if(attempt>0)await topUp(channelCheckpoint?1:2);
         // Resolve recent uploads through the channel's uploads playlist
         // (channels.list 1 unit + playlistItems.list 1 unit) instead of a
         // 100-unit search.list scoped to the channel. The uploads playlist
