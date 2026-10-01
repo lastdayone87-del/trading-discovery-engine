@@ -1137,6 +1137,110 @@ export async function upsertSiteProfile(row: {
     ON CONFLICT(site_identity) DO UPDATE SET identity_tier=excluded.identity_tier,robots_state=excluded.robots_state,robots_fetched_at=excluded.robots_fetched_at,sitemap_inventory=excluded.sitemap_inventory,feed_inventory=excluded.feed_inventory,structured_data=excluded.structured_data,page_type=excluded.page_type,politeness=excluded.politeness,profile=excluded.profile,policy_version=excluded.policy_version,last_observed_at=now(),observed_count=site_profiles.observed_count+1`,
     [row.siteIdentity, row.identityTier || '', row.robotsState || 'UNKNOWN', row.robotsFetchedAt || null, JSON.stringify(row.sitemapInventory || []), JSON.stringify(row.feedInventory || []), JSON.stringify(row.structuredData || {}), row.pageType || 'UNKNOWN', JSON.stringify(row.politeness || {}), JSON.stringify(row.profile || {}), row.policyVersion || '']);
 }
+
+export interface FrontierQueueRow {
+  siteIdentity: string;
+  urlKey: string;
+  url: string;
+  expectedValue: number;
+  politenessNotBefore: string | null;
+  attempts: number;
+  state: string;
+  nominatingSource: string;
+  sourceDetail: Record<string, unknown>;
+  weightVersion: string;
+  scorerInputs: Record<string, unknown>;
+  decisionLog: Array<Record<string, unknown>>;
+  firstObservedAt: string | null;
+  lastUpdatedAt: string | null;
+}
+
+/** Admits or refreshes one frontier queue entry. Working state (mutable
+ * lifecycle by design); every admission records its nominating source,
+ * scorer inputs, and weight version for replay. Pre-migration databases
+ * resolve quietly so callers fail open toward legacy crawling. */
+export async function upsertFrontierQueueItem(row: {
+  siteIdentity: string; urlKey: string; url: string; expectedValue: number;
+  politenessNotBefore?: string | null; nominatingSource: string;
+  sourceDetail?: Record<string, unknown>; weightVersion?: string;
+  scorerInputs?: Record<string, unknown>; decision?: Record<string, unknown>;
+}): Promise<void> {
+  if (!row.siteIdentity || !row.urlKey || !row.url) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO site_frontier(site_identity,url_key,url,expected_value,politeness_not_before,attempts,state,nominating_source,source_detail,weight_version,scorer_inputs,decision_log,first_observed_at,last_updated_at)
+      VALUES($1,$2,$3,$4,$5,0,'QUEUED',$6,$7,$8,$9,COALESCE($10,'[]'),now(),now())
+      ON CONFLICT(site_identity,url_key) DO UPDATE SET url=excluded.url,expected_value=excluded.expected_value,politeness_not_before=excluded.politeness_not_before,nominating_source=excluded.nominating_source,source_detail=excluded.source_detail,weight_version=excluded.weight_version,scorer_inputs=excluded.scorer_inputs,decision_log=site_frontier.decision_log||excluded.decision_log,last_updated_at=now()`,
+      [row.siteIdentity, row.urlKey, row.url, Number.isFinite(row.expectedValue) ? row.expectedValue : 0, row.politenessNotBefore || null, row.nominatingSource || '', JSON.stringify(row.sourceDetail || {}), row.weightVersion || '', JSON.stringify(row.scorerInputs || {}), JSON.stringify(row.decision ? [row.decision] : [])]);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
+
+/** Reads a site's queued frontier entries in priority order. Empty when
+ * unknown or pre-migration: callers fall back to legacy crawl order. */
+export async function getFrontierQueue(siteIdentity: string, limit = 50): Promise<FrontierQueueRow[]> {
+  if (!siteIdentity) return [];
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `SELECT * FROM site_frontier WHERE site_identity=$1 AND state='QUEUED' ORDER BY expected_value DESC, url_key ASC LIMIT $2`,
+      [siteIdentity, Math.min(500, Math.max(1, Math.trunc(limit) || 50))],
+    );
+    return (res.rows || []).map((item: Record<string, unknown>) => ({
+      siteIdentity: String(item.site_identity || ''),
+      urlKey: String(item.url_key || ''),
+      url: String(item.url || ''),
+      expectedValue: Number(item.expected_value || 0),
+      politenessNotBefore: item.politeness_not_before instanceof Date ? item.politeness_not_before.toISOString() : (typeof item.politeness_not_before === 'string' ? item.politeness_not_before : null),
+      attempts: Number(item.attempts || 0),
+      state: String(item.state || 'QUEUED'),
+      nominatingSource: String(item.nominating_source || ''),
+      sourceDetail: (item.source_detail && typeof item.source_detail === 'object' ? item.source_detail : {}) as Record<string, unknown>,
+      weightVersion: String(item.weight_version || ''),
+      scorerInputs: (item.scorer_inputs && typeof item.scorer_inputs === 'object' ? item.scorer_inputs : {}) as Record<string, unknown>,
+      decisionLog: (Array.isArray(item.decision_log) ? item.decision_log : []) as Array<Record<string, unknown>>,
+      firstObservedAt: item.first_observed_at instanceof Date ? item.first_observed_at.toISOString() : (typeof item.first_observed_at === 'string' ? item.first_observed_at : null),
+      lastUpdatedAt: item.last_updated_at instanceof Date ? item.last_updated_at.toISOString() : (typeof item.last_updated_at === 'string' ? item.last_updated_at : null),
+    }));
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return [];
+    throw error;
+  }
+}
+
+export interface PageCoverageRow {
+  siteIdentity: string;
+  pageKey: string;
+  pageUrl: string;
+  terminalState: string;
+  acquisitionMethod: string;
+  evidenceUnits: number;
+  policyVersion: string;
+  weightVersion: string;
+  observedAt: string | null;
+}
+
+/** Appends one per-page terminal-state record. Append-only: re-inspection
+ * adds a superseding row (latest timestamp wins); states are never rewritten
+ * in place. Best-effort at call sites like all observational writes. */
+export async function recordPageCoverage(row: {
+  siteIdentity: string; pageKey: string; pageUrl: string; terminalState: string;
+  acquisitionMethod: string; evidenceUnits: number;
+  policyVersion?: string; weightVersion?: string;
+}): Promise<void> {
+  if (!row.siteIdentity || !row.pageKey || !row.pageUrl) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO page_coverage(site_identity,page_key,page_url,terminal_state,acquisition_method,evidence_units,policy_version,weight_version,observed_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+      [row.siteIdentity, row.pageKey, row.pageUrl, row.terminalState || 'NOT_INSPECTED', row.acquisitionMethod || '', Math.max(0, Math.trunc(row.evidenceUnits) || 0), row.policyVersion || '', row.weightVersion || '']);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';

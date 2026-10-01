@@ -19,6 +19,13 @@ export const CRAWL_DROP_REASONS = [
   'page-budget',
   'queue-exhausted',
   /**
+   * Frontier stopping-arbiter halt: the marginal-yield or remaining-value
+   * floor (or budget) ended child exploration early under the P-C frontier
+   * policy. Counted separately from exploration-limit so arbiter-driven
+   * stops stay distinguishable from fixed-cap cutoffs in telemetry.
+   */
+  'frontier-yield-stop',
+  /**
    * Bounded-response-cap truncation. Counted whenever a fetched response is
    * cut at MAX_CRAWL_RESPONSE_CHARS, independent of the single primary
    * ceiling label — so a later truncation is never lost when an earlier,
@@ -44,6 +51,8 @@ export const CEILING_KINDS = [
   'exploration-limit',
   'response-cap',
   'total-timeout',
+  /** Frontier stopping-arbiter halt (see frontier-yield-stop above). */
+  'frontier-yield',
 ] as const;
 export type CeilingKind = typeof CEILING_KINDS[number];
 export function isCeilingKind(value: unknown): value is CeilingKind {
