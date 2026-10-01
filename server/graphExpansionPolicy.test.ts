@@ -51,6 +51,9 @@ test('depth-2 neighbor binding distinguishes candidate lineages deterministicall
   const a = buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: neighbor, neighborLineage: 'playlist:PLabc' });
   const b = buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: neighbor, neighborLineage: 'playlist:PLxyz' });
   const unbound = buildDepth2Proposals(PARENT, 'FEATURED', 3, e);
+  // One binding describes one candidate: exactly one bound proposal, never fanout copies.
+  assert.equal(a.length, 1);
+  assert.equal(unbound.length, 3);
   assert.notEqual(a[0].proposalKey, b[0].proposalKey);
   assert.notEqual(a[0].proposalKey, unbound[0].proposalKey);
   assert.deepEqual(buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: neighbor, neighborLineage: 'playlist:PLabc' })[0], a[0]);

@@ -19,7 +19,7 @@ export interface YouTubeQuotaProjection {
    * project draw from the same budget. `unitsUsed` stays per-key attribution.
    */
   quotaGroup: string | null;
-  /** Total attributed usage across all keys in the same project (or the key itself). */
+  /** Actual recorded project usage (uncapped sum; over-limit charges stay visible). */
   projectUnitsUsed: number;
 }
 
@@ -32,6 +32,13 @@ export function clampQuotaUnits(units: unknown, limit: number): number {
   const value = Number(units);
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(Math.max(0, Math.trunc(limit)), Math.trunc(value)));
+}
+
+/** Actual recorded usage for project attribution: non-negative truncation, never hidden by the display cap. */
+export function attributableQuotaUnits(units: unknown): number {
+  const value = Number(units);
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.trunc(value));
 }
 
 /**
@@ -48,12 +55,13 @@ export function projectYouTubeQuotaUsage(
   quotaGroups?: Array<string | undefined>,
 ): YouTubeQuotaProjection[] {
   const usage = new Map(rows.map(row => [row.keyFingerprint, clampQuotaUnits(row.unitsUsed, perKeyLimit)]));
+  const recorded = new Map(rows.map(row => [row.keyFingerprint, attributableQuotaUnits(row.unitsUsed)]));
   const perKeyUsed = keys.map(key => usage.get(fingerprintYouTubeKey(key)) ?? 0);
   const groupTotals = new Map<string, number>();
-  keys.forEach((_, index) => {
+  keys.forEach((key, index) => {
     const group = quotaGroups?.[index]?.trim();
     if (!group) return;
-    groupTotals.set(group, (groupTotals.get(group) ?? 0) + perKeyUsed[index]);
+    groupTotals.set(group, (groupTotals.get(group) ?? 0) + (recorded.get(fingerprintYouTubeKey(key)) ?? 0));
   });
   return keys.map((key, index) => {
     const unitsUsed = perKeyUsed[index];

@@ -58,6 +58,23 @@ test('shared quota group reports project-level remaining on every member key', (
   ]);
 });
 
+test('project usage reflects over-limit recorded charges while remaining floors at zero', () => {
+  const rows = [
+    { keyFingerprint: fingerprintYouTubeKey('key-a'), keyIndex: 1, unitsUsed: 12000, dailyLimit: 10000 },
+  ];
+  assert.deepEqual(projectYouTubeQuotaUsage(['key-a'], rows, 10000, ['proj-a']), [
+    { keyIndex: 1, unitsUsed: 10000, remaining: 0, limit: 10000, quotaGroup: 'proj-a', projectUnitsUsed: 12000 }
+  ]);
+  const shared = [
+    { keyFingerprint: fingerprintYouTubeKey('key-a'), keyIndex: 1, unitsUsed: 9000, dailyLimit: 10000 },
+    { keyFingerprint: fingerprintYouTubeKey('key-b'), keyIndex: 2, unitsUsed: 9000, dailyLimit: 10000 },
+  ];
+  const projection = projectYouTubeQuotaUsage(['key-a', 'key-b'], shared, 10000, ['proj-a', 'proj-a']);
+  assert.equal(projection[0].projectUnitsUsed, 18000);
+  assert.equal(projection[0].remaining, 0);
+  assert.equal(projection[0].unitsUsed, 9000);
+});
+
 test('every durable YouTube API charge receives the actually dispatched response key', () => {
   const source = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
   const chargeLines = source.split('\n').filter(line => line.includes('incrementQuota('));

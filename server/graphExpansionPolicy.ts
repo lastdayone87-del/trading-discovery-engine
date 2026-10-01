@@ -114,7 +114,11 @@ export function buildDepth2Proposals(
     neighborSuffix = `:${neighbor.neighborChannelId}:${createHash('sha256').update(neighbor.neighborLineage.normalize('NFKC')).digest('hex').slice(0, 16)}`;
   }
   const out: Depth2Proposal[] = [];
-  for (let i = 0; i < eligibility.cappedFanout; i++) {
+  // A single neighbor binding describes one discovered candidate: emit exactly
+  // one bound proposal rather than repeating the same candidate across slots.
+  // Unbound calls keep ordinal-slot identity for frozen-replay evaluation.
+  const slotCount = neighbor !== undefined ? 1 : eligibility.cappedFanout;
+  for (let i = 0; i < slotCount; i++) {
     const key = createHash('sha256')
       .update(`${GRAPH_EXPANSION_POLICY_VERSION}:${parentChannelId}:${edgeKind}:2:${i}${neighborSuffix}`)
       .digest('hex')
