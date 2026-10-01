@@ -43,6 +43,17 @@ export interface Depth2Eligibility {
 export function evaluateDepth2Eligibility(input: Depth2EligibilityInput): Depth2Eligibility {
   const base = { cappedFanout: 0, policyVersion: GRAPH_EXPANSION_POLICY_VERSION } as const;
   if (!input.canaryEnabled) return { ...base, eligible: false, reasonCode: 'GRAPH_CANARY_NOT_ENABLED' };
+  // Fail-closed numeric validation first: NaN/Infinity comparisons are false
+  // and would otherwise bypass every guard below.
+  if (!Number.isFinite(input.parentDepth) || !Number.isFinite(input.independentFamilies)) {
+    return { ...base, eligible: false, reasonCode: 'GRAPH_INVALID_NUMERIC_INPUT' };
+  }
+  if (input.overlap !== undefined && !Number.isFinite(input.overlap)) {
+    return { ...base, eligible: false, reasonCode: 'GRAPH_INVALID_NUMERIC_INPUT' };
+  }
+  if (input.knownFraction !== undefined && !Number.isFinite(input.knownFraction)) {
+    return { ...base, eligible: false, reasonCode: 'GRAPH_INVALID_NUMERIC_INPUT' };
+  }
   if (input.parentDepth < 1 || input.parentDepth >= GRAPH_MAX_DEPTH) {
     return { ...base, eligible: false, reasonCode: 'GRAPH_DEPTH_EXCEEDED' };
   }
@@ -69,21 +80,43 @@ export interface Depth2Proposal {
   fanout: number;
   provenance: string;
   policyVersion: string;
+  /** Bound neighbor lineage when the slot is attributed to a discovered candidate. */
+  neighborChannelId?: string;
+  neighborLineage?: string;
 }
 
-/** Build capped depth-2 proposal specs. Throws unless eligible (fail-closed). */
+export interface Depth2NeighborBinding {
+  neighborChannelId: string;
+  /** Source lineage describing how the neighbor was discovered (e.g. playlist:ID, section:ID). */
+  neighborLineage: string;
+}
+
+/**
+ * Build capped depth-2 proposal specs. Throws unless eligible (fail-closed).
+ * Optional `neighbor` binds ordinal slots to a discovered candidate's lineage:
+ * the binding enters both the identity hash and provenance so different
+ * candidate sets never produce indistinguishable proposals. Absent binding
+ * preserves the existing ordinal-slot identity byte-for-byte.
+ */
 export function buildDepth2Proposals(
   parentChannelId: string,
   edgeKind: GraphEdgeKind,
   fanoutRequested: number,
   eligibility: Depth2Eligibility,
+  neighbor?: Depth2NeighborBinding,
 ): Depth2Proposal[] {
   if (!eligibility.eligible) throw new Error(`GRAPH_DEPTH2_NOT_ELIGIBLE:${eligibility.reasonCode}`);
   if (!/^UC[A-Za-z0-9_-]{22}$/.test(parentChannelId)) throw new Error('GRAPH_INVALID_PARENT_CHANNEL');
+  let neighborSuffix = '';
+  if (neighbor !== undefined) {
+    if (!/^UC[A-Za-z0-9_-]{22}$/.test(neighbor.neighborChannelId)) throw new Error('GRAPH_INVALID_NEIGHBOR_CHANNEL');
+    if (!neighbor.neighborLineage.trim() || neighbor.neighborLineage.length > 512) throw new Error('GRAPH_INVALID_NEIGHBOR_LINEAGE');
+    neighborSuffix = `:${neighbor.neighborChannelId}:${createHash('sha256').update(neighbor.neighborLineage.normalize('NFKC')).digest('hex').slice(0, 16)}`;
+  }
   const out: Depth2Proposal[] = [];
   for (let i = 0; i < eligibility.cappedFanout; i++) {
     const key = createHash('sha256')
-      .update(`${GRAPH_EXPANSION_POLICY_VERSION}:${parentChannelId}:${edgeKind}:2:${i}`)
+      .update(`${GRAPH_EXPANSION_POLICY_VERSION}:${parentChannelId}:${edgeKind}:2:${i}${neighborSuffix}`)
       .digest('hex')
       .slice(0, 32);
     void fanoutRequested;
@@ -93,8 +126,9 @@ export function buildDepth2Proposals(
       edgeKind,
       depth: 2,
       fanout: eligibility.cappedFanout,
-      provenance: `depth2:${parentChannelId}:${edgeKind}:${eligibility.reasonCode}`,
+      provenance: `depth2:${parentChannelId}:${edgeKind}:${eligibility.reasonCode}${neighborSuffix ? `:neighbor${neighborSuffix}` : ''}`,
       policyVersion: GRAPH_EXPANSION_POLICY_VERSION,
+      ...(neighbor !== undefined ? { neighborChannelId: neighbor.neighborChannelId, neighborLineage: neighbor.neighborLineage } : {}),
     });
   }
   return out;

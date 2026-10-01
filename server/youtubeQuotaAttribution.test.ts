@@ -23,15 +23,38 @@ test('projection follows configured key rotation by fingerprint and preserves ex
   const second = 'key-b';
   const rows = [{ keyFingerprint: fingerprintYouTubeKey(first), keyIndex: 1, unitsUsed: 8240, dailyLimit: 10000 }, { keyFingerprint: fingerprintYouTubeKey(second), keyIndex: 2, unitsUsed: 10000, dailyLimit: 10000 }];
   assert.deepEqual(projectYouTubeQuotaUsage([second, first], rows, 10000), [
-    { keyIndex: 1, unitsUsed: 10000, remaining: 0, limit: 10000 },
-    { keyIndex: 2, unitsUsed: 8240, remaining: 1760, limit: 10000 }
+    { keyIndex: 1, unitsUsed: 10000, remaining: 0, limit: 10000, quotaGroup: null, projectUnitsUsed: 10000 },
+    { keyIndex: 2, unitsUsed: 8240, remaining: 1760, limit: 10000, quotaGroup: null, projectUnitsUsed: 8240 }
   ]);
 });
 
 test('a new quota day has zero usage for every configured key while preserving the same projection shape', () => {
   assert.deepEqual(projectYouTubeQuotaUsage(['key-a', 'key-b'], [], 10000), [
-    { keyIndex: 1, unitsUsed: 0, remaining: 10000, limit: 10000 },
-    { keyIndex: 2, unitsUsed: 0, remaining: 10000, limit: 10000 }
+    { keyIndex: 1, unitsUsed: 0, remaining: 10000, limit: 10000, quotaGroup: null, projectUnitsUsed: 0 },
+    { keyIndex: 2, unitsUsed: 0, remaining: 10000, limit: 10000, quotaGroup: null, projectUnitsUsed: 0 }
+  ]);
+});
+
+test('distinct quota groups keep independent remaining capacity', () => {
+  const rows = [
+    { keyFingerprint: fingerprintYouTubeKey('key-a'), keyIndex: 1, unitsUsed: 9000, dailyLimit: 10000 },
+    { keyFingerprint: fingerprintYouTubeKey('key-b'), keyIndex: 2, unitsUsed: 1000, dailyLimit: 10000 },
+  ];
+  assert.deepEqual(projectYouTubeQuotaUsage(['key-a', 'key-b'], rows, 10000, ['proj-a', 'proj-b']), [
+    { keyIndex: 1, unitsUsed: 9000, remaining: 1000, limit: 10000, quotaGroup: 'proj-a', projectUnitsUsed: 9000 },
+    { keyIndex: 2, unitsUsed: 1000, remaining: 9000, limit: 10000, quotaGroup: 'proj-b', projectUnitsUsed: 1000 }
+  ]);
+});
+
+test('shared quota group reports project-level remaining on every member key', () => {
+  const rows = [
+    { keyFingerprint: fingerprintYouTubeKey('key-a'), keyIndex: 1, unitsUsed: 6000, dailyLimit: 10000 },
+    { keyFingerprint: fingerprintYouTubeKey('key-b'), keyIndex: 2, unitsUsed: 4000, dailyLimit: 10000 },
+  ];
+  const projection = projectYouTubeQuotaUsage(['key-a', 'key-b'], rows, 10000, ['proj-a', 'proj-a']);
+  assert.deepEqual(projection, [
+    { keyIndex: 1, unitsUsed: 6000, remaining: 0, limit: 10000, quotaGroup: 'proj-a', projectUnitsUsed: 10000 },
+    { keyIndex: 2, unitsUsed: 4000, remaining: 0, limit: 10000, quotaGroup: 'proj-a', projectUnitsUsed: 10000 }
   ]);
 });
 

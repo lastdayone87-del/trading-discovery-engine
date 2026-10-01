@@ -29,3 +29,32 @@ test('depth-2 caps fanout and builds deterministic provenance', () => {
   assert.throws(() => buildDepth2Proposals(PARENT, 'FEATURED', 5, { ...e, eligible: false, reasonCode: 'X' }), /NOT_ELIGIBLE/);
   assert.throws(() => buildDepth2Proposals('bad', 'FEATURED', 5, e), /INVALID_PARENT/);
 });
+
+test('depth-2 rejects non-finite numeric inputs as fail-closed', () => {
+  const base = { parentDepth: 1, fanoutRequested: 5, edgeKind: 'FEATURED' as const, independentFamilies: 2, canaryEnabled: true };
+  for (const bad of [
+    { ...base, parentDepth: NaN },
+    { ...base, independentFamilies: NaN },
+    { ...base, overlap: NaN },
+    { ...base, knownFraction: Infinity },
+    { ...base, parentDepth: Infinity },
+  ]) {
+    const r = evaluateDepth2Eligibility(bad);
+    assert.equal(r.eligible, false);
+    assert.equal(r.reasonCode, 'GRAPH_INVALID_NUMERIC_INPUT');
+  }
+});
+
+test('depth-2 neighbor binding distinguishes candidate lineages deterministically', () => {
+  const e = evaluateDepth2Eligibility({ parentDepth: 1, fanoutRequested: 3, edgeKind: 'FEATURED', independentFamilies: 2, canaryEnabled: true });
+  const neighbor = 'UCZH9XjihGZGczInZMuXMlfw';
+  const a = buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: neighbor, neighborLineage: 'playlist:PLabc' });
+  const b = buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: neighbor, neighborLineage: 'playlist:PLxyz' });
+  const unbound = buildDepth2Proposals(PARENT, 'FEATURED', 3, e);
+  assert.notEqual(a[0].proposalKey, b[0].proposalKey);
+  assert.notEqual(a[0].proposalKey, unbound[0].proposalKey);
+  assert.deepEqual(buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: neighbor, neighborLineage: 'playlist:PLabc' })[0], a[0]);
+  assert.ok(a[0].provenance.includes(neighbor));
+  assert.throws(() => buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: 'bad', neighborLineage: 'x' }), /INVALID_NEIGHBOR/);
+  assert.throws(() => buildDepth2Proposals(PARENT, 'FEATURED', 3, e, { neighborChannelId: neighbor, neighborLineage: '  ' }), /INVALID_NEIGHBOR/);
+});

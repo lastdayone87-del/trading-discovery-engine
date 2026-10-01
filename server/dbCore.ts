@@ -649,7 +649,7 @@ export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(
  */
 export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');const providers=getConfiguredYouTubeProviders();const map=describeQuotaProjectMap(providers);if(map.projectCount===0)return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);return calculateEffectiveYouTubeBudget(providers,perKey);}
 export function describeYouTubeQuotaProjectMap(){const providers=getConfiguredYouTubeProviders();const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000'));const map=describeQuotaProjectMap(providers);return {...map,perKey,effectiveBudget:calculateEffectiveYouTubeBudget(providers,perKey),legacyKeySumBudget:calculateYouTubeDailyBudget(providers.length,perKey)};}
-export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; remaining:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; }
+export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; remaining:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; /** Quota project attribution; remaining is project-level capacity when set. */ quotaGroup?:string|null; projectUnitsUsed?:number; }
 export interface QuotaInfoExtended { unitsUsed:number; dailyLimit:number; lastReset:string; totalKeys:number; keyUsage:KeyQuotaUsage[]; }
 
 type QueryExecutor={query:(text:string,values?:any[])=>Promise<any>};
@@ -665,9 +665,10 @@ async function ensureYouTubeKeyRows(db:QueryExecutor, today:string, keys:string[
 
 export async function getQuota():Promise<QuotaInfoExtended>{
   const db=await getDb(); const today=getYouTubeQuotaDay(); const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
+  const quotaGroups=getConfiguredYouTubeProviders().map(provider=>provider.quotaGroup);
   await ensureYouTubeQuotaDay(db,today,limit); await ensureYouTubeKeyRows(db,today,keys,perKey);
   const [aggregate,keyRows]=await Promise.all([db.query("SELECT units_used,last_reset FROM quota_tracker WHERE id='youtube'"),db.query('SELECT key_fingerprint,key_index,units_used,daily_limit FROM youtube_key_quota_usage WHERE quota_day=$1 ORDER BY key_index',[today])]);
-  const row=aggregate.rows[0]||{units_used:0,last_reset:today}; const projection=projectYouTubeQuotaUsage(keys,keyRows.rows.map(row=>({keyFingerprint:String(row.key_fingerprint),keyIndex:Number(row.key_index),unitsUsed:Number(row.units_used||0),dailyLimit:Number(row.daily_limit||perKey)})),perKey);
+  const row=aggregate.rows[0]||{units_used:0,last_reset:today}; const projection=projectYouTubeQuotaUsage(keys,keyRows.rows.map(row=>({keyFingerprint:String(row.key_fingerprint),keyIndex:Number(row.key_index),unitsUsed:Number(row.units_used||0),dailyLimit:Number(row.daily_limit||perKey)})),perKey,quotaGroups);
   return {unitsUsed:Number(row.units_used||0),dailyLimit:limit,lastReset:row.last_reset,totalKeys:keys.length,keyUsage:projection.map((item,index)=>{const key=keys[index];const provider=youtubeProviderCooldown.status(key);return {...item,maskedKey:'****',isActive:provider.status==='Active',status:provider.status,retryAt:provider.retryAt===null?null:new Date(provider.retryAt).toISOString()};})};
 }
 

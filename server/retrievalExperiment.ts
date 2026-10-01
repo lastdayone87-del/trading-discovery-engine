@@ -24,10 +24,22 @@ export interface WindowedSearchParams {
 }
 
 /**
- * Build windowed search params. Control (no window or no experimentId)
- * returns base params unchanged. Treatment requires BOTH a valid window
- * and an experimentId so replay can attribute the extra page cost.
- * Validates RFC3339 timestamps; invalid window throws (fail-closed, no fetch).
+ * Full-datetime RFC3339 (YouTube publishedAfter/Before contract).
+ * Date-only values such as 2026-01-01 are rejected even though Date.parse
+ * accepts them: the API requires a complete timestamp with timezone.
+ */
+const RFC3339_FULL_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function requireRfc3339(value: string, code: string): void {
+  if (!RFC3339_FULL_DATETIME.test(value) || !Number.isFinite(Date.parse(value))) throw new Error(code);
+}
+
+/**
+ * Build windowed search params. Control (no window, empty window, or no
+ * experimentId) returns base params unchanged with windowApplied:false.
+ * Treatment requires at least one valid RFC3339 bound AND an experimentId
+ * so replay can attribute the extra page cost. Invalid window throws
+ * (fail-closed, no fetch).
  */
 export function buildWindowedSearchParams(
   base: Record<string, string | number>,
@@ -36,12 +48,11 @@ export function buildWindowedSearchParams(
 ): WindowedSearchParams {
   if (!window || !experimentId?.trim()) return { params: { ...base }, windowApplied: false, experimentId: null };
   const { publishedAfter, publishedBefore } = window;
-  if (publishedAfter !== undefined) {
-    if (!Number.isFinite(Date.parse(publishedAfter))) throw new Error('INVALID_WINDOW_PUBLISHED_AFTER');
+  if (publishedAfter === undefined && publishedBefore === undefined) {
+    return { params: { ...base }, windowApplied: false, experimentId: null };
   }
-  if (publishedBefore !== undefined) {
-    if (!Number.isFinite(Date.parse(publishedBefore))) throw new Error('INVALID_WINDOW_PUBLISHED_BEFORE');
-  }
+  if (publishedAfter !== undefined) requireRfc3339(publishedAfter, 'INVALID_WINDOW_PUBLISHED_AFTER');
+  if (publishedBefore !== undefined) requireRfc3339(publishedBefore, 'INVALID_WINDOW_PUBLISHED_BEFORE');
   if (
     publishedAfter !== undefined &&
     publishedBefore !== undefined &&

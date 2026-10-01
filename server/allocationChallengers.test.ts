@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { contextualArmScore, selectThompsonArm, thompsonSample } from './allocationChallengers';
+import { createHash } from 'node:crypto';
+import { ALLOCATION_CHALLENGER_VERSION, contextualArmScore, selectThompsonArm, thompsonSample } from './allocationChallengers';
 
 test('thompson sampling is deterministic and favors proven arms', () => {
   const a = thompsonSample(10, 1, 'salt-1');
@@ -10,6 +11,25 @@ test('thompson sampling is deterministic and favors proven arms', () => {
   assert.ok(a > low);
   assert.throws(() => thompsonSample(-1, 0, 's'), /INVALID_ARM/);
   assert.throws(() => thompsonSample(0, 0, 's', 0, 1), /INVALID_PRIOR/);
+});
+
+test('thompson draws are genuine Beta quantiles: Beta(1,1) equals the driving uniform', () => {
+  for (const salt of ['salt-a', 'salt-b', 'salt-c']) {
+    const digest = createHash('sha256').update(`${ALLOCATION_CHALLENGER_VERSION}:thompson:${salt}:0:0:1:1`).digest('hex');
+    const expected = Number.parseInt(digest.slice(0, 8), 16) / 0xffffffff;
+    assert.ok(Math.abs(thompsonSample(0, 0, salt) - expected) < 1e-9, `Beta(1,1) draw must equal its uniform ${expected}`);
+  }
+});
+
+test('thompson draws match posterior moments and cover the tails', () => {
+  // Fixed salt sets: fully deterministic, generous tolerances, neutral Beta(2,2).
+  const samples: number[] = [];
+  for (let i = 0; i < 200; i++) samples.push(thompsonSample(1, 1, `moment-${i}`));
+  const mean = samples.reduce((acc, v) => acc + v, 0) / samples.length;
+  assert.ok(Math.abs(mean - 0.5) < 0.05, `mean ${mean} far from Beta(2,2) mean 0.5`);
+  assert.ok(Math.min(...samples) < 0.25, 'draws never reach the lower tail');
+  assert.ok(Math.max(...samples) > 0.75, 'draws never reach the upper tail');
+  for (const v of samples) assert.ok(v >= 0 && v <= 1);
 });
 
 test('thompson arm selection is replay-safe', () => {

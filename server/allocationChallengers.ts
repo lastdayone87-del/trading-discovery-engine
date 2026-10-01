@@ -19,25 +19,98 @@ function deterministicUniform(key: string): number {
 
 /**
  * Thompson sample for a Bernoulli arm with Beta(alpha0+s, beta0+f) posterior.
- * Deterministic via hashed uniform -> inverse-CDF-free quantile transform
- * approximated by sorted-hash sampling (replay-safe, no Math.random).
+ * Genuine Beta-distributed draw via the posterior inverse CDF applied to a
+ * deterministic uniform derived from the inputs (replay-safe, no Math.random).
+ * Same inputs always yield the same draw; distinct salts yield distinct draws.
  * Prior alpha0/beta0 are E (pilot); selection among arms uses max sample.
  */
 export function thompsonSample(successes: number, failures: number, salt: string, alpha0 = 1, beta0 = 1): number {
   if (successes < 0 || failures < 0 || !Number.isFinite(successes) || !Number.isFinite(failures)) {
     throw new Error('INVALID_ARM_COUNTS');
   }
-  if (alpha0 <= 0 || beta0 <= 0) throw new Error('INVALID_PRIOR');
-  // Deterministic pseudo-posterior draw: mean + spread-scaled hashed deviate.
-  // Exact Beta quantile is unnecessary for challenger ranking tests; the
-  // live experiment uses the same deterministic draw for replay.
+  if (alpha0 <= 0 || beta0 <= 0 || !Number.isFinite(alpha0) || !Number.isFinite(beta0)) throw new Error('INVALID_PRIOR');
+  if (!salt.trim()) throw new Error('SALT_REQUIRED');
   const alpha = alpha0 + successes;
   const beta = beta0 + failures;
-  const mean = alpha / (alpha + beta);
-  const variance = (alpha * beta) / ((alpha + beta) * (alpha + beta) * (alpha + beta + 1));
   const u = deterministicUniform(`${ALLOCATION_CHALLENGER_VERSION}:thompson:${salt}:${successes}:${failures}:${alpha0}:${beta0}`);
-  const deviate = (u - 0.5) * 2; // [-1,1]
-  return mean + deviate * Math.sqrt(variance);
+  return betaQuantile(u, alpha, beta);
+}
+
+/** Lanczos log-gamma for positive arguments (reflection for z < 0.5). Pure. */
+function logGamma(z: number): number {
+  const lanczos = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313,
+    -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6,
+    1.5056327351493116e-7,
+  ];
+  if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - logGamma(1 - z);
+  z -= 1;
+  let x = lanczos[0];
+  for (let i = 1; i < 9; i++) x += lanczos[i] / (z + i);
+  const t = z + 7.5;
+  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
+}
+
+/** Continued fraction for the incomplete beta function (Numerical Recipes betacf). Pure. */
+function betaContinuedFraction(a: number, b: number, x: number): number {
+  const maxIterations = 200;
+  const epsilon = 3e-12;
+  const fpmin = 1e-300;
+  const qab = a + b;
+  const qap = a + 1;
+  const qam = a - 1;
+  let c = 1;
+  let d = 1 - (qab * x) / qap;
+  if (Math.abs(d) < fpmin) d = fpmin;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= maxIterations; m++) {
+    const m2 = 2 * m;
+    let aa = (m * (b - m) * x) / ((qam + m2) * (a + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < fpmin) d = fpmin;
+    c = 1 + aa / c;
+    if (Math.abs(c) < fpmin) c = fpmin;
+    d = 1 / d;
+    h *= d * c;
+    aa = (-(a + m) * (qab + m) * x) / ((a + m2) * (qap + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < fpmin) d = fpmin;
+    c = 1 + aa / c;
+    if (Math.abs(c) < fpmin) c = fpmin;
+    d = 1 / d;
+    const del = d * c;
+    h *= del;
+    if (Math.abs(del - 1) < epsilon) break;
+  }
+  return h;
+}
+
+/** Regularized incomplete beta I_x(a, b) for a, b > 0. Pure. */
+function regularizedBeta(x: number, a: number, b: number): number {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const logBeta = logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log(1 - x);
+  const front = Math.exp(logBeta);
+  if (x < (a + 1) / (a + b + 2)) return (front * betaContinuedFraction(a, b, x)) / a;
+  return 1 - (front * betaContinuedFraction(b, a, 1 - x)) / b;
+}
+
+/**
+ * Inverse regularized incomplete beta (Beta quantile) by bisection.
+ * Deterministic to ~1e-9; monotone in p for fixed shape.
+ */
+function betaQuantile(p: number, a: number, b: number): number {
+  if (p <= 0) return 0;
+  if (p >= 1) return 1;
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 100; i++) {
+    const mid = (lo + hi) / 2;
+    if (regularizedBeta(mid, a, b) < p) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
 }
 
 /** Select best arm index by Thompson sample. Pure. */
