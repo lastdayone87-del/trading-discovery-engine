@@ -2,7 +2,7 @@ import * as cheerio from 'cheerio';
 import { decodeEmbeddedMarkup, extractDynamicTargetValues, extractEmbeddedUrls, extractYouTubeVideoIds } from './crawlerExtraction';
 import { InspectionStep } from '../src/types';
 import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, type SiteInspectionRow } from './db';
-import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, needsRenderedRecrawl, siteInspectionCoversRequest, isSufficientRenderedCoverage, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
+import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, needsRenderedRecrawl, siteInspectionCoversRequest, isSufficientRenderedCoverage, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
@@ -645,10 +645,12 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
       // block can resolve without extra reads. Chains are never chased.
       const needFinals:string[]=[];
       for(const row of rows){
-        if(!row||row.outcome!=='REDIRECTED'||typeof row.finalUrl!=='string'||!row.finalUrl)continue;
-        const finalIdentity=canonicalSiteIdentity(row.finalUrl);
-        if(!finalIdentity||finalIdentity.siteIdentity===row.siteIdentity)continue;
-        if(!siteRowsByIdentity.has(finalIdentity.siteIdentity)&&!needFinals.includes(finalIdentity.siteIdentity))needFinals.push(finalIdentity.siteIdentity);
+        if(!row||row.outcome!=='REDIRECTED')continue;
+        for(const destination of redirectDestinations(row)){
+          const finalIdentity=canonicalSiteIdentity(destination);
+          if(!finalIdentity||finalIdentity.siteIdentity===row.siteIdentity)continue;
+          if(!siteRowsByIdentity.has(finalIdentity.siteIdentity)&&!needFinals.includes(finalIdentity.siteIdentity))needFinals.push(finalIdentity.siteIdentity);
+        }
       }
       if(needFinals.length){
         const finalRows=await siteCache.read(needFinals).catch(()=>[] as SiteInspectionRow[]);
@@ -682,20 +684,22 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         provenance:{policyVersion:SITE_INSPECTION_POLICY_VERSION},
       });
       const requestedIdentity=canonicalSiteIdentity(item.url);
-      if(requestedIdentity&&requestedIdentity.siteIdentity!==identity.siteIdentity){
-        // Redirect crossed site identities: alias the requested identity to
-        // the inspected destination so future inspections resolve without
-        // recrawling, and associate the creator with the inspected site too
-        // (the pre-crawl link records what the creator linked). Alias rows
-        // carry no facts and are never borrowed directly — one-hop
-        // resolution only, guarded by the same freshness checks.
+      if(seedFinal&&requestedIdentity&&requestedIdentity.siteIdentity!==identity.siteIdentity){
+        // Redirect crossed site identities: merge this requested-URL binding
+        // into the alias row so distinct wrappers on the same host coexist
+        // instead of overwriting each other. Alias rows carry no facts and
+        // are never borrowed directly — exact-binding one-hop resolution
+        // only. The pre-crawl link records what the creator linked; the
+        // destination association below records what was inspected.
+        const priorAlias=siteRowsByIdentity.get(requestedIdentity.siteIdentity);
+        const priorBindings=priorAlias&&priorAlias.outcome==='REDIRECTED'?priorAlias.observations:[];
         await siteCache.write({
           siteIdentity:requestedIdentity.siteIdentity,identityTier:requestedIdentity.tier,identityBasis:requestedIdentity.basis,
-          canonicalUrl:requestedIdentity.crawlUrl,finalUrl:seedFinal||null,outcome:'REDIRECTED',
+          canonicalUrl:requestedIdentity.crawlUrl,finalUrl:seedFinal,outcome:'REDIRECTED',
           retryable:false,httpStatus:typeof rollup?.httpStatus==='number'?rollup.httpStatus:null,
-          failureClass:'',detail:`Redirect observed from ${item.url} to ${seedFinal||item.url}; destination facts live under ${identity.siteIdentity}`,
-          payloadChecksum:checksumSiteFacts({outcome:'REDIRECTED',inviteCodes:[],finalUrl:seedFinal||null}),
-          candidates:[],observations:[],
+          failureClass:'',detail:`Redirect observed from ${item.url} to ${seedFinal}; destination facts live under ${identity.siteIdentity}`,
+          payloadChecksum:checksumSiteFacts({outcome:'REDIRECTED',inviteCodes:[],finalUrl:seedFinal}),
+          candidates:[],observations:mergeRedirectBinding(priorBindings,{kind:REDIRECT_BINDING_KIND,requestedUrl:item.url,finalUrl:seedFinal,observedAt:now}),
           renderedCovered:false,
           provenance:{policyVersion:SITE_INSPECTION_POLICY_VERSION},
         });
@@ -724,13 +728,16 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // itself and never chase chains.
   let seedCachedRow=seedSiteIdentity?siteRowsByIdentity.get(seedSiteIdentity.siteIdentity):undefined;
   let coverageUrl=item.url;
-  if(seedCachedRow&&seedCachedRow.outcome==='REDIRECTED'&&typeof seedCachedRow.finalUrl==='string'&&seedCachedRow.finalUrl
-    &&isSiteInspectionReusable(seedCachedRow,Date.now())
-    &&siteInspectionCoversRequest(seedCachedRow,item.url)){
-    const finalIdentity=canonicalSiteIdentity(seedCachedRow.finalUrl);
+  if(seedCachedRow&&seedCachedRow.outcome==='REDIRECTED'
+    &&isSiteInspectionReusable(seedCachedRow,Date.now())){
+    // Exact-binding resolution: only the binding recorded for this requested
+    // URL may resolve. Other wrappers sharing the host never match, so their
+    // destinations can neither be borrowed nor merged here.
+    const binding=redirectBindingFor(seedCachedRow,item.url);
+    const finalIdentity=binding?canonicalSiteIdentity(binding.finalUrl):null;
     const finalRow=finalIdentity&&seedSiteIdentity&&finalIdentity.siteIdentity!==seedSiteIdentity.siteIdentity
       ?siteRowsByIdentity.get(finalIdentity.siteIdentity):undefined;
-    if(finalRow&&finalRow.outcome!=='REDIRECTED'){seedCachedRow=finalRow;coverageUrl=seedCachedRow.finalUrl||item.url;}
+    if(binding&&finalRow&&finalRow.outcome!=='REDIRECTED'){seedCachedRow=finalRow;coverageUrl=binding.finalUrl;}
     else{seedCachedRow=undefined;}
   }
   const seedReusable=seedCachedRow?isSiteInspectionReusable(seedCachedRow,Date.now()):false;

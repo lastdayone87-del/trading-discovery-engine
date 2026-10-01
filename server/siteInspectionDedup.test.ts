@@ -256,6 +256,59 @@ test('same-site redirect writes no alias; shared shortener identities never merg
   assert.ok(fetched.length > before);
 });
 
+function makeCoexistFetch(fetched: string[]) {
+  return (async (url: unknown) => {
+    const target = String(url);
+    fetched.push(target);
+    const respond = (html: string, finalUrl?: string) => {
+      const response = new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });
+      if (finalUrl) Object.defineProperty(response, 'url', { value: finalUrl });
+      return response;
+    };
+    if (target.startsWith('https://shortener.com/a')) {
+      return respond('<html><body>A hub https://discord.gg/invitea today</body></html>', 'https://site-a.com/');
+    }
+    if (target.startsWith('https://shortener.com/b')) {
+      return respond('<html><body>B hub https://discord.gg/inviteb today</body></html>', 'https://site-b.com/');
+    }
+    if (target.startsWith('https://shortener.com/c')) {
+      return respond('<html><body>C hub https://discord.gg/invitea today</body></html>', 'https://site-a.com/');
+    }
+    return respond('<html><body>plain creator site</body></html>');
+  }) as typeof fetch;
+}
+
+test('shared shortener host: distinct wrappers coexist, resolve independently, never cross-borrow', async () => {
+  const { store, rows } = makeStore();
+  const fetched: string[] = [];
+  const fetchImpl = makeCoexistFetch(fetched);
+  const base = { videoDescriptions: DESCS, externalFetchImpl: fetchImpl, urlFailureHistoryLoader: async () => [], siteInspectionStore: store } as const;
+  const run = (channelId: string, channelName: string, link: string) => runChannelInspection({
+    ...base, channelId, channelName, channelBio: 'Trading educator', channelLinks: [link],
+  });
+
+  await run('UCShortCoexist000001', 'Wrapper A', 'https://shortener.com/a');
+  await run('UCShortCoexist000002', 'Wrapper B', 'https://shortener.com/b');
+  const alias = rows.get('shortener.com');
+  assert.equal(alias?.outcome, 'REDIRECTED', 'one shared alias row');
+  assert.equal((alias?.observations as unknown[]).length, 2, 'both bindings coexist instead of overwriting');
+  assert.ok(rows.has('site-a.com') && rows.has('site-b.com'), 'each destination keeps its own facts');
+
+  const beforeRevisits = fetched.length;
+  const revisitA = await run('UCShortCoexist000003', 'Wrapper A again', 'https://shortener.com/a');
+  const revisitB = await run('UCShortCoexist000004', 'Wrapper B again', 'https://shortener.com/b');
+  assert.equal(fetched.length, beforeRevisits, 'revisits reuse their own destinations without recrawling');
+  assert.equal(revisitA.foundInvite, 'invitea', 'A never borrows B facts');
+  assert.equal(revisitB.foundInvite, 'inviteb', 'B never borrows A facts');
+
+  await run('UCShortCoexist000005', 'Wrapper C', 'https://shortener.com/c');
+  assert.equal((rows.get('shortener.com')?.observations as unknown[]).length, 3, 'same-destination wrappers accumulate bindings');
+  const beforeCRevisit = fetched.length;
+  const revisitC = await run('UCShortCoexist000006', 'Wrapper C again', 'https://shortener.com/c');
+  assert.equal(fetched.length, beforeCRevisit, 'same-destination aliases deduplicate repeat inspections');
+  assert.equal(revisitC.foundInvite, 'invitea');
+});
+
 function makeRenderFallback(calls: string[], result: { complete: boolean; timedOut: boolean; inspectedPages: number }) {
   return (async (seedUrl: string) => {
     calls.push(seedUrl);

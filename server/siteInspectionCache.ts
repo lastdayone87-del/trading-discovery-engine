@@ -157,7 +157,8 @@ function normalizeCoverageKey(raw: string): string | null {
  * cached crawl demonstrably went: any observation requested/root/final URL,
  * the row's canonical/final URLs, or a retained candidate's source URL.
  * Uncovered negatives force acquisition instead of masquerading as complete
- * coverage of another page. */
+ * coverage of another page. REDIRECTED alias rows are never borrowed
+ * directly; resolve them with redirectBindingFor first. */
 export function siteInspectionCoversRequest(
   row: Pick<CachedSiteInspection, 'outcome' | 'canonicalUrl' | 'finalUrl' | 'observations' | 'candidates'>,
   requestedUrl: string,
@@ -191,6 +192,94 @@ export function siteInspectionCoversRequest(
   return covered.has(want);
 }
 
+/** Redirect-alias binding stored on REDIRECTED rows. One site identity
+ * (e.g. a shared shortener host) can carry many distinct requested-URL ->
+ * destination bindings so wrappers never overwrite each other. Resolution
+ * is exact requested-URL match only: bindings never merge destinations. */
+export const REDIRECT_BINDING_KIND = 'REDIRECT_BINDING';
+/** Storage safety bound on bindings per alias row (oldest evicted). */
+export const MAX_REDIRECT_BINDINGS = 50;
+
+export type RedirectBinding = {
+  kind: typeof REDIRECT_BINDING_KIND;
+  requestedUrl: string;
+  finalUrl: string;
+  observedAt: string;
+};
+
+function isRedirectBinding(item: unknown): item is RedirectBinding {
+  if (!item || typeof item !== 'object') return false;
+  const record = item as Record<string, unknown>;
+  return (
+    record.kind === REDIRECT_BINDING_KIND &&
+    typeof record.requestedUrl === 'string' &&
+    typeof record.finalUrl === 'string' &&
+    typeof record.observedAt === 'string'
+  );
+}
+
+/** Merge one binding into an alias row's observations: same requested URL
+ * (normalized) replaces in place, otherwise append; oldest evicted past the
+ * cap. Pure and deterministic. */
+export function mergeRedirectBinding(
+  existing: Array<Record<string, unknown>>,
+  binding: RedirectBinding,
+): Array<Record<string, unknown>> {
+  const list = (Array.isArray(existing) ? existing : []).filter(isRedirectBinding);
+  const key = normalizeCoverageKey(binding.requestedUrl);
+  const slot = key === null ? -1 : list.findIndex(entry => normalizeCoverageKey(entry.requestedUrl) === key);
+  const merged = [...list];
+  if (slot >= 0) merged[slot] = binding;
+  else merged.push(binding);
+  while (merged.length > MAX_REDIRECT_BINDINGS) {
+    let oldest = 0;
+    for (let i = 1; i < merged.length; i++) {
+      if (merged[i].observedAt < merged[oldest].observedAt) oldest = i;
+    }
+    merged.splice(oldest, 1);
+  }
+  return merged as Array<Record<string, unknown>>;
+}
+
+/** Resolve the destination bound to an exact requested URL on a REDIRECTED
+ * alias row, or null. Legacy single-binding rows (canonicalUrl + finalUrl,
+ * no bindings list) resolve exactly as before. Never merges destinations. */
+export function redirectBindingFor(
+  row: Pick<CachedSiteInspection, 'outcome' | 'canonicalUrl' | 'finalUrl' | 'observations'>,
+  requestedUrl: string,
+): { requestedUrl: string; finalUrl: string; observedAt: string | null } | null {
+  if (row.outcome !== 'REDIRECTED') return null;
+  const want = normalizeCoverageKey(requestedUrl);
+  if (!want) return null;
+  const bindings: RedirectBinding[] = [];
+  for (const item of Array.isArray(row.observations) ? row.observations : []) {
+    if (isRedirectBinding(item)) bindings.push(item);
+  }
+  for (const binding of bindings) {
+    if (normalizeCoverageKey(binding.requestedUrl) === want && binding.finalUrl) {
+      return { requestedUrl: binding.requestedUrl, finalUrl: binding.finalUrl, observedAt: binding.observedAt };
+    }
+  }
+  if (bindings.length === 0 && typeof row.finalUrl === 'string' && row.finalUrl) {
+    const canonical = typeof row.canonicalUrl === 'string' ? normalizeCoverageKey(row.canonicalUrl) : null;
+    if (canonical !== null && canonical === want) {
+      return { requestedUrl: row.canonicalUrl, finalUrl: row.finalUrl, observedAt: null };
+    }
+  }
+  return null;
+}
+
+/** Every destination referenced by an alias row (bindings plus legacy
+ * finalUrl) for prefetch. Deduped, order-stable. */
+export function redirectDestinations(row: Pick<CachedSiteInspection, 'outcome' | 'finalUrl' | 'observations'>): string[] {
+  if (row.outcome !== 'REDIRECTED') return [];
+  const out: string[] = [];
+  for (const item of Array.isArray(row.observations) ? row.observations : []) {
+    if (isRedirectBinding(item) && item.finalUrl && !out.includes(item.finalUrl)) out.push(item.finalUrl);
+  }
+  if (typeof row.finalUrl === 'string' && row.finalUrl && !out.includes(row.finalUrl)) out.push(row.finalUrl);
+  return out;
+}
 /** Stable checksum over site-facts (outcome + sorted invite codes + final
  * URL). Conservative use only: stored for change detection on recrawl,
  * never an identity or ownership input. */

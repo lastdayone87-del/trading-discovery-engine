@@ -9,6 +9,10 @@ import {
   needsRenderedRecrawl,
   siteInspectionCoversRequest,
   isSufficientRenderedCoverage,
+  mergeRedirectBinding,
+  redirectBindingFor,
+  redirectDestinations,
+  REDIRECT_BINDING_KIND,
   checksumSiteFacts,
   type CachedSiteInspection,
 } from './siteInspectionCache';
@@ -149,6 +153,33 @@ test('rendered coverage requires complete processed runs, never attempts', () =>
   assert.equal(isSufficientRenderedCoverage({ complete: false, timedOut: false }, false), false, 'unprocessed failure is not coverage');
 });
 
+test('redirect bindings coexist per requested URL and resolve exactly', () => {
+  const bindingA = { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://shortener.com/a', finalUrl: 'https://site-a.com/', observedAt: hoursAgo(2) } as const;
+  const bindingB = { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://shortener.com/b', finalUrl: 'https://site-b.com/', observedAt: hoursAgo(1) } as const;
+  let observations: Array<Record<string, unknown>> = [];
+  observations = mergeRedirectBinding(observations, { ...bindingA });
+  observations = mergeRedirectBinding(observations, { ...bindingB });
+  assert.equal(observations.length, 2, 'distinct wrappers coexist instead of overwriting');
+  const row = { outcome: 'REDIRECTED', canonicalUrl: 'https://shortener.com/b', finalUrl: 'https://site-b.com/', observations };
+  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/a')?.finalUrl, 'https://site-a.com/');
+  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/b')?.finalUrl, 'https://site-b.com/');
+  assert.equal(redirectBindingFor(row, 'https://shortener.com/c'), null, 'unseen wrapper never matches another destination');
+  assert.equal(redirectBindingFor({ ...row, outcome: 'FOUND' }, 'https://shortener.com/a'), null, 'non-alias rows never resolve');
+  // Re-observing the same wrapper replaces its binding instead of duplicating.
+  const replaced = mergeRedirectBinding(observations, { ...bindingA, finalUrl: 'https://site-a2.com/', observedAt: hoursAgo(0) });
+  assert.equal(replaced.length, 2);
+  assert.deepEqual(
+    redirectBindingFor({ outcome: 'REDIRECTED', canonicalUrl: '', finalUrl: '', observations: replaced }, 'https://shortener.com/a')?.finalUrl,
+    'https://site-a2.com/',
+  );
+  // Legacy single-binding rows (no bindings list) resolve exactly as before.
+  const legacy = { outcome: 'REDIRECTED', canonicalUrl: 'https://go.example/start', finalUrl: 'https://dest.example/landing', observations: [] };
+  assert.deepEqual(redirectBindingFor(legacy, 'https://go.example/start')?.finalUrl, 'https://dest.example/landing');
+  assert.equal(redirectBindingFor(legacy, 'https://go.example/other'), null);
+  // Prefetch surfaces every referenced destination once.
+  assert.deepEqual(redirectDestinations({ outcome: 'REDIRECTED', finalUrl: 'https://site-b.com/', observations }), ['https://site-a.com/', 'https://site-b.com/']);
+  assert.deepEqual(redirectDestinations({ outcome: 'FOUND', finalUrl: 'https://x/', observations }), []);
+});
 test('site-fact checksum is stable, order-insensitive, and content-sensitive', () => {
   const a = checksumSiteFacts({ outcome: 'FOUND', inviteCodes: ['b', 'a'], finalUrl: 'https://x/' });
   const b = checksumSiteFacts({ outcome: 'FOUND', inviteCodes: ['a', 'b', 'a'], finalUrl: 'https://x/' });
