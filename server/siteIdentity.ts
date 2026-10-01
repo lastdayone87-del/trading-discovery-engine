@@ -1,5 +1,5 @@
 import { domainToASCII } from 'node:url';
-import { getDomain } from 'tldts';
+import { getDomain, parse } from 'tldts';
 
 export type SiteIdentityTier = 'A' | 'B' | 'C';
 
@@ -18,8 +18,7 @@ export interface SiteIdentity {
  * one of these suffixes identifies the site by full host: collapsing to the
  * registrable domain would merge unrelated tenants (e.g. every Skool
  * community into `skool.com`). Code-owned, evidence-backed only: entries
- * require observed creator-link fixtures or production data. Deferred
- * platforms (github.io, vercel.app, …) stay out until evidence admits them. */
+ * require observed creator-link fixtures or production data. */
 const SUBDOMAIN_TENANT_SUFFIXES = ['skool.com', 'circle.so'] as const;
 
 /** Platforms whose tenants live under paths of a shared host. Neither the
@@ -54,6 +53,23 @@ function suffixMatch(host: string, suffix: string): boolean {
   return host === suffix || host.endsWith(`.${suffix}`);
 }
 
+/** Public suffix from the PSL private section (multi-tenant hosting such as
+ * github.io, vercel.app, herokuapp.com), or null. Used split-only: a private
+ * suffix marks a tenant boundary, so subdomains identify by full host and
+ * can never collapse into one cache identity. PSL drift can only cause extra
+ * splitting (recrawls), never unsafe merging — unlike relying on private
+ * suffixes to decide merges, which stays prohibited. */
+function privateTenantSuffix(host: string): string | null {
+  let parsed: ReturnType<typeof parse>;
+  try {
+    parsed = parse(host, { allowPrivateDomains: true });
+  } catch {
+    return null;
+  }
+  if (!parsed || !parsed.isPrivate || !parsed.publicSuffix) return null;
+  return parsed.publicSuffix;
+}
+
 /** Computes the global site identity for a crawled URL. Identity is derived
  * from `finalUrl` (post-redirect destination) when available, falling back
  * to the requested URL — redirects are resolved first (Tier D behavior),
@@ -86,9 +102,19 @@ export function canonicalSiteIdentity(requestedUrl: string, finalUrl?: string | 
     return { siteIdentity: host, tier: 'B', basis: `subdomain-tenant ${subdomainTenant}`, crawlUrl: parsed.toString() };
   }
 
+  // Private-suffix tenants (github.io, vercel.app, …): the registrable domain
+  // under a private suffix is a tenant boundary, not a shared site. Split by
+  // full host without requiring a registry entry. Split-only and fail-closed:
+  // ICANN-suffix hosts are unaffected and keep Tier A behavior below.
+  const tenantSuffix = privateTenantSuffix(host);
+  if (tenantSuffix) {
+    return { siteIdentity: host, tier: 'B', basis: `private-suffix tenant ${tenantSuffix}`, crawlUrl: parsed.toString() };
+  }
+
   // Tier A: ICANN PSL registrable domain only. Private-domain behavior is
-  // deliberately NOT enabled: tenant platforms are decided by the explicit
-  // registries above so PSL data drift can never silently merge tenants.
+  // deliberately NOT enabled for merges: tenant platforms are decided by the
+  // explicit registries above (or the private-suffix split) so PSL data drift
+  // can never silently merge tenants.
   const registrable = getDomain(host);
   if (!registrable) return null;
   return { siteIdentity: registrable.toLowerCase(), tier: 'A', basis: 'ICANN registrable domain', crawlUrl: parsed.toString() };

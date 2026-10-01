@@ -86,6 +86,48 @@ maybe('site prune removes only rows older than retention', async t => {
   assert.equal((await getSiteInspections([FRESH])).length, 1, 'fresh row survives');
 });
 
+maybe('prune removes obsolete links with expired inspections and keeps current associations', async t => {
+  const { getDb } = await import('./dbCore');
+  const db = await getDb();
+  const OLD = 'apex-prune-link-old.example';
+  const FRESH = 'apex-prune-link-fresh.example';
+  const STALE_ORPHAN = 'apex-prune-link-stale-orphan.example';
+  const CURRENT_ORPHAN = 'apex-prune-link-current-orphan.example';
+  const ALL = [OLD, FRESH, STALE_ORPHAN, CURRENT_ORPHAN];
+  t.after(async () => {
+    await db.query(`DELETE FROM creator_site_links WHERE site_identity = ANY($1)`, [ALL]);
+    await db.query(`DELETE FROM site_inspections WHERE site_identity = ANY($1)`, [ALL]);
+  });
+  for (const site of ALL) {
+    await db.query(`DELETE FROM creator_site_links WHERE site_identity=$1`, [site]);
+    await db.query(`DELETE FROM site_inspections WHERE site_identity=$1`, [site]);
+  }
+  for (const site of [OLD, FRESH]) {
+    await upsertSiteInspection({
+      siteIdentity: site, identityTier: 'A', identityBasis: 'test',
+      canonicalUrl: `https://${site}/`, outcome: 'FOUND', retryable: false,
+      candidates: [], observations: [], renderedCovered: false, provenance: {},
+    });
+  }
+  await recordCreatorSiteLinks(CHANNEL_A, [
+    { siteIdentity: OLD, sourceSurface: 'CREATOR_WEBSITES', sourceUrl: `https://${OLD}/` },
+    { siteIdentity: FRESH, sourceSurface: 'CREATOR_WEBSITES', sourceUrl: `https://${FRESH}/` },
+    { siteIdentity: STALE_ORPHAN, sourceSurface: 'CREATOR_WEBSITES', sourceUrl: `https://${STALE_ORPHAN}/` },
+    { siteIdentity: CURRENT_ORPHAN, sourceSurface: 'CREATOR_WEBSITES', sourceUrl: `https://${CURRENT_ORPHAN}/` },
+  ]);
+  await db.query(`UPDATE site_inspections SET last_observed_at=now()-interval '61 days' WHERE site_identity=$1`, [OLD]);
+  await db.query(`UPDATE creator_site_links SET last_seen=now()-interval '61 days' WHERE site_identity IN ($1,$2)`, [OLD, STALE_ORPHAN]);
+  const pruned = await pruneSiteInspections(60 * 24 * 60 * 60_000);
+  assert.ok(pruned >= 1, 'expired inspection pruned');
+  const remaining = await db.query(`SELECT site_identity FROM creator_site_links WHERE site_identity = ANY($1)`, [ALL]);
+  const leftovers = remaining.rows.map(r => String(r.site_identity)).sort();
+  assert.deepEqual(leftovers, [CURRENT_ORPHAN, FRESH].sort(), 'obsolete links removed with their inspections; current links remain');
+  const second = await pruneSiteInspections(60 * 24 * 60 * 60_000);
+  assert.equal(second, 0, 'repeated pruning is idempotent');
+  const again = await db.query(`SELECT site_identity FROM creator_site_links WHERE site_identity = ANY($1)`, [ALL]);
+  assert.deepEqual(again.rows.map(r => String(r.site_identity)).sort(), leftovers, 'repeat run deletes nothing further');
+});
+
 maybe('site_inspections carries no creator column by schema', async () => {
   const { getDb } = await import('./dbCore');
   const db = await getDb();

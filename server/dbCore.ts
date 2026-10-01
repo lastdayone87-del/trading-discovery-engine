@@ -858,13 +858,23 @@ export async function recordCreatorSiteLinks(channelId: string, links: Array<{ s
 }
 
 /** Bounds the site-inspection ledger: removes rows not observed within
- * retentionMs (default two freshness cycles). Runs at startup, never in a
- * crawl path. Pre-migration databases resolve to zero pruned. */
+ * retentionMs (default two freshness cycles) plus creator_site_links that
+ * are both stale (same cutoff) and orphaned (identity no longer cached).
+ * Links are re-recorded with fresh last_seen on every inspection, so a
+ * current association can never satisfy both predicates. Runs at startup,
+ * never in a crawl path. Pre-migration databases resolve to zero pruned.
+ * Idempotent: repeated runs remove nothing further. */
 export async function pruneSiteInspections(retentionMs = 2 * 30 * 24 * 60 * 60_000): Promise<number> {
   if (!Number.isFinite(retentionMs) || retentionMs <= 0) return 0;
   const db = await getDb();
   try {
     const res = await db.query(`DELETE FROM site_inspections WHERE last_observed_at < now() - ($1||' milliseconds')::interval`, [String(Math.trunc(retentionMs))]);
+    try {
+      await db.query(`DELETE FROM creator_site_links WHERE last_seen < now() - ($1||' milliseconds')::interval AND NOT EXISTS (SELECT 1 FROM site_inspections s WHERE s.site_identity = creator_site_links.site_identity)`, [String(Math.trunc(retentionMs))]);
+    } catch (linkError) {
+      if ((linkError as { code?: unknown } | null)?.code === '42P01') return res.rowCount || 0;
+      throw linkError;
+    }
     return res.rowCount || 0;
   } catch (error) {
     if ((error as { code?: unknown } | null)?.code === '42P01') return 0;

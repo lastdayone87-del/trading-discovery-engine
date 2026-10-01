@@ -7,6 +7,8 @@ import {
   isSiteInspectionReusable,
   buildBorrowedSiteInspection,
   needsRenderedRecrawl,
+  siteInspectionCoversRequest,
+  isSufficientRenderedCoverage,
   checksumSiteFacts,
   type CachedSiteInspection,
 } from './siteInspectionCache';
@@ -112,6 +114,39 @@ test('rendered recrawl rule is conservative toward inspection', () => {
   assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'INSPECTED_NO_MATCH', hasCreatorOwned: false }), true);
   assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'FOUND', hasCreatorOwned: false }), true, 'FOUND without owned candidate still needs escalation coverage');
   assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'FOUND', hasCreatorOwned: true }), false);
+});
+
+test('coverage gates negative reuse but never blocks positive site-facts', () => {
+  const negative = row({
+    outcome: 'INSPECTED_NO_MATCH',
+    canonicalUrl: 'https://apextrader.com/pricing',
+    finalUrl: 'https://apextrader.com/pricing',
+    observations: [
+      { requestedUrl: 'https://apextrader.com/pricing', rootUrl: 'https://apextrader.com/pricing', outcome: 'INSPECTED_NO_MATCH' },
+    ],
+    candidates: [],
+  });
+  assert.equal(siteInspectionCoversRequest(negative, 'https://apextrader.com/pricing'), true, 'same covered path reuses');
+  assert.equal(siteInspectionCoversRequest(negative, 'https://apextrader.com/pricing/'), true, 'trailing slash is the same page');
+  assert.equal(siteInspectionCoversRequest(negative, 'https://apextrader.com/join'), false, 'uncovered path cannot reuse an absence claim');
+  assert.equal(siteInspectionCoversRequest(negative, 'not a url at all !@#'), false, 'unparsable request fails toward recrawl');
+  const found = row({ outcome: 'FOUND', canonicalUrl: 'https://apextrader.com/pricing', observations: [], candidates: [] });
+  assert.equal(siteInspectionCoversRequest(found, 'https://apextrader.com/join'), true, 'genuine invites are site-facts, reusable across paths');
+  const viaCandidate = row({
+    outcome: 'INSPECTED_NO_MATCH',
+    canonicalUrl: 'https://apextrader.com/',
+    observations: [],
+    candidates: [{ candidateId: 'c1', sourceUrl: 'https://apextrader.com/join' }],
+  });
+  assert.equal(siteInspectionCoversRequest(viaCandidate, 'https://apextrader.com/join'), true, 'candidate source pages count as covered');
+});
+
+test('rendered coverage requires complete processed runs, never attempts', () => {
+  assert.equal(isSufficientRenderedCoverage({ complete: true, timedOut: false }, true), true, 'complete render');
+  assert.equal(isSufficientRenderedCoverage({ complete: false, timedOut: true }, true), false, 'timeout is not coverage');
+  assert.equal(isSufficientRenderedCoverage({ complete: false, timedOut: false }, true), false, 'partial page processing is not coverage');
+  assert.equal(isSufficientRenderedCoverage({ complete: true, timedOut: false }, false), false, 'zero-page/unprocessed render is not coverage');
+  assert.equal(isSufficientRenderedCoverage({ complete: false, timedOut: false }, false), false, 'unprocessed failure is not coverage');
 });
 
 test('site-fact checksum is stable, order-insensitive, and content-sensitive', () => {

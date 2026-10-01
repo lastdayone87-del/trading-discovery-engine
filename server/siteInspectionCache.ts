@@ -118,6 +118,79 @@ export function needsRenderedRecrawl(
   return input.staticOutcome !== 'FOUND' || !input.hasCreatorOwned;
 }
 
+/** Whether a rendered run counts as sufficient rendered coverage for the
+ * site cache. Attempted is not covered: timeouts, interruptions, partial
+ * page processing, and zero-page runs must never satisfy renderedCovered —
+ * only a complete, processed run does. Retryable partial results stay
+ * retryable through the row's own retryable flag, not through this bit. */
+export function isSufficientRenderedCoverage(
+  rendered: { complete?: unknown; timedOut?: unknown },
+  processed: boolean,
+): boolean {
+  return processed === true && rendered.complete === true && rendered.timedOut !== true;
+}
+
+/** Normalized page key for coverage checks: lowercased host plus pathname
+ * (trailing slash trimmed, empty path normalized to root). Query strings
+ * are kept verbatim: query-driven content differences fail toward recrawl,
+ * never toward assuming coverage. Fragments are dropped. Returns null for
+ * unparsable input (callers treat that as uncovered and crawl). */
+function normalizeCoverageKey(raw: string): string | null {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  const path = parsed.pathname.replace(/\/+$/, '') || '/';
+  return `${parsed.hostname.toLowerCase()}${path}${parsed.search}`;
+}
+
+/** Whether a cached row actually covers the requested surface/path.
+ * Positive site-facts (FOUND rows) are borrowed regardless of path — the
+ * invite genuinely exists on the site and ownership is always recomputed
+ * per borrower. Negative outcomes (INSPECTED_NO_MATCH, PARTIALLY_INSPECTED,
+ * ACQUISITION_FAILED) assert absence, so they are only reusable where the
+ * cached crawl demonstrably went: any observation requested/root/final URL,
+ * the row's canonical/final URLs, or a retained candidate's source URL.
+ * Uncovered negatives force acquisition instead of masquerading as complete
+ * coverage of another page. */
+export function siteInspectionCoversRequest(
+  row: Pick<CachedSiteInspection, 'outcome' | 'canonicalUrl' | 'finalUrl' | 'observations' | 'candidates'>,
+  requestedUrl: string,
+): boolean {
+  if (row.outcome === 'FOUND') return true;
+  const want = normalizeCoverageKey(requestedUrl);
+  if (!want) return false;
+  const covered = new Set<string>();
+  for (const url of [row.canonicalUrl, row.finalUrl]) {
+    if (typeof url === 'string' && url) {
+      const key = normalizeCoverageKey(url);
+      if (key) covered.add(key);
+    }
+  }
+  for (const item of row.observations || []) {
+    const source = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+    for (const field of ['requestedUrl', 'rootUrl', 'finalUrl'] as const) {
+      if (typeof source[field] === 'string') {
+        const key = normalizeCoverageKey(source[field] as string);
+        if (key) covered.add(key);
+      }
+    }
+  }
+  for (const item of row.candidates || []) {
+    const source = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+    if (typeof source.sourceUrl === 'string') {
+      const key = normalizeCoverageKey(source.sourceUrl);
+      if (key) covered.add(key);
+    }
+  }
+  return covered.has(want);
+}
+
 /** Stable checksum over site-facts (outcome + sorted invite codes + final
  * URL). Conservative use only: stored for change detection on recrawl,
  * never an identity or ownership input. */
