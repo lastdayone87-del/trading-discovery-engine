@@ -1241,6 +1241,113 @@ export async function recordPageCoverage(row: {
     throw error;
   }
 }
+
+/** Accumulates one observed page outcome into a route's counters. Counters
+ * only — never a routing decision. Pre-migration databases resolve quietly. */
+export async function accumulateRouteStats(row: {
+  siteIdentity: string; routePattern: string; evidenceUnits: number; observedAt?: string | null;
+}): Promise<void> {
+  if (!row.siteIdentity || !row.routePattern) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO domain_route_stats(site_identity,route_pattern,attempts,evidence_hits,evidence_units,first_observed_at,last_observed_at)
+      VALUES($1,$2,1,$3,$4,COALESCE($5,now()),COALESCE($5,now()))
+      ON CONFLICT(site_identity,route_pattern) DO UPDATE SET attempts=domain_route_stats.attempts+1,evidence_hits=domain_route_stats.evidence_hits+EXCLUDED.evidence_hits,evidence_units=domain_route_stats.evidence_units+EXCLUDED.evidence_units,last_observed_at=GREATEST(domain_route_stats.last_observed_at,EXCLUDED.last_observed_at)`,
+      [row.siteIdentity, row.routePattern, Math.max(0, Math.trunc(row.evidenceUnits) || 0) > 0 ? 1 : 0, Math.max(0, Math.trunc(row.evidenceUnits) || 0), row.observedAt || null]);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
+
+/** Reads a site's route counters for offline batch learning. Empty when
+ * unknown or pre-migration. */
+export async function getRouteStats(siteIdentity: string): Promise<Array<{
+  siteIdentity: string; routePattern: string; attempts: number;
+  evidenceHits: number; evidenceUnits: number; lastObservedAt: string | null;
+}>> {
+  if (!siteIdentity) return [];
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `SELECT site_identity,route_pattern,attempts,evidence_hits,evidence_units,last_observed_at FROM domain_route_stats WHERE site_identity=$1 ORDER BY route_pattern`,
+      [siteIdentity],
+    );
+    return (res.rows || []).map((item: Record<string, unknown>) => ({
+      siteIdentity: String(item.site_identity || ''),
+      routePattern: String(item.route_pattern || ''),
+      attempts: Number(item.attempts || 0),
+      evidenceHits: Number(item.evidence_hits || 0),
+      evidenceUnits: Number(item.evidence_units || 0),
+      lastObservedAt: item.last_observed_at instanceof Date ? item.last_observed_at.toISOString() : (typeof item.last_observed_at === 'string' ? item.last_observed_at : null),
+    }));
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return [];
+    throw error;
+  }
+}
+
+/** Persists a learner snapshot. Always DRAFT on write: approval is a
+ * separate explicit human act (approveWeightSnapshot). Version-keyed
+ * idempotency makes retried batch runs converge without duplicates. */
+export async function recordWeightSnapshot(snapshot: {
+  version: string; siteIdentity: string; weights: Record<string, number>;
+  trainingWindow: Record<string, unknown>; metrics: Record<string, unknown>; codeVersion: string;
+}): Promise<void> {
+  if (!snapshot.version || !snapshot.siteIdentity) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO domain_weight_snapshots(version,site_identity,weights,training_window,metrics,code_version,status)
+      VALUES($1,$2,$3,$4,$5,$6,'DRAFT')
+      ON CONFLICT(version) DO NOTHING`,
+      [snapshot.version, snapshot.siteIdentity, JSON.stringify(snapshot.weights || {}), JSON.stringify(snapshot.trainingWindow || {}), JSON.stringify(snapshot.metrics || {}), snapshot.codeVersion || '']);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
+
+/** Human approval gate: marks one snapshot APPROVED with approver identity.
+ * The only path by which learner output becomes consumable. Rejected
+ * snapshots are left queryable; approval never deletes or rewrites. */
+export async function approveWeightSnapshot(version: string, approver: string): Promise<boolean> {
+  if (!version || !approver.trim()) return false;
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `UPDATE domain_weight_snapshots SET status='APPROVED',approved_by=$2,approved_at=now() WHERE version=$1 AND status='DRAFT'`,
+      [version, approver.trim()],
+    );
+    return (res.rowCount || 0) > 0;
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return false;
+    throw error;
+  }
+}
+
+/** Resolves the latest APPROVED weights for a site, or null. DRAFT snapshots
+ * are never consumable through this path regardless of recency. */
+export async function getApprovedWeights(siteIdentity: string): Promise<{
+  version: string; weights: Record<string, number>;
+} | null> {
+  if (!siteIdentity) return null;
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `SELECT version,weights FROM domain_weight_snapshots WHERE site_identity=$1 AND status='APPROVED' ORDER BY approved_at DESC NULLS LAST,created_at DESC LIMIT 1`,
+      [siteIdentity],
+    );
+    const row = res.rows?.[0] as Record<string, unknown> | undefined;
+    if (!row || typeof row.version !== 'string') return null;
+    return {
+      version: row.version,
+      weights: (row.weights && typeof row.weights === 'object' ? row.weights : {}) as Record<string, number>,
+    };
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return null;
+    throw error;
+  }
+}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
