@@ -733,7 +733,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     // Exact-binding resolution: only the binding recorded for this requested
     // URL may resolve. Other wrappers sharing the host never match, so their
     // destinations can neither be borrowed nor merged here.
-    const binding=redirectBindingFor(seedCachedRow,item.url);
+    const binding=redirectBindingFor(seedCachedRow,item.url,Date.now());
     const finalIdentity=binding?canonicalSiteIdentity(binding.finalUrl):null;
     const finalRow=finalIdentity&&seedSiteIdentity&&finalIdentity.siteIdentity!==seedSiteIdentity.siteIdentity
       ?siteRowsByIdentity.get(finalIdentity.siteIdentity):undefined;

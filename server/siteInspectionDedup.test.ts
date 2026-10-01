@@ -309,6 +309,54 @@ test('shared shortener host: distinct wrappers coexist, resolve independently, n
   assert.equal(revisitC.foundInvite, 'invitea');
 });
 
+test('stale binding recrawls while a freshly observed sibling borrows', async () => {
+  const { store, rows } = makeStore();
+  const fetched: string[] = [];
+  const fetchImpl = makeCoexistFetch(fetched);
+  const base = { videoDescriptions: DESCS, externalFetchImpl: fetchImpl, urlFailureHistoryLoader: async () => [], siteInspectionStore: store } as const;
+  const nowIso = new Date().toISOString();
+  const oldIso = new Date(Date.now() - 61 * 24 * 3_600_000).toISOString();
+  const binding = (requestedUrl: string, finalUrl: string, observedAt: string) => ({ kind: 'REDIRECT_BINDING', requestedUrl, finalUrl, observedAt });
+  rows.set('shortener.com', {
+    siteIdentity: 'shortener.com', identityTier: 'A', identityBasis: 'ICANN registrable domain',
+    canonicalUrl: 'https://shortener.com/b', finalUrl: 'https://site-b.com/', outcome: 'REDIRECTED',
+    retryable: false, httpStatus: 200, failureClass: '', detail: 'injected alias', payloadChecksum: null,
+    candidates: [],
+    observations: [
+      binding('https://shortener.com/a', 'https://site-a.com/', oldIso),
+      binding('https://shortener.com/b', 'https://site-b.com/', nowIso),
+    ],
+    renderedCovered: false, provenance: {}, firstObservedAt: oldIso, lastObservedAt: nowIso, observedCount: 2,
+  });
+  rows.set('site-b.com', {
+    siteIdentity: 'site-b.com', identityTier: 'A', identityBasis: 'test',
+    canonicalUrl: 'https://site-b.com/', finalUrl: 'https://site-b.com/', outcome: 'INSPECTED_NO_MATCH',
+    retryable: false, httpStatus: 200, failureClass: '', detail: 'injected facts', payloadChecksum: null,
+    candidates: [],
+    observations: [{ requestedUrl: 'https://site-b.com/', rootUrl: 'https://site-b.com/', outcome: 'INSPECTED_NO_MATCH' }],
+    renderedCovered: false, provenance: {}, firstObservedAt: nowIso, lastObservedAt: nowIso, observedCount: 1,
+  });
+  const run = (channelId: string, channelName: string, link: string) => runChannelInspection({
+    ...base, channelId, channelName, channelBio: 'Trading educator', channelLinks: [link],
+  });
+
+  await run('UCShortStale00000001', 'Stale Wrapper', 'https://shortener.com/a');
+  assert.ok(fetched.some(url => url.includes('shortener.com/a')), 'stale binding falls through to inspection instead of reusing');
+  const refreshed = rows.get('shortener.com');
+  assert.ok(
+    (refreshed?.observations as Array<Record<string, unknown>>).some(item => item['requestedUrl'] === 'https://shortener.com/a'),
+    're-observation keeps the binding entry',
+  );
+
+  const beforeFresh = fetched.length;
+  const fresh = await run('UCShortStale00000002', 'Fresh Wrapper', 'https://shortener.com/b');
+  assert.equal(fetched.length, beforeFresh, 'fresh sibling still borrows without recrawling');
+  assert.ok(
+    (fresh.acquisitionOutcomes || []).some(item => (item as unknown as Record<string, unknown>).siteCacheHit === true),
+    'fresh binding borrows destination facts',
+  );
+});
+
 function makeRenderFallback(calls: string[], result: { complete: boolean; timedOut: boolean; inspectedPages: number }) {
   return (async (seedUrl: string) => {
     calls.push(seedUrl);

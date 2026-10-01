@@ -130,8 +130,11 @@ export function isSufficientRenderedCoverage(
   return processed === true && rendered.complete === true && rendered.timedOut !== true;
 }
 
-/** Normalized page key for coverage checks: lowercased host plus pathname
- * (trailing slash trimmed, empty path normalized to root). Query strings
+/** Normalized page key for coverage checks: scheme plus lowercased host
+ * plus non-default port plus pathname (trailing slash trimmed, empty path
+ * normalized to root). Scheme and port are load-bearing: http vs https and
+ * distinct ports can serve different content and follow different
+ * redirects, so they must never share a coverage identity. Query strings
  * are kept verbatim: query-driven content differences fail toward recrawl,
  * never toward assuming coverage. Fragments are dropped. Returns null for
  * unparsable input (callers treat that as uncovered and crawl). */
@@ -146,7 +149,8 @@ function normalizeCoverageKey(raw: string): string | null {
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
   const path = parsed.pathname.replace(/\/+$/, '') || '/';
-  return `${parsed.hostname.toLowerCase()}${path}${parsed.search}`;
+  const port = parsed.port ? `:${parsed.port}` : '';
+  return `${parsed.protocol}//${parsed.hostname.toLowerCase()}${port}${path}${parsed.search}`;
 }
 
 /** Whether a cached row actually covers the requested surface/path.
@@ -242,11 +246,18 @@ export function mergeRedirectBinding(
 }
 
 /** Resolve the destination bound to an exact requested URL on a REDIRECTED
- * alias row, or null. Legacy single-binding rows (canonicalUrl + finalUrl,
- * no bindings list) resolve exactly as before. Never merges destinations. */
+ * alias row, or null. Freshness is evaluated per exact binding against the
+ * row-independent fresh TTL: one binding refreshing (which rewrites the
+ * row's last_observed_at) never extends another binding's window, so stale
+ * bindings fall through to normal inspection/re-resolution. Malformed or
+ * missing observedAt on a listed binding also fails closed to null. Legacy
+ * single-binding rows (canonicalUrl + finalUrl, no bindings list) resolve
+ * exactly as before; their freshness remains governed by the row-level
+ * reusable check the caller already performs. Never merges destinations. */
 export function redirectBindingFor(
   row: Pick<CachedSiteInspection, 'outcome' | 'canonicalUrl' | 'finalUrl' | 'observations'>,
   requestedUrl: string,
+  nowMs: number = Date.now(),
 ): { requestedUrl: string; finalUrl: string; observedAt: string | null } | null {
   if (row.outcome !== 'REDIRECTED') return null;
   const want = normalizeCoverageKey(requestedUrl);
@@ -256,9 +267,11 @@ export function redirectBindingFor(
     if (isRedirectBinding(item)) bindings.push(item);
   }
   for (const binding of bindings) {
-    if (normalizeCoverageKey(binding.requestedUrl) === want && binding.finalUrl) {
-      return { requestedUrl: binding.requestedUrl, finalUrl: binding.finalUrl, observedAt: binding.observedAt };
-    }
+    if (normalizeCoverageKey(binding.requestedUrl) !== want || !binding.finalUrl) continue;
+    const observedAt = Date.parse(binding.observedAt);
+    if (!Number.isFinite(observedAt)) continue;
+    if (Math.max(0, nowMs - observedAt) > SITE_INSPECTION_FRESH_TTL_MS) continue;
+    return { requestedUrl: binding.requestedUrl, finalUrl: binding.finalUrl, observedAt: binding.observedAt };
   }
   if (bindings.length === 0 && typeof row.finalUrl === 'string' && row.finalUrl) {
     const canonical = typeof row.canonicalUrl === 'string' ? normalizeCoverageKey(row.canonicalUrl) : null;

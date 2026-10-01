@@ -161,24 +161,72 @@ test('redirect bindings coexist per requested URL and resolve exactly', () => {
   observations = mergeRedirectBinding(observations, { ...bindingB });
   assert.equal(observations.length, 2, 'distinct wrappers coexist instead of overwriting');
   const row = { outcome: 'REDIRECTED', canonicalUrl: 'https://shortener.com/b', finalUrl: 'https://site-b.com/', observations };
-  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/a')?.finalUrl, 'https://site-a.com/');
-  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/b')?.finalUrl, 'https://site-b.com/');
-  assert.equal(redirectBindingFor(row, 'https://shortener.com/c'), null, 'unseen wrapper never matches another destination');
-  assert.equal(redirectBindingFor({ ...row, outcome: 'FOUND' }, 'https://shortener.com/a'), null, 'non-alias rows never resolve');
+  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/a', NOW)?.finalUrl, 'https://site-a.com/');
+  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/b', NOW)?.finalUrl, 'https://site-b.com/');
+  assert.equal(redirectBindingFor(row, 'https://shortener.com/c', NOW), null, 'unseen wrapper never matches another destination');
+  assert.equal(redirectBindingFor({ ...row, outcome: 'FOUND' }, 'https://shortener.com/a', NOW), null, 'non-alias rows never resolve');
   // Re-observing the same wrapper replaces its binding instead of duplicating.
   const replaced = mergeRedirectBinding(observations, { ...bindingA, finalUrl: 'https://site-a2.com/', observedAt: hoursAgo(0) });
   assert.equal(replaced.length, 2);
   assert.deepEqual(
-    redirectBindingFor({ outcome: 'REDIRECTED', canonicalUrl: '', finalUrl: '', observations: replaced }, 'https://shortener.com/a')?.finalUrl,
+    redirectBindingFor({ outcome: 'REDIRECTED', canonicalUrl: '', finalUrl: '', observations: replaced }, 'https://shortener.com/a', NOW)?.finalUrl,
     'https://site-a2.com/',
   );
   // Legacy single-binding rows (no bindings list) resolve exactly as before.
   const legacy = { outcome: 'REDIRECTED', canonicalUrl: 'https://go.example/start', finalUrl: 'https://dest.example/landing', observations: [] };
-  assert.deepEqual(redirectBindingFor(legacy, 'https://go.example/start')?.finalUrl, 'https://dest.example/landing');
-  assert.equal(redirectBindingFor(legacy, 'https://go.example/other'), null);
+  assert.deepEqual(redirectBindingFor(legacy, 'https://go.example/start', NOW)?.finalUrl, 'https://dest.example/landing');
+  assert.equal(redirectBindingFor(legacy, 'https://go.example/other', NOW), null);
   // Prefetch surfaces every referenced destination once.
   assert.deepEqual(redirectDestinations({ outcome: 'REDIRECTED', finalUrl: 'https://site-b.com/', observations }), ['https://site-a.com/', 'https://site-b.com/']);
   assert.deepEqual(redirectDestinations({ outcome: 'FOUND', finalUrl: 'https://x/', observations }), []);
+});
+
+test('redirect identity distinguishes scheme and port', () => {
+  const bindings: Array<Record<string, unknown>> = [];
+  const merged = mergeRedirectBinding(
+    mergeRedirectBinding(bindings, { kind: REDIRECT_BINDING_KIND, requestedUrl: 'http://shortener.com/a', finalUrl: 'https://plain.example/', observedAt: hoursAgo(1) }),
+    { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://shortener.com/a', finalUrl: 'https://secure.example/', observedAt: hoursAgo(1) },
+  );
+  assert.equal(merged.length, 2, 'http and https wrappers are independent bindings');
+  const row = { outcome: 'REDIRECTED', canonicalUrl: 'https://shortener.com/a', finalUrl: 'https://secure.example/', observations: merged };
+  assert.deepEqual(redirectBindingFor(row, 'http://shortener.com/a', NOW)?.finalUrl, 'https://plain.example/');
+  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/a', NOW)?.finalUrl, 'https://secure.example/');
+  const ports = mergeRedirectBinding(
+    [],
+    { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://host.example:8080/a', finalUrl: 'https://alt.example/', observedAt: hoursAgo(1) },
+  );
+  const portRow = { outcome: 'REDIRECTED', canonicalUrl: '', finalUrl: '', observations: ports };
+  assert.deepEqual(redirectBindingFor(portRow, 'https://host.example:8080/a', NOW)?.finalUrl, 'https://alt.example/');
+  assert.equal(redirectBindingFor(portRow, 'https://host.example/a', NOW), null, 'default port never borrows the alternate-port destination');
+  // Explicit default ports normalize identically (no spurious split, no merge across schemes).
+  const bare = mergeRedirectBinding([], { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://host.example/a', finalUrl: 'https://alt.example/', observedAt: hoursAgo(1) });
+  assert.deepEqual(
+    redirectBindingFor({ outcome: 'REDIRECTED', canonicalUrl: '', finalUrl: '', observations: bare }, 'https://host.example:443/a', NOW)?.finalUrl,
+    'https://alt.example/',
+    'explicit :443 matches the default-port binding',
+  );
+});
+
+test('stale bindings expire individually while fresh siblings resolve', () => {
+  const oldAt = new Date(NOW - 61 * 24 * 3_600_000).toISOString();
+  const observations = mergeRedirectBinding(
+    mergeRedirectBinding([], { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://shortener.com/old', finalUrl: 'https://old.example/', observedAt: oldAt }),
+    { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://shortener.com/new', finalUrl: 'https://new.example/', observedAt: hoursAgo(1) },
+  );
+  const row = { outcome: 'REDIRECTED', canonicalUrl: 'https://shortener.com/new', finalUrl: 'https://new.example/', observations };
+  assert.equal(redirectBindingFor(row, 'https://shortener.com/old', NOW), null, 'stale binding is not reused despite the fresh sibling');
+  assert.deepEqual(redirectBindingFor(row, 'https://shortener.com/new', NOW)?.finalUrl, 'https://new.example/', 'fresh binding still resolves normally');
+  assert.equal(
+    redirectBindingFor(row, 'https://shortener.com/old', Date.parse(oldAt) + 60_000)?.finalUrl,
+    'https://old.example/',
+    'the same binding resolves inside its own window',
+  );
+  const malformed = mergeRedirectBinding([], { kind: REDIRECT_BINDING_KIND, requestedUrl: 'https://shortener.com/x', finalUrl: 'https://x.example/', observedAt: 'not-a-date' });
+  assert.equal(
+    redirectBindingFor({ outcome: 'REDIRECTED', canonicalUrl: '', finalUrl: '', observations: malformed }, 'https://shortener.com/x', NOW),
+    null,
+    'malformed observedAt fails closed',
+  );
 });
 test('site-fact checksum is stable, order-insensitive, and content-sensitive', () => {
   const a = checksumSiteFacts({ outcome: 'FOUND', inviteCodes: ['b', 'a'], finalUrl: 'https://x/' });
