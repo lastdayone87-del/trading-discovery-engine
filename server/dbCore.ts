@@ -1058,6 +1058,85 @@ export async function pruneSiteInspections(retentionMs = 2 * 30 * 24 * 60 * 60_0
     throw error;
   }
 }
+
+export interface SiteProfileRow {
+  siteIdentity: string;
+  identityTier: string;
+  robotsState: string;
+  robotsFetchedAt: string | null;
+  sitemapInventory: Array<Record<string, unknown>>;
+  feedInventory: Array<Record<string, unknown>>;
+  structuredData: Record<string, unknown>;
+  pageType: string;
+  politeness: Record<string, unknown>;
+  profile: Record<string, unknown>;
+  policyVersion: string;
+  firstObservedAt: string | null;
+  lastObservedAt: string | null;
+  observedCount: number;
+}
+
+function rowToSiteProfile(item: Record<string, unknown>): SiteProfileRow {
+  const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+  const jsonArray = (value: unknown): Array<Record<string, unknown>> => (Array.isArray(value) ? value as Array<Record<string, unknown>> : []);
+  const jsonObject = (value: unknown): Record<string, unknown> =>
+    (value && typeof value === 'object' && !Array.isArray(value) ? value : {}) as Record<string, unknown>;
+  const instant = (value: unknown): string | null => {
+    if (typeof value === 'string') return value;
+    return value instanceof Date ? value.toISOString() : null;
+  };
+  return {
+    siteIdentity: text(item.site_identity),
+    identityTier: text(item.identity_tier),
+    robotsState: text(item.robots_state) || 'UNKNOWN',
+    robotsFetchedAt: instant(item.robots_fetched_at),
+    sitemapInventory: jsonArray(item.sitemap_inventory),
+    feedInventory: jsonArray(item.feed_inventory),
+    structuredData: jsonObject(item.structured_data),
+    pageType: text(item.page_type) || 'UNKNOWN',
+    politeness: jsonObject(item.politeness),
+    profile: jsonObject(item.profile),
+    policyVersion: text(item.policy_version),
+    firstObservedAt: instant(item.first_observed_at),
+    lastObservedAt: instant(item.last_observed_at),
+    observedCount: Number(item.observed_count || 0),
+  };
+}
+
+/** Reads cached site profiles by identity. Misses are simply absent;
+ * unknown profiles fail open toward normal acquisition. Never throws for
+ * a missing table (pre-migration): callers treat that as a full miss. */
+export async function getSiteProfiles(identities: string[]): Promise<SiteProfileRow[]> {
+  const unique = Array.from(new Set((identities || []).filter(identity => typeof identity === 'string' && identity)));
+  if (!unique.length) return [];
+  const db = await getDb();
+  try {
+    const res = await db.query(`SELECT * FROM site_profiles WHERE site_identity = ANY($1)`, [unique]);
+    return (res.rows || []).map(rowToSiteProfile);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return [];
+    throw error;
+  }
+}
+
+/** Stores a profiler inventory run. Last-writer-wins on repeat profiles
+ * (fresher inventory replaces older); first-seen clock and count advance.
+ * Never carries creator attribution: profiles describe sites, not owners. */
+export async function upsertSiteProfile(row: {
+  siteIdentity: string; identityTier: string;
+  robotsState: string; robotsFetchedAt?: string | null;
+  sitemapInventory: Array<Record<string, unknown>>; feedInventory: Array<Record<string, unknown>>;
+  structuredData: Record<string, unknown>; pageType: string;
+  politeness: Record<string, unknown>; profile: Record<string, unknown>;
+  policyVersion: string;
+}): Promise<void> {
+  if (!row.siteIdentity) return;
+  const db = await getDb();
+  await db.query(`INSERT INTO site_profiles(site_identity,identity_tier,robots_state,robots_fetched_at,sitemap_inventory,feed_inventory,structured_data,page_type,politeness,profile,policy_version,first_observed_at,last_observed_at,observed_count)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now(),1)
+    ON CONFLICT(site_identity) DO UPDATE SET identity_tier=excluded.identity_tier,robots_state=excluded.robots_state,robots_fetched_at=excluded.robots_fetched_at,sitemap_inventory=excluded.sitemap_inventory,feed_inventory=excluded.feed_inventory,structured_data=excluded.structured_data,page_type=excluded.page_type,politeness=excluded.politeness,profile=excluded.profile,policy_version=excluded.policy_version,last_observed_at=now(),observed_count=site_profiles.observed_count+1`,
+    [row.siteIdentity, row.identityTier || '', row.robotsState || 'UNKNOWN', row.robotsFetchedAt || null, JSON.stringify(row.sitemapInventory || []), JSON.stringify(row.feedInventory || []), JSON.stringify(row.structuredData || {}), row.pageType || 'UNKNOWN', JSON.stringify(row.politeness || {}), JSON.stringify(row.profile || {}), row.policyVersion || '']);
+}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
