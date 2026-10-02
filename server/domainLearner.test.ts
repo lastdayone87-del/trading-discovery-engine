@@ -29,12 +29,14 @@ test('route patterns normalize numeric segments and reject non-pages', () => {
   assert.equal(routePatternFor('ftp://example.com/x'), null);
 });
 
-test('only genuinely inspected pages accumulate; blocked states never become negative evidence', () => {
-  for (const terminal of ['FOUND', 'INSPECTED_NO_MATCH', 'PARTIALLY_INSPECTED', 'OK']) {
-    assert.equal(shouldAccumulateRouteObservation(terminal), true, `${terminal} was inspected`);
+test('only complete inspections accumulate; partial and blocked states never become evidence either way', () => {
+  for (const terminal of ['FOUND', 'INSPECTED_NO_MATCH', 'OK']) {
+    assert.equal(shouldAccumulateRouteObservation(terminal), true, `${terminal} was completely inspected`);
   }
+  // PARTIALLY_INSPECTED is observed-but-incomplete: the unseen suffix is
+  // unknown, so it must neither confirm nor dilute learned yield.
   for (const terminal of [
-    'ACQUISITION_FAILED', 'BLOCKED', 'NOT_INSPECTED', 'NOT_FOUND',
+    'PARTIALLY_INSPECTED', 'ACQUISITION_FAILED', 'BLOCKED', 'NOT_INSPECTED', 'NOT_FOUND',
     'ROBOTS_DISALLOWED', 'LOGIN_WALL', 'PAYWALL', 'WAF_MANAGED',
     'RATE_LIMITED', 'UNREACHABLE', 'INCOMPLETE', '', 'whatever',
   ]) {

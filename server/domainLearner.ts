@@ -75,16 +75,17 @@ export function routePatternFor(pageUrl: string): string | null {
 }
 
 /** Whether a terminal outcome carries route-yield information worth
- * accumulating. Only genuinely inspected pages qualify: FOUND,
- * INSPECTED_NO_MATCH, PARTIALLY_INSPECTED (truncated but observed), and OK.
- * Blocked, unreachable, rate-limited, and incomplete terminals carry NO
- * yield information about the route — recording them as attempts would turn
- * inaccessibility into negative evidence, so they are excluded. Pure. */
+ * accumulating. Only COMPLETE inspections qualify: FOUND, INSPECTED_NO_MATCH,
+ * and OK. Truncated (PARTIALLY_INSPECTED) pages are excluded even though
+ * observed: the unseen suffix is unknown, so counting them as attempts would
+ * let incomplete inspections dilute learned yield like clean negatives.
+ * Blocked, unreachable, rate-limited, and otherwise incomplete terminals
+ * carry NO yield information — recording them as attempts would turn
+ * inaccessibility into negative evidence, so they are excluded too. Pure. */
 export function shouldAccumulateRouteObservation(terminalState: string): boolean {
   switch (terminalState) {
     case 'FOUND':
     case 'INSPECTED_NO_MATCH':
-    case 'PARTIALLY_INSPECTED':
     case 'OK':
       return true;
     default:

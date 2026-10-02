@@ -261,8 +261,8 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       const coverage=recordPageCoverage({siteIdentity:frontier.siteIdentity,pageKey:pageUrl,pageUrl,terminalState,acquisitionMethod:method,evidenceUnits,policyVersion:FRONTIER_POLICY_VERSION,weightVersion:frontier.weightVersion||''}).catch(()=>undefined);
       // P-D production data path (observational only): completed inspections
       // feed route statistics for the OFFLINE learner. Blocked/unreachable/
-      // incomplete terminals carry no yield information and are never
-      // recorded as attempts (never negative evidence). Best-effort like all
+      // truncated/incomplete terminals carry no complete yield information
+      // and are never recorded as attempts (never negative evidence). Best-effort like all
       // observational writes; failures never affect the crawl. Nothing here
       // is ever read back for routing, budgets, or stopping — the learner
       // runs offline and serving never consumes its weights.
