@@ -26,3 +26,19 @@ test('frontend surfaces API validation messages and request IDs',async()=>{
   const fetcher:typeof fetch=async()=>new Response(JSON.stringify({error:'reason is required',code:'REVIEW_VALIDATION_ERROR',requestId:'req-123'}),{status:422,headers:{'content-type':'application/json'}});
   await assert.rejects(()=>submitReviewDecision({channelId:'c',action:'approve',reviewVersion:1,reason:''},fetcher,{},'key'),/reason is required \(request req-123\)/);
 });
+
+test('submitReviewDecision falls back to a generated idempotency key when crypto.randomUUID is unavailable',async()=>{
+  const cryptoRef = globalThis.crypto as any;
+  const orig = cryptoRef.randomUUID;
+  cryptoRef.randomUUID = undefined;
+  try {
+    let sentKey: string | null = null;
+    const expected=successfulResult('APPROVE');
+    const fetcher:typeof fetch=async(_input,requestInit)=>{sentKey=new Headers(requestInit?.headers).get('Idempotency-Key');return new Response(JSON.stringify(expected),{status:200,headers:{'content-type':'application/json'}});};
+    const result=await submitReviewDecision({channelId:'channel/1',action:'approve',reviewVersion:1},fetcher,{'X-Reviewer-Id':'reviewer'});
+    assert.ok(sentKey && sentKey.length > 0);
+    assert.equal(result.review.state,'APPROVED');
+  } finally {
+    cryptoRef.randomUUID = orig;
+  }
+});
