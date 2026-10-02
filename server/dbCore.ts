@@ -1058,6 +1058,310 @@ export async function pruneSiteInspections(retentionMs = 2 * 30 * 24 * 60 * 60_0
     throw error;
   }
 }
+
+export interface SiteProfileRow {
+  siteIdentity: string;
+  identityTier: string;
+  robotsState: string;
+  robotsFetchedAt: string | null;
+  sitemapInventory: Array<Record<string, unknown>>;
+  feedInventory: Array<Record<string, unknown>>;
+  structuredData: Record<string, unknown>;
+  pageType: string;
+  politeness: Record<string, unknown>;
+  profile: Record<string, unknown>;
+  policyVersion: string;
+  firstObservedAt: string | null;
+  lastObservedAt: string | null;
+  observedCount: number;
+}
+
+function rowToSiteProfile(item: Record<string, unknown>): SiteProfileRow {
+  const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+  const jsonArray = (value: unknown): Array<Record<string, unknown>> => (Array.isArray(value) ? value as Array<Record<string, unknown>> : []);
+  const jsonObject = (value: unknown): Record<string, unknown> =>
+    (value && typeof value === 'object' && !Array.isArray(value) ? value : {}) as Record<string, unknown>;
+  const instant = (value: unknown): string | null => {
+    if (typeof value === 'string') return value;
+    return value instanceof Date ? value.toISOString() : null;
+  };
+  return {
+    siteIdentity: text(item.site_identity),
+    identityTier: text(item.identity_tier),
+    robotsState: text(item.robots_state) || 'UNKNOWN',
+    robotsFetchedAt: instant(item.robots_fetched_at),
+    sitemapInventory: jsonArray(item.sitemap_inventory),
+    feedInventory: jsonArray(item.feed_inventory),
+    structuredData: jsonObject(item.structured_data),
+    pageType: text(item.page_type) || 'UNKNOWN',
+    politeness: jsonObject(item.politeness),
+    profile: jsonObject(item.profile),
+    policyVersion: text(item.policy_version),
+    firstObservedAt: instant(item.first_observed_at),
+    lastObservedAt: instant(item.last_observed_at),
+    observedCount: Number(item.observed_count || 0),
+  };
+}
+
+/** Reads cached site profiles by identity. Misses are simply absent;
+ * unknown profiles fail open toward normal acquisition. Never throws for
+ * a missing table (pre-migration): callers treat that as a full miss. */
+export async function getSiteProfiles(identities: string[]): Promise<SiteProfileRow[]> {
+  const unique = Array.from(new Set((identities || []).filter(identity => typeof identity === 'string' && identity)));
+  if (!unique.length) return [];
+  const db = await getDb();
+  try {
+    const res = await db.query(`SELECT * FROM site_profiles WHERE site_identity = ANY($1)`, [unique]);
+    return (res.rows || []).map(rowToSiteProfile);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return [];
+    throw error;
+  }
+}
+
+/** Stores a profiler inventory run. Last-writer-wins on repeat profiles
+ * (fresher inventory replaces older); first-seen clock and count advance.
+ * Never carries creator attribution: profiles describe sites, not owners. */
+export async function upsertSiteProfile(row: {
+  siteIdentity: string; identityTier: string;
+  robotsState: string; robotsFetchedAt?: string | null;
+  sitemapInventory: Array<Record<string, unknown>>; feedInventory: Array<Record<string, unknown>>;
+  structuredData: Record<string, unknown>; pageType: string;
+  politeness: Record<string, unknown>; profile: Record<string, unknown>;
+  policyVersion: string;
+}): Promise<void> {
+  if (!row.siteIdentity) return;
+  const db = await getDb();
+  await db.query(`INSERT INTO site_profiles(site_identity,identity_tier,robots_state,robots_fetched_at,sitemap_inventory,feed_inventory,structured_data,page_type,politeness,profile,policy_version,first_observed_at,last_observed_at,observed_count)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now(),1)
+    ON CONFLICT(site_identity) DO UPDATE SET identity_tier=excluded.identity_tier,robots_state=excluded.robots_state,robots_fetched_at=excluded.robots_fetched_at,sitemap_inventory=excluded.sitemap_inventory,feed_inventory=excluded.feed_inventory,structured_data=excluded.structured_data,page_type=excluded.page_type,politeness=excluded.politeness,profile=excluded.profile,policy_version=excluded.policy_version,last_observed_at=now(),observed_count=site_profiles.observed_count+1`,
+    [row.siteIdentity, row.identityTier || '', row.robotsState || 'UNKNOWN', row.robotsFetchedAt || null, JSON.stringify(row.sitemapInventory || []), JSON.stringify(row.feedInventory || []), JSON.stringify(row.structuredData || {}), row.pageType || 'UNKNOWN', JSON.stringify(row.politeness || {}), JSON.stringify(row.profile || {}), row.policyVersion || '']);
+}
+
+export interface FrontierQueueRow {
+  siteIdentity: string;
+  urlKey: string;
+  url: string;
+  expectedValue: number;
+  politenessNotBefore: string | null;
+  attempts: number;
+  state: string;
+  nominatingSource: string;
+  sourceDetail: Record<string, unknown>;
+  weightVersion: string;
+  scorerInputs: Record<string, unknown>;
+  decisionLog: Array<Record<string, unknown>>;
+  firstObservedAt: string | null;
+  lastUpdatedAt: string | null;
+}
+
+/** Admits or refreshes one frontier queue entry. Working state (mutable
+ * lifecycle by design); every admission records its nominating source,
+ * scorer inputs, and weight version for replay. Pre-migration databases
+ * resolve quietly so callers fail open toward legacy crawling. */
+export async function upsertFrontierQueueItem(row: {
+  siteIdentity: string; urlKey: string; url: string; expectedValue: number;
+  politenessNotBefore?: string | null; nominatingSource: string;
+  sourceDetail?: Record<string, unknown>; weightVersion?: string;
+  scorerInputs?: Record<string, unknown>; decision?: Record<string, unknown>;
+}): Promise<void> {
+  if (!row.siteIdentity || !row.urlKey || !row.url) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO site_frontier(site_identity,url_key,url,expected_value,politeness_not_before,attempts,state,nominating_source,source_detail,weight_version,scorer_inputs,decision_log,first_observed_at,last_updated_at)
+      VALUES($1,$2,$3,$4,$5,0,'QUEUED',$6,$7,$8,$9,COALESCE($10,'[]'),now(),now())
+      ON CONFLICT(site_identity,url_key) DO UPDATE SET url=excluded.url,expected_value=excluded.expected_value,politeness_not_before=excluded.politeness_not_before,nominating_source=excluded.nominating_source,source_detail=excluded.source_detail,weight_version=excluded.weight_version,scorer_inputs=excluded.scorer_inputs,decision_log=site_frontier.decision_log||excluded.decision_log,last_updated_at=now()`,
+      [row.siteIdentity, row.urlKey, row.url, Number.isFinite(row.expectedValue) ? row.expectedValue : 0, row.politenessNotBefore || null, row.nominatingSource || '', JSON.stringify(row.sourceDetail || {}), row.weightVersion || '', JSON.stringify(row.scorerInputs || {}), JSON.stringify(row.decision ? [row.decision] : [])]);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
+
+/** Counts queued frontier entries for one site (cap enforcement input).
+ * Zero when unknown or pre-migration. */
+export async function countFrontierQueue(siteIdentity: string): Promise<number> {
+  if (!siteIdentity) return 0;
+  const db = await getDb();
+  try {
+    const res = await db.query(`SELECT count(*)::int n FROM site_frontier WHERE site_identity=$1 AND state='QUEUED'`, [siteIdentity]);
+    return Number(res.rows?.[0]?.n || 0);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
+    throw error;
+  }
+}
+
+/** Reads a site's queued frontier entries in priority order. Empty when
+ * unknown or pre-migration: callers fall back to legacy crawl order. */
+export async function getFrontierQueue(siteIdentity: string, limit = 50): Promise<FrontierQueueRow[]> {
+  if (!siteIdentity) return [];
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `SELECT * FROM site_frontier WHERE site_identity=$1 AND state='QUEUED' ORDER BY expected_value DESC, url_key ASC LIMIT $2`,
+      [siteIdentity, Math.min(500, Math.max(1, Math.trunc(limit) || 50))],
+    );
+    return (res.rows || []).map((item: Record<string, unknown>) => ({
+      siteIdentity: String(item.site_identity || ''),
+      urlKey: String(item.url_key || ''),
+      url: String(item.url || ''),
+      expectedValue: Number(item.expected_value || 0),
+      politenessNotBefore: item.politeness_not_before instanceof Date ? item.politeness_not_before.toISOString() : (typeof item.politeness_not_before === 'string' ? item.politeness_not_before : null),
+      attempts: Number(item.attempts || 0),
+      state: String(item.state || 'QUEUED'),
+      nominatingSource: String(item.nominating_source || ''),
+      sourceDetail: (item.source_detail && typeof item.source_detail === 'object' ? item.source_detail : {}) as Record<string, unknown>,
+      weightVersion: String(item.weight_version || ''),
+      scorerInputs: (item.scorer_inputs && typeof item.scorer_inputs === 'object' ? item.scorer_inputs : {}) as Record<string, unknown>,
+      decisionLog: (Array.isArray(item.decision_log) ? item.decision_log : []) as Array<Record<string, unknown>>,
+      firstObservedAt: item.first_observed_at instanceof Date ? item.first_observed_at.toISOString() : (typeof item.first_observed_at === 'string' ? item.first_observed_at : null),
+      lastUpdatedAt: item.last_updated_at instanceof Date ? item.last_updated_at.toISOString() : (typeof item.last_updated_at === 'string' ? item.last_updated_at : null),
+    }));
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return [];
+    throw error;
+  }
+}
+
+export interface PageCoverageRow {
+  siteIdentity: string;
+  pageKey: string;
+  pageUrl: string;
+  terminalState: string;
+  acquisitionMethod: string;
+  evidenceUnits: number;
+  policyVersion: string;
+  weightVersion: string;
+  observedAt: string | null;
+}
+
+/** Appends one per-page terminal-state record. Append-only: re-inspection
+ * adds a superseding row (latest timestamp wins); states are never rewritten
+ * in place. Best-effort at call sites like all observational writes. */
+export async function recordPageCoverage(row: {
+  siteIdentity: string; pageKey: string; pageUrl: string; terminalState: string;
+  acquisitionMethod: string; evidenceUnits: number;
+  policyVersion?: string; weightVersion?: string;
+}): Promise<void> {
+  if (!row.siteIdentity || !row.pageKey || !row.pageUrl) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO page_coverage(site_identity,page_key,page_url,terminal_state,acquisition_method,evidence_units,policy_version,weight_version,observed_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+      [row.siteIdentity, row.pageKey, row.pageUrl, row.terminalState || 'NOT_INSPECTED', row.acquisitionMethod || '', Math.max(0, Math.trunc(row.evidenceUnits) || 0), row.policyVersion || '', row.weightVersion || '']);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
+
+/** Accumulates one observed page outcome into a route's counters. Counters
+ * only — never a routing decision. Pre-migration databases resolve quietly. */
+export async function accumulateRouteStats(row: {
+  siteIdentity: string; routePattern: string; evidenceUnits: number; observedAt?: string | null;
+}): Promise<void> {
+  if (!row.siteIdentity || !row.routePattern) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO domain_route_stats(site_identity,route_pattern,attempts,evidence_hits,evidence_units,first_observed_at,last_observed_at)
+      VALUES($1,$2,1,$3,$4,COALESCE($5,now()),COALESCE($5,now()))
+      ON CONFLICT(site_identity,route_pattern) DO UPDATE SET attempts=domain_route_stats.attempts+1,evidence_hits=domain_route_stats.evidence_hits+EXCLUDED.evidence_hits,evidence_units=domain_route_stats.evidence_units+EXCLUDED.evidence_units,last_observed_at=GREATEST(domain_route_stats.last_observed_at,EXCLUDED.last_observed_at)`,
+      [row.siteIdentity, row.routePattern, Math.max(0, Math.trunc(row.evidenceUnits) || 0) > 0 ? 1 : 0, Math.max(0, Math.trunc(row.evidenceUnits) || 0), row.observedAt || null]);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
+
+/** Reads a site's route counters for offline batch learning. Empty when
+ * unknown or pre-migration. */
+export async function getRouteStats(siteIdentity: string): Promise<Array<{
+  siteIdentity: string; routePattern: string; attempts: number;
+  evidenceHits: number; evidenceUnits: number; lastObservedAt: string | null;
+}>> {
+  if (!siteIdentity) return [];
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `SELECT site_identity,route_pattern,attempts,evidence_hits,evidence_units,last_observed_at FROM domain_route_stats WHERE site_identity=$1 ORDER BY route_pattern`,
+      [siteIdentity],
+    );
+    return (res.rows || []).map((item: Record<string, unknown>) => ({
+      siteIdentity: String(item.site_identity || ''),
+      routePattern: String(item.route_pattern || ''),
+      attempts: Number(item.attempts || 0),
+      evidenceHits: Number(item.evidence_hits || 0),
+      evidenceUnits: Number(item.evidence_units || 0),
+      lastObservedAt: item.last_observed_at instanceof Date ? item.last_observed_at.toISOString() : (typeof item.last_observed_at === 'string' ? item.last_observed_at : null),
+    }));
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return [];
+    throw error;
+  }
+}
+
+/** Persists a learner snapshot. Always DRAFT on write: approval is a
+ * separate explicit human act (approveWeightSnapshot). Version-keyed
+ * idempotency makes retried batch runs converge without duplicates. */
+export async function recordWeightSnapshot(snapshot: {
+  version: string; siteIdentity: string; weights: Record<string, number>;
+  trainingWindow: Record<string, unknown>; metrics: Record<string, unknown>; codeVersion: string;
+}): Promise<void> {
+  if (!snapshot.version || !snapshot.siteIdentity) return;
+  const db = await getDb();
+  try {
+    await db.query(`INSERT INTO domain_weight_snapshots(version,site_identity,weights,training_window,metrics,code_version,status)
+      VALUES($1,$2,$3,$4,$5,$6,'DRAFT')
+      ON CONFLICT(version) DO NOTHING`,
+      [snapshot.version, snapshot.siteIdentity, JSON.stringify(snapshot.weights || {}), JSON.stringify(snapshot.trainingWindow || {}), JSON.stringify(snapshot.metrics || {}), snapshot.codeVersion || '']);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return;
+    throw error;
+  }
+}
+
+/** Human approval gate: marks one snapshot APPROVED with approver identity.
+ * The only path by which learner output becomes consumable. Rejected
+ * snapshots are left queryable; approval never deletes or rewrites. */
+export async function approveWeightSnapshot(version: string, approver: string): Promise<boolean> {
+  if (!version || !approver.trim()) return false;
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `UPDATE domain_weight_snapshots SET status='APPROVED',approved_by=$2,approved_at=now() WHERE version=$1 AND status='DRAFT'`,
+      [version, approver.trim()],
+    );
+    return (res.rowCount || 0) > 0;
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return false;
+    throw error;
+  }
+}
+
+/** Resolves the latest APPROVED weights for a site, or null. DRAFT snapshots
+ * are never consumable through this path regardless of recency. */
+export async function getApprovedWeights(siteIdentity: string): Promise<{
+  version: string; weights: Record<string, number>;
+} | null> {
+  if (!siteIdentity) return null;
+  const db = await getDb();
+  try {
+    const res = await db.query(
+      `SELECT version,weights FROM domain_weight_snapshots WHERE site_identity=$1 AND status='APPROVED' ORDER BY approved_at DESC NULLS LAST,created_at DESC LIMIT 1`,
+      [siteIdentity],
+    );
+    const row = res.rows?.[0] as Record<string, unknown> | undefined;
+    if (!row || typeof row.version !== 'string') return null;
+    return {
+      version: row.version,
+      weights: (row.weights && typeof row.weights === 'object' ? row.weights : {}) as Record<string, number>,
+    };
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return null;
+    throw error;
+  }
+}
 export async function performManualDatabaseBackup():Promise<{success:boolean;timestamp:string;backupPath:string}>{throw new Error('Manual SQL.js file backup is disabled after PostgreSQL migration. Use PostgreSQL/Railway backups or pg_dump.');}
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
