@@ -778,13 +778,16 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         if(!profile)continue;
         const inventories=profile.sitemapInventory as Array<{sourceUrl?:string;urls?:Array<{loc?:string}>}>;
         for(const inventory of inventories){
-          // Same-site gate (P1: Unchecked Sitemap Seed Destinations): an
-          // off-site sitemap file never contributes seeds to this site, even
-          // when its listed URLs happen to score positively. Stored profiles
-          // can carry robots-advertised off-site inventories, so this check
-          // runs at consumption time (not only at profile time).
-          const inventorySourceUrl=String(inventory.sourceUrl||seed.url);
-          if(!isSameSiteSitemapSeed(seed.url,inventorySourceUrl))continue;
+          // Candidate-level same-site gate only (P1: Unchecked Sitemap Seed
+          // Destinations). The inventory source itself is intentionally NOT
+          // required to share the seed's exact path-tenant identity: a
+          // conventional root sitemap (e.g. https://linktr.ee/sitemap.xml)
+          // routinely inventories tenant pages (e.g.
+          // https://linktr.ee/trader1/community) for a tenant seed (e.g.
+          // https://linktr.ee/trader1). Gating the source on exact identity
+          // would silently drop those valid pages. Off-site/private
+          // destinations are still rejected per URL below, so the crawler
+          // never requests an unintended destination.
           for(const candidate of selectSitemapSeedCandidates(
             (inventory.urls||[]).map(entry=>({loc:String(entry.loc||'')})),
             String(inventory.sourceUrl||seed.url),

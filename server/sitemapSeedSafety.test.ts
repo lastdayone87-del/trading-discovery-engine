@@ -78,9 +78,10 @@ test('off-site sitemap inventory is rejected even though its URLs score positive
     unscored.some(candidate => candidate.url === 'https://evil.example.net/community'),
     'scorer admits the off-site community URL by score (pre-fix behavior)',
   );
-  // The inspector gate rejects both the off-site inventory source and the
-  // off-site candidate, so no website seed is produced.
-  assert.equal(isSameSiteSitemapSeed(seedUrl, offSiteInventory.sourceUrl), false);
+  // The candidate-level gate rejects the off-site URL, so no website seed
+  // is produced. (The inventory source itself is intentionally not gated on
+  // exact identity — see path-tenant root-sitemap test below — the per-URL
+  // gate is the security boundary.)
   const gated = unscored.filter(candidate => isSameSiteSitemapSeed(seedUrl, candidate.url));
   assert.deepEqual(gated, [], 'off-site sitemap URLs never become seeds');
 });
@@ -104,16 +105,89 @@ test('same-site sitemap inventory still seeds through the gate (no over-blocking
   );
 });
 
-test('inspector sitemap seeding is same-site gated at consumption time', () => {
+test('inspector sitemap seeding is candidate-gated (no exact-identity source gate)', () => {
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
-  assert.match(
+  assert.doesNotMatch(
     source,
     /isSameSiteSitemapSeed\(seed\.url,\s*inventorySourceUrl\)/,
-    'off-site sitemap files never contribute seeds',
+    'root sitemaps must not require the exact path-tenant identity',
   );
   assert.match(
     source,
     /isSameSiteSitemapSeed\(seed\.url,\s*candidate\.url\)/,
     'off-site sitemap URLs never become website seeds',
+  );
+});
+
+/**
+ * Inspector-equivalent gating (mirrors server/inspector.ts): scorer +
+ * candidate-level same-site gate only. The inventory source is provenance,
+ * never a seed-identity requirement, so conventional root sitemaps keep
+ * working for path-tenant seeds.
+ */
+function gatedSeedsFor(
+  seedUrl: string,
+  inventories: Array<{ sourceUrl: string; urls: Array<{ loc: string }> }>,
+): string[] {
+  const out: string[] = [];
+  for (const inventory of inventories) {
+    for (const candidate of selectSitemapSeedCandidates(
+      inventory.urls,
+      inventory.sourceUrl,
+      MAX_LADDER_SITEMAP_SEEDS,
+    )) {
+      if (!isSameSiteSitemapSeed(seedUrl, candidate.url)) continue;
+      if (!out.includes(candidate.url)) out.push(candidate.url);
+    }
+  }
+  return out;
+}
+
+test('path-tenant root sitemap with valid tenant URL is accepted', () => {
+  const seeds = gatedSeedsFor('https://linktr.ee/trader1', [
+    {
+      sourceUrl: 'https://linktr.ee/sitemap.xml',
+      urls: [{ loc: 'https://linktr.ee/trader1/community' }],
+    },
+  ]);
+  assert.ok(
+    seeds.includes('https://linktr.ee/trader1/community'),
+    'root sitemap may inventory its tenant pages',
+  );
+});
+
+test('path-tenant sitemap listing another tenant URL is rejected', () => {
+  const seeds = gatedSeedsFor('https://linktr.ee/trader1', [
+    {
+      sourceUrl: 'https://linktr.ee/sitemap.xml',
+      urls: [{ loc: 'https://linktr.ee/trader2/join' }],
+    },
+  ]);
+  assert.deepEqual(seeds, [], 'another tenant never becomes this tenant seed');
+});
+
+test('genuinely off-site sitemap inventory is rejected', () => {
+  const seeds = gatedSeedsFor('https://creator.example/', [
+    {
+      sourceUrl: 'https://evil.example.net/sitemap.xml',
+      urls: [{ loc: 'https://evil.example.net/community' }],
+    },
+  ]);
+  assert.deepEqual(seeds, [], 'off-site inventory supplies no seeds');
+});
+
+test('Tier B/C tenant isolation is preserved under candidate gating', () => {
+  assert.deepEqual(
+    gatedSeedsFor('https://foo.skool.com/', [
+      { sourceUrl: 'https://skool.com/sitemap.xml', urls: [{ loc: 'https://bar.skool.com/community' }] },
+    ]),
+    [],
+    'Tier B cross-tenant rejected',
+  );
+  assert.ok(
+    gatedSeedsFor('https://foo.skool.com/', [
+      { sourceUrl: 'https://foo.skool.com/sitemap.xml', urls: [{ loc: 'https://foo.skool.com/community' }] },
+    ]).includes('https://foo.skool.com/community'),
+    'Tier B same-tenant accepted',
   );
 });
