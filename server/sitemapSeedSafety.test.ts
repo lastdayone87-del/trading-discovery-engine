@@ -7,6 +7,7 @@ import {
   selectSitemapSeedCandidates,
   MAX_LADDER_SITEMAP_SEEDS,
 } from './acquisitionLadder';
+import { canonicalSiteIdentity } from './siteIdentity';
 
 /**
  * P1 regression: Unchecked Sitemap Seed Destinations (inspector.ts ~787).
@@ -117,6 +118,16 @@ test('inspector sitemap seeding filters before the cap (no exact-identity source
     source,
     /selectSameSiteSitemapSeedCandidates\(\s*seed\.url/,
     'same-site filtering must happen inside the capped selector (filter-before-cap)',
+  );
+  assert.match(
+    source,
+    /processedSitemapIdentities/,
+    'same identity inventories must not be rescanned per seed',
+  );
+  assert.match(
+    source,
+    /selectSameSiteSitemapSeedCandidates\(\s*seed\.url,[\s\S]*?identity,?/,
+    'existing canonical seed identities must be reused (no per-URL seed re-resolution)',
   );
 });
 
@@ -231,4 +242,121 @@ test('Tier B/C tenant isolation is preserved under candidate gating', () => {
     ]).includes('https://foo.skool.com/community'),
     'Tier B same-tenant accepted',
   );
+});
+
+test('cached seed identity reuse does not change selected seeds (P2 optimization)', () => {
+  const cases: Array<{ seedUrl: string; inventories: Array<{ sourceUrl: string; urls: Array<{ loc: string }> }> }> = [
+    {
+      seedUrl: 'https://linktr.ee/trader1',
+      inventories: [
+        {
+          sourceUrl: 'https://linktr.ee/sitemap.xml',
+          urls: [
+            ...[2, 3, 4, 5, 6].map(n => ({ loc: `https://linktr.ee/trader${n}/discord-community-join` })),
+            { loc: 'https://linktr.ee/trader1/community' },
+          ],
+        },
+      ],
+    },
+    {
+      seedUrl: 'https://creator.example/',
+      inventories: [
+        {
+          sourceUrl: 'https://evil.example.net/sitemap.xml',
+          urls: [{ loc: 'https://evil.example.net/community' }],
+        },
+      ],
+    },
+    {
+      seedUrl: 'https://foo.skool.com/',
+      inventories: [
+        {
+          sourceUrl: 'https://skool.com/sitemap.xml',
+          urls: [{ loc: 'https://bar.skool.com/community' }, { loc: 'https://foo.skool.com/community' }],
+        },
+      ],
+    },
+    {
+      seedUrl: 'https://creator.example/',
+      inventories: [
+        {
+          sourceUrl: 'https://creator.example/sitemap.xml',
+          urls: [{ loc: 'https://creator.example/community' }, { loc: 'http://192.168.1.1/community' }],
+        },
+      ],
+    },
+  ];
+  for (const { seedUrl, inventories } of cases) {
+    const identity = canonicalSiteIdentity(seedUrl)?.siteIdentity ?? null;
+    for (const inventory of inventories) {
+      const fresh = selectSameSiteSitemapSeedCandidates(seedUrl, inventory.urls, inventory.sourceUrl);
+      const reused = selectSameSiteSitemapSeedCandidates(
+        seedUrl,
+        inventory.urls,
+        inventory.sourceUrl,
+        MAX_LADDER_SITEMAP_SEEDS,
+        identity,
+      );
+      assert.deepEqual(
+        reused,
+        fresh,
+        `cached identity selects identical seeds for ${seedUrl} (${inventory.sourceUrl})`,
+      );
+    }
+  }
+  assert.deepEqual(
+    selectSameSiteSitemapSeedCandidates(
+      'https://creator.example/',
+      [{ loc: 'https://creator.example/community' }],
+      'https://creator.example/sitemap.xml',
+      MAX_LADDER_SITEMAP_SEEDS,
+      null,
+    ),
+    [],
+    'empty cached identity fails closed to no seeds',
+  );
+});
+
+test('same-identity inventories scanned once select identical seeds (P2 dedup)', () => {
+  const seedA = 'https://creator.example/a';
+  const seedB = 'https://creator.example/b';
+  const inventories = [
+    {
+      sourceUrl: 'https://creator.example/sitemap.xml',
+      urls: [{ loc: 'https://creator.example/community' }, { loc: 'https://evil.example.net/community' }],
+    },
+  ];
+  // Naive per-seed scans (pre-P2 behavior): each seed scans the shared
+  // inventory independently, then results merge with global dedupe.
+  const naive: string[] = [];
+  for (const seedUrl of [seedA, seedB]) {
+    for (const inventory of inventories) {
+      for (const candidate of selectSameSiteSitemapSeedCandidates(seedUrl, inventory.urls, inventory.sourceUrl)) {
+        if (!naive.includes(candidate.url)) naive.push(candidate.url);
+      }
+    }
+  }
+  // Optimized single-identity scan (inspector processedSitemapIdentities):
+  // the shared identity's inventory is scanned once.
+  const seenIdentities = new Set<string>();
+  const optimized: string[] = [];
+  for (const seedUrl of [seedA, seedB]) {
+    const identity = canonicalSiteIdentity(seedUrl)?.siteIdentity;
+    if (!identity || seenIdentities.has(identity)) continue;
+    seenIdentities.add(identity);
+    for (const inventory of inventories) {
+      for (const candidate of selectSameSiteSitemapSeedCandidates(
+        seedUrl,
+        inventory.urls,
+        inventory.sourceUrl,
+        MAX_LADDER_SITEMAP_SEEDS,
+        identity,
+      )) {
+        if (!optimized.includes(candidate.url)) optimized.push(candidate.url);
+      }
+    }
+  }
+  assert.deepEqual(optimized, naive, 'dedup preserves the valid seed set');
+  assert.deepEqual(optimized, ['https://creator.example/community'], 'valid same-site seed kept, off-site dropped');
+  assert.equal(seenIdentities.size, 1, 'shared identity scanned once, not per seed');
 });

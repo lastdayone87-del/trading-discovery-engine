@@ -169,18 +169,38 @@ export function isSameSiteSitemapSeed(seedUrl: string, candidateUrl: string): bo
  * and capped identically to selectSitemapSeedCandidates. Security boundary
  * preserved: off-site, cross-tenant (Tier B/C), and private-literal
  * candidates never survive the pre-filter.
+ *
+ * Performance: the seed identity is resolved once per call (not once per
+ * URL). Callers that already hold the canonical site identity for the seed
+ * (e.g. inspector's seedIdentities map) may pass it as cachedSeedIdentity
+ * to avoid recomputing it; when omitted it is derived from seedUrl. An
+ * empty cached identity fails closed to no seeds, exactly like an
+ * unidentifiable seedUrl. Candidate checks remain per-URL identity
+ * comparisons — never weakened.
  */
 export function selectSameSiteSitemapSeedCandidates(
   seedUrl: string,
   sitemapUrls: Array<{ loc: string }>,
   sitemapSourceUrl: string,
   cap: number = MAX_LADDER_SITEMAP_SEEDS,
+  cachedSeedIdentity?: string | null,
 ): SitemapSeedCandidate[] {
+  let seedIdentity: string | null;
+  if (cachedSeedIdentity !== undefined) {
+    seedIdentity = cachedSeedIdentity || null;
+  } else {
+    try {
+      seedIdentity = canonicalSiteIdentity(seedUrl)?.siteIdentity ?? null;
+    } catch {
+      seedIdentity = null;
+    }
+  }
+  if (!seedIdentity) return [];
   const filtered = (sitemapUrls || []).filter(entry => {
     try {
       const loc = String((entry as { loc?: unknown })?.loc || '');
       if (!loc) return false;
-      return isSameSiteSitemapSeed(seedUrl, loc);
+      return canonicalSiteIdentity(loc)?.siteIdentity === seedIdentity;
     } catch {
       return false;
     }

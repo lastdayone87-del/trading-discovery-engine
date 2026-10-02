@@ -772,10 +772,19 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
       }catch{/* lazy profiling never breaks seed selection */}
       const profileByIdentity=new Map(profiles.map(profile=>[profile.siteIdentity,profile]));
       const sitemapSeeds:typeof websiteUrls=[];
+      // Performance (P2: Repeated Sitemap Identity Lookups): seeds sharing
+      // one canonical site identity share one profile/inventory, and the
+      // same-site filter depends only on that identity — so each distinct
+      // identity's inventories are scanned once. Skipping repeats is
+      // behavior-preserving: a repeat scan would score the same filtered
+      // survivors and only find duplicates already in sitemapSeeds.
+      const processedSitemapIdentities=new Set<string>();
       for(const seed of websiteUrls){
         const identity=seedIdentities.get(seed.url);
         const profile=identity?profileByIdentity.get(identity):undefined;
-        if(!profile)continue;
+        if(!profile||!identity)continue;
+        if(processedSitemapIdentities.has(identity))continue;
+        processedSitemapIdentities.add(identity);
         const inventories=profile.sitemapInventory as Array<{sourceUrl?:string;urls?:Array<{loc?:string}>}>;
         for(const inventory of inventories){
           // Candidate-level same-site gate with filter-before-cap ordering
@@ -788,12 +797,14 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
           // happens INSIDE the selector before the 5-seed cap, so valid
           // tenant URLs are never crowded out by higher-scoring other-tenant
           // or off-site URLs. Off-site/private destinations never survive
-          // the pre-filter, so the crawler never requests them.
+          // the pre-filter, so the crawler never requests them. The cached
+          // identity reuses seedIdentities (no per-URL seed re-resolution).
           for(const candidate of selectSameSiteSitemapSeedCandidates(
             seed.url,
             (inventory.urls||[]).map(entry=>({loc:String(entry.loc||'')})),
             String(inventory.sourceUrl||seed.url),
             MAX_LADDER_SITEMAP_SEEDS,
+            identity,
           )){
             if(websiteUrls.some(existing=>existing.url===candidate.url)||sitemapSeeds.some(existing=>existing.url===candidate.url))continue;
             sitemapSeeds.push({url:candidate.url,kind:'WEBSITE',contextMatches:false,source:'SITEMAP_DISCOVERY',sitemapUrl:candidate.sitemapUrl});
