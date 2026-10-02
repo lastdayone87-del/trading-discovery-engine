@@ -6,11 +6,22 @@ import assert from 'node:assert/strict';
 // never converts a successful retrieval into a provider failure.
 import {
   executeInnertubeRetrievalPage,
+  fetchChannelVideoDescriptionsViaInnertube,
   resetInnertubeCooldownForTests,
   resetInnertubePacingForTests,
   setInnertubeEmitSinkForTests,
   setInnertubeSessionFactoryForTests,
 } from './youtubeInnertubeProvider';
+
+/** provider_call_events.id is UUID PRIMARY KEY: PostgreSQL rejects anything
+ * else with "invalid input syntax for type uuid". */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function assertPersistableUuid(id: unknown): void {
+  assert.equal(typeof id, 'string', 'telemetry id must be a string');
+  assert.match(String(id), UUID_RE, `telemetry id must be a valid UUID for provider_call_events.id, got: ${String(id).slice(0, 120)}`);
+  assert.ok(!String(id).includes('adhoc:'), 'semantic request identity must not leak into the UUID primary key');
+}
 
 const UC = 'UCabcdefghijklmnopqrstuv';
 
@@ -162,6 +173,77 @@ test('continuation pages are attributed per page number', async () => {
     assert.equal(emitted[0].requestMetadata.innertubePage, '1');
     assert.equal(emitted[1].requestMetadata.innertubePage, '2');
     assert.ok(emitted.every(item => item.runId === 'run-telemetry-1' && item.status === 'SUCCESS'));
+  } finally {
+    teardown();
+  }
+});
+
+test('retrieval telemetry uses a UUID primary key and preserves semantic attribution', async () => {
+  setup();
+  const emitted = trackEmitted();
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => ({ channels: [{ author: { id: UC, name: 'Desk' } }], has_continuation: false }),
+  }));
+  try {
+    await executeInnertubeRetrievalPage(baseRequest());
+    assert.equal(emitted.length, 1);
+    const event = emitted[0];
+    assertPersistableUuid(event.id);
+    // Semantic attribution stays in its existing fields — never in the UUID.
+    assert.equal(event.requestId, 'run-telemetry-1:youtube-innertube:channel:p1');
+    assert.equal(event.runId, 'run-telemetry-1');
+    assert.equal(event.jobId, 'job-1');
+    assert.equal(event.provider, 'youtube-innertube');
+    assert.equal(event.operation, 'search');
+    assert.equal(event.requestMetadata.innertubePage, '1');
+    assert.equal(event.requestMetadata.innertubeLane, 'CHANNEL');
+  } finally {
+    teardown();
+  }
+});
+
+test('retrieval failure telemetry uses a UUID primary key', async () => {
+  setup();
+  const emitted = trackEmitted();
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => {
+      throw new Error('fetch failed: network down');
+    },
+  }));
+  try {
+    await assert.rejects(executeInnertubeRetrievalPage(baseRequest()));
+    assert.equal(emitted.length, 1);
+    assertPersistableUuid(emitted[0].id);
+    assert.equal(emitted[0].requestId, 'run-telemetry-1:youtube-innertube:channel:p1');
+    assert.equal(emitted[0].runId, 'run-telemetry-1');
+  } finally {
+    teardown();
+  }
+});
+
+test('channel-descriptions telemetry uses a UUID primary key and preserves channel attribution', async () => {
+  setup();
+  const emitted = trackEmitted();
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => {
+      throw new Error('unused');
+    },
+    getChannel: async () => ({
+      getVideos: async () => ({ videos: [{ content_id: 'vid1' }] }),
+    }),
+    getBasicInfo: async () => ({ basic_info: { short_description: 'A real description' } }),
+  }));
+  try {
+    const result = await fetchChannelVideoDescriptionsViaInnertube(UC, { maxVideos: 5, jobId: 'job-desc-1' });
+    assert.equal(result.items.length, 1);
+    assert.equal(emitted.length, 1);
+    const event = emitted[0];
+    assertPersistableUuid(event.id);
+    assert.equal(event.provider, 'youtube-innertube');
+    assert.equal(event.operation, 'channel-video-descriptions');
+    assert.equal(event.requestId, `adhoc:youtube-innertube:channel-descriptions:${UC}`);
+    assert.equal(event.jobId, 'job-desc-1');
+    assert.equal(event.requestMetadata.channelId, UC);
   } finally {
     teardown();
   }

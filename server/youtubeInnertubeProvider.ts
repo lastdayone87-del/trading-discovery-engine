@@ -26,6 +26,7 @@
  * failure. A missing required continuation fails the page — the previous
  * page is never returned as fresh successful data.
  */
+import { randomUUID } from 'node:crypto';
 import { Innertube } from 'youtubei.js';
 import { appendProviderCallEvent } from './db';
 import {
@@ -556,10 +557,14 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
   const actualOrdering = 'RELEVANCE';
   const pageNumber = parseInnertubeCursor(request.cursor);
   const started = Date.now();
+  // Telemetry identity: provider_call_events.id is UUID PRIMARY KEY, so it
+  // must always be a valid UUID. The semantic request attribution lives in
+  // requestId/runId/jobId/metadata — never in the UUID primary key.
   const base = {
-    id: `${request.queryRunId || 'adhoc'}:youtube-innertube:${lane.toLowerCase()}:p${pageNumber}:${Date.now()}`,
+    id: randomUUID(),
     provider: 'youtube-innertube',
     operation: 'search',
+    requestId: `${request.queryRunId || 'adhoc'}:youtube-innertube:${lane.toLowerCase()}:p${pageNumber}`,
     runId: request.queryRunId,
     jobId: request.jobId,
     requestMetadata: {
@@ -717,10 +722,13 @@ export async function fetchChannelVideoDescriptionsViaInnertube(
     );
   }
   const started = Date.now();
+  // Same UUID contract as retrieval pages above: id is always a valid UUID;
+  // the semantic channel attribution lives in requestId + requestMetadata.
   const base = {
-    id: `adhoc:youtube-innertube:channel-descriptions:${channelId}:${Date.now()}`,
+    id: randomUUID(),
     provider: 'youtube-innertube',
     operation: 'channel-video-descriptions',
+    requestId: `adhoc:youtube-innertube:channel-descriptions:${channelId}`,
     runId: undefined,
     jobId: opts.jobId,
     requestMetadata: { channelId },
