@@ -10,7 +10,7 @@ import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
-import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
+import { isAcquisitionLadderEnabled, isSameSiteSitemapSeed, resolveRenderEscalation, selectSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
 import { extractHeadDiscovery, isSiteProfilerEnabled, runSiteProfiler } from './siteProfiler';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, createDropCounter, type CrawlerTelemetry, type CeilingKind} from './crawlerTelemetry';
@@ -778,11 +778,22 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         if(!profile)continue;
         const inventories=profile.sitemapInventory as Array<{sourceUrl?:string;urls?:Array<{loc?:string}>}>;
         for(const inventory of inventories){
+          // Same-site gate (P1: Unchecked Sitemap Seed Destinations): an
+          // off-site sitemap file never contributes seeds to this site, even
+          // when its listed URLs happen to score positively. Stored profiles
+          // can carry robots-advertised off-site inventories, so this check
+          // runs at consumption time (not only at profile time).
+          const inventorySourceUrl=String(inventory.sourceUrl||seed.url);
+          if(!isSameSiteSitemapSeed(seed.url,inventorySourceUrl))continue;
           for(const candidate of selectSitemapSeedCandidates(
             (inventory.urls||[]).map(entry=>({loc:String(entry.loc||'')})),
             String(inventory.sourceUrl||seed.url),
             MAX_LADDER_SITEMAP_SEEDS,
           )){
+            // Same-site gate per URL: off-site, private-literal (IP/dotless
+            // have no site identity), or otherwise unidentifiable candidates
+            // fail closed and are never requested as website seeds.
+            if(!isSameSiteSitemapSeed(seed.url,candidate.url))continue;
             if(websiteUrls.some(existing=>existing.url===candidate.url)||sitemapSeeds.some(existing=>existing.url===candidate.url))continue;
             sitemapSeeds.push({url:candidate.url,kind:'WEBSITE',contextMatches:false,source:'SITEMAP_DISCOVERY',sitemapUrl:candidate.sitemapUrl});
           }

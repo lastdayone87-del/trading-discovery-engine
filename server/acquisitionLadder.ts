@@ -18,6 +18,7 @@
 import { shouldEscalateToRenderedFallback } from './browserCommunityFallback';
 import { getAppSetting } from './dbCore';
 import { communityNavigationScore } from './inspector';
+import { canonicalSiteIdentity } from './siteIdentity';
 import type { HeadDiscovery } from './siteProfiler';
 
 export const ACQUISITION_LADDER_POLICY_VERSION = 'acquisition-ladder-v1';
@@ -107,7 +108,11 @@ export interface SitemapSeedCandidate {
 /** Select sitemap-inventoried URLs as seed nominations: scored by the same
  * community-navigation scorer as observed links, deduped, capped. Seeds
  * carry their nominating sitemap for provenance; ranking and budgets
- * downstream treat them identically to observed seeds. */
+ * downstream treat them identically to observed seeds.
+ *
+ * Same-site enforcement lives with the caller (inspector's seed loop via
+ * isSameSiteSitemapSeed): this selector stays a pure scorer so its
+ * scoring/dedupe/cap contract is unchanged. */
 export function selectSitemapSeedCandidates(
   sitemapUrls: Array<{ loc: string }>,
   sitemapSourceUrl: string,
@@ -132,6 +137,28 @@ export function selectSitemapSeedCandidates(
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, Math.max(0, Math.trunc(cap)));
+}
+
+/**
+ * Same-site gate for P-B sitemap seeds (P1: Unchecked Sitemap Seed
+ * Destinations). Sitemap inventories are site-advertised (robots + sitemap
+ * files), so a stored profile can carry an off-site inventory whose
+ * positively-scored URLs must never become website seeds for another site.
+ * A candidate is admissible only when its canonical site identity equals
+ * the seed's identity; unidentifiable URLs (dotless, IP literals, unknown
+ * suffix, unparsable) fail closed and are dropped. Pure and deterministic
+ * (no DNS/fetch) so flag-off behavior is byte-identical and the hot path
+ * stays deterministic.
+ */
+export function isSameSiteSitemapSeed(seedUrl: string, candidateUrl: string): boolean {
+  try {
+    const seedIdentity = canonicalSiteIdentity(seedUrl)?.siteIdentity;
+    if (!seedIdentity) return false;
+    const candidateIdentity = canonicalSiteIdentity(candidateUrl)?.siteIdentity;
+    return candidateIdentity === seedIdentity;
+  } catch {
+    return false;
+  }
 }
 
 export interface StructuredNavigationCandidate {
