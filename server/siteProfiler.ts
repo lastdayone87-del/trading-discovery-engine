@@ -604,6 +604,40 @@ export const MAX_PROFILER_REDIRECT_HOPS = 5;
 
 const PROFILER_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+/** Best-effort release of a redirect response body the profiler will not
+ * read (rejections, hop-exhausted terminals). Prevents connection and
+ * memory pressure from accumulating across rejected hops. */
+async function cancelRedirectBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Best effort; already-consumed or locked bodies need no release.
+  }
+}
+
+/** Destination guard bounded by the fetch's remaining time budget. A slow
+ * or stalled DNS lookup must never outlive the profiler timeout that
+ * bounds the fetch itself: on budget exhaustion the destination is
+ * unknown, which fails closed (false), exactly like resolution failure. */
+async function guardRedirectWithBudget(
+  nextUrl: string,
+  resolveHost: DnsResolver,
+  remainingMs: number,
+): Promise<boolean> {
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const budget = new Promise<false>(resolve => {
+      timer = setTimeout(() => resolve(false), remainingMs);
+    });
+    return await Promise.race([isPublicInternetUrl(nextUrl, resolveHost), budget]);
+  } catch {
+    return false;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function readBoundedBody(response: Response, maxChars: number): Promise<{
   contentType: string;
   text: string;
@@ -658,6 +692,7 @@ export async function fetchProfilerUrl(
 ): Promise<ProfilerFetch | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
   try {
     const redirectsFollowed: string[] = [];
     const visited = new Set<string>();
@@ -687,6 +722,7 @@ export async function fetchProfilerUrl(
       try {
         nextUrl = new URL(location, currentUrl).toString();
       } catch {
+        await cancelRedirectBody(response);
         return {
           status: response.status,
           contentType: response.headers.get('content-type') || '',
@@ -711,11 +747,14 @@ export async function fetchProfilerUrl(
       }
       let allowed = false;
       try {
-        allowed = await isPublicInternetUrl(nextUrl, resolveHost);
+        // Bounded by the fetch's remaining budget: a stalled DNS lookup
+        // fails closed instead of delaying inspection past the timeout.
+        allowed = await guardRedirectWithBudget(nextUrl, resolveHost, startedAt + timeoutMs - Date.now());
       } catch {
         allowed = false;
       }
       if (!allowed) {
+        await cancelRedirectBody(response);
         return {
           status: response.status,
           contentType: response.headers.get('content-type') || '',
@@ -730,6 +769,7 @@ export async function fetchProfilerUrl(
       if (redirectsFollowed.length >= MAX_PROFILER_REDIRECT_HOPS) {
         // Hop budget exhausted on an otherwise-allowed chain: stop at the
         // last safe URL. The non-2xx status keeps this a skip, never evidence.
+        await cancelRedirectBody(response);
         return {
           status: response.status,
           contentType: response.headers.get('content-type') || '',

@@ -745,3 +745,50 @@ test('feed redirect to private destination is skipped within attempt budget', as
   const feedFetches = requested.filter(url => url === 'https://public.example/feed').length;
   assert.ok(feedFetches <= cap + 1, `feed attempt budget holds, got ${feedFetches}`);
 });
+
+test('stalled redirect DNS fails closed within the fetch budget', async () => {
+  const requested: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    requested.push(target);
+    if (target === 'https://public.example/feed') {
+      return new Response('', { status: 302, headers: { location: 'https://slow.example/next' } });
+    }
+    return new Response('must never arrive', { status: 200, headers: { 'content-type': 'text/html' } });
+  }) as typeof fetch;
+  // Resolver stalls far beyond the fetch budget; the guard must fail
+  // closed on budget instead of delaying inspection.
+  const resolveHost = async (): Promise<string[]> => {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    return ['93.184.216.1'];
+  };
+  const startedAt = Date.now();
+  const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 60, resolveHost);
+  const elapsed = Date.now() - startedAt;
+  assert.equal(fetched!.redirectRejected, true, 'unknown (budget-exhausted) destination fails closed');
+  assert.ok(!requested.some(url => url.includes('slow.example')), 'unvalidated destination never contacted');
+  assert.ok(elapsed < 2000, `bounded by budget, took ${elapsed}ms`);
+});
+
+test('rejected redirect responses release their bodies', async () => {
+  let cancelled = 0;
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    if (target === 'https://public.example/feed') {
+      const response = new Response('redirect body', { status: 302, headers: { location: 'http://127.0.0.1/x' } });
+      const stream = response.body!;
+      const original = stream.cancel.bind(stream);
+      stream.cancel = () => {
+        cancelled += 1;
+        return original();
+      };
+      return response;
+    }
+    return new Response('missing', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const fetched = await fetchProfilerUrl(
+    'https://public.example/feed', fetchImpl, 1000, 10_000, async () => ['93.184.216.1'],
+  );
+  assert.equal(fetched!.redirectRejected, true);
+  assert.equal(cancelled, 1, 'rejected redirect body released, not left open');
+});
