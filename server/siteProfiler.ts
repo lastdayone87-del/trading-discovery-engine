@@ -585,58 +585,168 @@ export interface ProfilerFetch {
   text: string;
   truncated: boolean;
   finalUrl: string;
+  /** URLs requested in order, including the initial URL. Preserves redirect
+   * provenance now that the profiler follows redirects itself. */
+  redirectsFollowed: string[];
+  /** True when a redirect destination was refused before any request touched
+   * it (non-public, malformed, or unresolvable). A typed, observable
+   * inspection limitation — callers treat the non-2xx status as a skip,
+   * never as NOT_FOUND or negative evidence. */
+  redirectRejected: boolean;
+  /** The refused destination, present only when redirectRejected. */
+  rejectedRedirect?: string;
+}
+
+/** Maximum redirect hops per profiler fetch. Conservative: discovery
+ * inventories never need deep chains; the cap bounds time, DNS lookups, and
+ * connection use per inventory request. */
+export const MAX_PROFILER_REDIRECT_HOPS = 5;
+
+const PROFILER_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+async function readBoundedBody(response: Response, maxChars: number): Promise<{
+  contentType: string;
+  text: string;
+  truncated: boolean;
+}> {
+  const contentType = response.headers.get('content-type') || '';
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const text = await response.text();
+    return {
+      contentType,
+      text: text.slice(0, maxChars),
+      truncated: text.length > maxChars,
+    };
+  }
+  const decoder = new TextDecoder();
+  let text = '';
+  let truncated = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    if (text.length > maxChars) {
+      truncated = true;
+      text = text.slice(0, maxChars);
+      try {
+        await reader.cancel();
+      } catch {
+        // Best effort; the prefix is already retained.
+      }
+      break;
+    }
+  }
+  text += decoder.decode();
+  return { contentType, text, truncated };
 }
 
 /** Bounded fetch shared by profiler inventory steps: timeout, byte budget,
- * and redirect following match the repository's static-acquisition
- * conventions. Returns null on transport failure (recorded as unreachable
+ * and destination-safe redirect handling. Redirects are followed MANUALLY
+ * (never `follow`): each Location is resolved against the current URL and
+ * validated with the public-destination guard BEFORE any request touches
+ * it, so a compromised site cannot aim server-side fetches at private
+ * services via a redirect. Hops are capped; rejection is typed and
+ * observable. Returns null on transport failure (recorded as unreachable
  * by the caller, never as evidence). */
 export async function fetchProfilerUrl(
   url: string,
   fetchImpl: typeof fetch,
   maxChars: number,
   timeoutMs: number = PROFILER_FETCH_TIMEOUT_MS,
+  resolveHost: DnsResolver = defaultDnsResolve,
 ): Promise<ProfilerFetch | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchImpl(url, {
-      signal: controller.signal,
-      headers: profilerFetchHeaders(),
-      redirect: 'follow',
-    });
-    const contentType = response.headers.get('content-type') || '';
-    const reader = response.body?.getReader();
-    if (!reader) {
-      const text = await response.text();
-      return {
-        status: response.status,
-        contentType,
-        text: text.slice(0, maxChars),
-        truncated: text.length > maxChars,
-        finalUrl: response.url || url,
-      };
-    }
-    const decoder = new TextDecoder();
-    let text = '';
-    let truncated = false;
+    const redirectsFollowed: string[] = [];
+    const visited = new Set<string>();
+    let currentUrl = url;
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      text += decoder.decode(value, { stream: true });
-      if (text.length > maxChars) {
-        truncated = true;
-        text = text.slice(0, maxChars);
-        try {
-          await reader.cancel();
-        } catch {
-          // Best effort; the prefix is already retained.
-        }
-        break;
+      redirectsFollowed.push(currentUrl);
+      visited.add(currentUrl);
+      const response = await fetchImpl(currentUrl, {
+        signal: controller.signal,
+        headers: profilerFetchHeaders(),
+        redirect: 'manual',
+      });
+      const location = response.headers.get('location');
+      if (!PROFILER_REDIRECT_STATUSES.has(response.status) || !location) {
+        const body = await readBoundedBody(response, maxChars);
+        return {
+          status: response.status,
+          ...body,
+          finalUrl: response.url || currentUrl,
+          redirectsFollowed,
+          redirectRejected: false,
+        };
       }
+      // Redirect hop: resolve, then validate BEFORE contact. Non-public,
+      // malformed, or unresolvable destinations are rejected here.
+      let nextUrl: string;
+      try {
+        nextUrl = new URL(location, currentUrl).toString();
+      } catch {
+        return {
+          status: response.status,
+          contentType: response.headers.get('content-type') || '',
+          text: '',
+          truncated: false,
+          finalUrl: response.url || currentUrl,
+          redirectsFollowed,
+          redirectRejected: true,
+          rejectedRedirect: location,
+        };
+      }
+      if (visited.has(nextUrl)) {
+        // Loop: stop at the last safe URL instead of burning the hop budget.
+        const body = await readBoundedBody(response, maxChars);
+        return {
+          status: response.status,
+          ...body,
+          finalUrl: response.url || currentUrl,
+          redirectsFollowed,
+          redirectRejected: false,
+        };
+      }
+      let allowed = false;
+      try {
+        allowed = await isPublicInternetUrl(nextUrl, resolveHost);
+      } catch {
+        allowed = false;
+      }
+      if (!allowed) {
+        return {
+          status: response.status,
+          contentType: response.headers.get('content-type') || '',
+          text: '',
+          truncated: false,
+          finalUrl: response.url || currentUrl,
+          redirectsFollowed,
+          redirectRejected: true,
+          rejectedRedirect: nextUrl,
+        };
+      }
+      if (redirectsFollowed.length >= MAX_PROFILER_REDIRECT_HOPS) {
+        // Hop budget exhausted on an otherwise-allowed chain: stop at the
+        // last safe URL. The non-2xx status keeps this a skip, never evidence.
+        return {
+          status: response.status,
+          contentType: response.headers.get('content-type') || '',
+          text: '',
+          truncated: false,
+          finalUrl: response.url || currentUrl,
+          redirectsFollowed,
+          redirectRejected: false,
+        };
+      }
+      try {
+        await response.body?.cancel();
+      } catch {
+        // Best effort; the redirect body is never inventory.
+      }
+      currentUrl = nextUrl;
     }
-    text += decoder.decode();
-    return { status: response.status, contentType, text, truncated, finalUrl: response.url || url };
   } catch {
     return null;
   } finally {
@@ -778,7 +888,7 @@ export async function runSiteProfiler(
   let parsedRobots: ParsedRobots = { groups: [], sitemaps: [], malformed: false };
   let robotsEvaluation: RobotsEvaluation = { allowed: null, crawlDelaySeconds: null, matchedRule: null };
   if (robotsUrl) {
-    const fetched = await fetchProfilerUrl(robotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES);
+    const fetched = await fetchProfilerUrl(robotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
     stamp('robots', robotsUrl, 'profiler:robots-fetch');
     if (!fetched) {
       robotsFetch = { state: 'UNREACHABLE', fetchedAt: now() };
@@ -824,7 +934,7 @@ export async function runSiteProfiler(
   const feeds: FeedInventoryEntry[] = [];
   let homeFinalUrl: string | null = null;
   if (!robotsBlocksFurther && !seedDisallowed) {
-    const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
+    const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
     stamp('homepage', input.seedUrl, 'profiler:homepage-fetch');
     if (homeFetched && homeFetched.status >= 200 && homeFetched.status < 300 && await allowFetched(homeFetched.finalUrl)) {
       homeFinalUrl = homeFetched.finalUrl;
@@ -860,7 +970,7 @@ export async function runSiteProfiler(
       // lookups across adversarial locations.
       sitemapFetches += 1;
       if (!(await allowUrl(location))) continue;
-      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
+      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
       stamp(`sitemap:${location}`, location, 'profiler:sitemap-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
       if (!(await allowFetched(fetched.finalUrl))) continue;
@@ -930,7 +1040,7 @@ export async function runSiteProfiler(
       if (!(await allowUrl(destRobotsUrl))) {
         destRobotsBlocksAll = true;
       } else {
-        const destFetched = await fetchProfilerUrl(destRobotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES);
+        const destFetched = await fetchProfilerUrl(destRobotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
         stamp('robots:destination', destRobotsUrl, 'profiler:robots-fetch');
         if (!destFetched) destRobotsBlocksAll = true;
         else if (destFetched.status === 429 || destFetched.status >= 500) destRobotsBlocksAll = true;
@@ -964,7 +1074,7 @@ export async function runSiteProfiler(
       feedFetches += 1;
       if (!(await allowUrl(location))) continue;
       if (!(await destFeedAllowed(location))) continue;
-      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
+      const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS, PROFILER_FETCH_TIMEOUT_MS, deps.resolveHost);
       stamp(`feed:${location}`, location, 'profiler:feed-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
       if (!(await allowFetched(fetched.finalUrl))) continue;

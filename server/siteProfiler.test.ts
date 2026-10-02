@@ -7,6 +7,7 @@ import {
   MAX_SITEMAP_URLS_ADMITTED,
   MAX_FEEDS_PER_SITE,
   MAX_FEED_ENTRIES,
+  MAX_PROFILER_REDIRECT_HOPS,
   parseRobotsTxt,
   evaluateRobotsForPath,
   parseSitemapXml,
@@ -15,6 +16,7 @@ import {
   classifyPageType,
   classifyCanonicalHref,
   isSiteProfilerEnabled,
+  fetchProfilerUrl,
   runSiteProfiler,
 } from './siteProfiler';
 
@@ -578,4 +580,168 @@ test('truncation flags survive from fetch bytes to inventory records', async () 
   assert.equal(parseFeedXml(`<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>`, 'https://example.com/f', false).truncated, false);
   assert.equal(extractHeadDiscovery('<html><head></head><body></body></html>', 'https://example.com/', true).bodyTruncated, true);
   assert.equal(extractHeadDiscovery('<html><head></head><body></body></html>', 'https://example.com/').bodyTruncated, false);
+});
+
+/** Redirect-destination SSRF guard: redirects are followed manually with
+ * each hop validated by the public-destination guard BEFORE contact.
+ * Injected fetch + DNS only; no real network access. */
+function makeRedirectHarness(routes: Record<string, { status: number; body?: string; headers?: Record<string, string> }>) {
+  const requested: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    requested.push(target);
+    const route = routes[target];
+    if (!route) return new Response('missing', { status: 404, headers: { 'content-type': 'text/plain' } });
+    return new Response(route.body ?? '', { status: route.status, headers: route.headers ?? { 'content-type': 'text/html' } });
+  }) as typeof fetch;
+  const resolveHost = async (host: string): Promise<string[]> => {
+    if (host === 'public.example' || host === 'cdn.example') return ['93.184.216.1'];
+    if (host === 'private.example') return ['10.9.9.9'];
+    throw new Error(`NXDOMAIN ${host}`);
+  };
+  return { fetchImpl, requested, resolveHost };
+}
+
+test('direct public fetch succeeds with single-URL provenance', async () => {
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+    'https://public.example/feed': { status: 200, body: 'hello' },
+  });
+  const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost);
+  assert.equal(fetched!.status, 200);
+  assert.equal(fetched!.text, 'hello');
+  assert.equal(fetched!.finalUrl, 'https://public.example/feed');
+  assert.deepEqual(fetched!.redirectsFollowed, ['https://public.example/feed']);
+  assert.equal(fetched!.redirectRejected, false);
+  assert.deepEqual(requested, ['https://public.example/feed']);
+});
+
+test('public redirect to public destination is followed to the final URL', async () => {
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+    'https://public.example/feed': { status: 302, headers: { location: 'https://cdn.example/asset' } },
+    'https://cdn.example/asset': { status: 200, body: 'final' },
+  });
+  const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost);
+  assert.equal(fetched!.status, 200);
+  assert.equal(fetched!.text, 'final');
+  assert.equal(fetched!.finalUrl, 'https://cdn.example/asset');
+  assert.deepEqual(fetched!.redirectsFollowed, ['https://public.example/feed', 'https://cdn.example/asset']);
+  assert.equal(fetched!.redirectRejected, false);
+  assert.deepEqual(requested, ['https://public.example/feed', 'https://cdn.example/asset']);
+});
+
+test('relative redirect Location resolves against the current URL', async () => {
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+    'https://public.example/old': { status: 301, headers: { location: '/new' } },
+    'https://public.example/new': { status: 200, body: 'moved' },
+  });
+  const fetched = await fetchProfilerUrl('https://public.example/old', fetchImpl, 1000, 10_000, resolveHost);
+  assert.equal(fetched!.status, 200);
+  assert.equal(fetched!.finalUrl, 'https://public.example/new');
+  assert.equal(fetched!.redirectRejected, false);
+  assert.deepEqual(requested, ['https://public.example/old', 'https://public.example/new']);
+});
+
+test('redirect to loopback is rejected before contact', async () => {
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+    'https://public.example/feed': { status: 302, headers: { location: 'http://127.0.0.1:9000/admin' } },
+  });
+  const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost);
+  assert.equal(fetched!.redirectRejected, true);
+  assert.equal(fetched!.rejectedRedirect, 'http://127.0.0.1:9000/admin');
+  assert.equal(fetched!.status, 302, 'typed limitation status preserved, not rewritten to NOT_FOUND');
+  assert.deepEqual(requested, ['https://public.example/feed'], 'private destination never contacted');
+});
+
+test('redirect to RFC1918 private IPv4 is rejected before contact', async () => {
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+    'https://public.example/feed': { status: 302, headers: { location: 'http://192.168.10.9/internal' } },
+  });
+  const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost);
+  assert.equal(fetched!.redirectRejected, true);
+  assert.deepEqual(requested, ['https://public.example/feed'], 'private destination never contacted');
+});
+
+test('redirect to link-local and reserved destinations is rejected', async () => {
+  for (const destination of [
+    'http://169.254.169.254/latest/meta-data',
+    'http://[fe80::1]/x',
+    'http://10.0.0.7/y',
+  ]) {
+    const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+      'https://public.example/feed': { status: 302, headers: { location: destination } },
+    });
+    const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost);
+    assert.equal(fetched!.redirectRejected, true, `${destination} rejected`);
+    assert.deepEqual(requested, ['https://public.example/feed'], `${destination} never contacted`);
+  }
+});
+
+test('redirect to DNS-resolving-private hostname is rejected before contact', async () => {
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+    'https://public.example/feed': { status: 302, headers: { location: 'https://private.example/secret' } },
+  });
+  const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost);
+  assert.equal(fetched!.redirectRejected, true);
+  assert.deepEqual(requested, ['https://public.example/feed'], 'resolving-private hostname never contacted');
+});
+
+test('malformed redirect Location is rejected without contact', async () => {
+  for (const location of ['http://[::1', 'https://exa mple.com/%']) {
+    const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+      'https://public.example/feed': { status: 302, headers: { location } },
+    });
+    const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost);
+    // WHATWG URL parsing is lenient (spaces encode); unparseable inputs
+    // throw while parseable-but-nonpublic inputs fail the guard. Both paths
+    // reject before contact — never evidence, never NOT_FOUND-shaped.
+    assert.equal(fetched!.redirectRejected, true, `${location} rejected`);
+    assert.ok(fetched!.status === 302 || fetched === null, `${location} stays a limitation`);
+    assert.deepEqual(requested, ['https://public.example/feed'], `${location} never contacted`);
+  }
+});
+
+test('redirect chains remain bounded', async () => {
+  const routes: Record<string, { status: number; body?: string; headers?: Record<string, string> }> = {};
+  for (let i = 0; i < 10; i += 1) {
+    routes[`https://public.example/hop${i}`] = { status: 302, headers: { location: `https://public.example/hop${i + 1}` } };
+  }
+  routes['https://public.example/hop10'] = { status: 200, body: 'too deep' };
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness(routes);
+  const fetched = await fetchProfilerUrl('https://public.example/hop0', fetchImpl, 1000, 10_000, resolveHost);
+  assert.ok(requested.length <= MAX_PROFILER_REDIRECT_HOPS, `chain bounded, got ${requested.length} requests`);
+  assert.ok(fetched!.redirectsFollowed.length <= MAX_PROFILER_REDIRECT_HOPS);
+  assert.equal(fetched!.redirectRejected, false, 'exhaustion is a skip, not a rejection');
+  assert.notEqual(fetched!.status, 200, 'capped chain never presents deep content as the fetch result');
+});
+
+test('feed redirect to private destination is skipped within attempt budget', async () => {
+  const { MAX_FEEDS_PER_SITE: cap } = await import('./siteProfiler');
+  const requested: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    requested.push(target);
+    if (target.endsWith('/robots.txt')) {
+      return new Response('User-agent: *\nAllow: /', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (target === 'https://public.example/') {
+      return new Response(
+        '<html><head><link rel="alternate" type="application/rss+xml" href="/feed"></head><body>hi</body></html>',
+        { status: 200, headers: { 'content-type': 'text/html' } },
+      );
+    }
+    if (target === 'https://public.example/feed') {
+      return new Response('', { status: 302, headers: { location: 'http://127.0.0.1/stolen' } });
+    }
+    return new Response('missing', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'public.example', identityTier: 'A', seedUrl: 'https://public.example/' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+    async () => true,
+  );
+  assert.equal(result.status, 'PROFILED', 'rejected redirect is a limitation, not a profile failure');
+  assert.deepEqual(result.profile!.feeds, [], 'redirect-rejected feed yields no inventory');
+  assert.ok(!requested.some(url => url.includes('127.0.0.1')), 'private redirect target never contacted');
+  const feedFetches = requested.filter(url => url === 'https://public.example/feed').length;
+  assert.ok(feedFetches <= cap + 1, `feed attempt budget holds, got ${feedFetches}`);
 });
