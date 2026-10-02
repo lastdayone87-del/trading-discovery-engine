@@ -214,8 +214,18 @@ export function evaluateRobotsForPath(
   if (!group) group = parsed.groups.find(g => g.agents.includes('*')) || null;
   if (!group) return { allowed: null, crawlDelaySeconds: null, matchedRule: null };
   const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const matchLen = (pattern: string): number => {
-    if (!pattern) return -1;
+  // Specificity for longest-match ordering: literal octets actually
+  // constraining the path. A bare `/*` (one literal octet) never outranks a
+  // concrete path no matter how much text its wildcard spans; ties resolve
+  // to Allow below. This keeps `Disallow: /*` from overriding an explicit
+  // `Allow: /public/page`.
+  const specificityOf = (pattern: string): number => {
+    let core = pattern;
+    if (core.endsWith('$')) core = core.slice(0, -1);
+    return core.split('*').join('').length;
+  };
+  const matches = (pattern: string): boolean => {
+    if (!pattern) return false;
     // RFC 9309 path matching: `*` spans any sequence, trailing `$` anchors
     // the end; otherwise patterns match from the start. The remainder of a
     // wildcard pattern still constrains the match — `/public/*.html` must
@@ -230,27 +240,27 @@ export function evaluateRobotsForPath(
     try {
       re = new RegExp(`^${core.split('*').map(escapeRegExp).join('.*')}${anchored ? '$' : ''}`);
     } catch {
-      return -1;
+      return false;
     }
-    const hit = re.exec(path);
-    if (!hit) return -1;
-    return hit[0].length;
+    return re.test(path);
   };
   let best = -1;
   let allowed = true;
   let matchedRule: string | null = null;
   for (const rule of group.disallow) {
-    const len = matchLen(rule);
-    if (len > best) {
-      best = len;
+    if (!matches(rule)) continue;
+    const specificity = specificityOf(rule);
+    if (specificity > best) {
+      best = specificity;
       allowed = false;
       matchedRule = `Disallow: ${rule}`;
     }
   }
   for (const rule of group.allow) {
-    const len = matchLen(rule);
-    if (len > best) {
-      best = len;
+    if (!matches(rule)) continue;
+    const specificity = specificityOf(rule);
+    if (specificity >= best) {
+      best = specificity;
       allowed = true;
       matchedRule = `Allow: ${rule}`;
     }
@@ -812,10 +822,12 @@ export async function runSiteProfiler(
   const sitemaps: SitemapInventory[] = [];
   let sitemapLocationsSkipped = 0;
   const feeds: FeedInventoryEntry[] = [];
+  let homeFinalUrl: string | null = null;
   if (!robotsBlocksFurther && !seedDisallowed) {
     const homeFetched = await fetchProfilerUrl(input.seedUrl, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
     stamp('homepage', input.seedUrl, 'profiler:homepage-fetch');
     if (homeFetched && homeFetched.status >= 200 && homeFetched.status < 300 && await allowFetched(homeFetched.finalUrl)) {
+      homeFinalUrl = homeFetched.finalUrl;
       head = extractHeadDiscovery(homeFetched.text, homeFetched.finalUrl, homeFetched.truncated);
       for (const href of head.canonicalHrefs) {
         canonicalConflicts.push({
@@ -865,23 +877,44 @@ export async function runSiteProfiler(
   // then conventional locations. Entry bodies are never extracted here.
   // Same destination guard and truncation accounting as sitemaps.
   const feedCandidates: string[] = [];
+  // Resolve autolinks against the fetched page's final URL: after a
+  // cross-host redirect, relative links belong to the destination, not the
+  // requested seed. Falls back to the seed only when nothing was fetched.
+  const feedBaseUrl = homeFinalUrl || input.seedUrl;
   for (const link of head?.feedLinks || []) {
     try {
-      const absolute = new URL(link.href, input.seedUrl).toString();
+      const absolute = new URL(link.href, feedBaseUrl).toString();
       if (!feedCandidates.includes(absolute)) feedCandidates.push(absolute);
     } catch {
       // Unresolvable autolinks contribute nothing to the inventory.
     }
   }
   if (origin) {
-    for (const conventional of [`${origin}/feed`, `${origin}/rss.xml`, `${origin}/atom.xml`]) {
+    // Conventional locations probe the fetched destination's origin when a
+    // redirect moved the site; only the unredirected seed origin otherwise.
+    // Probing the seed origin after a cross-host redirect would inventory a
+    // site the profile no longer describes.
+    const conventionalOrigin = (() => {
+      try {
+        return homeFinalUrl ? new URL(homeFinalUrl).origin : origin;
+      } catch {
+        return origin;
+      }
+    })();
+    for (const conventional of [`${conventionalOrigin}/feed`, `${conventionalOrigin}/rss.xml`, `${conventionalOrigin}/atom.xml`]) {
       if (!feedCandidates.includes(conventional)) feedCandidates.push(conventional);
     }
   }
   if (!robotsBlocksFurther && !seedDisallowed) {
+    // Attempt-bounded: every candidate costs a guard check plus (on pass) a
+    // fetch, so failing/unrecognized candidates must also consume budget.
+    // Autolinked feeds first (first = main feed); hard stop after the cap
+    // with the remainder unattempted (never silently assumed).
+    let feedFetches = 0;
     for (const location of feedCandidates) {
-      if (feeds.length >= MAX_FEEDS_PER_SITE) break;
+      if (feeds.length >= MAX_FEEDS_PER_SITE || feedFetches >= MAX_FEEDS_PER_SITE + 1) break;
       if (!(await allowUrl(location))) continue;
+      feedFetches += 1;
       const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
       stamp(`feed:${location}`, location, 'profiler:feed-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;

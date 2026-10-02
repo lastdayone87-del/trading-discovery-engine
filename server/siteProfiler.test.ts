@@ -312,10 +312,66 @@ test('robots wildcards constrain the suffix and honor end anchors', () => {
   assert.equal(evaluateRobotsForPath(parsed, 'x', '/exact/more').allowed, true, 'end anchor respected');
 });
 
+test('bare wildcards never override explicit allows of any length', () => {
+  const parsed = parseRobotsTxt(['User-agent: *', 'Disallow: /*', 'Allow: /public/page'].join('\n'));
+  const verdict = evaluateRobotsForPath(parsed, 'x', '/public/page');
+  assert.equal(verdict.allowed, true, 'concrete allow outranks spanning disallow');
+  assert.equal(verdict.matchedRule, 'Allow: /public/page');
+  assert.equal(evaluateRobotsForPath(parsed, 'x', '/other').allowed, false, 'wildcard still governs unmatched paths');
+  const tied = parseRobotsTxt(['User-agent: *', 'Disallow: /x', 'Allow: /x'].join('\n'));
+  assert.equal(evaluateRobotsForPath(tied, 'x', '/x').allowed, true, 'exact ties resolve to Allow');
+});
+
 test('profiler fetch identity is single-sourced for requests and evaluation', async () => {
   const { PROFILER_USER_AGENT, profilerFetchHeaders } = await import('./siteProfiler');
   assert.ok(PROFILER_USER_AGENT.includes('Mozilla'));
   assert.equal(profilerFetchHeaders()['User-Agent'], PROFILER_USER_AGENT);
+});
+
+test('feed autolinks resolve against the fetched final URL after redirects', async () => {
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    fetched.push(target);
+    if (target === 'https://short.example/x') {
+      const response = new Response('<html><head><link rel="alternate" type="application/rss+xml" href="/feed"></head><body>hi</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      Object.defineProperty(response, 'url', { value: 'https://dest.example/landing' });
+      return response;
+    }
+    return new Response('missing', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'short.example', identityTier: 'A', seedUrl: 'https://short.example/x' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+    async () => true,
+  );
+  assert.ok(fetched.includes('https://dest.example/feed'), 'relative feed resolved against the destination, not the seed');
+  assert.ok(!fetched.includes('https://short.example/feed'), 'seed-host feed never requested after a cross-host redirect');
+  assert.deepEqual(result.profile!.feeds, [], 'unparseable/missing feeds yield no inventory, not errors');
+});
+
+test('feed fetch attempts are bounded even when every candidate fails', async () => {
+  const { MAX_FEEDS_PER_SITE } = await import('./siteProfiler');
+  let attempts = 0;
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    if (target.endsWith('/robots.txt')) {
+      return new Response('User-agent: *\nAllow: /', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (target === 'https://example.com/') {
+      const links = Array.from({ length: 10 }, (_, i) => `<link rel="alternate" type="application/rss+xml" href="/f${i}">`).join('');
+      return new Response(`<html><head>${links}</head><body>hi</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    if (/\/f\d+$/.test(target)) attempts += 1;
+    return new Response('nope', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'example.com', identityTier: 'A', seedUrl: 'https://example.com/' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+    async () => true,
+  );
+  assert.ok(attempts <= MAX_FEEDS_PER_SITE + 1, `feed attempts bounded, got ${attempts}`);
+  assert.equal(result.profile!.feeds.length, 0);
 });
 
 test('robots disallow, rate limit, and unreachable states stop further fetching', async () => {
