@@ -322,6 +322,17 @@ test('bare wildcards never override explicit allows of any length', () => {
   assert.equal(evaluateRobotsForPath(tied, 'x', '/x').allowed, true, 'exact ties resolve to Allow');
 });
 
+test('wildcard disallow with literal suffix outranks a generic allow', () => {
+  // Regression pin: `/*a` carries two constraining octets (`/a`) against
+  // `/`'s one, so the disallow governs `/x/y/z/a`. Literal specificity —
+  // not spanned text length — orders the match.
+  const parsed = parseRobotsTxt(['User-agent: *', 'Disallow: /*a', 'Allow: /'].join('\n'));
+  const verdict = evaluateRobotsForPath(parsed, 'x', '/x/y/z/a');
+  assert.equal(verdict.allowed, false);
+  assert.equal(verdict.matchedRule, 'Disallow: /*a');
+  assert.equal(evaluateRobotsForPath(parsed, 'x', '/x/y/z/b').allowed, true, 'non-matching suffix stays allowed');
+});
+
 test('profiler fetch identity is single-sourced for requests and evaluation', async () => {
   const { PROFILER_USER_AGENT, profilerFetchHeaders } = await import('./siteProfiler');
   assert.ok(PROFILER_USER_AGENT.includes('Mozilla'));
@@ -372,6 +383,92 @@ test('feed fetch attempts are bounded even when every candidate fails', async ()
   );
   assert.ok(attempts <= MAX_FEEDS_PER_SITE + 1, `feed attempts bounded, got ${attempts}`);
   assert.equal(result.profile!.feeds.length, 0);
+});
+
+test('guard-rejected feed candidates consume budget instead of looping unbounded', async () => {
+  const { MAX_FEEDS_PER_SITE } = await import('./siteProfiler');
+  let guardChecks = 0;
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    if (target.endsWith('/robots.txt')) {
+      return new Response('User-agent: *\nAllow: /', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (target === 'https://example.com/') {
+      // Ten autolinked feeds, every one aimed at a private address: without
+      // budget accounting the profiler would DNS-check all ten.
+      const links = Array.from({ length: 10 }, (_, i) => `<link rel="alternate" type="application/rss+xml" href="http://10.0.0.${i + 1}/feed${i}">`).join('');
+      return new Response(`<html><head>${links}</head><body>hi</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    return new Response('nope', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'example.com', identityTier: 'A', seedUrl: 'https://example.com/' },
+    {
+      fetchImpl,
+      now: () => '2026-10-01T00:00:00.000Z',
+      resolveHost: async (host: string) => {
+        if (host === 'example.com') return ['93.184.216.1'];
+        guardChecks += 1;
+        return ['10.9.9.9'];
+      },
+    },
+    async () => true,
+  );
+  assert.ok(guardChecks <= MAX_FEEDS_PER_SITE + 1, `guard checks bounded, got ${guardChecks}`);
+  assert.equal(result.profile!.feeds.length, 0, 'no private feed ever inventoried');
+});
+
+test('destination robots policy governs destination feeds after a cross-host redirect', async () => {
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    fetched.push(target);
+    if (target === 'https://short.example/robots.txt') {
+      return new Response('User-agent: *\nAllow: /', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (target === 'https://short.example/x') {
+      const response = new Response('<html><head><link rel="alternate" type="application/rss+xml" href="/feed"></head><body>hi</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      Object.defineProperty(response, 'url', { value: 'https://dest.example/landing' });
+      return response;
+    }
+    if (target === 'https://dest.example/robots.txt') {
+      return new Response('User-agent: *\nDisallow: /feed\nDisallow: /rss.xml\nDisallow: /atom.xml\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    return new Response('missing', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'short.example', identityTier: 'A', seedUrl: 'https://short.example/x' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+    async () => true,
+  );
+  assert.ok(fetched.includes('https://dest.example/robots.txt'), 'destination policy resolved before probing its feeds');
+  assert.ok(!fetched.includes('https://dest.example/feed'), 'disallowed destination feed never requested');
+  assert.deepEqual(result.profile!.feeds, [], 'policy-blocked feeds yield no inventory, not errors');
+});
+
+test('unreachable destination policy fails closed for destination probes only', async () => {
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    fetched.push(target);
+    if (target === 'https://short.example/robots.txt') {
+      return new Response('User-agent: *\nAllow: /', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (target === 'https://short.example/x') {
+      const response = new Response('<html><head><link rel="alternate" type="application/rss+xml" href="/feed"></head><body>hi</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      Object.defineProperty(response, 'url', { value: 'https://dest.example/landing' });
+      return response;
+    }
+    if (target === 'https://dest.example/robots.txt') throw new Error('destination policy unreachable');
+    return new Response('missing', { status: 404, headers: { 'content-type': 'text/plain' } });
+  }) as typeof fetch;
+  const result = await runSiteProfiler(
+    { siteIdentity: 'short.example', identityTier: 'A', seedUrl: 'https://short.example/x' },
+    { fetchImpl, now: () => '2026-10-01T00:00:00.000Z', resolveHost: async () => ['93.184.216.1'] },
+    async () => true,
+  );
+  assert.ok(!fetched.includes('https://dest.example/feed'), 'unknown destination policy means no destination probing');
+  assert.ok(result.profile!.head !== null, 'seed inventory itself still recorded');
 });
 
 test('robots disallow, rate limit, and unreachable states stop further fetching', async () => {

@@ -855,8 +855,11 @@ export async function runSiteProfiler(
   if (!robotsBlocksFurther && !seedDisallowed) {
     while (pendingSitemaps.length > 0 && sitemapFetches < MAX_SITEMAP_FETCHES) {
       const location = pendingSitemaps.shift()!;
-      if (!(await allowUrl(location))) continue;
+      // Guard rejections consume worklist budget too: every candidate costs
+      // a DNS-backed check, so skipping the counter would allow unbounded
+      // lookups across adversarial locations.
       sitemapFetches += 1;
+      if (!(await allowUrl(location))) continue;
       const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
       stamp(`sitemap:${location}`, location, 'profiler:sitemap-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
@@ -906,15 +909,61 @@ export async function runSiteProfiler(
     }
   }
   if (!robotsBlocksFurther && !seedDisallowed) {
+    // Destination-robots gate: after a cross-host redirect, destination-origin
+    // feeds live under a different host's policy than the seed robots file
+    // already evaluated. Resolve that host's policy once (bounded, single
+    // fetch behind the same destination guard) and evaluate each destination
+    // feed path against it. Unreachable/rate-limited destination policy fails
+    // closed for destination probes only; seed-origin behavior is unchanged.
+    // A 4xx (no policy file) means no policy to enforce, matching seed posture.
+    let destRobots: ParsedRobots | null = null;
+    let destRobotsBlocksAll = false;
+    let destOrigin: string | null = null;
+    try {
+      destOrigin = homeFinalUrl ? new URL(homeFinalUrl).origin : null;
+    } catch {
+      destOrigin = null;
+    }
+    const crossHostRedirect = !!destOrigin && !!origin && destOrigin !== origin;
+    if (crossHostRedirect && destOrigin) {
+      const destRobotsUrl = `${destOrigin}/robots.txt`;
+      if (!(await allowUrl(destRobotsUrl))) {
+        destRobotsBlocksAll = true;
+      } else {
+        const destFetched = await fetchProfilerUrl(destRobotsUrl, deps.fetchImpl, ROBOTS_MAX_BYTES);
+        stamp('robots:destination', destRobotsUrl, 'profiler:robots-fetch');
+        if (!destFetched) destRobotsBlocksAll = true;
+        else if (destFetched.status === 429 || destFetched.status >= 500) destRobotsBlocksAll = true;
+        else if (destFetched.status >= 200 && destFetched.status < 300) destRobots = parseRobotsTxt(destFetched.text);
+      }
+    }
+    const destFeedAllowed = async (location: string): Promise<boolean> => {
+      if (!crossHostRedirect || !destOrigin) return true;
+      let locOrigin: string | null = null;
+      let pathname = '/';
+      try {
+        const parsed = new URL(location);
+        locOrigin = parsed.origin;
+        pathname = parsed.pathname || '/';
+      } catch {
+        return false;
+      }
+      if (locOrigin !== destOrigin) return true;
+      if (destRobotsBlocksAll) return false;
+      if (!destRobots) return true;
+      return evaluateRobotsForPath(destRobots, PROFILER_USER_AGENT, pathname).allowed !== false;
+    };
     // Attempt-bounded: every candidate costs a guard check plus (on pass) a
-    // fetch, so failing/unrecognized candidates must also consume budget.
+    // fetch, so guard-rejected candidates also consume budget — otherwise an
+    // adversarial candidate list forces unbounded DNS lookups.
     // Autolinked feeds first (first = main feed); hard stop after the cap
     // with the remainder unattempted (never silently assumed).
     let feedFetches = 0;
     for (const location of feedCandidates) {
       if (feeds.length >= MAX_FEEDS_PER_SITE || feedFetches >= MAX_FEEDS_PER_SITE + 1) break;
-      if (!(await allowUrl(location))) continue;
       feedFetches += 1;
+      if (!(await allowUrl(location))) continue;
+      if (!(await destFeedAllowed(location))) continue;
       const fetched = await fetchProfilerUrl(location, deps.fetchImpl, MAX_CRAWL_RESPONSE_CHARS);
       stamp(`feed:${location}`, location, 'profiler:feed-fetch');
       if (!fetched || fetched.status < 200 || fetched.status >= 300) continue;
