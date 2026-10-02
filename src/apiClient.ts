@@ -12,6 +12,15 @@ export function setOperatorToken(token: string): void {
 
 export const AUTH_REQUIRED_EVENT = 'trading-engine:auth-required';
 
+/** Secure-context-safe request ID. `crypto.randomUUID()` only exists in secure
+ * contexts (HTTPS/localhost); on plain HTTP it is undefined and would throw
+ * before any fetch is sent. Fall back so the dashboard still loads. */
+export function newRequestId(): string {
+  const cryptoRef = globalThis.crypto as Crypto | undefined;
+  if (cryptoRef && typeof cryptoRef.randomUUID === 'function') return cryptoRef.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 const PACIFIC_TIME_ZONE = 'America/Los_Angeles';
 
 function zonedOffsetMs(timestamp: number, timeZone: string): number {
@@ -74,7 +83,7 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
   const headers = new Headers(init.headers);
   const token = operatorToken();
   if (token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
-  if (!headers.has('X-Request-Id')) headers.set('X-Request-Id', crypto.randomUUID());
+  if (!headers.has('X-Request-Id')) headers.set('X-Request-Id', newRequestId());
   const response = await fetch(input, { ...init, headers });
   // A 403 proves the stored credential was authenticated but lacks the role for
   // one action. Do not tear down an otherwise valid dashboard session.

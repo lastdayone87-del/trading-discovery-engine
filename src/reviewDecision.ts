@@ -1,3 +1,5 @@
+import { newRequestId } from './apiClient';
+
 export type ReviewDecisionAction = 'approve' | 'reject' | 'force-rescan';
 
 export interface ReviewDecisionRequest {
@@ -34,7 +36,7 @@ export async function submitReviewDecision(
   request: ReviewDecisionRequest,
   fetcher: typeof fetch,
   headers: Record<string, string>,
-  idempotencyKey: string = crypto.randomUUID()
+  idempotencyKey: string = newRequestId()
 ): Promise<ReviewDecisionResult> {
   const response = await fetcher(`/api/reviews/${encodeURIComponent(request.channelId)}/${request.action}`, {
     method: 'POST',
