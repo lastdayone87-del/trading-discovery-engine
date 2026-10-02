@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   isSameSiteSitemapSeed,
+  selectSameSiteSitemapSeedCandidates,
   selectSitemapSeedCandidates,
   MAX_LADDER_SITEMAP_SEEDS,
 } from './acquisitionLadder';
@@ -105,7 +106,7 @@ test('same-site sitemap inventory still seeds through the gate (no over-blocking
   );
 });
 
-test('inspector sitemap seeding is candidate-gated (no exact-identity source gate)', () => {
+test('inspector sitemap seeding filters before the cap (no exact-identity source gate)', () => {
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(
     source,
@@ -114,16 +115,16 @@ test('inspector sitemap seeding is candidate-gated (no exact-identity source gat
   );
   assert.match(
     source,
-    /isSameSiteSitemapSeed\(seed\.url,\s*candidate\.url\)/,
-    'off-site sitemap URLs never become website seeds',
+    /selectSameSiteSitemapSeedCandidates\(\s*seed\.url/,
+    'same-site filtering must happen inside the capped selector (filter-before-cap)',
   );
 });
 
 /**
- * Inspector-equivalent gating (mirrors server/inspector.ts): scorer +
- * candidate-level same-site gate only. The inventory source is provenance,
- * never a seed-identity requirement, so conventional root sitemaps keep
- * working for path-tenant seeds.
+ * Inspector-equivalent gating (delegates to the production selector in
+ * server/acquisitionLadder.ts): same-site filter BEFORE scoring/capping.
+ * The inventory source is provenance, never a seed-identity requirement,
+ * so conventional root sitemaps keep working for path-tenant seeds.
  */
 function gatedSeedsFor(
   seedUrl: string,
@@ -131,17 +132,57 @@ function gatedSeedsFor(
 ): string[] {
   const out: string[] = [];
   for (const inventory of inventories) {
-    for (const candidate of selectSitemapSeedCandidates(
+    for (const candidate of selectSameSiteSitemapSeedCandidates(
+      seedUrl,
       inventory.urls,
       inventory.sourceUrl,
       MAX_LADDER_SITEMAP_SEEDS,
     )) {
-      if (!isSameSiteSitemapSeed(seedUrl, candidate.url)) continue;
       if (!out.includes(candidate.url)) out.push(candidate.url);
     }
   }
   return out;
 }
+
+test('valid tenant URL survives higher-scoring other-tenant URLs (filter-before-cap)', () => {
+  const seedUrl = 'https://linktr.ee/trader1';
+  const crowding = [2, 3, 4, 5, 6].map(n => ({
+    loc: `https://linktr.ee/trader${n}/discord-community-join`,
+  }));
+  const inventories = [
+    {
+      sourceUrl: 'https://linktr.ee/sitemap.xml',
+      urls: [...crowding, { loc: 'https://linktr.ee/trader1/community' }],
+    },
+  ];
+  // Old ordering (cap-then-filter) loses the valid tenant URL: the top-5
+  // cap keeps only the higher-scoring other-tenant URLs, which are then all
+  // rejected, leaving no seeds.
+  const cappedFirst = selectSitemapSeedCandidates(
+    inventories[0].urls,
+    inventories[0].sourceUrl,
+    MAX_LADDER_SITEMAP_SEEDS,
+  );
+  assert.ok(
+    !cappedFirst.some(candidate => candidate.url === 'https://linktr.ee/trader1/community'),
+    'cap-before-filter crowds out the valid tenant URL',
+  );
+  assert.deepEqual(
+    cappedFirst.filter(candidate => isSameSiteSitemapSeed(seedUrl, candidate.url)),
+    [],
+    'cap-before-filter leaves the tenant with no seeds',
+  );
+  // Filter-before-cap keeps the valid tenant URL despite lower rank.
+  const seeds = gatedSeedsFor(seedUrl, inventories);
+  assert.ok(
+    seeds.includes('https://linktr.ee/trader1/community'),
+    'valid tenant URL still selected after higher-scoring cross-tenant URLs',
+  );
+  assert.ok(
+    seeds.every(url => isSameSiteSitemapSeed(seedUrl, url)),
+    'no off-site or cross-tenant URL leaks through the cap',
+  );
+});
 
 test('path-tenant root sitemap with valid tenant URL is accepted', () => {
   const seeds = gatedSeedsFor('https://linktr.ee/trader1', [

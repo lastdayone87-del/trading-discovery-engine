@@ -10,7 +10,7 @@ import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
-import { isAcquisitionLadderEnabled, isSameSiteSitemapSeed, resolveRenderEscalation, selectSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
+import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
 import { extractHeadDiscovery, isSiteProfilerEnabled, runSiteProfiler } from './siteProfiler';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, createDropCounter, type CrawlerTelemetry, type CeilingKind} from './crawlerTelemetry';
@@ -778,25 +778,23 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         if(!profile)continue;
         const inventories=profile.sitemapInventory as Array<{sourceUrl?:string;urls?:Array<{loc?:string}>}>;
         for(const inventory of inventories){
-          // Candidate-level same-site gate only (P1: Unchecked Sitemap Seed
-          // Destinations). The inventory source itself is intentionally NOT
-          // required to share the seed's exact path-tenant identity: a
-          // conventional root sitemap (e.g. https://linktr.ee/sitemap.xml)
-          // routinely inventories tenant pages (e.g.
-          // https://linktr.ee/trader1/community) for a tenant seed (e.g.
-          // https://linktr.ee/trader1). Gating the source on exact identity
-          // would silently drop those valid pages. Off-site/private
-          // destinations are still rejected per URL below, so the crawler
-          // never requests an unintended destination.
-          for(const candidate of selectSitemapSeedCandidates(
+          // Candidate-level same-site gate with filter-before-cap ordering
+          // (P1: Valid Tenant Pages Lose Seed Slots). The inventory source
+          // itself is intentionally NOT required to share the seed's exact
+          // path-tenant identity: a conventional root sitemap (e.g.
+          // https://linktr.ee/sitemap.xml) routinely inventories tenant
+          // pages (e.g. https://linktr.ee/trader1/community) for a tenant
+          // seed (e.g. https://linktr.ee/trader1). Same-site filtering
+          // happens INSIDE the selector before the 5-seed cap, so valid
+          // tenant URLs are never crowded out by higher-scoring other-tenant
+          // or off-site URLs. Off-site/private destinations never survive
+          // the pre-filter, so the crawler never requests them.
+          for(const candidate of selectSameSiteSitemapSeedCandidates(
+            seed.url,
             (inventory.urls||[]).map(entry=>({loc:String(entry.loc||'')})),
             String(inventory.sourceUrl||seed.url),
             MAX_LADDER_SITEMAP_SEEDS,
           )){
-            // Same-site gate per URL: off-site, private-literal (IP/dotless
-            // have no site identity), or otherwise unidentifiable candidates
-            // fail closed and are never requested as website seeds.
-            if(!isSameSiteSitemapSeed(seed.url,candidate.url))continue;
             if(websiteUrls.some(existing=>existing.url===candidate.url)||sitemapSeeds.some(existing=>existing.url===candidate.url))continue;
             sitemapSeeds.push({url:candidate.url,kind:'WEBSITE',contextMatches:false,source:'SITEMAP_DISCOVERY',sitemapUrl:candidate.sitemapUrl});
           }

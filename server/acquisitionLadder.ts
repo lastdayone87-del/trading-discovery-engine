@@ -161,6 +161,33 @@ export function isSameSiteSitemapSeed(seedUrl: string, candidateUrl: string): bo
   }
 }
 
+/**
+ * Same-site-filtered sitemap seed selection (P1: Valid Tenant Pages Lose
+ * Seed Slots). Filtering happens BEFORE scoring/capping so a valid tenant
+ * URL is never crowded out of the 5-seed cap by higher-scoring other-tenant
+ * or off-site URLs: those are dropped first, then the survivors are scored
+ * and capped identically to selectSitemapSeedCandidates. Security boundary
+ * preserved: off-site, cross-tenant (Tier B/C), and private-literal
+ * candidates never survive the pre-filter.
+ */
+export function selectSameSiteSitemapSeedCandidates(
+  seedUrl: string,
+  sitemapUrls: Array<{ loc: string }>,
+  sitemapSourceUrl: string,
+  cap: number = MAX_LADDER_SITEMAP_SEEDS,
+): SitemapSeedCandidate[] {
+  const filtered = (sitemapUrls || []).filter(entry => {
+    try {
+      const loc = String((entry as { loc?: unknown })?.loc || '');
+      if (!loc) return false;
+      return isSameSiteSitemapSeed(seedUrl, loc);
+    } catch {
+      return false;
+    }
+  });
+  return selectSitemapSeedCandidates(filtered, sitemapSourceUrl, cap);
+}
+
 export interface StructuredNavigationCandidate {
   url: string;
   score: number;
