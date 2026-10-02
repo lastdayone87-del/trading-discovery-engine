@@ -1,7 +1,8 @@
 import * as cheerio from 'cheerio';
 import { decodeEmbeddedMarkup, extractDynamicTargetValues, extractEmbeddedUrls, extractYouTubeVideoIds } from './crawlerExtraction';
 import { InspectionStep } from '../src/types';
-import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, upsertSiteProfile, type SiteInspectionRow } from './db';
+import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, accumulateRouteStats, upsertSiteProfile, type SiteInspectionRow } from './db';
+import { routePatternFor, shouldAccumulateRouteObservation } from './domainLearner';
 import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition, isFrontierEnabled, MAX_FRONTIER_PAGES_PER_SITE, MAX_FRONTIER_QUEUE_PER_SITE, FRONTIER_POLICY_VERSION, type FrontierCrawlOptions } from './frontierManager';
 import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, needsRenderedRecrawl, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
@@ -257,7 +258,23 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // byte-identical to legacy behavior.
     const frontierRecordCoverage=(pageUrl:string,terminalState:string,method:string,evidenceUnits:number)=>{
       if(!frontierOn||!frontier?.siteIdentity)return Promise.resolve();
-      return recordPageCoverage({siteIdentity:frontier.siteIdentity,pageKey:pageUrl,pageUrl,terminalState,acquisitionMethod:method,evidenceUnits,policyVersion:FRONTIER_POLICY_VERSION,weightVersion:frontier.weightVersion||''}).catch(()=>undefined);
+      const coverage=recordPageCoverage({siteIdentity:frontier.siteIdentity,pageKey:pageUrl,pageUrl,terminalState,acquisitionMethod:method,evidenceUnits,policyVersion:FRONTIER_POLICY_VERSION,weightVersion:frontier.weightVersion||''}).catch(()=>undefined);
+      // P-D production data path (observational only): completed inspections
+      // feed route statistics for the OFFLINE learner. Blocked/unreachable/
+      // incomplete terminals carry no yield information and are never
+      // recorded as attempts (never negative evidence). Best-effort like all
+      // observational writes; failures never affect the crawl. Nothing here
+      // is ever read back for routing, budgets, or stopping — the learner
+      // runs offline and serving never consumes its weights.
+      let stats:Promise<void>=Promise.resolve();
+      if(shouldAccumulateRouteObservation(terminalState)){
+        const pattern=routePatternFor(pageUrl);
+        if(pattern){
+          const sink=frontier.routeStatsSink||accumulateRouteStats;
+          stats=sink({siteIdentity:frontier.siteIdentity,routePattern:pattern,evidenceUnits,observedAt:new Date().toISOString()}).catch(()=>undefined);
+        }
+      }
+      return Promise.all([coverage,stats]).then(()=>undefined);
     };
     const frontierAdmitChildren=async (children:Array<{url:string;score:number}>,depth:number)=>{
       if(!frontierOn||!frontier?.siteIdentity)return;

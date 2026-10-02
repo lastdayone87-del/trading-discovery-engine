@@ -6,6 +6,7 @@ import {
   ROUTE_QUORUM_MIN_OBSERVATIONS,
   ROUTE_HALF_LIFE_MS,
   routePatternFor,
+  shouldAccumulateRouteObservation,
   decayWeight,
   aggregateRouteStats,
   computeDomainWeights,
@@ -26,6 +27,19 @@ test('route patterns normalize numeric segments and reject non-pages', () => {
   assert.notEqual(routePatternFor('https://example.com/a'), routePatternFor('https://example.com/b'));
   assert.equal(routePatternFor('not a url'), null);
   assert.equal(routePatternFor('ftp://example.com/x'), null);
+});
+
+test('only genuinely inspected pages accumulate; blocked states never become negative evidence', () => {
+  for (const terminal of ['FOUND', 'INSPECTED_NO_MATCH', 'PARTIALLY_INSPECTED', 'OK']) {
+    assert.equal(shouldAccumulateRouteObservation(terminal), true, `${terminal} was inspected`);
+  }
+  for (const terminal of [
+    'ACQUISITION_FAILED', 'BLOCKED', 'NOT_INSPECTED', 'NOT_FOUND',
+    'ROBOTS_DISALLOWED', 'LOGIN_WALL', 'PAYWALL', 'WAF_MANAGED',
+    'RATE_LIMITED', 'UNREACHABLE', 'INCOMPLETE', '', 'whatever',
+  ]) {
+    assert.equal(shouldAccumulateRouteObservation(terminal), false, `${terminal || '(empty)'} carries no yield information`);
+  }
 });
 
 test('decay halves weight per half-life and rejects garbage', () => {

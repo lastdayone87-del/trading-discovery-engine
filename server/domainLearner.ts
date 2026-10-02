@@ -74,6 +74,24 @@ export function routePatternFor(pageUrl: string): string | null {
   return `${parsed.hostname.toLowerCase()}/${segments.join('/')}`;
 }
 
+/** Whether a terminal outcome carries route-yield information worth
+ * accumulating. Only genuinely inspected pages qualify: FOUND,
+ * INSPECTED_NO_MATCH, PARTIALLY_INSPECTED (truncated but observed), and OK.
+ * Blocked, unreachable, rate-limited, and incomplete terminals carry NO
+ * yield information about the route — recording them as attempts would turn
+ * inaccessibility into negative evidence, so they are excluded. Pure. */
+export function shouldAccumulateRouteObservation(terminalState: string): boolean {
+  switch (terminalState) {
+    case 'FOUND':
+    case 'INSPECTED_NO_MATCH':
+    case 'PARTIALLY_INSPECTED':
+    case 'OK':
+      return true;
+    default:
+      return false;
+  }
+}
+
 /** Exponential decay multiplier for an observation age. Pure. */
 export function decayWeight(ageMs: number, halfLifeMs: number): number {
   if (!Number.isFinite(ageMs) || !Number.isFinite(halfLifeMs) || halfLifeMs <= 0) return 0;

@@ -90,6 +90,12 @@ export interface FrontierCrawlOptions {
   remainingValueFloor?: number;
   marginalWindow?: number;
   weightVersion?: string;
+  /** Observational sink for P-D route statistics. Defaults to the production
+   * accumulateRouteStats persistence; tests inject a capture. Observational
+   * only — never consulted for routing, budgets, or stopping. */
+  routeStatsSink?: (row: {
+    siteIdentity: string; routePattern: string; evidenceUnits: number; observedAt?: string | null;
+  }) => Promise<void>;
 }
 
 export async function isFrontierEnabled(
