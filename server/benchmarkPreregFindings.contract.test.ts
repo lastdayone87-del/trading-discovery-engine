@@ -68,3 +68,27 @@ test('benchmark opportunity identity is designated pre-selection, never served-q
   assert.match(source, /INVALID_BENCHMARK_SCOPE/);
   assert.match(source, /isFrozenBenchmarkConfiguration\(experiment\)/);
 });
+
+test('benchmark cycles serve only the designated row and read back before scheduling', () => {
+  const cycle = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  // Research/frontier/native allocations are declined under benchmark scope.
+  assert.match(cycle, /!normalizedExperiment\?\.benchmark/);
+  assert.match(cycle, /Benchmark-designated attempt declines non-designated allocation/);
+  const experiments = fs.readFileSync(new URL('./querySelectionExperiments.ts', import.meta.url), 'utf8');
+  assert.match(experiments, /restrictPoolToDesignatedRow\(fetchedQueries, designatedRowIds\)/);
+  const intelligence = fs.readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.match(intelligence, /restrictToQueryIds\?: number\[\]/);
+  // Restricted requests return null instead of generating queries.
+  assert.match(intelligence, /if \(options\.restrictToQueryIds !== undefined && restrictedQueries\.length === 0\) return null/);
+  assert.match(intelligence, /if \(options\.restrictToQueryIds !== undefined\) return null;/);
+});
+
+test('plan enforces the full frozen scope and execution waits for terminal attribution', () => {
+  const script = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  assert.match(script, /assertFullScope\(snapshot\)/);
+  assert.match(script, /waitForTerminalObservation\(pollRunState\(/);
+  assert.match(script, /isScopeTerminallyAccounted\(/);
+  assert.match(script, /planRowAttempt\(\{/);
+  assert.match(script, /detectConfigurationDrift\(/);
+  assert.match(script, /record\.firstObservedAt/);
+});

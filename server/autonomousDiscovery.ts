@@ -463,7 +463,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
 
       let research: { actionId: string; queryRecord: any } | null = null;
       // Persistent Research runs ONLY on the control/legacy path when frontier allocation is NOT authorized
-      if (!frontierAllocationInfo?.authorized) {
+      // and no benchmark-designated scope is active (benchmark attempts must
+      // never schedule unrelated research work as a designated observation).
+      if (!frontierAllocationInfo?.authorized && !normalizedExperiment?.benchmark) {
         research = await getAllocatedResearchQuery(country);
       }
 
@@ -475,6 +477,21 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       const nativeSnapshot = frontierAllocationInfo?.decision?.proposalEvidenceSnapshot;
       const governedConceptProposal = ['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(nativeSnapshot?.proposalFamily);
 
+      // Benchmark-designated attempts (benchmark-preregistration-v1
+      // execution): serve ONLY the designated pool row or nothing. An
+      // authorized frontier/native allocation is declined and released here
+      // so the cycle can never schedule unrelated work while claiming a
+      // designated opportunity; the restricted experiment-selection path
+      // below is the sole scheduling source on this path. Absent a benchmark
+      // scope this block is inert and legacy flow is byte-identical.
+      if (normalizedExperiment?.benchmark && frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+        await releaseAllocationDecision(
+          frontierAllocationInfo.decision.decisionId,
+          'Benchmark-designated attempt declines non-designated allocation'
+        ).catch(error => console.warn('[Autonomous Producer] Benchmark allocation release failed:', error));
+        frontierAllocationInfo.authorized = false;
+      }
+
       if (research) {
         selected = {
           queryRecord: research.queryRecord,
@@ -482,7 +499,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
         };
         candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'PERSISTENT_RESEARCH', selectedQueryId: selected.queryRecord.id };
-      } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
+      } else if (frontierAllocationInfo?.authorized && !normalizedExperiment?.benchmark && frontierAllocationInfo.targetNeighborhoodDimensions) {
         const nativeAuthorization = governedConceptProposal
           ? await authorizeCountryNativeAllocationQuery({
               country,

@@ -33,21 +33,27 @@ import { rowToQuery } from '../server/dbCore';
 import {
   BENCHMARK_PREREG_SPEC_VERSION,
   BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
-  BENCHMARK_PREREG_SCOPE_SIZE,
-  BENCHMARK_PREREG_WALL_CLOCK_DAYS,
   BENCHMARK_PREREG_FROZEN_MIGRATION_COUNT,
   verifyFrozenBenchmarkVersions,
   verifyBenchmarkGatesOff,
   buildFrozenBenchmarkRequest,
   buildPoolSnapshot,
   verifyPoolSnapshotHash,
+  assertFullScope,
   computeConfigurationHash,
   buildExecutionRecord,
+  classifyNoMatchOutcome,
+  waitForTerminalObservation,
+  detectConfigurationDrift,
+  benchmarkDeadlineMs,
+  isWallClockExceeded,
+  planRowAttempt,
+  isBenchmarkRowTerminal,
+  isScopeTerminallyAccounted,
   type BenchmarkExecutionRecord,
+  type BenchmarkRowState,
   type PoolSnapshot,
 } from '../server/benchmarkPreregV1';
-
-const DAY_MS = 24 * 60 * 60 * 1000;
 
 function usageError(message: string): never {
   console.error(`[benchmark-prereg-v1] ${message}`);
@@ -124,11 +130,14 @@ async function main(): Promise<void> {
     if (snapshot.rows.length === 0) {
       throw new Error('BENCHMARK_PREREG_EMPTY_POOL: no eligible opportunities; refusing to freeze an empty scope');
     }
+    // Frozen scope is 300: an undersized plan is not executable and must
+    // fail closed here with its deterministic reason, never silently fewer.
+    assertFullScope(snapshot);
     const providerRegistry = (await db.query(
       'SELECT provider_key, provider_family, provider_kind, capabilities, quota_domain, mode, daily_cost_cap, configuration_version FROM discovery_provider_registry ORDER BY provider_key'
     )).rows as Array<Record<string, unknown>>;
     const configurationHash = computeConfigurationHash({ appSettings: settingsRows, maxMigrationVersion, providerRegistry });
-    const record = buildExecutionRecord({ runningCommit: commit, poolSnapshot: snapshot, configurationHash, maxMigrationVersion, providerRegistry });
+    const record = buildExecutionRecord({ runningCommit: commit, poolSnapshot: snapshot, configurationHash, maxMigrationVersion, providerRegistry, appSettings: settingsRows });
     mkdirSync(outDir, { recursive: true });
     writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
@@ -156,43 +165,113 @@ async function main(): Promise<void> {
   verifyPoolSnapshotHash(snapshot);
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
+  if (record.firstObservedAt === undefined) record.firstObservedAt = null;
 
   const { runAutonomousDiscoveryCycle, getAutonomousDiscoveryStatus } = await import('../server/autonomousDiscovery');
-  const { getAppSetting } = await import('../server/dbCore');
   const status = await getAutonomousDiscoveryStatus().catch(() => null);
   if (status?.isRunning) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_BUSY: autonomous scheduler already running; stop it before executing');
   }
+  if (record.firstObservedAt === undefined) record.firstObservedAt = null;
 
-  const deadlineOf = (firstObservedAt: string | null): number =>
-    new Date(firstObservedAt || record.createdAt).getTime() + BENCHMARK_PREREG_WALL_CLOCK_DAYS * DAY_MS;
-  let firstObservedAt: string | null = null;
-  const covered = new Set<string>(
-    (record.attempts as Array<{ benchmarkOpportunityId?: string; matchedRunIds?: string[] }>)
-      .filter(attempt => (attempt.matchedRunIds || []).length > 0)
-      .map(attempt => String(attempt.benchmarkOpportunityId))
-  );
   const saveRecord = () => {
     record.updatedAt = new Date().toISOString();
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
   };
+  const rowState = (benchmarkOpportunityId: string): BenchmarkRowState => {
+    const attempts = (record.attempts as Array<{ benchmarkOpportunityId?: string; state?: BenchmarkRowState }>)
+      .filter(attempt => attempt.benchmarkOpportunityId === benchmarkOpportunityId);
+    if (attempts.length === 0) return 'NOT_ATTEMPTED';
+    return attempts[attempts.length - 1].state || 'NOT_ATTEMPTED';
+  };
+  const readMatched = async (benchmarkOpportunityId: string, sinceIso: string) => (await db.query(
+    `SELECT id, query_id, status, scheduled_at FROM query_runs
+     WHERE metadata->'selectionExperiment'->>'benchmarkOpportunityId' = $1 AND scheduled_at >= $2
+     ORDER BY scheduled_at`,
+    [benchmarkOpportunityId, sinceIso]
+  )).rows as Array<{ id: string; query_id: number; status: string; scheduled_at: string }>;
+  const abortIncomplete = async (stopReason: string): Promise<never> => {
+    record.status = 'INCOMPLETE';
+    record.stopReason = stopReason;
+    saveRecord();
+    await db.end().catch(() => undefined);
+    throw new Error(`[benchmark-prereg-v1] INCOMPLETE: ${stopReason}`);
+  };
+  const pollRunState = (runId: string) => async () => {
+    const runRows = (await db.query('SELECT status FROM query_runs WHERE id = $1', [runId])).rows as Array<{ status: string }>;
+    const attrRows = await db.query('SELECT 1 FROM query_run_accounting_attributions WHERE query_run_id = $1', [runId]);
+    return { status: String(runRows[0]?.status || 'UNKNOWN'), attributed: (attrRows.rowCount || 0) > 0 };
+  };
+  const haltedByKillSwitch = async (): Promise<boolean> => {
+    const paused = (await db.query("SELECT setting_value FROM app_settings WHERE setting_key = 'query_intelligence_paused'")).rows as Array<{ setting_value: string }>;
+    return (paused[0]?.setting_value ?? 'false') === 'true';
+  };
 
   for (const designated of record.designatedOpportunities) {
-    if (covered.has(designated.benchmarkOpportunityId)) continue;
-    if (Date.now() > deadlineOf(firstObservedAt)) {
-      record.status = 'INCOMPLETE';
-      record.stopReason = 'WALL_CLOCK_CEILING';
-      saveRecord();
-      console.log('[benchmark-prereg-v1] INCOMPLETE: 14-day ceiling reached');
-      await db.end().catch(() => undefined);
-      process.exit(1);
+    const preMatched = await readMatched(designated.benchmarkOpportunityId, record.createdAt);
+    const rowPlan = planRowAttempt({
+      covered: isBenchmarkRowTerminal(rowState(designated.benchmarkOpportunityId)),
+      matchedRunIds: preMatched.map(run => run.id),
+    });
+    if (rowPlan === 'skip-covered') continue;
+
+    // Re-verify frozen provenance at this durable execution boundary. Any
+    // drift fails closed: schedule nothing further under a changed config.
+    const liveSettingsRows = (await db.query('SELECT setting_key, setting_value FROM app_settings ORDER BY setting_key')).rows as Array<{ setting_key: string; setting_value: string }>;
+    const liveSettings: Record<string, string> = Object.fromEntries(liveSettingsRows.map(row => [row.setting_key, row.setting_value]));
+    const liveRegistry = (await db.query(
+      'SELECT provider_key, provider_family, provider_kind, capabilities, quota_domain, mode, daily_cost_cap, configuration_version FROM discovery_provider_registry ORDER BY provider_key'
+    )).rows as Array<Record<string, unknown>>;
+    const liveMigration = Number(((await db.query('SELECT max(version) AS max_version FROM schema_migrations')).rows as Array<{ max_version: string | number | null }>)[0]?.max_version || 0);
+    const plannedSettings: Record<string, string> = Object.fromEntries(record.appSettings.map(row => [row.setting_key, row.setting_value]));
+    const drift = detectConfigurationDrift(
+      { settings: plannedSettings, providerRegistry: record.providerRegistry, maxMigrationVersion: record.maxMigrationVersion },
+      { settings: liveSettings, providerRegistry: liveRegistry, maxMigrationVersion: liveMigration }
+    );
+    if (drift.length > 0) {
+      await abortIncomplete(`CONFIGURATION_DRIFT:${drift.join(';').slice(0, 400)}`);
     }
-    if ((await getAppSetting('query_intelligence_paused', 'false')) === 'true') {
-      record.status = 'INCOMPLETE';
-      record.stopReason = 'KILL_SWITCH_PAUSED';
-      saveRecord();
-      throw new Error('BENCHMARK_PREREG_KILL_SWITCH: query intelligence paused mid-run; intake stopped');
+    if (isWallClockExceeded(Date.now(), record.firstObservedAt, record.createdAt)) {
+      await abortIncomplete('WALL_CLOCK_CEILING');
     }
+    const deadlineMs = benchmarkDeadlineMs(record.firstObservedAt, record.createdAt);
+    const observeRun = async (runId: string): Promise<'OBSERVED_COMPLETE' | 'OBSERVED_FAILED'> => {
+      try {
+        return await waitForTerminalObservation(pollRunState(runId), {
+          deadlineMs,
+          pollIntervalMs: 60_000,
+          isHalted: haltedByKillSwitch,
+        });
+      } catch (error) {
+        if (error instanceof Error && /KILL_SWITCH/.test(error.message)) await abortIncomplete('KILL_SWITCH_PAUSED');
+        if (error instanceof Error && /WALL_CLOCK_CEILING/.test(error.message)) await abortIncomplete('WALL_CLOCK_CEILING');
+        throw error;
+      }
+    };
+
+    if (rowPlan === 'adopt-recovered') {
+      // A previous attempt scheduled this run but the process was
+      // interrupted before recording it: adopt the durable ledger state and
+      // wait it out. Never schedule a duplicate for the same opportunity.
+      const latest = preMatched[preMatched.length - 1];
+      if (!record.firstObservedAt) {
+        record.firstObservedAt = preMatched.map(run => run.scheduled_at).sort()[0];
+        saveRecord();
+      }
+      const outcome = await observeRun(latest.id);
+      record.attempts.push({
+        benchmarkOpportunityId: designated.benchmarkOpportunityId, poolRowId: designated.poolRowId,
+        country: designated.country, state: outcome, recovered: true,
+        matchedRunIds: preMatched.map(run => run.id),
+      });
+      saveRecord();
+      console.log(`[benchmark-prereg-v1] recovered ${designated.benchmarkOpportunityId} ${outcome} run=${latest.id}`);
+      continue;
+    }
+
+    // rowPlan === 'schedule-attempt': zero matched runs exist; invoke exactly
+    // one cycle. Restriction (Finding 1) guarantees it serves the designated
+    // row or nothing — never unrelated work.
     const attemptStart = new Date();
     const requestId = `benchmark-prereg-v1:${snapshot.snapshotHash.slice(0, 12)}:${designated.poolRowId}`;
     let report: {
@@ -205,75 +284,86 @@ async function main(): Promise<void> {
       const frozenRequest = buildFrozenBenchmarkRequest(snapshot.snapshotHash, row.queryId);
       report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest);
     } catch (error) {
-      record.status = 'INCOMPLETE';
-      record.stopReason = `INFRA_INCIDENT:${error instanceof Error ? error.message : String(error)}`.slice(0, 300);
-      record.attempts.push({ benchmarkOpportunityId: designated.benchmarkOpportunityId, poolRowId: designated.poolRowId, error: record.stopReason });
+      const message = error instanceof Error ? error.message : String(error);
+      if (/already in progress|already held|SCHEDULER_BUSY/.test(message)) {
+        await abortIncomplete(`INFRA_INCIDENT:${message.slice(0, 200)}`);
+      }
+      record.attempts.push({
+        benchmarkOpportunityId: designated.benchmarkOpportunityId, poolRowId: designated.poolRowId,
+        country: designated.country, state: 'EXCLUDED_EXECUTION_FAILURE', cycleRequestId: requestId,
+        exclusionReason: `EXECUTION_FAILURE:${message.slice(0, 200)}`,
+      });
       saveRecord();
-      throw error;
+      console.log(`[benchmark-prereg-v1] excluded ${designated.benchmarkOpportunityId} EXCLUDED_EXECUTION_FAILURE`);
+      continue;
     }
     const attemptEnd = new Date();
-    const matched = (await db.query(
-      `SELECT id, query_id, status, scheduled_at FROM query_runs
-       WHERE metadata->'selectionExperiment'->>'benchmarkOpportunityId' = $1 AND scheduled_at >= $2
-       ORDER BY scheduled_at`,
-      [designated.benchmarkOpportunityId, attemptStart.toISOString()]
-    )).rows as Array<{ id: string; query_id: number; status: string; scheduled_at: string }>;
+    const matched = await readMatched(designated.benchmarkOpportunityId, attemptStart.toISOString());
     const windowRuns = (await db.query(
       `SELECT id, metadata->'selectionExperiment'->>'benchmarkOpportunityId' AS boid FROM query_runs
        WHERE scheduled_at >= $1 AND scheduled_at < $2`,
       [attemptStart.toISOString(), attemptEnd.toISOString()]
     )).rows as Array<{ id: string; boid: string | null }>;
     const extras = windowRuns.filter(run => run.boid !== designated.benchmarkOpportunityId);
-    if (matched.length > 0 && !firstObservedAt) {
-      firstObservedAt = matched.map(run => run.scheduled_at).sort()[0];
-    }
-    if (matched.length > 0) covered.add(designated.benchmarkOpportunityId);
-    let exclusionReason: string | null = null;
-    if (matched.length === 0) {
-      const candidates = report.diagnostics?.candidates || [];
-      const skipped = candidates.find(candidate => candidate.disposition && candidate.disposition !== 'SCHEDULED');
-      exclusionReason = skipped ? `${skipped.disposition}:${skipped.reasonCode || 'UNKNOWN'}` : `CYCLE_SCHEDULED_NOTHING:${(report.summary || '').slice(0, 200)}`;
-    }
-    record.attempts.push({
-      benchmarkOpportunityId: designated.benchmarkOpportunityId,
-      poolRowId: designated.poolRowId,
-      country: designated.country,
-      cycleRequestId: requestId,
-      matchedRunIds: matched.map(run => run.id),
-      matchedStatuses: matched.map(run => run.status),
-      exclusionReason,
-      queuedCount: report.queuedCount || 0,
-      remainingAutonomousQuota: report.remainingAutonomousQuota ?? null,
-    });
     if (extras.length > 0) {
       record.extras.push({ afterOpportunity: designated.benchmarkOpportunityId, count: extras.length, runIds: extras.slice(0, 50).map(run => run.id) });
     }
-    saveRecord();
-    console.log(`[benchmark-prereg-v1] ${covered.size}/${BENCHMARK_PREREG_SCOPE_SIZE} opportunity=${designated.benchmarkOpportunityId} matched=${matched.length} extras=${extras.length}${exclusionReason ? ` excluded=${exclusionReason}` : ''}`);
-    if ((report.remainingAutonomousQuota ?? 1) <= 0) {
-      record.status = covered.size >= BENCHMARK_PREREG_SCOPE_SIZE ? 'COMPLETE' : 'INCOMPLETE';
-      record.stopReason = 'QUOTA_CEILING';
+    if (matched.length === 0) {
+      const classified = classifyNoMatchOutcome({
+        queuedCount: report.queuedCount,
+        remainingAutonomousQuota: report.remainingAutonomousQuota,
+        candidates: report.diagnostics?.candidates,
+        extrasCount: extras.length,
+      });
+      record.attempts.push({
+        benchmarkOpportunityId: designated.benchmarkOpportunityId, poolRowId: designated.poolRowId,
+        country: designated.country, state: classified.state, cycleRequestId: requestId,
+        exclusionReason: classified.reason, queuedCount: report.queuedCount || 0,
+        remainingAutonomousQuota: report.remainingAutonomousQuota ?? null,
+      });
       saveRecord();
-      console.log(`[benchmark-prereg-v1] ${record.status}: quota ceiling reached`);
-      await db.end().catch(() => undefined);
-      process.exit(record.status === 'COMPLETE' ? 0 : 1);
+      console.log(`[benchmark-prereg-v1] excluded ${designated.benchmarkOpportunityId} ${classified.state} ${classified.reason}`);
+    } else {
+      if (!record.firstObservedAt) {
+        record.firstObservedAt = matched.map(run => run.scheduled_at).sort()[0];
+        saveRecord();
+      }
+      const outcome = await observeRun(matched[matched.length - 1].id);
+      record.attempts.push({
+        benchmarkOpportunityId: designated.benchmarkOpportunityId, poolRowId: designated.poolRowId,
+        country: designated.country, state: outcome, cycleRequestId: requestId,
+        matchedRunIds: matched.map(run => run.id),
+        matchedStatuses: matched.map(run => run.status),
+        queuedCount: report.queuedCount || 0,
+        remainingAutonomousQuota: report.remainingAutonomousQuota ?? null,
+      });
+      saveRecord();
+      console.log(`[benchmark-prereg-v1] observed ${designated.benchmarkOpportunityId} ${outcome} run=${matched[matched.length - 1].id}`);
     }
-    if (covered.size >= BENCHMARK_PREREG_SCOPE_SIZE) {
+    const statesNow = record.designatedOpportunities.map(item => rowState(item.benchmarkOpportunityId));
+    if (isScopeTerminallyAccounted(statesNow)) {
       record.status = 'COMPLETE';
       record.stopReason = 'SCOPE_COVERED';
       saveRecord();
-      console.log('[benchmark-prereg-v1] COMPLETE: all 300 designated opportunities observed or excluded');
+      console.log('[benchmark-prereg-v1] COMPLETE: all 300 designated opportunities terminally accounted');
       await db.end().catch(() => undefined);
       process.exit(0);
     }
+    if ((report.remainingAutonomousQuota ?? 1) <= 0) {
+      await abortIncomplete('QUOTA_CEILING');
+    }
   }
 
-  record.status = covered.size >= BENCHMARK_PREREG_SCOPE_SIZE ? 'COMPLETE' : 'INCOMPLETE';
-  record.stopReason = covered.size >= BENCHMARK_PREREG_SCOPE_SIZE ? 'SCOPE_COVERED' : 'DESIGNATED_ROWS_UNCOVERED';
-  saveRecord();
-  console.log(`[benchmark-prereg-v1] ${record.status}: covered=${covered.size}/${BENCHMARK_PREREG_SCOPE_SIZE}`);
-  await db.end().catch(() => undefined);
-  process.exit(record.status === 'COMPLETE' ? 0 : 1);
+  const finalStates = record.designatedOpportunities.map(item => rowState(item.benchmarkOpportunityId));
+  if (isScopeTerminallyAccounted(finalStates)) {
+    record.status = 'COMPLETE';
+    record.stopReason = 'SCOPE_COVERED';
+    saveRecord();
+    console.log('[benchmark-prereg-v1] COMPLETE: all 300 designated opportunities terminally accounted');
+    await db.end().catch(() => undefined);
+    process.exit(0);
+  }
+  await abortIncomplete('DESIGNATED_ROWS_UNACCOUNTED');
 }
 
 main().catch(error => {

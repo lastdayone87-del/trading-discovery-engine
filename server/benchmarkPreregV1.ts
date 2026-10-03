@@ -229,17 +229,38 @@ export function buildPoolSnapshot(input: PoolSnapshotInput): PoolSnapshot {
     exclusionCounts[reason] = (exclusionCounts[reason] || 0) + 1;
   };
   const reservable = rows.filter(query => {
+    // Mirrors production selection/reservation: only ACTIVE rows are
+    // schedulable (getQueriesByCountry requires status='ACTIVE').
+    if (query.status !== 'ACTIVE') {
+      exclude('NOT_ACTIVE');
+      return false;
+    }
     const ok = reservableFilter(query, collectedAt);
     if (!ok) exclude('NOT_RESERVABLE');
     return ok;
   });
-  const outsideCooldown = queriesOutsideCooldown(reservable, collectedAt, cooldownMinutes);
-  exclusionCounts['IN_COOLDOWN'] = reservable.length - outsideCooldown.length;
-  const diverse = limitRepeatedPrimaryTerms(outsideCooldown, rows, collectedAt, cooldownMinutes, maxPrimaryUses);
-  exclusionCounts['PRIMARY_TERM_CAPPED'] = outsideCooldown.length - diverse.length;
-  const rotated = rotateAwayFromMostRecentIntent(diverse, rows);
-  exclusionCounts['MOST_RECENT_INTENT'] = diverse.length - rotated.length;
-  const authorized = rotated.filter(query => {
+  // Cooldown, primary-term diversity, and intent rotation apply WITHIN each
+  // country's query set in production (per-cycle country pools), never
+  // across the whole library: group first so a recent query in country A
+  // cannot exclude an otherwise eligible row in country B.
+  const groups = new Map<string, QueryRecord[]>();
+  for (const query of reservable) {
+    const key = query.country.toLowerCase();
+    const group = groups.get(key);
+    if (group) group.push(query);
+    else groups.set(key, [query]);
+  }
+  const gated: QueryRecord[] = [];
+  for (const group of groups.values()) {
+    const outsideCooldown = queriesOutsideCooldown(group, collectedAt, cooldownMinutes);
+    exclusionCounts['IN_COOLDOWN'] = (exclusionCounts['IN_COOLDOWN'] || 0) + (group.length - outsideCooldown.length);
+    const diverse = limitRepeatedPrimaryTerms(outsideCooldown, group, collectedAt, cooldownMinutes, maxPrimaryUses);
+    exclusionCounts['PRIMARY_TERM_CAPPED'] = (exclusionCounts['PRIMARY_TERM_CAPPED'] || 0) + (outsideCooldown.length - diverse.length);
+    const rotated = rotateAwayFromMostRecentIntent(diverse, group);
+    exclusionCounts['MOST_RECENT_INTENT'] = (exclusionCounts['MOST_RECENT_INTENT'] || 0) + (diverse.length - rotated.length);
+    gated.push(...rotated);
+  }
+  const authorized = gated.filter(query => {
     // Authority revalidation implies the retrieval-shape check
     // (evaluateAutonomousQueryAuthority rejects non-oriented queries with
     // CURRENT_RETRIEVAL_SHAPE_FAILED), so no separate shape stage exists.
@@ -333,11 +354,24 @@ export interface BenchmarkExecutionRecord {
   configurationHash: string;
   maxMigrationVersion: number;
   providerRegistry: Array<Record<string, unknown>>;
+  /**
+   * Full app_settings dump at plan time: the baseline for mid-execution
+   * drift detection (gates + benchmark-relevant knobs). Operational cursors
+   * are recorded but never compared (see detectConfigurationDrift).
+   */
+  appSettings: Array<{ setting_key: string; setting_value: string }>;
   designatedOpportunities: Array<{ snapshotHash: string; poolRowId: number; benchmarkOpportunityId: string; country: string }>;
   status: 'PLANNED' | 'IN_PROGRESS' | 'COMPLETE' | 'INCOMPLETE';
   attempts: Array<Record<string, unknown>>;
   extras: Array<Record<string, unknown>>;
   stopReason: string | null;
+  /**
+   * Authoritative 14-day wall-clock anchor: the earliest matched benchmark
+   * run's scheduled_at, persisted here so process restarts can never reset
+   * the window. Null until the first observation; createdAt is the
+   * provisional bound meanwhile (documented, never extended on restart).
+   */
+  firstObservedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -349,6 +383,7 @@ export function buildExecutionRecord(input: {
   configurationHash: string;
   maxMigrationVersion: number;
   providerRegistry: Array<Record<string, unknown>>;
+  appSettings: Array<{ setting_key: string; setting_value: string }>;
 }): BenchmarkExecutionRecord {
   verifyFrozenBenchmarkVersions();
   verifyPoolSnapshotHash(input.poolSnapshot);
@@ -364,6 +399,7 @@ export function buildExecutionRecord(input: {
     configurationHash: input.configurationHash,
     maxMigrationVersion: input.maxMigrationVersion,
     providerRegistry: input.providerRegistry,
+    appSettings: input.appSettings,
     designatedOpportunities: input.poolSnapshot.rows.map(row => ({
       snapshotHash: input.poolSnapshot.snapshotHash,
       poolRowId: row.queryId,
@@ -374,6 +410,7 @@ export function buildExecutionRecord(input: {
     attempts: [],
     extras: [],
     stopReason: null,
+    firstObservedAt: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -384,4 +421,212 @@ export function assertNormalizedRequestUsable(normalized: NormalizedSelectionExp
   if (!normalized || !isFrozenBenchmarkConfiguration(normalized)) {
     throw new Error('BENCHMARK_PREREG_FROZEN_REQUEST_REJECTED');
   }
+}
+
+/**
+ * Fail closed unless the snapshot holds the full frozen scope. An
+ * undersized plan is not an executable benchmark: the frozen scope is 300,
+ * never silently fewer. Reports the deterministic reason (candidate volume
+ * plus leading exclusion causes) so operators know what to remediate.
+ */
+export function assertFullScope(snapshot: PoolSnapshot): void {
+  if (snapshot.rows.length >= BENCHMARK_PREREG_SCOPE_SIZE) return;
+  const reasons = Object.entries(snapshot.exclusionCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(',');
+  throw new Error(
+    `BENCHMARK_PREREG_INSUFFICIENT_POOL: eligible=${snapshot.rows.length} required=${BENCHMARK_PREREG_SCOPE_SIZE} candidates=${snapshot.candidateRows} exclusions:${reasons}`
+  );
+}
+
+export type BenchmarkRowState =
+  | 'NOT_ATTEMPTED'
+  | 'AWAITING_TERMINAL'
+  | 'OBSERVED_COMPLETE'
+  | 'OBSERVED_FAILED'
+  | 'EXCLUDED_ELIGIBILITY'
+  | 'EXCLUDED_NO_CAPACITY'
+  | 'EXCLUDED_SELECTED_ANOTHER'
+  | 'EXCLUDED_EXECUTION_FAILURE';
+
+const BENCHMARK_ROW_TERMINAL_STATES: BenchmarkRowState[] = [
+  'OBSERVED_COMPLETE',
+  'OBSERVED_FAILED',
+  'EXCLUDED_ELIGIBILITY',
+  'EXCLUDED_NO_CAPACITY',
+  'EXCLUDED_SELECTED_ANOTHER',
+  'EXCLUDED_EXECUTION_FAILURE',
+];
+
+/** Every designated opportunity needs one of these before scope can complete. */
+export function isBenchmarkRowTerminal(state: BenchmarkRowState): boolean {
+  return BENCHMARK_ROW_TERMINAL_STATES.includes(state);
+}
+
+export interface NoMatchClassification {
+  state: Extract<BenchmarkRowState, 'EXCLUDED_ELIGIBILITY' | 'EXCLUDED_NO_CAPACITY' | 'EXCLUDED_SELECTED_ANOTHER'>;
+  reason: string;
+}
+
+/**
+ * Classifies a designated attempt that scheduled zero matched runs. Pure and
+ * deterministic: the cycle report diagnostics decide between eligibility,
+ * capacity, and selected-another outcomes. Never fabricates an observation.
+ */
+export function classifyNoMatchOutcome(input: {
+  queuedCount?: number;
+  remainingAutonomousQuota?: number | null;
+  candidates?: Array<{ disposition?: string; reasonCode?: string }>;
+  extrasCount: number;
+}): NoMatchClassification {
+  if (input.extrasCount > 0) {
+    return {
+      state: 'EXCLUDED_SELECTED_ANOTHER',
+      reason: `SELECTED_ANOTHER_QUERY:extras=${input.extrasCount}`,
+    };
+  }
+  const skipped = (input.candidates || []).find(candidate => candidate.disposition && candidate.disposition !== 'SCHEDULED');
+  const code = skipped?.reasonCode || skipped?.disposition || '';
+  if (/QUOTA|QUEUE|CAPACITY/.test(code) || (input.queuedCount || 0) === 0 && (input.remainingAutonomousQuota ?? 1) <= 0) {
+    return { state: 'EXCLUDED_NO_CAPACITY', reason: `NO_QUEUE_CAPACITY:${code || 'quota-exhausted'}` };
+  }
+  return { state: 'EXCLUDED_ELIGIBILITY', reason: `ELIGIBILITY:${code || 'cycle-scheduled-nothing'}` };
+}
+
+/** True only when every designated row is terminally accounted. */
+export function isScopeTerminallyAccounted(states: BenchmarkRowState[]): boolean {
+  return states.length > 0 && states.every(isBenchmarkRowTerminal);
+}
+
+export interface TerminalObservationPoll {
+  status: string;
+  attributed: boolean;
+}
+
+/**
+ * Waits for a scheduled run to become a legitimate benchmark observation:
+ * terminal status (COMPLETED/FAILED) AND a persisted accounting attribution
+ * row. Scheduling alone is never an observation. Fails closed on the wall
+ * clock ceiling or a kill-switch halt; never fabricates. Inject sleep/clock
+ * for tests; production polls the run ledger.
+ */
+export async function waitForTerminalObservation(
+  pollRun: () => Promise<TerminalObservationPoll>,
+  opts: {
+    deadlineMs: number;
+    nowMs?: () => number;
+    sleepMs?: (ms: number) => Promise<void>;
+    pollIntervalMs?: number;
+    isHalted?: () => boolean | Promise<boolean>;
+  }
+): Promise<'OBSERVED_COMPLETE' | 'OBSERVED_FAILED'> {
+  const nowMs = opts.nowMs ?? Date.now;
+  const sleepMs = opts.sleepMs ?? ((ms: number) => new Promise(resolve => setTimeout(resolve, ms)));
+  const interval = opts.pollIntervalMs ?? 60_000;
+  for (;;) {
+    if (await opts.isHalted?.()) throw new Error('BENCHMARK_PREREG_KILL_SWITCH');
+    const observed = await pollRun();
+    const terminal = observed.status === 'COMPLETED' || observed.status === 'FAILED';
+    if (terminal && observed.attributed) {
+      return observed.status === 'COMPLETED' ? 'OBSERVED_COMPLETE' : 'OBSERVED_FAILED';
+    }
+    if (nowMs() > opts.deadlineMs) throw new Error('BENCHMARK_PREREG_WALL_CLOCK_CEILING');
+    await sleepMs(interval);
+  }
+}
+
+/** Knobs compared for mid-execution drift (settings key → env key → default). */
+export const BENCHMARK_PREREG_DRIFT_KNOBS: Array<{ setting: string; env: string; fallback: string }> = [
+  { setting: 'query_intelligence_query_cooldown_minutes', env: 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', fallback: '360' },
+  { setting: 'query_intelligence_primary_term_max_uses', env: 'QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES', fallback: '2' },
+  { setting: 'query_intelligence_exploration_ratio', env: 'QUERY_INTELLIGENCE_EXPLORATION_RATIO', fallback: '0.4' },
+  { setting: 'discovery_batch_size', env: 'DISCOVERY_BATCH_SIZE', fallback: '5' },
+  { setting: 'discovery_target_queue_depth', env: 'DISCOVERY_TARGET_QUEUE_DEPTH', fallback: '15' },
+  { setting: 'discovery_autonomous_quota_percent', env: 'DISCOVERY_AUTONOMOUS_QUOTA_PERCENT', fallback: '70' },
+  { setting: 'discovery_video_lane_percent', env: 'DISCOVERY_VIDEO_LANE_PERCENT', fallback: '70' },
+  { setting: 'discovery_date_ordering_video_percent', env: 'DISCOVERY_DATE_ORDERING_VIDEO_PERCENT', fallback: '10' },
+  { setting: 'autonomous_pagination_max_pages', env: 'AUTONOMOUS_PAGINATION_MAX_PAGES', fallback: '3' },
+  { setting: 'autonomous_pagination_max_low_yield_pages', env: 'AUTONOMOUS_PAGINATION_MAX_LOW_YIELD_PAGES', fallback: '2' },
+];
+
+/** Effective knob values under the same precedence the engine uses. */
+export function effectiveBenchmarkKnobs(
+  settings: Record<string, string>,
+  env: Record<string, string | undefined> = process.env
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const knob of BENCHMARK_PREREG_DRIFT_KNOBS) {
+    out[knob.setting] = settings[knob.setting] ?? env[knob.env] ?? knob.fallback;
+  }
+  return out;
+}
+
+export interface DriftCheckProvenance {
+  settings: Record<string, string>;
+  providerRegistry: unknown;
+  maxMigrationVersion: number;
+}
+
+/**
+ * Compares live provenance against the planned record. Any difference in
+ * gates, benchmark-relevant knobs, provider registry, migration level, or
+ * code versions is drift: fail closed, schedule nothing further. Operational
+ * cursors (country index, materialization cursors, scheduler state) are
+ * intentionally outside the checked set — they cannot change treatment.
+ */
+export function detectConfigurationDrift(
+  planned: DriftCheckProvenance,
+  current: DriftCheckProvenance,
+  env: Record<string, string | undefined> = process.env
+): string[] {
+  const drift: string[] = [];
+  try {
+    verifyBenchmarkGatesOff(current.settings);
+  } catch (error) {
+    drift.push(error instanceof Error ? error.message : String(error));
+  }
+  try {
+    verifyFrozenBenchmarkVersions();
+  } catch (error) {
+    drift.push(error instanceof Error ? error.message : String(error));
+  }
+  const plannedKnobs = effectiveBenchmarkKnobs(planned.settings, env);
+  const currentKnobs = effectiveBenchmarkKnobs(current.settings, env);
+  for (const knob of BENCHMARK_PREREG_DRIFT_KNOBS) {
+    if (plannedKnobs[knob.setting] !== currentKnobs[knob.setting]) {
+      drift.push(`BENCHMARK_PREREG_KNOB_DRIFT:${knob.setting}:${plannedKnobs[knob.setting]}->${currentKnobs[knob.setting]}`);
+    }
+  }
+  if (JSON.stringify(planned.providerRegistry) !== JSON.stringify(current.providerRegistry)) {
+    drift.push('BENCHMARK_PREREG_PROVIDER_REGISTRY_DRIFT');
+  }
+  if (current.maxMigrationVersion !== planned.maxMigrationVersion) {
+    drift.push(`BENCHMARK_PREREG_MIGRATION_DRIFT:${planned.maxMigrationVersion}->${current.maxMigrationVersion}`);
+  }
+  return drift;
+}
+
+/** 14-day ceiling from the durable anchor (first observation, else record creation). */
+export function benchmarkDeadlineMs(firstObservedAt: string | null, createdAt: string): number {
+  return new Date(firstObservedAt || createdAt).getTime() + BENCHMARK_PREREG_WALL_CLOCK_DAYS * 24 * 60 * 60 * 1000;
+}
+
+export function isWallClockExceeded(nowMs: number, firstObservedAt: string | null, createdAt: string): boolean {
+  return nowMs > benchmarkDeadlineMs(firstObservedAt, createdAt);
+}
+
+export type RowAttemptPlan = 'skip-covered' | 'adopt-recovered' | 'schedule-attempt';
+
+/**
+ * Resume-safe per-row decision. Recovery is idempotent by construction:
+ * matched runs discovered in the durable ledger are adopted (never
+ * rescheduled merely because local attempt state was lost); only a row
+ * with zero matched runs proceeds to scheduling.
+ */
+export function planRowAttempt(args: { covered: boolean; matchedRunIds: string[] }): RowAttemptPlan {
+  if (args.covered) return 'skip-covered';
+  if (args.matchedRunIds.length > 0) return 'adopt-recovered';
+  return 'schedule-attempt';
 }

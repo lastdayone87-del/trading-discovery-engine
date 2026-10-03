@@ -298,6 +298,21 @@ Return ONLY a valid JSON object with format:
 // ==========================================
 
 /**
+ * Benchmark designated-row restriction (benchmark-preregistration-v1
+ * execution only). Narrows a candidate pool to the designated pool row so a
+ * benchmark attempt can serve ONLY that row or nothing — the cycle then
+ * never schedules unrelated work while claiming a designated opportunity.
+ * Pure. An undefined restriction returns the input reference unchanged.
+ */
+export function restrictPoolToDesignatedRow<T extends { id: number }>(
+  pool: T[],
+  restrictToQueryIds: number[] | undefined
+): T[] {
+  if (restrictToQueryIds === undefined) return pool;
+  return pool.filter(query => restrictToQueryIds.includes(query.id));
+}
+
+/**
  * Selects the next search query for a country using Multi-Armed Bandit (UCB1)
  * balancing exploitation (PROVEN) vs exploration (EXPERIMENTAL) with intent rotation.
  */
@@ -311,6 +326,14 @@ export async function selectNextQueryForCountry(
      * supported country can bootstrap instead of staying dormant forever.
      */
     scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
+    /**
+     * Benchmark designated-row restriction (benchmark-preregistration-v1
+     * execution only). When defined, selection may serve ONLY one of these
+     * query ids, and returns null instead of generating cold-start or
+     * exploration queries when none is eligible. Absent by default: legacy
+     * behavior byte-identical.
+     */
+    restrictToQueryIds?: number[];
   } = {}
 ): Promise<{
   queryRecord: QueryRecord;
@@ -325,12 +348,18 @@ export async function selectNextQueryForCountry(
       && (!reservedUntil || new Date(reservedUntil) <= now)
       && (!nextEligibleAt || new Date(nextEligibleAt) <= now);
   });
+  // Benchmark-designated restriction: narrow to the designated row. An
+  // absent designated row yields no candidate — never cold-start-generate
+  // unrelated queries for a restricted request.
+  const restrictedQueries = restrictPoolToDesignatedRow(queries, options.restrictToQueryIds);
+  if (options.restrictToQueryIds !== undefined && restrictedQueries.length === 0) return null;
   const cooldownMinutes = Math.max(1, Number(await getAppSetting('query_intelligence_query_cooldown_minutes', process.env.QUERY_INTELLIGENCE_COOLDOWN_MINUTES || '360')) || 360);
   const maxPrimaryUses = Math.max(1, Number(await getAppSetting('query_intelligence_primary_term_max_uses', process.env.QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES || '2')) || 2);
   const explorationRatio = Math.min(0.9, Math.max(0.1, Number(await getAppSetting('query_intelligence_exploration_ratio', process.env.QUERY_INTELLIGENCE_EXPLORATION_RATIO || '0.4')) || 0.4));
 
   // If no queries exist for country, generate cold-start initial queries
-  if (queries.length === 0) {
+  // (unreachable for restricted requests: those returned null above).
+  if (restrictedQueries.length === 0) {
     const generated = await generateCandidateQueriesForCountry(country, 4, 'COLD_START', { scopePromotionBasis: options.scopePromotionBasis });
     const selected = generated[0];
     if (!selected) return null;
@@ -342,10 +371,13 @@ export async function selectNextQueryForCountry(
   }
 
   // Cooldown is a hard eligibility gate, never merely a score penalty.
-  const outsideCooldown = queriesOutsideCooldown(queries, now, cooldownMinutes);
-  let eligible = limitRepeatedPrimaryTerms(outsideCooldown, queries, now, cooldownMinutes, maxPrimaryUses);
-  eligible = rotateAwayFromMostRecentIntent(eligible, queries);
+  const outsideCooldown = queriesOutsideCooldown(restrictedQueries, now, cooldownMinutes);
+  let eligible = limitRepeatedPrimaryTerms(outsideCooldown, restrictedQueries, now, cooldownMinutes, maxPrimaryUses);
+  eligible = rotateAwayFromMostRecentIntent(eligible, restrictedQueries);
   if (eligible.length === 0) {
+    // A restricted (benchmark-designated) request whose row is ineligible is
+    // a deterministic exclusion — never generate exploration queries for it.
+    if (options.restrictToQueryIds !== undefined) return null;
     const generated = await generateCandidateQueriesForCountry(country, 4, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
     const selected = generated[0];
     if (!selected) return null;
