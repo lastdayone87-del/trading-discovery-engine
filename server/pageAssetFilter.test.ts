@@ -77,3 +77,9 @@ test('asset URLs in channelLinks and socialLinks never become crawl seeds', asyn
   const seeds = (result.acquisitionOutcomes || []).map(outcome => outcome.requestedUrl);
   assert.ok(!seeds.some(url => isPageAssetInfrastructureUrl(url)), 'no asset seed recorded');
 });
+
+test('scheme-less creator links survive the filter', () => {
+  assert.equal(isPageAssetInfrastructureUrl('example.com/community'), false);
+  assert.equal(isPageAssetInfrastructureUrl('kiss.com'), false);
+  assert.equal(isPageAssetInfrastructureUrl('t.me/tradingroom'), false);
+});

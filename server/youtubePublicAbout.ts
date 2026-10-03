@@ -198,6 +198,10 @@ export function parseYouTubeChannelAboutFromHtml(
   // Page-asset infrastructure endpoints (thumbnails, playback, telemetry,
   // schema, fonts) captured by the indiscriminate scrape above can never be
   // creator sites, so they are filtered here and never become crawl seeds.
+  // The predicate applies the normalizer's https fallback internally, so
+  // scheme-less creator links survive; youtube/redirect wrappers keep their
+  // wrapper host here and are unwrapped-then-filtered at the normalize-first
+  // seed boundary downstream.
   const extractedUrls = Array.from(
     new Set([...explicitLinks, ...extractExternalUrlsFromHtmlText(cleanHtml)])
   ).filter(url => !isPageAssetInfrastructureUrl(url));

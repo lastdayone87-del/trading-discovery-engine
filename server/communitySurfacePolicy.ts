@@ -294,14 +294,21 @@ const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
   'gstatic.com',
 ];
 export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
-  let host = '';
-  try {
-    host = new URL(rawUrl).hostname.toLowerCase();
-  } catch {
-    return true;
+  // Scheme-less links get the same https fallback as normalizeExternalUrl so
+  // valid creator links (e.g. `example.com/community`) are never dropped;
+  // only unparseable strings and asset hosts are filtered.
+  const candidates = [rawUrl, /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`];
+  for (const candidate of candidates) {
+    try {
+      const host = new URL(candidate).hostname.toLowerCase();
+      if (!host) return true;
+      if (PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
+      return false;
+    } catch {
+      continue;
+    }
   }
-  if (!host) return true;
-  return PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`));
+  return true;
 }
 
 export function isKnownBrokerOrExchangeHost(host: string): boolean {

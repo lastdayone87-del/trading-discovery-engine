@@ -782,16 +782,21 @@ export async function processNextSearchJob(
         const queryMetadata = authorityQueryRecord?.generation_metadata || {};
         const preferredLanguage = preferredLanguageFromQueryMetadata(queryMetadata);
         const retrievalStartMs = Date.now();
-        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
-          if(braveProvider||quotaFreeInnertubeProvider) return;
-          const topUpStartMs = Date.now();
-          const budget=getDailyYouTubeQuotaBudget();
-          const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
-          const toppedUp=await topUpQuotaReservation({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',additionalUnits,dailyBudget:budget,allocationPercent:percent});
-          searchTopUpWaitMs += Date.now() - topUpStartMs;
-          if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
-        },priority:'autonomous'});
-        searchRetrievalGrossMs += Date.now() - retrievalStartMs;
+        try {
+          searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
+            if(braveProvider||quotaFreeInnertubeProvider) return;
+            const topUpStartMs = Date.now();
+            const budget=getDailyYouTubeQuotaBudget();
+            const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
+            const toppedUp=await topUpQuotaReservation({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',additionalUnits,dailyBudget:budget,allocationPercent:percent});
+            searchTopUpWaitMs += Date.now() - topUpStartMs;
+            if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
+          },priority:'autonomous'});
+        } finally {
+          // Failed retrieval attempts are retrieval wall time too: attribute
+          // them even when the call throws into the handler below.
+          searchRetrievalGrossMs += Date.now() - retrievalStartMs;
+        }
         if(braveProvider){
           providerRequestsSucceeded=1; providerPagesRetrieved=1; providerCostUsd=Number(searchPage.providerCostUsd ?? 0);
           await settleProviderRequest(providerRequestId!, 'SUCCEEDED', providerCostUsd);
@@ -811,7 +816,14 @@ export async function processNextSearchJob(
     // Quota-free providers never fall back to the official YouTube API: an
     // empty InnerTube page is an honest empty result, not a trigger to spend
     // official quota. (The legacy official path keeps its existing behavior.)
-    const extracted = searchPage?.channels || (quotaFreeInnertubeProvider ? [] : await searchYouTubeChannels(query, country, vocab, retrievalLane));
+    // The legacy official fallback is retrieval wall time like any provider.
+    const fallbackStartMs = Date.now();
+    let extracted: DiscoveredChannelRaw[] = [];
+    try {
+      extracted = searchPage?.channels || (quotaFreeInnertubeProvider ? [] : await searchYouTubeChannels(query, country, vocab, retrievalLane));
+    } finally {
+      searchRetrievalGrossMs += Date.now() - fallbackStartMs;
+    }
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
