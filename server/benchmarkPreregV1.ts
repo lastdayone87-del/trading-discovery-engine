@@ -491,14 +491,16 @@ export function classifyNoMatchOutcome(input: {
   candidates?: Array<{ disposition?: string; reasonCode?: string }>;
   extrasCount: number;
 }): NoMatchClassification {
-  if (input.extrasCount > 0) {
-    return {
-      state: 'EXCLUDED_SELECTED_ANOTHER',
-      reason: `SELECTED_ANOTHER_QUERY:extras=${input.extrasCount}`,
-    };
-  }
   const skipped = (input.candidates || []).find(candidate => candidate.disposition && candidate.disposition !== 'SCHEDULED');
   const code = skipped?.reasonCode || skipped?.disposition || '';
+  // A declined free choice is selected-another, never an eligibility
+  // failure: the row's eligibility did not fail, the arm chose elsewhere.
+  if (/SELECTED_ANOTHER/.test(code) || input.extrasCount > 0) {
+    return {
+      state: 'EXCLUDED_SELECTED_ANOTHER',
+      reason: `SELECTED_ANOTHER_QUERY:${code || `extras=${input.extrasCount}`}`,
+    };
+  }
   if (/QUOTA|QUEUE|CAPACITY/.test(code) || (input.queuedCount || 0) === 0 && (input.remainingAutonomousQuota ?? 1) <= 0) {
     return { state: 'EXCLUDED_NO_CAPACITY', reason: `NO_QUEUE_CAPACITY:${code || 'quota-exhausted'}` };
   }

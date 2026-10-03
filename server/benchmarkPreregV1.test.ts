@@ -205,6 +205,12 @@ test('row accounting states distinguish every terminal outcome', async () => {
     classifyNoMatchOutcome({ queuedCount: 3, remainingAutonomousQuota: 100, candidates: [], extrasCount: 2 }).state,
     'EXCLUDED_SELECTED_ANOTHER'
   );
+  // A declined free choice keeps its selected-another state even with zero
+  // extras: the row's eligibility did not fail, the arm chose elsewhere.
+  assert.deepEqual(
+    classifyNoMatchOutcome({ queuedCount: 3, remainingAutonomousQuota: 100, candidates: [{ disposition: 'SKIPPED', reasonCode: 'SELECTED_ANOTHER_QUERY' }], extrasCount: 0 }),
+    { state: 'EXCLUDED_SELECTED_ANOTHER', reason: 'SELECTED_ANOTHER_QUERY:SELECTED_ANOTHER_QUERY' }
+  );
   // Scope completes only when nothing is pending or unattempted.
   assert.equal(isScopeTerminallyAccounted(['OBSERVED_COMPLETE', 'OBSERVED_FAILED', 'EXCLUDED_ELIGIBILITY']), true);
   assert.equal(isScopeTerminallyAccounted(['OBSERVED_COMPLETE', 'NOT_ATTEMPTED']), false);

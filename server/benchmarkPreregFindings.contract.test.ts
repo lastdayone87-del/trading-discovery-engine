@@ -99,3 +99,21 @@ test('plan enforces the full frozen scope and execution waits for terminal attri
   assert.match(script, /detectConfigurationDrift\(/);
   assert.match(script, /record\.firstObservedAt/);
 });
+
+test('cycle throw adopts ledger-matched runs; unreadable ledger aborts instead of excluding', () => {
+  const script = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  // A failed release strands nothing silently: genuinely stranded RESERVED
+  // decisions abort the run as an infra incident.
+  assert.match(script, /BENCHMARK_ALLOCATION_RELEASE_FAILED/);
+  assert.match(script, /INFRA_INCIDENT:LEDGER_UNREADABLE/);
+  // No silent empty-list fallback on ledger read failure.
+  assert.doesNotMatch(script, /readMatched\(designated\.benchmarkOpportunityId, attemptStart\.toISOString\(\)\)\.catch\(\(\) => \[\]\)/);
+});
+
+test('failed benchmark allocation release fails closed only when still reserved', () => {
+  const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  // A benign race (decision already consumed elsewhere) proceeds; only a
+  // still-RESERVED decision with held quota fails the cycle.
+  assert.match(source, /SELECT decision_status FROM frontier_allocation_decisions WHERE decision_id = \$1/);
+  assert.match(source, /BENCHMARK_ALLOCATION_RELEASE_FAILED/);
+});

@@ -487,12 +487,30 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // stranding a RESERVED decision with held quota while scheduling as
       // LEGACY. Absent a benchmark scope this block is inert.
       if (normalizedExperiment?.benchmark && frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+        const benchmarkDeclinedId = frontierAllocationInfo.decision.decisionId;
         const released = await releaseAllocationDecision(
-          frontierAllocationInfo.decision.decisionId,
+          benchmarkDeclinedId,
           'Benchmark-designated attempt declines non-designated allocation'
         );
         if (!released) {
-          throw new Error(`BENCHMARK_ALLOCATION_RELEASE_FAILED:${frontierAllocationInfo.decision.decisionId}`);
+          // Distinguish a benign race (another worker already consumed or
+          // expired the decision: nothing is held) from a genuinely stranded
+          // RESERVED decision (quota held). Only the stranded case fails the
+          // cycle — and an unreadable ledger fails closed the same way.
+          let stillReserved = true;
+          try {
+            const releaseCheckDb = await getDb();
+            const releaseCheck = await releaseCheckDb.query(
+              'SELECT decision_status FROM frontier_allocation_decisions WHERE decision_id = $1',
+              [benchmarkDeclinedId]
+            );
+            stillReserved = releaseCheck.rows.length > 0 && String(releaseCheck.rows[0].decision_status) === 'RESERVED';
+          } catch {
+            stillReserved = true;
+          }
+          if (stillReserved) {
+            throw new Error(`BENCHMARK_ALLOCATION_RELEASE_FAILED:${benchmarkDeclinedId}`);
+          }
         }
         frontierAllocationInfo.authorized = false;
       }

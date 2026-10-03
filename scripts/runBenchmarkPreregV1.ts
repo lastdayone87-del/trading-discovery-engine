@@ -289,14 +289,21 @@ async function main(): Promise<void> {
       report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (/already in progress|already held|SCHEDULER_BUSY/.test(message)) {
+      if (/already in progress|already held|SCHEDULER_BUSY|BENCHMARK_ALLOCATION_RELEASE_FAILED/.test(message)) {
         await abortIncomplete(`INFRA_INCIDENT:${message.slice(0, 200)}`);
       }
       // The producer may have scheduled before throwing (e.g., post-commit
       // scheduler-state bookkeeping): read the durable ledger first. An
       // already-created run is adopted and awaited — never excluded while it
       // may yet produce an attributed observation, and never rescheduled.
-      const postMatched = await readMatched(designated.benchmarkOpportunityId, attemptStart.toISOString()).catch(() => []);
+      // A ledger read failure is itself an infra incident, never an empty
+      // match list: abort rather than risk excluding a row whose run exists.
+      let postMatched: Array<{ id: string; query_id: number; status: string; scheduled_at: string }>;
+      try {
+        postMatched = await readMatched(designated.benchmarkOpportunityId, attemptStart.toISOString());
+      } catch (readError) {
+        await abortIncomplete(`INFRA_INCIDENT:LEDGER_UNREADABLE:${(readError instanceof Error ? readError.message : String(readError)).slice(0, 120)}`);
+      }
       if (postMatched.length > 0) {
         if (!record.firstObservedAt) {
           record.firstObservedAt = postMatched.map(run => run.scheduled_at).sort()[0];
