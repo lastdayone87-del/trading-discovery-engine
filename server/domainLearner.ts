@@ -319,3 +319,58 @@ export async function consumeExperimentalWeights(
   if (!resolved) return { available: false, reason: 'NO_APPROVED_WEIGHTS' };
   return { available: true, version: resolved.version, weights: resolved.weights };
 }
+
+export interface DomainWeightShadowCandidate {
+  url: string;
+  score: number;
+}
+
+export interface DomainWeightShadowEvaluation {
+  siteIdentity: string;
+  weightsVersion: string;
+  routeCount: number;
+  baselineTopUrl: string | null;
+  shadowPickUrl: string | null;
+  agreement: boolean;
+}
+
+/**
+ * Shadow evaluation of experimental domain weights against a live crawl
+ * order. Observational only: the result never routes, budgets, or stops
+ * anything — it records what an approved-weights policy WOULD have picked
+ * next to the baseline order for later comparison. Returns null unless the
+ * explicit experiment gate admits AND an APPROVED snapshot exists for the
+ * site (DRAFT is never consumed). Attempts are unknown in crawl context and
+ * recorded as 0 for every route (exploration floor applies uniformly).
+ */
+export async function evaluateDomainWeightShadow(
+  siteIdentity: string,
+  candidates: DomainWeightShadowCandidate[],
+  deps: {
+    readSetting?: (key: string, fallback: string) => Promise<string>;
+    getApproved?: (siteIdentity: string) => Promise<{ version: string; weights: Record<string, number> } | null>;
+  } = {}
+): Promise<DomainWeightShadowEvaluation | null> {
+  if (!siteIdentity || !candidates.length) return null;
+  const consumption = await consumeExperimentalWeights(siteIdentity, deps);
+  if (!consumption.available) return null;
+  const routes = candidates.map(candidate => {
+    const pattern = routePatternFor(candidate.url) || candidate.url;
+    return { pattern, weight: consumption.weights[pattern] ?? 0, attempts: 0, url: candidate.url };
+  });
+  const pick = resolveRoutePick(
+    routes.map(({ pattern, weight, attempts }) => ({ pattern, weight, attempts })),
+    ROUTE_EXPLORATION_FLOOR_BPS,
+    siteIdentity
+  );
+  const shadowPickUrl = routes.find(route => route.pattern === pick)?.url ?? null;
+  const baselineTopUrl = candidates[0]?.url ?? null;
+  return {
+    siteIdentity,
+    weightsVersion: consumption.version,
+    routeCount: routes.length,
+    baselineTopUrl,
+    shadowPickUrl,
+    agreement: shadowPickUrl !== null && shadowPickUrl === baselineTopUrl,
+  };
+}

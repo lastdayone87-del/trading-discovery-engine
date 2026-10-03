@@ -174,3 +174,46 @@ test('experimental weight consumption is default-off and never serves DRAFT', as
   });
   assert.deepEqual(open, { available: true, version: 'dw-approved', weights: { a: 0.7 } });
 });
+
+test('domain-weight shadow evaluation is observational and version-bound', async () => {
+  const { evaluateDomainWeightShadow } = await import('./domainLearner');
+  assert.equal(await evaluateDomainWeightShadow('', [{ url: 'https://example.com/a', score: 10 }]), null);
+  assert.equal(
+    await evaluateDomainWeightShadow('example.com', [], {
+      readSetting: async () => 'true',
+      getApproved: async () => ({ version: 'dw-1', weights: {} }),
+    }),
+    null
+  );
+  assert.equal(
+    await evaluateDomainWeightShadow('example.com', [{ url: 'https://example.com/a', score: 10 }], {
+      readSetting: async () => 'false',
+      getApproved: async () => ({ version: 'dw-1', weights: {} }),
+    }),
+    null
+  );
+  assert.equal(
+    await evaluateDomainWeightShadow('example.com', [{ url: 'https://example.com/a', score: 10 }], {
+      readSetting: async () => 'true',
+      getApproved: async () => null,
+    }),
+    null
+  );
+  const shadow = await evaluateDomainWeightShadow(
+    'example.com',
+    [
+      { url: 'https://example.com/b', score: 90 },
+      { url: 'https://example.com/a', score: 10 },
+    ],
+    {
+      readSetting: async () => 'true',
+      getApproved: async () => ({ version: 'dw-approved-1', weights: {} }),
+    }
+  );
+  assert.ok(shadow);
+  assert.equal(shadow?.siteIdentity, 'example.com');
+  assert.equal(shadow?.weightsVersion, 'dw-approved-1');
+  assert.equal(shadow?.routeCount, 2);
+  assert.equal(shadow?.baselineTopUrl, 'https://example.com/b');
+  assert.equal(typeof shadow?.agreement, 'boolean');
+});
