@@ -286,6 +286,7 @@ export function isDotlessHostnameUrl(raw: string): boolean {
 const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
   'ytimg.com',
   'googlevideo.com',
+  'googleapis.com',
   'schema.org',
   'w3.org',
   'fonts.googleapis.com',
@@ -296,11 +297,12 @@ const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
 export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
   // Scheme-less links get the same https fallback as normalizeExternalUrl so
   // valid creator links (e.g. `example.com/community`) are never dropped;
-  // only unparseable strings and asset hosts are filtered.
+  // only unparseable strings and asset hosts are filtered. A single trailing
+  // dot is DNS-equivalent noise and is stripped before comparison.
   const candidates = [rawUrl, /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`];
   for (const candidate of candidates) {
     try {
-      const host = new URL(candidate).hostname.toLowerCase();
+      const host = new URL(candidate).hostname.toLowerCase().replace(/\.$/, '');
       if (!host) return true;
       if (PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
       return false;

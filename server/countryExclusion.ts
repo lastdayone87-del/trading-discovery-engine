@@ -1,5 +1,5 @@
 import { getExcludedCountries } from './db';
-import { CountryExclusionMatch, findCountryExclusion } from './countryExclusionRules';
+import { CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
 export { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
@@ -38,6 +38,10 @@ export function shouldBlockEnrichClaimForCountry(
 ): CountryExclusionMatch | null {
   if (countryStatus !== 'CONFIRMED') return null;
   if (typeof country !== 'string' || !country.trim()) return null;
+  if (!exclusion) return null;
+  // Defense in depth: the match must belong to this country. A stale or
+  // mismatched lookup result must never block the wrong country.
+  if (normalizeCountryName(exclusion.country) !== normalizeCountryName(country)) return null;
   return exclusion;
 }
 

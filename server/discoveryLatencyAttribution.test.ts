@@ -22,7 +22,7 @@ test('stale recovery summary tolerates missing lock metadata', () => {
   assert.equal(summary.oldestStuckMs, 0);
 });
 
-test('SEARCH latency breakdown separates quota-wait, retrieval, and processing', () => {
+test('latency buckets are disjoint across quota, retrieval, and processing spans', () => {
   const breakdown = buildSearchLatencyBreakdownMs(1000, 200, 3000, 500, 5000, 8000, 9000);
   assert.deepEqual(breakdown, {
     workerTotalMs: 8000,
@@ -33,11 +33,22 @@ test('SEARCH latency breakdown separates quota-wait, retrieval, and processing',
 });
 
 test('channel processing ends at loop end, not at post-loop accounting', () => {
-  // Post-loop work (query-performance evaluation, sightings persistence)
-  // must not inflate channelProcessingMs; workerTotalMs still covers it.
+  // Pure-function check: the loop-end timestamp bounds channelProcessingMs
+  // while workerTotalMs still covers post-loop work. Capture placement in
+  // the worker is guarded by the source-order assertion below.
   const breakdown = buildSearchLatencyBreakdownMs(0, 0, 0, 0, 1000, 2000, 9000);
   assert.equal(breakdown.channelProcessingMs, 1000);
   assert.equal(breakdown.workerTotalMs, 9000);
+});
+
+test('loop-end capture precedes post-loop accounting in the SEARCH worker', async () => {
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
+  const captureIdx = source.indexOf('const channelLoopEndMs = Date.now();');
+  assert.ok(captureIdx >= 0, 'loop-end capture exists');
+  assert.ok(source.indexOf('recordQueryRunSightings(queryRunId', captureIdx) > captureIdx, 'capture precedes sightings persistence');
+  assert.ok(source.indexOf('calculateQueryFunnel(', captureIdx) > captureIdx, 'capture precedes funnel evaluation');
 });
 
 test('nested top-up waits are not double-counted in retrieval', () => {

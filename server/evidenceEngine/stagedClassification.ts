@@ -13,9 +13,12 @@ export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
  * retrieval provenance, the matched document's content is deliberately
  * withheld from evidence (anti-contamination), so the evaluation is known to
  * rest on title/bio alone with no channel videos, playlists, or transcripts.
- * Such an evaluation must never terminally REJECT: the pipeline requires
- * hydration/corroboration first. Withheld match content is never fed into
- * evidence — the case routes to ENRICH instead.
+ * Such an evaluation must never terminally REJECT: when contradiction would
+ * otherwise FAIL, it ABSTAINS with THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION
+ * instead, and the normal lifecycle routing applies (ENRICH when evidence
+ * coverage is incomplete, REVIEW when candidate and corroboration already
+ * pass on affirmative positive evidence). Withheld match content is never
+ * fed into evidence.
  */
 export function isThinRetrievalInputRequiringHydration(input: RawChannelInput): boolean {
   if (Number(input.enrichment_stage || 0) !== 0) return false;

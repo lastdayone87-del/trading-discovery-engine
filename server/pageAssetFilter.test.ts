@@ -83,3 +83,9 @@ test('scheme-less creator links survive the filter', () => {
   assert.equal(isPageAssetInfrastructureUrl('kiss.com'), false);
   assert.equal(isPageAssetInfrastructureUrl('t.me/tradingroom'), false);
 });
+
+test('google API infrastructure and trailing-dot hosts are filtered', () => {
+  assert.equal(isPageAssetInfrastructureUrl('https://youtube.googleapis.com/youtube/v3/channels'), true);
+  assert.equal(isPageAssetInfrastructureUrl('https://i.ytimg.com./vi/abc/hqdefault.jpg'), true);
+  assert.equal(isPageAssetInfrastructureUrl('https://example-creator-site.test./'), false);
+});

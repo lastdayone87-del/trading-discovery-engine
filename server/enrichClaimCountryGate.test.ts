@@ -22,7 +22,7 @@ test('LIKELY and below stay fail-open even with an exclusion match', () => {
 
 test('CONFIRMED without an exclusion match proceeds', () => {
   assert.equal(shouldBlockEnrichClaimForCountry('CONFIRMED', 'France', null), null);
-  assert.equal(shouldBlockEnrichClaimForCountry('CONFIRMED', 'France', EXCLUSION), EXCLUSION);
+  assert.equal(shouldBlockEnrichClaimForCountry('CONFIRMED', 'France', { country: 'India', reason: 'test exclusion' }), null);
 });
 
 test('missing country or status never blocks', () => {
@@ -34,8 +34,8 @@ test('missing country or status never blocks', () => {
 
 test('creator-country claim gate runs before ENRICHING stamp and quota reservation', async () => {
   const fs = await import('node:fs');
-  const path = await import('node:path');
-  const source = fs.readFileSync(path.join(process.cwd(), 'server/queueManager.ts'), 'utf8');
+  const { fileURLToPath } = await import('node:url');
+  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
   const gateIdx = source.indexOf('Creator-country claim gate');
   assert.ok(gateIdx >= 0, 'claim gate exists');
   const enrichingIdx = source.indexOf("channel.scan_status = 'ENRICHING'");
@@ -78,8 +78,8 @@ test('hydration-upgraded CONFIRMED-excluded creator is revalidated before quota'
 
 test('quota reservation precedes hydration and the re-gate releases it on block', async () => {
   const fs = await import('node:fs');
-  const path = await import('node:path');
-  const source = fs.readFileSync(path.join(process.cwd(), 'server/queueManager.ts'), 'utf8');
+  const { fileURLToPath } = await import('node:url');
+  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
   // Order: reserve → hydrate → re-gate. A quota-exhausted claim throws at
   // reservation and never spends the hydration fetch; a blocked re-gate
   // releases the reservation unconsumed.
@@ -91,4 +91,15 @@ test('quota reservation precedes hydration and the re-gate releases it on block'
   assert.ok(revalidateIdx > changedAnchor, 'revalidation runs after hydration completes');
   const releaseIdx = source.indexOf("finishQuotaReservation('ENRICH_CHANNEL',job.id,false)", revalidateIdx);
   assert.ok(releaseIdx > revalidateIdx, 'blocked re-gate releases the reservation');
+});
+
+test('mismatched exclusion lookup never blocks the wrong country', () => {
+  assert.equal(
+    shouldBlockEnrichClaimForCountry('CONFIRMED', 'France', { country: 'India', reason: 'test exclusion' }),
+    null
+  );
+  assert.deepEqual(
+    shouldBlockEnrichClaimForCountry('CONFIRMED', ' india ', { country: 'India', reason: 'test exclusion' }),
+    { country: 'India', reason: 'test exclusion' }
+  );
 });

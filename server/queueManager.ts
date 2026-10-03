@@ -550,9 +550,14 @@ export async function processNextSearchJob(
       // 1-unit metadata fetch below. A hydrated known-low count skips
       // enrichment with the same SKIPPED_LOW_AUDIENCE projection as the
       // Phase-7 gate and releases the reservation unconsumed.
-      let claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount ?? channel.subscriber_count ?? undefined);
+      // A stale queued candidate must not override the stored row: skip when
+      // EITHER the candidate or the stored count is known-low. Hydration runs
+      // only when both are unavailable.
+      const claimCandidateGate = evaluateLowAudienceGate(candidate.subscriberCount ?? undefined);
+      const claimStoredGate = evaluateLowAudienceGate(channel.subscriber_count ?? undefined);
+      let claimAudienceGate = claimCandidateGate.shouldSkipDeepEnrichment ? claimCandidateGate : claimStoredGate;
       let claimHydrationChanged = false;
-      if (!claimAudienceGate.shouldSkipDeepEnrichment && claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
+      if (claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE' && claimCandidateGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
         const beforeSub = candidate.subscriberCount;
         const beforeDesc = candidate.description;
         const beforeLoc = candidate.locationTag;
@@ -615,7 +620,8 @@ export async function processNextSearchJob(
             candidate
           );
           await upsertChannel(channel);
-          if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
+          if(candidateAlreadyEnriched)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
+          else if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
           console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId,targetCountry,detectedCountry:claimCreatorCountry,reason:claimCountryVal.rejectionReason,context:`enrichment_claim_hydrated:${job.id}`,timestamp:claimNow}));
           if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'COUNTRY_POLICY_CHANGED'}).catch(()=>undefined);
           if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
@@ -624,7 +630,7 @@ export async function processNextSearchJob(
       }
       if (claimAudienceGate.shouldSkipDeepEnrichment) {
         const claimNow = new Date().toISOString();
-        const claimCountText = candidate.subscriberCount ?? channel.subscriber_count;
+        const claimCountText = (claimAudienceGate === claimStoredGate ? channel.subscriber_count : candidate.subscriberCount) ?? channel.subscriber_count ?? candidate.subscriberCount;
         channel.subscriber_count = claimCountText;
         channel.scan_status = 'SKIPPED_LOW_AUDIENCE';
         channel.last_checked = claimNow;
@@ -636,7 +642,8 @@ export async function processNextSearchJob(
           timestamp: claimNow,
         }];
         await upsertChannel(channel);
-        if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
+        if(candidateAlreadyEnriched)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
+        else if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'LOW_AUDIENCE_SKIP'}).catch(()=>undefined);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel.trading_status,output:{reason:'LOW_AUDIENCE_SKIP'}});else await completeJob(job.id);
         return true;
