@@ -37,3 +37,43 @@ test('public-about extraction filters asset URLs so they cannot become crawl see
   assert.ok(links.includes('https://t.me/tradingroom'), 'messaging link retained');
   assert.ok(!links.some(url => isPageAssetInfrastructureUrl(url)), 'no asset URL survives');
 });
+
+test('asset URLs in channelLinks and socialLinks never become crawl seeds', async () => {
+  const { runChannelInspection } = await import('./inspector');
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    fetched.push(String(url));
+    return new Response('<html><body>plain creator site</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+  }) as typeof fetch;
+  const store = {
+    read: async () => [],
+    write: async () => undefined,
+    recordLinks: async () => undefined
+  };
+  const result = await runChannelInspection({
+    channelId: 'UCAssetFilter00000001',
+    channelName: 'Asset Filter Channel',
+    channelBio: 'A sufficiently long creator biography for inspection testing purposes.',
+    channelLinks: [
+      'https://i.ytimg.com/vi/abc/hqdefault.jpg',
+      'https://rr1---sn-p5qs7n6y.googlevideo.com/initplayback?x=1',
+      'https://schema.org/Person',
+      'https://example-creator-site.test/'
+    ],
+    socialLinks: [
+      'https://fonts.googleapis.com/css2?family=Roboto',
+      'https://t.me/tradingroom'
+    ],
+    videoDescriptions: ['d1', 'd2', 'd3', 'd4', 'd5'],
+    externalFetchImpl: fetchImpl,
+    urlFailureHistoryLoader: async () => [],
+    siteInspectionStore: store
+  } as never);
+  assert.ok(fetched.some(url => url.includes('example-creator-site.test')), 'legit creator site crawled');
+  assert.ok(fetched.some(url => url.includes('t.me')), 'messaging link crawled');
+  for (const target of fetched) {
+    assert.equal(isPageAssetInfrastructureUrl(target), false, `asset URL must never be fetched: ${target}`);
+  }
+  const seeds = (result.acquisitionOutcomes || []).map(outcome => outcome.requestedUrl);
+  assert.ok(!seeds.some(url => isPageAssetInfrastructureUrl(url)), 'no asset seed recorded');
+});

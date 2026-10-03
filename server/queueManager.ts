@@ -250,12 +250,12 @@ export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
  * retrieval vs per-channel processing vs total worker time. Persisted in
  * query-run performance_details; never affects scoring or behavior.
  */
-export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searchQuotaWaitMs: number, searchRetrievalMs: number, channelLoopStartMs: number, nowMs = Date.now()): { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number } {
+export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searchQuotaWaitMs: number, searchRetrievalMs: number, channelLoopStartMs: number, channelLoopEndMs: number, nowMs = Date.now()): { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number } {
   return {
     workerTotalMs: nowMs - searchWorkerStartMs,
     quotaWaitMs: searchQuotaWaitMs,
     retrievalMs: searchRetrievalMs,
-    channelProcessingMs: nowMs - channelLoopStartMs,
+    channelProcessingMs: channelLoopEndMs - channelLoopStartMs,
   };
 }
 
@@ -832,6 +832,7 @@ export async function processNextSearchJob(
         }
       });
     }
+    const channelLoopEndMs = Date.now();
     if (queryRunId && queryId) {
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
@@ -975,7 +976,7 @@ export async function processNextSearchJob(
       // Worker wall-time split (observability only, persisted in
       // performance_details): quota-wait vs retrieval vs per-channel
       // processing vs total worker time. Never affects scoring or behavior.
-      const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalMs, channelLoopStartMs, Date.now());
+      const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalMs, channelLoopStartMs, channelLoopEndMs, Date.now());
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
         uniqueChannels: finalMetrics.newChannels,

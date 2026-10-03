@@ -23,11 +23,19 @@ test('stale recovery summary tolerates missing lock metadata', () => {
 });
 
 test('SEARCH latency breakdown separates quota-wait, retrieval, and processing', () => {
-  const breakdown = buildSearchLatencyBreakdownMs(1000, 200, 3000, 5000, 9000);
+  const breakdown = buildSearchLatencyBreakdownMs(1000, 200, 3000, 5000, 8000, 9000);
   assert.deepEqual(breakdown, {
     workerTotalMs: 8000,
     quotaWaitMs: 200,
     retrievalMs: 3000,
-    channelProcessingMs: 4000
+    channelProcessingMs: 3000
   });
+});
+
+test('channel processing ends at loop end, not at post-loop accounting', () => {
+  // Post-loop work (query-performance evaluation, sightings persistence)
+  // must not inflate channelProcessingMs; workerTotalMs still covers it.
+  const breakdown = buildSearchLatencyBreakdownMs(0, 0, 0, 1000, 2000, 9000);
+  assert.equal(breakdown.channelProcessingMs, 1000);
+  assert.equal(breakdown.workerTotalMs, 9000);
 });
