@@ -3056,7 +3056,15 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const code=String((error as any)?.code||'').toUpperCase();
   const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':capacity ? 'PROVIDER_CAPACITY' : 'PROVIDER_FAILURE';
   const failureMetadata = JSON.stringify({ failureKind, ...capacityMetadata, ...outcomeMetadata });
-  const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
+  // Terminal failure records status AND attribution atomically: a worker
+  // crash between the FAILED update and the attribution insert must never
+  // leave a terminal run without its accounting row (benchmark
+  // observations require both). All-or-nothing in one transaction; a late
+  // failure on an already-terminal run stays a silent no-op as before.
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const run = await client.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
     provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search') ELSE provider_requests_attempted END,
     provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
     provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
@@ -3064,30 +3072,43 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
     provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
     performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
     WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureMetadata]);
-  if (run.rowCount) {
-    await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
-    await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
-    // Benchmark attribution conformance (benchmark-preregistration-v1 §8/§9):
-    // terminally failed runs must be deterministically attributable to their
-    // assigned arm and countable in arm denominators. Successful completions
-    // insert this row in completeQueryRun; failures previously left none,
-    // silently dropping provider/network/quota failures from measurement.
-    // The zero-funnel row marks the run as a failed observation (quality 0).
-    // Deliberately does NOT touch query_library aggregates: UCB1/Thompson
-    // counters observe completed runs only (production behavior unchanged).
-    await db.query(
-      `INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics)
-       VALUES($1,$2,'query-run-accounting-v1',0,$3) ON CONFLICT(query_run_id) DO NOTHING`,
-      [runId, run.rows[0].query_id, JSON.stringify({
-        failed: true, terminal: true, failureKind,
-        rawResults: 0, distinctResults: 0, duplicateResults: 0,
-        knownChannels: 0, newChannels: 0, countryRejected: 0,
-        nonTrading: 0, uncertain: 0, needsReview: 0,
-        tradingConfirmed: 0, qualityChannels: 0, communitiesDiscovered: 0,
-        averageQualityScore: 0, noveltyRatio: 0, countryPrecision: 0,
-        tradingPrecision: 0, qualityYield: 0, communityYield: 0, performanceScore: 0,
-      })]
-    );
+  if (!run.rowCount) {
+    await client.query('ROLLBACK');
+    return;
+  }
+  await client.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
+  await client.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+  // Benchmark attribution conformance (benchmark-preregistration-v1 §8/§9):
+  // terminally failed runs must be deterministically attributable to their
+  // assigned arm and countable in arm denominators. Successful completions
+  // insert this row in completeQueryRun; failures previously left none,
+  // silently dropping provider/network/quota failures from measurement.
+  // The zero-funnel row marks the run as a failed observation (quality 0).
+  // Deliberately does NOT touch query_library aggregates: UCB1/Thompson
+  // counters observe completed runs only (production behavior unchanged).
+  // Same-transaction insert: status and attribution commit together, so a
+  // crash can never strand a terminal run without its accounting row.
+  await client.query(
+    `INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics)
+     VALUES($1,$2,'query-run-accounting-v1',0,$3) ON CONFLICT(query_run_id) DO NOTHING`,
+    [runId, run.rows[0].query_id, JSON.stringify({
+      failed: true, terminal: true, failureKind,
+      rawResults: 0, distinctResults: 0, duplicateResults: 0,
+      knownChannels: 0, newChannels: 0, countryRejected: 0,
+      nonTrading: 0, uncertain: 0, needsReview: 0,
+      tradingConfirmed: 0, qualityChannels: 0, communitiesDiscovered: 0,
+      averageQualityScore: 0, noveltyRatio: 0, countryPrecision: 0,
+      tradingPrecision: 0, qualityYield: 0, communityYield: 0, performanceScore: 0,
+    })]
+  );
+  await client.query('COMMIT');
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* already closed */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+  {
     const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
     await captureCompletedRunObservation(runId).catch(captureError => console.warn('[DiscoveryTrustEvaluation] Failure observation capture failed:', captureError));
   }

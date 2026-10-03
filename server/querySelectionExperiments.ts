@@ -46,7 +46,7 @@ import {
   limitRepeatedPrimaryTerms,
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
-import { selectNextQueryForCountry, restrictPoolToDesignatedRow } from './queryIntelligence';
+import { selectNextQueryForCountry } from './queryIntelligence';
 import { getQueriesByCountry, getAppSetting } from './db';
 import type { QueryRecord } from '../src/types';
 
@@ -807,10 +807,6 @@ export async function selectExperimentalQueryForCountry(
   );
   const selection = experiment?.selection ?? null;
   const eligibility = evaluateSelectionExperimentEligibility(selection);
-  // Benchmark-designated restriction: when the request designates a frozen
-  // pool row, every selection pool below narrows to that row, so a benchmark
-  // attempt serves ONLY the designated row or nothing. Absent otherwise.
-  const designatedRowIds = experiment?.benchmark ? [experiment.benchmark.poolRowId] : undefined;
   // Ordering is an independent dimension: it is evaluated even when no
   // selection experiment was requested, so ordering-only experiments reach
   // the retrieval treatment without requiring Thompson/Contextual.
@@ -828,7 +824,7 @@ export async function selectExperimentalQueryForCountry(
       })
     : undefined;
   const delegateLegacy = async () => {
-    const base = await selectNextQueryForCountry(country, { scopePromotionBasis: options.scopePromotionBasis, restrictToQueryIds: designatedRowIds });
+    const base = await selectNextQueryForCountry(country, { scopePromotionBasis: options.scopePromotionBasis });
     // Null preserves the producer's existing skip/continue contract: no
     // eligible query yields no candidate — never a cycle-failing exception
     // merely because the experimental wrapper is active.
@@ -897,9 +893,7 @@ export async function selectExperimentalQueryForCountry(
   }
   // Treatment: same eligibility pipeline as control (cooldown/diversity/intent),
   // deterministic pool order (id ascending) so arm indexes are replay-stable.
-  // A benchmark-designated request narrows the pool to the designated row.
-  const fetchedQueries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
-  const queries = restrictPoolToDesignatedRow(fetchedQueries, designatedRowIds);
+  const queries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
   let eligible = limitRepeatedPrimaryTerms(queriesOutsideCooldown(queries, now, cooldownMinutes), queries, now, cooldownMinutes, maxPrimaryUses);
   eligible = rotateAwayFromMostRecentIntent(eligible, queries);
   eligible = [...eligible].sort((a, b) => a.id - b.id);

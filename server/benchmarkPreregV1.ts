@@ -360,6 +360,13 @@ export interface BenchmarkExecutionRecord {
    * are recorded but never compared (see detectConfigurationDrift).
    */
   appSettings: Array<{ setting_key: string; setting_value: string }>;
+  /**
+   * Knob values as RESOLVED at plan time (settings + environment as resolved
+   * then). Mid-execution drift detection compares live-resolved values
+   * against these recorded strings, so an environment change between plan
+   * and execute cannot pass silently.
+   */
+  plannedKnobs: Record<string, string>;
   designatedOpportunities: Array<{ snapshotHash: string; poolRowId: number; benchmarkOpportunityId: string; country: string }>;
   status: 'PLANNED' | 'IN_PROGRESS' | 'COMPLETE' | 'INCOMPLETE';
   attempts: Array<Record<string, unknown>>;
@@ -400,6 +407,9 @@ export function buildExecutionRecord(input: {
     maxMigrationVersion: input.maxMigrationVersion,
     providerRegistry: input.providerRegistry,
     appSettings: input.appSettings,
+    plannedKnobs: effectiveBenchmarkKnobs(
+      Object.fromEntries(input.appSettings.map(row => [row.setting_key, row.setting_value]))
+    ),
     designatedOpportunities: input.poolSnapshot.rows.map(row => ({
       snapshotHash: input.poolSnapshot.snapshotHash,
       poolRowId: row.queryId,
@@ -503,14 +513,19 @@ export function isScopeTerminallyAccounted(states: BenchmarkRowState[]): boolean
 export interface TerminalObservationPoll {
   status: string;
   attributed: boolean;
+  /** Authoritative completion instant (query_runs.completed_at), if known. */
+  completedAt: string | null;
 }
 
 /**
  * Waits for a scheduled run to become a legitimate benchmark observation:
  * terminal status (COMPLETED/FAILED) AND a persisted accounting attribution
- * row. Scheduling alone is never an observation. Fails closed on the wall
- * clock ceiling or a kill-switch halt; never fabricates. Inject sleep/clock
- * for tests; production polls the run ledger.
+ * row. Scheduling alone is never an observation. The 14-day ceiling binds
+ * the authoritative completion instant (completed_at), not the poll time: a
+ * run that finished after the ceiling is rejected even if first polled
+ * later, and a run that finished inside the ceiling is accepted. Fails
+ * closed on the ceiling or a kill-switch halt; never fabricates. Inject
+ * sleep/clock for tests; production polls the run ledger.
  */
 export async function waitForTerminalObservation(
   pollRun: () => Promise<TerminalObservationPoll>,
@@ -530,6 +545,8 @@ export async function waitForTerminalObservation(
     const observed = await pollRun();
     const terminal = observed.status === 'COMPLETED' || observed.status === 'FAILED';
     if (terminal && observed.attributed) {
+      const completedMs = observed.completedAt ? new Date(observed.completedAt).getTime() : nowMs();
+      if (completedMs > opts.deadlineMs) throw new Error('BENCHMARK_PREREG_WALL_CLOCK_CEILING');
       return observed.status === 'COMPLETED' ? 'OBSERVED_COMPLETE' : 'OBSERVED_FAILED';
     }
     if (nowMs() > opts.deadlineMs) throw new Error('BENCHMARK_PREREG_WALL_CLOCK_CEILING');
@@ -570,6 +587,16 @@ export interface DriftCheckProvenance {
 }
 
 /**
+ * Compares live provenance against the planned record. The planned knobs
+ * are the RESOLVED values stored at plan time (settings + environment as
+ * resolved then); the current side re-resolves the same way now. An
+ * environment-backed setting that changes between plan and execute is
+ * therefore drift, not invisible: the plan stores the earlier environment
+ * value. Any difference in gates, benchmark-relevant knobs, provider
+ * registry, migration level, or code versions fails closed.
+ */
+
+/**
  * Compares live provenance against the planned record. Any difference in
  * gates, benchmark-relevant knobs, provider registry, migration level, or
  * code versions is drift: fail closed, schedule nothing further. Operational
@@ -577,7 +604,7 @@ export interface DriftCheckProvenance {
  * intentionally outside the checked set — they cannot change treatment.
  */
 export function detectConfigurationDrift(
-  planned: DriftCheckProvenance,
+  planned: { knobs: Record<string, string>; providerRegistry: unknown; maxMigrationVersion: number },
   current: DriftCheckProvenance,
   env: Record<string, string | undefined> = process.env
 ): string[] {
@@ -592,11 +619,10 @@ export function detectConfigurationDrift(
   } catch (error) {
     drift.push(error instanceof Error ? error.message : String(error));
   }
-  const plannedKnobs = effectiveBenchmarkKnobs(planned.settings, env);
   const currentKnobs = effectiveBenchmarkKnobs(current.settings, env);
   for (const knob of BENCHMARK_PREREG_DRIFT_KNOBS) {
-    if (plannedKnobs[knob.setting] !== currentKnobs[knob.setting]) {
-      drift.push(`BENCHMARK_PREREG_KNOB_DRIFT:${knob.setting}:${plannedKnobs[knob.setting]}->${currentKnobs[knob.setting]}`);
+    if (planned.knobs[knob.setting] !== currentKnobs[knob.setting]) {
+      drift.push(`BENCHMARK_PREREG_KNOB_DRIFT:${knob.setting}:${planned.knobs[knob.setting]}->${currentKnobs[knob.setting]}`);
     }
   }
   if (JSON.stringify(planned.providerRegistry) !== JSON.stringify(current.providerRegistry)) {

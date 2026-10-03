@@ -198,9 +198,10 @@ async function main(): Promise<void> {
     throw new Error(`[benchmark-prereg-v1] INCOMPLETE: ${stopReason}`);
   };
   const pollRunState = (runId: string) => async () => {
-    const runRows = (await db.query('SELECT status FROM query_runs WHERE id = $1', [runId])).rows as Array<{ status: string }>;
+    const runRows = (await db.query('SELECT status, completed_at FROM query_runs WHERE id = $1', [runId])).rows as Array<{ status: string; completed_at: string | null }>;
     const attrRows = await db.query('SELECT 1 FROM query_run_accounting_attributions WHERE query_run_id = $1', [runId]);
-    return { status: String(runRows[0]?.status || 'UNKNOWN'), attributed: (attrRows.rowCount || 0) > 0 };
+    const completedAt = runRows[0]?.completed_at ? new Date(String(runRows[0].completed_at)).toISOString() : null;
+    return { status: String(runRows[0]?.status || 'UNKNOWN'), attributed: (attrRows.rowCount || 0) > 0, completedAt };
   };
   const haltedByKillSwitch = async (): Promise<boolean> => {
     const paused = (await db.query("SELECT setting_value FROM app_settings WHERE setting_key = 'query_intelligence_paused'")).rows as Array<{ setting_value: string }>;
@@ -223,9 +224,11 @@ async function main(): Promise<void> {
       'SELECT provider_key, provider_family, provider_kind, capabilities, quota_domain, mode, daily_cost_cap, configuration_version FROM discovery_provider_registry ORDER BY provider_key'
     )).rows as Array<Record<string, unknown>>;
     const liveMigration = Number(((await db.query('SELECT max(version) AS max_version FROM schema_migrations')).rows as Array<{ max_version: string | number | null }>)[0]?.max_version || 0);
-    const plannedSettings: Record<string, string> = Object.fromEntries(record.appSettings.map(row => [row.setting_key, row.setting_value]));
+    if (!record.plannedKnobs) {
+      await abortIncomplete('CONFIGURATION_DRIFT:planned knob baseline absent from execution record');
+    }
     const drift = detectConfigurationDrift(
-      { settings: plannedSettings, providerRegistry: record.providerRegistry, maxMigrationVersion: record.maxMigrationVersion },
+      { knobs: record.plannedKnobs, providerRegistry: record.providerRegistry, maxMigrationVersion: record.maxMigrationVersion },
       { settings: liveSettings, providerRegistry: liveRegistry, maxMigrationVersion: liveMigration }
     );
     if (drift.length > 0) {
@@ -270,8 +273,9 @@ async function main(): Promise<void> {
     }
 
     // rowPlan === 'schedule-attempt': zero matched runs exist; invoke exactly
-    // one cycle. Restriction (Finding 1) guarantees it serves the designated
-    // row or nothing — never unrelated work.
+    // one cycle. Free choice with the SELECTED_ANOTHER_QUERY output gate
+    // guarantees it schedules the designated row or nothing — never
+    // unrelated work.
     const attemptStart = new Date();
     const requestId = `benchmark-prereg-v1:${snapshot.snapshotHash.slice(0, 12)}:${designated.poolRowId}`;
     let report: {
@@ -287,6 +291,27 @@ async function main(): Promise<void> {
       const message = error instanceof Error ? error.message : String(error);
       if (/already in progress|already held|SCHEDULER_BUSY/.test(message)) {
         await abortIncomplete(`INFRA_INCIDENT:${message.slice(0, 200)}`);
+      }
+      // The producer may have scheduled before throwing (e.g., post-commit
+      // scheduler-state bookkeeping): read the durable ledger first. An
+      // already-created run is adopted and awaited — never excluded while it
+      // may yet produce an attributed observation, and never rescheduled.
+      const postMatched = await readMatched(designated.benchmarkOpportunityId, attemptStart.toISOString()).catch(() => []);
+      if (postMatched.length > 0) {
+        if (!record.firstObservedAt) {
+          record.firstObservedAt = postMatched.map(run => run.scheduled_at).sort()[0];
+          saveRecord();
+        }
+        const outcome = await observeRun(postMatched[postMatched.length - 1].id);
+        record.attempts.push({
+          benchmarkOpportunityId: designated.benchmarkOpportunityId, poolRowId: designated.poolRowId,
+          country: designated.country, state: outcome, recovered: true,
+          matchedRunIds: postMatched.map(run => run.id),
+          note: `adopted-after-cycle-error:${message.slice(0, 120)}`,
+        });
+        saveRecord();
+        console.log(`[benchmark-prereg-v1] adopted ${designated.benchmarkOpportunityId} ${outcome} run=${postMatched[postMatched.length - 1].id}`);
+        continue;
       }
       record.attempts.push({
         benchmarkOpportunityId: designated.benchmarkOpportunityId, poolRowId: designated.poolRowId,

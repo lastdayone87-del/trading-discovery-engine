@@ -29,9 +29,11 @@ then schedules one designated attempt per pool row through the
 priors 1,1 / weights 0.5,0.35,0.1; ordering `benchmark-prereg-v1-ordering`
 5000 with the stored-`scheduled_at` 90-day window). Two benchmark-scoped
 enforcements are inert without a benchmark scope: research/frontier/native
-allocations are declined for designated cycles, and every selection pool
-narrows to the designated row — a benchmark attempt serves ONLY that row
-or records a coded exclusion, never unrelated work. Each scheduled run is
+allocations are declined for designated cycles, and a SELECTED_ANOTHER_QUERY
+output gate declines any non-designated selection before scheduling — the
+arms choose freely among eligible queries under full production gates, but
+only the designated pool row may be scheduled as a benchmark observation,
+never unrelated work. Each scheduled run is
 awaited to terminal COMPLETED/FAILED *with* its accounting attribution row
 before it counts; scheduling alone is never an observation. Every row ends
 in one unambiguous terminal state (observed complete/failed, or a coded

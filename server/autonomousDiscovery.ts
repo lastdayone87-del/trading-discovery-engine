@@ -481,14 +481,19 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // execution): serve ONLY the designated pool row or nothing. An
       // authorized frontier/native allocation is declined and released here
       // so the cycle can never schedule unrelated work while claiming a
-      // designated opportunity; the restricted experiment-selection path
-      // below is the sole scheduling source on this path. Absent a benchmark
-      // scope this block is inert and legacy flow is byte-identical.
+      // designated opportunity; the experiment-selection path below (with
+      // the SELECTED_ANOTHER_QUERY output gate) is the sole scheduling
+      // source on this path. A failed release fails the cycle rather than
+      // stranding a RESERVED decision with held quota while scheduling as
+      // LEGACY. Absent a benchmark scope this block is inert.
       if (normalizedExperiment?.benchmark && frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
-        await releaseAllocationDecision(
+        const released = await releaseAllocationDecision(
           frontierAllocationInfo.decision.decisionId,
           'Benchmark-designated attempt declines non-designated allocation'
-        ).catch(error => console.warn('[Autonomous Producer] Benchmark allocation release failed:', error));
+        );
+        if (!released) {
+          throw new Error(`BENCHMARK_ALLOCATION_RELEASE_FAILED:${frontierAllocationInfo.decision.decisionId}`);
+        }
         frontierAllocationInfo.authorized = false;
       }
 
@@ -610,6 +615,19 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         selected = legacySelection;
         selectedExperiment = legacyExperiment;
         candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY', selectedQueryId: selected.queryRecord.id };
+      }
+
+      // Benchmark-designated output gate (benchmark-preregistration-v1
+      // execution): the arms choose freely among eligible queries under full
+      // production gates, but ONLY the designated pool row may be scheduled
+      // as a benchmark observation. A non-designated selection is declined
+      // here — never scheduled, never labeled — so the cycle cannot schedule
+      // unrelated work while claiming a designated opportunity. Absent a
+      // benchmark scope this gate is inert and legacy flow is byte-identical.
+      if (normalizedExperiment?.benchmark && selected.queryRecord.id !== normalizedExperiment.benchmark.poolRowId) {
+        candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'SELECTED_ANOTHER_QUERY', schedulingOutcome: 'NOT_REACHED' };
+        recordCandidateDiagnostic(candidateDiagnostic);
+        continue;
       }
 
       // Every query source is revalidated immediately before scheduling. Stored

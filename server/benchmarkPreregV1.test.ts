@@ -216,11 +216,11 @@ test('scheduled runs become observations only at terminal attribution', async ()
   const { waitForTerminalObservation } = await import('./benchmarkPreregV1');
   let clock = 0;
   let calls = 0;
-  const script: Array<{ status: string; attributed: boolean }> = [
-    { status: 'RUNNING', attributed: false },
-    { status: 'RUNNING', attributed: false },
-    { status: 'COMPLETED', attributed: false },
-    { status: 'COMPLETED', attributed: true },
+  const script: Array<{ status: string; attributed: boolean; completedAt: string | null }> = [
+    { status: 'RUNNING', attributed: false, completedAt: null },
+    { status: 'RUNNING', attributed: false, completedAt: null },
+    { status: 'COMPLETED', attributed: false, completedAt: null },
+    { status: 'COMPLETED', attributed: true, completedAt: new Date(5_000).toISOString() },
   ];
   const outcome = await waitForTerminalObservation(
     async () => script[Math.min(calls++, script.length - 1)],
@@ -234,11 +234,19 @@ test('scheduled runs become observations only at terminal attribution', async ()
   assert.equal(outcome, 'OBSERVED_COMPLETE');
   assert.equal(calls, 4);
   assert.equal(clock, 3000);
+  // A run that finished after the ceiling is rejected even if polled later.
+  await assert.rejects(
+    waitForTerminalObservation(
+      async () => ({ status: 'COMPLETED', attributed: true, completedAt: new Date(20_000).toISOString() }),
+      { deadlineMs: 10_000, nowMs: () => 30_000, sleepMs: async () => {}, pollIntervalMs: 1_000 }
+    ),
+    /BENCHMARK_PREREG_WALL_CLOCK_CEILING/
+  );
   // Terminal status without attribution is not an observation yet.
   let ticks = 0;
   await assert.rejects(
     waitForTerminalObservation(
-      async () => ({ status: 'FAILED', attributed: false }),
+      async () => ({ status: 'FAILED', attributed: false, completedAt: null }),
       { deadlineMs: 500, nowMs: () => ticks, sleepMs: async ms => { ticks += ms; }, pollIntervalMs: 1_000 }
     ),
     /BENCHMARK_PREREG_WALL_CLOCK_CEILING/
@@ -246,7 +254,7 @@ test('scheduled runs become observations only at terminal attribution', async ()
   // Kill-switch halts waiting without fabricating.
   await assert.rejects(
     waitForTerminalObservation(
-      async () => ({ status: 'RUNNING', attributed: false }),
+      async () => ({ status: 'RUNNING', attributed: false, completedAt: null }),
       { deadlineMs: 60_000, nowMs: () => 0, sleepMs: async () => {}, pollIntervalMs: 1_000, isHalted: () => true }
     ),
     /BENCHMARK_PREREG_KILL_SWITCH/
@@ -255,28 +263,43 @@ test('scheduled runs become observations only at terminal attribution', async ()
 
 test('mid-execution drift fails closed with specifics', async () => {
   const { detectConfigurationDrift, effectiveBenchmarkKnobs } = await import('./benchmarkPreregV1');
+  const knobsFor = (settings: Record<string, string>, env: Record<string, string | undefined> = {}) =>
+    effectiveBenchmarkKnobs(settings, env);
+  const baseSettings = { site_profiler_enabled: 'false', query_intelligence_query_cooldown_minutes: '360' };
   const base = {
-    settings: { site_profiler_enabled: 'false', query_intelligence_query_cooldown_minutes: '360' },
+    knobs: knobsFor(baseSettings),
     providerRegistry: [{ provider_key: 'youtube-search', mode: 'ACTIVE' }],
     maxMigrationVersion: 137,
   };
-  assert.deepEqual(detectConfigurationDrift(base, structuredClone(base)), []);
-  const gateFlip = structuredClone(base);
+  const currentBase = {
+    settings: { ...baseSettings },
+    providerRegistry: [{ provider_key: 'youtube-search', mode: 'ACTIVE' }],
+    maxMigrationVersion: 137,
+  };
+  assert.deepEqual(detectConfigurationDrift(base, structuredClone(currentBase), {}), []);
+  const gateFlip = structuredClone(currentBase);
   gateFlip.settings['frontier_trials_enabled'] = 'true';
-  assert.match(detectConfigurationDrift(base, gateFlip).join(';'), /BENCHMARK_PREREG_GATE_ENGAGED/);
-  const knobDrift = structuredClone(base);
+  assert.match(detectConfigurationDrift(base, gateFlip, {}).join(';'), /BENCHMARK_PREREG_GATE_ENGAGED/);
+  const knobDrift = structuredClone(currentBase);
   knobDrift.settings['query_intelligence_query_cooldown_minutes'] = '30';
-  assert.match(detectConfigurationDrift(base, knobDrift).join(';'), /KNOB_DRIFT.*cooldown/);
-  const registryDrift = structuredClone(base);
+  assert.match(detectConfigurationDrift(base, knobDrift, {}).join(';'), /KNOB_DRIFT.*cooldown/);
+  // An environment-backed setting that changes between plan and execute is
+  // drift even though neither app_settings dump contains it: the plan stored
+  // the resolved value, so the new resolution differs.
+  assert.match(
+    detectConfigurationDrift(base, { settings: {}, providerRegistry: base.providerRegistry, maxMigrationVersion: 137 }, { QUERY_INTELLIGENCE_EXPLORATION_RATIO: '0.9' }).join(';'),
+    /KNOB_DRIFT.*exploration_ratio/
+  );
+  const registryDrift = structuredClone(currentBase);
   (registryDrift.providerRegistry as Array<Record<string, unknown>>).push({ provider_key: 'new-provider', mode: 'ACTIVE' });
-  assert.match(detectConfigurationDrift(base, registryDrift).join(';'), /PROVIDER_REGISTRY_DRIFT/);
-  const migrationDrift = { ...structuredClone(base), maxMigrationVersion: 138 };
-  assert.match(detectConfigurationDrift(base, migrationDrift).join(';'), /MIGRATION_DRIFT/);
+  assert.match(detectConfigurationDrift(base, registryDrift, {}).join(';'), /PROVIDER_REGISTRY_DRIFT/);
+  const migrationDrift = { ...structuredClone(currentBase), maxMigrationVersion: 138 };
+  assert.match(detectConfigurationDrift(base, migrationDrift, {}).join(';'), /MIGRATION_DRIFT/);
   // Operational cursors are not treatment: they never count as drift.
-  const cursorNoise = structuredClone(base);
+  const cursorNoise = structuredClone(currentBase);
   cursorNoise.settings['qi_current_country_index'] = '7';
   cursorNoise.settings['country_native_materialization_cursor'] = '25';
-  assert.deepEqual(detectConfigurationDrift(base, cursorNoise), []);
+  assert.deepEqual(detectConfigurationDrift(base, cursorNoise, {}), []);
   assert.equal(effectiveBenchmarkKnobs({}, {}).query_intelligence_query_cooldown_minutes, '360');
 });
 
@@ -300,10 +323,14 @@ test('resume adopts scheduled runs instead of duplicating them', async () => {
   assert.equal(planRowAttempt({ covered: false, matchedRunIds: [] }), 'schedule-attempt');
 });
 
-test('designated-row restriction narrows pools without touching legacy flow', async () => {
-  const { restrictPoolToDesignatedRow } = await import('./queryIntelligence');
-  const pool = [{ id: 1 }, { id: 2 }, { id: 3 }];
-  assert.equal(restrictPoolToDesignatedRow(pool, undefined), pool);
-  assert.deepEqual(restrictPoolToDesignatedRow(pool, [2]), [{ id: 2 }]);
-  assert.deepEqual(restrictPoolToDesignatedRow(pool, [9]), []);
+test('non-designated selections are declined, never scheduled, under benchmark scope', async () => {
+  const fs = await import('node:fs');
+  const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  // Arms choose freely; the output gate declines anything but the
+  // designated row before scheduling, with a distinct skip reason.
+  assert.match(source, /normalizedExperiment\?\.benchmark && selected\.queryRecord\.id !== normalizedExperiment\.benchmark\.poolRowId/);
+  assert.match(source, /reasonCode: 'SELECTED_ANOTHER_QUERY'/);
+  // Research/frontier/native allocations are declined on the same path.
+  assert.match(source, /!normalizedExperiment\?\.benchmark/);
+  assert.match(source, /Benchmark-designated attempt declines non-designated allocation/);
 });

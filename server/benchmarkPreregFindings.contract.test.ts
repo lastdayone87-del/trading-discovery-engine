@@ -33,6 +33,10 @@ test('terminally failed runs receive a zero-funnel accounting attribution', () =
   assert.match(failure, /'query-run-accounting-v1'/);
   assert.match(failure, /ON CONFLICT\(query_run_id\) DO NOTHING/);
   assert.match(failure, /failureKind/);
+  // Status and attribution commit atomically: no crash window can strand a
+  // terminal run without its accounting row.
+  assert.match(failure, /await client\.query\('BEGIN'\)/);
+  assert.match(failure, /await client\.query\('COMMIT'\)/);
   // Production counters are untouched: UCB1/Thompson observe completed runs
   // only, so the attribution row must not feed query_library aggregates.
   assert.doesNotMatch(failure, /times_executed=times_executed\+1/);
@@ -74,13 +78,16 @@ test('benchmark cycles serve only the designated row and read back before schedu
   // Research/frontier/native allocations are declined under benchmark scope.
   assert.match(cycle, /!normalizedExperiment\?\.benchmark/);
   assert.match(cycle, /Benchmark-designated attempt declines non-designated allocation/);
+  // Arms choose freely; the output gate declines non-designated selections
+  // before scheduling (never forced, never generated for the benchmark).
+  assert.match(cycle, /selected\.queryRecord\.id !== normalizedExperiment\.benchmark\.poolRowId/);
+  assert.match(cycle, /reasonCode: 'SELECTED_ANOTHER_QUERY'/);
   const experiments = fs.readFileSync(new URL('./querySelectionExperiments.ts', import.meta.url), 'utf8');
-  assert.match(experiments, /restrictPoolToDesignatedRow\(fetchedQueries, designatedRowIds\)/);
+  // Selection pools are NOT pre-restricted: Thompson/Contextual/UCB1 choose
+  // among eligible queries with full production gates.
+  assert.doesNotMatch(experiments, /restrictPoolToDesignatedRow/);
   const intelligence = fs.readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
-  assert.match(intelligence, /restrictToQueryIds\?: number\[\]/);
-  // Restricted requests return null instead of generating queries.
-  assert.match(intelligence, /if \(options\.restrictToQueryIds !== undefined && restrictedQueries\.length === 0\) return null/);
-  assert.match(intelligence, /if \(options\.restrictToQueryIds !== undefined\) return null;/);
+  assert.doesNotMatch(intelligence, /restrictToQueryIds/);
 });
 
 test('plan enforces the full frozen scope and execution waits for terminal attribution', () => {
