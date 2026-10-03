@@ -1,0 +1,70 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import test from 'node:test';
+
+// Greptile findings on PR #493 (benchmark preregistration): executable-path
+// conformance for the frozen P2 window, pool/opportunity tracking, failed-run
+// attribution, and P3 target-level shadow metrics. Contract tests only — no
+// benchmark execution, no mechanism enablement, no UCB1 or frozen-parameter
+// changes.
+
+test('schedule derives the frozen window from the stored scheduled_at', () => {
+  const source = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  // The authoritative timestamp comes from the run record, not an app clock.
+  assert.match(source, /RETURNING id, scheduled_at/);
+  const frozenBlock = source.slice(
+    source.indexOf('const frozenPatched = resolveFrozenBenchmarkScheduleOrdering'),
+    source.indexOf('const orderingWindow = candidate.experiment')
+  );
+  assert.match(frozenBlock, /new Date\(String\(run\.rows\[0\]\.scheduled_at\)\)/);
+  assert.match(frozenBlock, /experimentMetadata = \{ selectionExperiment: candidate\.experiment \}/);
+  assert.match(frozenBlock, /jsonb_set\(jsonb_set\(metadata, '\{selectionExperiment,ordering,window\}'/);
+  // No independent application timestamp feeds the frozen derivation.
+  assert.doesNotMatch(frozenBlock, /new Date\(\)/);
+});
+
+test('terminally failed runs receive a zero-funnel accounting attribution', () => {
+  const source = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const failure = source.slice(
+    source.indexOf('export async function failQueryRun'),
+    source.indexOf('export async function tryReserveQuota')
+  );
+  assert.match(failure, /INSERT INTO query_run_accounting_attributions/);
+  assert.match(failure, /'query-run-accounting-v1'/);
+  assert.match(failure, /ON CONFLICT\(query_run_id\) DO NOTHING/);
+  assert.match(failure, /failureKind/);
+  // Production counters are untouched: UCB1/Thompson observe completed runs
+  // only, so the attribution row must not feed query_library aggregates.
+  assert.doesNotMatch(failure, /times_executed=times_executed\+1/);
+  assert.doesNotMatch(failure, /quality_channels_found=quality_channels_found\+\$|quality_channels_found \+/);
+});
+
+test('benchmark opportunity identity is designated pre-selection, never served-query derived', async () => {
+  const { benchmarkOpportunityIdForScope, isFrozenBenchmarkConfiguration, normalizeSelectionExperimentRequest } = await import('./querySelectionExperiments');
+  const frozen = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 101 },
+  });
+  // The designated frozen pool row maps stably regardless of arm, attempt,
+  // or which query wins; retries stay attached to the same opportunity.
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 101, frozen), 'benchmark-prereg-v1:pool:abc123:101');
+  // A fallback winner, a newly generated query, or any non-designated row
+  // never acquires the frozen identity.
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 102, frozen), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(null, 101, frozen), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(undefined, 101, frozen), undefined);
+  // A valid scope alone never grants benchmark identity: the request must
+  // exactly match the frozen benchmark configuration.
+  const offConfig = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'other-exp', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 101 },
+  });
+  assert.equal(isFrozenBenchmarkConfiguration(offConfig), false);
+  assert.equal(benchmarkOpportunityIdForScope(offConfig.benchmark, 101, offConfig), undefined);
+  // The scope rides the validated request shape (pre-selection by design).
+  const source = fs.readFileSync(new URL('./querySelectionExperiments.ts', import.meta.url), 'utf8');
+  assert.match(source, /benchmark\?: SelectionExperimentBenchmarkScope/);
+  assert.match(source, /INVALID_BENCHMARK_SCOPE/);
+  assert.match(source, /isFrozenBenchmarkConfiguration\(experiment\)/);
+});

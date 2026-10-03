@@ -24,8 +24,8 @@ function poolFixture(): QueryRecord[] {
 }
 
 test('absent experiment normalizes to all-null (legacy path)', () => {
-  assert.deepEqual(normalizeSelectionExperimentRequest(undefined), { selection: null, ordering: null, trial: null });
-  assert.deepEqual(normalizeSelectionExperimentRequest(null), { selection: null, ordering: null, trial: null });
+  assert.deepEqual(normalizeSelectionExperimentRequest(undefined), { selection: null, ordering: null, trial: null, benchmark: null });
+  assert.deepEqual(normalizeSelectionExperimentRequest(null), { selection: null, ordering: null, trial: null, benchmark: null });
   assert.equal(validateSelectionExperimentRequest(undefined), null);
   assert.equal(validateSelectionExperimentRequest(null), null);
 });
@@ -313,4 +313,242 @@ test('ordering without any identity falls back to selection, then fails closed',
     () => validateSelectionExperimentRequest({ ordering: { treatmentBasisPoints: 5000 } }),
     /INVALID_ORDERING_EXPERIMENT/
   );
+});
+
+test('frozen benchmark ordering derives the 90-day window from scheduled_at', async () => {
+  const {
+    evaluateOrderingDimension,
+    deriveBenchmarkOrderingWindow,
+    resolveScheduledSearchWindow,
+    resolveFrozenBenchmarkScheduleOrdering,
+    benchmarkOpportunityIdForScope,
+    BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    BENCHMARK_PREREG_ORDERING_WINDOW_DAYS,
+  } = await import('./querySelectionExperiments');
+  const { buildWindowedSearchParams } = await import('./retrievalExperiment');
+  assert.equal(BENCHMARK_PREREG_ORDERING_WINDOW_DAYS, 90);
+  const scheduledAt = new Date('2026-03-10T12:00:00.000Z');
+  const derived = deriveBenchmarkOrderingWindow(scheduledAt);
+  assert.equal(derived.publishedBefore, '2026-03-10T12:00:00.000Z');
+  assert.equal(derived.publishedAfter, '2025-12-10T12:00:00.000Z');
+  assert.equal(buildWindowedSearchParams({}, derived, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID).windowApplied, true);
+  // A divergent caller-supplied window never reaches the frozen envelope.
+  const treated = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window: { publishedAfter: '2020-01-01T00:00:00Z', publishedBefore: '2020-02-01T00:00:00Z' },
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-divergent',
+    scheduledAt,
+  });
+  assert.equal(treated.arm, 'TREATMENT');
+  assert.equal(treated.windowApplied, true);
+  assert.deepEqual(treated.window, derived);
+  assert.equal(treated.experimentId, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID);
+  assert.deepEqual(resolveScheduledSearchWindow(treated), { ...derived, experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID });
+  // A missing caller window still derives (no unwindowed treatment).
+  const missing = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window: null,
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-missing',
+    scheduledAt,
+  });
+  assert.equal(missing.arm, 'TREATMENT');
+  assert.equal(missing.windowApplied, true);
+  assert.deepEqual(missing.window, derived);
+  // Frozen CONTROL carries no window, as before.
+  const control = evaluateOrderingDimension({
+    treatmentBasisPoints: 0,
+    window: { publishedAfter: '2020-01-01T00:00:00Z' },
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-control',
+    scheduledAt,
+  });
+  assert.equal(control.arm, 'CONTROL');
+  assert.equal(control.windowApplied, false);
+  // Stable benchmark opportunity identity is scoped to designated frozen
+  // pool rows under the frozen configuration, never the served query alone.
+  const frozenExperiment = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  });
+  assert.equal(
+    benchmarkOpportunityIdForScope(frozenExperiment.benchmark, 42, frozenExperiment),
+    'benchmark-prereg-v1:pool:abc123:42'
+  );
+  // A fallback winner or generated query never acquires the frozen identity.
+  assert.equal(benchmarkOpportunityIdForScope(frozenExperiment.benchmark, 7, frozenExperiment), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(null, 42, frozenExperiment), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(undefined, 42, frozenExperiment), undefined);
+});
+
+test('benchmark opportunity identity requires the full frozen configuration', async () => {
+  const { benchmarkOpportunityIdForScope, isFrozenBenchmarkConfiguration, normalizeSelectionExperimentRequest } = await import('./querySelectionExperiments');
+  const frozenRequest = {
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  };
+  const frozen = normalizeSelectionExperimentRequest(frozenRequest);
+  // 1. Valid frozen configuration + matching designated pool row → attached.
+  assert.equal(isFrozenBenchmarkConfiguration(frozen), true);
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 42, frozen), 'benchmark-prereg-v1:pool:abc123:42');
+  const variant = (patch: Record<string, unknown>) => normalizeSelectionExperimentRequest({
+    selection: { ...(frozenRequest.selection as object), ...(patch.selection as object | undefined) },
+    ordering: { ...(frozenRequest.ordering as object), ...(patch.ordering as object | undefined) },
+    benchmark: frozenRequest.benchmark,
+  });
+  // 2. Same valid scope + unrelated experimentId → absent (never mislabeled).
+  const unrelated = variant({ selection: { experimentId: 'other-exp' } });
+  assert.equal(isFrozenBenchmarkConfiguration(unrelated), false);
+  assert.equal(benchmarkOpportunityIdForScope(unrelated.benchmark, 42, unrelated), undefined);
+  // 3. Same valid scope + altered treatmentBasisPoints → absent.
+  const alteredBasis = variant({ selection: { treatmentBasisPoints: 2500 } });
+  assert.equal(isFrozenBenchmarkConfiguration(alteredBasis), false);
+  assert.equal(benchmarkOpportunityIdForScope(alteredBasis.benchmark, 42, alteredBasis), undefined);
+  const alteredOrderingBasis = variant({ ordering: { treatmentBasisPoints: 1000 } });
+  assert.equal(isFrozenBenchmarkConfiguration({ ...alteredOrderingBasis, selection: null }), false);
+  // 4. Same valid scope + altered enabled arms → absent.
+  const alteredArms = variant({ selection: { enabledArms: ['THOMPSON'] } });
+  assert.equal(isFrozenBenchmarkConfiguration(alteredArms), false);
+  assert.equal(benchmarkOpportunityIdForScope(alteredArms.benchmark, 42, alteredArms), undefined);
+  const reorderedArms = variant({ selection: { enabledArms: ['CONTEXTUAL', 'THOMPSON'] } });
+  assert.equal(isFrozenBenchmarkConfiguration(reorderedArms), false);
+  assert.equal(benchmarkOpportunityIdForScope(reorderedArms.benchmark, 42, reorderedArms), undefined);
+  // 5. Same valid scope + altered frozen priors/weights → absent.
+  const alteredPrior = variant({ selection: { thompsonPrior: { alpha0: 2, beta0: 1 } } });
+  assert.equal(isFrozenBenchmarkConfiguration(alteredPrior), false);
+  assert.equal(benchmarkOpportunityIdForScope(alteredPrior.benchmark, 42, alteredPrior), undefined);
+  const alteredWeights = variant({ selection: { contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.2 } } });
+  assert.equal(isFrozenBenchmarkConfiguration(alteredWeights), false);
+  assert.equal(benchmarkOpportunityIdForScope(alteredWeights.benchmark, 42, alteredWeights), undefined);
+  // 6. Generated/fallback query still cannot acquire the frozen ID.
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 999, frozen), undefined);
+  // Ordering-only frozen configuration also qualifies on its own.
+  const orderingOnly = normalizeSelectionExperimentRequest({
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  });
+  assert.equal(isFrozenBenchmarkConfiguration(orderingOnly), true);
+  assert.equal(benchmarkOpportunityIdForScope(orderingOnly.benchmark, 42, orderingOnly), 'benchmark-prereg-v1:pool:abc123:42');
+  // 7. CONTROL and treatment share the same frozen opportunity identity: the
+  // gate depends on configuration only, never the assigned arm.
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 42, frozen), benchmarkOpportunityIdForScope(frozen.benchmark, 42, frozen));
+  assert.equal(isFrozenBenchmarkConfiguration(null), false);
+  assert.equal(isFrozenBenchmarkConfiguration(undefined), false);
+});
+
+test('observation envelope carries the stable benchmark opportunity only for frozen experiments', async () => {
+  const { buildSelectionExperimentObservation, assignSelectionExperimentArm } = await import('./querySelectionExperiments');
+  const base = {
+    experimentId: 'exp-plain',
+    assignment: assignSelectionExperimentArm({ experimentId: 'exp-plain', enabledArms: [], treatmentBasisPoints: 0, opportunityKey: 'opp-plain' }),
+    eligibility: 'SELECTION_EXPERIMENT_NOT_REQUESTED' as const,
+    reason: 'plain',
+    opportunityKey: 'opp-plain',
+    poolQueryIds: [],
+    winner: null,
+    thompsonPrior: { alpha0: 1, beta0: 1 },
+    contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
+    servedArm: 'CONTROL' as const,
+  };
+  const legacy = buildSelectionExperimentObservation(base);
+  assert.equal('benchmarkOpportunityId' in legacy, false);
+  const benchmark = buildSelectionExperimentObservation({ ...base, benchmarkOpportunityId: 'benchmark-prereg-v1:q42' });
+  assert.equal(benchmark.benchmarkOpportunityId, 'benchmark-prereg-v1:q42');
+});
+
+test('benchmark pool scope normalizes, validates, and gates opportunity identity', () => {
+  // Absent scope normalizes to null without affecting dimensions.
+  assert.equal(normalizeSelectionExperimentRequest({ selection: { experimentId: 's', enabledArms: ['THOMPSON'], treatmentBasisPoints: 0 } }).benchmark, null);
+  // Designated frozen pool row normalizes exactly.
+  const scoped = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  });
+  assert.deepEqual(scoped.benchmark, { snapshotHash: 'abc123', poolRowId: 42 });
+  assert.notEqual(validateSelectionExperimentRequest({
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  }), null);
+  // Present-but-invalid scope fails closed; scope alone validates nothing.
+  assert.throws(
+    () => validateSelectionExperimentRequest({ selection: { experimentId: 's', enabledArms: ['THOMPSON'], treatmentBasisPoints: 0 }, benchmark: { snapshotHash: '', poolRowId: 0 } }),
+    /INVALID_BENCHMARK_SCOPE/
+  );
+  assert.throws(() => validateSelectionExperimentRequest({ benchmark: { snapshotHash: 'abc123', poolRowId: 42 } }), /INVALID_EXPERIMENT_REQUEST/);
+});
+
+test('schedule-authoritative frozen ordering derives from the stored scheduled_at', async () => {
+  const { resolveFrozenBenchmarkScheduleOrdering, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID } = await import('./querySelectionExperiments');
+  const stored = new Date('2026-04-01T00:00:00.000Z');
+  const envelope = {
+    arm: 'TREATMENT' as const,
+    propensityBasisPoints: 5000,
+    policyVersion: 'retrieval-experiment-v1',
+    windowApplied: true,
+    window: { publishedAfter: '2020-01-01T00:00:00Z', publishedBefore: '2020-02-01T00:00:00Z' },
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+  };
+  const resolved = resolveFrozenBenchmarkScheduleOrdering(envelope, stored);
+  assert.notEqual(resolved, envelope);
+  assert.equal(resolved?.arm, 'TREATMENT');
+  assert.equal(resolved?.windowApplied, true);
+  assert.deepEqual(resolved?.window, { publishedAfter: '2026-01-01T00:00:00.000Z', publishedBefore: '2026-04-01T00:00:00.000Z' });
+  assert.equal(resolved?.experimentId, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID);
+  // Non-frozen identities, CONTROL arms, and absent envelopes pass through
+  // by reference (nothing to persist).
+  const control = { ...envelope, arm: 'CONTROL' as const, windowApplied: false, window: null, experimentId: null };
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(control, stored), control);
+  const other = { ...envelope, experimentId: 'other-exp' };
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(other, stored), other);
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(undefined, stored), undefined);
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(null, stored), null);
+});
+
+test('frozen ordering without a valid scheduledAt fails closed instead of using the application clock', async () => {
+  const { evaluateOrderingDimension, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID } = await import('./querySelectionExperiments');
+  // Frozen TREATMENT without scheduledAt: no silent new Date() fallback.
+  assert.throws(
+    () => evaluateOrderingDimension({
+      treatmentBasisPoints: 10000,
+      window: null,
+      experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+      opportunityKey: 'opp-frozen-no-clock',
+    }),
+    /BENCHMARK_ORDERING_SCHEDULED_AT_REQUIRED/
+  );
+  // Frozen TREATMENT with an invalid Date: same fail-closed behavior.
+  assert.throws(
+    () => evaluateOrderingDimension({
+      treatmentBasisPoints: 10000,
+      window: null,
+      experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+      opportunityKey: 'opp-frozen-bad-clock',
+      scheduledAt: new Date(Number.NaN),
+    }),
+    /BENCHMARK_ORDERING_SCHEDULED_AT_REQUIRED/
+  );
+  // Frozen CONTROL needs no window and stays open without scheduledAt.
+  const control = evaluateOrderingDimension({
+    treatmentBasisPoints: 0,
+    window: null,
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-control-no-clock',
+  });
+  assert.equal(control.arm, 'CONTROL');
+  assert.equal(control.windowApplied, false);
+  // Legacy identities never consult the clock and are unaffected.
+  const legacy = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window: { publishedAfter: '2026-01-01T00:00:00Z' },
+    experimentId: 'legacy-exp',
+    opportunityKey: 'opp-legacy-no-clock',
+  });
+  assert.equal(legacy.arm, 'TREATMENT');
+  assert.equal(legacy.windowApplied, true);
+  assert.deepEqual(legacy.window, { publishedAfter: '2026-01-01T00:00:00Z' });
 });
