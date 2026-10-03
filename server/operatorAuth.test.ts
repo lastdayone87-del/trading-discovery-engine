@@ -36,6 +36,17 @@ test('crawler reliability telemetry is an explicit operator-only read route',()=
  assert.deepEqual(route?.action,'diagnostics.crawler-reliability.read');
 });
 
+test('frontier benchmark surfaces are explicit operator-only read routes (never public)',()=>{
+ for (const path of ['/api/discovery/frontier/diagnostics','/api/discovery/frontier/comparison']) {
+  const matching=routePolicyInventory.filter(item=>item.method==='GET'&&new RegExp(item.pattern).test(path));
+  assert.equal(matching.length,1,`${path} must resolve to exactly one explicit route policy`);
+  assert.equal(matching[0].policy,'operator');
+ }
+ const frontier=routePolicyInventory.filter(item=>new RegExp(item.pattern).test('/api/discovery/frontier/comparison'));
+ assert.deepEqual(frontier[0].action,'discovery.frontier.read');
+ assert.ok(!routePolicyInventory.some(x=>x.policy==='public'&&/frontier/.test(x.pattern)));
+});
+
 test('version diagnostics is an explicit operator-only read route',()=>{
  const matching=routePolicyInventory.filter(item=>item.method==='GET'&&new RegExp(item.pattern).test('/api/version'));
  assert.equal(matching.length,1,'/api/version must resolve to exactly one explicit route policy');

@@ -15,6 +15,7 @@ const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; acti
   { method:'GET', pattern:/^\/api\/browser-capability$/, policy:'operator', action:'runtime.browser-capability.read' },
   { method:'GET', pattern:/^\/api\/provider-metrics$/, policy:'operator', action:'providers.metrics.read' },
   { method:'GET', pattern:/^\/api\/discovery\/evaluation$/, policy:'operator', action:'discovery.evaluation.read' },
+  { method:'GET', pattern:/^\/api\/discovery\/frontier\/(diagnostics|comparison)$/, policy:'operator', action:'discovery.frontier.read' },
   { method:'POST', pattern:/^\/api\/discovery\/evaluation\/snapshots$/, policy:'operator', action:'discovery.evaluation.materialize' },
   { method:'GET', pattern:/^\/api\/diagnostics\/enrichment-backlog$/, policy:'operator', action:'diagnostics.enrichment-backlog.read' },
   { method:'GET', pattern:/^\/api\/diagnostics\/crawler-reliability$/, policy:'operator', action:'diagnostics.crawler-reliability.read' },

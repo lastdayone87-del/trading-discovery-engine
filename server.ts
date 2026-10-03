@@ -69,6 +69,7 @@ import {
   setDiscoveryScope
 } from './server/autonomousDiscovery';
 import { generateCandidateQueriesForCountry } from './server/queryIntelligence';
+import { validateSelectionExperimentRequest } from './server/querySelectionExperiments';
 import { getTerminologyDashboard } from './server/terminologyIntelligence';
 import {
   runRegressionTestSuite,
@@ -459,12 +460,23 @@ async function startServer() {
   app.post('/api/search/automated', async (req, res) => {
     try {
       await recordExecutionStage('HTTP_HANDLER','REACHED',{route:'/api/search/automated'},req.requestId);
-      const { country } = req.body;
+      const { country, experiment: experimentInput } = req.body;
       if (!country) {
         return res.status(400).json({ error: 'Missing country parameter.' });
       }
+      // Opt-in selection experiment (Thompson/Contextual/CONTROL + ordering
+      // window + canary-trial request). Absent by default; present-but-invalid
+      // fails closed with 400 and schedules nothing.
+      let experiment = null;
+      if (experimentInput !== undefined) {
+        try {
+          experiment = validateSelectionExperimentRequest(experimentInput);
+        } catch {
+          return res.status(400).json({ error: 'Invalid experiment request.', code: 'INVALID_EXPERIMENT_REQUEST' });
+        }
+      }
 
-      const report = await runAutonomousDiscoveryCycle(country, undefined, req.requestId);
+      const report = await runAutonomousDiscoveryCycle(country, undefined, req.requestId, experiment);
       
       // Kick off processing for the durable Phase 9 job created by the producer.
       processNextSearchJob().catch(() => {});
@@ -687,7 +699,7 @@ async function startServer() {
   // 19. Run Autonomous Discovery Cycle On-Demand
   app.post('/api/query-intelligence/run-cycle', async (req, res) => {
     try {
-      const { country, providerKey, capability, maxRuns } = req.body || {};
+      const { country, providerKey, capability, maxRuns, experiment: experimentInput } = req.body || {};
       const providerTargetRequested = providerKey !== undefined || capability !== undefined || maxRuns !== undefined;
       if (providerTargetRequested) {
         if (req.operator?.role !== 'admin') return res.status(403).json({ error: 'Administrator role required for provider-targeted canary cycles.', code: 'FORBIDDEN' });
@@ -695,7 +707,15 @@ async function startServer() {
           return res.status(400).json({ error: 'Only one governed Brave direct-search canary run is supported.', code: 'UNSUPPORTED_PROVIDER_TARGET' });
         }
       }
-      const result = await runAutonomousDiscoveryCycle(country, providerTargetRequested ? { targetProviderKey: providerKey, requiredCapability: capability, allocationType: 'FRONTIER_CANARY', maxRuns: 1, allowShadowProvider: true } : undefined, req.requestId);
+      let experiment = null;
+      if (experimentInput !== undefined) {
+        try {
+          experiment = validateSelectionExperimentRequest(experimentInput);
+        } catch {
+          return res.status(400).json({ error: 'Invalid experiment request.', code: 'INVALID_EXPERIMENT_REQUEST' });
+        }
+      }
+      const result = await runAutonomousDiscoveryCycle(country, providerTargetRequested ? { targetProviderKey: providerKey, requiredCapability: capability, allocationType: 'FRONTIER_CANARY', maxRuns: 1, allowShadowProvider: true } : undefined, req.requestId, experiment);
       res.json(result);
     } catch (err: any) {
       sendOperationError(res, err);

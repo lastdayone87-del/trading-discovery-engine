@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildWindowedSearchParams, selectOrderingExperimentArm } from './retrievalExperiment';
+import { buildWindowedSearchParams, selectOrderingExperimentArm, resolveExecutionSearchWindow } from './retrievalExperiment';
 
 test('windowed params default to control passthrough', () => {
   const base = { q: 'DAX Analyse', order: 'relevance' };
@@ -63,4 +63,24 @@ test('ordering assignment is disabled by default and deterministic', () => {
   assert.equal(c.propensityBasisPoints, c.arm === 'TREATMENT' ? 2500 : 7500);
   assert.throws(() => selectOrderingExperimentArm(''), /OPPORTUNITY_KEY_REQUIRED/);
   assert.throws(() => selectOrderingExperimentArm('opp', -1), /INVALID_TREATMENT/);
+});
+
+test('execution window resolves recorded bounds and rejects everything else', () => {
+  assert.deepEqual(
+    resolveExecutionSearchWindow({ publishedAfter: '2026-01-01T00:00:00Z', experimentId: 'exp-1' }),
+    { publishedAfter: '2026-01-01T00:00:00Z' }
+  );
+  assert.deepEqual(
+    resolveExecutionSearchWindow({ publishedAfter: '2026-01-01T00:00:00Z', publishedBefore: '2026-02-01T00:00:00Z', experimentId: 'exp-1' }),
+    { publishedAfter: '2026-01-01T00:00:00Z', publishedBefore: '2026-02-01T00:00:00Z' }
+  );
+  assert.equal(resolveExecutionSearchWindow(null), null);
+  assert.equal(resolveExecutionSearchWindow(undefined), null);
+  assert.equal(resolveExecutionSearchWindow({}), null);
+  assert.equal(resolveExecutionSearchWindow({ publishedAfter: '2026-01-01T00:00:00Z' }), null);
+  assert.equal(resolveExecutionSearchWindow({ publishedAfter: '2026-01-01', experimentId: 'exp-1' }), null);
+  assert.equal(
+    resolveExecutionSearchWindow({ publishedAfter: '2026-02-01T00:00:00Z', publishedBefore: '2026-01-01T00:00:00Z', experimentId: 'exp-1' }),
+    null
+  );
 });

@@ -20,7 +20,7 @@
  * separately approved experiment.
  */
 import { createHash } from 'node:crypto';
-import { getRouteStats, recordWeightSnapshot } from './dbCore';
+import { getRouteStats, recordWeightSnapshot, getApprovedWeights, getAppSetting } from './dbCore';
 
 export const DOMAIN_LEARNER_POLICY_VERSION = 'domain-learner-v1';
 
@@ -274,4 +274,48 @@ export async function runDomainLearningBatch(
   const snapshot = buildWeightSnapshot(computed);
   await recordSnapshot(snapshot);
   return { status: 'DRAFT_RECORDED', version: snapshot.version };
+}
+
+export const DOMAIN_WEIGHT_EXPERIMENT_SETTING_KEY = 'domain_weight_experiment_enabled';
+
+/**
+ * Explicit experimental admission gate for approved domain weights.
+ * Default-off (setting absent/false, or read failure, yields false).
+ * DRAFT snapshots are never consumable through any path: consumption
+ * additionally requires an APPROVED snapshot (see getApprovedWeights).
+ * No serving caller exists by design — experiment harnesses call
+ * consumeExperimentalWeights explicitly.
+ */
+export async function isDomainWeightExperimentConsumptionEnabled(
+  readSetting: (key: string, fallback: string) => Promise<string> = getAppSetting,
+): Promise<boolean> {
+  try {
+    return (await readSetting(DOMAIN_WEIGHT_EXPERIMENT_SETTING_KEY, 'false')) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export type ExperimentalWeightConsumption =
+  | { available: true; version: string; weights: Record<string, number> }
+  | { available: false; reason: 'EXPERIMENT_NOT_ENABLED' | 'NO_APPROVED_WEIGHTS' };
+
+/**
+ * Consumes the latest APPROVED weight snapshot for a site if and only if
+ * the explicit experiment gate is enabled. Returns a machine-readable
+ * unavailability reason otherwise. DRAFT snapshots are never returned.
+ */
+export async function consumeExperimentalWeights(
+  siteIdentity: string,
+  deps: {
+    readSetting?: (key: string, fallback: string) => Promise<string>;
+    getApproved?: (siteIdentity: string) => Promise<{ version: string; weights: Record<string, number> } | null>;
+  } = {}
+): Promise<ExperimentalWeightConsumption> {
+  const enabled = await isDomainWeightExperimentConsumptionEnabled(deps.readSetting);
+  if (!enabled) return { available: false, reason: 'EXPERIMENT_NOT_ENABLED' };
+  const getApproved = deps.getApproved || getApprovedWeights;
+  const resolved = await getApproved(siteIdentity);
+  if (!resolved) return { available: false, reason: 'NO_APPROVED_WEIGHTS' };
+  return { available: true, version: resolved.version, weights: resolved.weights };
 }

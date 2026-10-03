@@ -7,8 +7,10 @@ const here = (name: string) => readFileSync(fileURLToPath(new URL(name, import.m
 
 test('normal run-cycle forwards request identity without accepting provider overrides', () => {
   const server = here('../server.ts');
-  assert.match(server, /runAutonomousDiscoveryCycle\(country, providerTargetRequested \? \{[\s\S]*?\} : undefined, req\.requestId\)/);
+  assert.match(server, /runAutonomousDiscoveryCycle\(country, providerTargetRequested \? \{[\s\S]*?\} : undefined, req\.requestId, experiment\)/);
   assert.match(server, /if \(providerTargetRequested\) \{[\s\S]*?providerKey !== 'brave-search'/);
+  assert.match(server, /validateSelectionExperimentRequest\(experimentInput\)/);
+  assert.match(server, /INVALID_EXPERIMENT_REQUEST/);
 });
 
 test('producer persists a structured diagnostic report alongside the compatible queuedCount summary', () => {

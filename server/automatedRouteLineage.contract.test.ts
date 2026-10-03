@@ -7,8 +7,10 @@ const here = (name: string) => readFileSync(fileURLToPath(new URL(name, import.m
 
 test('authenticated automated search routes through the governed autonomous producer', () => {
   const server = here('../server.ts');
-  assert.match(server, /runAutonomousDiscoveryCycle\(country, undefined, req\.requestId\)/);
-  assert.match(server, /const report = await runAutonomousDiscoveryCycle\(country, undefined, req\.requestId\);/);
+  assert.match(server, /runAutonomousDiscoveryCycle\(country, undefined, req\.requestId, experiment\)/);
+  assert.match(server, /const report = await runAutonomousDiscoveryCycle\(country, undefined, req\.requestId, experiment\);/);
+  assert.match(server, /validateSelectionExperimentRequest\(experimentInput\)/);
+  assert.match(server, /INVALID_EXPERIMENT_REQUEST/);
   assert.match(server, /const queries = report\.queries \|\|/);
   assert.match(server, /Scheduled \$\{report\.queuedCount \|\| 0\} governed queries/);
   assert.doesNotMatch(server, /addAutomatedCountrySearch/);

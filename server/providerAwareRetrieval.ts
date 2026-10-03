@@ -212,6 +212,11 @@ export interface RetrievalRequest {
   jobId?: string;
   /** Optional language selected by persisted query/evidence metadata. */
   preferredLanguage?: string;
+  /**
+   * Opt-in P2 window treatment recorded on the job payload at schedule time
+   * (validated bounds + experiment id). Absent means an unwindowed fetch.
+   */
+  searchWindow?: { publishedAfter?: string; publishedBefore?: string } | null;
   reserveAdditionalUnits?: (units:number)=>Promise<void>;
   priority?: 'autonomous'|'manual';
 }
@@ -257,7 +262,8 @@ function registerDefaultExecutors(): void {
   registerRetrievalExecutor(YOUTUBE_SEARCH_PROVIDER, async (request) => {
     return searchYouTubeChannelPage(
       request.query, request.country, request.vocabulary, request.lane, request.cursor, request.ordering, request.reserveAdditionalUnits, request.priority,
-      { requestId: request.requestId, runId: request.queryRunId, jobId: request.jobId, preferredLanguage: request.preferredLanguage }
+      { requestId: request.requestId, runId: request.queryRunId, jobId: request.jobId, preferredLanguage: request.preferredLanguage },
+      request.searchWindow ?? undefined
     );
   });
 }

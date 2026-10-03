@@ -45,7 +45,7 @@ test('Phase 7: Trial outcome state classification - PRODUCTIVE when relevant AND
 
 test('Phase 7: Fail Closed Gate - Rejects trial when operator kill switch read fails or is not true', async () => {
   const mockClientKillSwitchOff = {
-    query: async (sql: string) => {
+    query: async (sql: string, _values?: unknown[]) => {
       if (sql.includes('app_settings')) {
         return { rows: [{ setting_value: 'false' }] };
       }
@@ -60,7 +60,7 @@ test('Phase 7: Fail Closed Gate - Rejects trial when operator kill switch read f
 
 test('Phase 7: Fail Closed Gate - Rejects trial when target neighborhood frontier state verification errors', async () => {
   const mockClientError = {
-    query: async (sql: string) => {
+    query: async (sql: string, _values?: unknown[]) => {
       if (sql.includes('app_settings')) {
         return { rows: [{ setting_value: 'true' }] };
       }
@@ -117,4 +117,213 @@ test('Phase 7: Strict Quota Input Validation - Rejects zero, negative, >100, non
       /Invalid canary quota reservation/
     );
   }
+});
+
+test('Phase 7b: trial funnel mapping is measured-only with documented unmeasured zeros', async () => {
+  const { mapCompletionFunnelToTrialMetrics, TRIAL_FUNNEL_MAP_VERSION } = await import('./discoveryFrontierTrials');
+  assert.equal(TRIAL_FUNNEL_MAP_VERSION, 'trial-funnel-map-v1');
+  const mapped = mapCompletionFunnelToTrialMetrics({
+    rawResults: 25, distinctResults: 20, knownChannels: 15, newChannels: 5,
+    tradingConfirmed: 3, qualityChannels: 2, quotaUsed: 100,
+  });
+  assert.deepEqual(mapped, {
+    creatorsReturned: 25,
+    distinctCreators: 20,
+    newCreators: 5,
+    relevantNewCreators: 3,
+    qualityNewCreators: 2,
+    knownChannelOverlap: 0.75,
+    neighborhoodOverlap: 0,
+    quotaConsumed: 100,
+    marginalDiscoveryValue: 0,
+    coverageGain: 0,
+  });
+  const empty = mapCompletionFunnelToTrialMetrics({
+    rawResults: 0, distinctResults: 0, knownChannels: 0, newChannels: 0,
+    tradingConfirmed: 0, qualityChannels: 0, quotaUsed: 0,
+  });
+  assert.equal(empty.knownChannelOverlap, 0);
+  assert.equal(classifyTrialOutcomeState(empty), 'NOISY');
+});
+
+test('Phase 7b: trial linkage fails closed without a matching frontier decision', async () => {
+  const { resolveTrialLinkage, isTrialQuotaSufficient, trialContinuationCap, quotaYieldPer1000 } = await import('./discoveryFrontierTrials');
+  assert.deepEqual(resolveTrialLinkage({ requestedProposalId: 'p1', decisionProposalId: null }), {
+    proceed: false,
+    reason: 'TRIAL_REQUIRES_FRONTIER_DECISION',
+  });
+  assert.deepEqual(resolveTrialLinkage({ requestedProposalId: 'p1', decisionProposalId: 'p2' }), {
+    proceed: false,
+    reason: 'TRIAL_PROPOSAL_DECISION_MISMATCH',
+  });
+  assert.deepEqual(resolveTrialLinkage({ requestedProposalId: 'p1', decisionProposalId: 'p1' }), {
+    proceed: true,
+    proposalId: 'p1',
+  });
+  assert.equal(isTrialQuotaSufficient(100, 100), true);
+  assert.equal(isTrialQuotaSufficient(100, 0), true);
+  assert.equal(isTrialQuotaSufficient(50, 100), false);
+  assert.equal(isTrialQuotaSufficient(NaN, 100), false);
+  assert.equal(trialContinuationCap(3, 100), 1);
+  assert.equal(trialContinuationCap(3, 250), 2);
+  assert.equal(trialContinuationCap(3, 0), 0);
+  assert.equal(trialContinuationCap(5, 10000), 5);
+  const zero = quotaYieldPer1000(0, 0);
+  assert.equal(zero.totalQuotaConsumed, 0);
+  assert.equal(zero.yieldPer1000Quota, 0);
+  const some = quotaYieldPer1000(3, 100);
+  assert.equal(some.totalQuotaConsumed, 100);
+  assert.equal(some.yieldPer1000Quota, 30);
+});
+
+test('Phase 7b: caller-owned trial initiation scopes failures to a savepoint (outer txn survives)', async () => {
+  const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
+  const statements: string[] = [];
+  const proposalRow = {
+    proposal_id: 'prop-savepoint',
+    dedup_key: 'dedup-savepoint',
+    proposal_family: 'LEARNED',
+    country: 'US',
+    language: null,
+    concept: 'options trading',
+    target_neighborhood_key: null,
+    target_dimensions: {},
+    source_provenance: 'query_library:active',
+    supporting_evidence: {},
+    confidence: 0.8,
+    novelty_rationale: 'test',
+    trial_status: 'PENDING',
+    expires_at: null,
+  };
+  const stubClient = {
+    query: async (sql: string, _values?: unknown[]) => {
+      statements.push(sql.split('\n')[0].trim());
+      if (sql.includes('app_settings')) return { rows: [{ setting_value: 'true' }], rowCount: 1 };
+      if (sql.includes('FROM frontier_discovery_proposals')) return { rows: [proposalRow], rowCount: 1 };
+      if (sql.includes('FROM discovery_neighborhood_frontier_states')) return { rows: [], rowCount: 0 };
+      if (sql.includes('SUM(GREATEST')) return { rows: [{ daily_reserved_capacity: 0 }], rowCount: 1 };
+      if (sql.includes('FROM frontier_canary_trials')) return { rows: [], rowCount: 0 };
+      if (sql.includes('INSERT INTO frontier_canary_trials')) throw new Error('simulated trial insert failure');
+      if (sql.includes('UPDATE frontier_discovery_proposals')) return { rows: [], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  await assert.rejects(
+    initiateCanaryTrial('prop-savepoint', { maxQuota: 50 }, stubClient as any),
+    /simulated trial insert failure/
+  );
+  const exact = (name: string) => statements.filter(statement => statement === name);
+  // Trial statements were fenced in a savepoint: local rollback only.
+  assert.ok(statements.some(statement => statement.startsWith('SAVEPOINT')), 'savepoint established');
+  assert.ok(exact('ROLLBACK TO SAVEPOINT frontier_trial_init').length === 1, 'rolled back to savepoint');
+  // The caller-owned outer transaction was never aborted: no bare transaction
+  // control may appear on the caller-owned path.
+  assert.equal(exact('BEGIN').length, 0);
+  assert.equal(exact('COMMIT').length, 0);
+  assert.equal(exact('ROLLBACK').length, 0);
+  // The outer transaction remains usable: a follow-up statement on the same
+  // client (e.g. the scheduling run/job insert) still executes.
+  const followUp = await stubClient.query('INSERT INTO query_runs(id) VALUES($1)', ['run-1']);
+  assert.equal(followUp.rowCount, 0);
+});
+
+test('Phase 7b: caller-owned trial success releases the savepoint without touching the outer txn', async () => {
+  const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
+  const statements: string[] = [];
+  const proposalRow = {
+    proposal_id: 'prop-ok',
+    dedup_key: 'dedup-ok',
+    proposal_family: 'LEARNED',
+    country: 'US',
+    language: null,
+    concept: 'options trading',
+    target_neighborhood_key: null,
+    target_dimensions: {},
+    source_provenance: 'query_library:active',
+    supporting_evidence: {},
+    confidence: 0.8,
+    novelty_rationale: 'test',
+    trial_status: 'PENDING',
+    expires_at: null,
+  };
+  const stubClient = {
+    query: async (sql: string, _values?: unknown[]) => {
+      statements.push(sql.split('\n')[0].trim());
+      if (sql.includes('app_settings')) return { rows: [{ setting_value: 'true' }], rowCount: 1 };
+      if (sql.includes('FROM frontier_discovery_proposals')) return { rows: [proposalRow], rowCount: 1 };
+      if (sql.includes('SUM(GREATEST')) return { rows: [{ daily_reserved_capacity: 0 }], rowCount: 1 };
+      if (sql.includes('FROM frontier_canary_trials')) return { rows: [], rowCount: 0 };
+      if (sql.includes('INSERT INTO frontier_canary_trials')) {
+        return {
+          rows: [{
+            trial_id: 'trial-1', trial_key: 'trial:dedup-ok', proposal_id: 'prop-ok', country: 'US',
+            neighborhood_key: null, quota_reserved: 50, quota_consumed: 0, trial_status: 'INITIATED',
+            initiated_at: new Date().toISOString(),
+          }],
+          rowCount: 1,
+        };
+      }
+      if (sql.includes('UPDATE frontier_discovery_proposals')) return { rows: [], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const initiated = await initiateCanaryTrial('prop-ok', { maxQuota: 50 }, stubClient as any);
+  assert.equal(initiated.trialId, 'trial-1');
+  assert.equal(initiated.quotaReserved, 50);
+  const exact = (name: string) => statements.filter(statement => statement === name);
+  assert.ok(statements.some(statement => statement.startsWith('SAVEPOINT')));
+  assert.ok(exact('RELEASE SAVEPOINT frontier_trial_init').length >= 1);
+  assert.equal(exact('BEGIN').length, 0);
+  assert.equal(exact('COMMIT').length, 0);
+  assert.equal(exact('ROLLBACK').length, 0);
+});
+
+test('Phase 7b: rejected trial (closed gate) rolls back once and leaves the outer txn usable', async () => {
+  const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
+  const statements: string[] = [];
+  const proposalRow = {
+    proposal_id: 'prop-closed',
+    dedup_key: 'dedup-closed',
+    proposal_family: 'LEARNED',
+    country: 'US',
+    language: null,
+    concept: 'options trading',
+    target_neighborhood_key: null,
+    target_dimensions: {},
+    source_provenance: 'query_library:active',
+    supporting_evidence: {},
+    confidence: 0.8,
+    novelty_rationale: 'test',
+    trial_status: 'PENDING',
+    expires_at: null,
+  };
+  const stubClient = {
+    query: async (sql: string, _values?: unknown[]) => {
+      statements.push(sql.split('\n')[0].trim());
+      if (sql.includes('app_settings')) return { rows: [{ setting_value: 'false' }], rowCount: 1 };
+      if (sql.includes('FROM frontier_discovery_proposals')) return { rows: [proposalRow], rowCount: 1 };
+      if (sql.includes('FROM frontier_canary_trials')) return { rows: [], rowCount: 0 };
+      if (sql.includes('SUM(GREATEST')) return { rows: [{ daily_reserved_capacity: 0 }], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  // Kill switch closed is the DEFAULT production state: rejection is the
+  // common path, and it must never poison the caller's transaction.
+  await assert.rejects(
+    initiateCanaryTrial('prop-closed', { maxQuota: 50 }, stubClient as any),
+    /Trial gate rejected proposal/
+  );
+  const exact = (name: string) => statements.filter(statement => statement === name);
+  assert.ok(statements.some(statement => statement.startsWith('SAVEPOINT')));
+  // Exactly one local rollback: the rejection branch aborts, and the shared
+  // catch must NOT touch the savepoint again (a second ROLLBACK TO would
+  // error on the consumed savepoint and abort the outer transaction).
+  assert.equal(exact('ROLLBACK TO SAVEPOINT frontier_trial_init').length, 1);
+  assert.equal(exact('RELEASE SAVEPOINT frontier_trial_init').length, 0);
+  assert.equal(exact('BEGIN').length, 0);
+  assert.equal(exact('COMMIT').length, 0);
+  assert.equal(exact('ROLLBACK').length, 0);
+  // Scheduling continues: run/job inserts on the same client still execute.
+  const followUp = await stubClient.query('INSERT INTO query_runs(id) VALUES($1)', ['run-1']);
+  assert.equal(followUp.rowCount, 0);
 });
