@@ -66,3 +66,9 @@ test('social crawls never inherit website seed-admission counts (call-site contr
   assert.ok(websiteMatch, 'website safeCrawlStatic call site exists');
   assert.match(websiteMatch[1], /ladderSeedAdmission/);
 });
+
+test('domain-weight shadow evaluates the live capped queue, never the pre-cap list', () => {
+  const source = here('./inspector.ts');
+  assert.match(source, /evaluateDomainWeightShadow\(shadowSiteIdentity,queue\.map\(item=>\(\{url:item\.url,score:item\.score\}\)\)\)/);
+  assert.doesNotMatch(source, /evaluateDomainWeightShadow\(shadowSiteIdentity,dedupedNavigation\.map/);
+});

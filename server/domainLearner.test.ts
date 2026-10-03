@@ -174,3 +174,68 @@ test('experimental weight consumption is default-off and never serves DRAFT', as
   });
   assert.deepEqual(open, { available: true, version: 'dw-approved', weights: { a: 0.7 } });
 });
+
+test('domain-weight shadow evaluation is observational and version-bound', async () => {
+  const { evaluateDomainWeightShadow } = await import('./domainLearner');
+  assert.equal(await evaluateDomainWeightShadow('', [{ url: 'https://example.com/a', score: 10 }]), null);
+  assert.equal(
+    await evaluateDomainWeightShadow('example.com', [], {
+      readSetting: async () => 'true',
+      getApproved: async () => ({ version: 'dw-1', weights: {} }),
+    }),
+    null
+  );
+  assert.equal(
+    await evaluateDomainWeightShadow('example.com', [{ url: 'https://example.com/a', score: 10 }], {
+      readSetting: async () => 'false',
+      getApproved: async () => ({ version: 'dw-1', weights: {} }),
+    }),
+    null
+  );
+  assert.equal(
+    await evaluateDomainWeightShadow('example.com', [{ url: 'https://example.com/a', score: 10 }], {
+      readSetting: async () => 'true',
+      getApproved: async () => null,
+    }),
+    null
+  );
+  const shadow = await evaluateDomainWeightShadow(
+    'example.com',
+    [
+      { url: 'https://example.com/b', score: 90 },
+      { url: 'https://example.com/a', score: 10 },
+    ],
+    {
+      readSetting: async () => 'true',
+      getApproved: async () => ({ version: 'dw-approved-1', weights: {} }),
+    }
+  );
+  assert.ok(shadow);
+  assert.equal(shadow?.siteIdentity, 'example.com');
+  assert.equal(shadow?.weightsVersion, 'dw-approved-1');
+  assert.equal(shadow?.routeCount, 2);
+  assert.equal(shadow?.baselineTopUrl, 'https://example.com/b');
+  assert.equal(typeof shadow?.agreement, 'boolean');
+});
+
+test('shadow evaluation is deterministic over a fixed candidate list', async () => {
+  const { evaluateDomainWeightShadow } = await import('./domainLearner');
+  const candidates = Array.from({ length: 13 }, (_, index) => ({
+    url: `https://example.com/page-${index}`,
+    score: 100 - index,
+  }));
+  const deps = {
+    readSetting: async () => 'true',
+    getApproved: async () => ({ version: 'dw-cap', weights: {} as Record<string, number> }),
+  };
+  const first = await evaluateDomainWeightShadow('example.com', candidates, deps);
+  const second = await evaluateDomainWeightShadow('example.com', candidates, deps);
+  assert.ok(first && second);
+  // Thirteen candidates reach the evaluator uncapped here by construction:
+  // this documents why callers must pass the live capped queue instead —
+  // the evaluator trusts its input list (see the inspector call-site
+  // contract test), so an uncapped list can surface a beyond-cap pick.
+  assert.equal(first?.routeCount, 13);
+  assert.deepEqual(first, second);
+  assert.ok(candidates.some(candidate => candidate.url === first?.shadowPickUrl));
+});

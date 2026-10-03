@@ -78,3 +78,82 @@ test('assistance stays disabled by default and versions its policy', async () =>
   assert.equal(await isLlmAssistEnabled(async () => 'true'), true);
   assert.match(LLM_ASSIST_POLICY_VERSION, /^llm-assist-v\d+$/);
 });
+
+test('orchestrator gates before calling, validates after, and never throws', async () => {
+  const { executeLlmAssistTask } = await import('./llmAssist');
+  const budget: { enabled: boolean; allowlistedTasks: ('AMBIGUOUS_NAVIGATION')[]; callsUsed: number; inputChars: number } = {
+    enabled: true,
+    allowlistedTasks: ['AMBIGUOUS_NAVIGATION'],
+    callsUsed: 0,
+    inputChars: 100,
+  };
+  let calls = 0;
+  const gated = await executeLlmAssistTask(
+    INPUT,
+    { completeDecision: async () => { calls += 1; return validDecision; } },
+    { ...budget, enabled: false }
+  );
+  assert.equal(gated.outcome, 'FALLBACK');
+  assert.deepEqual(gated.reasonCodes, ['GATEWAY_DISABLED']);
+  assert.equal(calls, 0);
+  const noClient = await executeLlmAssistTask(INPUT, null, { ...budget, allowlistedTasks: [...budget.allowlistedTasks] });
+  assert.equal(noClient.outcome, 'FALLBACK');
+  assert.deepEqual(noClient.reasonCodes, ['NO_PROVIDER_CLIENT']);
+  assert.equal(noClient.decision.selectedUrl, null);
+  const applied = await executeLlmAssistTask(
+    INPUT,
+    { completeDecision: async () => validDecision },
+    { ...budget, allowlistedTasks: [...budget.allowlistedTasks] }
+  );
+  assert.equal(applied.outcome, 'APPLIED');
+  assert.deepEqual(applied.decision, validDecision);
+  assert.equal(applied.audit.outcome, 'APPLIED');
+  const invented = await executeLlmAssistTask(
+    INPUT,
+    { completeDecision: async () => ({ ...validDecision, selectedUrl: 'https://example.com/secret-vip-room' }) },
+    { ...budget, allowlistedTasks: [...budget.allowlistedTasks] }
+  );
+  assert.equal(invented.outcome, 'REJECTED');
+  assert.deepEqual(invented.reasonCodes, ['INVENTED_URL']);
+  assert.equal(invented.decision.selectedUrl, null);
+  const exploded = await executeLlmAssistTask(
+    INPUT,
+    {
+      completeDecision: async () => {
+        throw new Error('provider down');
+      },
+    },
+    { ...budget, allowlistedTasks: [...budget.allowlistedTasks] }
+  );
+  assert.equal(exploded.outcome, 'FALLBACK');
+  assert.ok(exploded.reasonCodes[0].startsWith('PROVIDER_ERROR:'));
+});
+
+test('null/undefined provider responses fall back safely with audit intact', async () => {
+  const { executeLlmAssistTask } = await import('./llmAssist');
+  const budget = {
+    enabled: true,
+    allowlistedTasks: ['AMBIGUOUS_NAVIGATION'] as ('AMBIGUOUS_NAVIGATION')[],
+    callsUsed: 0,
+    inputChars: 100,
+  };
+  for (const empty of [null, undefined]) {
+    const result = await executeLlmAssistTask(
+      {
+        task: 'AMBIGUOUS_NAVIGATION',
+        candidateUrls: ['https://example.com/join'],
+        evidenceSpans: ['members gather here'],
+        baseline: 'https://example.com/join',
+        contextUrl: 'https://example.com/',
+      },
+      { completeDecision: async () => empty as never },
+      { ...budget, allowlistedTasks: [...budget.allowlistedTasks] }
+    );
+    assert.equal(result.outcome, 'FALLBACK');
+    assert.deepEqual(result.reasonCodes, ['PROVIDER_EMPTY_RESPONSE']);
+    assert.equal(result.decision.selectedUrl, null);
+    assert.equal(result.audit.outcome, 'FALLBACK');
+    assert.deepEqual(result.audit.reasonCodes, ['PROVIDER_EMPTY_RESPONSE']);
+    assert.equal(result.audit.task, 'AMBIGUOUS_NAVIGATION');
+  }
+});

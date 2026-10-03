@@ -46,3 +46,34 @@ export const brokerInterviewAdapter: OsintAdapter = stubAdapter('broker-intervie
 export const eventSpeakerAdapter: OsintAdapter = stubAdapter('event-speakers-stub', 'PUBLICATION');
 
 export const P5_OSINT_ADAPTERS: OsintAdapter[] = [brokerInterviewAdapter, eventSpeakerAdapter];
+
+/**
+ * Keyed adapter registry (contract stubs pre-registered by sourceId).
+ * A registry entry is identity only — it never implies ToS review, CANARY
+ * status, or enablement. Those remain explicit per-run gate inputs because
+ * no owning authority for them exists yet (see prerequisites below).
+ */
+const osintAdapterRegistry = new Map<string, OsintAdapter>();
+for (const adapter of P5_OSINT_ADAPTERS) {
+  osintAdapterRegistry.set(adapter.sourceId.trim().toLowerCase(), adapter);
+}
+
+export function registerOsintAdapter(adapter: OsintAdapter): void {
+  if (!adapter || typeof adapter.sourceId !== 'string' || !adapter.sourceId.trim() || typeof adapter.fetch !== 'function') {
+    throw new Error('OSINT_ADAPTER_REGISTRATION_INVALID');
+  }
+  const key = adapter.sourceId.trim().toLowerCase();
+  // Source identity is append-only: silently replacing a registered adapter
+  // (including the pre-registered contract stubs) would let one source
+  // masquerade as another. Duplicates are rejected deterministically; there
+  // is no implicit replacement path and none is required by any contract.
+  if (osintAdapterRegistry.has(key)) {
+    throw new Error('OSINT_ADAPTER_DUPLICATE_SOURCE_ID');
+  }
+  osintAdapterRegistry.set(key, adapter);
+}
+
+export function resolveOsintAdapter(sourceId: string): OsintAdapter | null {
+  if (typeof sourceId !== 'string' || !sourceId.trim()) return null;
+  return osintAdapterRegistry.get(sourceId.trim().toLowerCase()) ?? null;
+}

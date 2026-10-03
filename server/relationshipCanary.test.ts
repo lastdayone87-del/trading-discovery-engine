@@ -7,6 +7,7 @@ import type { DiscoveredChannelRaw } from './youtube';
 import {
   aggregateRelationshipCohort,
   buildRelationshipProvenance,
+  evaluateGraphDepth2ForCanaryTarget,
   isRelationshipCanaryLive,
   planRelationshipExpansion,
   processRelationshipCanaryJob,
@@ -1594,4 +1595,53 @@ test('mid-batch fence failure rejects without provider-failure record', async ()
     ),
     (error: unknown) => error instanceof CanaryOwnershipCheckError,
   );
+});
+
+test('P3 depth-2 evaluation builds provenance-bound specs when evidence and enablement exist', () => {
+  const parent = UC('parent1');
+  const evaluation = evaluateGraphDepth2ForCanaryTarget(
+    { kind: 'featured', targetId: UC('target1'), parentChannelId: parent },
+    { fanoutRequested: 5, canaryEnabled: true, independentFamilies: 3 }
+  );
+  assert.equal(evaluation.eligible, true);
+  assert.equal(evaluation.reasonCode, 'GRAPH_DEPTH2_ELIGIBLE');
+  assert.equal(evaluation.policyVersion, 'graph-expansion-v1');
+  assert.ok(evaluation.proposals.length > 0 && evaluation.proposals.length <= 5);
+  for (const proposal of evaluation.proposals) {
+    assert.equal(proposal.parentChannelId, parent);
+    assert.equal(proposal.depth, 2);
+    assert.equal(proposal.edgeKind, 'FEATURED');
+    assert.match(proposal.proposalKey, /^[0-9a-f]{32}$/);
+  }
+});
+
+test('P3 depth-2 evaluation denies without enablement, independence, or valid parent', () => {
+  const parent = UC('parent2');
+  const disabled = evaluateGraphDepth2ForCanaryTarget(
+    { kind: 'featured', targetId: UC('target2'), parentChannelId: parent },
+    { fanoutRequested: 5, canaryEnabled: false, independentFamilies: 0 }
+  );
+  assert.equal(disabled.eligible, false);
+  assert.equal(disabled.reasonCode, 'GRAPH_CANARY_NOT_ENABLED');
+  assert.deepEqual(disabled.proposals, []);
+  // No family-diversity signal exists in the canary context today: 0 means
+  // zero evidenced (the measured state), which the policy denies.
+  const unmeasured = evaluateGraphDepth2ForCanaryTarget(
+    { kind: 'featured', targetId: UC('target3'), parentChannelId: parent },
+    { fanoutRequested: 5, canaryEnabled: true, independentFamilies: 0 }
+  );
+  assert.equal(unmeasured.eligible, false);
+  assert.equal(unmeasured.reasonCode, 'GRAPH_INSUFFICIENT_INDEPENDENCE');
+  const badParent = evaluateGraphDepth2ForCanaryTarget(
+    { kind: 'featured', targetId: UC('target4'), parentChannelId: 'not-a-channel' },
+    { fanoutRequested: 5, canaryEnabled: true, independentFamilies: 3 }
+  );
+  assert.equal(badParent.eligible, false);
+  assert.equal(badParent.reasonCode, 'GRAPH_PARENT_INVALID');
+  const playlist = evaluateGraphDepth2ForCanaryTarget(
+    { kind: 'playlist', targetId: UC('target5'), parentChannelId: parent },
+    { fanoutRequested: 5, canaryEnabled: true, independentFamilies: 2 }
+  );
+  assert.equal(playlist.eligible, true);
+  assert.equal(playlist.proposals[0]?.edgeKind, 'PLAYLIST_COHOST');
 });

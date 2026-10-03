@@ -6,6 +6,13 @@ import { FEATURED_CHANNEL_PROVIDER_COST } from './featuredChannelAdapter';
 import { PLAYLIST_PROVIDER_COST } from './evidenceGraphAdapters';
 import { fetchYouTubeFeaturedChannels, fetchYouTubePlaylistChannels, type DiscoveredChannelRaw, type RelationshipProvenance } from './youtube';
 import { recordNomination } from './candidateAdmission/store';
+import {
+  evaluateDepth2Eligibility,
+  buildDepth2Proposals,
+  GRAPH_EXPANSION_POLICY_VERSION,
+  type GraphEdgeKind,
+  type Depth2Proposal,
+} from './graphExpansionPolicy';
 
 /**
  * Bounded relationship-driven discovery canary (forensic report PR #439 §10).
@@ -202,6 +209,62 @@ export function planRelationshipExpansion(input: {
     });
   }
   return plan.slice(0, Math.max(0, Math.trunc(input.maxFanout)));
+}
+
+export interface GraphDepth2TargetEvaluation {
+  eligible: boolean;
+  reasonCode: string;
+  proposals: Depth2Proposal[];
+  policyVersion: string;
+}
+
+/**
+ * P3 graph depth-2 policy evaluation for one relationship-canary depth-2
+ * target. Pure and observational only: the result never gates fetching or
+ * admission (the existing canary flow proceeds identically either way), it
+ * is recorded on admitted candidates for frozen-replay evaluation.
+ *
+ * Input provenance (no invented values):
+ * - parentDepth is 1 by construction (depth-2 plan targets expand depth-1
+ *   parents; see planRelationshipExpansion).
+ * - fanoutRequested comes from the validated job payload.
+ * - edgeKind maps the plan target kind: 'featured' targets expand featured
+ *   edges; 'playlist' targets expand playlist co-host edges (channels
+ *   co-occurring on a playlist).
+ * - independentFamilies counts evidenced families. This context evidences
+ *   none, so callers pass 0 and the policy denies with
+ *   GRAPH_INSUFFICIENT_INDEPENDENCE until family-diversity signals exist
+ *   (explicit prerequisite, not a silent default: 0 means zero evidenced,
+ *   which is the measured state here).
+ * - canaryEnabled is the explicit experiment opt-in supplied by the caller.
+ */
+export function evaluateGraphDepth2ForCanaryTarget(
+  target: { kind: 'featured' | 'playlist'; targetId: string; parentChannelId?: string },
+  context: { fanoutRequested: number; canaryEnabled: boolean; independentFamilies: number; overlap?: number; knownFraction?: number }
+): GraphDepth2TargetEvaluation {
+  const edgeKind: GraphEdgeKind = target.kind === 'playlist' ? 'PLAYLIST_COHOST' : 'FEATURED';
+  const parentChannelId = target.parentChannelId || target.targetId;
+  if (!CHANNEL_ID.test(parentChannelId)) {
+    return { eligible: false, reasonCode: 'GRAPH_PARENT_INVALID', proposals: [], policyVersion: GRAPH_EXPANSION_POLICY_VERSION };
+  }
+  const eligibility = evaluateDepth2Eligibility({
+    parentDepth: 1,
+    fanoutRequested: context.fanoutRequested,
+    edgeKind,
+    independentFamilies: context.independentFamilies,
+    ...(context.overlap !== undefined ? { overlap: context.overlap } : {}),
+    ...(context.knownFraction !== undefined ? { knownFraction: context.knownFraction } : {}),
+    canaryEnabled: context.canaryEnabled,
+  });
+  if (!eligibility.eligible) {
+    return { eligible: false, reasonCode: eligibility.reasonCode, proposals: [], policyVersion: eligibility.policyVersion };
+  }
+  return {
+    eligible: true,
+    reasonCode: eligibility.reasonCode,
+    proposals: buildDepth2Proposals(parentChannelId, edgeKind, context.fanoutRequested, eligibility),
+    policyVersion: eligibility.policyVersion,
+  };
 }
 
 export interface RelationshipCanarySummary {
@@ -848,6 +911,11 @@ export async function processRelationshipCanaryJob(
       depth1ChannelIds: depth1.map(entry => entry.channelId),
       seedOf,
     });
+    // P3 graph depth-2 experiment opt-in (observational only, default-off).
+    // Read once per run; absent/false fails the P3 policy closed without
+    // touching the existing canary flow below.
+    const graphDepth2ExperimentEnabled =
+      (await getAppSetting('graph_depth2_experiment_enabled', 'false').catch(() => 'false')) === 'true';
     for (const target of plan) {
       // Expansion identity is channel-ID based and independent of admission:
       // seeds and already-expanded channels are never fetched twice, while
@@ -863,6 +931,15 @@ export async function processRelationshipCanaryJob(
       // No admissible capacity left: stop traversal before spending fetches
       // whose results could not be admitted.
       if (!capacityRemains()) break;
+      // P3 shadow evaluation (record-only): evaluate the graph depth-2
+      // policy for this target and attach the decision to admissions below.
+      // Never gates fetching or admission — the existing canary flow
+      // proceeds identically regardless of the outcome.
+      const graphDepth2Policy = evaluateGraphDepth2ForCanaryTarget(
+        { kind: target.kind, targetId: target.targetId, parentChannelId: target.parentChannelId },
+        { fanoutRequested: payload.maxFanout, canaryEnabled: graphDepth2ExperimentEnabled, independentFamilies: 0 }
+      );
+      log(`[GraphDepth2] target=${target.targetId} eligible=${graphDepth2Policy.eligible} reason=${graphDepth2Policy.reasonCode} proposals=${graphDepth2Policy.proposals.length}.`);
       summary.depth2Fetches++;
       try {
         const ids = await expandFeatured(target.targetId, {
@@ -891,7 +968,7 @@ export async function processRelationshipCanaryJob(
             query: target.parentChannelId || target.targetId,
             resultRank: index + 1,
             matchedDocument: { type: 'EXTERNAL', providerNativeId: channelId, locator: `youtube:relationship-canary:${payload.cohortId}:featured:${target.parentChannelId}` },
-            rawObservation: { sourceChannelId: target.parentChannelId, relationshipDepth: 2, relationshipKind: 'featured', cohortId: payload.cohortId, relationshipPath: target.path },
+            rawObservation: { sourceChannelId: target.parentChannelId, relationshipDepth: 2, relationshipKind: 'featured', cohortId: payload.cohortId, relationshipPath: target.path, graphDepth2Policy: { eligible: graphDepth2Policy.eligible, reasonCode: graphDepth2Policy.reasonCode, proposalCount: graphDepth2Policy.proposals.length, firstProposalKey: graphDepth2Policy.proposals[0]?.proposalKey ?? null, policyVersion: graphDepth2Policy.policyVersion } },
           })) { return summary; }
         }
       } catch (error) {

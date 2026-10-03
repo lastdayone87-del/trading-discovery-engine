@@ -141,6 +141,93 @@ export function evaluateLlmAssistGate(input: {
   return { allowed: reasonCodes.length === 0, reasonCodes };
 }
 
+export interface LlmAssistClient {
+  completeDecision(input: LlmAssistInput): Promise<Partial<LlmAssistDecision>>;
+}
+
+export interface LlmAssistExecution {
+  decision: LlmAssistDecision;
+  outcome: LlmAssistCall['outcome'];
+  reasonCodes: string[];
+  audit: LlmAssistCall;
+}
+
+/**
+ * Executes one bounded assistance task: gate → provider client → validate →
+ * deterministic fallback, with an audit trail for every outcome. The
+ * provider client is injected: no live provider is wired anywhere in-repo
+ * (see header), so there are no live callers by design. Experiment
+ * harnesses supply a client once a provider is approved through the
+ * documented prerequisites (endpoint, credential, ToS/governance review).
+ * Client outputs are never trusted: validation rejects invented URLs,
+ * ungrounded evidence, and invalid confidence/rationale, and provider
+ * errors fall back without throwing.
+ */
+export async function executeLlmAssistTask(
+  input: LlmAssistInput,
+  client: LlmAssistClient | null,
+  budget: { enabled: boolean; allowlistedTasks: LlmAssistTask[]; callsUsed: number; inputChars: number }
+): Promise<LlmAssistExecution> {
+  const fallback = (reasonCodes: string[]): LlmAssistExecution => ({
+    decision: {
+      task: input.task,
+      selectedUrl: null,
+      citedEvidence: [],
+      confidence: 0,
+      rationale: `FALLBACK: ${reasonCodes.join(',') || 'no provider decision'}`,
+    },
+    outcome: 'FALLBACK',
+    reasonCodes,
+    audit: { task: input.task, contextUrl: input.contextUrl, outcome: 'FALLBACK', reasonCodes, at: new Date().toISOString() },
+  });
+  const gate = evaluateLlmAssistGate({ ...budget, task: input.task });
+  if (!gate.allowed) return fallback(gate.reasonCodes);
+  if (!client) return fallback(['NO_PROVIDER_CLIENT']);
+  let partial: Partial<LlmAssistDecision> | null | undefined;
+  try {
+    partial = await client.completeDecision(input);
+  } catch (error) {
+    return fallback([`PROVIDER_ERROR:${error instanceof Error ? error.message : String(error)}`.slice(0, 120)]);
+  }
+  // Null/undefined/non-object provider responses never reach validation:
+  // property access on them would throw outside the fallback path. They
+  // resolve deterministically to FALLBACK with a full audit record.
+  // Object-shaped malformed responses still flow to the validator below
+  // (REJECTED with reason codes) — that behavior is unchanged.
+  if (!partial || typeof partial !== 'object') {
+    return fallback(['PROVIDER_EMPTY_RESPONSE']);
+  }
+  // Shape-normalize without masking validator-rejectable content: a wrong
+  // task, ungrounded evidence, or invalid confidence must still fail below.
+  const decision = {
+    task: partial.task as LlmAssistTask,
+    selectedUrl: partial.selectedUrl ?? null,
+    citedEvidence: Array.isArray(partial.citedEvidence) ? partial.citedEvidence : [],
+    confidence: typeof partial.confidence === 'number' ? partial.confidence : NaN,
+    rationale: typeof partial.rationale === 'string' ? partial.rationale : '',
+  };
+  const validation = validateLlmDecision(input, decision);
+  if (!validation.valid) {
+    return {
+      ...fallback(validation.reasonCodes),
+      outcome: 'REJECTED',
+      audit: {
+        task: input.task,
+        contextUrl: input.contextUrl,
+        outcome: 'REJECTED',
+        reasonCodes: validation.reasonCodes,
+        at: new Date().toISOString(),
+      },
+    };
+  }
+  return {
+    decision: { ...decision, task: input.task },
+    outcome: 'APPLIED',
+    reasonCodes: [],
+    audit: { task: input.task, contextUrl: input.contextUrl, outcome: 'APPLIED', reasonCodes: [], at: new Date().toISOString() },
+  };
+}
+
 export async function isLlmAssistEnabled(
   readSetting: (key: string, fallback: string) => Promise<string> = getAppSetting,
 ): Promise<boolean> {
