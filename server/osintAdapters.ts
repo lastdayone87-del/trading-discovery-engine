@@ -62,7 +62,15 @@ export function registerOsintAdapter(adapter: OsintAdapter): void {
   if (!adapter || typeof adapter.sourceId !== 'string' || !adapter.sourceId.trim() || typeof adapter.fetch !== 'function') {
     throw new Error('OSINT_ADAPTER_REGISTRATION_INVALID');
   }
-  osintAdapterRegistry.set(adapter.sourceId.trim().toLowerCase(), adapter);
+  const key = adapter.sourceId.trim().toLowerCase();
+  // Source identity is append-only: silently replacing a registered adapter
+  // (including the pre-registered contract stubs) would let one source
+  // masquerade as another. Duplicates are rejected deterministically; there
+  // is no implicit replacement path and none is required by any contract.
+  if (osintAdapterRegistry.has(key)) {
+    throw new Error('OSINT_ADAPTER_DUPLICATE_SOURCE_ID');
+  }
+  osintAdapterRegistry.set(key, adapter);
 }
 
 export function resolveOsintAdapter(sourceId: string): OsintAdapter | null {

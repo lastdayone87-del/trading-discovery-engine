@@ -128,3 +128,32 @@ test('orchestrator gates before calling, validates after, and never throws', asy
   assert.equal(exploded.outcome, 'FALLBACK');
   assert.ok(exploded.reasonCodes[0].startsWith('PROVIDER_ERROR:'));
 });
+
+test('null/undefined provider responses fall back safely with audit intact', async () => {
+  const { executeLlmAssistTask } = await import('./llmAssist');
+  const budget = {
+    enabled: true,
+    allowlistedTasks: ['AMBIGUOUS_NAVIGATION'] as ('AMBIGUOUS_NAVIGATION')[],
+    callsUsed: 0,
+    inputChars: 100,
+  };
+  for (const empty of [null, undefined]) {
+    const result = await executeLlmAssistTask(
+      {
+        task: 'AMBIGUOUS_NAVIGATION',
+        candidateUrls: ['https://example.com/join'],
+        evidenceSpans: ['members gather here'],
+        baseline: 'https://example.com/join',
+        contextUrl: 'https://example.com/',
+      },
+      { completeDecision: async () => empty as never },
+      { ...budget, allowlistedTasks: [...budget.allowlistedTasks] }
+    );
+    assert.equal(result.outcome, 'FALLBACK');
+    assert.deepEqual(result.reasonCodes, ['PROVIDER_EMPTY_RESPONSE']);
+    assert.equal(result.decision.selectedUrl, null);
+    assert.equal(result.audit.outcome, 'FALLBACK');
+    assert.deepEqual(result.audit.reasonCodes, ['PROVIDER_EMPTY_RESPONSE']);
+    assert.equal(result.audit.task, 'AMBIGUOUS_NAVIGATION');
+  }
+});

@@ -183,11 +183,19 @@ export async function executeLlmAssistTask(
   const gate = evaluateLlmAssistGate({ ...budget, task: input.task });
   if (!gate.allowed) return fallback(gate.reasonCodes);
   if (!client) return fallback(['NO_PROVIDER_CLIENT']);
-  let partial: Partial<LlmAssistDecision>;
+  let partial: Partial<LlmAssistDecision> | null | undefined;
   try {
     partial = await client.completeDecision(input);
   } catch (error) {
     return fallback([`PROVIDER_ERROR:${error instanceof Error ? error.message : String(error)}`.slice(0, 120)]);
+  }
+  // Null/undefined/non-object provider responses never reach validation:
+  // property access on them would throw outside the fallback path. They
+  // resolve deterministically to FALLBACK with a full audit record.
+  // Object-shaped malformed responses still flow to the validator below
+  // (REJECTED with reason codes) — that behavior is unchanged.
+  if (!partial || typeof partial !== 'object') {
+    return fallback(['PROVIDER_EMPTY_RESPONSE']);
   }
   // Shape-normalize without masking validator-rejectable content: a wrong
   // task, ungrounded evidence, or invalid confidence must still fail below.

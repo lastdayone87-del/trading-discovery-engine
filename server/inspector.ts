@@ -353,7 +353,10 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       try{
         const shadowSiteIdentity=frontier?.siteIdentity||canonicalSiteIdentity(url)?.siteIdentity;
         if(shadowSiteIdentity){
-          const shadow=await evaluateDomainWeightShadow(shadowSiteIdentity,dedupedNavigation.map(item=>({url:item.url,score:item.score})));
+          // Shadow input is the live capped queue (not the pre-cap deduped
+          // list): the shadow must never select a URL the live crawl could
+          // not attempt. Queue items carry the same url/score shape.
+          const shadow=await evaluateDomainWeightShadow(shadowSiteIdentity,queue.map(item=>({url:item.url,score:item.score})));
           if(shadow)domainWeightShadows.push(shadow);
         }
       }catch{/* shadow evaluation never breaks acquisition */}

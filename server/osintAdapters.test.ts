@@ -66,3 +66,43 @@ test('gated runner denies before fetch and permits only fully-evidenced gates', 
   assert.equal(fetched, 1);
   assert.deepEqual(open.observations, []);
 });
+
+test('duplicate source registration is rejected, stubs stay protected', () => {
+  const stub = {
+    sourceId: 'broker-interviews-stub',
+    sourceFamily: 'EDUCATOR_DIRECTORY',
+    timeoutMs: 1000,
+    maxRequests: 5,
+    maxCost: 0,
+    retry: { attempts: 0, backoffMs: 0 },
+    fetch: async () => [],
+  } as never;
+  assert.throws(() => registerOsintAdapter(stub), /OSINT_ADAPTER_DUPLICATE_SOURCE_ID/);
+  assert.throws(() => registerOsintAdapter({ ...(stub as object), sourceId: 'BROKER-INTERVIEWS-STUB' } as never), /OSINT_ADAPTER_DUPLICATE_SOURCE_ID/);
+  // The rejected registration changed nothing: the original stub still resolves.
+  assert.equal(resolveOsintAdapter('broker-interviews-stub')?.sourceFamily, 'EDUCATOR_DIRECTORY');
+  // A genuinely new identity still registers exactly once.
+  registerOsintAdapter({
+    sourceId: 'unique-test-source',
+    sourceFamily: 'PUBLICATION',
+    timeoutMs: 1000,
+    maxRequests: 5,
+    maxCost: 0,
+    retry: { attempts: 0, backoffMs: 0 },
+    fetch: async () => [],
+  });
+  assert.equal(resolveOsintAdapter('unique-test-source')?.sourceFamily, 'PUBLICATION');
+  assert.throws(
+    () =>
+      registerOsintAdapter({
+        sourceId: 'unique-test-source',
+        sourceFamily: 'PUBLICATION',
+        timeoutMs: 1000,
+        maxRequests: 5,
+        maxCost: 0,
+        retry: { attempts: 0, backoffMs: 0 },
+        fetch: async () => [],
+      }),
+    /OSINT_ADAPTER_DUPLICATE_SOURCE_ID/
+  );
+});

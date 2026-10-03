@@ -217,3 +217,25 @@ test('domain-weight shadow evaluation is observational and version-bound', async
   assert.equal(shadow?.baselineTopUrl, 'https://example.com/b');
   assert.equal(typeof shadow?.agreement, 'boolean');
 });
+
+test('shadow evaluation is deterministic over a fixed candidate list', async () => {
+  const { evaluateDomainWeightShadow } = await import('./domainLearner');
+  const candidates = Array.from({ length: 13 }, (_, index) => ({
+    url: `https://example.com/page-${index}`,
+    score: 100 - index,
+  }));
+  const deps = {
+    readSetting: async () => 'true',
+    getApproved: async () => ({ version: 'dw-cap', weights: {} as Record<string, number> }),
+  };
+  const first = await evaluateDomainWeightShadow('example.com', candidates, deps);
+  const second = await evaluateDomainWeightShadow('example.com', candidates, deps);
+  assert.ok(first && second);
+  // Thirteen candidates reach the evaluator uncapped here by construction:
+  // this documents why callers must pass the live capped queue instead —
+  // the evaluator trusts its input list (see the inspector call-site
+  // contract test), so an uncapped list can surface a beyond-cap pick.
+  assert.equal(first?.routeCount, 13);
+  assert.deepEqual(first, second);
+  assert.ok(candidates.some(candidate => candidate.url === first?.shadowPickUrl));
+});
