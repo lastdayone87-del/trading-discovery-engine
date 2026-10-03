@@ -417,6 +417,10 @@ export async function processNextSearchJob(
       if(!before) { await completeJob(job.id); return true; }
       const result=await triggerManualRecheck(channelId, true, true);
       if(!result.success){
+        // A policy skip is a handled outcome, not a failure: complete the job
+        // instead of consuming bounded retry attempts. Other policy refusals
+        // (e.g. country exclusion) keep the existing failure taxonomy.
+        if(result.code==='MANUAL_RESCAN_LOW_AUDIENCE_SKIP'){await completeJob(job.id);return true;}
         // Preserve the provider/admission taxonomy so capacity/transient
         // failures defer attempt-free with their retry schedule, while genuine
         // failures consume one bounded attempt and eventually project a
@@ -556,6 +560,7 @@ export async function processNextSearchJob(
       const claimCandidateGate = evaluateLowAudienceGate(candidate.subscriberCount ?? undefined);
       const claimStoredGate = evaluateLowAudienceGate(channel.subscriber_count ?? undefined);
       let claimAudienceGate = claimCandidateGate.shouldSkipDeepEnrichment ? claimCandidateGate : claimStoredGate;
+      let claimHydrationUnits = 0;
       let claimHydrationChanged = false;
       if (claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE' && claimCandidateGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
         const beforeSub = candidate.subscriberCount;
@@ -571,6 +576,9 @@ export async function processNextSearchJob(
           if (hydrated.locationTag) candidate.locationTag = hydrated.locationTag;
           candidate.countryMetadataStatus = hydrated.countryMetadataStatus;
           candidate.countryMetadataCheckedAt = hydrated.countryMetadataCheckedAt;
+          // A successful official metadata call spends 1 quota unit: attribute
+          // it on skip outcomes below instead of reporting zero cost.
+          if (hydrated.countryMetadataStatus === 'AVAILABLE_DECLARED' || hydrated.countryMetadataStatus === 'AVAILABLE_NOT_DECLARED') claimHydrationUnits = 1;
           // Country revalidation triggers only on creator-evidence changes
           // (hidden-subscriber hydration can still deliver new country
           // evidence via description/location); a bare metadata-status flip
@@ -623,7 +631,7 @@ export async function processNextSearchJob(
           if(candidateAlreadyEnriched)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
           else if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
           console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId,targetCountry,detectedCountry:claimCreatorCountry,reason:claimCountryVal.rejectionReason,context:`enrichment_claim_hydrated:${job.id}`,timestamp:claimNow}));
-          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'COUNTRY_POLICY_CHANGED'}).catch(()=>undefined);
+          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:claimHydrationUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'COUNTRY_POLICY_CHANGED'}).catch(()=>undefined);
           if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
           return true;
         }
@@ -644,7 +652,7 @@ export async function processNextSearchJob(
         await upsertChannel(channel);
         if(candidateAlreadyEnriched)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         else if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
-        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'LOW_AUDIENCE_SKIP'}).catch(()=>undefined);
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:claimHydrationUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'LOW_AUDIENCE_SKIP'}).catch(()=>undefined);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel.trading_status,output:{reason:'LOW_AUDIENCE_SKIP'}});else await completeJob(job.id);
         return true;
       }
@@ -1842,7 +1850,7 @@ export async function triggerManualRecheck(
   // A stored known-low audience count must not spend recheck quota: the
   // low-audience gate would skip this channel before any enrichment work.
   if (evaluateLowAudienceGate(channel.subscriber_count).shouldSkipDeepEnrichment) {
-    return { success: false, message: `Manual re-scan skipped: ${channel.subscriber_count} subscribers is below the 30-subscriber budget gate.`, code: 'MANUAL_RESCAN_POLICY_INELIGIBLE', retryable: false, channel };
+    return { success: false, message: `Manual re-scan skipped: ${channel.subscriber_count} subscribers is below the 30-subscriber budget gate.`, code: 'MANUAL_RESCAN_LOW_AUDIENCE_SKIP', retryable: false, channel };
   }
 
   const quotaOperationId = `manual-recheck:${channelId}:${randomUUID()}`;

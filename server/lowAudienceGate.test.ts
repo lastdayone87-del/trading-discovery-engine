@@ -103,3 +103,10 @@ test('orphan skip-projection cannot regress rows that left ENRICHMENT_PENDING', 
   const guardIdx = source.indexOf("AND scan_status='ENRICHMENT_PENDING'", updateIdx);
   assert.ok(guardIdx > updateIdx, 'skip projection is guarded by current ENRICHMENT_PENDING status');
 });
+
+test('manual recheck low-audience skip completes instead of failing', () => {
+  const source = read('server/queueManager.ts');
+  assert.match(source, /code: 'MANUAL_RESCAN_LOW_AUDIENCE_SKIP'/);
+  const handlerIdx = source.indexOf("if(result.code==='MANUAL_RESCAN_LOW_AUDIENCE_SKIP'){await completeJob(job.id);return true;}");
+  assert.ok(handlerIdx >= 0, 'policy skip completes the job without consuming retries');
+});
