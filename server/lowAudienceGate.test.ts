@@ -87,3 +87,11 @@ test('re-enqueue paths cannot bypass the low-audience gate on known-low counts',
   const recovery = read('server/operationalEnrichmentRecovery.ts');
   assert.match(recovery, /evaluateLowAudienceGate\(channel\.subscriber_count\)\.shouldSkipDeepEnrichment/);
 });
+
+test('orphan skip-projection cannot regress rows that left ENRICHMENT_PENDING', () => {
+  const source = read('server/investigationWorkflow.ts');
+  const updateIdx = source.indexOf("scan_status='SKIPPED_LOW_AUDIENCE'");
+  assert.ok(updateIdx >= 0, 'orphan skip projection exists');
+  const guardIdx = source.indexOf("AND scan_status='ENRICHMENT_PENDING'", updateIdx);
+  assert.ok(guardIdx > updateIdx, 'skip projection is guarded by current ENRICHMENT_PENDING status');
+});

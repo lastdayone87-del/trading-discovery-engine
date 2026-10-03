@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isPageAssetInfrastructureUrl } from './inspector';
+import { isPageAssetInfrastructureUrl } from './communitySurfacePolicy';
+import { parseYouTubeChannelAboutFromHtml } from './youtubePublicAbout';
 
 test('page-asset infrastructure hosts are filtered', () => {
   assert.equal(isPageAssetInfrastructureUrl('https://i.ytimg.com/vi/abc/hqdefault.jpg'), true);
@@ -25,4 +26,14 @@ test('dotless single-label hosts keep the existing static-attempt doctrine', () 
   // isDotlessHostnameUrl semantics unchanged: these are NOT asset-filtered,
   // so the recall-safe static attempt path is preserved.
   assert.equal(isPageAssetInfrastructureUrl('https://g/'), false);
+});
+
+test('public-about extraction filters asset URLs so they cannot become crawl seeds', () => {
+  const html = `<html><head></head><body><script>ytInitialData = {"a":{"urlEndpoint":{"url":"https://i.ytimg.com/vi/abc/hqdefault.jpg"}},"b":{"urlEndpoint":{"url":"https://www.kiss.com/"}},"c":{"channelExternalLinkViewModel":{"link":{"content":"https://kiki.com/shop"}}}};</script><a href="https://schema.org/Person">x</a><a href="https://t.me/tradingroom">join</a></body></html>`;
+  const parsed = parseYouTubeChannelAboutFromHtml(html, {});
+  const links = parsed.channelLinks || [];
+  assert.ok(links.includes('https://www.kiss.com/'), 'creator link retained');
+  assert.ok(links.includes('https://kiki.com/shop'), 'affiliate link retained');
+  assert.ok(links.includes('https://t.me/tradingroom'), 'messaging link retained');
+  assert.ok(!links.some(url => isPageAssetInfrastructureUrl(url)), 'no asset URL survives');
 });

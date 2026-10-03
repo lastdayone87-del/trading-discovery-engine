@@ -525,6 +525,7 @@ export async function processNextSearchJob(
       // count skips enrichment with the same SKIPPED_LOW_AUDIENCE projection
       // as the Phase-7 gate. Quota/hydration failure stays fail-open.
       let claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount ?? channel.subscriber_count ?? undefined);
+      let claimHydrationChanged = false;
       if (!claimAudienceGate.shouldSkipDeepEnrichment && claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
         try {
           const hydrated = await fetchYouTubeChannelCountryMetadata(channelId, candidate);
@@ -535,9 +536,53 @@ export async function processNextSearchJob(
             candidate.countryMetadataStatus = hydrated.countryMetadataStatus;
             candidate.countryMetadataCheckedAt = hydrated.countryMetadataCheckedAt;
             claimAudienceGate = evaluateLowAudienceGate(hydrated.subscriberCount);
+            claimHydrationChanged = true;
           }
         } catch {
           // Hydration unavailable (no keys, quota, network): proceed fail-open.
+        }
+      }
+      // Hydration may have upgraded an UNCERTAIN creator into a CONFIRMED
+      // excluded country. Re-run the existing Gate-1 validation on the
+      // hydrated candidate before any quota is reserved: a REJECTED result
+      // projects onto the row and consumes the job with zero quota spend.
+      // Non-rejected results fall through unchanged (fail-open preserved).
+      if (claimHydrationChanged) {
+        const claimCountryVal = await validateChannelCountry({
+          channelName: candidate.channelName,
+          description: candidate.description,
+          videoTitles: candidate.videoTitles,
+          locationTag: candidate.locationTag,
+          externalLinks: candidate.channelLinks,
+          metadataStatus: candidate.countryMetadataStatus,
+          videoDescriptions: candidate.videoDescriptions,
+          videoDescriptionsAuthoritative: candidate.videoDescriptionsAuthoritative,
+          playlists: candidate.playlists,
+        }, targetCountry);
+        const claimCreatorCountry = claimCountryVal.detectedCreatorCountry || null;
+        if (claimCountryVal.status === 'REJECTED' && claimCreatorCountry) {
+          const claimNow = new Date().toISOString();
+          applyGate1CountryRejectionToExisting(
+            channel,
+            {
+              creatorCountry: claimCreatorCountry,
+              score: claimCountryVal.score,
+              validationStep: {
+                step: 'COUNTRY_VALIDATION',
+                title: `Country Validation (${claimCreatorCountry})`,
+                status: 'REJECTED',
+                details: `${claimCountryVal.decisionLogs}\nDetected at ENRICH_CHANNEL claim after hydration for job ${job.id}; enrichment cancelled before quota spend.`,
+                timestamp: claimNow,
+              },
+              now: claimNow,
+            },
+            candidate
+          );
+          await upsertChannel(channel);
+          console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId,targetCountry,detectedCountry:claimCreatorCountry,reason:claimCountryVal.rejectionReason,context:`enrichment_claim_hydrated:${job.id}`,timestamp:claimNow}));
+          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'COUNTRY_POLICY_CHANGED'}).catch(()=>undefined);
+          if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
+          return true;
         }
       }
       if (claimAudienceGate.shouldSkipDeepEnrichment) {

@@ -9,7 +9,7 @@ import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
-import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
+import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface} from './communitySurfacePolicy';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
 import { extractHeadDiscovery, isSiteProfilerEnabled, runSiteProfiler } from './siteProfiler';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
@@ -575,36 +575,6 @@ function normalizeSummaryUrl(raw: string): string {
  */
 export function isMeaningfulWebsiteObservation(item: { rootUrl?: string; requestedUrl: string }): boolean {
   return !isDotlessHostnameUrl(item.rootUrl || item.requestedUrl);
-}
-
-/**
- * Page-asset infrastructure hosts captured by indiscriminate page scraping
- * (thumbnail/playback/telemetry/schema/font endpoints embedded in channel
- * page data). These can never be creator sites and can never carry Discord
- * invites, so they are filtered at link-collection time and never become
- * crawl seeds. Dotless single-label hosts are deliberately NOT in this list:
- * they keep the existing static-attempt-for-recall doctrine. Valid creator,
- * affiliate, social, and messaging hosts are unaffected.
- */
-const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
-  'ytimg.com',
-  'googlevideo.com',
-  'schema.org',
-  'w3.org',
-  'fonts.googleapis.com',
-  'fonts.gstatic.com',
-  'youtubei-att.googleapis.com',
-  'gstatic.com',
-];
-export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
-  let host = '';
-  try {
-    host = new URL(rawUrl).hostname.toLowerCase();
-  } catch {
-    return true;
-  }
-  if (!host) return true;
-  return PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`));
 }
 
 /**

@@ -61,7 +61,7 @@ function sufficientCollection(): EvidenceCollectionReport {
 }
 
 const thinRetrievalInput = {
-  channel_name: 'Louvis',
+  channel_name: 'Harborlight Media',
   description: 'Share your videos with friends, family, and the world',
   video_titles: [] as string[],
   videos: [] as Array<{ title: string }>,
