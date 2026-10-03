@@ -79,10 +79,10 @@ export interface SelectionExperimentOrderingConfig {
   treatmentBasisPoints?: number;
   window?: { publishedAfter?: string; publishedBefore?: string };
   /**
-   * Identity for the ordering dimension. Falls back to the selection
-   * experimentId when both dimensions are requested together; a standalone
-   * ordering experiment must supply its own (an untraceable experiment is
-   * rejected at validation).
+   * Identity for the ordering dimension. An explicit ordering experimentId
+   * always wins; only when ordering carries none may it fall back to the
+   * selection experimentId. A standalone ordering experiment must supply
+   * its own (an untraceable experiment is rejected at validation).
    */
   experimentId?: string;
 }
@@ -188,10 +188,12 @@ export function normalizeSelectionExperimentRequest(input: unknown): NormalizedS
     const window = raw.window && typeof raw.window === 'object' ? raw.window : null;
     const hasBounds = window !== null &&
       (typeof window.publishedAfter === 'string' || typeof window.publishedBefore === 'string');
-    // Identity is mandatory for the ordering dimension: prefer the
-    // selection experimentId when both dimensions travel together.
+    // Identity precedence: an explicit ordering experimentId always wins;
+    // only when ordering carries none may it fall back to the selection
+    // experimentId. Ordering arm assignment, propensity, window attribution,
+    // and persisted metadata therefore all use the resolved ordering identity.
     const rawOrderingId = typeof raw.experimentId === 'string' ? raw.experimentId.trim() : '';
-    const experimentId = (selection?.experimentId || rawOrderingId).trim();
+    const experimentId = (rawOrderingId || selection?.experimentId || '').trim();
     const basisValid = Number.isInteger(treatmentBasisPoints) && treatmentBasisPoints >= 0 && treatmentBasisPoints <= 10000;
     let windowValid = true;
     if (hasBounds) {
@@ -620,7 +622,10 @@ export async function selectExperimentalQueryForCountry(
   // Ordering is an independent dimension: it is evaluated even when no
   // selection experiment was requested, so ordering-only experiments reach
   // the retrieval treatment without requiring Thompson/Contextual.
-  const orderingExperimentId = selection?.experimentId ?? experiment?.ordering?.experimentId ?? '';
+  // Ordering identity precedence: an explicit ordering experimentId always
+  // wins; only when ordering carries none may it fall back to the selection
+  // experimentId (normalized ordering always carries one by validation).
+  const orderingExperimentId = experiment?.ordering?.experimentId ?? selection?.experimentId ?? '';
   const ordering = experiment?.ordering
     ? evaluateOrderingDimension({
         treatmentBasisPoints: experiment.ordering.treatmentBasisPoints,

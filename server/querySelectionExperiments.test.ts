@@ -267,3 +267,50 @@ test('ordering TREATMENT applies the validated window with matching propensity',
   assert.equal(noWindow.windowApplied, false);
   assert.equal(resolveScheduledSearchWindow(noWindow), undefined);
 });
+
+test('explicit ordering experimentId wins over the selection identity', async () => {
+  const { normalizeSelectionExperimentRequest, evaluateOrderingDimension, resolveScheduledSearchWindow } = await import('./querySelectionExperiments');
+  const normalized = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'selection-exp', enabledArms: ['THOMPSON'], treatmentBasisPoints: 0 },
+    ordering: {
+      experimentId: 'ordering-exp',
+      treatmentBasisPoints: 10000,
+      window: { publishedAfter: '2026-01-01T00:00:00Z' },
+    },
+  });
+  assert.equal(normalized.selection?.experimentId, 'selection-exp');
+  assert.equal(normalized.ordering?.experimentId, 'ordering-exp');
+  const evaluated = evaluateOrderingDimension({
+    treatmentBasisPoints: normalized.ordering!.treatmentBasisPoints,
+    window: normalized.ordering!.window,
+    experimentId: normalized.ordering!.experimentId,
+    opportunityKey: 'opp-ids',
+  });
+  assert.equal(evaluated.arm, 'TREATMENT');
+  assert.equal(evaluated.experimentId, 'ordering-exp');
+  const payload = resolveScheduledSearchWindow({
+    arm: evaluated.arm,
+    propensityBasisPoints: evaluated.propensityBasisPoints,
+    policyVersion: evaluated.policyVersion,
+    windowApplied: evaluated.windowApplied,
+    window: evaluated.window,
+    experimentId: evaluated.experimentId,
+  });
+  assert.deepEqual(payload, { publishedAfter: '2026-01-01T00:00:00Z', experimentId: 'ordering-exp' });
+});
+
+test('ordering without any identity falls back to selection, then fails closed', () => {
+  // Window present but no identity anywhere: rejected, never unattributed.
+  assert.throws(
+    () =>
+      validateSelectionExperimentRequest({
+        ordering: { treatmentBasisPoints: 1000, window: { publishedAfter: '2026-01-01T00:00:00Z' } },
+      }),
+    /INVALID_ORDERING_EXPERIMENT/
+  );
+  // Bare ordering knobs without identity are not an experiment either.
+  assert.throws(
+    () => validateSelectionExperimentRequest({ ordering: { treatmentBasisPoints: 5000 } }),
+    /INVALID_ORDERING_EXPERIMENT/
+  );
+});

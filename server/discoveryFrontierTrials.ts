@@ -213,13 +213,24 @@ export async function initiateCanaryTrial(
 
   const commit = async (): Promise<void> => {
     if (owned) await client.query('COMMIT');
+    else await client.query('RELEASE SAVEPOINT frontier_trial_init');
   };
   const rollback = async (): Promise<void> => {
-    if (owned) await client.query('ROLLBACK');
+    if (owned) {
+      await client.query('ROLLBACK');
+    } else {
+      // Caller-owned transaction: roll back only the trial's own statements
+      // so the outer scheduling transaction remains usable. Never issue a
+      // bare ROLLBACK here — that would destroy the caller's transaction
+      // and every subsequent statement in it would fail.
+      await client.query('ROLLBACK TO SAVEPOINT frontier_trial_init');
+      await client.query('RELEASE SAVEPOINT frontier_trial_init');
+    }
   };
 
   try {
     if (owned) await client.query('BEGIN');
+    else await client.query('SAVEPOINT frontier_trial_init');
 
     // Acquire transaction-scoped advisory lock to serialize daily canary capacity checks across all concurrent workers & proposals.
     // This is a hard safety boundary: failure to acquire/verify the lock aborts the transaction.

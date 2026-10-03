@@ -45,7 +45,7 @@ test('Phase 7: Trial outcome state classification - PRODUCTIVE when relevant AND
 
 test('Phase 7: Fail Closed Gate - Rejects trial when operator kill switch read fails or is not true', async () => {
   const mockClientKillSwitchOff = {
-    query: async (sql: string) => {
+    query: async (sql: string, _values?: unknown[]) => {
       if (sql.includes('app_settings')) {
         return { rows: [{ setting_value: 'false' }] };
       }
@@ -60,7 +60,7 @@ test('Phase 7: Fail Closed Gate - Rejects trial when operator kill switch read f
 
 test('Phase 7: Fail Closed Gate - Rejects trial when target neighborhood frontier state verification errors', async () => {
   const mockClientError = {
-    query: async (sql: string) => {
+    query: async (sql: string, _values?: unknown[]) => {
       if (sql.includes('app_settings')) {
         return { rows: [{ setting_value: 'true' }] };
       }
@@ -174,4 +174,106 @@ test('Phase 7b: trial linkage fails closed without a matching frontier decision'
   const some = quotaYieldPer1000(3, 100);
   assert.equal(some.totalQuotaConsumed, 100);
   assert.equal(some.yieldPer1000Quota, 30);
+});
+
+test('Phase 7b: caller-owned trial initiation scopes failures to a savepoint (outer txn survives)', async () => {
+  const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
+  const statements: string[] = [];
+  const proposalRow = {
+    proposal_id: 'prop-savepoint',
+    dedup_key: 'dedup-savepoint',
+    proposal_family: 'LEARNED',
+    country: 'US',
+    language: null,
+    concept: 'options trading',
+    target_neighborhood_key: null,
+    target_dimensions: {},
+    source_provenance: 'query_library:active',
+    supporting_evidence: {},
+    confidence: 0.8,
+    novelty_rationale: 'test',
+    trial_status: 'PENDING',
+    expires_at: null,
+  };
+  const stubClient = {
+    query: async (sql: string, _values?: unknown[]) => {
+      statements.push(sql.split('\n')[0].trim());
+      if (sql.includes('app_settings')) return { rows: [{ setting_value: 'true' }], rowCount: 1 };
+      if (sql.includes('FROM frontier_discovery_proposals')) return { rows: [proposalRow], rowCount: 1 };
+      if (sql.includes('FROM discovery_neighborhood_frontier_states')) return { rows: [], rowCount: 0 };
+      if (sql.includes('SUM(GREATEST')) return { rows: [{ daily_reserved_capacity: 0 }], rowCount: 1 };
+      if (sql.includes('FROM frontier_canary_trials')) return { rows: [], rowCount: 0 };
+      if (sql.includes('INSERT INTO frontier_canary_trials')) throw new Error('simulated trial insert failure');
+      if (sql.includes('UPDATE frontier_discovery_proposals')) return { rows: [], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  await assert.rejects(
+    initiateCanaryTrial('prop-savepoint', { maxQuota: 50 }, stubClient as any),
+    /simulated trial insert failure/
+  );
+  const exact = (name: string) => statements.filter(statement => statement === name);
+  // Trial statements were fenced in a savepoint: local rollback only.
+  assert.ok(statements.some(statement => statement.startsWith('SAVEPOINT')), 'savepoint established');
+  assert.ok(exact('ROLLBACK TO SAVEPOINT frontier_trial_init').length === 1, 'rolled back to savepoint');
+  // The caller-owned outer transaction was never aborted: no bare transaction
+  // control may appear on the caller-owned path.
+  assert.equal(exact('BEGIN').length, 0);
+  assert.equal(exact('COMMIT').length, 0);
+  assert.equal(exact('ROLLBACK').length, 0);
+  // The outer transaction remains usable: a follow-up statement on the same
+  // client (e.g. the scheduling run/job insert) still executes.
+  const followUp = await stubClient.query('INSERT INTO query_runs(id) VALUES($1)', ['run-1']);
+  assert.equal(followUp.rowCount, 0);
+});
+
+test('Phase 7b: caller-owned trial success releases the savepoint without touching the outer txn', async () => {
+  const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
+  const statements: string[] = [];
+  const proposalRow = {
+    proposal_id: 'prop-ok',
+    dedup_key: 'dedup-ok',
+    proposal_family: 'LEARNED',
+    country: 'US',
+    language: null,
+    concept: 'options trading',
+    target_neighborhood_key: null,
+    target_dimensions: {},
+    source_provenance: 'query_library:active',
+    supporting_evidence: {},
+    confidence: 0.8,
+    novelty_rationale: 'test',
+    trial_status: 'PENDING',
+    expires_at: null,
+  };
+  const stubClient = {
+    query: async (sql: string, _values?: unknown[]) => {
+      statements.push(sql.split('\n')[0].trim());
+      if (sql.includes('app_settings')) return { rows: [{ setting_value: 'true' }], rowCount: 1 };
+      if (sql.includes('FROM frontier_discovery_proposals')) return { rows: [proposalRow], rowCount: 1 };
+      if (sql.includes('SUM(GREATEST')) return { rows: [{ daily_reserved_capacity: 0 }], rowCount: 1 };
+      if (sql.includes('FROM frontier_canary_trials')) return { rows: [], rowCount: 0 };
+      if (sql.includes('INSERT INTO frontier_canary_trials')) {
+        return {
+          rows: [{
+            trial_id: 'trial-1', trial_key: 'trial:dedup-ok', proposal_id: 'prop-ok', country: 'US',
+            neighborhood_key: null, quota_reserved: 50, quota_consumed: 0, trial_status: 'INITIATED',
+            initiated_at: new Date().toISOString(),
+          }],
+          rowCount: 1,
+        };
+      }
+      if (sql.includes('UPDATE frontier_discovery_proposals')) return { rows: [], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const initiated = await initiateCanaryTrial('prop-ok', { maxQuota: 50 }, stubClient as any);
+  assert.equal(initiated.trialId, 'trial-1');
+  assert.equal(initiated.quotaReserved, 50);
+  const exact = (name: string) => statements.filter(statement => statement === name);
+  assert.ok(statements.some(statement => statement.startsWith('SAVEPOINT')));
+  assert.ok(exact('RELEASE SAVEPOINT frontier_trial_init').length >= 1);
+  assert.equal(exact('BEGIN').length, 0);
+  assert.equal(exact('COMMIT').length, 0);
+  assert.equal(exact('ROLLBACK').length, 0);
 });
