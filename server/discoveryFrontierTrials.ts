@@ -211,26 +211,41 @@ export async function initiateCanaryTrial(
     client = externalClient!;
   }
 
+  // Savepoint lifecycle for caller-owned transactions. The savepoint is
+  // established once; abort rolls back to it (never a bare ROLLBACK, which
+  // would destroy the caller's transaction); release happens at most once,
+  // on the success path only. The `trialScopeOpen` flag makes repeated
+  // abort calls safe: rejection branches abort and then rethrow through the
+  // shared catch, which must NOT touch a savepoint that no longer exists —
+  // a second ROLLBACK TO would error and poison the caller's entire
+  // transaction, failing scheduling that should proceed without a trial.
+  let trialScopeOpen = false;
   const commit = async (): Promise<void> => {
-    if (owned) await client.query('COMMIT');
-    else await client.query('RELEASE SAVEPOINT frontier_trial_init');
+    if (owned) {
+      await client.query('COMMIT');
+      return;
+    }
+    if (!trialScopeOpen) return;
+    trialScopeOpen = false;
+    await client.query('RELEASE SAVEPOINT frontier_trial_init');
   };
   const rollback = async (): Promise<void> => {
     if (owned) {
       await client.query('ROLLBACK');
-    } else {
-      // Caller-owned transaction: roll back only the trial's own statements
-      // so the outer scheduling transaction remains usable. Never issue a
-      // bare ROLLBACK here — that would destroy the caller's transaction
-      // and every subsequent statement in it would fail.
-      await client.query('ROLLBACK TO SAVEPOINT frontier_trial_init');
-      await client.query('RELEASE SAVEPOINT frontier_trial_init');
+      return;
     }
+    if (!trialScopeOpen) return;
+    trialScopeOpen = false;
+    await client.query('ROLLBACK TO SAVEPOINT frontier_trial_init');
   };
 
   try {
-    if (owned) await client.query('BEGIN');
-    else await client.query('SAVEPOINT frontier_trial_init');
+    if (owned) {
+      await client.query('BEGIN');
+    } else {
+      await client.query('SAVEPOINT frontier_trial_init');
+      trialScopeOpen = true;
+    }
 
     // Acquire transaction-scoped advisory lock to serialize daily canary capacity checks across all concurrent workers & proposals.
     // This is a hard safety boundary: failure to acquire/verify the lock aborts the transaction.

@@ -277,3 +277,53 @@ test('Phase 7b: caller-owned trial success releases the savepoint without touchi
   assert.equal(exact('COMMIT').length, 0);
   assert.equal(exact('ROLLBACK').length, 0);
 });
+
+test('Phase 7b: rejected trial (closed gate) rolls back once and leaves the outer txn usable', async () => {
+  const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
+  const statements: string[] = [];
+  const proposalRow = {
+    proposal_id: 'prop-closed',
+    dedup_key: 'dedup-closed',
+    proposal_family: 'LEARNED',
+    country: 'US',
+    language: null,
+    concept: 'options trading',
+    target_neighborhood_key: null,
+    target_dimensions: {},
+    source_provenance: 'query_library:active',
+    supporting_evidence: {},
+    confidence: 0.8,
+    novelty_rationale: 'test',
+    trial_status: 'PENDING',
+    expires_at: null,
+  };
+  const stubClient = {
+    query: async (sql: string, _values?: unknown[]) => {
+      statements.push(sql.split('\n')[0].trim());
+      if (sql.includes('app_settings')) return { rows: [{ setting_value: 'false' }], rowCount: 1 };
+      if (sql.includes('FROM frontier_discovery_proposals')) return { rows: [proposalRow], rowCount: 1 };
+      if (sql.includes('FROM frontier_canary_trials')) return { rows: [], rowCount: 0 };
+      if (sql.includes('SUM(GREATEST')) return { rows: [{ daily_reserved_capacity: 0 }], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  // Kill switch closed is the DEFAULT production state: rejection is the
+  // common path, and it must never poison the caller's transaction.
+  await assert.rejects(
+    initiateCanaryTrial('prop-closed', { maxQuota: 50 }, stubClient as any),
+    /Trial gate rejected proposal/
+  );
+  const exact = (name: string) => statements.filter(statement => statement === name);
+  assert.ok(statements.some(statement => statement.startsWith('SAVEPOINT')));
+  // Exactly one local rollback: the rejection branch aborts, and the shared
+  // catch must NOT touch the savepoint again (a second ROLLBACK TO would
+  // error on the consumed savepoint and abort the outer transaction).
+  assert.equal(exact('ROLLBACK TO SAVEPOINT frontier_trial_init').length, 1);
+  assert.equal(exact('RELEASE SAVEPOINT frontier_trial_init').length, 0);
+  assert.equal(exact('BEGIN').length, 0);
+  assert.equal(exact('COMMIT').length, 0);
+  assert.equal(exact('ROLLBACK').length, 0);
+  // Scheduling continues: run/job inserts on the same client still execute.
+  const followUp = await stubClient.query('INSERT INTO query_runs(id) VALUES($1)', ['run-1']);
+  assert.equal(followUp.rowCount, 0);
+});
