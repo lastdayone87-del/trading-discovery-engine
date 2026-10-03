@@ -217,3 +217,41 @@ test('zero-page telemetry without a cap carries no ceiling', () => {
   assert.equal(zeroPage.ceiling, undefined);
   assert.equal(zeroPage.budgetExhausted, false);
 });
+
+test('experiment attribution passes through bounded treatment records, absent by default', () => {
+  const plain = staticCrawlerTelemetry({ redirectsFollowed: 0, pagesInspected: 1 });
+  assert.equal(plain.experimentAttribution, undefined);
+  const attributed = staticCrawlerTelemetry({
+    redirectsFollowed: 0,
+    pagesInspected: 1,
+    experimentAttribution: {
+      policies: ['acquisition-ladder-v1', 'frontier-manager-v1'],
+      method: 'sitemap-seed',
+      admittedSeeds: 3,
+      consideredSeeds: 10,
+      escalation: 'rendered',
+      stoppingReason: 'frontier-yield-stop',
+    },
+  });
+  assert.deepEqual(attributed.experimentAttribution, {
+    policies: ['acquisition-ladder-v1', 'frontier-manager-v1'],
+    method: 'sitemap-seed',
+    admittedSeeds: 3,
+    consideredSeeds: 10,
+    escalation: 'rendered',
+    stoppingReason: 'frontier-yield-stop',
+  });
+  const scrubbed = safeCrawlerTelemetry({
+    mode: 'STATIC',
+    pagesInspected: 1,
+    experimentAttribution: { policies: [], method: 'x'.repeat(200), admittedSeeds: -5, escalation: 'bogus' },
+  });
+  assert.equal(scrubbed?.experimentAttribution, undefined);
+  const capped = safeCrawlerTelemetry({
+    mode: 'STATIC',
+    pagesInspected: 1,
+    experimentAttribution: { policies: ['a', 'b', 'c', 'd', 'e'], method: 'ok', admittedSeeds: 1.9 },
+  });
+  assert.deepEqual(capped?.experimentAttribution?.policies, ['a', 'b', 'c', 'd']);
+  assert.equal(capped?.experimentAttribution?.admittedSeeds, 1);
+});

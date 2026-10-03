@@ -82,6 +82,60 @@ export function sanitizeScrollsUsed(input: unknown): number {
     : 0;
 }
 
+/**
+ * Bounded experiment-attribution record for persisted observations. Answers
+ * which experimental treatment (if any) was active for an observation, so
+ * ladder/frontier crawls stay distinguishable from legacy crawls in the
+ * ledger. All fields are bounded (no URLs/payloads); absent means legacy
+ * (no experimental treatment active). Sanitizer drops malformed values
+ * rather than storing them.
+ */
+export interface ExperimentAttribution {
+  /** Treatment policy versions active, e.g. ['acquisition-ladder-v1']. */
+  policies: string[];
+  /** Admission method, e.g. 'sitemap-seed', 'structured-navigation'. */
+  method?: string;
+  /** Ladder seed admission counts (admitted vs considered). */
+  admittedSeeds?: number;
+  consideredSeeds?: number;
+  /** Render escalation outcome for rendered rows. */
+  escalation?: 'none' | 'static' | 'rendered';
+  /** Stopping-arbiter reason when a halt cut coverage short. */
+  stoppingReason?: string;
+}
+
+const EXPERIMENT_ATTRIBUTION_STRING_MAX = 64;
+
+export function sanitizeExperimentAttribution(input: unknown): ExperimentAttribution | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  const candidate = input as Partial<ExperimentAttribution>;
+  const text = (value: unknown): string | undefined => {
+    if (typeof value !== 'string' || !value.trim()) return undefined;
+    return value.replace(/\s+/g, ' ').trim().slice(0, EXPERIMENT_ATTRIBUTION_STRING_MAX) || undefined;
+  };
+  const count = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.min(999999, Math.floor(value)) : undefined;
+  const policies = Array.isArray(candidate.policies)
+    ? candidate.policies.map(text).filter((policy): policy is string => !!policy).slice(0, 4)
+    : [];
+  if (!policies.length) return undefined;
+  const method = text(candidate.method);
+  const admittedSeeds = count(candidate.admittedSeeds);
+  const consideredSeeds = count(candidate.consideredSeeds);
+  const escalation = candidate.escalation === 'none' || candidate.escalation === 'static' || candidate.escalation === 'rendered'
+    ? candidate.escalation
+    : undefined;
+  const stoppingReason = text(candidate.stoppingReason);
+  return {
+    policies,
+    ...(method ? { method } : {}),
+    ...(admittedSeeds !== undefined ? { admittedSeeds } : {}),
+    ...(consideredSeeds !== undefined ? { consideredSeeds } : {}),
+    ...(escalation ? { escalation } : {}),
+    ...(stoppingReason ? { stoppingReason } : {}),
+  };
+}
+
 /** Tiny bounded counter for per-crawl drop/stop reasons (ints only). */
 export interface DropCounter {
   count(reason: CrawlDropReason, n?: number): void;
@@ -182,6 +236,11 @@ export interface CrawlerTelemetry {
    * classifier label.
    */
   launchCauseSnippet?: string;
+  /**
+   * Experimental treatment attribution (see ExperimentAttribution). Sparse:
+   * absent on legacy crawls and on rows predating instrumentation.
+   */
+  experimentAttribution?: ExperimentAttribution;
 }
 
 import os from 'node:os';
@@ -276,6 +335,7 @@ export function renderedCrawlerTelemetry(input: {
   dropReasons?: Partial<Record<CrawlDropReason, number>>;
   scrollsUsed?: number;
   ceiling?: CeilingKind;
+  experimentAttribution?: ExperimentAttribution;
 }): CrawlerTelemetry {
   // Ceiling precedence: explicit > page-budget evidence > total timeout.
   // A timeout alone still records total-timeout (an elapsed budget is a
@@ -303,6 +363,7 @@ export function renderedCrawlerTelemetry(input: {
     mode: 'RENDERED',
     ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
     ...(sanitizeScrollsUsed(input.scrollsUsed) > 0 ? { scrollsUsed: sanitizeScrollsUsed(input.scrollsUsed) } : {}),
+    ...(sanitizeExperimentAttribution(input.experimentAttribution) ? { experimentAttribution: sanitizeExperimentAttribution(input.experimentAttribution)! } : {}),
   };
 }
 
@@ -311,6 +372,7 @@ export function staticCrawlerTelemetry(input: {
   pagesInspected: number;
   ceiling?: CeilingKind;
   dropReasons?: Partial<Record<CrawlDropReason, number>>;
+  experimentAttribution?: ExperimentAttribution;
 }): CrawlerTelemetry {
   return {
     ...emptyCrawlerTelemetry('STATIC'),
@@ -320,6 +382,7 @@ export function staticCrawlerTelemetry(input: {
     ...(input.ceiling ? { ceiling: { kind: input.ceiling } } : {}),
     workerInstanceId: workerInstanceId(),
     ...(Object.keys(sanitizeDropReasons(input.dropReasons)).length ? { dropReasons: sanitizeDropReasons(input.dropReasons) } : {}),
+    ...(sanitizeExperimentAttribution(input.experimentAttribution) ? { experimentAttribution: sanitizeExperimentAttribution(input.experimentAttribution)! } : {}),
   };
 }
 
@@ -352,6 +415,7 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
   // persisted rows.
   const drops = sanitizeDropReasons(candidate.dropReasons);
   const scrolls = sanitizeScrollsUsed(candidate.scrollsUsed);
+  const attribution = sanitizeExperimentAttribution(candidate.experimentAttribution);
   const instance = text(candidate.workerInstanceId, 120);
   const ceiling = candidate.ceiling && typeof candidate.ceiling === 'object' && isCeilingKind((candidate.ceiling as { kind?: unknown }).kind)
     ? { kind: (candidate.ceiling as { kind: CeilingKind }).kind }
@@ -381,6 +445,7 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(instance ? { workerInstanceId: instance } : {}),
     ...(Object.keys(drops).length ? { dropReasons: drops } : {}),
     ...(scrolls > 0 ? { scrollsUsed: scrolls } : {}),
+    ...(attribution ? { experimentAttribution: attribution } : {}),
     ...(ceiling ? { ceiling } : {}),
   };
 }

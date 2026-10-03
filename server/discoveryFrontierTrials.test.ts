@@ -118,3 +118,30 @@ test('Phase 7: Strict Quota Input Validation - Rejects zero, negative, >100, non
     );
   }
 });
+
+test('Phase 7b: trial funnel mapping is measured-only with documented unmeasured zeros', async () => {
+  const { mapCompletionFunnelToTrialMetrics, TRIAL_FUNNEL_MAP_VERSION } = await import('./discoveryFrontierTrials');
+  assert.equal(TRIAL_FUNNEL_MAP_VERSION, 'trial-funnel-map-v1');
+  const mapped = mapCompletionFunnelToTrialMetrics({
+    rawResults: 25, distinctResults: 20, knownChannels: 15, newChannels: 5,
+    tradingConfirmed: 3, qualityChannels: 2, quotaUsed: 100,
+  });
+  assert.deepEqual(mapped, {
+    creatorsReturned: 25,
+    distinctCreators: 20,
+    newCreators: 5,
+    relevantNewCreators: 3,
+    qualityNewCreators: 2,
+    knownChannelOverlap: 0.75,
+    neighborhoodOverlap: 0,
+    quotaConsumed: 100,
+    marginalDiscoveryValue: 0,
+    coverageGain: 0,
+  });
+  const empty = mapCompletionFunnelToTrialMetrics({
+    rawResults: 0, distinctResults: 0, knownChannels: 0, newChannels: 0,
+    tradingConfirmed: 0, qualityChannels: 0, quotaUsed: 0,
+  });
+  assert.equal(empty.knownChannelOverlap, 0);
+  assert.equal(classifyTrialOutcomeState(empty), 'NOISY');
+});

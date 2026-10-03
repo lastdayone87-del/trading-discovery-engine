@@ -14,6 +14,9 @@ import {
   resolveRoutePick,
   revisitIntervalMs,
   runDomainLearningBatch,
+  isDomainWeightExperimentConsumptionEnabled,
+  consumeExperimentalWeights,
+  DOMAIN_WEIGHT_EXPERIMENT_SETTING_KEY,
   type DomainWeights,
 } from './domainLearner';
 
@@ -147,4 +150,27 @@ test('migration 137 creates additive domain-memory tables only', () => {
   assert.match(ddl, /PRIMARY KEY \(site_identity, route_pattern\)/);
   assert.match(ddl, /status TEXT NOT NULL DEFAULT 'DRAFT'/);
   assert.doesNotMatch(ddl, /DROP TABLE|ALTER TABLE|BACKFILL|UPDATE\s+\w+\s+SET/i);
+});
+
+test('experimental weight consumption is default-off and never serves DRAFT', async () => {
+  assert.equal(DOMAIN_WEIGHT_EXPERIMENT_SETTING_KEY, 'domain_weight_experiment_enabled');
+  assert.equal(await isDomainWeightExperimentConsumptionEnabled(async () => 'false'), false);
+  assert.equal(await isDomainWeightExperimentConsumptionEnabled(async () => ''), false);
+  assert.equal(await isDomainWeightExperimentConsumptionEnabled(async () => { throw new Error('down'); }), false);
+  assert.equal(await isDomainWeightExperimentConsumptionEnabled(async () => 'true'), true);
+  const closed = await consumeExperimentalWeights('example.com', {
+    readSetting: async () => 'false',
+    getApproved: async () => ({ version: 'dw-x', weights: { a: 1 } }),
+  });
+  assert.deepEqual(closed, { available: false, reason: 'EXPERIMENT_NOT_ENABLED' });
+  const none = await consumeExperimentalWeights('example.com', {
+    readSetting: async () => 'true',
+    getApproved: async () => null,
+  });
+  assert.deepEqual(none, { available: false, reason: 'NO_APPROVED_WEIGHTS' });
+  const open = await consumeExperimentalWeights('example.com', {
+    readSetting: async () => 'true',
+    getApproved: async () => ({ version: 'dw-approved', weights: { a: 0.7 } }),
+  });
+  assert.deepEqual(open, { available: true, version: 'dw-approved', weights: { a: 0.7 } });
 });
