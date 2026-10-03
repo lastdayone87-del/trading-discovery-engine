@@ -24,8 +24,8 @@ function poolFixture(): QueryRecord[] {
 }
 
 test('absent experiment normalizes to all-null (legacy path)', () => {
-  assert.deepEqual(normalizeSelectionExperimentRequest(undefined), { selection: null, ordering: null, trial: null });
-  assert.deepEqual(normalizeSelectionExperimentRequest(null), { selection: null, ordering: null, trial: null });
+  assert.deepEqual(normalizeSelectionExperimentRequest(undefined), { selection: null, ordering: null, trial: null, benchmark: null });
+  assert.deepEqual(normalizeSelectionExperimentRequest(null), { selection: null, ordering: null, trial: null, benchmark: null });
   assert.equal(validateSelectionExperimentRequest(undefined), null);
   assert.equal(validateSelectionExperimentRequest(null), null);
 });
@@ -320,9 +320,9 @@ test('frozen benchmark ordering derives the 90-day window from scheduled_at', as
     evaluateOrderingDimension,
     deriveBenchmarkOrderingWindow,
     resolveScheduledSearchWindow,
-    benchmarkOpportunityIdFor,
+    resolveFrozenBenchmarkScheduleOrdering,
+    benchmarkOpportunityIdForScope,
     BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
-    BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID,
     BENCHMARK_PREREG_ORDERING_WINDOW_DAYS,
   } = await import('./querySelectionExperiments');
   const { buildWindowedSearchParams } = await import('./retrievalExperiment');
@@ -366,10 +366,12 @@ test('frozen benchmark ordering derives the 90-day window from scheduled_at', as
   });
   assert.equal(control.arm, 'CONTROL');
   assert.equal(control.windowApplied, false);
-  // Stable benchmark opportunity identity is scoped to frozen identities.
-  assert.equal(benchmarkOpportunityIdFor(BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID, 42), 'benchmark-prereg-v1:q42');
-  assert.equal(benchmarkOpportunityIdFor(BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID, 7), 'benchmark-prereg-v1:q7');
-  assert.equal(benchmarkOpportunityIdFor('some-other-exp', 42), undefined);
+  // Stable benchmark opportunity identity is scoped to designated frozen
+  // pool rows, never the served query.
+  assert.equal(benchmarkOpportunityIdForScope({ snapshotHash: 'abc123', poolRowId: 42 }, 42), 'benchmark-prereg-v1:pool:abc123:42');
+  assert.equal(benchmarkOpportunityIdForScope({ snapshotHash: 'abc123', poolRowId: 42 }, 7), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(null, 42), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(undefined, 42), undefined);
 });
 
 test('observation envelope carries the stable benchmark opportunity only for frozen experiments', async () => {
@@ -390,4 +392,54 @@ test('observation envelope carries the stable benchmark opportunity only for fro
   assert.equal('benchmarkOpportunityId' in legacy, false);
   const benchmark = buildSelectionExperimentObservation({ ...base, benchmarkOpportunityId: 'benchmark-prereg-v1:q42' });
   assert.equal(benchmark.benchmarkOpportunityId, 'benchmark-prereg-v1:q42');
+});
+
+test('benchmark pool scope normalizes, validates, and gates opportunity identity', () => {
+  // Absent scope normalizes to null without affecting dimensions.
+  assert.equal(normalizeSelectionExperimentRequest({ selection: { experimentId: 's', enabledArms: ['THOMPSON'], treatmentBasisPoints: 0 } }).benchmark, null);
+  // Designated frozen pool row normalizes exactly.
+  const scoped = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  });
+  assert.deepEqual(scoped.benchmark, { snapshotHash: 'abc123', poolRowId: 42 });
+  assert.notEqual(validateSelectionExperimentRequest({
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  }), null);
+  // Present-but-invalid scope fails closed; scope alone validates nothing.
+  assert.throws(
+    () => validateSelectionExperimentRequest({ selection: { experimentId: 's', enabledArms: ['THOMPSON'], treatmentBasisPoints: 0 }, benchmark: { snapshotHash: '', poolRowId: 0 } }),
+    /INVALID_BENCHMARK_SCOPE/
+  );
+  assert.throws(() => validateSelectionExperimentRequest({ benchmark: { snapshotHash: 'abc123', poolRowId: 42 } }), /INVALID_EXPERIMENT_REQUEST/);
+});
+
+test('schedule-authoritative frozen ordering derives from the stored scheduled_at', async () => {
+  const { resolveFrozenBenchmarkScheduleOrdering, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID } = await import('./querySelectionExperiments');
+  const stored = new Date('2026-04-01T00:00:00.000Z');
+  const envelope = {
+    arm: 'TREATMENT' as const,
+    propensityBasisPoints: 5000,
+    policyVersion: 'retrieval-experiment-v1',
+    windowApplied: true,
+    window: { publishedAfter: '2020-01-01T00:00:00Z', publishedBefore: '2020-02-01T00:00:00Z' },
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+  };
+  const resolved = resolveFrozenBenchmarkScheduleOrdering(envelope, stored);
+  assert.notEqual(resolved, envelope);
+  assert.equal(resolved?.arm, 'TREATMENT');
+  assert.equal(resolved?.windowApplied, true);
+  assert.deepEqual(resolved?.window, { publishedAfter: '2026-01-01T00:00:00.000Z', publishedBefore: '2026-04-01T00:00:00.000Z' });
+  assert.equal(resolved?.experimentId, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID);
+  // Non-frozen identities, CONTROL arms, and absent envelopes pass through
+  // by reference (nothing to persist).
+  const control = { ...envelope, arm: 'CONTROL' as const, windowApplied: false, window: null, experimentId: null };
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(control, stored), control);
+  const other = { ...envelope, experimentId: 'other-exp' };
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(other, stored), other);
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(undefined, stored), undefined);
+  assert.equal(resolveFrozenBenchmarkScheduleOrdering(null, stored), null);
 });

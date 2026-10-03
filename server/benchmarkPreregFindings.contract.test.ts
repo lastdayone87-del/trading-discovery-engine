@@ -8,17 +8,19 @@ import test from 'node:test';
 // benchmark execution, no mechanism enablement, no UCB1 or frozen-parameter
 // changes.
 
-test('frozen P2 window derives from scheduled_at at schedule time', () => {
+test('schedule derives the frozen window from the stored scheduled_at', () => {
   const source = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
-  const scheduling = source.slice(
-    source.indexOf('Frozen benchmark P2 path'),
-    source.indexOf('const experimentMetadata = candidate.experiment')
+  // The authoritative timestamp comes from the run record, not an app clock.
+  assert.match(source, /RETURNING id, scheduled_at/);
+  const frozenBlock = source.slice(
+    source.indexOf('const frozenPatched = resolveFrozenBenchmarkScheduleOrdering'),
+    source.indexOf('const orderingWindow = candidate.experiment')
   );
-  assert.match(scheduling, /BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID/);
-  assert.match(scheduling, /deriveBenchmarkOrderingWindow\(scheduleTimestamp\)/);
-  assert.match(scheduling, /arm === 'TREATMENT'/);
-  // Caller-supplied or selection-time bounds are overwritten, never merged.
-  assert.match(scheduling, /window: deriveBenchmarkOrderingWindow\(scheduleTimestamp\)/);
+  assert.match(frozenBlock, /new Date\(String\(run\.rows\[0\]\.scheduled_at\)\)/);
+  assert.match(frozenBlock, /experimentMetadata = \{ selectionExperiment: candidate\.experiment \}/);
+  assert.match(frozenBlock, /jsonb_set\(jsonb_set\(metadata, '\{selectionExperiment,ordering,window\}'/);
+  // No independent application timestamp feeds the frozen derivation.
+  assert.doesNotMatch(frozenBlock, /new Date\(\)/);
 });
 
 test('terminally failed runs receive a zero-funnel accounting attribution', () => {
@@ -37,12 +39,19 @@ test('terminally failed runs receive a zero-funnel accounting attribution', () =
   assert.doesNotMatch(failure, /quality_channels_found=quality_channels_found\+\$|quality_channels_found \+/);
 });
 
-test('benchmark opportunity identity is stable per served query', async () => {
-  const { benchmarkOpportunityIdFor } = await import('./querySelectionExperiments');
-  // Same pool row retried maps to the same opportunity identity, so frozen
-  // pool rows track 1:1 to opportunities while each attempt keeps its own
-  // recorded assignment draw.
-  assert.equal(benchmarkOpportunityIdFor('benchmark-prereg-v1-selection', 101), 'benchmark-prereg-v1:q101');
-  assert.equal(benchmarkOpportunityIdFor('benchmark-prereg-v1-selection', 101), 'benchmark-prereg-v1:q101');
-  assert.equal(benchmarkOpportunityIdFor('unrelated-exp', 101), undefined);
+test('benchmark opportunity identity is designated pre-selection, never served-query derived', async () => {
+  const { benchmarkOpportunityIdForScope } = await import('./querySelectionExperiments');
+  const scope = { snapshotHash: 'abc123', poolRowId: 101 };
+  // The designated frozen pool row maps stably regardless of arm, attempt,
+  // or which query wins; retries stay attached to the same opportunity.
+  assert.equal(benchmarkOpportunityIdForScope(scope, 101), 'benchmark-prereg-v1:pool:abc123:101');
+  // A fallback winner, a newly generated query, or any non-designated row
+  // never acquires the frozen identity.
+  assert.equal(benchmarkOpportunityIdForScope(scope, 102), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(null, 101), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(undefined, 101), undefined);
+  // The scope rides the validated request shape (pre-selection by design).
+  const source = fs.readFileSync(new URL('./querySelectionExperiments.ts', import.meta.url), 'utf8');
+  assert.match(source, /benchmark\?: SelectionExperimentBenchmarkScope/);
+  assert.match(source, /INVALID_BENCHMARK_SCOPE/);
 });

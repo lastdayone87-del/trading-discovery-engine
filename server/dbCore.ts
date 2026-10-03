@@ -2086,36 +2086,43 @@ export async function scheduleAutonomousQueryRuns(
           }
         }
       }
-      const { resolveScheduledSearchWindow, deriveBenchmarkOrderingWindow, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID } = await import('./querySelectionExperiments');
-      // Frozen benchmark P2 path (benchmark-preregistration-v1 §3A/§6): a
-      // TREATMENT ordering envelope carrying the frozen benchmark ordering
-      // experimentId executes a window derived from this run's scheduled_at.
-      // Caller-supplied or selection-time bounds never reach execution or the
-      // persisted envelope on this path; every other experiment identity uses
-      // the legacy envelope path byte-identically.
-      const scheduleTimestamp = new Date();
-      const frozenOrdering = candidate.experiment?.ordering;
-      if (candidate.experiment && frozenOrdering && frozenOrdering.arm === 'TREATMENT' && frozenOrdering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
-        candidate.experiment = {
-          ...candidate.experiment,
-          ordering: { ...frozenOrdering, windowApplied: true, window: deriveBenchmarkOrderingWindow(scheduleTimestamp), experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID },
-        };
-      }
-      const experimentMetadata = candidate.experiment ? { selectionExperiment: candidate.experiment } : {};
+      const { resolveScheduledSearchWindow, resolveFrozenBenchmarkScheduleOrdering } = await import('./querySelectionExperiments');
+      let experimentMetadata = candidate.experiment ? { selectionExperiment: candidate.experiment } : {};
       const trialMetadata = trialLink ? { trial: trialLink } : {};
-      // The job-payload window derives from the persisted ordering envelope
-      // and is present only for TREATMENT arms with an applied window, so
-      // recorded propensity/arm state always matches executed retrieval.
-      const orderingWindow = candidate.experiment ? resolveScheduledSearchWindow(candidate.experiment.ordering) : undefined;
       let run;
       try {
         run = await client.query(
           `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
-           VALUES($1,$2,'automated_query',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+           VALUES($1,$2,'automated_query',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id, scheduled_at`,
           [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,scheduledProviderUnits,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{}),...experimentMetadata,...trialMetadata}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
         );
       } catch (error) { await failStep('query_run_insert', error); }
       const runId = run.rows[0].id;
+      // Frozen benchmark P2 path (benchmark-preregistration-v1 §3A/§6): the
+      // executed window derives from the run's STORED scheduled_at —
+      // PostgreSQL now() returned by the INSERT above — never an application
+      // clock. The in-transaction metadata row and the in-memory envelope are
+      // both overwritten with the derived bounds, so recorded and executed
+      // retrieval agree exactly. Every other experiment identity skips this
+      // block (resolver returns the input reference) and uses the legacy
+      // envelope path byte-identically. Caller-supplied or selection-time
+      // bounds never reach execution on the frozen path.
+      const frozenPatched = resolveFrozenBenchmarkScheduleOrdering(
+        candidate.experiment?.ordering,
+        new Date(String(run.rows[0].scheduled_at))
+      );
+      if (candidate.experiment && frozenPatched && frozenPatched !== candidate.experiment.ordering && frozenPatched.window) {
+        candidate.experiment = { ...candidate.experiment, ordering: frozenPatched };
+        experimentMetadata = { selectionExperiment: candidate.experiment };
+        await client.query(
+          `UPDATE query_runs SET metadata = jsonb_set(jsonb_set(metadata, '{selectionExperiment,ordering,window}', $2::jsonb), '{selectionExperiment,ordering,windowApplied}', 'true'::jsonb) WHERE id = $1`,
+          [runId, JSON.stringify(frozenPatched.window)]
+        ).catch(async (error: unknown) => { await failStep('benchmark_window_persistence', error); });
+      }
+      // The job-payload window derives from the persisted ordering envelope
+      // and is present only for TREATMENT arms with an applied window, so
+      // recorded propensity/arm state always matches executed retrieval.
+      const orderingWindow = candidate.experiment ? resolveScheduledSearchWindow(candidate.experiment.ordering) : undefined;
 
       if (canaryReservationId) {
         const committed = await commitRetrievalCanaryReservation(canaryReservationId, runId, client);

@@ -94,10 +94,26 @@ export interface SelectionExperimentTrialConfig {
   trialKey?: string;
 }
 
+/**
+ * Frozen benchmark opportunity scope (benchmark-preregistration-v1).
+ * Designates the pre-existing frozen pool snapshot row this attempt belongs
+ * to. Carried on the request (pre-selection) so the benchmark opportunity
+ * identity never depends on which query selection serves. Optional and
+ * inert on its own: it rides with selection/ordering/trial dimensions and
+ * changes no assignment math.
+ */
+export interface SelectionExperimentBenchmarkScope {
+  /** Frozen pool snapshot hash (external execution-record identity). */
+  snapshotHash?: string;
+  /** Frozen pool snapshot row: the pre-existing query_library id. */
+  poolRowId?: number;
+}
+
 export interface SelectionExperimentRequest {
   selection?: SelectionExperimentSelectionConfig;
   ordering?: SelectionExperimentOrderingConfig;
   trial?: SelectionExperimentTrialConfig;
+  benchmark?: SelectionExperimentBenchmarkScope;
 }
 
 export interface NormalizedTrialRequest {
@@ -121,6 +137,17 @@ export interface NormalizedSelectionExperiment {
     window: { publishedAfter?: string; publishedBefore?: string } | null;
   } | null;
   trial: NormalizedTrialRequest | null;
+  /**
+   * Frozen benchmark opportunity scope, when the request designates one.
+   * Present only when snapshotHash is non-empty and poolRowId is a positive
+   * integer; a present-but-invalid scope normalizes to null (routes then
+   * fail closed). Alone it validates nothing: at least one valid dimension
+   * (selection/ordering/trial) is still required.
+   */
+  benchmark: {
+    snapshotHash: string;
+    poolRowId: number;
+  } | null;
 }
 
 export type SelectionExperimentEligibilityReason =
@@ -165,16 +192,22 @@ export function deriveBenchmarkOrderingWindow(scheduledAt: Date): { publishedAft
 }
 
 /**
- * Stable benchmark opportunity identity for a served query. Returns
- * `benchmark-prereg-v1:q<queryId>` when the envelope experiment identity is
- * a frozen benchmark identity, else undefined (the envelope field then stays
- * absent and non-benchmark envelopes are byte-identical).
+ * Stable benchmark opportunity identity for a served query. The identity is
+ * the driver-designated frozen pool scope (snapshot hash + pool row id) —
+ * fixed BEFORE selection — never the query selection happened to serve.
+ * Returns the identity only when a scope is designated AND the served query
+ * is that designated pool row; otherwise undefined (the envelope field then
+ * stays absent). A newly generated query, a fallback winner, or any
+ * non-designated row can therefore never acquire a frozen opportunity's
+ * identity. CONTROL and treatment share the same identity by construction.
  */
-export function benchmarkOpportunityIdFor(envelopeExperimentId: string, servedQueryId: number): string | undefined {
-  return envelopeExperimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID ||
-    envelopeExperimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID
-    ? `benchmark-prereg-v1:q${servedQueryId}`
-    : undefined;
+export function benchmarkOpportunityIdForScope(
+  scope: { snapshotHash: string; poolRowId: number } | null | undefined,
+  servedQueryId: number
+): string | undefined {
+  if (!scope) return undefined;
+  if (servedQueryId !== scope.poolRowId) return undefined;
+  return `benchmark-prereg-v1:pool:${scope.snapshotHash}:${scope.poolRowId}`;
 }
 
 /**
@@ -289,7 +322,19 @@ export function normalizeSelectionExperimentRequest(input: unknown): NormalizedS
       };
     }
   }
-  return { selection, ordering, trial };
+  let benchmark: NormalizedSelectionExperiment['benchmark'] = null;
+  if (source.benchmark && typeof source.benchmark === 'object') {
+    const raw = source.benchmark;
+    const snapshotHash = typeof raw.snapshotHash === 'string' ? raw.snapshotHash.trim() : '';
+    const poolRowId = raw.poolRowId;
+    if (
+      snapshotHash.length > 0 && snapshotHash.length <= 128 &&
+      Number.isInteger(poolRowId) && (poolRowId as number) > 0
+    ) {
+      benchmark = { snapshotHash, poolRowId: poolRowId as number };
+    }
+  }
+  return { selection, ordering, trial, benchmark };
 }
 
 /**
@@ -307,6 +352,7 @@ export function validateSelectionExperimentRequest(input: unknown): NormalizedSe
   if (source.selection !== undefined && normalized.selection === null) throw new Error('INVALID_SELECTION_EXPERIMENT');
   if (source.ordering !== undefined && normalized.ordering === null) throw new Error('INVALID_ORDERING_EXPERIMENT');
   if (source.trial !== undefined && normalized.trial === null) throw new Error('INVALID_TRIAL_REQUEST');
+  if (source.benchmark !== undefined && normalized.benchmark === null) throw new Error('INVALID_BENCHMARK_SCOPE');
   if (!normalized.selection && !normalized.ordering && !normalized.trial) {
     throw new Error('INVALID_EXPERIMENT_REQUEST');
   }
@@ -450,6 +496,29 @@ export function evaluateOrderingDimension(args: {
 }
 
 /**
+ * Resolves the schedule-authoritative frozen ordering from the run's STORED
+ * scheduled_at. The stored timestamp comes from INSERT ... RETURNING
+ * scheduled_at (PostgreSQL now()) — never an application clock. Returns a
+ * new ordering carrying the derived 90-day window when the envelope is a
+ * frozen benchmark TREATMENT; otherwise returns the input reference
+ * unchanged (reference equality signals "nothing to persist"). Pure.
+ */
+export function resolveFrozenBenchmarkScheduleOrdering(
+  ordering: SelectionExperimentObservation['ordering'],
+  storedScheduledAt: Date
+): SelectionExperimentObservation['ordering'] {
+  if (!ordering || ordering.arm !== 'TREATMENT' || ordering.experimentId !== BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
+    return ordering;
+  }
+  return {
+    ...ordering,
+    windowApplied: true,
+    window: deriveBenchmarkOrderingWindow(storedScheduledAt),
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+  };
+}
+
+/**
  * Resolves the job-payload search window from a persisted ordering envelope.
  * Returns undefined unless the envelope records a TREATMENT arm with an
  * applied, bounded window — CONTROL observations therefore never produce a
@@ -544,11 +613,12 @@ export interface SelectionExperimentObservation {
   /** Arm whose selection actually produced the query (differs on fallback). */
   servedArm: SelectionExperimentArm;
   /**
-   * Stable benchmark opportunity identity (`benchmark-prereg-v1:q<queryId>`).
-   * Present only on benchmark-preregistration experiments; lets frozen pool
-   * rows map 1:1 to scheduled opportunities across retries (each attempt
-   * keeps its own assignment draw under determinism.*). Absent otherwise,
-   * so non-benchmark envelopes are byte-identical.
+   * Stable benchmark opportunity identity
+   * (`benchmark-prereg-v1:pool:<snapshotHash>:<poolRowId>`). Present only
+   * when the request designated a frozen pool scope AND the served query is
+   * that designated row; retries share it while each attempt keeps its own
+   * assignment draw under determinism.*. Absent otherwise, so
+   * non-benchmark envelopes are byte-identical.
    */
   benchmarkOpportunityId?: string;
   propensityBasisPoints: number;
@@ -739,7 +809,7 @@ export async function selectExperimentalQueryForCountry(
         winner: null,
         servedArm: 'CONTROL',
         ordering,
-        benchmarkOpportunityId: benchmarkOpportunityIdFor(orderingExperimentId, base.queryRecord.id),
+        benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, base.queryRecord.id),
       }),
     };
   }
@@ -768,7 +838,7 @@ export async function selectExperimentalQueryForCountry(
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
         reason: 'Control arm: UCB1 selection unchanged.',
-        benchmarkOpportunityId: benchmarkOpportunityIdFor(selection.experimentId, base.queryRecord.id),
+        benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, base.queryRecord.id),
         poolQueryIds: [],
         winner: null,
         servedArm: 'CONTROL',
@@ -791,7 +861,7 @@ export async function selectExperimentalQueryForCountry(
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
         reason: 'Requested treatment arm but the eligible pool was empty; served UCB1 fallback.',
-        benchmarkOpportunityId: benchmarkOpportunityIdFor(selection.experimentId, base.queryRecord.id),
+        benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, base.queryRecord.id),
         poolQueryIds: [],
         winner: null,
         servedArm: 'CONTROL',
@@ -813,7 +883,7 @@ export async function selectExperimentalQueryForCountry(
     experiment: buildSelectionExperimentObservation({
       ...envelopeBase,
       reason: `${assignment.arm} winner query #${selected.id} at pool index ${winner.index}.`,
-      benchmarkOpportunityId: benchmarkOpportunityIdFor(selection.experimentId, selected.id),
+      benchmarkOpportunityId: benchmarkOpportunityIdForScope(experiment?.benchmark ?? null, selected.id),
       poolQueryIds: eligible.map(query => query.id),
       winner,
       servedArm: assignment.arm,
