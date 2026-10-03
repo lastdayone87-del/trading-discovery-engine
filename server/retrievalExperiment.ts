@@ -73,6 +73,36 @@ export function buildWindowedSearchParams(
 
 export type OrderingExperimentArm = 'CONTROL' | 'TREATMENT';
 
+export interface ExecutionSearchWindow {
+  publishedAfter?: string;
+  publishedBefore?: string;
+}
+
+/**
+ * Resolves a recorded job-payload search window for execution. Re-validates
+ * through buildWindowedSearchParams (fail-closed): malformed or experiment-
+ * less windows resolve to null and the fetch proceeds unwindowed. Pure.
+ */
+export function resolveExecutionSearchWindow(input: unknown): ExecutionSearchWindow | null {
+  if (!input || typeof input !== 'object') return null;
+  const recorded = input as { publishedAfter?: unknown; publishedBefore?: unknown; experimentId?: unknown };
+  const bounds: SearchWindow = {};
+  if (typeof recorded.publishedAfter === 'string') bounds.publishedAfter = recorded.publishedAfter;
+  if (typeof recorded.publishedBefore === 'string') bounds.publishedBefore = recorded.publishedBefore;
+  if (bounds.publishedAfter === undefined && bounds.publishedBefore === undefined) return null;
+  const experimentId = typeof recorded.experimentId === 'string' ? recorded.experimentId : '';
+  try {
+    const applied = buildWindowedSearchParams({}, bounds, experimentId);
+    if (!applied.windowApplied) return null;
+    const resolved: ExecutionSearchWindow = {};
+    if (typeof applied.params.publishedAfter === 'string') resolved.publishedAfter = applied.params.publishedAfter;
+    if (typeof applied.params.publishedBefore === 'string') resolved.publishedBefore = applied.params.publishedBefore;
+    return resolved.publishedAfter === undefined && resolved.publishedBefore === undefined ? null : resolved;
+  } catch {
+    return null;
+  }
+}
+
 export interface OrderingExperimentAssignment {
   arm: OrderingExperimentArm;
   /** Propensity in basis points, compatible with outcomeFeedback allocationProbability = bp/10000. */

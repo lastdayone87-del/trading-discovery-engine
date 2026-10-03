@@ -37,6 +37,7 @@ import {
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
+import { resolveExecutionSearchWindow } from './retrievalExperiment';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
@@ -519,8 +520,10 @@ export async function processNextSearchJob(
       return true;
     }
 
-    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null, retrievalConfigKey = null, retrievalTreatmentOrigin = 'CONTROL', requestedPageDepth = 1 } = job.payload as {
+    const { query, country, source, queryRunId, queryId, retrievalLane = 'VIDEO', searchOrdering = 'RELEVANCE', pageNumber = 1, pageToken = null, retrievalConfigKey = null, retrievalTreatmentOrigin = 'CONTROL', requestedPageDepth = 1, trial = null, searchWindow = null } = job.payload as {
       query: string; country: string; source: DiscoverySource; queryRunId?: string; queryId?: number; retrievalLane?: RetrievalLane; searchOrdering?: import('./searchOrdering').SearchOrdering; pageNumber?:number; pageToken?:string|null; retrievalConfigKey?: string | null; retrievalTreatmentOrigin?: string; requestedPageDepth?: number;provider?:ProviderAllocation;
+      trial?: { trialId?: string; trialKey?: string; proposalId?: string; status?: string } | null;
+      searchWindow?: { publishedAfter?: string; publishedBefore?: string; experimentId?: string } | null;
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
@@ -617,7 +620,7 @@ export async function processNextSearchJob(
         const providerRequestBaseId = buildProviderRequestBaseId({queryRunId,jobId:job.id,jobAttempt:job.attempts,pageNumber});
         const queryMetadata = authorityQueryRecord?.generation_metadata || {};
         const preferredLanguage = preferredLanguageFromQueryMetadata(queryMetadata);
-        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,reserveAdditionalUnits:async additionalUnits=>{
+        searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
           if(braveProvider||quotaFreeInnertubeProvider) return;
           const budget=getDailyYouTubeQuotaBudget();
           const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
@@ -827,7 +830,10 @@ export async function processNextSearchJob(
         providerRunOutcome,
         averageQualityScore: finalMetrics.averageQualityScore,
         performanceScore: performance.performanceScore,
-        newCollection: performance.newCollection
+        newCollection: performance.newCollection,
+        // Opt-in trial linkage recorded on the job payload at schedule time.
+        // Absent on every legacy run.
+        ...(typeof trial?.trialId === 'string' && trial.trialId ? { trialCompletion: { trialId: trial.trialId } } : {})
       });
       await addQueryExecutionLog({
         query_run_id: queryRunId,

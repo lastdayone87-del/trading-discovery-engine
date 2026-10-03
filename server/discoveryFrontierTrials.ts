@@ -406,6 +406,66 @@ export async function completeCanaryTrial(
 }
 
 /**
+ * Completion-funnel to trial-metrics mapping (trial-funnel-map-v1).
+ * Measured funnel fields map one-to-one; known_channel_overlap is a
+ * documented proxy (known share among resolved creators) because per-trial
+ * overlap is not measured at completion; neighborhoodOverlap,
+ * marginalDiscoveryValue, and coverageGain have no completion-time source
+ * and are recorded as 0 (documented unmeasured). Zeros cannot falsely
+ * trigger SATURATED (>=0.80) or coverage-PROMISING (>=0.20); HARMFUL stays
+ * meaningful on measured quota/relevant/overlap-proxy.
+ */
+export const TRIAL_FUNNEL_MAP_VERSION = 'trial-funnel-map-v1';
+
+export function mapCompletionFunnelToTrialMetrics(funnel: {
+  rawResults: number;
+  distinctResults: number;
+  knownChannels: number;
+  newChannels: number;
+  tradingConfirmed: number;
+  qualityChannels: number;
+  quotaUsed: number;
+}): FrontierTrialMetrics {
+  const nonNegative = (value: number): number => (Number.isFinite(value) && value > 0 ? Math.floor(value) : 0);
+  const known = nonNegative(funnel.knownChannels);
+  const fresh = nonNegative(funnel.newChannels);
+  return {
+    creatorsReturned: nonNegative(funnel.rawResults),
+    distinctCreators: nonNegative(funnel.distinctResults),
+    newCreators: fresh,
+    relevantNewCreators: nonNegative(funnel.tradingConfirmed),
+    qualityNewCreators: nonNegative(funnel.qualityChannels),
+    knownChannelOverlap: known + fresh > 0 ? known / (known + fresh) : 0,
+    neighborhoodOverlap: 0,
+    quotaConsumed: nonNegative(funnel.quotaUsed),
+    marginalDiscoveryValue: 0,
+    coverageGain: 0,
+  };
+}
+
+/**
+ * Completes the INITIATED trial linked to a finished query run. Thin wrapper
+ * over completeCanaryTrial (unchanged): maps the run's measured completion
+ * funnel to trial metrics. Trial failures propagate to the caller — callers
+ * serving production runs must catch (best-effort, never fail the run).
+ */
+export async function completeFrontierTrialForRun(
+  trialId: string,
+  queryRunId: string,
+  funnel: {
+    rawResults: number;
+    distinctResults: number;
+    knownChannels: number;
+    newChannels: number;
+    tradingConfirmed: number;
+    qualityChannels: number;
+    quotaUsed: number;
+  }
+): Promise<FrontierCanaryTrial> {
+  return completeCanaryTrial(trialId, queryRunId, mapCompletionFunnelToTrialMetrics(funnel));
+}
+
+/**
  * Compares legacy autonomous discovery vs frontier canary discovery metrics.
  */
 export async function getFrontierBaselineComparison(
@@ -413,10 +473,15 @@ export async function getFrontierBaselineComparison(
 ): Promise<{
   legacy: Record<string, unknown>;
   frontierCanary: Record<string, unknown>;
+  selectionArms: Array<Record<string, unknown>>;
 }> {
   const db = await getDb();
 
-  // Legacy Autonomous Search Runs
+  // Legacy Autonomous Search Runs. A run is legacy only when it is neither
+  // a serving-path FRONTIER_CANARY allocation nor flagged by the legacy
+  // isFrontierTrial marker (kept for backward compatibility). Previously the
+  // serving-path allocation_origin was ignored here, so canary runs were
+  // silently counted as legacy.
   const legacyRes = await db.query(
     `SELECT
        COUNT(*)::int AS total_runs,
@@ -427,7 +492,7 @@ export async function getFrontierBaselineComparison(
        COUNT(DISTINCT country)::int AS distinct_countries
      FROM query_runs
      WHERE completed_at >= now() - ($1 || ' hours')::interval
-       AND (metadata->>'isFrontierTrial')::boolean IS NOT TRUE`,
+       AND NOT (allocation_origin = 'FRONTIER_CANARY' OR (metadata->>'isFrontierTrial')::boolean IS TRUE)`,
     [windowHours]
   );
 
@@ -453,6 +518,26 @@ export async function getFrontierBaselineComparison(
   const lQuota = Math.max(1, lRow?.total_quota || 0);
   const cQuota = Math.max(1, cRow?.total_quota || 0);
 
+  // Selection-arm breakdown over the same window. Arms resolve from the
+  // persisted selectionExperiment envelope (see resolvePersistedSelectionArm);
+  // runs without an envelope are CONTROL. Allocation origin (LEGACY vs
+  // FRONTIER_CANARY) stays a separate dimension in `legacy`/`frontierCanary`
+  // above and is intentionally not conflated here.
+  const armRes = await db.query(
+    `SELECT
+       COALESCE(NULLIF(metadata->'selectionExperiment'->>'servedArm', ''), 'CONTROL') AS arm,
+       COUNT(*)::int AS runs,
+       COALESCE(SUM(quota_used), 0)::int AS quota,
+       COALESCE(SUM(new_channels), 0)::int AS newc,
+       COALESCE(SUM(trading_confirmed), 0)::int AS relevant,
+       COALESCE(SUM(quality_channels), 0)::int AS quality,
+       COUNT(DISTINCT country)::int AS countries
+     FROM query_runs
+     WHERE completed_at >= now() - ($1 || ' hours')::interval
+     GROUP BY 1 ORDER BY 1`,
+    [windowHours]
+  );
+
   return {
     legacy: {
       totalRuns: lRow?.total_runs || 0,
@@ -474,7 +559,21 @@ export async function getFrontierBaselineComparison(
       qualityYieldPer1000Quota: Math.round(((cRow?.total_quality || 0) / cQuota) * 1000 * 100) / 100,
       distinctCountries: cRow?.distinct_countries || 0,
       averageOverlap: Math.round((cRow?.avg_overlap || 0) * 100) / 100
-    }
+    },
+    selectionArms: armRes.rows.map(row => {
+      const quota = Math.max(1, Number(row.quota || 0));
+      return {
+        arm: String(row.arm || 'CONTROL'),
+        runs: Number(row.runs || 0),
+        totalQuotaConsumed: quota,
+        totalNewCreators: Number(row.newc || 0),
+        totalRelevantNewCreators: Number(row.relevant || 0),
+        totalQualityNewCreators: Number(row.quality || 0),
+        relevantYieldPer1000Quota: Math.round((Number(row.relevant || 0) / quota) * 1000 * 100) / 100,
+        qualityYieldPer1000Quota: Math.round((Number(row.quality || 0) / quota) * 1000 * 100) / 100,
+        distinctCountries: Number(row.countries || 0),
+      };
+    })
   };
 }
 

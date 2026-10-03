@@ -33,6 +33,7 @@ import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaA
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
+import type { SelectionExperimentObservation } from './querySelectionExperiments';
 
 const { Pool } = pg;
 const MIGRATIONS_DIR = path.join(process.cwd(), 'server', 'db', 'migrations');
@@ -1587,6 +1588,21 @@ export interface AutonomousQueryCandidate {
   targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
   provider?: ProviderAllocation;
   allowShadowProvider?: boolean;
+  /**
+   * Opt-in selection-experiment observation (Thompson/Contextual/CONTROL).
+   * Absent means a legacy run: no envelope is persisted anywhere.
+   */
+  experiment?: SelectionExperimentObservation | null;
+  /**
+   * Opt-in canary-trial request. Absent means no trial lifecycle runs for
+   * this candidate; trial initiation never blocks or fails scheduling.
+   */
+  trialRequest?: {
+    proposalId: string;
+    maxQuota?: number;
+    pageDepth?: number;
+    trialKey?: string;
+  } | null;
 }
 
 export interface AutonomousSchedulingSnapshot {
@@ -2021,12 +2037,51 @@ export async function scheduleAutonomousQueryRuns(
       // Quota-free providers (YouTube.js/InnerTube) reserve 0 official units;
       // the official YouTube path keeps its 100-unit page reservation.
       const scheduledProviderUnits = allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE' ? 0 : 100;
+      // Opt-in canary-trial initiation. The existing gate (kill switch, caps,
+      // protections) stays fail-closed inside initiateCanaryTrial; a rejection
+      // or error here is recorded on the run but never fails scheduling.
+      // When the candidate also carries a frontier decision, the trial
+      // proposal must be that decision's proposal so the trial cannot be
+      // linked to an unrelated run.
+      let trialLink:
+        | { trialId: string; trialKey: string; proposalId: string; status: 'INITIATED' }
+        | { proposalId: string; status: 'NOT_INITIATED'; reason: string }
+        | undefined;
+      if (candidate.trialRequest && typeof candidate.trialRequest.proposalId === 'string' && candidate.trialRequest.proposalId.trim()) {
+        const trialProposalId = candidate.trialRequest.proposalId.trim();
+        try {
+          if (candidate.frontierDecisionId) {
+            const decisionProposal = await client.query(
+              `SELECT proposal_id FROM frontier_allocation_decisions WHERE decision_id=$1`,
+              [candidate.frontierDecisionId]
+            );
+            if (!decisionProposal.rowCount || decisionProposal.rows[0].proposal_id !== trialProposalId) {
+              throw new Error('TRIAL_PROPOSAL_DECISION_MISMATCH');
+            }
+          }
+          const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
+          const initiated = await initiateCanaryTrial(trialProposalId, {
+            maxQuota: candidate.trialRequest.maxQuota,
+            pageDepth: candidate.trialRequest.pageDepth,
+            trialKey: candidate.trialRequest.trialKey,
+          });
+          if (!initiated.trialId) throw new Error('TRIAL_INITIATION_MISSING_ID');
+          trialLink = { trialId: initiated.trialId, trialKey: initiated.trialKey, proposalId: initiated.proposalId, status: 'INITIATED' };
+        } catch (error) {
+          trialLink = { proposalId: trialProposalId, status: 'NOT_INITIATED', reason: error instanceof Error ? error.message : String(error) };
+        }
+      }
+      const experimentMetadata = candidate.experiment ? { selectionExperiment: candidate.experiment } : {};
+      const trialMetadata = trialLink ? { trial: trialLink } : {};
+      const orderingWindow = candidate.experiment?.ordering && candidate.experiment.ordering.windowApplied && candidate.experiment.ordering.window
+        ? { ...candidate.experiment.ordering.window, experimentId: candidate.experiment.experimentId }
+        : undefined;
       let run;
       try {
         run = await client.query(
           `INSERT INTO query_runs(query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot)
            VALUES($1,$2,'automated_query',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
-          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,scheduledProviderUnits,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
+          [candidate.query.id,candidate.query.country,candidate.strategy,candidate.reason,retrievalLane,searchOrdering,scheduledProviderUnits,JSON.stringify({...(candidate.query.generation_metadata||{}),...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{}),...experimentMetadata,...trialMetadata}),origin,retrievalConfigKey,treatmentOrigin,allocatedProvider.providerKey,allocatedProvider.retrievalSurface,allocatedProvider.capability,allocatedProvider.costDomain,JSON.stringify(allocatedProvider)]
         );
       } catch (error) { await failStep('query_run_insert', error); }
       const runId = run.rows[0].id;
@@ -2099,6 +2154,9 @@ export async function scheduleAutonomousQueryRuns(
           retrievalTreatmentOrigin: treatmentOrigin,
           requestedPageDepth
           ,provider:allocatedProvider
+          ,...(candidate.experiment ? { selectionExperiment: candidate.experiment } : {})
+          ,...(trialLink ? { trial: trialLink } : {})
+          ,...(orderingWindow ? { searchWindow: orderingWindow } : {})
         }), `search-run:${runId}`]
         );
       } catch (error) { await failStep('child_job_insert', error); }
@@ -2107,7 +2165,7 @@ export async function scheduleAutonomousQueryRuns(
       catch (error) { await failStep('query_run_job_linkage', error); }
 
       try {
-        await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:scheduledProviderUnits,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{})}});
+        await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:scheduledProviderUnits,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{}),...experimentMetadata,...trialMetadata}});
       } catch (error) { await failStep('decision_event_persistence', error); }
       flushDiagnostic({ selectedQueryId: candidate.query.id, queryRunId: runId, jobId, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'RESERVED', reservationReasonCode: 'QUERY_LIBRARY_RESERVED', schedulingOutcome: 'SCHEDULED', schedulingOperation: 'query_run_job_and_selection_commit', disposition: 'SCHEDULED', reasonCode: 'SCHEDULED' });
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
@@ -2753,6 +2811,11 @@ export async function completeQueryRun(runId: string, metrics: {
   performanceScore?: number;
   newCollection?: 'PROVEN' | 'EXPERIMENTAL' | 'REJECTED';
   providerRunOutcome?: ProviderRunOutcome;
+  /**
+   * Opt-in canary-trial linkage (trialId recorded on the job payload at
+   * schedule time). Absent means no trial completion runs for this run.
+   */
+  trialCompletion?: { trialId: string };
 }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
@@ -2848,6 +2911,20 @@ export async function completeQueryRun(runId: string, metrics: {
     {
       const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
       await captureCompletedRunObservation(runId).catch(error => console.warn('[DiscoveryTrustEvaluation] Observation capture failed:', error));
+    }
+    // Opt-in canary-trial completion. Best-effort like the observation
+    // capture above: trial failures never roll back or abort completed runs.
+    if (run.rowCount && metrics.trialCompletion?.trialId) {
+      const { completeFrontierTrialForRun } = await import('./discoveryFrontierTrials');
+      await completeFrontierTrialForRun(metrics.trialCompletion.trialId, runId, {
+        rawResults: metrics.rawResults,
+        distinctResults: metrics.distinctResults,
+        knownChannels: metrics.knownChannels,
+        newChannels: metrics.newChannels,
+        tradingConfirmed: metrics.tradingConfirmed,
+        qualityChannels: metrics.qualityChannels,
+        quotaUsed: metrics.quotaUsed,
+      }).catch(error => console.warn('[FrontierTrials] Trial completion failed:', error));
     }
   } catch (error) {
     await client.query('ROLLBACK');

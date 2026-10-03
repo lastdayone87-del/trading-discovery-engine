@@ -16,6 +16,13 @@ import {
 import { SUPPORTED_DORMANT_COUNTRIES, SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
 import { assertCountryAllowed } from './countryExclusion';
 import { authorizeCountryNativeAllocationQuery, selectNextQueryForCountry } from './queryIntelligence';
+import {
+  selectExperimentalQueryForCountry,
+  normalizeSelectionExperimentRequest,
+  type NormalizedSelectionExperiment,
+  type SelectionExperimentObservation,
+  type SelectionExperimentRequest,
+} from './querySelectionExperiments';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
@@ -293,7 +300,7 @@ export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCount
  * Produces a quota-paced batch of durable work. It deliberately performs no
  * YouTube or channel processing; workers are the only autonomous executors.
  */
-export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean; geographicAllocationIntent?: GeographicAllocationIntent }, requestId?: string): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
+export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean; geographicAllocationIntent?: GeographicAllocationIntent }, requestId?: string, experiment?: SelectionExperimentRequest | NormalizedSelectionExperiment | null): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
   if (targetCountry) await assertCountryAllowed(targetCountry, 'autonomous_cycle');
   if (isCycleRunning) throw new Error('An autonomous discovery producer cycle is already in progress.');
 
@@ -359,6 +366,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     }, providerTarget);
     const capacity = providerTarget?.maxRuns ? Math.min(calculatedCapacity, Math.max(1, Math.floor(providerTarget.maxRuns))) : calculatedCapacity;
     diagnostics.capacity = capacity;
+
+    // Opt-in selection experiment (Thompson/Contextual/CONTROL + ordering
+    // window + canary-trial request). Absent by default: the scheduler and
+    // all existing callers pass nothing and every selection below is legacy.
+    // normalizeSelectionExperimentRequest is idempotent, so route-validated
+    // and raw requests converge here.
+    const normalizedExperiment = experiment ? normalizeSelectionExperimentRequest(experiment) : null;
 
     if (capacity === 0) {
       lastReport = {
@@ -454,6 +468,10 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       }
 
       let selected: { queryRecord: any; selectionStrategy: any; reason: string };
+      // Experiment envelope for the scheduled run, if an opt-in selection
+      // experiment served this attempt. Null on every legacy path (targeted,
+      // research, native, or no experiment requested).
+      let selectedExperiment: SelectionExperimentObservation | null = null;
       const nativeSnapshot = frontierAllocationInfo?.decision?.proposalEvidenceSnapshot;
       const governedConceptProposal = ['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(nativeSnapshot?.proposalFamily);
 
@@ -515,7 +533,13 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             continue;
           }
           country = legacyCountry;
-          const fallbackSelection = await selectNextQueryForCountry(legacyCountry, { scopePromotionBasis });
+          // Opt-in experimental selection substitutes the UCB1 call at this
+          // legacy site only. CONTROL (or empty pool) delegates inside and
+          // behaves identically to the legacy call below.
+          const fallbackExperimental = normalizedExperiment
+            ? await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: `${opportunityKey}:fallback`, scopePromotionBasis })
+            : null;
+          const fallbackSelection = fallbackExperimental ?? await selectNextQueryForCountry(legacyCountry, { scopePromotionBasis });
           if (!fallbackSelection) {
             candidateDiagnostic = {
               ...candidateDiagnostic,
@@ -528,10 +552,15 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             continue;
           }
           selected = fallbackSelection;
+          selectedExperiment = fallbackExperimental?.experiment ?? null;
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY_FALLBACK', selectedQueryId: selected.queryRecord.id };
         }
       } else {
-        const legacySelection = await selectNextQueryForCountry(country, { scopePromotionBasis });
+        // Same opt-in substitution as the fallback site above.
+        const legacyExperimental = normalizedExperiment
+          ? await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: `${opportunityKey}:legacy`, scopePromotionBasis })
+          : null;
+        const legacySelection = legacyExperimental ?? await selectNextQueryForCountry(country, { scopePromotionBasis });
         if (!legacySelection) {
           candidateDiagnostic = {
             ...candidateDiagnostic,
@@ -544,6 +573,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           continue;
         }
         selected = legacySelection;
+        selectedExperiment = legacyExperimental?.experiment ?? null;
         candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY', selectedQueryId: selected.queryRecord.id };
       }
 
@@ -602,7 +632,11 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           treatmentPropensityBasisPoints: creatorAllocation.treatmentPropensityBasisPoints,
           policyVersion: creatorAllocation.policyVersion,
           queryAuthority: 'QUERY_INTELLIGENCE'
-        } : { status: 'LEGACY_FALLBACK', reason: 'CANARY_ALLOCATION_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' }
+        } : { status: 'LEGACY_FALLBACK', reason: 'CANARY_ALLOCATION_UNAVAILABLE', queryAuthority: 'QUERY_INTELLIGENCE' },
+        // Opt-in experiment observation + trial request. Both absent on every
+        // legacy path, keeping the scheduled payload byte-identical.
+        ...(selectedExperiment ? { experiment: selectedExperiment } : {}),
+        ...(normalizedExperiment?.trial ? { trialRequest: normalizedExperiment.trial } : {}),
       }], workerId, cooldownMinutes, {
         onDiagnostic: patch => recordCandidateDiagnostic({ ...candidateDiagnostic, ...patch })
       }).catch(async error => {

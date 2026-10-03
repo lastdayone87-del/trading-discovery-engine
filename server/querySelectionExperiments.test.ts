@@ -35,19 +35,23 @@ test('invalid experiment requests are rejected, never defaulted on', () => {
   assert.throws(() => validateSelectionExperimentRequest([]), /INVALID_EXPERIMENT_REQUEST/);
   assert.throws(
     () => validateSelectionExperimentRequest({ selection: { experimentId: '', enabledArms: ['THOMPSON'], treatmentBasisPoints: 100 } }),
-    /INVALID_EXPERIMENT_REQUEST/
+    /INVALID_SELECTION_EXPERIMENT/
   );
   assert.throws(
     () => validateSelectionExperimentRequest({ selection: { experimentId: 'x', enabledArms: ['BOGUS'], treatmentBasisPoints: 100 } }),
-    /INVALID_EXPERIMENT_REQUEST/
+    /INVALID_SELECTION_EXPERIMENT/
   );
   assert.throws(
     () => validateSelectionExperimentRequest({ selection: { experimentId: 'x', enabledArms: ['THOMPSON'], treatmentBasisPoints: 10001 } }),
-    /INVALID_EXPERIMENT_REQUEST/
+    /INVALID_SELECTION_EXPERIMENT/
   );
   assert.throws(
     () => validateSelectionExperimentRequest({ trial: { proposalId: '', maxQuota: 50 } }),
-    /INVALID_EXPERIMENT_REQUEST/
+    /INVALID_TRIAL_REQUEST/
+  );
+  assert.throws(
+    () => validateSelectionExperimentRequest({ ordering: { treatmentBasisPoints: -1 } }),
+    /INVALID_ORDERING_EXPERIMENT/
   );
 });
 

@@ -710,7 +710,12 @@ export async function searchYouTubeChannelPage(
   ordering: SearchOrdering = 'RELEVANCE',
   onAdditionalQuota?: YouTubeAdditionalQuotaCallback,
   priority: YouTubeRequestPriority = 'autonomous',
-  lifecycle?: YouTubeProviderLifecycle
+  lifecycle?: YouTubeProviderLifecycle,
+  /**
+   * Opt-in P2 window treatment (validated publishedAfter/Before bounds).
+   * Absent means an unwindowed search; existing callers are unaffected.
+   */
+  searchWindow?: { publishedAfter?: string; publishedBefore?: string } | null
 ): Promise<YouTubeChannelPage> {
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
@@ -743,7 +748,9 @@ export async function searchYouTubeChannelPage(
         const searchUrl = buildYouTubeApiUrl('search', apiKey, {
           part: 'snippet', type: searchType, order: youtubeOrder(ordering),
           q: sanitizedQuery, maxResults, pageToken: pageToken || undefined,
-          regionCode: searchHints.regionCode, relevanceLanguage: searchHints.relevanceLanguage
+          regionCode: searchHints.regionCode, relevanceLanguage: searchHints.relevanceLanguage,
+          ...(searchWindow?.publishedAfter ? { publishedAfter: searchWindow.publishedAfter } : {}),
+          ...(searchWindow?.publishedBefore ? { publishedBefore: searchWindow.publishedBefore } : {})
         });
 
         console.log(`[YouTube Outbound Trace] search-${attempt + 1} before youtubeFetch at server/youtube.ts:255`);

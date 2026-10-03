@@ -213,13 +213,18 @@ export function normalizeSelectionExperimentRequest(input: unknown): NormalizedS
 /**
  * Route-level validator: returns the normalized experiment when the request
  * carries at least one valid dimension, otherwise throws INVALID_* so routes
- * fail closed with 400. An absent experiment (undefined/null) returns null
- * (no experiment requested — legacy path, not an error).
+ * fail closed with 400. A dimension that is present but invalid is rejected
+ * explicitly (never silently dropped); an absent experiment (undefined/null)
+ * returns null (no experiment requested — legacy path, not an error).
  */
 export function validateSelectionExperimentRequest(input: unknown): NormalizedSelectionExperiment | null {
   if (input === undefined || input === null) return null;
   if (typeof input !== 'object' || Array.isArray(input)) throw new Error('INVALID_EXPERIMENT_REQUEST');
+  const source = input as SelectionExperimentRequest;
   const normalized = normalizeSelectionExperimentRequest(input);
+  if (source.selection !== undefined && normalized.selection === null) throw new Error('INVALID_SELECTION_EXPERIMENT');
+  if (source.ordering !== undefined && normalized.ordering === null) throw new Error('INVALID_ORDERING_EXPERIMENT');
+  if (source.trial !== undefined && normalized.trial === null) throw new Error('INVALID_TRIAL_REQUEST');
   if (!normalized.selection && !normalized.ordering && !normalized.trial) {
     throw new Error('INVALID_EXPERIMENT_REQUEST');
   }
