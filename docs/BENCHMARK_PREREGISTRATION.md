@@ -81,7 +81,7 @@ Chosen deterministically from the spec version and code defaults — not from ex
 - Ordering treatmentBasisPoints: `5000` (balanced 50% CONTROL / 50% TREATMENT windowed retrieval; propensities `5000`/`5000`). Independent of the selection dimension.
 - Thompson priors: `alpha0=1, beta0=1` (implemented defaults; `allocationChallengers.ts:27,123-127`).
 - Contextual weights: `value=0.5, exploration=0.35, cost=0.1` (implemented defaults; `allocationChallengers.ts:156-160`).
-- P2 window definition (immutable rule, computed per opportunity at execution — no operator choice): for each assigned opportunity, `publishedBefore = <opportunity scheduled_at rendered RFC3339 full-datetime>`, `publishedAfter = <scheduled_at minus 90 days rendered RFC3339 full-datetime>`. Both bounds always present, `after < before`, format-validated per `retrievalExperiment.ts:31,49-62`. Justification: fixed 90-day recency lookback matching retrieval recency semantics; deterministic per opportunity; frozen before execution.
+- P2 window definition (immutable rule, enforced in code — not operator-selected): for the frozen ordering experimentId with a TREATMENT arm, the executed window is derived from the run's scheduled_at at schedule time (`deriveBenchmarkOrderingWindow`: publishedBefore = scheduled_at, publishedAfter = scheduled_at − 90 days, RFC3339). Caller-supplied bounds (present, absent, or divergent) never reach execution or the persisted envelope on this path (`querySelectionExperiments.ts:evaluateOrderingDimension` frozen branch + `dbCore.ts` schedule-time derivation, which overwrites the envelope copy before metadata/job persistence so recorded and executed bounds agree). All other experiment identities use the legacy caller-window path byte-identically.
 - Trial request defaults (no tuning): `maxQuota=100`, `pageDepth=1` (code defaults; `querySelectionExperiments.ts:237-244`); downstream caps per §7 still bind.
 - Feature-gated mechanisms during benchmark: P-A OFF, P-B OFF, P-C OFF, P-D serving OFF (no approved snapshot), P-E gateway OFF (fallbacks only), `graph_depth2_experiment_enabled` OFF, `relationship_canary_enabled` OFF, `frontier_trials_enabled` as-coded (missing=false) with trial initiation permitted only through the frozen trial path and caps. No gate is enabled to create the benchmark.
 
@@ -118,8 +118,9 @@ No frozen corpus/snapshot exists at preregistration time. Pool construction is f
 - Pool version identity: `pool = sha256(specVersion + engineCommit + SELECT … FROM query_library snapshot ordered by id + inclusion/exclusion rules below)`. Record pool hash + row count + collection timestamp in execution record.
 - Inclusion: rows passing reservable filter (`collection!=='REJECTED'`, `reserved_until`/`next_eligible_at` null-or-past), cooldown/diversity/intent gates at snapshot time, authority-eligible (`STANDALONE/ANCHOR_ONLY` or scope-promoted pair), retrieval-oriented shape (`queryPlanner.ts:107-115`).
 - Exclusion: `REJECTED`, reserved, `next_eligible_at` future, in-cooldown, primary-term-capped, most-recent-intent-only remainder, non-retrieval-oriented, stale policy version, unsupported-country scope.
-- Dedup: observations keyed by `channelId` within run (`calculateQueryFunnel` distinct map); opportunities keyed by `opportunityKey` (query/country/run identity as passed to assignment); duplicate observations handled per §6/§11, never double-counted in denominators.
+- Dedup: observations keyed by `channelId` within run (`calculateQueryFunnel` distinct map); opportunities keyed by `benchmarkOpportunityId` (`benchmark-prereg-v1:q<queryId>`, recorded on every benchmark envelope and run metadata) mapping frozen pool rows 1:1 to scheduled opportunities across retries. Each scheduled attempt keeps its own recorded assignment draw (`determinism.opportunityKey/bucket/propensity`) and resulting run id: retries are new draws under the same opportunity identity, distinguished by run id. Never double-counted in denominators.
 - Time boundaries: snapshot timestamp + `observed_at` window recorded; no favorable-year/query/source/period selection after results; no post-hoc pool modification.
+- Tracking ledger (durable): `query_runs` rows (`query_id` = pool row, `metadata.selectionExperiment` = assignment + `benchmarkOpportunityId` + snapshot context) joined to the external execution record (pool snapshot hash, spec version, config hash). Pool rows with zero attributed runs after scope completion are coded exclusions classified by the gate that stopped them (cooldown, authority, reservation, provider-registry — see candidate diagnostics reason codes); they are reported, never silently dropped.
 
 ## 6. Assignment (frozen)
 
@@ -129,7 +130,7 @@ No frozen corpus/snapshot exists at preregistration time. Pool construction is f
 - Ordering: `bucket = shaBucket(f"{RETRIEVAL_EXPERIMENT_VERSION}:{opportunityKey}")`; note the ordering construction embeds no experimentId (implemented as `VERSION:opportunityKey`); the frozen `experimentId=benchmark-prereg-v1-ordering` travels as the window `experimentId` attribution field, not as a hash input. With frozen `treatmentBasisPoints=5000`: `bucket<5000 → TREATMENT p=5000` else `CONTROL p=5000` (`retrievalExperiment.ts:114-143`).
 - Assignment identity/version inputs (no separate salt field exists in the implementation): the hash is constructed directly from the experiment policy/version string, the experimentId where applicable (selection only), and the opportunityKey, exactly as written above. Frozen versions: `query-selection-experiment-v1` + `benchmark-prereg-v1-selection`; `retrieval-experiment-v1` (+ window `experimentId=benchmark-prereg-v1-ordering` as attribution). Same eligible input + same frozen inputs → same assignment (no `Math.random` on assignment paths).
 - Arm probabilities: frozen by §3A (`5000` control / `2500`+`2500` selection treatments; `5000`/`5000` ordering); recorded per observation as `propensityBasisPoints`.
-- Stratification: none implemented — explicitly none. Eligibility checks precede assignment; retries create new opportunities only if re-eligible (reservation/authority gates re-evaluated); duplicate observations deduped by channel/run keys; failed assignments (invalid request) → 400 with nothing scheduled; unavailable treatment (empty pool) → documented UCB1 fallback, `servedArm=CONTROL`.
+- Stratification: none implemented — explicitly none. Eligibility checks precede assignment; retries are new assignment draws under the same `benchmarkOpportunityId` (reservation/authority gates re-evaluated, draw recorded per attempt); duplicate observations deduped by channel/run keys; failed assignments (invalid request) → 400 with nothing scheduled; unavailable treatment (empty pool) → documented UCB1 fallback, `servedArm=CONTROL`.
 
 ## 7. Parameter table (from code/config — nothing tuned)
 
@@ -167,9 +168,9 @@ Anything not listed here and not defined in code/config is documented as not def
 ## 8. Outcomes and metrics (frozen, from repo measurement)
 
 - Primary outcome: per-observation quality yield — `qualityChannels / evaluated`, where quality = `isQualityCreator` (`TRADING_CONFIRMED` and score ≥ 55), evaluated = `nonTrading+uncertain+needsReview+tradingConfirmed` (`queryPerformance.ts`). Reported at query-run level via `calculateQueryFunnel`, mapped to trial metrics (`relevantNewCreators=tradingConfirmed`, `qualityNewCreators=qualityChannels`, `TRIAL_FUNNEL_MAP_VERSION`, `discoveryFrontierTrials.ts:465-512`).
-- Secondary: `performanceScore` composite + components (tradingPrecision, noveltyRatio, qualityYield, countryPrecision, communityYield); `distinctResults/newChannels/inScopeNewChannels/communitiesDiscovered`; retrieval/order measures (lane/ordering attribution, window-applied rate); cost/quota (`quotaConsumed`, provider units, trial `quota_reserved/consumed`); resource (pagination depth, duration); terminology yield (`terminology_performance`, scope-weighted); P3/P5/P-D/P-E shadow metrics (eligibility + reason codes only).
+- Secondary: `performanceScore` composite + components (tradingPrecision, noveltyRatio, qualityYield, countryPrecision, communityYield); `distinctResults/newChannels/inScopeNewChannels/communitiesDiscovered`; retrieval/order measures (lane/ordering attribution, window-applied rate); cost/quota (`quotaConsumed`, provider units, trial `quota_reserved/consumed`); resource (pagination depth, duration); terminology yield (`terminology_performance`, scope-weighted); P3/P5/P-D/P-E shadow metrics (eligibility + reason codes only — P3 measured over the attempt-log `graphDepth2Decisions` set covering every evaluated depth-2 target, including targets returning no channels or admitted nothing).
 - Success/failure: run `COMPLETED` with persisted funnel vs `FAILED`/rejected/skipped per `completeQueryRun`/`completeCanaryTrial` states; quality per `QUALITY_CREATOR_SCORE_THRESHOLD`.
-- Attribution: `query_run_accounting_attributions(query_run_id, 'query-run-accounting-v1')`; `query_library` aggregates; `query_execution_logs`; `terminology_performance` keyed by lane/ordering; frontier consumption on `COMMITTED` decisions; trial metrics via funnel map. Denominators: distinct channels per run for funnel ratios; eligible assigned opportunities per arm for comparisons.
+- Attribution: `query_run_accounting_attributions(query_run_id, 'query-run-accounting-v1')` — inserted for COMPLETED runs (`completeQueryRun`) and for terminally FAILED runs (`failQueryRun`: zero-funnel row with `failureKind`, quality 0, `ON CONFLICT DO NOTHING`); `query_library` aggregates; `query_execution_logs`; `terminology_performance` keyed by lane/ordering; frontier consumption on `COMMITTED` decisions; trial metrics via funnel map. Denominators: distinct channels per run for funnel ratios; eligible attributed observations (completed + terminal-failed rows) per arm for comparisons — a provider/network/quota failure is attributable to its assigned arm and counts as a failed (quality-0) observation, never silently dropped.
 - Missing/failed/partial: missing outcomes excluded from numerators and denominators with reason recorded; failed runs counted in arm denominators as failures unless §11 exclusion applies; partial observations (e.g., capped pagination) measured as-is with caps recorded; no metric chosen after results.
 
 ## 9. Sample size / minimum observation rules
@@ -179,7 +180,7 @@ No benchmark-N power contract exists in the repository — this is stated explic
 - Minimum 30 eligible attributed observations per reported arm; arms below minimum reported as `INSUFFICIENT_SAMPLE — no comparison`.
 - Relevant strata (lane/video-channel, ordering) reported only with ≥10 observations; otherwise pooled only.
 - Treatment/control balance reported (assigned counts + propensity sums); imbalance investigated as assignment/execution bug, not adjusted post hoc.
-- Minimum valid-attribution count = observations with persisted `query_run_accounting_attributions` row; unattributed observations invalid.
+- Minimum valid-attribution count = observations with a persisted `query_run_accounting_attributions` row (completed or terminal-failed); unattributed observations invalid.
 - Insufficient/incomplete runs: reported with denominators; no claim made from them.
 
 ## 10. Stopping rules (frozen scope — no later execution approval may change the boundary)
@@ -211,7 +212,7 @@ No post-outcome discarding. Every exclusion carries its coded reason.
 
 ## 12. Provenance (traceability + gaps)
 
-Required per observation: spec version (`benchmark-preregistration-v1`), engine commit (`4b49e0c…`), mechanism versions (§1 table), assignment identity (`experimentId`, `bucket`, `armPickBucket`, `propensityBasisPoints`, `policyVersion`), arm identity (`CONTROL/THOMPSON/CONTEXTUAL`, ordering `CONTROL/TREATMENT`), propensity, opportunity identity (`opportunityKey`, query/country/run ids), source/evidence provenance (funnel observations, provider allocation snapshot), provider/version where applicable, configuration hash, run/query ids.
+Required per observation: spec version (`benchmark-preregistration-v1`), engine commit (`4b49e0c…`), mechanism versions (§1 table), assignment identity (`experimentId`, `bucket`, `armPickBucket`, `propensityBasisPoints`, `policyVersion`), `benchmarkOpportunityId` (`benchmark-prereg-v1:q<queryId>`), arm identity (`CONTROL/THOMPSON/CONTEXTUAL`, ordering `CONTROL/TREATMENT`), propensity, opportunity identity (`opportunityKey`, query/country/run ids), source/evidence provenance (funnel observations, provider allocation snapshot), provider/version where applicable, configuration hash, run/query ids.
 
 Persisted today: `query_runs` (+`provider_allocation_snapshot`, `performance_details`, quota fields), `query_run_accounting_attributions`, `query_library` aggregates, `query_execution_logs`, `terminology_performance`, `frontier_canary_trials`, `frontier_allocation_decisions`, `external_osint_observations`/`_attribution` (tables exist, materialization off), `creator_action_shadow_*`, corpus/rollout decision/event tables, job payloads (`selectionExperiment/trial/searchWindow`).
 
@@ -249,6 +250,9 @@ This document: `docs/BENCHMARK_PREREGISTRATION.md` (new file). Historical benchm
   - `node --import tsx --test server/querySelectionExperiments.test.ts`
   - `node --import tsx --test server/retrievalExperiment.test.ts`
   - `node --import tsx --test server/discoveryFrontierTrials.test.ts`
+  - `node --import tsx --test server/relationshipCanary.test.ts`
+  - `node --import tsx --test server/benchmarkPreregFindings.contract.test.ts`
+  - `npx tsc --noEmit` (full-project typecheck)
 - Confirmed no production mechanism enabled or tuned (docs-only diff; `git status` shows only this file).
 
 ## 18. Git workflow

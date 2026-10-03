@@ -1645,3 +1645,41 @@ test('P3 depth-2 evaluation denies without enablement, independence, or valid pa
   assert.equal(playlist.eligible, true);
   assert.equal(playlist.proposals[0]?.edgeKind, 'PLAYLIST_COHOST');
 });
+
+test('P3 shadow decisions persist for every evaluated depth-2 target without gating traversal', async () => {
+  const seed = UC('p3seed');
+  const d1 = UC('p3d1');
+  let calls = 0;
+  const summary = await processRelationshipCanaryJob(
+    { id: 'job-p3', payload: { cohortId: 'p3', targetCountry: 'US', seeds: [{ kind: 'channel', id: seed }], maxDepth: 2, maxFanout: 5, maxChannels: 50 } },
+    async () => {},
+    {
+      settings: { enabled: true, killSwitch: false, quotaPercent: 10 },
+      dailyBudget: 100000,
+      checkCountryAllowed: async () => {},
+      fetchFeaturedChannels: async () => {
+        calls++;
+        return calls === 1 ? { observations: [{ featuredChannelId: d1 }] } : { observations: [] };
+      },
+      reserveQuota: async () => true,
+      finishQuota: async () => {},
+      claimQuota: async () => true,
+      log: () => {},
+    },
+  );
+  // Traversal proceeded independently of the P3 decision (shadow-only).
+  assert.ok(summary.depth2Fetches >= 1);
+  // Every evaluated target recorded its P3 decision even though depth-2
+  // traversal returned zero channels and admitted nothing there.
+  const decisions = summary.graphDepth2Decisions ?? [];
+  assert.ok(decisions.length >= 1);
+  for (const decision of decisions) {
+    assert.equal(typeof decision.targetId, 'string');
+    assert.equal(typeof decision.reasonCode, 'string');
+    assert.equal(decision.policyVersion, 'graph-expansion-v1');
+  }
+  const { relationshipCanaryAttemptLog } = await import('./relationshipCanary');
+  const entry = relationshipCanaryAttemptLog(summary) as Record<string, unknown>;
+  assert.deepEqual(entry.graphDepth2Decisions, decisions);
+  assert.equal(entry.graphDepth2EvaluatedTargets, decisions.length);
+});

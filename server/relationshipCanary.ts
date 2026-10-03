@@ -267,6 +267,22 @@ export function evaluateGraphDepth2ForCanaryTarget(
   };
 }
 
+/**
+ * One evaluated P3 depth-2 policy decision (shadow-only observation).
+ * Recorded for EVERY evaluated depth-2 target — including targets whose
+ * traversal returns no channels or whose channels cannot be admitted — so
+ * the eligibility rate and reason-code distribution are computable over the
+ * full evaluated set. Never gates fetching or admission.
+ */
+export interface GraphDepth2TargetDecision {
+  targetId: string;
+  parentChannelId: string | null;
+  eligible: boolean;
+  reasonCode: string;
+  proposalCount: number;
+  policyVersion: string;
+}
+
 export interface RelationshipCanarySummary {
   cohortId: string;
   status: 'COMPLETED' | 'KILLED' | 'QUOTA_EXHAUSTED';
@@ -286,6 +302,12 @@ export interface RelationshipCanarySummary {
    * provider call failures without exposing any secret material.
    */
   failureCodes: string[];
+  /**
+   * P3 depth-2 policy decisions for every evaluated depth-2 target, in
+   * evaluation order (shadow-only; see GraphDepth2TargetDecision). Optional
+   * so previously constructed summaries remain valid.
+   */
+  graphDepth2Decisions?: GraphDepth2TargetDecision[];
   quotaUnits: number;
 }
 
@@ -355,6 +377,8 @@ export function relationshipCanaryAttemptLog(summary: RelationshipCanarySummary)
     downstreamCapped: summary.downstreamCapped,
     failures: summary.failures.slice(0, 100),
     failureCodes: summary.failureCodes.slice(0, 100),
+    graphDepth2Decisions: (summary.graphDepth2Decisions ?? []).slice(0, 150),
+    graphDepth2EvaluatedTargets: (summary.graphDepth2Decisions ?? []).length,
     quotaUnits: summary.quotaUnits,
     observedAt: new Date().toISOString(),
   };
@@ -640,6 +664,7 @@ export async function processRelationshipCanaryJob(
     downstreamCapped: 0,
     failures: [],
     failureCodes: [],
+    graphDepth2Decisions: [],
     quotaUnits: 0,
   };
   const log = deps.log || ((message: string) => console.info(message));
@@ -940,6 +965,19 @@ export async function processRelationshipCanaryJob(
         { fanoutRequested: payload.maxFanout, canaryEnabled: graphDepth2ExperimentEnabled, independentFamilies: 0 }
       );
       log(`[GraphDepth2] target=${target.targetId} eligible=${graphDepth2Policy.eligible} reason=${graphDepth2Policy.reasonCode} proposals=${graphDepth2Policy.proposals.length}.`);
+      // Target-level shadow record: every evaluated target leaves a
+      // persisted P3 decision (benchmark-preregistration-v1 §8), including
+      // targets whose traversal later returns no channels or whose channels
+      // cannot be admitted. Recorded before traversal so fetch/admission
+      // outcomes cannot suppress it. Still never gates anything.
+      (summary.graphDepth2Decisions ??= []).push({
+        targetId: target.targetId,
+        parentChannelId: target.parentChannelId ?? null,
+        eligible: graphDepth2Policy.eligible,
+        reasonCode: graphDepth2Policy.reasonCode,
+        proposalCount: graphDepth2Policy.proposals.length,
+        policyVersion: graphDepth2Policy.policyVersion,
+      });
       summary.depth2Fetches++;
       try {
         const ids = await expandFeatured(target.targetId, {

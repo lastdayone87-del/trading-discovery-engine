@@ -314,3 +314,80 @@ test('ordering without any identity falls back to selection, then fails closed',
     /INVALID_ORDERING_EXPERIMENT/
   );
 });
+
+test('frozen benchmark ordering derives the 90-day window from scheduled_at', async () => {
+  const {
+    evaluateOrderingDimension,
+    deriveBenchmarkOrderingWindow,
+    resolveScheduledSearchWindow,
+    benchmarkOpportunityIdFor,
+    BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID,
+    BENCHMARK_PREREG_ORDERING_WINDOW_DAYS,
+  } = await import('./querySelectionExperiments');
+  const { buildWindowedSearchParams } = await import('./retrievalExperiment');
+  assert.equal(BENCHMARK_PREREG_ORDERING_WINDOW_DAYS, 90);
+  const scheduledAt = new Date('2026-03-10T12:00:00.000Z');
+  const derived = deriveBenchmarkOrderingWindow(scheduledAt);
+  assert.equal(derived.publishedBefore, '2026-03-10T12:00:00.000Z');
+  assert.equal(derived.publishedAfter, '2025-12-10T12:00:00.000Z');
+  assert.equal(buildWindowedSearchParams({}, derived, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID).windowApplied, true);
+  // A divergent caller-supplied window never reaches the frozen envelope.
+  const treated = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window: { publishedAfter: '2020-01-01T00:00:00Z', publishedBefore: '2020-02-01T00:00:00Z' },
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-divergent',
+    scheduledAt,
+  });
+  assert.equal(treated.arm, 'TREATMENT');
+  assert.equal(treated.windowApplied, true);
+  assert.deepEqual(treated.window, derived);
+  assert.equal(treated.experimentId, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID);
+  assert.deepEqual(resolveScheduledSearchWindow(treated), { ...derived, experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID });
+  // A missing caller window still derives (no unwindowed treatment).
+  const missing = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window: null,
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-missing',
+    scheduledAt,
+  });
+  assert.equal(missing.arm, 'TREATMENT');
+  assert.equal(missing.windowApplied, true);
+  assert.deepEqual(missing.window, derived);
+  // Frozen CONTROL carries no window, as before.
+  const control = evaluateOrderingDimension({
+    treatmentBasisPoints: 0,
+    window: { publishedAfter: '2020-01-01T00:00:00Z' },
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-control',
+    scheduledAt,
+  });
+  assert.equal(control.arm, 'CONTROL');
+  assert.equal(control.windowApplied, false);
+  // Stable benchmark opportunity identity is scoped to frozen identities.
+  assert.equal(benchmarkOpportunityIdFor(BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID, 42), 'benchmark-prereg-v1:q42');
+  assert.equal(benchmarkOpportunityIdFor(BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID, 7), 'benchmark-prereg-v1:q7');
+  assert.equal(benchmarkOpportunityIdFor('some-other-exp', 42), undefined);
+});
+
+test('observation envelope carries the stable benchmark opportunity only for frozen experiments', async () => {
+  const { buildSelectionExperimentObservation, assignSelectionExperimentArm } = await import('./querySelectionExperiments');
+  const base = {
+    experimentId: 'exp-plain',
+    assignment: assignSelectionExperimentArm({ experimentId: 'exp-plain', enabledArms: [], treatmentBasisPoints: 0, opportunityKey: 'opp-plain' }),
+    eligibility: 'SELECTION_EXPERIMENT_NOT_REQUESTED' as const,
+    reason: 'plain',
+    opportunityKey: 'opp-plain',
+    poolQueryIds: [],
+    winner: null,
+    thompsonPrior: { alpha0: 1, beta0: 1 },
+    contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
+    servedArm: 'CONTROL' as const,
+  };
+  const legacy = buildSelectionExperimentObservation(base);
+  assert.equal('benchmarkOpportunityId' in legacy, false);
+  const benchmark = buildSelectionExperimentObservation({ ...base, benchmarkOpportunityId: 'benchmark-prereg-v1:q42' });
+  assert.equal(benchmark.benchmarkOpportunityId, 'benchmark-prereg-v1:q42');
+});

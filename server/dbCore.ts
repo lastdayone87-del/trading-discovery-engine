@@ -2086,12 +2086,26 @@ export async function scheduleAutonomousQueryRuns(
           }
         }
       }
+      const { resolveScheduledSearchWindow, deriveBenchmarkOrderingWindow, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID } = await import('./querySelectionExperiments');
+      // Frozen benchmark P2 path (benchmark-preregistration-v1 §3A/§6): a
+      // TREATMENT ordering envelope carrying the frozen benchmark ordering
+      // experimentId executes a window derived from this run's scheduled_at.
+      // Caller-supplied or selection-time bounds never reach execution or the
+      // persisted envelope on this path; every other experiment identity uses
+      // the legacy envelope path byte-identically.
+      const scheduleTimestamp = new Date();
+      const frozenOrdering = candidate.experiment?.ordering;
+      if (candidate.experiment && frozenOrdering && frozenOrdering.arm === 'TREATMENT' && frozenOrdering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
+        candidate.experiment = {
+          ...candidate.experiment,
+          ordering: { ...frozenOrdering, windowApplied: true, window: deriveBenchmarkOrderingWindow(scheduleTimestamp), experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID },
+        };
+      }
       const experimentMetadata = candidate.experiment ? { selectionExperiment: candidate.experiment } : {};
       const trialMetadata = trialLink ? { trial: trialLink } : {};
       // The job-payload window derives from the persisted ordering envelope
       // and is present only for TREATMENT arms with an applied window, so
       // recorded propensity/arm state always matches executed retrieval.
-      const { resolveScheduledSearchWindow } = await import('./querySelectionExperiments');
       const orderingWindow = candidate.experiment ? resolveScheduledSearchWindow(candidate.experiment.ordering) : undefined;
       let run;
       try {
@@ -3046,6 +3060,27 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   if (run.rowCount) {
     await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
     await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+    // Benchmark attribution conformance (benchmark-preregistration-v1 §8/§9):
+    // terminally failed runs must be deterministically attributable to their
+    // assigned arm and countable in arm denominators. Successful completions
+    // insert this row in completeQueryRun; failures previously left none,
+    // silently dropping provider/network/quota failures from measurement.
+    // The zero-funnel row marks the run as a failed observation (quality 0).
+    // Deliberately does NOT touch query_library aggregates: UCB1/Thompson
+    // counters observe completed runs only (production behavior unchanged).
+    await db.query(
+      `INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics)
+       VALUES($1,$2,'query-run-accounting-v1',0,$3) ON CONFLICT(query_run_id) DO NOTHING`,
+      [runId, run.rows[0].query_id, JSON.stringify({
+        failed: true, terminal: true, failureKind,
+        rawResults: 0, distinctResults: 0, duplicateResults: 0,
+        knownChannels: 0, newChannels: 0, countryRejected: 0,
+        nonTrading: 0, uncertain: 0, needsReview: 0,
+        tradingConfirmed: 0, qualityChannels: 0, communitiesDiscovered: 0,
+        averageQualityScore: 0, noveltyRatio: 0, countryPrecision: 0,
+        tradingPrecision: 0, qualityYield: 0, communityYield: 0, performanceScore: 0,
+      })]
+    );
     const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
     await captureCompletedRunObservation(runId).catch(captureError => console.warn('[DiscoveryTrustEvaluation] Failure observation capture failed:', captureError));
   }

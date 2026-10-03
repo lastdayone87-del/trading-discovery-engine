@@ -139,6 +139,45 @@ function shaBucket(input: string): number {
 }
 
 /**
+ * Frozen benchmark identity (benchmark-preregistration-v1 §3A). These
+ * constants name the preregistered experiment identities; they change no
+ * assignment math and gate only benchmark-scoped derivation paths. All
+ * other experiment identities execute the legacy caller-supplied paths
+ * byte-identically.
+ */
+export const BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v1-selection';
+export const BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v1-ordering';
+/** Frozen P2 recency lookback in days (benchmark-preregistration-v1 §3A). */
+export const BENCHMARK_PREREG_ORDERING_WINDOW_DAYS = 90;
+
+const BENCHMARK_PREREG_ORDERING_WINDOW_MS = BENCHMARK_PREREG_ORDERING_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
+/**
+ * Derives the frozen P2 benchmark window from the opportunity's scheduled_at.
+ * Pure: publishedBefore = scheduledAt, publishedAfter = scheduledAt − 90
+ * days, both RFC3339. Caller-supplied bounds are never consulted, so a
+ * missing or divergent caller window cannot violate the preregistered rule.
+ */
+export function deriveBenchmarkOrderingWindow(scheduledAt: Date): { publishedAfter: string; publishedBefore: string } {
+  const before = new Date(scheduledAt.getTime());
+  const after = new Date(scheduledAt.getTime() - BENCHMARK_PREREG_ORDERING_WINDOW_MS);
+  return { publishedAfter: after.toISOString(), publishedBefore: before.toISOString() };
+}
+
+/**
+ * Stable benchmark opportunity identity for a served query. Returns
+ * `benchmark-prereg-v1:q<queryId>` when the envelope experiment identity is
+ * a frozen benchmark identity, else undefined (the envelope field then stays
+ * absent and non-benchmark envelopes are byte-identical).
+ */
+export function benchmarkOpportunityIdFor(envelopeExperimentId: string, servedQueryId: number): string | undefined {
+  return envelopeExperimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID ||
+    envelopeExperimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID
+    ? `benchmark-prereg-v1:q${servedQueryId}`
+    : undefined;
+}
+
+/**
  * Validates + normalizes an operator-supplied experiment request. Pure and
  * fail-closed: anything invalid yields { selection: null, ordering: null,
  * trial: null } semantics at the call site (routes must 400 instead — see
@@ -351,6 +390,12 @@ export function evaluateOrderingDimension(args: {
   window: { publishedAfter?: string; publishedBefore?: string } | null;
   experimentId: string;
   opportunityKey: string;
+  /**
+   * Opportunity scheduled_at for frozen-benchmark window derivation. Only
+   * consulted on the frozen benchmark ordering path; all other identities
+   * ignore it entirely.
+   */
+  scheduledAt?: Date;
 }): OrderingDimensionEvaluation {
   const evaluated = selectOrderingExperimentArm(args.opportunityKey, args.treatmentBasisPoints);
   if (evaluated.arm === 'CONTROL') {
@@ -361,6 +406,23 @@ export function evaluateOrderingDimension(args: {
       windowApplied: false,
       window: null,
       experimentId: null,
+    };
+  }
+  if (args.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
+    // Frozen benchmark path (benchmark-preregistration-v1 §3A/§6): a
+    // TREATMENT assignment always carries the scheduled_at-derived 90-day
+    // window. Caller-supplied bounds (present, absent, or divergent) never
+    // reach the envelope, closing the unwindowed-treatment hole.
+    const at = args.scheduledAt instanceof Date && !Number.isNaN(args.scheduledAt.getTime())
+      ? args.scheduledAt
+      : new Date();
+    return {
+      arm: 'TREATMENT',
+      propensityBasisPoints: evaluated.propensityBasisPoints,
+      policyVersion: evaluated.policyVersion,
+      windowApplied: true,
+      window: deriveBenchmarkOrderingWindow(at),
+      experimentId: args.experimentId,
     };
   }
   let windowApplied = false;
@@ -481,6 +543,14 @@ export interface SelectionExperimentObservation {
   requestedArm: SelectionExperimentArm;
   /** Arm whose selection actually produced the query (differs on fallback). */
   servedArm: SelectionExperimentArm;
+  /**
+   * Stable benchmark opportunity identity (`benchmark-prereg-v1:q<queryId>`).
+   * Present only on benchmark-preregistration experiments; lets frozen pool
+   * rows map 1:1 to scheduled opportunities across retries (each attempt
+   * keeps its own assignment draw under determinism.*). Absent otherwise,
+   * so non-benchmark envelopes are byte-identical.
+   */
+  benchmarkOpportunityId?: string;
   propensityBasisPoints: number;
   allocationProbability: number;
   treatmentBasisPoints: number;
@@ -532,12 +602,14 @@ export function buildSelectionExperimentObservation(args: {
   contextualWeights: { value: number; exploration: number; cost: number };
   servedArm: SelectionExperimentArm;
   ordering?: SelectionExperimentObservation['ordering'];
+  benchmarkOpportunityId?: string;
 }): SelectionExperimentObservation {
   return {
     experimentId: args.experimentId,
     experimentVersion: QUERY_SELECTION_EXPERIMENT_VERSION,
     requestedArm: args.assignment.arm,
     servedArm: args.servedArm,
+    ...(args.benchmarkOpportunityId ? { benchmarkOpportunityId: args.benchmarkOpportunityId } : {}),
     propensityBasisPoints: args.assignment.propensityBasisPoints,
     allocationProbability: args.assignment.propensityBasisPoints / 10000,
     treatmentBasisPoints: args.assignment.treatmentBasisPoints,
@@ -632,6 +704,7 @@ export async function selectExperimentalQueryForCountry(
         window: experiment.ordering.window,
         experimentId: orderingExperimentId,
         opportunityKey: options.opportunityKey,
+        scheduledAt: now,
       })
     : undefined;
   const delegateLegacy = async () => {
@@ -666,6 +739,7 @@ export async function selectExperimentalQueryForCountry(
         winner: null,
         servedArm: 'CONTROL',
         ordering,
+        benchmarkOpportunityId: benchmarkOpportunityIdFor(orderingExperimentId, base.queryRecord.id),
       }),
     };
   }
@@ -694,6 +768,7 @@ export async function selectExperimentalQueryForCountry(
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
         reason: 'Control arm: UCB1 selection unchanged.',
+        benchmarkOpportunityId: benchmarkOpportunityIdFor(selection.experimentId, base.queryRecord.id),
         poolQueryIds: [],
         winner: null,
         servedArm: 'CONTROL',
@@ -716,6 +791,7 @@ export async function selectExperimentalQueryForCountry(
       experiment: buildSelectionExperimentObservation({
         ...envelopeBase,
         reason: 'Requested treatment arm but the eligible pool was empty; served UCB1 fallback.',
+        benchmarkOpportunityId: benchmarkOpportunityIdFor(selection.experimentId, base.queryRecord.id),
         poolQueryIds: [],
         winner: null,
         servedArm: 'CONTROL',
@@ -737,6 +813,7 @@ export async function selectExperimentalQueryForCountry(
     experiment: buildSelectionExperimentObservation({
       ...envelopeBase,
       reason: `${assignment.arm} winner query #${selected.id} at pool index ${winner.index}.`,
+      benchmarkOpportunityId: benchmarkOpportunityIdFor(selection.experimentId, selected.id),
       poolQueryIds: eligible.map(query => query.id),
       winner,
       servedArm: assignment.arm,
