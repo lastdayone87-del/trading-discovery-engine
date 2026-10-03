@@ -198,7 +198,7 @@ No benchmark-N power contract exists in the repository — this is stated explic
 |---|---|
 | Invalid experiment request | Route 400, nothing scheduled |
 | Empty treatment pool | UCB1 fallback, `servedArm=CONTROL`, reason recorded |
-| Invalid window | Execution unwindowed (`resolveExecutionSearchWindow→null`), control attribution |
+| Invalid window (legacy/non-frozen path only) | Execution unwindowed (`resolveExecutionSearchWindow→null`), control attribution. Does NOT apply to the frozen benchmark ordering experiment: there, a malformed request/window is rejected by validation (`INVALID_ORDERING_EXPERIMENT`, nothing scheduled); a valid but divergent caller-supplied window is ignored and overwritten with the immutable 90-day window derived from stored `scheduled_at`; the executed frozen TREATMENT window is therefore always the derived window — it must never become an unwindowed benchmark treatment. |
 | Trial initiation failure | `NOT_INITIATED`, scheduling proceeds |
 | Provider failure/timeout/quota/network/malformed | Run `FAILED` with classified code; counts in arm denominator; quota settled (`finishQuotaReservation(false)`); no silent retry beyond coded policy |
 | Missing evidence | Funnel zeros for that channel; run still attributed |
@@ -230,7 +230,7 @@ Gaps identified (not invented around): no dedicated `benchmark_spec_version` / `
 
 - UCB1 remains the production control. Experimental mechanisms stay non-authoritative until benchmark completion + evaluation.
 - No global feature gate enabled for this specification. All experimental defaults remain OFF/false/0. Kill switches (`frontier_trials_enabled` missing=false, `relationship_canary_kill_switch` default true, per-arm basis-0 CONTROL) and quotas/caps (§7) remain intact.
-- Benchmark preparation changed no production allocation/scoring behavior (docs-only change; see §18).
+- Benchmark preparation changed no production allocation/scoring behavior: UCB1 is untouched, legacy/non-benchmark paths execute byte-identically, and all experimental gates remain default-off. Beyond the preregistration document, PR #493 contains only benchmark-support wiring/measurement scoped to frozen benchmark identities (enumerated in §18) — no tuning, no threshold/parameter changes, no global enablement.
 
 ## 15. Reproducibility contract
 
@@ -253,10 +253,14 @@ This document: `docs/BENCHMARK_PREREGISTRATION.md` (new file). Historical benchm
   - `node --import tsx --test server/relationshipCanary.test.ts`
   - `node --import tsx --test server/benchmarkPreregFindings.contract.test.ts`
   - `npx tsc --noEmit` (full-project typecheck)
-- Confirmed no production mechanism enabled or tuned (docs-only diff; `git status` shows only this file).
+- Confirmed no production mechanism enabled or tuned, no frozen benchmark parameter changed, UCB1 unchanged (verified by diff inspection; see §18 for the exact file list).
 
 ## 18. Git workflow
 
 - Branch: `docs/frozen-benchmark-preregistration` from `4b49e0c` (pushed, PR opened, NOT merged).
-- Commit: this preregistration document only.
-- No production code modified. No discovered defect blocking factual preregistration (if one appears in review, it will be reported as a blocker, not scope-expanded here).
+- Commits: the preregistration document (`docs/BENCHMARK_PREREGISTRATION.md`) plus benchmark-support wiring/measurement that enforces it, all scoped to frozen benchmark identities with legacy paths byte-identical:
+  - `server/querySelectionExperiments.ts` — frozen benchmark identity constants, scheduled_at-derived P2 window enforcement, pre-selection pool-scope request field, configuration-gated opportunity identity, schedule-authoritative ordering resolver; no UCB1 or assignment-math changes.
+  - `server/dbCore.ts` — schedule path derives the frozen P2 window from stored `query_runs.scheduled_at` (`INSERT ... RETURNING id, scheduled_at`) and records zero-funnel accounting attributions for terminally failed runs (without touching `query_library` aggregates); non-benchmark scheduling unchanged.
+  - `server/relationshipCanary.ts` — per-target P3 shadow decision records on the run summary/attempt log; traversal and admission ungated (still record-only).
+  - Tests only: `server/querySelectionExperiments.test.ts`, `server/relationshipCanary.test.ts`, `server/benchmarkPreregFindings.contract.test.ts` (new).
+- The FROZEN SYSTEM UNDER TEST remains base commit `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc`. No production code outside the files above was modified. No discovered defect blocking factual preregistration (if one appears in review, it will be reported as a blocker, not scope-expanded here).

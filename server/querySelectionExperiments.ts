@@ -500,16 +500,20 @@ export function evaluateOrderingDimension(args: {
     // Frozen benchmark path (benchmark-preregistration-v1 §3A/§6): a
     // TREATMENT assignment always carries the scheduled_at-derived 90-day
     // window. Caller-supplied bounds (present, absent, or divergent) never
-    // reach the envelope, closing the unwindowed-treatment hole.
-    const at = args.scheduledAt instanceof Date && !Number.isNaN(args.scheduledAt.getTime())
-      ? args.scheduledAt
-      : new Date();
+    // reach the envelope, closing the unwindowed-treatment hole. There is
+    // intentionally no application-clock fallback: a frozen TREATMENT
+    // without a valid scheduledAt fails closed, because only the stored
+    // PostgreSQL scheduled_at is authoritative for the executed window
+    // (see resolveFrozenBenchmarkScheduleOrdering at schedule time).
+    if (!(args.scheduledAt instanceof Date) || Number.isNaN(args.scheduledAt.getTime())) {
+      throw new Error('BENCHMARK_ORDERING_SCHEDULED_AT_REQUIRED');
+    }
     return {
       arm: 'TREATMENT',
       propensityBasisPoints: evaluated.propensityBasisPoints,
       policyVersion: evaluated.policyVersion,
       windowApplied: true,
-      window: deriveBenchmarkOrderingWindow(at),
+      window: deriveBenchmarkOrderingWindow(args.scheduledAt),
       experimentId: args.experimentId,
     };
   }

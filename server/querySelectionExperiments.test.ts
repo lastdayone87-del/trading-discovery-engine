@@ -508,3 +508,47 @@ test('schedule-authoritative frozen ordering derives from the stored scheduled_a
   assert.equal(resolveFrozenBenchmarkScheduleOrdering(undefined, stored), undefined);
   assert.equal(resolveFrozenBenchmarkScheduleOrdering(null, stored), null);
 });
+
+test('frozen ordering without a valid scheduledAt fails closed instead of using the application clock', async () => {
+  const { evaluateOrderingDimension, BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID } = await import('./querySelectionExperiments');
+  // Frozen TREATMENT without scheduledAt: no silent new Date() fallback.
+  assert.throws(
+    () => evaluateOrderingDimension({
+      treatmentBasisPoints: 10000,
+      window: null,
+      experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+      opportunityKey: 'opp-frozen-no-clock',
+    }),
+    /BENCHMARK_ORDERING_SCHEDULED_AT_REQUIRED/
+  );
+  // Frozen TREATMENT with an invalid Date: same fail-closed behavior.
+  assert.throws(
+    () => evaluateOrderingDimension({
+      treatmentBasisPoints: 10000,
+      window: null,
+      experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+      opportunityKey: 'opp-frozen-bad-clock',
+      scheduledAt: new Date(Number.NaN),
+    }),
+    /BENCHMARK_ORDERING_SCHEDULED_AT_REQUIRED/
+  );
+  // Frozen CONTROL needs no window and stays open without scheduledAt.
+  const control = evaluateOrderingDimension({
+    treatmentBasisPoints: 0,
+    window: null,
+    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    opportunityKey: 'opp-frozen-control-no-clock',
+  });
+  assert.equal(control.arm, 'CONTROL');
+  assert.equal(control.windowApplied, false);
+  // Legacy identities never consult the clock and are unaffected.
+  const legacy = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window: { publishedAfter: '2026-01-01T00:00:00Z' },
+    experimentId: 'legacy-exp',
+    opportunityKey: 'opp-legacy-no-clock',
+  });
+  assert.equal(legacy.arm, 'TREATMENT');
+  assert.equal(legacy.windowApplied, true);
+  assert.deepEqual(legacy.window, { publishedAfter: '2026-01-01T00:00:00Z' });
+});
