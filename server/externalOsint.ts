@@ -5,6 +5,7 @@ import { canonicalCountry } from './countryInference';
 import { inferScript, isNoiseOrBoilerplate, normalizeNativeTerm } from './countryNativeIntelligence';
 import { buildFrontierProposal, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 import { createNeighborhoodChecksum } from './discoveryNeighborhood';
+import { resolveOsintAdapter, isOsintAdapterPermitted, type OsintAdapterGate } from './osintAdapters';
 
 type Queryable = Pool | PoolClient | { query: (sql: string, params?: any[]) => Promise<any> };
 export type OsintSourceFamily = 'PUBLIC_COMMUNITY' | 'PUBLICATION' | 'EDUCATOR_DIRECTORY' | 'BROKER_TERMINOLOGY' | 'TREND_SURFACE';
@@ -145,6 +146,37 @@ export async function runOsintAdapter(adapter: OsintAdapter): Promise<{ observat
     if (attempt < adapter.retry.attempts) await new Promise(resolve => setTimeout(resolve, Math.min(adapter.retry.backoffMs * 2 ** attempt, 2_000)));
   }
   return { observations: [], degraded: true, error: lastError };
+}
+
+export interface GatedOsintRun {
+  permitted: boolean;
+  reasonCode: 'OSINT_ADAPTER_PERMITTED' | 'OSINT_ADAPTER_UNKNOWN_SOURCE' | 'OSINT_ADAPTER_GATE_CLOSED';
+  observations: ExternalOsintObservation[];
+  degraded: boolean;
+  error?: string;
+}
+
+/**
+ * Gated adapter execution: resolves the adapter by contract sourceId, then
+ * enforces isOsintAdapterPermitted BEFORE any fetch is attempted. Denied
+ * runs return no observations and never invoke the adapter. Permitted runs
+ * delegate to runOsintAdapter (retry/timeout/cap policy unchanged).
+ *
+ * No scheduler calls this: there is no fetch loop by design (fetching
+ * requires per-source endpoint credentials and ToS/legal review, neither of
+ * which exists — see osintAdapters.ts prerequisites). Experiment harnesses
+ * and tests invoke it explicitly with caller-supplied gate evidence.
+ */
+export async function runGatedOsintAdapter(sourceId: string, gate: OsintAdapterGate): Promise<GatedOsintRun> {
+  const adapter = resolveOsintAdapter(sourceId);
+  if (!adapter) {
+    return { permitted: false, reasonCode: 'OSINT_ADAPTER_UNKNOWN_SOURCE', observations: [], degraded: true };
+  }
+  if (!isOsintAdapterPermitted(gate)) {
+    return { permitted: false, reasonCode: 'OSINT_ADAPTER_GATE_CLOSED', observations: [], degraded: true };
+  }
+  const result = await runOsintAdapter(adapter);
+  return { permitted: true, reasonCode: 'OSINT_ADAPTER_PERMITTED', ...result };
 }
 
 export interface MaterializationCaps { global: number; perSourceFamily: number; perCountry: number }
