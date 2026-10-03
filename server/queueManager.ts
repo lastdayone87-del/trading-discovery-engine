@@ -250,11 +250,11 @@ export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
  * retrieval vs per-channel processing vs total worker time. Persisted in
  * query-run performance_details; never affects scoring or behavior.
  */
-export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searchQuotaWaitMs: number, searchRetrievalMs: number, channelLoopStartMs: number, channelLoopEndMs: number, nowMs = Date.now()): { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number } {
+export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searchQuotaWaitMs: number, searchRetrievalGrossMs: number, searchTopUpWaitMs: number, channelLoopStartMs: number, channelLoopEndMs: number, nowMs = Date.now()): { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number } {
   return {
     workerTotalMs: nowMs - searchWorkerStartMs,
-    quotaWaitMs: searchQuotaWaitMs,
-    retrievalMs: searchRetrievalMs,
+    quotaWaitMs: searchQuotaWaitMs + searchTopUpWaitMs,
+    retrievalMs: Math.max(0, searchRetrievalGrossMs - searchTopUpWaitMs),
     channelProcessingMs: channelLoopEndMs - channelLoopStartMs,
   };
 }
@@ -518,35 +518,71 @@ export async function processNextSearchJob(
         }
       }
 
+      channel.scan_status = 'ENRICHING';
+      channel.scan_attempts = job.attempts;
+      await upsertChannel(channel);
+      // Reserve before the claim-time hydration below so a quota-exhausted
+      // claim throws here without spending the 1-unit metadata fetch.
+      // Reservation is not consumption: skip paths below release it.
+      const dailyBudget = getDailyYouTubeQuotaBudget();
+      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
+      const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;
+      // Actual request costs after the uploads-playlist optimization (1 unit
+      // per list call): stage 1 = channels.list (1) + playlistItems.list (1);
+      // stage 2 adds playlist search (100) + videos.list (1). Checkpoints are
+      // per-invocation locals, so every stage-2 job re-runs the stage-1
+      // requests first: reserve the true maximum (2 / 103), never the
+      // pre-optimization 101/202 totals that could reject a 2-unit job.
+      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?103:2);
+      let quotaReserved=false;
+      let acquisitionPersisted=candidateAlreadyEnriched;
+      if(!candidateAlreadyEnriched){
+        quotaReserved=await tryReserveQuota({
+          operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
+          units:enrichmentQuotaUnits,dailyBudget,allocationPercent:enrichmentPercent
+        });
+        if(!quotaReserved)throw new QuotaAllocationExhaustedError('ENRICHMENT');
+      }
       // Claim-time low-audience gate: the scheduler may have queued enrichment
       // before a numeric count was available (handle-shaped or missing stored
-      // values fail open at schedule time). Hydrate once via the 1-unit
-      // metadata call when the count is unavailable; a hydrated known-low
-      // count skips enrichment with the same SKIPPED_LOW_AUDIENCE projection
-      // as the Phase-7 gate. Quota/hydration failure stays fail-open.
+      // values fail open at schedule time). The enrichment allocation is
+      // already reserved above, so a quota-exhausted claim never reaches the
+      // 1-unit metadata fetch below. A hydrated known-low count skips
+      // enrichment with the same SKIPPED_LOW_AUDIENCE projection as the
+      // Phase-7 gate and releases the reservation unconsumed.
       let claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount ?? channel.subscriber_count ?? undefined);
       let claimHydrationChanged = false;
       if (!claimAudienceGate.shouldSkipDeepEnrichment && claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
+        const beforeSub = candidate.subscriberCount;
+        const beforeDesc = candidate.description;
+        const beforeLoc = candidate.locationTag;
         try {
           const hydrated = await fetchYouTubeChannelCountryMetadata(channelId, candidate);
           if (hydrated.subscriberCount && hydrated.subscriberCount !== candidate.subscriberCount) {
             candidate.subscriberCount = hydrated.subscriberCount;
-            if (hydrated.description) candidate.description = hydrated.description;
-            if (hydrated.locationTag) candidate.locationTag = hydrated.locationTag;
-            candidate.countryMetadataStatus = hydrated.countryMetadataStatus;
-            candidate.countryMetadataCheckedAt = hydrated.countryMetadataCheckedAt;
             claimAudienceGate = evaluateLowAudienceGate(hydrated.subscriberCount);
-            claimHydrationChanged = true;
           }
+          if (hydrated.description) candidate.description = hydrated.description;
+          if (hydrated.locationTag) candidate.locationTag = hydrated.locationTag;
+          candidate.countryMetadataStatus = hydrated.countryMetadataStatus;
+          candidate.countryMetadataCheckedAt = hydrated.countryMetadataCheckedAt;
+          // Country revalidation triggers only on creator-evidence changes
+          // (hidden-subscriber hydration can still deliver new country
+          // evidence via description/location); a bare metadata-status flip
+          // carries no country evidence and must not trigger it.
+          claimHydrationChanged =
+            candidate.subscriberCount !== beforeSub ||
+            candidate.description !== beforeDesc ||
+            candidate.locationTag !== beforeLoc;
         } catch {
           // Hydration unavailable (no keys, quota, network): proceed fail-open.
         }
       }
       // Hydration may have upgraded an UNCERTAIN creator into a CONFIRMED
       // excluded country. Re-run the existing Gate-1 validation on the
-      // hydrated candidate before any quota is reserved: a REJECTED result
-      // projects onto the row and consumes the job with zero quota spend.
-      // Non-rejected results fall through unchanged (fail-open preserved).
+      // hydrated candidate: a REJECTED result projects onto the row, releases
+      // the reservation unconsumed, and consumes the job with zero quota
+      // spend. Non-rejected results fall through unchanged (fail-open).
       if (claimHydrationChanged) {
         const claimCountryVal = await validateChannelCountry({
           channelName: candidate.channelName,
@@ -579,6 +615,7 @@ export async function processNextSearchJob(
             candidate
           );
           await upsertChannel(channel);
+          if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
           console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId,targetCountry,detectedCountry:claimCreatorCountry,reason:claimCountryVal.rejectionReason,context:`enrichment_claim_hydrated:${job.id}`,timestamp:claimNow}));
           if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'COUNTRY_POLICY_CHANGED'}).catch(()=>undefined);
           if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
@@ -599,32 +636,10 @@ export async function processNextSearchJob(
           timestamp: claimNow,
         }];
         await upsertChannel(channel);
+        if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,false);
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'LOW_AUDIENCE_SKIP'}).catch(()=>undefined);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel.trading_status,output:{reason:'LOW_AUDIENCE_SKIP'}});else await completeJob(job.id);
         return true;
-      }
-
-      channel.scan_status = 'ENRICHING';
-      channel.scan_attempts = job.attempts;
-      await upsertChannel(channel);
-      const dailyBudget = getDailyYouTubeQuotaBudget();
-      const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
-      const candidateAlreadyEnriched=Number(candidate.enrichmentStage||0)>=enrichmentStage;
-      // Actual request costs after the uploads-playlist optimization (1 unit
-      // per list call): stage 1 = channels.list (1) + playlistItems.list (1);
-      // stage 2 adds playlist search (100) + videos.list (1). Checkpoints are
-      // per-invocation locals, so every stage-2 job re-runs the stage-1
-      // requests first: reserve the true maximum (2 / 103), never the
-      // pre-optimization 101/202 totals that could reject a 2-unit job.
-      const enrichmentQuotaUnits=candidateAlreadyEnriched?0:(enrichmentStage>=2?103:2);
-      let quotaReserved=false;
-      let acquisitionPersisted=candidateAlreadyEnriched;
-      if(!candidateAlreadyEnriched){
-        quotaReserved=await tryReserveQuota({
-          operationType:'ENRICH_CHANNEL',operationId:job.id,allocation:'ENRICHMENT',
-          units:enrichmentQuotaUnits,dailyBudget,allocationPercent:enrichmentPercent
-        });
-        if(!quotaReserved)throw new QuotaAllocationExhaustedError('ENRICHMENT');
       }
       try {
         const enriched=candidateAlreadyEnriched?candidate:await fetchYouTubeChannelEnrichment(channelId,candidate,enrichmentStage,async additionalUnits=>{
@@ -669,7 +684,8 @@ export async function processNextSearchJob(
     // reads queue/quota waiting apart from actual processing latency.
     const searchWorkerStartMs = Date.now();
     let searchQuotaWaitMs = 0;
-    let searchRetrievalMs = 0;
+    let searchRetrievalGrossMs = 0;
+    let searchTopUpWaitMs = 0;
 
     // Execution-time query authority revalidation: every non-manual search job
     // must satisfy the current retrieval-policy before YouTube quota is spent.
@@ -772,10 +788,10 @@ export async function processNextSearchJob(
           const budget=getDailyYouTubeQuotaBudget();
           const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
           const toppedUp=await topUpQuotaReservation({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',additionalUnits,dailyBudget:budget,allocationPercent:percent});
-          searchQuotaWaitMs += Date.now() - topUpStartMs;
+          searchTopUpWaitMs += Date.now() - topUpStartMs;
           if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
         },priority:'autonomous'});
-        searchRetrievalMs += Date.now() - retrievalStartMs;
+        searchRetrievalGrossMs += Date.now() - retrievalStartMs;
         if(braveProvider){
           providerRequestsSucceeded=1; providerPagesRetrieved=1; providerCostUsd=Number(searchPage.providerCostUsd ?? 0);
           await settleProviderRequest(providerRequestId!, 'SUCCEEDED', providerCostUsd);
@@ -976,7 +992,7 @@ export async function processNextSearchJob(
       // Worker wall-time split (observability only, persisted in
       // performance_details): quota-wait vs retrieval vs per-channel
       // processing vs total worker time. Never affects scoring or behavior.
-      const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalMs, channelLoopStartMs, channelLoopEndMs, Date.now());
+      const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalGrossMs, searchTopUpWaitMs, channelLoopStartMs, channelLoopEndMs, Date.now());
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
         uniqueChannels: finalMetrics.newChannels,

@@ -76,14 +76,19 @@ test('hydration-upgraded CONFIRMED-excluded creator is revalidated before quota'
   );
 });
 
-test('claim revalidation runs after hydration and before quota reservation', async () => {
+test('quota reservation precedes hydration and the re-gate releases it on block', async () => {
   const fs = await import('node:fs');
   const path = await import('node:path');
   const source = fs.readFileSync(path.join(process.cwd(), 'server/queueManager.ts'), 'utf8');
-  const hydrationIdx = source.indexOf('claimHydrationChanged');
-  assert.ok(hydrationIdx >= 0, 'hydration tracking exists');
-  const revalidateIdx = source.indexOf('validateChannelCountry({', hydrationIdx);
-  assert.ok(revalidateIdx > hydrationIdx, 'revalidation runs after hydration');
-  const quotaIdx = source.indexOf('tryReserveQuota({', revalidateIdx);
-  assert.ok(quotaIdx > revalidateIdx, 'revalidation runs before quota reservation');
+  // Order: reserve → hydrate → re-gate. A quota-exhausted claim throws at
+  // reservation and never spends the hydration fetch; a blocked re-gate
+  // releases the reservation unconsumed.
+  const changedAnchor = source.indexOf('candidate.locationTag !== beforeLoc;');
+  assert.ok(changedAnchor >= 0, 'hydration change detection exists');
+  const quotaIdx = source.lastIndexOf('tryReserveQuota({', changedAnchor);
+  assert.ok(quotaIdx >= 0 && quotaIdx < changedAnchor, 'quota reservation precedes hydration');
+  const revalidateIdx = source.indexOf('validateChannelCountry({', changedAnchor);
+  assert.ok(revalidateIdx > changedAnchor, 'revalidation runs after hydration completes');
+  const releaseIdx = source.indexOf("finishQuotaReservation('ENRICH_CHANNEL',job.id,false)", revalidateIdx);
+  assert.ok(releaseIdx > revalidateIdx, 'blocked re-gate releases the reservation');
 });

@@ -93,7 +93,10 @@ function decide(input: any, evidence: EvidenceItem[], collection = sufficientCol
 test('thin retrieval input is detected as requiring hydration', () => {
   assert.equal(isThinRetrievalInputRequiringHydration(thinRetrievalInput), true);
   assert.equal(isThinRetrievalInputRequiringHydration(hydratedInput), false);
-  assert.equal(isThinRetrievalInputRequiringHydration({ ...thinRetrievalInput, enrichment_stage: 1, search_match_context: undefined }), false);
+  // Each guard independently disables the thin classification: dropping only
+  // the stage signal or only the provenance signal must suffice.
+  assert.equal(isThinRetrievalInputRequiringHydration({ ...thinRetrievalInput, enrichment_stage: 1 }), false);
+  assert.equal(isThinRetrievalInputRequiringHydration({ ...thinRetrievalInput, search_match_context: undefined }), false);
   assert.equal(isThinRetrievalInputRequiringHydration({ channel_name: 'x', description: 'y' }), false);
 });
 
@@ -113,7 +116,12 @@ test('same evidence on hydrated input still terminally rejects', () => {
 });
 
 test('withheld match titles are never fed into evidence by the guard', () => {
-  const { stages } = decide(thinRetrievalInput, [semanticUnrelated()]);
+  // The fixture carries a trading-relevant VIDEO match title that the
+  // anti-contamination layer withholds from evidence; the guard must route
+  // to ENRICH on the thin input rather than terminally rejecting, and no
+  // video_title field may appear among the staged evidence fields.
+  const { stages, decision } = decide(thinRetrievalInput, [semanticUnrelated()]);
+  assert.equal(decision.status, 'UNCERTAIN');
   const usedFields = stages.stages.flatMap(stage => stage.fields?.map(field => field.field) || []);
   assert.ok(!usedFields.includes('video_title'));
 });

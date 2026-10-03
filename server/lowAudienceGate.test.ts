@@ -69,13 +69,21 @@ test('handle-shaped and missing counts fail open as unavailable, never as low-au
   }
 });
 
-test('ENRICH claim hydrates unavailable counts and enforces the gate before ENRICHING', () => {
+test('ENRICH claim reserves quota before hydrating and releases it on audience skip', () => {
   const source = read('server/queueManager.ts');
-  const claimIdx = source.indexOf('Claim-time low-audience gate');
-  assert.ok(claimIdx >= 0, 'claim-time audience gate exists');
-  const enrichingIdx = source.indexOf("channel.scan_status = 'ENRICHING'");
-  assert.ok(enrichingIdx > claimIdx, 'audience gate runs before ENRICHING is stamped');
-  assert.match(source, /fetchYouTubeChannelCountryMetadata\(channelId, candidate\)/);
+  // Order: stamp ENRICHING (preserves the existing row lifecycle) →
+  // reserve quota → hydrate → skip with release. A quota-exhausted claim
+  // throws at reservation and never spends the hydration fetch.
+  const stampIdx = source.indexOf("channel.scan_status = 'ENRICHING'");
+  assert.ok(stampIdx >= 0, 'ENRICHING stamp exists');
+  const skipIdx = source.indexOf('if (claimAudienceGate.shouldSkipDeepEnrichment) {');
+  assert.ok(skipIdx > stampIdx, 'audience skip runs after the stamp');
+  const reserveIdx = source.indexOf('tryReserveQuota({', stampIdx);
+  assert.ok(reserveIdx > stampIdx && reserveIdx < skipIdx, 'quota reservation precedes hydration and skip');
+  const hydrateIdx = source.indexOf('fetchYouTubeChannelCountryMetadata(channelId, candidate)', reserveIdx);
+  assert.ok(hydrateIdx > reserveIdx, 'hydration runs under reservation');
+  const releaseIdx = source.indexOf("finishQuotaReservation('ENRICH_CHANNEL',job.id,false)", skipIdx);
+  assert.ok(releaseIdx > skipIdx, 'audience skip releases the reservation');
   assert.match(source, /reasonCode:'LOW_AUDIENCE_SKIP'/);
 });
 
