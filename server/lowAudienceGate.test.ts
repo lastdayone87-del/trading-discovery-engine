@@ -60,3 +60,30 @@ test('ingestionPipeline enforces country hard-rejection before low-audience budg
   assert.ok(countryRejectedIndex >= 0 && lowAudienceGateIndex >= 0);
   assert.ok(countryRejectedIndex < lowAudienceGateIndex, 'Country hard-rejection must precede low-audience budget gate in ingestion pipeline');
 });
+
+test('handle-shaped and missing counts fail open as unavailable, never as low-audience', () => {
+  for (const raw of ['@KelvinVinny', '@DerivativeTradingAcademy', '', undefined]) {
+    const gate = evaluateLowAudienceGate(raw);
+    assert.equal(gate.shouldSkipDeepEnrichment, false);
+    assert.equal(gate.reasonCode, 'SUBSCRIBER_COUNT_UNAVAILABLE');
+  }
+});
+
+test('ENRICH claim hydrates unavailable counts and enforces the gate before ENRICHING', () => {
+  const source = read('server/queueManager.ts');
+  const claimIdx = source.indexOf('Claim-time low-audience gate');
+  assert.ok(claimIdx >= 0, 'claim-time audience gate exists');
+  const enrichingIdx = source.indexOf("channel.scan_status = 'ENRICHING'");
+  assert.ok(enrichingIdx > claimIdx, 'audience gate runs before ENRICHING is stamped');
+  assert.match(source, /fetchYouTubeChannelCountryMetadata\(channelId, candidate\)/);
+  assert.match(source, /reasonCode:'LOW_AUDIENCE_SKIP'/);
+});
+
+test('re-enqueue paths cannot bypass the low-audience gate on known-low counts', () => {
+  const qm = read('server/queueManager.ts');
+  assert.match(qm, /evaluateLowAudienceGate\(channel\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+  const iw = read('server/investigationWorkflow.ts');
+  assert.match(iw, /evaluateLowAudienceGate\(row\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+  const recovery = read('server/operationalEnrichmentRecovery.ts');
+  assert.match(recovery, /evaluateLowAudienceGate\(channel\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+});

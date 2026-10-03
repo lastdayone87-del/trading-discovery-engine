@@ -44,19 +44,20 @@ import { runChannelInspection } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { validateDiscordInvite } from './discordValidator';
 import {projectDiscordValidation, reconcileDiscordDiscoveryFromInspection} from './discordProjection';
-import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, DiscoveredChannelRaw, RetrievalLane } from './youtube';
+import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
 import './youtubeInnertubeProvider';
 import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
-import { processChannelThroughPipeline, isTerminalState } from './ingestionPipeline';
+import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting } from './ingestionPipeline';
+import { evaluateLowAudienceGate } from './lowAudienceGate';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
 import { completeInvestigationStep, failInvestigationStep, heartbeatInvestigationStep, reconcileOrphanInvestigations, recoverStaleInvestigationSteps, startInvestigationStep } from './investigationWorkflow';
 import { ChannelRecord, CountryStatus, DiscoverySource, SearchJob, InspectionStep, DiscordStatus } from '../src/types';
-import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion } from './countryExclusion';
+import { assertCountryAllowed, ExcludedCountryError, getCountryExclusion, shouldBlockEnrichClaimForCountry } from './countryExclusion';
 import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { evaluateContinuation } from './continuationPolicy';
@@ -242,6 +243,20 @@ export function groqFallbackCoolingDown(persistedCooldownActive: boolean, localC
  */
 export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
   return perRouteCooling.length === 0 || perRouteCooling.every(Boolean);
+}
+
+/**
+ * Pure SEARCH worker wall-time split (observability only): quota-wait vs
+ * retrieval vs per-channel processing vs total worker time. Persisted in
+ * query-run performance_details; never affects scoring or behavior.
+ */
+export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searchQuotaWaitMs: number, searchRetrievalMs: number, channelLoopStartMs: number, nowMs = Date.now()): { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number } {
+  return {
+    workerTotalMs: nowMs - searchWorkerStartMs,
+    quotaWaitMs: searchQuotaWaitMs,
+    retrievalMs: searchRetrievalMs,
+    channelProcessingMs: nowMs - channelLoopStartMs,
+  };
 }
 
 /**
@@ -468,6 +483,82 @@ export async function processNextSearchJob(
         return true;
       }
 
+      // Creator-country claim gate: a stored CONFIRMED creator country that is
+      // excluded must stop enrichment before ENRICHING is stamped and before
+      // quota is reserved. LIKELY and below stay fail-open, matching the
+      // existing Gate-1 authority semantics (only confirmed-level evidence
+      // rejects). The claim-time assertCountryAllowed above covers only the
+      // discovery target country, never the creator country.
+      if (channel.country_status === 'CONFIRMED' && channel.country) {
+        const creatorExclusion = await getCountryExclusion(channel.country);
+        const claimBlock = shouldBlockEnrichClaimForCountry(channel.country_status, channel.country, creatorExclusion);
+        if (claimBlock) {
+          const claimNow = new Date().toISOString();
+          applyGate1CountryRejectionToExisting(
+            channel,
+            {
+              creatorCountry: channel.country,
+              score: channel.confidence_score,
+              validationStep: {
+                step: 'COUNTRY_VALIDATION',
+                title: `Country Validation (${channel.country})`,
+                status: 'REJECTED',
+                details: `${channel.country} is excluded by policy: ${claimBlock.reason}. Detected at ENRICH_CHANNEL claim for job ${job.id}; enrichment cancelled before quota spend.`,
+                timestamp: claimNow,
+              },
+              now: claimNow,
+            },
+            candidate
+          );
+          await upsertChannel(channel);
+          console.warn(JSON.stringify({event:'excluded_channel_blocked',channelId,targetCountry,detectedCountry:channel.country,reason:claimBlock.reason,context:`enrichment_claim:${job.id}`,timestamp:claimNow}));
+          if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'COUNTRY_POLICY_CHANGED'}).catch(()=>undefined);
+          if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
+          return true;
+        }
+      }
+
+      // Claim-time low-audience gate: the scheduler may have queued enrichment
+      // before a numeric count was available (handle-shaped or missing stored
+      // values fail open at schedule time). Hydrate once via the 1-unit
+      // metadata call when the count is unavailable; a hydrated known-low
+      // count skips enrichment with the same SKIPPED_LOW_AUDIENCE projection
+      // as the Phase-7 gate. Quota/hydration failure stays fail-open.
+      let claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount ?? channel.subscriber_count ?? undefined);
+      if (!claimAudienceGate.shouldSkipDeepEnrichment && claimAudienceGate.reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE') {
+        try {
+          const hydrated = await fetchYouTubeChannelCountryMetadata(channelId, candidate);
+          if (hydrated.subscriberCount && hydrated.subscriberCount !== candidate.subscriberCount) {
+            candidate.subscriberCount = hydrated.subscriberCount;
+            if (hydrated.description) candidate.description = hydrated.description;
+            if (hydrated.locationTag) candidate.locationTag = hydrated.locationTag;
+            candidate.countryMetadataStatus = hydrated.countryMetadataStatus;
+            candidate.countryMetadataCheckedAt = hydrated.countryMetadataCheckedAt;
+            claimAudienceGate = evaluateLowAudienceGate(hydrated.subscriberCount);
+          }
+        } catch {
+          // Hydration unavailable (no keys, quota, network): proceed fail-open.
+        }
+      }
+      if (claimAudienceGate.shouldSkipDeepEnrichment) {
+        const claimNow = new Date().toISOString();
+        const claimCountText = candidate.subscriberCount ?? channel.subscriber_count;
+        channel.subscriber_count = claimCountText;
+        channel.scan_status = 'SKIPPED_LOW_AUDIENCE';
+        channel.last_checked = claimNow;
+        channel.inspection_trail = [...(channel.inspection_trail || []), {
+          step: 'BIO',
+          title: 'Low-Audience Budget Gate',
+          status: 'SKIPPED',
+          details: `Subscribers: ${claimCountText} (< 30). Stored and skipped deep enrichment.`,
+          timestamp: claimNow,
+        }];
+        await upsertChannel(channel);
+        if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'LOW_AUDIENCE_SKIP'}).catch(()=>undefined);
+        if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel.trading_status,output:{reason:'LOW_AUDIENCE_SKIP'}});else await completeJob(job.id);
+        return true;
+      }
+
       channel.scan_status = 'ENRICHING';
       channel.scan_attempts = job.attempts;
       await upsertChannel(channel);
@@ -528,6 +619,12 @@ export async function processNextSearchJob(
     };
     // Defense in depth for jobs queued before a country was excluded.
     await assertCountryAllowed(country, `worker:${job.id}`);
+    // Latency attribution (observability only): split worker wall time into
+    // quota-wait vs retrieval vs per-channel processing so slowdown triage
+    // reads queue/quota waiting apart from actual processing latency.
+    const searchWorkerStartMs = Date.now();
+    let searchQuotaWaitMs = 0;
+    let searchRetrievalMs = 0;
 
     // Execution-time query authority revalidation: every non-manual search job
     // must satisfy the current retrieval-policy before YouTube quota is spent.
@@ -606,6 +703,7 @@ export async function processNextSearchJob(
       // provider key, cost domain, cooldown, and telemetry throughout.
       quotaFreeInnertubeProvider=allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE';
       let providerRequestId: string | null = null;
+      const quotaWaitStartMs = Date.now();
       if(braveProvider){
         providerRequestId=`${autonomousOperationId}:provider-request`;
         const reservation = await reserveProviderRequest({provider:allocatedProvider,requestId:providerRequestId,queryRunId});
@@ -617,17 +715,22 @@ export async function processNextSearchJob(
         const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
         if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent}))throw new QuotaAllocationExhaustedError('AUTONOMOUS');
       }
+      searchQuotaWaitMs += Date.now() - quotaWaitStartMs;
       try {
         const providerRequestBaseId = buildProviderRequestBaseId({queryRunId,jobId:job.id,jobAttempt:job.attempts,pageNumber});
         const queryMetadata = authorityQueryRecord?.generation_metadata || {};
         const preferredLanguage = preferredLanguageFromQueryMetadata(queryMetadata);
+        const retrievalStartMs = Date.now();
         searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
           if(braveProvider||quotaFreeInnertubeProvider) return;
+          const topUpStartMs = Date.now();
           const budget=getDailyYouTubeQuotaBudget();
           const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
           const toppedUp=await topUpQuotaReservation({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',additionalUnits,dailyBudget:budget,allocationPercent:percent});
+          searchQuotaWaitMs += Date.now() - topUpStartMs;
           if(!toppedUp)throw new QuotaAllocationExhaustedError('AUTONOMOUS');
         },priority:'autonomous'});
+        searchRetrievalMs += Date.now() - retrievalStartMs;
         if(braveProvider){
           providerRequestsSucceeded=1; providerPagesRetrieved=1; providerCostUsd=Number(searchPage.providerCostUsd ?? 0);
           await settleProviderRequest(providerRequestId!, 'SUCCEEDED', providerCostUsd);
@@ -652,6 +755,7 @@ export async function processNextSearchJob(
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
     const sightings = [];
+    const channelLoopStartMs = Date.now();
     for (const [index, raw] of distinctExtracted.entries()) {
       // A durable nomination is written before channel processing. When the
       // ledger is OFF, legacy channel_sightings remain the compatibility path.
@@ -823,6 +927,10 @@ export async function processNextSearchJob(
       }
       const quotaConsumed=providerCostUsd>0||allocatedProvider.costDomain==='YOUTUBE_INNERTUBE_FREE'?0:pageNumber*100;
       const performance = await evaluateQueryPerformance(queryRecord, finalMetrics, { retrievalLane, searchOrdering, quotaConsumed, persist: false });
+      // Worker wall-time split (observability only, persisted in
+      // performance_details): quota-wait vs retrieval vs per-channel
+      // processing vs total worker time. Never affects scoring or behavior.
+      const latencyBreakdownMs = buildSearchLatencyBreakdownMs(searchWorkerStartMs, searchQuotaWaitMs, searchRetrievalMs, channelLoopStartMs, Date.now());
       await completeQueryRun(queryRunId, {
         ...finalMetrics,
         uniqueChannels: finalMetrics.newChannels,
@@ -839,6 +947,7 @@ export async function processNextSearchJob(
         averageQualityScore: finalMetrics.averageQualityScore,
         performanceScore: performance.performanceScore,
         newCollection: performance.newCollection,
+        latencyBreakdownMs,
         // Opt-in trial linkage recorded on the job payload at schedule time.
         // Absent on every legacy run.
         ...(typeof trial?.trialId === 'string' && trial.trialId ? { trialCompletion: { trialId: trial.trialId } } : {})
@@ -1647,6 +1756,12 @@ export async function triggerManualRecheck(
   if (exclusion) {
     console.warn(JSON.stringify({ event: 'excluded_country_blocked', country: exclusion.country, reason: exclusion.reason, context: 'manual_recheck', channelId, timestamp: new Date().toISOString() }));
     return { success: false, message: `Manual re-scan blocked because ${exclusion.country} is excluded: ${exclusion.reason}`, code: 'MANUAL_RESCAN_POLICY_INELIGIBLE', retryable: false, channel };
+  }
+
+  // A stored known-low audience count must not spend recheck quota: the
+  // low-audience gate would skip this channel before any enrichment work.
+  if (evaluateLowAudienceGate(channel.subscriber_count).shouldSkipDeepEnrichment) {
+    return { success: false, message: `Manual re-scan skipped: ${channel.subscriber_count} subscribers is below the 30-subscriber budget gate.`, code: 'MANUAL_RESCAN_POLICY_INELIGIBLE', retryable: false, channel };
   }
 
   const quotaOperationId = `manual-recheck:${channelId}:${randomUUID()}`;

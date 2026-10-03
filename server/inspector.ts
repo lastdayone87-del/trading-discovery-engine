@@ -475,7 +475,7 @@ async function scrapeRecentVideoDescriptionsWithCoverage(youtubeUrl:string):Prom
 }
 
 async function fetchLiveYouTubeChannelData(youtubeUrl:string,enableDebug?:boolean):Promise<{rawHtml?:string;fetchLog?:string;bio?:string;channelLinks?:string[];videoDescriptions?:string[];thumbnailUrl?:string;truncated?:boolean;}|null>{
-  if(!youtubeUrl||!youtubeUrl.startsWith('http'))return null;const page=await fetchWithTimeout(youtubeUrl,0);if(!page)return null;const html=page.html,cleanHtml=decodeEmbeddedMarkup(html);let thumbnailUrl:string|undefined,bio:string|undefined,explicitLinks:string[]=[];const match=html.match(/ytInitialData\s*=\s*({.*?});<\/script>/);if(match){try{const ytData=JSON.parse(match[1]);if(ytData.metadata?.channelMetadataRenderer?.description)bio=ytData.metadata.channelMetadataRenderer.description;if(ytData.metadata?.channelMetadataRenderer?.avatar?.thumbnails?.[0]?.url)thumbnailUrl=ytData.metadata.channelMetadataRenderer.avatar.thumbnails[0].url;function extractLinks(obj:any){if(typeof obj!=='object'||obj===null)return;if(obj.channelExternalLinkViewModel?.link?.content)explicitLinks.push(obj.channelExternalLinkViewModel.link.content);if(obj.urlEndpoint?.url){const url=obj.urlEndpoint.url;if(typeof url==='string'&&url.startsWith('http')&&!url.includes('youtube.com/watch')&&!url.includes('youtube.com/channel'))explicitLinks.push(url);}for(const key in obj)extractLinks(obj[key]);}extractLinks(ytData);}catch(e){console.warn('Failed to parse ytInitialData',e);}}if(!thumbnailUrl){const ogImg=html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i)||html.match(/<link\s+rel="image_src"\s+href="([^"]+)"/i);if(ogImg&&ogImg[1])thumbnailUrl=ogImg[1];}if(!bio){const ogDesc=html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)||html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);if(ogDesc&&ogDesc[1])bio=ogDesc[1];}const extractedUrls=Array.from(new Set([...explicitLinks,...extractExternalUrlsFromText(cleanHtml)]));if(page.truncated&&!bio&&extractedUrls.length===0)return null;return {bio,channelLinks:extractedUrls,thumbnailUrl,truncated:page.truncated,rawHtml:enableDebug?cleanHtml:undefined,fetchLog:enableDebug?`Fetched ${page.finalUrl} (${page.html.length} bytes)`:undefined};
+  if(!youtubeUrl||!youtubeUrl.startsWith('http'))return null;const page=await fetchWithTimeout(youtubeUrl,0);if(!page)return null;const html=page.html,cleanHtml=decodeEmbeddedMarkup(html);let thumbnailUrl:string|undefined,bio:string|undefined,explicitLinks:string[]=[];const match=html.match(/ytInitialData\s*=\s*({.*?});<\/script>/);if(match){try{const ytData=JSON.parse(match[1]);if(ytData.metadata?.channelMetadataRenderer?.description)bio=ytData.metadata.channelMetadataRenderer.description;if(ytData.metadata?.channelMetadataRenderer?.avatar?.thumbnails?.[0]?.url)thumbnailUrl=ytData.metadata.channelMetadataRenderer.avatar.thumbnails[0].url;function extractLinks(obj:any){if(typeof obj!=='object'||obj===null)return;if(obj.channelExternalLinkViewModel?.link?.content)explicitLinks.push(obj.channelExternalLinkViewModel.link.content);if(obj.urlEndpoint?.url){const url=obj.urlEndpoint.url;if(typeof url==='string'&&url.startsWith('http')&&!url.includes('youtube.com/watch')&&!url.includes('youtube.com/channel'))explicitLinks.push(url);}for(const key in obj)extractLinks(obj[key]);}extractLinks(ytData);}catch(e){console.warn('Failed to parse ytInitialData',e);}}if(!thumbnailUrl){const ogImg=html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i)||html.match(/<link\s+rel="image_src"\s+href="([^"]+)"/i);if(ogImg&&ogImg[1])thumbnailUrl=ogImg[1];}if(!bio){const ogDesc=html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)||html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);if(ogDesc&&ogDesc[1])bio=ogDesc[1];}const extractedUrls=Array.from(new Set([...explicitLinks,...extractExternalUrlsFromText(cleanHtml)])).filter(url=>!isPageAssetInfrastructureUrl(url));if(page.truncated&&!bio&&extractedUrls.length===0)return null;return {bio,channelLinks:extractedUrls,thumbnailUrl,truncated:page.truncated,rawHtml:enableDebug?cleanHtml:undefined,fetchLog:enableDebug?`Fetched ${page.finalUrl} (${page.html.length} bytes)`:undefined};
 }
 
 function normalizedRenderedCandidates(rendered:BrowserFallbackResult,surface:AcquisitionSurface,seedUrl:string):DiscordCandidate[]{
@@ -575,6 +575,36 @@ function normalizeSummaryUrl(raw: string): string {
  */
 export function isMeaningfulWebsiteObservation(item: { rootUrl?: string; requestedUrl: string }): boolean {
   return !isDotlessHostnameUrl(item.rootUrl || item.requestedUrl);
+}
+
+/**
+ * Page-asset infrastructure hosts captured by indiscriminate page scraping
+ * (thumbnail/playback/telemetry/schema/font endpoints embedded in channel
+ * page data). These can never be creator sites and can never carry Discord
+ * invites, so they are filtered at link-collection time and never become
+ * crawl seeds. Dotless single-label hosts are deliberately NOT in this list:
+ * they keep the existing static-attempt-for-recall doctrine. Valid creator,
+ * affiliate, social, and messaging hosts are unaffected.
+ */
+const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
+  'ytimg.com',
+  'googlevideo.com',
+  'schema.org',
+  'w3.org',
+  'fonts.googleapis.com',
+  'fonts.gstatic.com',
+  'youtubei-att.googleapis.com',
+  'gstatic.com',
+];
+export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
+  let host = '';
+  try {
+    host = new URL(rawUrl).hostname.toLowerCase();
+  } catch {
+    return true;
+  }
+  if (!host) return true;
+  return PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`));
 }
 
 /**
@@ -703,7 +733,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   }
 
   function addStep(stepName:InspectionStep['step'],title:string,status:InspectionStep['status'],detailsArr:string[],foundInvite:string|null=null,inviteLocation:string|undefined=undefined,foundInvites:string[]=[]){steps.push({step:stepName,title,status,details:detailsArr.join('\n'),detectedInvite:foundInvite||undefined,detectedInvites:foundInvites.length?foundInvites:foundInvite?[foundInvite]:undefined,inviteLocation,timestamp:now});if(debugLog&&status==='NOT_FOUND'&&!debugLog.failureStep)debugLog.failureStep=stepName;}
-  let collectedExternalUrls:{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING';contextMatches:boolean;source:string}[]=[];const checkContext=(text:string,url:string):boolean=>{const contextKeywords=['discord','community','join','trading floor','members','server'],lowerText=text.toLowerCase(),urlIndex=lowerText.indexOf(url.toLowerCase());if(urlIndex===-1)return false;const window=lowerText.substring(Math.max(0,urlIndex-100),Math.min(lowerText.length,urlIndex+url.length+100));return contextKeywords.some(kw=>window.includes(kw));};const addExternalUrls=(text:string,source:string)=>{const urls=extractExternalUrlsFromText(text);if(debugLog)debugLog.extractedUrls.push(...urls);for(const url of urls){const normalized=normalizeExternalUrl(url);if(normalized)collectedExternalUrls.push({...normalized,contextMatches:checkContext(text,url),source});}};
+  let collectedExternalUrls:{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING';contextMatches:boolean;source:string}[]=[];const checkContext=(text:string,url:string):boolean=>{const contextKeywords=['discord','community','join','trading floor','members','server'],lowerText=text.toLowerCase(),urlIndex=lowerText.indexOf(url.toLowerCase());if(urlIndex===-1)return false;const window=lowerText.substring(Math.max(0,urlIndex-100),Math.min(lowerText.length,urlIndex+url.length+100));return contextKeywords.some(kw=>window.includes(kw));};const addExternalUrls=(text:string,source:string)=>{const urls=extractExternalUrlsFromText(text);if(debugLog)debugLog.extractedUrls.push(...urls);for(const url of urls){if(isPageAssetInfrastructureUrl(url))continue;const normalized=normalizeExternalUrl(url);if(normalized)collectedExternalUrls.push({...normalized,contextMatches:checkContext(text,url),source});}};
   for(const link of links)if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);const normalized=normalizeExternalUrl(link);if(normalized)collectedExternalUrls.push({...normalized,contextMatches:false,source:'CHANNEL_LINKS'});}for(const link of channelData.socialLinks||[])if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);const normalized=normalizeExternalUrl(link);if(normalized)collectedExternalUrls.push({...normalized,contextMatches:false,source:'SOCIAL_LINKS'});}
   const discoveredCandidates:DiscordCandidate[]=[];const retainCandidates=(items:DiscordCandidate[])=>{discoveredCandidates.push(...items.filter(item=>item.nativeInviteCode));};
   // Creator-canonical domains: hosts from creator-controlled channel links

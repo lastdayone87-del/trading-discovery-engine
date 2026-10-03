@@ -245,7 +245,19 @@ function channelIdOf(authorId: string, nodeId: string): string {
 /**
  * Pure CHANNEL-lane mapping from InnerTube channel-search nodes.
  * Nodes without a resolvable UC channel id are dropped (never fabricated).
+ * Subscriber text is count-validated at the source: channel handles
+ * ('@name', with or without digits) and digit-free text are never stored in
+ * the subscriberCount field — they would poison the low-audience gate, which
+ * treats unparseable values as unknown and fail-opens.
  */
+export function sanitizedSubscriberCountText(value: unknown): string | undefined {
+  const raw = textOf(value);
+  const text = raw.trim();
+  if (!text) return undefined;
+  if (text.startsWith('@')) return undefined;
+  if (!/[0-9]/.test(text)) return undefined;
+  return text;
+}
 export function mapInnertubeChannelsToRaw(
   nodes: InnertubeChannelLike[],
   _country: string,
@@ -270,7 +282,7 @@ export function mapInnertubeChannelsToRaw(
       description,
       videoTitles: [],
       videoDescriptions: [],
-      subscriberCount: textOf(node?.subscriber_count) || textOf(node?.subscribers) || undefined,
+      subscriberCount: sanitizedSubscriberCountText(node?.subscriber_count) ?? sanitizedSubscriberCountText(node?.subscribers),
       channelThumbnailUrl: avatar || undefined,
       matchedDocument: {
         type: 'CHANNEL',

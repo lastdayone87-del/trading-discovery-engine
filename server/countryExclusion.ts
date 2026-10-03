@@ -25,6 +25,23 @@ export async function getCountryExclusion(country: string | null | undefined): P
 }
 
 /**
+ * ENRICH-claim creator-country gate predicate (pure). A stored CONFIRMED
+ * creator country matching the exclusion list blocks enrichment. LIKELY and
+ * below stay fail-open, matching the existing Gate-1 authority semantics
+ * where only confirmed-level evidence rejects. Returns the matched
+ * exclusion, or null when the claim may proceed.
+ */
+export function shouldBlockEnrichClaimForCountry(
+  countryStatus: string | null | undefined,
+  country: string | null | undefined,
+  exclusion: CountryExclusionMatch | null
+): CountryExclusionMatch | null {
+  if (countryStatus !== 'CONFIRMED') return null;
+  if (typeof country !== 'string' || !country.trim()) return null;
+  return exclusion;
+}
+
+/**
  * The resource-boundary gate for any country-targeted operation. Call this before
  * creating jobs, selecting/generating queries, or invoking an external provider.
  * A null/unknown country is legitimate (e.g. unresolved creator country) and
