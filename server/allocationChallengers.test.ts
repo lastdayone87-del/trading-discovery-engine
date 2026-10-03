@@ -44,3 +44,25 @@ test('contextual score combines value, exploration, and cost', () => {
   assert.ok(high > low);
   assert.throws(() => contextualArmScore({ expectedValue: NaN, uncertainty: 0, coverageGap: 0, cost: 0 }), /INVALID_ARM_FEATURES/);
 });
+
+test('configured Thompson prior drives selection identically to persisted scores', async () => {
+  const { selectThompsonArm, thompsonSample } = await import('./allocationChallengers');
+  const arms = [
+    { successes: 8, failures: 2 },
+    { successes: 1, failures: 9 },
+    { successes: 0, failures: 0 },
+  ];
+  const prior = { alpha0: 2, beta0: 5 };
+  const first = selectThompsonArm(arms, 'opp-prior', prior);
+  const second = selectThompsonArm(arms, 'opp-prior', prior);
+  assert.equal(first, second);
+  const scores = arms.map((counts, index) => thompsonSample(counts.successes, counts.failures, `opp-prior:${index}`, prior.alpha0, prior.beta0));
+  let argmax = 0;
+  scores.forEach((score, index) => {
+    if (score > scores[argmax]) argmax = index;
+  });
+  assert.equal(first, argmax);
+  const unconfigured = selectThompsonArm(arms, 'opp-prior');
+  const implicit = selectThompsonArm(arms, 'opp-prior', {});
+  assert.equal(unconfigured, implicit);
+});

@@ -192,13 +192,34 @@ export async function evaluateTrialGate(
  */
 export async function initiateCanaryTrial(
   proposalId: string,
-  options: { maxQuota?: number; pageDepth?: number; trialKey?: string } = {}
+  options: { maxQuota?: number; pageDepth?: number; trialKey?: string } = {},
+  /**
+   * Optional caller-owned database client. When supplied, initiation joins
+   * the caller's transaction (no BEGIN/COMMIT/ROLLBACK/release here), so a
+   * caller rollback atomically rolls the trial reservation back with it —
+   * an initiated trial cannot orphan on scheduling rollback. When absent,
+   * the previous standalone-transaction behavior is unchanged.
+   */
+  externalClient?: { query: (text: string, values?: any[]) => Promise<{ rows: any[]; rowCount: number | null }> }
 ): Promise<FrontierCanaryTrial> {
-  const db = await getDb();
-  const client = await db.connect();
+  const owned = !externalClient;
+  let client: { query: (text: string, values?: any[]) => Promise<{ rows: any[]; rowCount: number | null }>; release?: () => void };
+  if (owned) {
+    const db = await getDb();
+    client = await db.connect();
+  } else {
+    client = externalClient!;
+  }
+
+  const commit = async (): Promise<void> => {
+    if (owned) await client.query('COMMIT');
+  };
+  const rollback = async (): Promise<void> => {
+    if (owned) await client.query('ROLLBACK');
+  };
 
   try {
-    await client.query('BEGIN');
+    if (owned) await client.query('BEGIN');
 
     // Acquire transaction-scoped advisory lock to serialize daily canary capacity checks across all concurrent workers & proposals.
     // This is a hard safety boundary: failure to acquire/verify the lock aborts the transaction.
@@ -213,7 +234,7 @@ export async function initiateCanaryTrial(
     );
 
     if (!propRes.rows.length) {
-      await client.query('ROLLBACK');
+      await rollback();
       throw new Error('Proposal ID not found.');
     }
 
@@ -231,7 +252,7 @@ export async function initiateCanaryTrial(
     );
 
     if (existingRes.rows.length > 0) {
-      await client.query('COMMIT');
+      await commit();
       const row = existingRes.rows[0];
       return {
         trialId: row.trial_id,
@@ -254,7 +275,7 @@ export async function initiateCanaryTrial(
       rawQuota < 1 ||
       rawQuota > 100
     ) {
-      await client.query('ROLLBACK');
+      await rollback();
       throw new Error(
         `Invalid canary quota reservation: ${rawQuota}. Quota reservation must be an integer between 1 and 100.`
       );
@@ -264,7 +285,7 @@ export async function initiateCanaryTrial(
     // Evaluate gate inside transaction for concurrency safety
     const gate = await evaluateTrialGate(proposalId, quotaReserved, client);
     if (!gate.eligible || !gate.proposal) {
-      await client.query('ROLLBACK');
+      await rollback();
       throw new Error(`Trial gate rejected proposal: ${gate.reason}`);
     }
 
@@ -298,7 +319,7 @@ export async function initiateCanaryTrial(
       [proposalId]
     );
 
-    await client.query('COMMIT');
+    await commit();
 
     const row = res.rows[0];
     return {
@@ -313,10 +334,10 @@ export async function initiateCanaryTrial(
       initiatedAt: row.initiated_at
     };
   } catch (error) {
-    await client.query('ROLLBACK');
+    await rollback();
     throw error;
   } finally {
-    client.release();
+    if (owned) client.release();
   }
 }
 
@@ -466,6 +487,65 @@ export async function completeFrontierTrialForRun(
 }
 
 /**
+ * Resolves whether a trial request may link to a scheduled run. Pure.
+ * Proposal consumption flows exclusively through frontier decisions, so a
+ * request is linkable only when the run carries the frontier decision whose
+ * proposal matches the requested proposal. Anything else fails closed with
+ * an explicit reason instead of attaching to an unrelated run.
+ */
+export function resolveTrialLinkage(args: {
+  requestedProposalId: string;
+  decisionProposalId: string | null;
+}): { proceed: true; proposalId: string } | { proceed: false; reason: 'TRIAL_REQUIRES_FRONTIER_DECISION' | 'TRIAL_PROPOSAL_DECISION_MISMATCH' } {
+  if (!args.decisionProposalId) {
+    return { proceed: false, reason: 'TRIAL_REQUIRES_FRONTIER_DECISION' };
+  }
+  if (args.decisionProposalId !== args.requestedProposalId) {
+    return { proceed: false, reason: 'TRIAL_PROPOSAL_DECISION_MISMATCH' };
+  }
+  return { proceed: true, proposalId: args.requestedProposalId };
+}
+
+/**
+ * Whether a trial reservation covers at least the first page's execution
+ * cost. Pure. A reservation below first-page cost can never stay within
+ * budget, so such requests are refused before reserving anything.
+ */
+export function isTrialQuotaSufficient(maxQuota: number, firstPageCostUnits: number): boolean {
+  if (!Number.isFinite(maxQuota) || !Number.isFinite(firstPageCostUnits)) return false;
+  if (firstPageCostUnits < 0) return false;
+  return maxQuota >= firstPageCostUnits;
+}
+
+/**
+ * Bounds continuation pages by the trial reservation (100 units per
+ * official page — the existing quota methodology, unchanged). Free
+ * (zero-cost) execution needs no bound; callers skip the cap then.
+ * Pure. A zero bound stops continuation after the already-executed first
+ * page; it never deadlocks the run.
+ */
+export function trialContinuationCap(normalMaxPages: number, quotaReservedUnits: number): number {
+  if (!Number.isFinite(normalMaxPages) || !Number.isFinite(quotaReservedUnits)) {
+    return Math.max(0, Math.floor(normalMaxPages) || 0);
+  }
+  return Math.max(0, Math.min(Math.floor(normalMaxPages), Math.floor(quotaReservedUnits / 100)));
+}
+
+/**
+ * Yield per 1,000 quota units with honest zero handling. Returns the actual
+ * recorded consumption alongside the yield: a genuinely zero-quota arm
+ * reports zero consumption (the denominator alone is floored at 1 to avoid
+ * divide-by-zero, never the reported total). Pure.
+ */
+export function quotaYieldPer1000(value: number, quotaUnits: number): { totalQuotaConsumed: number; yieldPer1000Quota: number } {
+  const consumed = Number.isFinite(quotaUnits) && quotaUnits > 0 ? Math.floor(quotaUnits) : 0;
+  return {
+    totalQuotaConsumed: consumed,
+    yieldPer1000Quota: Math.round((value / Math.max(1, consumed)) * 1000 * 100) / 100,
+  };
+}
+
+/**
  * Compares legacy autonomous discovery vs frontier canary discovery metrics.
  */
 export async function getFrontierBaselineComparison(
@@ -515,8 +595,10 @@ export async function getFrontierBaselineComparison(
   const lRow = legacyRes.rows[0];
   const cRow = canaryRes.rows[0];
 
-  const lQuota = Math.max(1, lRow?.total_quota || 0);
-  const cQuota = Math.max(1, cRow?.total_quota || 0);
+  const legacyRelevantYield = quotaYieldPer1000(Number(lRow?.total_relevant || 0), Number(lRow?.total_quota || 0));
+  const legacyQualityYield = quotaYieldPer1000(Number(lRow?.total_quality || 0), Number(lRow?.total_quota || 0));
+  const canaryRelevantYield = quotaYieldPer1000(Number(cRow?.total_relevant || 0), Number(cRow?.total_quota || 0));
+  const canaryQualityYield = quotaYieldPer1000(Number(cRow?.total_quality || 0), Number(cRow?.total_quota || 0));
 
   // Selection-arm breakdown over the same window. Arms resolve from the
   // persisted selectionExperiment envelope (see resolvePersistedSelectionArm);
@@ -541,36 +623,37 @@ export async function getFrontierBaselineComparison(
   return {
     legacy: {
       totalRuns: lRow?.total_runs || 0,
-      totalQuotaConsumed: lQuota,
+      totalQuotaConsumed: legacyRelevantYield.totalQuotaConsumed,
       totalNewCreators: lRow?.total_new || 0,
       totalRelevantNewCreators: lRow?.total_relevant || 0,
       totalQualityNewCreators: lRow?.total_quality || 0,
-      relevantYieldPer1000Quota: Math.round(((lRow?.total_relevant || 0) / lQuota) * 1000 * 100) / 100,
-      qualityYieldPer1000Quota: Math.round(((lRow?.total_quality || 0) / lQuota) * 1000 * 100) / 100,
+      relevantYieldPer1000Quota: legacyRelevantYield.yieldPer1000Quota,
+      qualityYieldPer1000Quota: legacyQualityYield.yieldPer1000Quota,
       distinctCountries: lRow?.distinct_countries || 0
     },
     frontierCanary: {
       totalTrials: cRow?.total_trials || 0,
-      totalQuotaConsumed: cQuota,
+      totalQuotaConsumed: canaryRelevantYield.totalQuotaConsumed,
       totalNewCreators: cRow?.total_new || 0,
       totalRelevantNewCreators: cRow?.total_relevant || 0,
       totalQualityNewCreators: cRow?.total_quality || 0,
-      relevantYieldPer1000Quota: Math.round(((cRow?.total_relevant || 0) / cQuota) * 1000 * 100) / 100,
-      qualityYieldPer1000Quota: Math.round(((cRow?.total_quality || 0) / cQuota) * 1000 * 100) / 100,
+      relevantYieldPer1000Quota: canaryRelevantYield.yieldPer1000Quota,
+      qualityYieldPer1000Quota: canaryQualityYield.yieldPer1000Quota,
       distinctCountries: cRow?.distinct_countries || 0,
       averageOverlap: Math.round((cRow?.avg_overlap || 0) * 100) / 100
     },
     selectionArms: armRes.rows.map(row => {
-      const quota = Math.max(1, Number(row.quota || 0));
+      const relevantYield = quotaYieldPer1000(Number(row.relevant || 0), Number(row.quota || 0));
+      const qualityYield = quotaYieldPer1000(Number(row.quality || 0), Number(row.quota || 0));
       return {
         arm: String(row.arm || 'CONTROL'),
         runs: Number(row.runs || 0),
-        totalQuotaConsumed: quota,
+        totalQuotaConsumed: relevantYield.totalQuotaConsumed,
         totalNewCreators: Number(row.newc || 0),
         totalRelevantNewCreators: Number(row.relevant || 0),
         totalQualityNewCreators: Number(row.quality || 0),
-        relevantYieldPer1000Quota: Math.round((Number(row.relevant || 0) / quota) * 1000 * 100) / 100,
-        qualityYieldPer1000Quota: Math.round((Number(row.quality || 0) / quota) * 1000 * 100) / 100,
+        relevantYieldPer1000Quota: relevantYield.yieldPer1000Quota,
+        qualityYieldPer1000Quota: qualityYield.yieldPer1000Quota,
         distinctCountries: Number(row.countries || 0),
       };
     })

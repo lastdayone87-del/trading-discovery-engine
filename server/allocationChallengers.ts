@@ -113,14 +113,26 @@ function betaQuantile(p: number, a: number, b: number): number {
   return (lo + hi) / 2;
 }
 
-/** Select best arm index by Thompson sample. Pure. */
-export function selectThompsonArm(arms: Array<{ successes: number; failures: number }>, opportunityKey: string): number {
+/**
+ * Select best arm index by Thompson sample. Pure.
+ * The prior defaults to alpha0=1/beta0=1 (uniform); callers with an explicit
+ * experimental prior pass it through so selection and persisted provenance
+ * describe the exact same computation. The sampling algorithm itself is
+ * unchanged regardless of prior.
+ */
+export function selectThompsonArm(
+  arms: Array<{ successes: number; failures: number }>,
+  opportunityKey: string,
+  prior: { alpha0?: number; beta0?: number } = {}
+): number {
   if (!arms.length) throw new Error('NO_ARMS');
   if (!opportunityKey.trim()) throw new Error('OPPORTUNITY_KEY_REQUIRED');
+  const alpha0 = prior.alpha0 ?? 1;
+  const beta0 = prior.beta0 ?? 1;
   let best = 0;
   let bestScore = -Infinity;
   arms.forEach((arm, index) => {
-    const score = thompsonSample(arm.successes, arm.failures, `${opportunityKey}:${index}`);
+    const score = thompsonSample(arm.successes, arm.failures, `${opportunityKey}:${index}`, alpha0, beta0);
     if (score > bestScore) {
       bestScore = score;
       best = index;

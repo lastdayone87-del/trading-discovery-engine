@@ -78,6 +78,13 @@ export interface SelectionExperimentSelectionConfig {
 export interface SelectionExperimentOrderingConfig {
   treatmentBasisPoints?: number;
   window?: { publishedAfter?: string; publishedBefore?: string };
+  /**
+   * Identity for the ordering dimension. Falls back to the selection
+   * experimentId when both dimensions are requested together; a standalone
+   * ordering experiment must supply its own (an untraceable experiment is
+   * rejected at validation).
+   */
+  experimentId?: string;
 }
 
 export interface SelectionExperimentTrialConfig {
@@ -109,6 +116,7 @@ export interface NormalizedSelectionExperiment {
     contextualWeights: { value: number; exploration: number; cost: number };
   } | null;
   ordering: {
+    experimentId: string;
     treatmentBasisPoints: number;
     window: { publishedAfter?: string; publishedBefore?: string } | null;
   } | null;
@@ -178,13 +186,46 @@ export function normalizeSelectionExperimentRequest(input: unknown): NormalizedS
     const raw = source.ordering;
     const treatmentBasisPoints = raw.treatmentBasisPoints ?? 0;
     const window = raw.window && typeof raw.window === 'object' ? raw.window : null;
+    const hasBounds = window !== null &&
+      (typeof window.publishedAfter === 'string' || typeof window.publishedBefore === 'string');
+    // Identity is mandatory for the ordering dimension: prefer the
+    // selection experimentId when both dimensions travel together.
+    const rawOrderingId = typeof raw.experimentId === 'string' ? raw.experimentId.trim() : '';
+    const experimentId = (selection?.experimentId || rawOrderingId).trim();
+    const basisValid = Number.isInteger(treatmentBasisPoints) && treatmentBasisPoints >= 0 && treatmentBasisPoints <= 10000;
+    let windowValid = true;
+    if (hasBounds) {
+      // Reuse the existing search-window contract (RFC3339 bounds, ordered
+      // range, experiment id required) so malformed windows fail here with
+      // 400 instead of surfacing inside experiment execution.
+      try {
+        buildWindowedSearchParams(
+          {},
+          {
+            ...(typeof window!.publishedAfter === 'string' ? { publishedAfter: window!.publishedAfter } : {}),
+            ...(typeof window!.publishedBefore === 'string' ? { publishedBefore: window!.publishedBefore } : {}),
+          },
+          experimentId
+        );
+      } catch {
+        windowValid = false;
+      }
+    }
     if (
-      Number.isInteger(treatmentBasisPoints) && treatmentBasisPoints >= 0 && treatmentBasisPoints <= 10000 &&
-      (window === null || typeof window.publishedAfter === 'string' || typeof window.publishedBefore === 'string')
+      basisValid &&
+      experimentId.length > 0 &&
+      (!hasBounds || windowValid) &&
+      (window === null || hasBounds || typeof window === 'object')
     ) {
       ordering = {
+        experimentId,
         treatmentBasisPoints,
-        window: window ? { ...(typeof window.publishedAfter === 'string' ? { publishedAfter: window.publishedAfter } : {}), ...(typeof window.publishedBefore === 'string' ? { publishedBefore: window.publishedBefore } : {}) } : null,
+        window: hasBounds
+          ? {
+              ...(typeof window!.publishedAfter === 'string' ? { publishedAfter: window!.publishedAfter } : {}),
+              ...(typeof window!.publishedBefore === 'string' ? { publishedBefore: window!.publishedBefore } : {}),
+            }
+          : null,
       };
     }
   }
@@ -286,6 +327,80 @@ export function assignSelectionExperimentArm(args: {
   };
 }
 
+export interface OrderingDimensionEvaluation {
+  arm: 'CONTROL' | 'TREATMENT';
+  propensityBasisPoints: number;
+  policyVersion: string;
+  windowApplied: boolean;
+  window: { publishedAfter?: string; publishedBefore?: string } | null;
+  experimentId: string | null;
+}
+
+/**
+ * Evaluates the P2 ordering dimension independently of selection. Pure.
+ * CONTROL never carries a treatment window: the window is applied if and
+ * only if the deterministic assignment selected TREATMENT, so persisted
+ * propensity/arm state always matches actual execution. Window bounds were
+ * already validated at the route boundary; a defensive re-check here keeps
+ * direct programmatic callers fail-closed too.
+ */
+export function evaluateOrderingDimension(args: {
+  treatmentBasisPoints: number;
+  window: { publishedAfter?: string; publishedBefore?: string } | null;
+  experimentId: string;
+  opportunityKey: string;
+}): OrderingDimensionEvaluation {
+  const evaluated = selectOrderingExperimentArm(args.opportunityKey, args.treatmentBasisPoints);
+  if (evaluated.arm === 'CONTROL') {
+    return {
+      arm: 'CONTROL',
+      propensityBasisPoints: evaluated.propensityBasisPoints,
+      policyVersion: evaluated.policyVersion,
+      windowApplied: false,
+      window: null,
+      experimentId: null,
+    };
+  }
+  let windowApplied = false;
+  let window: { publishedAfter?: string; publishedBefore?: string } | null = null;
+  let windowExperimentId: string | null = null;
+  if (args.window) {
+    const applied = buildWindowedSearchParams({}, args.window, args.experimentId);
+    windowApplied = applied.windowApplied;
+    if (windowApplied) {
+      window = {
+        ...(typeof applied.params.publishedAfter === 'string' ? { publishedAfter: applied.params.publishedAfter } : {}),
+        ...(typeof applied.params.publishedBefore === 'string' ? { publishedBefore: applied.params.publishedBefore } : {}),
+      };
+      windowExperimentId = applied.experimentId;
+    }
+  }
+  return {
+    arm: 'TREATMENT',
+    propensityBasisPoints: evaluated.propensityBasisPoints,
+    policyVersion: evaluated.policyVersion,
+    windowApplied,
+    window,
+    experimentId: windowExperimentId,
+  };
+}
+
+/**
+ * Resolves the job-payload search window from a persisted ordering envelope.
+ * Returns undefined unless the envelope records a TREATMENT arm with an
+ * applied, bounded window — CONTROL observations therefore never produce a
+ * treatment window even if unrelated window fields exist on the run.
+ * Pure; used at schedule time so execution only ever sees valid windows.
+ */
+export function resolveScheduledSearchWindow(
+  ordering: SelectionExperimentObservation['ordering']
+): { publishedAfter?: string; publishedBefore?: string; experimentId: string } | undefined {
+  if (!ordering || ordering.arm !== 'TREATMENT' || !ordering.windowApplied || !ordering.window || !ordering.experimentId) {
+    return undefined;
+  }
+  return { ...ordering.window, experimentId: ordering.experimentId };
+}
+
 /** Thompson observation mapping (thompson-observation-map-v1) from existing counters. */
 export function buildThompsonObservationArms(pool: QueryRecord[]): Array<{ successes: number; failures: number }> {
   return pool.map(query => {
@@ -337,10 +452,12 @@ export function selectPoolWinner(args: {
   if (!pool.length) throw new Error('NO_ARMS');
   if (arm === 'THOMPSON') {
     const arms = buildThompsonObservationArms(pool);
-    // The existing implementation performs the selection verbatim; scores
-    // are recomputed below with identical inputs purely for the persisted
-    // observation envelope (deterministic, same values).
-    const best = selectThompsonArm(arms, opportunityKey);
+    // The existing implementation performs the selection verbatim with the
+    // experiment's configured prior; scores are recomputed below with the
+    // identical prior purely for the persisted observation envelope
+    // (deterministic, same values). A configurable prior is therefore never
+    // silently ignored: selection, scores, and provenance always agree.
+    const best = selectThompsonArm(arms, opportunityKey, args.thompsonPrior);
     const scores = arms.map((counts, index) =>
       thompsonSample(counts.successes, counts.failures, `${opportunityKey}:${index}`, args.thompsonPrior.alpha0, args.thompsonPrior.beta0)
     );
@@ -488,7 +605,7 @@ export async function selectExperimentalQueryForCountry(
   selectionStrategy: string;
   reason: string;
   experiment: SelectionExperimentObservation | null;
-}> {
+} | null> {
   const now = new Date();
   const cooldownMinutes = Math.max(
     1,
@@ -500,18 +617,52 @@ export async function selectExperimentalQueryForCountry(
   );
   const selection = experiment?.selection ?? null;
   const eligibility = evaluateSelectionExperimentEligibility(selection);
-  const noEnvelope = async (): Promise<{
-    queryRecord: QueryRecord;
-    selectionStrategy: string;
-    reason: string;
-    experiment: null;
-  }> => {
+  // Ordering is an independent dimension: it is evaluated even when no
+  // selection experiment was requested, so ordering-only experiments reach
+  // the retrieval treatment without requiring Thompson/Contextual.
+  const orderingExperimentId = selection?.experimentId ?? experiment?.ordering?.experimentId ?? '';
+  const ordering = experiment?.ordering
+    ? evaluateOrderingDimension({
+        treatmentBasisPoints: experiment.ordering.treatmentBasisPoints,
+        window: experiment.ordering.window,
+        experimentId: orderingExperimentId,
+        opportunityKey: options.opportunityKey,
+      })
+    : undefined;
+  const delegateLegacy = async () => {
     const base = await selectNextQueryForCountry(country, { scopePromotionBasis: options.scopePromotionBasis });
-    if (!base) throw new Error('QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY');
-    return { queryRecord: base.queryRecord, selectionStrategy: base.selectionStrategy, reason: base.reason, experiment: null };
+    // Null preserves the producer's existing skip/continue contract: no
+    // eligible query yields no candidate — never a cycle-failing exception
+    // merely because the experimental wrapper is active.
+    if (!base) return null;
+    return { queryRecord: base.queryRecord, selectionStrategy: base.selectionStrategy, reason: base.reason };
   };
   if (!selection || !eligibility.eligible) {
-    return noEnvelope();
+    const base = await delegateLegacy();
+    if (!base) return null;
+    if (!ordering) return { ...base, experiment: null };
+    const controlAssignment = assignSelectionExperimentArm({
+      experimentId: orderingExperimentId,
+      enabledArms: [],
+      treatmentBasisPoints: 0,
+      opportunityKey: options.opportunityKey,
+    });
+    return {
+      ...base,
+      experiment: buildSelectionExperimentObservation({
+        experimentId: orderingExperimentId,
+        assignment: controlAssignment,
+        eligibility: 'SELECTION_EXPERIMENT_NOT_REQUESTED',
+        reason: 'No selection experiment requested: UCB1 selection unchanged; ordering dimension evaluated independently.',
+        opportunityKey: options.opportunityKey,
+        thompsonPrior: { alpha0: 1, beta0: 1 },
+        contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
+        poolQueryIds: [],
+        winner: null,
+        servedArm: 'CONTROL',
+        ordering,
+      }),
+    };
   }
   const assignment = assignSelectionExperimentArm({
     experimentId: selection.experimentId,
@@ -519,25 +670,6 @@ export async function selectExperimentalQueryForCountry(
     treatmentBasisPoints: selection.treatmentBasisPoints,
     opportunityKey: options.opportunityKey,
   });
-  const ordering = experiment?.ordering
-    ? (() => {
-        const evaluated = selectOrderingExperimentArm(options.opportunityKey, experiment.ordering!.treatmentBasisPoints);
-        const windowed = buildWindowedSearchParams({}, experiment.ordering!.window, selection.experimentId);
-        return {
-          arm: evaluated.arm,
-          propensityBasisPoints: evaluated.propensityBasisPoints,
-          policyVersion: evaluated.policyVersion,
-          windowApplied: windowed.windowApplied,
-          window: windowed.windowApplied
-            ? {
-                ...(typeof experiment.ordering!.window?.publishedAfter === 'string' ? { publishedAfter: experiment.ordering!.window!.publishedAfter } : {}),
-                ...(typeof experiment.ordering!.window?.publishedBefore === 'string' ? { publishedBefore: experiment.ordering!.window!.publishedBefore } : {}),
-              }
-            : null,
-          experimentId: windowed.experimentId,
-        };
-      })()
-    : undefined;
   const envelopeBase = {
     experimentId: selection.experimentId,
     assignment,
@@ -548,8 +680,8 @@ export async function selectExperimentalQueryForCountry(
     ...(ordering ? { ordering } : {}),
   };
   if (assignment.arm === 'CONTROL') {
-    const base = await selectNextQueryForCountry(country, { scopePromotionBasis: options.scopePromotionBasis });
-    if (!base) throw new Error('QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY');
+    const base = await delegateLegacy();
+    if (!base) return null;
     return {
       queryRecord: base.queryRecord,
       selectionStrategy: base.selectionStrategy,
@@ -570,8 +702,8 @@ export async function selectExperimentalQueryForCountry(
   eligible = rotateAwayFromMostRecentIntent(eligible, queries);
   eligible = [...eligible].sort((a, b) => a.id - b.id);
   if (!eligible.length) {
-    const base = await selectNextQueryForCountry(country, { scopePromotionBasis: options.scopePromotionBasis });
-    if (!base) throw new Error('QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY');
+    const base = await delegateLegacy();
+    if (!base) return null;
     return {
       queryRecord: base.queryRecord,
       selectionStrategy: base.selectionStrategy,

@@ -192,3 +192,78 @@ test('persisted arm resolution never invents treatment', () => {
   assert.equal(resolvePersistedSelectionArm({ selectionExperiment: { servedArm: 'BOGUS' } }), 'CONTROL');
   assert.equal(resolvePersistedSelectionArm({ selectionExperiment: { servedArm: 'FRONTIER_CANARY' } }), 'CONTROL');
 });
+
+test('ordering dimension requires identity and validates the window contract', () => {
+  assert.throws(
+    () => validateSelectionExperimentRequest({ ordering: { treatmentBasisPoints: 1000 } }),
+    /INVALID_ORDERING_EXPERIMENT/
+  );
+  assert.throws(
+    () => validateSelectionExperimentRequest({
+      ordering: { treatmentBasisPoints: 1000, experimentId: 'ord-1', window: { publishedAfter: '2026-01-01' } },
+    }),
+    /INVALID_ORDERING_EXPERIMENT/
+  );
+  assert.throws(
+    () => validateSelectionExperimentRequest({
+      ordering: {
+        treatmentBasisPoints: 1000,
+        experimentId: 'ord-1',
+        window: { publishedAfter: '2026-02-01T00:00:00Z', publishedBefore: '2026-01-01T00:00:00Z' },
+      },
+    }),
+    /INVALID_ORDERING_EXPERIMENT/
+  );
+  const inherited = validateSelectionExperimentRequest({
+    selection: { experimentId: 'exp-1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 0 },
+    ordering: { treatmentBasisPoints: 1000, window: { publishedAfter: '2026-01-01T00:00:00Z' } },
+  })!;
+  assert.equal(inherited.ordering?.experimentId, 'exp-1');
+  const standalone = validateSelectionExperimentRequest({
+    ordering: { treatmentBasisPoints: 1000, experimentId: 'ord-9', window: { publishedAfter: '2026-01-01T00:00:00Z' } },
+  })!;
+  assert.equal(standalone.selection, null);
+  assert.equal(standalone.ordering?.experimentId, 'ord-9');
+});
+
+test('ordering CONTROL never carries a treatment window', async () => {
+  const { evaluateOrderingDimension, resolveScheduledSearchWindow } = await import('./querySelectionExperiments');
+  const control = evaluateOrderingDimension({
+    treatmentBasisPoints: 0,
+    window: { publishedAfter: '2026-01-01T00:00:00Z' },
+    experimentId: 'exp-1',
+    opportunityKey: 'opp-oc',
+  });
+  assert.equal(control.arm, 'CONTROL');
+  assert.equal(control.windowApplied, false);
+  assert.equal(control.window, null);
+  assert.equal(control.experimentId, null);
+  assert.equal(resolveScheduledSearchWindow(control), undefined);
+  assert.equal(resolveScheduledSearchWindow(undefined), undefined);
+  assert.equal(resolveScheduledSearchWindow(null), undefined);
+});
+
+test('ordering TREATMENT applies the validated window with matching propensity', async () => {
+  const { evaluateOrderingDimension, resolveScheduledSearchWindow } = await import('./querySelectionExperiments');
+  const window = { publishedAfter: '2026-01-01T00:00:00Z', publishedBefore: '2026-02-01T00:00:00Z' };
+  const treated = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window,
+    experimentId: 'exp-1',
+    opportunityKey: 'opp-ot',
+  });
+  assert.equal(treated.arm, 'TREATMENT');
+  assert.equal(treated.windowApplied, true);
+  assert.deepEqual(treated.window, window);
+  assert.equal(treated.experimentId, 'exp-1');
+  assert.deepEqual(resolveScheduledSearchWindow(treated), { ...window, experimentId: 'exp-1' });
+  const noWindow = evaluateOrderingDimension({
+    treatmentBasisPoints: 10000,
+    window: null,
+    experimentId: 'exp-1',
+    opportunityKey: 'opp-ot',
+  });
+  assert.equal(noWindow.arm, 'TREATMENT');
+  assert.equal(noWindow.windowApplied, false);
+  assert.equal(resolveScheduledSearchWindow(noWindow), undefined);
+});

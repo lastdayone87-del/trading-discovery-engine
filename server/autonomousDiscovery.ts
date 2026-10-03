@@ -534,12 +534,21 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           }
           country = legacyCountry;
           // Opt-in experimental selection substitutes the UCB1 call at this
-          // legacy site only. CONTROL (or empty pool) delegates inside and
-          // behaves identically to the legacy call below.
-          const fallbackExperimental = normalizedExperiment
-            ? await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: `${opportunityKey}:fallback`, scopePromotionBasis })
-            : null;
-          const fallbackSelection = fallbackExperimental ?? await selectNextQueryForCountry(legacyCountry, { scopePromotionBasis });
+          // legacy site only. A null experimental result propagates as-is to
+          // the existing skip path below (never re-runs legacy selection).
+          let fallbackSelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
+          let fallbackExperiment: SelectionExperimentObservation | null = null;
+          if (normalizedExperiment) {
+            const experimental = await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: `${opportunityKey}:fallback`, scopePromotionBasis });
+            if (experimental) {
+              fallbackSelection = experimental;
+              fallbackExperiment = experimental.experiment;
+            } else {
+              fallbackSelection = null;
+            }
+          } else {
+            fallbackSelection = await selectNextQueryForCountry(legacyCountry, { scopePromotionBasis });
+          }
           if (!fallbackSelection) {
             candidateDiagnostic = {
               ...candidateDiagnostic,
@@ -552,15 +561,24 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
             continue;
           }
           selected = fallbackSelection;
-          selectedExperiment = fallbackExperimental?.experiment ?? null;
+          selectedExperiment = fallbackExperiment;
           candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY_FALLBACK', selectedQueryId: selected.queryRecord.id };
         }
       } else {
         // Same opt-in substitution as the fallback site above.
-        const legacyExperimental = normalizedExperiment
-          ? await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: `${opportunityKey}:legacy`, scopePromotionBasis })
-          : null;
-        const legacySelection = legacyExperimental ?? await selectNextQueryForCountry(country, { scopePromotionBasis });
+        let legacySelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
+        let legacyExperiment: SelectionExperimentObservation | null = null;
+        if (normalizedExperiment) {
+          const experimental = await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: `${opportunityKey}:legacy`, scopePromotionBasis });
+          if (experimental) {
+            legacySelection = experimental;
+            legacyExperiment = experimental.experiment;
+          } else {
+            legacySelection = null;
+          }
+        } else {
+          legacySelection = await selectNextQueryForCountry(country, { scopePromotionBasis });
+        }
         if (!legacySelection) {
           candidateDiagnostic = {
             ...candidateDiagnostic,
@@ -573,7 +591,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           continue;
         }
         selected = legacySelection;
-        selectedExperiment = legacyExperimental?.experiment ?? null;
+        selectedExperiment = legacyExperiment;
         candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY', selectedQueryId: selected.queryRecord.id };
       }
 

@@ -145,3 +145,33 @@ test('Phase 7b: trial funnel mapping is measured-only with documented unmeasured
   assert.equal(empty.knownChannelOverlap, 0);
   assert.equal(classifyTrialOutcomeState(empty), 'NOISY');
 });
+
+test('Phase 7b: trial linkage fails closed without a matching frontier decision', async () => {
+  const { resolveTrialLinkage, isTrialQuotaSufficient, trialContinuationCap, quotaYieldPer1000 } = await import('./discoveryFrontierTrials');
+  assert.deepEqual(resolveTrialLinkage({ requestedProposalId: 'p1', decisionProposalId: null }), {
+    proceed: false,
+    reason: 'TRIAL_REQUIRES_FRONTIER_DECISION',
+  });
+  assert.deepEqual(resolveTrialLinkage({ requestedProposalId: 'p1', decisionProposalId: 'p2' }), {
+    proceed: false,
+    reason: 'TRIAL_PROPOSAL_DECISION_MISMATCH',
+  });
+  assert.deepEqual(resolveTrialLinkage({ requestedProposalId: 'p1', decisionProposalId: 'p1' }), {
+    proceed: true,
+    proposalId: 'p1',
+  });
+  assert.equal(isTrialQuotaSufficient(100, 100), true);
+  assert.equal(isTrialQuotaSufficient(100, 0), true);
+  assert.equal(isTrialQuotaSufficient(50, 100), false);
+  assert.equal(isTrialQuotaSufficient(NaN, 100), false);
+  assert.equal(trialContinuationCap(3, 100), 1);
+  assert.equal(trialContinuationCap(3, 250), 2);
+  assert.equal(trialContinuationCap(3, 0), 0);
+  assert.equal(trialContinuationCap(5, 10000), 5);
+  const zero = quotaYieldPer1000(0, 0);
+  assert.equal(zero.totalQuotaConsumed, 0);
+  assert.equal(zero.yieldPer1000Quota, 0);
+  const some = quotaYieldPer1000(3, 100);
+  assert.equal(some.totalQuotaConsumed, 100);
+  assert.equal(some.yieldPer1000Quota, 30);
+});

@@ -2040,42 +2040,59 @@ export async function scheduleAutonomousQueryRuns(
       // Opt-in canary-trial initiation. The existing gate (kill switch, caps,
       // protections) stays fail-closed inside initiateCanaryTrial; a rejection
       // or error here is recorded on the run but never fails scheduling.
-      // When the candidate also carries a frontier decision, the trial
-      // proposal must be that decision's proposal so the trial cannot be
-      // linked to an unrelated run.
+      // Lifecycle boundary: initiation joins THIS scheduling transaction via
+      // the caller-supplied client, so a scheduling rollback rolls the trial
+      // back with it — an initiated trial can never orphan on rollback.
+      // Linkage boundary: a trial must represent its proposal, and proposals
+      // are consumed exclusively through frontier decisions, so a request
+      // without a frontier decision fails closed instead of attaching to an
+      // unrelated run.
       let trialLink:
-        | { trialId: string; trialKey: string; proposalId: string; status: 'INITIATED' }
+        | { trialId: string; trialKey: string; proposalId: string; quotaReserved: number; status: 'INITIATED' }
         | { proposalId: string; status: 'NOT_INITIATED'; reason: string }
         | undefined;
       if (candidate.trialRequest && typeof candidate.trialRequest.proposalId === 'string' && candidate.trialRequest.proposalId.trim()) {
         const trialProposalId = candidate.trialRequest.proposalId.trim();
-        try {
-          if (candidate.frontierDecisionId) {
+        const { initiateCanaryTrial, resolveTrialLinkage, isTrialQuotaSufficient } = await import('./discoveryFrontierTrials');
+        if (!candidate.frontierDecisionId) {
+          trialLink = { proposalId: trialProposalId, status: 'NOT_INITIATED', reason: 'TRIAL_REQUIRES_FRONTIER_DECISION' };
+        } else {
+          try {
             const decisionProposal = await client.query(
               `SELECT proposal_id FROM frontier_allocation_decisions WHERE decision_id=$1`,
               [candidate.frontierDecisionId]
             );
-            if (!decisionProposal.rowCount || decisionProposal.rows[0].proposal_id !== trialProposalId) {
-              throw new Error('TRIAL_PROPOSAL_DECISION_MISMATCH');
+            const linkage = resolveTrialLinkage({
+              requestedProposalId: trialProposalId,
+              decisionProposalId: typeof decisionProposal.rows[0]?.proposal_id === 'string' ? decisionProposal.rows[0].proposal_id : null,
+            });
+            if (linkage.proceed === false) throw new Error(linkage.reason);
+            const maxQuota = candidate.trialRequest.maxQuota ?? 100;
+            // The reservation must cover at least the first page's cost, or
+            // execution could never stay within budget (reservations record
+            // budgets; they must also constrain spend — see worker cap).
+            if (!isTrialQuotaSufficient(maxQuota, scheduledProviderUnits)) {
+              throw new Error('TRIAL_QUOTA_BELOW_FIRST_PAGE_COST');
             }
+            const initiated = await initiateCanaryTrial(trialProposalId, {
+              maxQuota,
+              pageDepth: candidate.trialRequest.pageDepth,
+              trialKey: candidate.trialRequest.trialKey,
+            }, client);
+            if (!initiated.trialId) throw new Error('TRIAL_INITIATION_MISSING_ID');
+            trialLink = { trialId: initiated.trialId, trialKey: initiated.trialKey, proposalId: initiated.proposalId, quotaReserved: initiated.quotaReserved, status: 'INITIATED' };
+          } catch (error) {
+            trialLink = { proposalId: trialProposalId, status: 'NOT_INITIATED', reason: error instanceof Error ? error.message : String(error) };
           }
-          const { initiateCanaryTrial } = await import('./discoveryFrontierTrials');
-          const initiated = await initiateCanaryTrial(trialProposalId, {
-            maxQuota: candidate.trialRequest.maxQuota,
-            pageDepth: candidate.trialRequest.pageDepth,
-            trialKey: candidate.trialRequest.trialKey,
-          });
-          if (!initiated.trialId) throw new Error('TRIAL_INITIATION_MISSING_ID');
-          trialLink = { trialId: initiated.trialId, trialKey: initiated.trialKey, proposalId: initiated.proposalId, status: 'INITIATED' };
-        } catch (error) {
-          trialLink = { proposalId: trialProposalId, status: 'NOT_INITIATED', reason: error instanceof Error ? error.message : String(error) };
         }
       }
       const experimentMetadata = candidate.experiment ? { selectionExperiment: candidate.experiment } : {};
       const trialMetadata = trialLink ? { trial: trialLink } : {};
-      const orderingWindow = candidate.experiment?.ordering && candidate.experiment.ordering.windowApplied && candidate.experiment.ordering.window
-        ? { ...candidate.experiment.ordering.window, experimentId: candidate.experiment.experimentId }
-        : undefined;
+      // The job-payload window derives from the persisted ordering envelope
+      // and is present only for TREATMENT arms with an applied window, so
+      // recorded propensity/arm state always matches executed retrieval.
+      const { resolveScheduledSearchWindow } = await import('./querySelectionExperiments');
+      const orderingWindow = candidate.experiment ? resolveScheduledSearchWindow(candidate.experiment.ordering) : undefined;
       let run;
       try {
         run = await client.query(
