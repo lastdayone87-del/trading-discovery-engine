@@ -40,18 +40,31 @@ test('terminally failed runs receive a zero-funnel accounting attribution', () =
 });
 
 test('benchmark opportunity identity is designated pre-selection, never served-query derived', async () => {
-  const { benchmarkOpportunityIdForScope } = await import('./querySelectionExperiments');
-  const scope = { snapshotHash: 'abc123', poolRowId: 101 };
+  const { benchmarkOpportunityIdForScope, isFrozenBenchmarkConfiguration, normalizeSelectionExperimentRequest } = await import('./querySelectionExperiments');
+  const frozen = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 101 },
+  });
   // The designated frozen pool row maps stably regardless of arm, attempt,
   // or which query wins; retries stay attached to the same opportunity.
-  assert.equal(benchmarkOpportunityIdForScope(scope, 101), 'benchmark-prereg-v1:pool:abc123:101');
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 101, frozen), 'benchmark-prereg-v1:pool:abc123:101');
   // A fallback winner, a newly generated query, or any non-designated row
   // never acquires the frozen identity.
-  assert.equal(benchmarkOpportunityIdForScope(scope, 102), undefined);
-  assert.equal(benchmarkOpportunityIdForScope(null, 101), undefined);
-  assert.equal(benchmarkOpportunityIdForScope(undefined, 101), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 102, frozen), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(null, 101, frozen), undefined);
+  assert.equal(benchmarkOpportunityIdForScope(undefined, 101, frozen), undefined);
+  // A valid scope alone never grants benchmark identity: the request must
+  // exactly match the frozen benchmark configuration.
+  const offConfig = normalizeSelectionExperimentRequest({
+    selection: { experimentId: 'other-exp', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 101 },
+  });
+  assert.equal(isFrozenBenchmarkConfiguration(offConfig), false);
+  assert.equal(benchmarkOpportunityIdForScope(offConfig.benchmark, 101, offConfig), undefined);
   // The scope rides the validated request shape (pre-selection by design).
   const source = fs.readFileSync(new URL('./querySelectionExperiments.ts', import.meta.url), 'utf8');
   assert.match(source, /benchmark\?: SelectionExperimentBenchmarkScope/);
   assert.match(source, /INVALID_BENCHMARK_SCOPE/);
+  assert.match(source, /isFrozenBenchmarkConfiguration\(experiment\)/);
 });
