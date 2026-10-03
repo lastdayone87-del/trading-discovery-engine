@@ -120,6 +120,9 @@ export interface RawChannelInput {
   transcript_excerpts?: Array<{ video_id?: string; text: string; language?: string }>;
   visual_evidence?: Array<{ source_ref: string; description: string; model_provenance: string }>;
   pinned_comment?: string;
+  /** Set only by enrichment hydration: the video sample is an authoritative
+   * recent-channel sample, not retrieval-selected match content. */
+  videoDescriptionsAuthoritative?: boolean;
   activity_metadata?: { latest_upload_at?: string; uploads_last_30_days?: number; uploads_last_90_days?: number; uploads_last_365_days?: number; activity_band?: string; activity_score?: number; observed_at?: string };
   enrichment_stage?: number;
   /** Immutable provider input projection, populated by the engine. */

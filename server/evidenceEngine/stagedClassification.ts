@@ -18,17 +18,24 @@ export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
  * instead, and the normal lifecycle routing applies (ENRICH when evidence
  * coverage is incomplete, REVIEW when candidate and corroboration already
  * pass on affirmative positive evidence). Withheld match content is never
- * fed into evidence. Any hydrated video signal — titles, video objects,
- * descriptions, playlists, or transcripts — disables the thin classification.
+ * fed into evidence. Video fields count as hydration only with the explicit
+ * authoritative-hydration marker (set solely by enrichment hydration):
+ * retrieval-selected titles and fallback video objects at stage 0 never do,
+ * so ordinary stage-0 search candidates cannot bypass the guard.
  */
 export function isThinRetrievalInputRequiringHydration(input: RawChannelInput): boolean {
   if (Number(input.enrichment_stage || 0) !== 0) return false;
   if (!input.search_match_context) return false;
-  const hasVideos = (input.video_titles?.length || 0) > 0 || (input.videos?.length || 0) > 0;
-  const hasVideoDescriptions = (input.video_descriptions?.length || 0) > 0;
+  // Retrieval-selected video fields are not hydration evidence: at stage 0
+  // they describe the matched retrieval document, never a hydrated channel
+  // sample. Only an explicitly authoritative sample (set by enrichment
+  // hydration) counts, so ordinary stage-0 search candidates cannot bypass
+  // the guard via their own match titles.
+  const videoSampleAuthoritative = input.videoDescriptionsAuthoritative === true;
+  const hasVideos = ((input.video_titles?.length || 0) > 0 || (input.videos?.length || 0) > 0 || (input.video_descriptions?.length || 0) > 0) && videoSampleAuthoritative;
   const hasPlaylists = (input.playlists?.length || 0) > 0;
   const hasTranscripts = (input.transcript_excerpts?.length || 0) > 0;
-  return !hasVideos && !hasVideoDescriptions && !hasPlaylists && !hasTranscripts;
+  return !hasVideos && !hasPlaylists && !hasTranscripts;
 }
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {

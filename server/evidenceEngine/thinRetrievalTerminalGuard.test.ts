@@ -126,12 +126,79 @@ test('withheld match titles are never fed into evidence by the guard', () => {
   assert.ok(!usedFields.includes('video_title'));
 });
 
-test('descriptions-only input counts as hydrated, not thin', () => {
+test('descriptions-only input counts as hydrated only when authoritative', () => {
   const descriptionsOnly = {
     ...thinRetrievalInput,
     video_descriptions: ['Weekly forex outlook and price action review']
   };
-  assert.equal(isThinRetrievalInputRequiringHydration(descriptionsOnly), false);
+  // Retrieval-derived descriptions without the enrichment hydration marker
+  // are not hydration evidence: still thin.
+  assert.equal(isThinRetrievalInputRequiringHydration(descriptionsOnly), true);
   const { stages } = decide(descriptionsOnly, [semanticUnrelated()]);
-  assert.equal(stages.lifecycleAction, 'REJECT');
+  assert.equal(stages.lifecycleAction, 'ENRICH');
+  // The same sample marked authoritative (set only by enrichment hydration)
+  // disables the thin classification and preserves terminal routing.
+  assert.equal(
+    isThinRetrievalInputRequiringHydration({ ...descriptionsOnly, videoDescriptionsAuthoritative: true }),
+    false
+  );
+});
+
+function positiveItem(id: string, category: string, field: string, family: string, weight: number): EvidenceItem {
+  return {
+    id,
+    source: 'gemini_semantic',
+    polarity: 'POSITIVE',
+    category,
+    fact: `trading evidence ${id}`,
+    rawMatches: ['forex'],
+    confidence: 80,
+    reliability: 'MEDIUM',
+    reliabilityMultiplier: 1,
+    rawWeight: weight,
+    finalWeight: weight,
+    timestamp: new Date(0).toISOString(),
+    provenance: {
+      provider: 'gemini_semantic',
+      type: category,
+      matchedTerm: 'forex',
+      sourceRef: 'structured-semantic:gemini-3.6-flash',
+      fields: [{ field, sourceId: id, sourceFamilyId: family }]
+    }
+  } as EvidenceItem;
+}
+
+test('thin input with affirmative positives keeps REVIEW (never forced to ENRICH)', () => {
+  const evidence = [
+    positiveItem('pos-1', 'TERMINOLOGY', 'channel_bio', 'fam-bio', 20),
+    positiveItem('pos-2', 'INSTRUMENT', 'external_link_domain', 'fam-link', 18),
+    {
+      id: 'hype-negative',
+      source: 'channel_metadata',
+      polarity: 'NEGATIVE',
+      category: 'HYPE_SPECULATION',
+      fact: 'promotional language without domain evidence',
+      rawMatches: [],
+      confidence: 70,
+      reliability: 'MEDIUM',
+      reliabilityMultiplier: 1,
+      rawWeight: 30,
+      finalWeight: -30,
+      timestamp: new Date(0).toISOString(),
+      provenance: {
+        provider: 'channel_metadata',
+        type: 'HYPE_SPECULATION',
+        matchedTerm: 'moon',
+        sourceRef: 'deterministic:channel_metadata',
+        fields: [{ field: 'channel_bio', sourceId: 'about' }]
+      }
+    } as EvidenceItem
+  ];
+  const { stages, decision } = decide(thinRetrievalInput, evidence);
+  const candidate = stages.stages.find(stage => stage.stage === 'CANDIDATE_DETECTION');
+  const corroboration = stages.stages.find(stage => stage.stage === 'CORROBORATION');
+  assert.equal(candidate?.disposition, 'PASS');
+  assert.equal(corroboration?.disposition, 'PASS');
+  assert.equal(stages.lifecycleAction, 'REVIEW');
+  assert.equal(decision.status, 'UNCERTAIN');
 });

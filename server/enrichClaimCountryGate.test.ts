@@ -46,28 +46,24 @@ test('creator-country claim gate runs before ENRICHING stamp and quota reservati
 });
 
 test('hydration-upgraded CONFIRMED-excluded creator is revalidated before quota', async () => {
-  // Policy composition (pure, DB-free): a mention-grade bio stays
-  // non-rejected, while the hydrated domicile-grade bio for the same
-  // excluded country rejects — this is what the claim path re-runs after
-  // hydration and before quota reservation.
+  // Honest hydration-upgrade model (pure, DB-free): a no-evidence bio is
+  // UNCERTAIN, while the hydrated domicile-grade bio for the same excluded
+  // country rejects. The worker persists the UNCERTAIN row, hydrates at
+  // claim, and re-runs this same policy on the hydrated evidence.
   const { assessChannelCountry } = await import('./countryInference');
   const excluded = [{ country_name: 'India', reason: 'test exclusion' }];
-  const before = assessChannelCountry({
+  const input = {
     channelName: 'Harborlight Trading Academy',
-    aboutBio: 'Harborlight Trading Academy is one of India\u2019s premier training institutes.',
     videoTitles: [],
     videoDescriptions: [],
     videoDescriptionsAuthoritative: false,
     playlists: []
-  } as never, excluded as never, []);
-  assert.notEqual(before.countryStatus, 'REJECTED');
+  };
+  const before = assessChannelCountry({ ...input, aboutBio: 'Market hours notes.' } as never, excluded as never, []);
+  assert.equal(before.countryStatus, 'UNCERTAIN');
   const after = assessChannelCountry({
-    channelName: 'Harborlight Trading Academy',
-    aboutBio: 'Harborlight Trading Academy is one of India\u2019s premier training institutes. Our desk is based in India.',
-    videoTitles: [],
-    videoDescriptions: [],
-    videoDescriptionsAuthoritative: false,
-    playlists: []
+    ...input,
+    aboutBio: 'Harborlight Trading Academy is one of India\u2019s premier training institutes. Our desk is based in India.'
   } as never, excluded as never, []);
   assert.equal(after.countryStatus, 'REJECTED');
   assert.equal(after.detectedCreatorCountry, 'India');
