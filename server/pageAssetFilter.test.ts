@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { isPageAssetInfrastructureUrl } from './communitySurfacePolicy';
 import { parseYouTubeChannelAboutFromHtml } from './youtubePublicAbout';
+import type { SiteInspectionStore } from './siteInspectionCache';
 
 test('page-asset infrastructure hosts are filtered', () => {
   assert.equal(isPageAssetInfrastructureUrl('https://i.ytimg.com/vi/abc/hqdefault.jpg'), true);
@@ -45,7 +46,7 @@ test('asset URLs in channelLinks and socialLinks never become crawl seeds', asyn
     fetched.push(String(url));
     return new Response('<html><body>plain creator site</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
   }) as typeof fetch;
-  const store = {
+  const store: SiteInspectionStore = {
     read: async () => [],
     write: async () => undefined,
     recordLinks: async () => undefined
@@ -68,7 +69,7 @@ test('asset URLs in channelLinks and socialLinks never become crawl seeds', asyn
     externalFetchImpl: fetchImpl,
     urlFailureHistoryLoader: async () => [],
     siteInspectionStore: store
-  } as never);
+  });
   assert.ok(fetched.some(url => url.includes('example-creator-site.test')), 'legit creator site crawled');
   assert.ok(fetched.some(url => url.includes('t.me')), 'messaging link crawled');
   for (const target of fetched) {

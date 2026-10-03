@@ -8,9 +8,10 @@ test('CONFIRMED excluded creator country blocks the ENRICH claim', () => {
   assert.deepEqual(shouldBlockEnrichClaimForCountry('CONFIRMED', 'India', EXCLUSION), EXCLUSION);
 });
 
-test('predicate passes through the lookup match without re-normalizing', () => {
-  // Normalization lives in findCountryExclusion/getCountryExclusion; the
-  // predicate only gates on status + presence of a match.
+test('predicate verifies the match belongs to the country before blocking', () => {
+  // The predicate gates on status AND verifies via normalizeCountryName that
+  // the supplied exclusion belongs to this country; a stale or mismatched
+  // lookup result never blocks the wrong country.
   assert.deepEqual(shouldBlockEnrichClaimForCountry('CONFIRMED', ' india ', EXCLUSION), EXCLUSION);
 });
 

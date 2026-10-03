@@ -110,3 +110,9 @@ test('manual recheck low-audience skip completes instead of failing', () => {
   const handlerIdx = source.indexOf("if(result.code==='MANUAL_RESCAN_LOW_AUDIENCE_SKIP'){await completeJob(job.id);return true;}");
   assert.ok(handlerIdx >= 0, 'policy skip completes the job without consuming retries');
 });
+
+test('confirmed excluded creators reach the claim gate instead of the audience skip', () => {
+  const source = read('server/investigationWorkflow.ts');
+  assert.match(source, /countryPreemptsAudience/);
+  assert.match(source, /findCountryExclusion\(row\.country/);
+});

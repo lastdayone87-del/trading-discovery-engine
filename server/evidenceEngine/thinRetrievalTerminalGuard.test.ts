@@ -125,3 +125,13 @@ test('withheld match titles are never fed into evidence by the guard', () => {
   const usedFields = stages.stages.flatMap(stage => stage.fields?.map(field => field.field) || []);
   assert.ok(!usedFields.includes('video_title'));
 });
+
+test('descriptions-only input counts as hydrated, not thin', () => {
+  const descriptionsOnly = {
+    ...thinRetrievalInput,
+    video_descriptions: ['Weekly forex outlook and price action review']
+  };
+  assert.equal(isThinRetrievalInputRequiringHydration(descriptionsOnly), false);
+  const { stages } = decide(descriptionsOnly, [semanticUnrelated()]);
+  assert.equal(stages.lifecycleAction, 'REJECT');
+});

@@ -18,15 +18,17 @@ export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
  * instead, and the normal lifecycle routing applies (ENRICH when evidence
  * coverage is incomplete, REVIEW when candidate and corroboration already
  * pass on affirmative positive evidence). Withheld match content is never
- * fed into evidence.
+ * fed into evidence. Any hydrated video signal — titles, video objects,
+ * descriptions, playlists, or transcripts — disables the thin classification.
  */
 export function isThinRetrievalInputRequiringHydration(input: RawChannelInput): boolean {
   if (Number(input.enrichment_stage || 0) !== 0) return false;
   if (!input.search_match_context) return false;
   const hasVideos = (input.video_titles?.length || 0) > 0 || (input.videos?.length || 0) > 0;
+  const hasVideoDescriptions = (input.video_descriptions?.length || 0) > 0;
   const hasPlaylists = (input.playlists?.length || 0) > 0;
   const hasTranscripts = (input.transcript_excerpts?.length || 0) > 0;
-  return !hasVideos && !hasPlaylists && !hasTranscripts;
+  return !hasVideos && !hasVideoDescriptions && !hasPlaylists && !hasTranscripts;
 }
 
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
