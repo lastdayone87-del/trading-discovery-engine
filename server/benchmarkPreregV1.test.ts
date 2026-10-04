@@ -13,6 +13,7 @@ import {
   buildFrozenBenchmarkRequest,
   buildPoolSnapshot,
   verifyPoolSnapshotHash,
+  verifyExecutionArtifactsBound,
   computeConfigurationHash,
   buildExecutionRecord,
 } from './benchmarkPreregV1';
@@ -137,6 +138,29 @@ test('runner script cannot substitute an unrelated benchmark', () => {
   assert.match(source, /buildFrozenBenchmarkRequest/);
   assert.match(source, /verifyFrozenBenchmarkVersions/);
   assert.match(source, /verifyBenchmarkGatesOff/);
+});
+
+test('planning cannot reach scheduling without the explicit execute mode', () => {
+  const source = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  // Default mode is plan; only the literal --execute flag selects execute.
+  assert.match(source, /let mode: 'plan' \| 'execute' = 'plan'/);
+  assert.match(source, /if \(arg === '--execute'\) mode = 'execute'/);
+  // The plan branch returns before any scheduling site.
+  const planGuard = source.indexOf("if (mode === 'plan')");
+  const scheduleSite = source.indexOf('runAutonomousDiscoveryCycle(row.country');
+  const executeGuard = source.indexOf('BENCHMARK_PREREG_NO_PLAN');
+  assert.ok(planGuard !== -1 && scheduleSite !== -1 && executeGuard !== -1);
+  assert.ok(planGuard < scheduleSite, 'plan branch must precede scheduling');
+  assert.ok(executeGuard < scheduleSite, 'execute guard must precede scheduling');
+  assert.ok(source.slice(planGuard, scheduleSite).includes('return;'), 'plan path must early-return before scheduling');
+  // Scheduling happens only after the frozen execution record is bound and
+  // marked IN_PROGRESS (persisted), never from the plan path.
+  const inProgressMark = source.indexOf("record.status = 'IN_PROGRESS'");
+  assert.ok(inProgressMark !== -1 && inProgressMark < scheduleSite);
+  assert.match(source, /verifyExecutionArtifactsBound\(record, snapshot\)/);
+  // The engine import is dynamic and occurs only on the execute path.
+  const dynamicImport = source.indexOf("await import('../server/autonomousDiscovery')");
+  assert.ok(dynamicImport !== -1 && dynamicImport < scheduleSite);
 });
 
 test('pool eligibility is country-scoped like production', () => {
@@ -339,4 +363,100 @@ test('non-designated selections are declined, never scheduled, under benchmark s
   // Research/frontier/native allocations are declined on the same path.
   assert.match(source, /!normalizedExperiment\?\.benchmark/);
   assert.match(source, /Benchmark-designated attempt declines non-designated allocation/);
+});
+
+test('execution record is cryptographically bound to the loaded snapshot', async () => {
+  const now = new Date('2026-05-01T00:00:00.000Z');
+  const rows = Array.from({ length: 5 }, (_, index) => eligibleRow(index + 1));
+  const snapshot = buildPoolSnapshot({ rows, collectedAt: now, cooldownMinutes: 360, maxPrimaryUses: 2 });
+  const record = buildExecutionRecord({
+    runningCommit: 'test-commit',
+    poolSnapshot: snapshot,
+    configurationHash: computeConfigurationHash({ appSettings: [], maxMigrationVersion: 137, providerRegistry: [] }),
+    maxMigrationVersion: 137,
+    providerRegistry: [],
+    appSettings: [],
+  });
+  verifyExecutionArtifactsBound(record, snapshot);
+  // A jointly edited record+snapshot pair with mismatched designated rows fails.
+  const tamperedRecord = structuredClone(record);
+  tamperedRecord.designatedOpportunities[0] = {
+    ...tamperedRecord.designatedOpportunities[0],
+    poolRowId: 999999,
+    benchmarkOpportunityId: `benchmark-prereg-v1:pool:${snapshot.snapshotHash}:999999`,
+  };
+  assert.throws(() => verifyExecutionArtifactsBound(tamperedRecord, snapshot), /BENCHMARK_PREREG_RECORD_MISMATCH/);
+  // A snapshot with different rows fails even when hashes are internally consistent.
+  const other = buildPoolSnapshot({
+    rows: Array.from({ length: 5 }, (_, index) => eligibleRow(index + 101)),
+    collectedAt: now, cooldownMinutes: 360, maxPrimaryUses: 2,
+  });
+  assert.throws(() => verifyExecutionArtifactsBound(record, other), /BENCHMARK_PREREG_RECORD_MISMATCH/);
+});
+
+test('scheduling failures stay execution failures and later selections are not masked', async () => {
+  const { classifyNoMatchOutcome } = await import('./benchmarkPreregV1');
+  // FAILED scheduling diagnostics are execution failures, never eligibility.
+  assert.deepEqual(
+    classifyNoMatchOutcome({
+      queuedCount: 0, remainingAutonomousQuota: 100,
+      candidates: [{ disposition: 'FAILED', reasonCode: 'SCHEDULING_SQL_FAILURE' }],
+      extrasCount: 0,
+    }).state,
+    'EXCLUDED_EXECUTION_FAILURE'
+  );
+  assert.deepEqual(
+    classifyNoMatchOutcome({
+      queuedCount: 0, remainingAutonomousQuota: 100,
+      candidates: [{ disposition: 'FAILED', reasonCode: 'UNKNOWN_SCHEDULING_FAILURE' }],
+      extrasCount: 0,
+    }).state,
+    'EXCLUDED_EXECUTION_FAILURE'
+  );
+  // An earlier skip cannot mask a later SELECTED_ANOTHER_QUERY.
+  assert.deepEqual(
+    classifyNoMatchOutcome({
+      queuedCount: 3, remainingAutonomousQuota: 100,
+      candidates: [
+        { disposition: 'SKIPPED', reasonCode: 'QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY' },
+        { disposition: 'SKIPPED', reasonCode: 'SELECTED_ANOTHER_QUERY' },
+      ],
+      extrasCount: 0,
+    }),
+    { state: 'EXCLUDED_SELECTED_ANOTHER', reason: 'SELECTED_ANOTHER_QUERY:SELECTED_ANOTHER_QUERY' }
+  );
+  // A FAILED diagnostic takes precedence over eligibility skips.
+  assert.equal(
+    classifyNoMatchOutcome({
+      queuedCount: 3, remainingAutonomousQuota: 100,
+      candidates: [
+        { disposition: 'SKIPPED', reasonCode: 'QUERY_INTELLIGENCE_AUTHORITY_REJECTED' },
+        { disposition: 'FAILED', reasonCode: 'QUERY_RUN_INSERTION_FAILURE' },
+      ],
+      extrasCount: 0,
+    }).state,
+    'EXCLUDED_EXECUTION_FAILURE'
+  );
+});
+
+test('benchmark allocation release failures stop execution and committed races fail closed', async () => {
+  const fs = await import('node:fs');
+  const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  // Infrastructure failures in release are distinguishable and abort the run.
+  assert.match(source, /BENCHMARK_ALLOCATION_RELEASE_FAILED/);
+  assert.match(source, /\.catch\(error => \{\s*throw new Error\(`BENCHMARK_ALLOCATION_RELEASE_FAILED/);
+  // COMMITTED is treated as stranded (unrelated work scheduled), not benign.
+  assert.match(source, /\['RESERVED', 'COMMITTED'\]\.includes\(String\(releaseCheck\.rows\[0\]\.decision_status\)\)/);
+});
+
+test('benchmark honors the kill switch even with a target country', async () => {
+  const fs = await import('node:fs');
+  const cycle = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  assert.match(cycle, /hasBenchmarkScope/);
+  assert.match(cycle, /!\s*targetCountry \|\| hasBenchmarkScope/);
+  const script = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  assert.match(script, /haltedByKillSwitch\(\)/);
+  assert.match(script, /KILL_SWITCH_PAUSED/);
+  assert.match(script, /record\.status = 'IN_PROGRESS'[\s\S]*writeFileSync\(recordPath/);
+  assert.match(script, /INFRA_INCIDENT:LEDGER_UNREADABLE/);
 });

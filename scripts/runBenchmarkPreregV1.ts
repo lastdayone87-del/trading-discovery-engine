@@ -39,6 +39,7 @@ import {
   buildFrozenBenchmarkRequest,
   buildPoolSnapshot,
   verifyPoolSnapshotHash,
+  verifyExecutionArtifactsBound,
   assertFullScope,
   computeConfigurationHash,
   buildExecutionRecord,
@@ -85,9 +86,23 @@ function runningCommit(repoRoot: string): string {
   }
 }
 
-function effectiveNumberedSetting(settings: Record<string, string>, key: string, envKey: string, fallback: string, min: number): number {
+function effectiveNumberedSetting(
+  settings: Record<string, string>,
+  key: string,
+  envKey: string,
+  fallback: string,
+  min: number,
+  max: number = Number.POSITIVE_INFINITY
+): number {
+  // Same precedence as production readers (app_settings ?? env ?? fallback)
+  // with the engine's bounds: cooldown is clamped to 1..10080 like
+  // numericSetting('query_intelligence_query_cooldown_minutes', ..., 360, 1,
+  // 10080) in runAutonomousDiscoveryCycle; other numbered settings keep only
+  // their lower bound like queryIntelligence/querySelectionExperiments.
   const raw = settings[key] ?? process.env[envKey] ?? fallback;
-  return Math.max(min, Number(raw) || Number(fallback));
+  const parsed = Number(raw) || Number(fallback);
+  const finite = Number.isFinite(parsed) ? parsed : Number(fallback);
+  return Math.min(max, Math.max(min, finite));
 }
 
 async function main(): Promise<void> {
@@ -119,7 +134,7 @@ async function main(): Promise<void> {
     }
     const libraryRows = (await db.query('SELECT * FROM query_library ORDER BY id')).rows as Array<Record<string, unknown>>;
     const now = new Date();
-    const cooldownMinutes = effectiveNumberedSetting(settings, 'query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', '360', 1);
+    const cooldownMinutes = effectiveNumberedSetting(settings, 'query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', '360', 1, 10080);
     const maxPrimaryUses = effectiveNumberedSetting(settings, 'query_intelligence_primary_term_max_uses', 'QUERY_INTELLIGENCE_PRIMARY_TERM_MAX_USES', '2', 1);
     const snapshot = buildPoolSnapshot({
       rows: libraryRows.map(row => rowToQuery(row)),
@@ -163,9 +178,15 @@ async function main(): Promise<void> {
     throw new Error('BENCHMARK_PREREG_RECORD_MISMATCH: execution record does not match the frozen plan; refusing to execute');
   }
   verifyPoolSnapshotHash(snapshot);
+  verifyExecutionArtifactsBound(record, snapshot);
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
+  // Persist IN_PROGRESS before any scheduling so a post-scheduling crash or
+  // ledger-read failure can never leave the file as PLANNED while a run is
+  // active. Every later mutation also saves via saveRecord().
+  record.updatedAt = new Date().toISOString();
+  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
 
   const { runAutonomousDiscoveryCycle, getAutonomousDiscoveryStatus } = await import('../server/autonomousDiscovery');
   const status = await getAutonomousDiscoveryStatus().catch(() => null);
@@ -209,7 +230,12 @@ async function main(): Promise<void> {
   };
 
   for (const designated of record.designatedOpportunities) {
-    const preMatched = await readMatched(designated.benchmarkOpportunityId, record.createdAt);
+    let preMatched: Array<{ id: string; query_id: number; status: string; scheduled_at: string }>;
+    try {
+      preMatched = await readMatched(designated.benchmarkOpportunityId, record.createdAt);
+    } catch (readError) {
+      await abortIncomplete(`INFRA_INCIDENT:LEDGER_UNREADABLE:${(readError instanceof Error ? readError.message : String(readError)).slice(0, 120)}`);
+    }
     const rowPlan = planRowAttempt({
       covered: isBenchmarkRowTerminal(rowState(designated.benchmarkOpportunityId)),
       matchedRunIds: preMatched.map(run => run.id),
@@ -278,8 +304,20 @@ async function main(): Promise<void> {
     // unrelated work.
     const attemptStart = new Date();
     const requestId = `benchmark-prereg-v1:${snapshot.snapshotHash.slice(0, 12)}:${designated.poolRowId}`;
+    // Kill-switch recheck immediately before scheduling: drift checking ran
+    // above, but a pause engaged in the gap must still stop the benchmark.
+    // The engine also honors pause for benchmark scope even with a target
+    // country; this runner-side check fails closed first.
+    try {
+      if (await haltedByKillSwitch()) {
+        await abortIncomplete('KILL_SWITCH_PAUSED');
+      }
+    } catch (killError) {
+      if (killError instanceof Error && /KILL_SWITCH_PAUSED|INCOMPLETE/.test(killError.message)) throw killError;
+      await abortIncomplete(`INFRA_INCIDENT:KILL_SWITCH_UNREADABLE:${(killError instanceof Error ? killError.message : String(killError)).slice(0, 120)}`);
+    }
     let report: {
-      queuedCount?: number; remainingAutonomousQuota?: number; summary?: string;
+      queuedCount?: number; remainingAutonomousQuota?: number; summary?: string; isPaused?: boolean;
       diagnostics?: { candidates?: Array<{ disposition?: string; reasonCode?: string }> };
     };
     try {
@@ -287,6 +325,11 @@ async function main(): Promise<void> {
       if (!row) throw new Error(`BENCHMARK_PREREG_DESIGNATED_ROW_MISSING: poolRowId=${designated.poolRowId}`);
       const frozenRequest = buildFrozenBenchmarkRequest(snapshot.snapshotHash, row.queryId);
       report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest);
+      // Engine pause (kill switch engaged mid-cycle) is an abort, never a
+      // no-match exclusion: schedule nothing further.
+      if (report.isPaused) {
+        await abortIncomplete('KILL_SWITCH_PAUSED');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (/already in progress|already held|SCHEDULER_BUSY|BENCHMARK_ALLOCATION_RELEASE_FAILED/.test(message)) {
@@ -330,12 +373,21 @@ async function main(): Promise<void> {
       continue;
     }
     const attemptEnd = new Date();
-    const matched = await readMatched(designated.benchmarkOpportunityId, attemptStart.toISOString());
-    const windowRuns = (await db.query(
-      `SELECT id, metadata->'selectionExperiment'->>'benchmarkOpportunityId' AS boid FROM query_runs
-       WHERE scheduled_at >= $1 AND scheduled_at < $2`,
-      [attemptStart.toISOString(), attemptEnd.toISOString()]
-    )).rows as Array<{ id: string; boid: string | null }>;
+    // Post-scheduling ledger reads are durability boundaries: a failure here
+    // must abort as an infra incident with INCOMPLETE persisted, never exit
+    // uncaught and never masquerade as zero matches.
+    let matched: Array<{ id: string; query_id: number; status: string; scheduled_at: string }>;
+    let windowRuns: Array<{ id: string; boid: string | null }>;
+    try {
+      matched = await readMatched(designated.benchmarkOpportunityId, attemptStart.toISOString());
+      windowRuns = ((await db.query(
+        `SELECT id, metadata->'selectionExperiment'->>'benchmarkOpportunityId' AS boid FROM query_runs
+         WHERE scheduled_at >= $1 AND scheduled_at < $2`,
+        [attemptStart.toISOString(), attemptEnd.toISOString()]
+      )).rows as Array<{ id: string; boid: string | null }>);
+    } catch (readError) {
+      await abortIncomplete(`INFRA_INCIDENT:LEDGER_UNREADABLE:${(readError instanceof Error ? readError.message : String(readError)).slice(0, 120)}`);
+    }
     const extras = windowRuns.filter(run => run.boid !== designated.benchmarkOpportunityId);
     if (extras.length > 0) {
       record.extras.push({ afterOpportunity: designated.benchmarkOpportunityId, count: extras.length, runIds: extras.slice(0, 50).map(run => run.id) });

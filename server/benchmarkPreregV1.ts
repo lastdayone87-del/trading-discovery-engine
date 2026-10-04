@@ -325,6 +325,47 @@ export function verifyPoolSnapshotHash(snapshot: PoolSnapshot): void {
 }
 
 /**
+ * Cryptographically/structurally binds the execution record to the loaded
+ * snapshot before any scheduling. The record's embedded pool snapshot must
+ * equal the loaded snapshot (hash + rows + frozen metadata), and every
+ * designated opportunity must be exactly the snapshot-derived set
+ * (snapshotHash + poolRowId + deterministic opportunity id + country).
+ * A jointly edited record+snapshot pair can otherwise schedule under a
+ * mismatched opportunity identity, causing ledger attribution lookups to
+ * miss and misclassify as exclusions.
+ */
+export function verifyExecutionArtifactsBound(record: BenchmarkExecutionRecord, snapshot: PoolSnapshot): void {
+  if (
+    record.poolSnapshot.snapshotHash !== snapshot.snapshotHash ||
+    record.poolSnapshot.specVersion !== snapshot.specVersion ||
+    record.poolSnapshot.baseCommit !== snapshot.baseCommit ||
+    record.poolSnapshot.rulesVersion !== snapshot.rulesVersion ||
+    JSON.stringify(record.poolSnapshot.rows) !== JSON.stringify(snapshot.rows)
+  ) {
+    throw new Error('BENCHMARK_PREREG_RECORD_MISMATCH: execution record pool snapshot does not match loaded snapshot');
+  }
+  if (record.designatedOpportunities.length !== snapshot.rows.length) {
+    throw new Error('BENCHMARK_PREREG_RECORD_MISMATCH: designated opportunity count does not match snapshot rows');
+  }
+  for (let index = 0; index < snapshot.rows.length; index++) {
+    const row = snapshot.rows[index];
+    const designated = record.designatedOpportunities[index] as
+      | { snapshotHash?: string; poolRowId?: number; benchmarkOpportunityId?: string; country?: string }
+      | undefined;
+    const expectedId = `benchmark-prereg-v1:pool:${snapshot.snapshotHash}:${row.queryId}`;
+    if (
+      !designated ||
+      designated.snapshotHash !== snapshot.snapshotHash ||
+      designated.poolRowId !== row.queryId ||
+      designated.benchmarkOpportunityId !== expectedId ||
+      designated.country !== row.country
+    ) {
+      throw new Error(`BENCHMARK_PREREG_RECORD_MISMATCH: designated opportunity mismatch at poolIndex=${index}`);
+    }
+  }
+}
+
+/**
  * configHash = sha256(engineCommit + specVersion + sorted app_settings dump
  * + max migration version + provider registry snapshot). Pure.
  */
@@ -476,14 +517,16 @@ export function isBenchmarkRowTerminal(state: BenchmarkRowState): boolean {
 }
 
 export interface NoMatchClassification {
-  state: Extract<BenchmarkRowState, 'EXCLUDED_ELIGIBILITY' | 'EXCLUDED_NO_CAPACITY' | 'EXCLUDED_SELECTED_ANOTHER'>;
+  state: Extract<BenchmarkRowState, 'EXCLUDED_ELIGIBILITY' | 'EXCLUDED_NO_CAPACITY' | 'EXCLUDED_SELECTED_ANOTHER' | 'EXCLUDED_EXECUTION_FAILURE'>;
   reason: string;
 }
 
 /**
  * Classifies a designated attempt that scheduled zero matched runs. Pure and
- * deterministic: the cycle report diagnostics decide between eligibility,
- * capacity, and selected-another outcomes. Never fabricates an observation.
+ * deterministic: every cycle report diagnostic is examined (not just the
+ * first), scheduling/infrastructure failures stay EXECUTION_FAILURE and are
+ * never mislabeled as eligibility, and a later SELECTED_ANOTHER cannot be
+ * masked by an earlier skip. Never fabricates an observation.
  */
 export function classifyNoMatchOutcome(input: {
   queuedCount?: number;
@@ -491,19 +534,37 @@ export function classifyNoMatchOutcome(input: {
   candidates?: Array<{ disposition?: string; reasonCode?: string }>;
   extrasCount: number;
 }): NoMatchClassification {
-  const skipped = (input.candidates || []).find(candidate => candidate.disposition && candidate.disposition !== 'SCHEDULED');
-  const code = skipped?.reasonCode || skipped?.disposition || '';
+  const candidates = input.candidates || [];
+  // Scheduling/infrastructure failures surface as FAILED dispositions (the
+  // cycle catches scheduling errors and records FAILED + sanitized
+  // SCHEDULING_*/QUERY_RUN_*/CHILD_JOB_*/etc. reason codes). These must never
+  // become eligibility exclusions.
+  const failure = candidates.find(
+    candidate =>
+      candidate.disposition === 'FAILED' ||
+      /SCHEDULING_|QUERY_RUN_|CHILD_JOB_|DECISION_EVENT|SQL_FAILURE|LINKAGE_FAILURE|INSERTION_FAILURE|UNKNOWN_SCHEDULING_FAILURE/.test(candidate.reasonCode || '')
+  );
+  if (failure) {
+    const code = failure.reasonCode || failure.disposition || 'scheduling-failure';
+    return { state: 'EXCLUDED_EXECUTION_FAILURE', reason: `EXECUTION_FAILURE:${code}` };
+  }
   // A declined free choice is selected-another, never an eligibility
   // failure: the row's eligibility did not fail, the arm chose elsewhere.
-  if (/SELECTED_ANOTHER/.test(code) || input.extrasCount > 0) {
+  // Scan all diagnostics so an earlier skip cannot mask a later selection.
+  const selectedAnother = candidates.find(candidate => /SELECTED_ANOTHER/.test(candidate.reasonCode || ''));
+  if (selectedAnother || input.extrasCount > 0) {
+    const code = selectedAnother?.reasonCode || `extras=${input.extrasCount}`;
     return {
       state: 'EXCLUDED_SELECTED_ANOTHER',
-      reason: `SELECTED_ANOTHER_QUERY:${code || `extras=${input.extrasCount}`}`,
+      reason: `SELECTED_ANOTHER_QUERY:${code}`,
     };
   }
-  if (/QUOTA|QUEUE|CAPACITY/.test(code) || (input.queuedCount || 0) === 0 && (input.remainingAutonomousQuota ?? 1) <= 0) {
-    return { state: 'EXCLUDED_NO_CAPACITY', reason: `NO_QUEUE_CAPACITY:${code || 'quota-exhausted'}` };
+  const capacityCode = candidates.find(candidate => /QUOTA|QUEUE|CAPACITY/.test(candidate.reasonCode || ''))?.reasonCode || '';
+  if (capacityCode || (input.queuedCount || 0) === 0 && (input.remainingAutonomousQuota ?? 1) <= 0) {
+    return { state: 'EXCLUDED_NO_CAPACITY', reason: `NO_QUEUE_CAPACITY:${capacityCode || 'quota-exhausted'}` };
   }
+  const firstSkipped = candidates.find(candidate => candidate.disposition && candidate.disposition !== 'SCHEDULED');
+  const code = firstSkipped?.reasonCode || firstSkipped?.disposition || '';
   return { state: 'EXCLUDED_ELIGIBILITY', reason: `ELIGIBILITY:${code || 'cycle-scheduled-nothing'}` };
 }
 

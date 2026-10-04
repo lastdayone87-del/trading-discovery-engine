@@ -334,7 +334,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
   };
 
   try {
-    if (await isQueryIntelligencePaused() && !targetCountry) {
+    // Direct targets bypass the pause gate by design (operator on-demand),
+    // but benchmark-designated attempts must never bypass it: a pause engaged
+    // after drift checking must still stop scheduling. The raw request is
+    // checked here (normalization happens later); any benchmark scope counts.
+    const hasBenchmarkScope = Boolean((experiment as { benchmark?: unknown } | null | undefined)?.benchmark);
+    if ((await isQueryIntelligencePaused()) && (!targetCountry || hasBenchmarkScope)) {
       return {
         country: 'N/A', query: 'N/A', strategy: 'PAUSED', discoveredCount: 0,
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0,
@@ -491,12 +496,17 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         const released = await releaseAllocationDecision(
           benchmarkDeclinedId,
           'Benchmark-designated attempt declines non-designated allocation'
-        );
+        ).catch(error => {
+          throw new Error(`BENCHMARK_ALLOCATION_RELEASE_FAILED:${benchmarkDeclinedId}:${error instanceof Error ? error.message : String(error)}`);
+        });
         if (!released) {
           // Distinguish a benign race (another worker already consumed or
           // expired the decision: nothing is held) from a genuinely stranded
-          // RESERVED decision (quota held). Only the stranded case fails the
-          // cycle — and an unreadable ledger fails closed the same way.
+          // decision (quota held or unrelated work already scheduled). Only
+          // the stranded case fails the cycle — and an unreadable ledger
+          // fails closed the same way. COMMITTED is stranded too: scheduling
+          // flips RESERVED to COMMITTED while leaving quota_reserved intact,
+          // meaning unrelated work was already scheduled.
           let stillReserved = true;
           try {
             const releaseCheckDb = await getDb();
@@ -504,7 +514,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
               'SELECT decision_status FROM frontier_allocation_decisions WHERE decision_id = $1',
               [benchmarkDeclinedId]
             );
-            stillReserved = releaseCheck.rows.length > 0 && String(releaseCheck.rows[0].decision_status) === 'RESERVED';
+            stillReserved = releaseCheck.rows.length > 0 && ['RESERVED', 'COMMITTED'].includes(String(releaseCheck.rows[0].decision_status));
           } catch {
             stillReserved = true;
           }
