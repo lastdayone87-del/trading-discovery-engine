@@ -125,3 +125,16 @@ test('reconcile and validation share one admitted inspection view', async () => 
   const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
   assert.match(source, /reconcileDiscordDiscoveryFromInspection\(channel, admittedInspection,/);
 });
+
+test('foundInvite naming an unevaluated code is claimed, not suppressed', () => {
+  // Structured candidates all discarded, but the trail foundInvite names a
+  // different, unknown code: it must be admitted (legacy path), not dropped
+  // merely because its siblings lost.
+  const structured = [
+    { candidateId: 'x', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', rawLocator: 'https://discord.gg/OLD1', normalizedLocator: 'https://discord.gg/old1', nativeInviteCode: 'OLD1', extractionConfidence: 'EXPLICIT' },
+  ];
+  const r = admitDiscordCandidates(structured as DiscordCandidate[], 'NEW2', new Set(['new2']));
+  assert.equal(r.candidates.length, 1);
+  assert.equal(r.discoveredInvite, 'NEW2');
+  assert.equal(r.discardedCount, 1);
+});

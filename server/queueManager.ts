@@ -1347,6 +1347,11 @@ export async function inspectAndValidateChannel(
       const code=discordInviteCodeOf(candidate.nativeInviteCode);
       if(code&&!preClaimSources.has(code))preClaimSources.set(code,{surface:candidate.sourceSurface||null,url:candidate.sourceUrl||null});
     }
+    // A trail-level foundInvite naming a code outside the structured set must
+    // still go through the claim so a genuinely new invite is never
+    // suppressed merely because sibling candidates were discarded.
+    const preFoundCode=discordInviteCodeOf(inspection.foundInvite);
+    if(preFoundCode&&!preClaimSources.has(preFoundCode))preClaimSources.set(preFoundCode,{surface:null,url:null});
     const preInviteClaims=await claimDiscordInvites([...preClaimSources.entries()].map(([code,src])=>({code,sourceSurface:src.surface,sourceUrl:src.url})),channel.channel_id);
     const preAdmittedCodes=new Set(preInviteClaims.filter(claim=>claim.admitted).map(claim=>claim.code));
     const preAdmission=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,preAdmittedCodes);
