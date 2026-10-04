@@ -125,6 +125,64 @@ export async function appendOperatorAuditEvent(event: AuditEvent): Promise<void>
 export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=await getDb();const res=await db.query(`SELECT id,actor_identifier,actor_hash,role,action,target,request_id,outcome,safe_metadata,created_at FROM operator_audit_events ORDER BY created_at DESC LIMIT $1`,[Math.min(Math.max(limit,1),500)]);return res.rows;}
 export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);}
 export interface DiscordAttemptCandidate {candidateId?:string;rawLocator?:string;locatorType?:string;resolvedLocator?:string;sourceSurface?:string;sourceUrl?:string;observations?:Array<unknown>}
+export interface DiscordInviteClaim {code:string;admitted:boolean;firstChannelId:string|null}
+/**
+ * Atomically claims canonical Discord invite codes for a channel. Each code
+ * resolves to exactly one global winner via the registry primary key, so
+ * concurrent first discoveries cannot create duplicate canonical claims.
+ * A code is admitted when this channel claimed it now or already owns the
+ * existing claim (same-channel rediscovery keeps its normal lifecycle);
+ * codes owned by other channels are rejected for discard upstream.
+ * Crash safety: the claim precedes candidate persistence by design (a later
+ * loser must never write first), and a registry row without a candidate row
+ * remains a truthful first-seen record — the owning channel's retry
+ * rediscovers through the same-channel path and completes normally.
+ */
+export async function claimDiscordInvites(items:Array<{code:string;sourceSurface?:string|null;sourceUrl?:string|null}>,channelId:string):Promise<DiscordInviteClaim[]>{
+  const seen=new Map<string,{surface:string|null;url:string|null}>();
+  for(const item of items||[]){
+    if(!item||typeof item.code!=='string'||!item.code)continue;
+    if(!seen.has(item.code))seen.set(item.code,{surface:item.sourceSurface||null,url:item.sourceUrl||null});
+  }
+  const unique=[...seen.keys()];
+  if(!unique.length||!channelId)return unique.map(code=>({code,admitted:false,firstChannelId:null}));
+  const db=await getDb();
+  const claimed=await db.query(
+    `INSERT INTO discord_invite_registry(canonical_code,first_channel_id,first_seen_at,first_source_surface,first_source_url)
+     SELECT code,$2,now(),surface,url FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
+     ON CONFLICT(canonical_code) DO NOTHING RETURNING canonical_code`,
+    [unique,channelId,unique.map(code=>seen.get(code)!.surface),unique.map(code=>seen.get(code)!.url)]);
+  const won=new Set(claimed.rows.map((row:any)=>String(row.canonical_code)));
+  const existing=won.size===unique.length?[]:(await db.query(
+    `SELECT canonical_code,first_channel_id FROM discord_invite_registry WHERE canonical_code=ANY($1::text[])`,
+    [unique])).rows;
+  const owners=new Map(existing.map((row:any)=>[String(row.canonical_code),String(row.first_channel_id)]));
+  return unique.map(code=>({code,admitted:won.has(code)||owners.get(code)===channelId,firstChannelId:won.has(code)?channelId:(owners.get(code)||null)}));
+}
+/** Removes this channel's candidate rows for the given canonical codes.
+ * Used after a lost global claim so a duplicate discovery leaves no residue:
+ * validation never ran for removed rows (the candidate-attempt trigger only
+ * fires on check inserts), so deletion is side-effect free. Returns removed
+ * row count. */
+/** Canonical invite code extracted from a stored locator, mirroring the
+ * TypeScript canonicalizer (all supported Discord URL forms, stripped
+ * query/fragment, first path segment, lowercased). Kept inline here and in
+ * the registry backfill so loser cleanup matches exactly the rows the
+ * registry can name. */
+/** Removes only provisional candidate rows created by the current execution:
+ * callers must pass the timestamp captured before persisting provisional
+ * rows, so pre-existing validated/selected/historical rows for the same
+ * channel are never deleted merely because the channel later loses the
+ * global claim. Returns removed row count. */
+export async function deleteDiscordCandidates(channelId:string,codes:string[],onlyNewerThan:string):Promise<number>{
+  const unique=[...new Set((codes||[]).filter(code=>typeof code==='string'&&!!code))];
+  if(!unique.length||!channelId||!onlyNewerThan)return 0;
+  const db=await getDb();
+  const res=await db.query(
+    `DELETE FROM discord_candidates WHERE channel_id=$1 AND discovered_at>=$3::timestamptz AND lower(split_part(regexp_replace(regexp_replace(normalized_locator, '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1))=ANY($2::text[])`,
+    [channelId,unique,onlyNewerThan]);
+  return res.rowCount||0;
+}
 export async function persistDiscordCandidates(channelId:string,candidates:DiscordAttemptCandidate[]):Promise<void>{const db=await getDb();for(const candidate of candidates){if(!candidate.candidateId)continue;await db.query(`INSERT INTO discord_candidates(channel_id,candidate_id,raw_locator,normalized_locator,locator_type,source_surface,source_url,source_observations) VALUES($1,$2,$3,lower($4),$5,$6,$7,$8) ON CONFLICT(channel_id,normalized_locator) DO UPDATE SET raw_locator=COALESCE(NULLIF(discord_candidates.raw_locator,''),excluded.raw_locator),locator_type=excluded.locator_type,source_surface=COALESCE(discord_candidates.source_surface,excluded.source_surface),source_url=COALESCE(discord_candidates.source_url,excluded.source_url),source_observations=COALESCE((SELECT jsonb_agg(DISTINCT observation) FROM jsonb_array_elements(discord_candidates.source_observations||excluded.source_observations) observation),'[]'::jsonb)`,[channelId,candidate.candidateId,candidate.rawLocator||'',candidate.resolvedLocator||candidate.rawLocator||'',candidate.locatorType||'UNKNOWN',candidate.sourceSurface||null,candidate.sourceUrl||null,JSON.stringify(candidate.observations||[{sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,rawLocator:candidate.rawLocator}])]);}}
 export async function selectDiscordCandidate(channelId:string,candidateId:string):Promise<void>{const db=await getDb();await db.query(`UPDATE discord_candidates SET selected=(candidate_id=$2) WHERE channel_id=$1`,[channelId,candidateId]);}
 export async function appendDiscordCheckAttempts(channelId:string,inviteLocator:string,semanticStatus:string,attempts:Array<{attemptNumber:number;operationalOutcome:string;retryable:boolean;httpStatus?:number;providerErrorClass?:string;providerErrorCode?:number;responseContentType?:string;reason:string;checkedAt:string}>,candidate:DiscordAttemptCandidate={}):Promise<void>{const db=await getDb();for(const attempt of attempts)await db.query(`INSERT INTO discord_check_attempts(attempt_key,channel_id,invite_locator,semantic_status,operational_outcome,retryable,attempt_number,http_status,provider_error_class,reason,provenance,policy_version,checked_at,candidate_id,raw_locator,locator_type,resolved_locator,source_surface,source_url,response_content_type,provider_error_code) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'discord-check-policy-v2',$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT(attempt_key) DO NOTHING`,[`${channelId}:${candidate.candidateId||inviteLocator}:${attempt.checkedAt}:${attempt.attemptNumber}`,channelId,inviteLocator,semanticStatus,attempt.operationalOutcome,attempt.retryable,attempt.attemptNumber,attempt.httpStatus||null,attempt.providerErrorClass||null,attempt.reason,JSON.stringify({provider:'discord',operation:'invite-lookup',candidateLocatorPreserved:true}),attempt.checkedAt,candidate.candidateId||null,candidate.rawLocator||null,candidate.locatorType||null,candidate.resolvedLocator||inviteLocator,candidate.sourceSurface||null,candidate.sourceUrl||null,attempt.responseContentType||null,attempt.providerErrorCode||null]);}

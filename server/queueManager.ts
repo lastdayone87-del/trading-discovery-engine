@@ -29,11 +29,15 @@ import {
   getYouTubeKeyPool,
   appendDiscordCheckAttempts,
   persistDiscordCandidates,
+  claimDiscordInvites,
+  deleteDiscordCandidates,
   selectDiscordCandidate,
   countDiscordInvalidObservations,
   appendExternalAcquisitionObservations,
   getNeighborhoodForQueryRun,
-  markCommunityInspectionStarted
+  markCommunityInspectionStarted,
+  type DiscordAttemptCandidate,
+  type DiscordInviteClaim
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -92,6 +96,7 @@ import { canContinueCommunityInspectionAfterDegradedManualClassification } from 
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
+import { admitDiscordCandidates, buildLegacyDiscordCandidate, discordInviteCodeOf, type DiscordCandidate } from './discordCandidates';
 import { processPendingStagedCandidates } from './candidateStaging';
 
 const WORKER_ID = `worker_${process.pid}`;
@@ -255,6 +260,78 @@ export function resolveBorrowBypassForInspectionMarker(marker?: { isRetryOwnedRe
   return marker?.isRetryOwnedReacquire === true;
 }
 
+/**
+ * Choke-point orchestration for global canonical Discord discard. Crash-safe
+ * ordering per call: persist provisional rows (idempotent upsert), claim all
+ * codes, delete losers. Dependencies are injectable so invocation order,
+ * payloads, and admission outcomes are unit-testable without a database;
+ * production passes the real persist/claim/delete implementations.
+ */
+export interface DiscordChokeDeps {
+  persist(channelId: string, candidates: DiscordAttemptCandidate[]): Promise<void>;
+  claim(items: Array<{ code: string; sourceSurface?: string | null; sourceUrl?: string | null }>, channelId: string): Promise<DiscordInviteClaim[]>;
+  removeLosers(channelId: string, codes: string[], onlyNewerThan: string): Promise<number>;
+}
+export async function admitInspectionDiscordCandidates(
+  structuredCandidates: DiscordCandidate[],
+  foundInvite: string | null | undefined,
+  channelId: string,
+  deps: DiscordChokeDeps = {
+    persist: (targetChannelId, candidates) => persistDiscordCandidates(targetChannelId, candidates),
+    claim: (items, targetChannelId) => claimDiscordInvites(items, targetChannelId),
+    removeLosers: (targetChannelId, codes, onlyNewerThan) => deleteDiscordCandidates(targetChannelId, codes, onlyNewerThan),
+  },
+): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number }> {
+  const toPersist = (list: DiscordCandidate[]) => list.map(candidate => ({
+    candidateId: candidate.candidateId,
+    rawLocator: candidate.rawLocator,
+    locatorType: candidate.locatorType,
+    resolvedLocator: candidate.normalizedLocator,
+    sourceSurface: candidate.sourceSurface,
+    sourceUrl: candidate.sourceUrl,
+    observations: candidate.observations,
+  }));
+  // Provisional watermark: loser cleanup only removes rows created by this
+  // execution (discovered_at at/after the first persist below). Pre-existing
+  // validated/selected/historical rows for the same channel are never deleted
+  // merely because the channel later loses the global claim.
+  const provisionalSince = new Date().toISOString();
+  const preLegacy = !structuredCandidates.length && foundInvite
+    ? buildLegacyDiscordCandidate(foundInvite, discordInviteCodeOf(foundInvite))
+    : null;
+  const provisional = [...structuredCandidates, ...(preLegacy ? [preLegacy] : [])];
+  if (provisional.length) await deps.persist(channelId, toPersist(provisional));
+  const claimSources = new Map<string, { surface: string | null; url: string | null }>();
+  for (const candidate of provisional) {
+    const code = discordInviteCodeOf(candidate.nativeInviteCode);
+    if (code && !claimSources.has(code)) claimSources.set(code, { surface: candidate.sourceSurface || null, url: candidate.sourceUrl || null });
+  }
+  const inviteClaims = await deps.claim([...claimSources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  let admittedCodes = new Set(inviteClaims.filter(claim => claim.admitted).map(claim => claim.code));
+  let admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
+  // A trail-level foundInvite naming a code outside the structured set is
+  // claimed only when nothing was admitted: claiming it unconditionally
+  // would park codes that are never processed, blackholing later channels.
+  const foundCode = discordInviteCodeOf(foundInvite);
+  if (!admission.candidates.length && foundCode && !claimSources.has(foundCode)) {
+    // Persist-before-claim (crash-safe ordering) also applies here: the
+    // legacy row must exist before its code can be claimed.
+    const legacyFallback = buildLegacyDiscordCandidate(foundInvite, foundCode);
+    if (legacyFallback) {
+      await deps.persist(channelId, toPersist([legacyFallback]));
+      const [legacyClaim] = await deps.claim([{ code: foundCode, sourceSurface: null, sourceUrl: null }], channelId);
+      if (legacyClaim.admitted) {
+        admittedCodes = new Set([...admittedCodes, foundCode]);
+        admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
+      } else {
+        await deps.removeLosers(channelId, [foundCode], provisionalSince);
+      }
+    }
+  }
+  const loserCodes = [...claimSources.keys()].filter(code => !admittedCodes.has(code));
+  if (loserCodes.length) await deps.removeLosers(channelId, loserCodes, provisionalSince);
+  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount };
+}
 /**
  * Pure SEARCH worker wall-time split (observability only): quota-wait vs
  * retrieval vs per-channel processing vs total worker time. Persisted in
@@ -1240,6 +1317,7 @@ export async function inspectAndValidateChannel(
   let inspection: Awaited<ReturnType<typeof runChannelInspection>> | null = null;
   let retryDirective: CommunityRetryDirective | undefined;
   let attemptFree = false;
+  let admittedInspection: typeof inspection;
   try {
     // 1. Re-check Country Validation before Discord scanning
     // Provenance boundary: only creator-level fields may enter P2 matching.
@@ -1323,6 +1401,31 @@ export async function inspectAndValidateChannel(
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
+    // Global canonical discard (single authoritative claim for this
+    // inspection). Crash-safe ordering: persist provisional rows first
+    // (idempotent upsert), then claim, then delete losers. A crash between
+    // steps always converges on retry, and the registry can never name a
+    // code whose candidate row was never written in the same execution.
+    // Codes owned by other channels are discarded completely here (row
+    // deleted, no check record, no validation, no projection); same-channel
+    // and unknown codes proceed exactly as before.
+    // Structured candidates are authoritative for discovery; foundInvite is a
+    // compatibility fallback for older inspection results without the
+    // structured collection. The admitted view below preserves that
+    // precedence while enforcing the global canonical discard. The choke
+    // orchestration (persist, claim, delete losers) is injectable for tests;
+    // production passes the real implementations below.
+    const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
+    const chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
+    if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,timestamp:new Date().toISOString()}));
+    admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
+
+    // The admitted inspection view (computed once at the authoritative claim
+    // above) shapes every downstream gate, so a duplicate-only inspection
+    // can neither reconcile nor project a discarded invite.
+
+    // Live About-page hydration can reveal stronger country evidence than the
+
     // Live About-page hydration can reveal stronger country evidence than the
     // search snippet. Re-evaluate before persisting any discovered community.
     // The country voter receives the FRESH channel-sampled descriptions
@@ -1362,8 +1465,13 @@ export async function inspectAndValidateChannel(
       // Preserve its real steps and only project NOT_FOUND when the inspection
       // actually completed without a candidate or an acquisition failure.
       const hasInspectionFailure = inspection.acquisitionStatus === 'ACQUISITION_FAILED' || inspection.acquisitionStatus === 'PARTIALLY_INSPECTED';
-      const hasCandidate = Boolean(inspection.foundInvite || inspection.discordCandidates?.some(candidate => candidate.nativeInviteCode));
-      if (!hasInspectionFailure && !hasCandidate) {
+      const hasCandidate = Boolean(admittedInspection.foundInvite || admittedInspection.discordCandidates?.some(candidate => candidate.nativeInviteCode));
+      // A duplicate-only inspection must never erase an already-validated
+      // Discord state: without admitted candidates there is nothing new to
+      // project, so a VALIDATED/ACTIVE-or-DEAD channel keeps its outcome.
+      // Mirrors the alreadyValidatedSuccess guard of the normal path below.
+      const alreadyValidatedDiscord=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+      if (!hasInspectionFailure && !hasCandidate && !alreadyValidatedDiscord) {
         channel.discord_status='NOT_FOUND';
         channel.discord_validation_status='COMPLETED';
         channel.discord_resolution_status='NOT_ATTEMPTED';
@@ -1371,7 +1479,7 @@ export async function inspectAndValidateChannel(
         channel.discord_relevance_status='NOT_CHECKED';
         channel.discord_discovery_status='NOT_DISCOVERED';
       } else if (hasCandidate) {
-        reconcileDiscordDiscoveryFromInspection(channel, inspection, {validationProjected:false});
+        reconcileDiscordDiscoveryFromInspection(channel, admittedInspection, {validationProjected:false});
       }
       channel.inspection_trail=[countryStep, ...inspection.steps, liveCountryStep];
       return;
@@ -1396,15 +1504,14 @@ export async function inspectAndValidateChannel(
 
     // Structured candidates are authoritative for discovery; foundInvite is a
     // compatibility fallback for older inspection results without the
-    // structured collection.
-    const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
-    const discoveredInvite=structuredCandidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||inspection.foundInvite||null;
+    // structured collection. Admission was decided once at the authoritative
+    // claim above; this block validates the admitted winners only.
+    const candidates=chokeAdmission.candidates;
+    const discoveredInvite=chokeAdmission.discoveredInvite;
     if (discoveredInvite) {
       // Validate bounded native candidates until a high-confidence trading
       // community is found. A live-but-ambiguous or live-but-non-trading first
       // invite is a fallback, not a reason to suppress a stronger later invite.
-      const candidates=structuredCandidates.length?structuredCandidates:[{candidateId:`legacy:${discoveredInvite}`,locatorType:'NATIVE_INVITE' as const,sourceSurface:'CHANNEL_EXTERNAL_LINKS' as const,rawLocator:discoveredInvite,nativeInviteCode:discoveredInvite,normalizedLocator:`https://discord.gg/${discoveredInvite}`,extractionConfidence:'EXPLICIT' as const}];
-      await persistDiscordCandidates(channel.channel_id,candidates.map(candidate=>({candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:candidate.normalizedLocator,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,observations:candidate.observations})));
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
       for(const candidate of candidates){
@@ -1439,7 +1546,7 @@ export async function inspectAndValidateChannel(
       channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
       channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:attemptFree?Math.max(0,channel.scan_attempts):nextChannelScanAttempts(channel.scan_attempts,false);
       channel.last_checked=now;
-      reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:true});
+      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:true});
       retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined,retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'}:undefined;
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
@@ -1456,7 +1563,7 @@ export async function inspectAndValidateChannel(
         channel.discord_resolution_status=channel.discord_resolution_status||'RESOLVED';
         channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':'NOT_DISCOVERED';
       }
-      reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
+      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
       retryDirective=inspection.retryDirective;
       attemptFree=Boolean(retryDirective?.attemptFree);
       channel.scan_status='FAILED';
@@ -1478,14 +1585,16 @@ export async function inspectAndValidateChannel(
       // Only a complete inspection with no prior discovery may project absence.
       if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
       else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
-      reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
+      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
       channel.last_checked = now;
     }
 
   } catch (err) {
     // Preserve any structured discovery even when validation or later
-    // processing throws. This must run before catch persistence and retry.
-    reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
+    // processing throws. If the choke-point claim itself failed, fall back to
+    // the raw inspection (pre-existing behavior): this must run before catch
+    // persistence and retry.
+    reconcileDiscordDiscoveryFromInspection(channel,admittedInspection??inspection,{validationProjected:false});
     attemptFree=isAttemptFreeCommunityFailure(err);
     retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err),retryReason:retryReasonFromError(err)}:undefined;
     if(!attemptFree)channel.scan_attempts++;
