@@ -51,21 +51,32 @@ test('already-terminal failQueryRun still reaches observation capture without mu
   );
   // The already-terminal branch rolls back and falls through — it must not
   // return before the capture step, or a later call could never recover an
-  // observation missed by an earlier capture failure.
+  // observation missed by an earlier capture failure. Scope both assertions
+  // to the terminal branch body itself: the wider range reaching the catch
+  // block contains a second ROLLBACK that must not satisfy this check.
   assert.match(failure, /if \(!run\.rowCount\)/);
-  const noopToCapture = failure.slice(failure.indexOf('if (!run.rowCount)'), failure.indexOf('captureCompletedRunObservation'));
-  assert.match(noopToCapture, /ROLLBACK/);
-  assert.doesNotMatch(noopToCapture, /return;/);
+  const terminalBranch = failure.slice(failure.indexOf('if (!run.rowCount)'));
+  const terminalBody = terminalBranch.slice(0, terminalBranch.indexOf('} else {'));
+  assert.match(terminalBody, /ROLLBACK/);
+  assert.doesNotMatch(terminalBody, /return;/);
   // Capture runs after the client is released, so it is reachable from both
   // the mutated and the already-terminal paths, and stays best-effort.
   assert.ok(failure.indexOf('client.release()') < failure.indexOf('captureCompletedRunObservation'));
   assert.match(failure, /captureCompletedRunObservation\(runId\)\.catch\(/);
-  // All mutations (library release, quota release, attribution insert,
-  // COMMIT) live in the mutated branch only: the terminal path writes
-  // nothing and the attribution row is inserted exactly once.
+  // All four mutations live exclusively in the mutated (else) branch: the
+  // terminal path writes nothing and the attribution row is inserted exactly
+  // once.
   assert.match(failure, /if \(!run\.rowCount\)[\s\S]*\} else \{[\s\S]*INSERT INTO query_run_accounting_attributions/);
   assert.equal(failure.match(/INSERT INTO query_run_accounting_attributions/g)?.length, 1);
-  assert.match(failure, /\} else \{[\s\S]*UPDATE query_library SET reserved_at=NULL[\s\S]*await client\.query\('COMMIT'\)/);
+  const mutatedBranch = failure.slice(failure.indexOf('} else {'), failure.indexOf('} catch (error)'));
+  for (const required of [
+    'UPDATE query_library SET reserved_at=NULL',
+    "UPDATE quota_reservations SET status='RELEASED'",
+    'INSERT INTO query_run_accounting_attributions',
+    "await client.query('COMMIT')",
+  ]) {
+    assert.ok(mutatedBranch.includes(required), `mutated branch must contain: ${required}`);
+  }
 });
 
 test('benchmark opportunity identity is designated pre-selection, never served-query derived', async () => {
