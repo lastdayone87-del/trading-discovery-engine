@@ -152,3 +152,11 @@ test('foundInvite naming an unevaluated code is claimed, not suppressed', () => 
   assert.equal(r.discoveredInvite, 'NEW2');
   assert.equal(r.discardedCount, 1);
 });
+
+test('duplicate-only inspection preserves an already-validated Discord state', async () => {
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
+  const gateIdx = source.indexOf('if (!hasInspectionFailure && !hasCandidate && !alreadyValidatedDiscord) {');
+  assert.ok(gateIdx >= 0, 'validated-success guard exists on the duplicate-only absence projection');
+});

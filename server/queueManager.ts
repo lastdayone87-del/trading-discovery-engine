@@ -1421,7 +1421,12 @@ export async function inspectAndValidateChannel(
       // actually completed without a candidate or an acquisition failure.
       const hasInspectionFailure = inspection.acquisitionStatus === 'ACQUISITION_FAILED' || inspection.acquisitionStatus === 'PARTIALLY_INSPECTED';
       const hasCandidate = Boolean(admittedInspection.foundInvite || admittedInspection.discordCandidates?.some(candidate => candidate.nativeInviteCode));
-      if (!hasInspectionFailure && !hasCandidate) {
+      // A duplicate-only inspection must never erase an already-validated
+      // Discord state: without admitted candidates there is nothing new to
+      // project, so a VALIDATED/ACTIVE-or-DEAD channel keeps its outcome.
+      // Mirrors the alreadyValidatedSuccess guard of the normal path below.
+      const alreadyValidatedDiscord=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+      if (!hasInspectionFailure && !hasCandidate && !alreadyValidatedDiscord) {
         channel.discord_status='NOT_FOUND';
         channel.discord_validation_status='COMPLETED';
         channel.discord_resolution_status='NOT_ATTEMPTED';
