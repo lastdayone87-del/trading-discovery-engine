@@ -480,7 +480,7 @@ test('repeat-failure skip stays authoritative over cache borrowing', async () =>
   );
 });
 
-test('retry-owned reacquisition bypasses borrowed coverage and re-crawls', async () => {
+test('retry on complete coverage still borrows; only incomplete sites reacquire', async () => {
   const { store } = makeStore();
   const fetched: string[] = [];
   const fetchImpl = makeFetch(fetched);
@@ -497,11 +497,16 @@ test('retry-owned reacquisition bypasses borrowed coverage and re-crawls', async
   const afterFirst = fetched.length;
   assert.ok(afterFirst >= 1, 'first inspection crawls');
 
-  // Same channel retrying an unresolved acquisition must re-acquire rather
-  // than borrow its own incomplete coverage in a zero-fetch loop.
+  // The first crawl completed the row, so even a retry-owned run borrows it:
+  // there is no incomplete coverage to reacquire. Incomplete rows (covered
+  // by the multi-seed test below) are the only bypass case.
   const retry = await runChannelInspection({ ...base, ...channel, bypassBorrowedCoverage: true });
-  assert.ok(fetched.length > afterFirst, 'retry-owned inspection re-crawls instead of borrowing');
-  assert.equal(retry.foundInvite, 'apexroom', 'retry rediscovers through its own fetch');
+  assert.equal(fetched.length, afterFirst, 'retry on complete coverage still borrows with zero fetches');
+  assert.equal(retry.foundInvite, null, 'no candidates flow on a borrow, even for the same channel');
+  assert.ok(
+    (retry.acquisitionOutcomes || []).some(item => (item as unknown as Record<string, unknown>).siteCacheHit === true),
+    'retry carries borrow-marked coverage',
+  );
 
   // A different creator on the same fresh row still borrows with zero fetches
   // and receives zero candidates.
@@ -519,4 +524,69 @@ test('retry-owned reacquisition bypasses borrowed coverage and re-crawls', async
     (other.acquisitionOutcomes || []).some(item => (item as unknown as Record<string, unknown>).siteCacheHit === true),
     'later creator carries borrow-marked coverage',
   );
+});
+
+test('retry reacquires only the incomplete site; fresh covered sites still borrow', async () => {
+  const { store, rows } = makeStore();
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: unknown) => {
+    const target = String(url);
+    fetched.push(target);
+    if (target.includes('site-a.example')) {
+      return new Response('<html><body>Join our desk https://discord.gg/ownroom today</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    return new Response('<html><body>plain creator site</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+  }) as typeof fetch;
+  const now = new Date().toISOString();
+  const seedRow = (identity: string, outcome: string, retryable: boolean, invite: string | null) => rows.set(identity, {
+    siteIdentity: identity,
+    identityTier: 'A',
+    identityBasis: 'ICANN registrable domain',
+    canonicalUrl: `https://${identity}/`,
+    finalUrl: `https://${identity}/`,
+    outcome,
+    retryable,
+    httpStatus: 200,
+    failureClass: '',
+    detail: 'injected',
+    payloadChecksum: null,
+    candidates: invite ? [{ candidateId: `${identity}-c1`, nativeInviteCode: invite, sourceUrl: `https://${identity}/` }] : [],
+    observations: [{ requestedUrl: `https://${identity}/`, rootUrl: `https://${identity}/`, outcome, retryable, detail: 'injected', observedAt: now }],
+    renderedCovered: false,
+    provenance: {},
+    firstObservedAt: now,
+    lastObservedAt: now,
+    observedCount: 1,
+  });
+  // Site A: incomplete/retryable coverage owning the retry. Sites B and C:
+  // fresh complete coverage, each holding another creator's invite.
+  seedRow('site-a.example', 'PARTIALLY_INSPECTED', true, null);
+  seedRow('site-b.example', 'FOUND', false, 'invite-b');
+  seedRow('site-c.example', 'INSPECTED_NO_MATCH', false, 'invite-c');
+
+  const result = await runChannelInspection({
+    videoDescriptions: DESCS,
+    externalFetchImpl: fetchImpl,
+    urlFailureHistoryLoader: async () => [],
+    siteInspectionStore: store,
+    channelId: 'UCRetryScoped00000001',
+    channelName: 'Scoped Retry',
+    channelBio: 'Trading educator',
+    channelLinks: ['https://site-a.example/', 'https://site-b.example/', 'https://site-c.example/'],
+    bypassBorrowedCoverage: true,
+  });
+
+  // Only the incomplete site is reacquired.
+  assert.ok(fetched.some(url => url.includes('site-a.example')), 'retry-owned incomplete site re-crawled');
+  assert.ok(!fetched.some(url => url.includes('site-b.example')), 'fresh covered site B not fetched');
+  assert.ok(!fetched.some(url => url.includes('site-c.example')), 'fresh covered site C not fetched');
+  // Fresh covered sites contribute borrow-marked coverage only.
+  const borrowed = (result.acquisitionOutcomes || []).filter(item => (item as unknown as Record<string, unknown>).siteCacheHit === true);
+  assert.ok(borrowed.some(item => item.requestedUrl === 'https://site-b.example/'), 'site B coverage borrowed');
+  assert.ok(borrowed.some(item => item.requestedUrl === 'https://site-c.example/'), 'site C coverage borrowed');
+  // No cached invite transfers; the retry rediscovers its own site's invite.
+  const codes = (result.discordCandidates || []).map(c => c.nativeInviteCode);
+  assert.ok(!codes.includes('invite-b'), 'no transfer from site B');
+  assert.ok(!codes.includes('invite-c'), 'no transfer from site C');
+  assert.ok(codes.includes('ownroom'), 'retry rediscovers from its own reacquired site');
 });

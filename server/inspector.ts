@@ -1010,7 +1010,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   if(seedCachedRow&&seedReusable&&!seedCovered){
     step5Logs.push(`[Site cache] ${item.url} not covered by cached inspection for ${seedCachedRow.siteIdentity} (cached ${seedCachedRow.lastObservedAt}); recrawling for full path coverage.`);
   }
-  if(seedCachedRow&&seedReusable&&seedCovered&&!channelData.bypassBorrowedCoverage){
+  if(seedCachedRow&&seedReusable&&seedCovered&&!(channelData.bypassBorrowedCoverage&&(seedCachedRow.retryable||seedCachedRow.outcome==='PARTIALLY_INSPECTED'))){
     // Coverage-only borrow (cross-creator invariant): a freshly covered site
     // is never re-crawled for a later creator, and the originating
     // investigation's discoveries are never transferred. Only coverage
@@ -1020,17 +1020,17 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     // intentionally absent here: site-driven recrawls (stale TTL, uncovered
     // paths) still happen above and below; creator difference alone never
     // triggers a new crawl.
-    // Retry-owned reacquisitions opt out via bypassBorrowedCoverage (set only
-    // by the retry worker): an unresolved partial/timeout inspection for the
-    // same channel must re-crawl rather than borrow its own incomplete
-    // coverage in a loop.
+    // Retry-owned reacquisitions bypass borrowing ONLY for incomplete site
+    // coverage (retryable or PARTIALLY_INSPECTED): the unresolved site is
+    // re-acquired, while unrelated freshly covered sites still borrow. The
+    // flag alone never disables borrowing for complete coverage.
     const borrowed=buildBorrowedSiteInspection(seedCachedRow,{requestedUrl:item.url,surface:'CREATOR_WEBSITES',required:false,wrapperUrl:item.wrapperUrl,observedAt:now});
     step5Logs.push(`[Site cache] ${item.url} reuses site inspection for ${seedCachedRow.siteIdentity} (observed ${seedCachedRow.lastObservedAt}); no recrawl, no borrowed candidates.`);
     acquisitionOutcomes.push(...borrowed.observations as unknown as ExternalAcquisitionObservation[]);
     continue;
   }
   if(seedCachedRow&&seedReusable&&seedCovered){
-    step5Logs.push(`[Site cache] ${item.url} bypasses borrowed coverage for retry-owned reacquisition; re-crawling.`);
+    step5Logs.push(`[Site cache] ${item.url} bypasses borrowed coverage for retry-owned reacquisition of incomplete coverage; re-crawling.`);
   }
   step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights)).crawlRes;acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every discovered website URL — including auxiliary,
 // broker/affiliate-pattern, promotional, and dotless single-label hosts —
