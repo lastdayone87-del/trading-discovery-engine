@@ -1546,8 +1546,10 @@ export async function inspectAndValidateChannel(
 
   } catch (err) {
     // Preserve any structured discovery even when validation or later
-    // processing throws. This must run before catch persistence and retry.
-    reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
+    // processing throws. If the choke-point claim itself failed, fall back to
+    // the raw inspection (pre-existing behavior): this must run before catch
+    // persistence and retry.
+    reconcileDiscordDiscoveryFromInspection(channel,admittedInspection??inspection,{validationProjected:false});
     attemptFree=isAttemptFreeCommunityFailure(err);
     retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err),retryReason:retryReasonFromError(err)}:undefined;
     if(!attemptFree)channel.scan_attempts++;
