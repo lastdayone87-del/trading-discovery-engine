@@ -26,3 +26,9 @@ test('queue status exposes only the aggregate community retry worker health read
 });
 
 assert.ok(true);
+
+test('retry worker reacquires instead of borrowing its own incomplete coverage', () => {
+  const qm = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(qm, /isRetryOwnedReacquire:true/);
+  assert.match(qm, /bypassBorrowedCoverage: executionMarker\?\.isRetryOwnedReacquire === true/);
+});

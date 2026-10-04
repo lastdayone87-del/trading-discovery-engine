@@ -108,6 +108,7 @@ test('borrowed observations refresh the audit trail but preserve site-facts', ()
   assert.equal(first.siteIdentity, 'apextrader.com');
   assert.equal(first.siteObservedAt, hoursAgo(1));
   assert.deepEqual((borrowed as unknown as Record<string, unknown>).candidates, undefined, 'borrowed inspections carry no candidates across creators');
+  assert.deepEqual(borrowed.row.candidates, [], 'borrowed row is candidate-free at the API boundary');
 });
 
 test('coverage gates negative reuse but never blocks positive site-facts', () => {

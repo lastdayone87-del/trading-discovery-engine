@@ -479,3 +479,44 @@ test('repeat-failure skip stays authoritative over cache borrowing', async () =>
     'new success evidence resets the skip through existing policy',
   );
 });
+
+test('retry-owned reacquisition bypasses borrowed coverage and re-crawls', async () => {
+  const { store } = makeStore();
+  const fetched: string[] = [];
+  const fetchImpl = makeFetch(fetched);
+  const base = { videoDescriptions: DESCS, externalFetchImpl: fetchImpl, urlFailureHistoryLoader: async () => [], siteInspectionStore: store } as const;
+  const channel = {
+    channelId: 'UCRetryOwned00000001',
+    channelName: 'Retry Owner',
+    channelBio: 'Trading educator',
+    channelLinks: ['https://apextrader.com/pricing'],
+  };
+
+  const first = await runChannelInspection({ ...base, ...channel });
+  assert.equal(first.foundInvite, 'apexroom', 'first inspection discovers its own invite');
+  const afterFirst = fetched.length;
+  assert.ok(afterFirst >= 1, 'first inspection crawls');
+
+  // Same channel retrying an unresolved acquisition must re-acquire rather
+  // than borrow its own incomplete coverage in a zero-fetch loop.
+  const retry = await runChannelInspection({ ...base, ...channel, bypassBorrowedCoverage: true });
+  assert.ok(fetched.length > afterFirst, 'retry-owned inspection re-crawls instead of borrowing');
+  assert.equal(retry.foundInvite, 'apexroom', 'retry rediscovers through its own fetch');
+
+  // A different creator on the same fresh row still borrows with zero fetches
+  // and receives zero candidates.
+  const beforeBorrow = fetched.length;
+  const other = await runChannelInspection({
+    ...base,
+    channelId: 'UCRetryOther00000002',
+    channelName: 'Other Creator',
+    channelBio: 'Another educator',
+    channelLinks: ['https://apextrader.com/'],
+  });
+  assert.equal(fetched.length, beforeBorrow, 'later creator performs zero fetches on fresh coverage');
+  assert.equal(other.foundInvite, null, 'later creator receives no borrowed invite');
+  assert.ok(
+    (other.acquisitionOutcomes || []).some(item => (item as unknown as Record<string, unknown>).siteCacheHit === true),
+    'later creator carries borrow-marked coverage',
+  );
+});

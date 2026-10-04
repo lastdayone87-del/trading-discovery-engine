@@ -41,6 +41,9 @@ export interface CachedSiteInspection {
 }
 
 export interface BorrowedSiteInspection {
+  /** The covering row with candidates explicitly stripped: the borrow result
+   * is candidate-free at the API boundary so no future caller can reintroduce
+   * cross-creator candidate propagation through `borrowed.row.candidates`. */
   row: CachedSiteInspection;
   /** Borrowed observations reuse the cached outcome verbatim — including
    * PARTIALLY_INSPECTED and ACQUISITION_FAILED — so downstream retry and
@@ -105,7 +108,7 @@ export function buildBorrowedSiteInspection(
       siteObservedAt: row.lastObservedAt,
     };
   });
-  return { row, observations };
+  return { row: { ...row, candidates: [] }, observations };
 }
 
 /** Root-page terminal for coverage rows: reflects ONLY the root page's own
