@@ -57,7 +57,7 @@ function makeFetch(fetched: string[]) {
   }) as typeof fetch;
 }
 
-test('Trader A/B: shared affiliate site is crawled once, reused with separate associations', async () => {
+test('Trader A/B: shared affiliate site is crawled once; coverage reused, discoveries never transferred', async () => {
   const { store, rows, links } = makeStore();
   const fetched: string[] = [];
   const fetchImpl = makeFetch(fetched);
@@ -96,14 +96,17 @@ test('Trader A/B: shared affiliate site is crawled once, reused with separate as
   assert.ok(borrowed.length >= 1, 'Trader B carries borrowed site observations');
   assert.ok(borrowed.every(item => item.requestedUrl === 'https://apextrader.com/'), 'borrowed rows are re-attributed to Trader B');
   assert.ok(borrowed.every(item => item.surface === 'CREATOR_WEBSITES'));
-  assert.equal(b.foundInvite, 'apexroom', 'reused site-facts still surface the invite for Trader B');
+  // Cross-creator invariant: coverage is reused, discoveries are not. Trader
+  // B never crawled the affiliate, so Trader A's invite must not surface for
+  // Trader B in any form — no Step-4 invite, no retained candidate.
+  assert.equal(b.foundInvite, null, 'no borrowed invite surfaces for Trader B');
+  const bApexCandidates = (b.discordCandidates || []).filter(c => c.nativeInviteCode === 'apexroom');
+  assert.equal(bApexCandidates.length, 0, 'no affiliate candidate transferred to Trader B');
   assert.deepEqual(
     links.filter(link => link.channelId === 'UCTraderB00000000000002').map(link => link.siteIdentity).sort(),
     ['apextrader.com', 'soso.com'],
     'Trader B associated to the affiliate separately despite no crawl',
   );
-  const bApexCandidates = (b.discordCandidates || []).filter(c => c.nativeInviteCode === 'apexroom');
-  assert.ok(bApexCandidates.length >= 1, 'affiliate candidate present for Trader B');
   assert.ok(rows.has('soso.com'), 'new site cached after Trader B');
 });
 
@@ -298,15 +301,21 @@ test('shared shortener host: distinct wrappers coexist, resolve independently, n
   const revisitA = await run('UCShortCoexist000003', 'Wrapper A again', 'https://shortener.com/a');
   const revisitB = await run('UCShortCoexist000004', 'Wrapper B again', 'https://shortener.com/b');
   assert.equal(fetched.length, beforeRevisits, 'revisits reuse their own destinations without recrawling');
-  assert.equal(revisitA.foundInvite, 'invitea', 'A never borrows B facts');
-  assert.equal(revisitB.foundInvite, 'inviteb', 'B never borrows A facts');
+  // Cross-creator invariant: revisits borrow coverage only. Neither revisit
+  // inherits the other destination's invite despite resolving through the
+  // shared alias host.
+  assert.equal(revisitA.foundInvite, null, 'A revisit carries no borrowed invite');
+  assert.equal(revisitB.foundInvite, null, 'B never borrows A facts');
+  assert.ok(!(revisitA.discordCandidates || []).some(c => c.nativeInviteCode === 'invitea' || c.nativeInviteCode === 'inviteb'));
+  assert.ok(!(revisitB.discordCandidates || []).some(c => c.nativeInviteCode === 'invitea' || c.nativeInviteCode === 'inviteb'));
 
   await run('UCShortCoexist000005', 'Wrapper C', 'https://shortener.com/c');
   assert.equal((rows.get('shortener.com')?.observations as unknown[]).length, 3, 'same-destination wrappers accumulate bindings');
   const beforeCRevisit = fetched.length;
   const revisitC = await run('UCShortCoexist000006', 'Wrapper C again', 'https://shortener.com/c');
   assert.equal(fetched.length, beforeCRevisit, 'same-destination aliases deduplicate repeat inspections');
-  assert.equal(revisitC.foundInvite, 'invitea');
+  assert.equal(revisitC.foundInvite, null, 'C carries coverage only, never the destination invite');
+  assert.ok(!(revisitC.discordCandidates || []).some(c => c.nativeInviteCode === 'invitea'));
 });
 
 test('stale binding recrawls while a freshly observed sibling borrows', async () => {
@@ -381,7 +390,7 @@ function makeTradingBase(store: ReturnType<typeof makeStore>['store'], fetched: 
   } as const;
 }
 
-test('timeout render leaves renderedCovered false so the next creator re-renders', async () => {
+test('timeout render leaves renderedCovered false but the next creator still borrows without recrawling', async () => {
   const { store, rows } = makeStore();
   const fetched: string[] = [];
   const renderCalls: string[] = [];
@@ -395,8 +404,14 @@ test('timeout render leaves renderedCovered false so the next creator re-renders
   assert.equal(renderCalls.length, 1, 'first inspection renders');
   assert.equal(rows.get('rendersite.example')?.renderedCovered, false, 'timeout never satisfies rendered coverage');
 
-  await run('UCRenderTimeout00000002', 'Render B');
-  assert.equal(renderCalls.length, 2, 'incomplete coverage triggers rendered acquisition again');
+  const fetchedAfterFirst = fetched.length;
+  const b = await run('UCRenderTimeout00000002', 'Render B');
+  assert.equal(renderCalls.length, 1, 'fresh covered borrow never triggers a creator-driven re-render');
+  assert.equal(fetched.length, fetchedAfterFirst, 'fresh covered borrow performs zero fetches');
+  assert.ok(
+    (b.acquisitionOutcomes || []).some(item => (item as unknown as Record<string, unknown>).siteCacheHit === true),
+    'borrowed coverage marked without new crawling',
+  );
 });
 
 test('complete render satisfies coverage and is borrowed without re-render', async () => {
