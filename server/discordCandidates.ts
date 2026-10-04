@@ -33,6 +33,59 @@ export interface DiscordCandidate {
 const reserved=new Set(['channels','guilds','store','download','nitro','login','register','api','widget','terms','privacy','branding','jobs','before','after','next','prev','index','home','about','contact','faq','support','invite','oauth2','template']);
 const id=(value:object)=>createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0,32);
 export const canonicalDiscordInviteId=(code:string)=>`discord:${String(code||'').trim().toLowerCase()}`;
+/** Canonical invite code shared by every layer that must agree on Discord
+ * invite identity (registry claims, choke-point filtering, tests). Accepts a
+ * bare code or any Discord URL form (discord.gg, discord.com/invite, dsc.gg,
+ * …) in any casing; returns the lowercase code, or null when unparseable
+ * (callers fail open and preserve legacy behavior for such inputs). */
+export interface DiscordInviteClaimInput {code:string;admitted:boolean}
+export interface AdmittedDiscordCandidates {
+  candidates:DiscordCandidate[];
+  discoveredInvite:string|null;
+  discardedCount:number;
+}
+/** Canonical invite code shared by every layer that must agree on Discord
+ * invite identity (registry claims, choke-point filtering, tests). Accepts a
+ * bare code or any Discord URL form (discord.gg, discord.com/invite, dsc.gg,
+ * …) in any casing; returns the lowercase code, or null when unparseable
+ * (callers fail open and preserve legacy behavior for such inputs). */
+export function discordInviteCodeOf(value:string|null|undefined):string|null{
+  const text=String(value||'').trim();
+  if(!text)return null;
+  const match=text.match(/(?:discord\.gg|discord\.(?:com|app)\/invite|discordapp\.com\/invite|discord\.(?:me|io)|dsc\.gg)\/([^\s"'<>\/?#&]+)/i);
+  const raw=match?match[1]:text;
+  if(/[\s\/]/.test(raw))return null;
+  const code=raw.trim().toLowerCase();
+  if(code.length<2||code.length>128)return null;
+  return code;
+}
+/**
+ * Pure admission decision for the global canonical-discard choke point.
+ * Given already-resolved registry claims, partitions structured candidates
+ * into admitted ones and computes the discovered invite, suppressing the
+ * legacy foundInvite fallback when it names a discarded (globally known)
+ * code so it cannot resurrect the duplicate downstream. Unparseable values
+ * fail open (admitted) to preserve legacy behavior. No I/O.
+ */
+export function admitDiscordCandidates(
+  structured:DiscordCandidate[],
+  foundInvite:string|null|undefined,
+  admittedCodes:Set<string>,
+):AdmittedDiscordCandidates{
+  const admitted=structured.filter(candidate=>{const code=discordInviteCodeOf(candidate.nativeInviteCode);return !code||admittedCodes.has(code);});
+  let legacy:DiscordCandidate|null=null;
+  if(!admitted.length&&foundInvite){
+    const legacyCode=discordInviteCodeOf(foundInvite);
+    if(!legacyCode){
+      legacy={candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:foundInvite,normalizedLocator:`https://discord.gg/${foundInvite}`,extractionConfidence:'EXPLICIT'};
+    }else if(admittedCodes.has(legacyCode)){
+      legacy={candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:foundInvite,normalizedLocator:`https://discord.gg/${legacyCode}`,extractionConfidence:'EXPLICIT'};
+    }
+  }
+  const candidates=legacy?[...admitted,legacy]:admitted;
+  const discardedCount=structured.length-admitted.length;
+  return {candidates,discoveredInvite:candidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||null,discardedCount};
+}
 const candidate=(value:Omit<DiscordCandidate,'candidateId'>):DiscordCandidate=>{
   const canonicalInviteId=value.nativeInviteCode?canonicalDiscordInviteId(value.nativeInviteCode):undefined;
   const observation:DiscordCandidateObservation={sourceSurface:value.sourceSurface,sourceUrl:value.sourceUrl,rawLocator:value.rawLocator,sourcePageUrl:value.sourceUrl,extractionConfidence:value.extractionConfidence};

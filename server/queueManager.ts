@@ -29,6 +29,7 @@ import {
   getYouTubeKeyPool,
   appendDiscordCheckAttempts,
   persistDiscordCandidates,
+  claimDiscordInvites,
   selectDiscordCandidate,
   countDiscordInvalidObservations,
   appendExternalAcquisitionObservations,
@@ -92,6 +93,7 @@ import { canContinueCommunityInspectionAfterDegradedManualClassification } from 
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
+import { admitDiscordCandidates, discordInviteCodeOf, type DiscordCandidate } from './discordCandidates';
 import { processPendingStagedCandidates } from './candidateStaging';
 
 const WORKER_ID = `worker_${process.pid}`;
@@ -1398,13 +1400,21 @@ export async function inspectAndValidateChannel(
     // compatibility fallback for older inspection results without the
     // structured collection.
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
-    const discoveredInvite=structuredCandidates.find(candidate=>candidate.nativeInviteCode)?.nativeInviteCode||inspection.foundInvite||null;
+    // Global canonical discard: claim every discovered invite code before any
+    // candidate row is created or any validation runs. Unknown codes are
+    // claimed and admitted; codes owned by this channel keep existing
+    // behavior; codes owned by other channels are discarded completely here
+    // (no row, no check record, no validation, no projection).
+    const provisionalFoundCode=!structuredCandidates.length&&inspection.foundInvite?discordInviteCodeOf(inspection.foundInvite):null;
+    const claimableCodes=[...new Set([...structuredCandidates.map(candidate=>discordInviteCodeOf(candidate.nativeInviteCode)),provisionalFoundCode].filter((code):code is string=>!!code))];
+    const inviteClaims=await claimDiscordInvites(claimableCodes,channel.channel_id);
+    const {candidates,discoveredInvite,discardedCount}=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,new Set(inviteClaims.filter(claim=>claim.admitted).map(claim=>claim.code)));
+    if(discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount,timestamp:new Date().toISOString()}));
     if (discoveredInvite) {
+      await persistDiscordCandidates(channel.channel_id,candidates.map(candidate=>({candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:candidate.normalizedLocator,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,observations:candidate.observations})));
       // Validate bounded native candidates until a high-confidence trading
       // community is found. A live-but-ambiguous or live-but-non-trading first
       // invite is a fallback, not a reason to suppress a stronger later invite.
-      const candidates=structuredCandidates.length?structuredCandidates:[{candidateId:`legacy:${discoveredInvite}`,locatorType:'NATIVE_INVITE' as const,sourceSurface:'CHANNEL_EXTERNAL_LINKS' as const,rawLocator:discoveredInvite,nativeInviteCode:discoveredInvite,normalizedLocator:`https://discord.gg/${discoveredInvite}`,extractionConfidence:'EXPLICIT' as const}];
-      await persistDiscordCandidates(channel.channel_id,candidates.map(candidate=>({candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:candidate.normalizedLocator,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,observations:candidate.observations})));
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<Awaited<ReturnType<typeof validateDiscordInvite>>>=[];
       for(const candidate of candidates){
