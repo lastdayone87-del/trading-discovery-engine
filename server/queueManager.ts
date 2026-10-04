@@ -270,7 +270,7 @@ export function resolveBorrowBypassForInspectionMarker(marker?: { isRetryOwnedRe
 export interface DiscordChokeDeps {
   persist(channelId: string, candidates: DiscordAttemptCandidate[]): Promise<void>;
   claim(items: Array<{ code: string; sourceSurface?: string | null; sourceUrl?: string | null }>, channelId: string): Promise<DiscordInviteClaim[]>;
-  removeLosers(channelId: string, codes: string[]): Promise<number>;
+  removeLosers(channelId: string, codes: string[], onlyNewerThan: string): Promise<number>;
 }
 export async function admitInspectionDiscordCandidates(
   structuredCandidates: DiscordCandidate[],
@@ -279,7 +279,7 @@ export async function admitInspectionDiscordCandidates(
   deps: DiscordChokeDeps = {
     persist: (targetChannelId, candidates) => persistDiscordCandidates(targetChannelId, candidates),
     claim: (items, targetChannelId) => claimDiscordInvites(items, targetChannelId),
-    removeLosers: (targetChannelId, codes) => deleteDiscordCandidates(targetChannelId, codes),
+    removeLosers: (targetChannelId, codes, onlyNewerThan) => deleteDiscordCandidates(targetChannelId, codes, onlyNewerThan),
   },
 ): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number }> {
   const toPersist = (list: DiscordCandidate[]) => list.map(candidate => ({
@@ -291,6 +291,11 @@ export async function admitInspectionDiscordCandidates(
     sourceUrl: candidate.sourceUrl,
     observations: candidate.observations,
   }));
+  // Provisional watermark: loser cleanup only removes rows created by this
+  // execution (discovered_at at/after the first persist below). Pre-existing
+  // validated/selected/historical rows for the same channel are never deleted
+  // merely because the channel later loses the global claim.
+  const provisionalSince = new Date().toISOString();
   const preLegacy = !structuredCandidates.length && foundInvite
     ? buildLegacyDiscordCandidate(foundInvite, discordInviteCodeOf(foundInvite))
     : null;
@@ -319,12 +324,12 @@ export async function admitInspectionDiscordCandidates(
         admittedCodes = new Set([...admittedCodes, foundCode]);
         admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
       } else {
-        await deps.removeLosers(channelId, [foundCode]);
+        await deps.removeLosers(channelId, [foundCode], provisionalSince);
       }
     }
   }
   const loserCodes = [...claimSources.keys()].filter(code => !admittedCodes.has(code));
-  if (loserCodes.length) await deps.removeLosers(channelId, loserCodes);
+  if (loserCodes.length) await deps.removeLosers(channelId, loserCodes, provisionalSince);
   return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount };
 }
 /**

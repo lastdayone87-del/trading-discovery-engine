@@ -57,7 +57,7 @@ test('structured admission suppresses the legacy fallback for the same code', ()
   assert.equal(r.discardedCount, 0);
 });
 
-test('different URL forms and casings collapse to one admitted identity', () => {
+test('different URL forms map to the same code and stay admitted when owned', () => {
   const r = admitDiscordCandidates(
     [cand('https://discord.com/invite/ABC123'), cand('https://discord.gg/abc123/')],
     null,
@@ -137,8 +137,10 @@ test('legacy foundInvite is persisted, claimed, and admitted when structured los
       calls.push({ op: 'claim', arg: items.map(i => i.code) });
       return items.map(i => ({ code: i.code, admitted: true, firstChannelId: 'chanX' }));
     },
-    removeLosers: async (channelId: string, codes: string[]) => {
+    removeLosers: async (channelId: string, codes: string[], onlyNewerThan?: string) => {
       calls.push({ op: 'delete', arg: codes });
+      assert.ok(typeof onlyNewerThan === 'string' && !Number.isNaN(Date.parse(onlyNewerThan)), 'loser delete carries a provisional watermark');
+      assert.ok(Date.parse(onlyNewerThan as string) <= Date.now(), 'watermark predates the delete');
       return codes.length;
     },
   };

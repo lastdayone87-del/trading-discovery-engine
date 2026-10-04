@@ -169,13 +169,18 @@ export async function claimDiscordInvites(items:Array<{code:string;sourceSurface
  * query/fragment, first path segment, lowercased). Kept inline here and in
  * the registry backfill so loser cleanup matches exactly the rows the
  * registry can name. */
-export async function deleteDiscordCandidates(channelId:string,codes:string[]):Promise<number>{
+/** Removes only provisional candidate rows created by the current execution:
+ * callers must pass the timestamp captured before persisting provisional
+ * rows, so pre-existing validated/selected/historical rows for the same
+ * channel are never deleted merely because the channel later loses the
+ * global claim. Returns removed row count. */
+export async function deleteDiscordCandidates(channelId:string,codes:string[],onlyNewerThan:string):Promise<number>{
   const unique=[...new Set((codes||[]).filter(code=>typeof code==='string'&&!!code))];
-  if(!unique.length||!channelId)return 0;
+  if(!unique.length||!channelId||!onlyNewerThan)return 0;
   const db=await getDb();
   const res=await db.query(
-    `DELETE FROM discord_candidates WHERE channel_id=$1 AND lower(split_part(regexp_replace(regexp_replace(normalized_locator, '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1))=ANY($2::text[])`,
-    [channelId,unique]);
+    `DELETE FROM discord_candidates WHERE channel_id=$1 AND discovered_at>=$3::timestamptz AND lower(split_part(regexp_replace(regexp_replace(normalized_locator, '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1))=ANY($2::text[])`,
+    [channelId,unique,onlyNewerThan]);
   return res.rowCount||0;
 }
 export async function persistDiscordCandidates(channelId:string,candidates:DiscordAttemptCandidate[]):Promise<void>{const db=await getDb();for(const candidate of candidates){if(!candidate.candidateId)continue;await db.query(`INSERT INTO discord_candidates(channel_id,candidate_id,raw_locator,normalized_locator,locator_type,source_surface,source_url,source_observations) VALUES($1,$2,$3,lower($4),$5,$6,$7,$8) ON CONFLICT(channel_id,normalized_locator) DO UPDATE SET raw_locator=COALESCE(NULLIF(discord_candidates.raw_locator,''),excluded.raw_locator),locator_type=excluded.locator_type,source_surface=COALESCE(discord_candidates.source_surface,excluded.source_surface),source_url=COALESCE(discord_candidates.source_url,excluded.source_url),source_observations=COALESCE((SELECT jsonb_agg(DISTINCT observation) FROM jsonb_array_elements(discord_candidates.source_observations||excluded.source_observations) observation),'[]'::jsonb)`,[channelId,candidate.candidateId,candidate.rawLocator||'',candidate.resolvedLocator||candidate.rawLocator||'',candidate.locatorType||'UNKNOWN',candidate.sourceSurface||null,candidate.sourceUrl||null,JSON.stringify(candidate.observations||[{sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,rawLocator:candidate.rawLocator}])]);}}

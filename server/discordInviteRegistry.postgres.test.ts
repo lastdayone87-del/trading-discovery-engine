@@ -53,7 +53,7 @@ maybe('concurrent first discoveries produce exactly one winner', async () => {
   const db = await getDb();
   await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code='rgtestrace'`);
   const results = await Promise.all(
-    Array.from({ length: 8 }, (_, i) => claimDiscordInvites([{code:'rgtestrace'}], `rgchan${(i % 3) + 1}`)),
+    Array.from({ length: 8 }, (_, i) => claimDiscordInvites([{code:'rgtestrace'}], `rgrace${i + 1}`)),
   );
   const admitted = results.flat().filter(r => r.admitted);
   assert.equal(admitted.length, 1);
@@ -94,16 +94,36 @@ maybe('loser rows are removed without touching the registry or winner rows', asy
   const { persistDiscordCandidates, deleteDiscordCandidates } = await import('./db');
   const db = await getDb();
   await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code='rgtestloser'`);
+  for (const id of ['rgchan1', 'rgchan2']) {
+    await db.query(
+      `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,trading_status,subscriber_count) VALUES($1,$2,$3,'Germany','CONFIRMED','NOT_FOUND','ENRICHING','automated_query',now(),'UNCERTAIN','100') ON CONFLICT DO NOTHING`,
+      [id, `RG ${id}`, `https://youtube.test/${id}`],
+    );
+  }
   await persistDiscordCandidates('rgchan1', [{candidateId:'rg-loser',rawLocator:'https://discord.gg/rgtestloser',resolvedLocator:'https://discord.gg/rgtestloser',locatorType:'NATIVE_INVITE',sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://rg.test/'}]);
   await claimDiscordInvites([{code:'rgtestloser'}], 'rgchan1');
   await persistDiscordCandidates('rgchan2', [{candidateId:'rg-loser',rawLocator:'https://discord.gg/rgtestloser',resolvedLocator:'https://discord.gg/rgtestloser',locatorType:'NATIVE_INVITE',sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://rg2.test/'}]);
   const lost = await claimDiscordInvites([{code:'rgtestloser'}], 'rgchan2');
   assert.equal(lost[0].admitted, false);
-  assert.equal(await deleteDiscordCandidates('rgchan2', ['rgtestloser']), 1);
+  assert.equal(await deleteDiscordCandidates('rgchan2', ['rgtestloser'], new Date(Date.now() - 60_000).toISOString()), 1);
   const remaining = await db.query(`SELECT channel_id FROM discord_candidates WHERE normalized_locator='https://discord.gg/rgtestloser' ORDER BY 1`);
   assert.deepEqual(remaining.rows.map(r => r.channel_id), ['rgchan1']);
   const reg = await db.query(`SELECT first_channel_id FROM discord_invite_registry WHERE canonical_code='rgtestloser'`);
   assert.equal(reg.rows[0].first_channel_id, 'rgchan1');
   await cleanup(db);
   await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code='rgtestloser'`);
+});
+
+maybe('loser cleanup preserves pre-existing historical rows', async () => {
+  const { deleteDiscordCandidates } = await import('./db');
+  const db = await getDb();
+  await db.query(`INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,trading_status,subscriber_count) VALUES('rgchan2','RG rgchan2','https://youtube.test/rgchan2','Germany','CONFIRMED','NOT_FOUND','ENRICHING','automated_query',now(),'UNCERTAIN','100') ON CONFLICT DO NOTHING`);
+  await db.query(`DELETE FROM discord_candidates WHERE channel_id='rgchan2'`);
+  await db.query(
+    `INSERT INTO discord_candidates(channel_id,candidate_id,raw_locator,normalized_locator,candidate_status,validation_status,liveness_status,discovered_at) VALUES('rgchan2','rg-old','https://discord.gg/rgtestold','https://discord.gg/rgtestold','VALIDATED','COMPLETED','ACTIVE',now()-interval '2 days')`,
+  );
+  assert.equal(await deleteDiscordCandidates('rgchan2', ['rgtestold'], new Date().toISOString()), 0);
+  const kept = await db.query(`SELECT candidate_status FROM discord_candidates WHERE channel_id='rgchan2' AND normalized_locator='https://discord.gg/rgtestold'`);
+  assert.equal(kept.rows[0].candidate_status, 'VALIDATED');
+  await cleanup(db);
 });
