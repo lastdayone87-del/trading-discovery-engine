@@ -116,7 +116,21 @@ test('choke ordering is persist, claim, delete losers, then validate exactly onc
   assert.ok(deleteIdx > claimIdx, 'loser delete follows claim');
   const validateIdx = source.indexOf('await validateDiscordInvite(', deleteIdx);
   assert.ok(validateIdx > deleteIdx, 'validation runs last, on winners only');
-  assert.equal(source.split('await claimDiscordInvites(').length - 1, 1, 'exactly one claim call per inspection');
+  assert.equal(source.split('await claimDiscordInvites(').length - 1, 2, 'structured batch claim plus conditional legacy claim');
+});
+
+test('legacy claim runs only when nothing was admitted (no parking)', async () => {
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
+  const anchor = source.indexOf('if(!preAdmission.candidates.length&&preFoundCode&&!preClaimSources.has(preFoundCode)){');
+  assert.ok(anchor >= 0, 'conditional legacy claim exists');
+  const persistIdx = source.indexOf('await persistDiscordCandidates(channel.channel_id,[{candidateId:legacyFallback', anchor);
+  assert.ok(persistIdx > anchor, 'legacy row persisted before its claim');
+  const claimIdx = source.indexOf('await claimDiscordInvites([{code:preFoundCode', persistIdx);
+  assert.ok(claimIdx > persistIdx, 'legacy claim follows its persist');
+  const deleteIdx = source.indexOf('await deleteDiscordCandidates(channel.channel_id,[preFoundCode]);', claimIdx);
+  assert.ok(deleteIdx > claimIdx, 'lost legacy claim is cleaned up');
 });
 
 test('reconcile and validation share one admitted inspection view', async () => {

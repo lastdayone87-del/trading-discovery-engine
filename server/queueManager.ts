@@ -1347,14 +1347,28 @@ export async function inspectAndValidateChannel(
       const code=discordInviteCodeOf(candidate.nativeInviteCode);
       if(code&&!preClaimSources.has(code))preClaimSources.set(code,{surface:candidate.sourceSurface||null,url:candidate.sourceUrl||null});
     }
-    // A trail-level foundInvite naming a code outside the structured set must
-    // still go through the claim so a genuinely new invite is never
-    // suppressed merely because sibling candidates were discarded.
-    const preFoundCode=discordInviteCodeOf(inspection.foundInvite);
-    if(preFoundCode&&!preClaimSources.has(preFoundCode))preClaimSources.set(preFoundCode,{surface:null,url:null});
     const preInviteClaims=await claimDiscordInvites([...preClaimSources.entries()].map(([code,src])=>({code,sourceSurface:src.surface,sourceUrl:src.url})),channel.channel_id);
-    const preAdmittedCodes=new Set(preInviteClaims.filter(claim=>claim.admitted).map(claim=>claim.code));
-    const preAdmission=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,preAdmittedCodes);
+    let preAdmittedCodes=new Set(preInviteClaims.filter(claim=>claim.admitted).map(claim=>claim.code));
+    let preAdmission=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,preAdmittedCodes);
+    // A trail-level foundInvite naming a code outside the structured set is
+    // claimed only when nothing was admitted: claiming it unconditionally
+    // would park codes that are never processed, blackholing later channels.
+    const preFoundCode=discordInviteCodeOf(inspection.foundInvite);
+    if(!preAdmission.candidates.length&&preFoundCode&&!preClaimSources.has(preFoundCode)){
+      // Persist-before-claim (crash-safe ordering) also applies here: the
+      // legacy row must exist before its code can be claimed.
+      const legacyFallback=buildLegacyDiscordCandidate(inspection.foundInvite,preFoundCode);
+      if(legacyFallback){
+        await persistDiscordCandidates(channel.channel_id,[{candidateId:legacyFallback.candidateId,rawLocator:legacyFallback.rawLocator,locatorType:legacyFallback.locatorType,resolvedLocator:legacyFallback.normalizedLocator,sourceSurface:legacyFallback.sourceSurface,sourceUrl:legacyFallback.sourceUrl,observations:legacyFallback.observations}]);
+        const [legacyClaim]=await claimDiscordInvites([{code:preFoundCode,sourceSurface:null,sourceUrl:null}],channel.channel_id);
+        if(legacyClaim.admitted){
+          preAdmittedCodes=new Set([...preAdmittedCodes,preFoundCode]);
+          preAdmission=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,preAdmittedCodes);
+        }else{
+          await deleteDiscordCandidates(channel.channel_id,[preFoundCode]);
+        }
+      }
+    }
     const preLoserCodes=[...preClaimSources.keys()].filter(code=>!preAdmittedCodes.has(code));
     if(preLoserCodes.length)await deleteDiscordCandidates(channel.channel_id,preLoserCodes);
     if(preAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:preAdmission.discardedCount,timestamp:new Date().toISOString()}));
