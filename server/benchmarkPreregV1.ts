@@ -327,20 +327,27 @@ export function verifyPoolSnapshotHash(snapshot: PoolSnapshot): void {
 /**
  * Cryptographically/structurally binds the execution record to the loaded
  * snapshot before any scheduling. The record's embedded pool snapshot must
- * equal the loaded snapshot (hash + rows + frozen metadata), and every
- * designated opportunity must be exactly the snapshot-derived set
- * (snapshotHash + poolRowId + deterministic opportunity id + country).
- * A jointly edited record+snapshot pair can otherwise schedule under a
- * mismatched opportunity identity, causing ledger attribution lookups to
+ * equal the complete loaded snapshot — every PoolSnapshot field, not just
+ * hash/rows/metadata — and every designated opportunity must be exactly the
+ * snapshot-derived set (snapshotHash + poolRowId + deterministic opportunity
+ * id + country). A jointly edited record+snapshot pair can otherwise preserve
+ * rows/hash while silently changing planning provenance (collection time,
+ * limits, candidate/exclusion counts), causing ledger attribution lookups to
  * miss and misclassify as exclusions.
  */
 export function verifyExecutionArtifactsBound(record: BenchmarkExecutionRecord, snapshot: PoolSnapshot): void {
+  const embedded = record.poolSnapshot;
   if (
-    record.poolSnapshot.snapshotHash !== snapshot.snapshotHash ||
-    record.poolSnapshot.specVersion !== snapshot.specVersion ||
-    record.poolSnapshot.baseCommit !== snapshot.baseCommit ||
-    record.poolSnapshot.rulesVersion !== snapshot.rulesVersion ||
-    JSON.stringify(record.poolSnapshot.rows) !== JSON.stringify(snapshot.rows)
+    embedded.snapshotHash !== snapshot.snapshotHash ||
+    embedded.specVersion !== snapshot.specVersion ||
+    embedded.baseCommit !== snapshot.baseCommit ||
+    embedded.rulesVersion !== snapshot.rulesVersion ||
+    embedded.collectedAt !== snapshot.collectedAt ||
+    embedded.cooldownMinutes !== snapshot.cooldownMinutes ||
+    embedded.maxPrimaryUses !== snapshot.maxPrimaryUses ||
+    embedded.candidateRows !== snapshot.candidateRows ||
+    JSON.stringify(embedded.exclusionCounts) !== JSON.stringify(snapshot.exclusionCounts) ||
+    JSON.stringify(embedded.rows) !== JSON.stringify(snapshot.rows)
   ) {
     throw new Error('BENCHMARK_PREREG_RECORD_MISMATCH: execution record pool snapshot does not match loaded snapshot');
   }
@@ -560,8 +567,18 @@ export function classifyNoMatchOutcome(input: {
     };
   }
   const capacityCode = candidates.find(candidate => /QUOTA|QUEUE|CAPACITY/.test(candidate.reasonCode || ''))?.reasonCode || '';
-  if (capacityCode || (input.queuedCount || 0) === 0 && (input.remainingAutonomousQuota ?? 1) <= 0) {
-    return { state: 'EXCLUDED_NO_CAPACITY', reason: `NO_QUEUE_CAPACITY:${capacityCode || 'quota-exhausted'}` };
+  // Queue-target/paced-capacity exhaustion surfaces as queuedCount 0 with
+  // positive quota and an empty candidate list (the producer returns early
+  // with QUOTA_OR_QUEUE_GUARD before recording any candidate). That is
+  // capacity, never eligibility: it must not terminally exclude as
+  // ELIGIBILITY. An explicit capacity code wins and is preserved; otherwise
+  // an empty zero-queue report is NO_CAPACITY with its guard reason, while a
+  // non-empty eligibility skip stays ELIGIBILITY.
+  const queuedZero = (input.queuedCount || 0) === 0;
+  const quotaExhausted = (input.remainingAutonomousQuota ?? 1) <= 0;
+  const emptyZeroQueue = queuedZero && candidates.length === 0;
+  if (capacityCode || (queuedZero && (quotaExhausted || emptyZeroQueue))) {
+    return { state: 'EXCLUDED_NO_CAPACITY', reason: `NO_QUEUE_CAPACITY:${capacityCode || (quotaExhausted ? 'quota-exhausted' : 'queue-target-exhausted')}` };
   }
   const firstSkipped = candidates.find(candidate => candidate.disposition && candidate.disposition !== 'SCHEDULED');
   const code = firstSkipped?.reasonCode || firstSkipped?.disposition || '';

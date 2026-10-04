@@ -392,6 +392,18 @@ test('execution record is cryptographically bound to the loaded snapshot', async
     collectedAt: now, cooldownMinutes: 360, maxPrimaryUses: 2,
   });
   assert.throws(() => verifyExecutionArtifactsBound(record, other), /BENCHMARK_PREREG_RECORD_MISMATCH/);
+  // Planning provenance cannot silently change while rows/hash match: every
+  // PoolSnapshot field is bound.
+  for (const tamper of [
+    (snap: typeof snapshot) => ({ ...snap, collectedAt: new Date('2026-06-01T00:00:00.000Z').toISOString() }),
+    (snap: typeof snapshot) => ({ ...snap, cooldownMinutes: 30 }),
+    (snap: typeof snapshot) => ({ ...snap, maxPrimaryUses: 9 }),
+    (snap: typeof snapshot) => ({ ...snap, candidateRows: snap.candidateRows + 1 }),
+    (snap: typeof snapshot) => ({ ...snap, exclusionCounts: { ...snap.exclusionCounts, TAMPERED: 1 } }),
+  ]) {
+    const tamperedSnapshot = tamper(structuredClone(snapshot));
+    assert.throws(() => verifyExecutionArtifactsBound(record, tamperedSnapshot), /BENCHMARK_PREREG_RECORD_MISMATCH/);
+  }
 });
 
 test('scheduling failures stay execution failures and later selections are not masked', async () => {
@@ -437,6 +449,21 @@ test('scheduling failures stay execution failures and later selections are not m
     }).state,
     'EXCLUDED_EXECUTION_FAILURE'
   );
+  // Queue-target exhaustion (zero queue, positive quota, empty candidates)
+  // is capacity, never eligibility.
+  assert.deepEqual(
+    classifyNoMatchOutcome({ queuedCount: 0, remainingAutonomousQuota: 100, candidates: [], extrasCount: 0 }),
+    { state: 'EXCLUDED_NO_CAPACITY', reason: 'NO_QUEUE_CAPACITY:queue-target-exhausted' }
+  );
+  // A genuine non-empty eligibility skip with positive quota stays eligibility.
+  assert.deepEqual(
+    classifyNoMatchOutcome({
+      queuedCount: 0, remainingAutonomousQuota: 100,
+      candidates: [{ disposition: 'SKIPPED', reasonCode: 'QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY' }],
+      extrasCount: 0,
+    }),
+    { state: 'EXCLUDED_ELIGIBILITY', reason: 'ELIGIBILITY:QUERY_INTELLIGENCE_NO_ELIGIBLE_QUERY' }
+  );
 });
 
 test('benchmark allocation release failures stop execution and committed races fail closed', async () => {
@@ -459,4 +486,11 @@ test('benchmark honors the kill switch even with a target country', async () => 
   assert.match(script, /KILL_SWITCH_PAUSED/);
   assert.match(script, /record\.status = 'IN_PROGRESS'[\s\S]*writeFileSync\(recordPath/);
   assert.match(script, /INFRA_INCIDENT:LEDGER_UNREADABLE/);
+  // The kill-switch read and the PAUSED abort are separate: the read has its
+  // own try/catch that only handles read failures, and no message regex
+  // distinguishes control flow.
+  assert.match(script, /let killSwitchEngaged: boolean;/);
+  assert.match(script, /killSwitchEngaged = await haltedByKillSwitch\(\);/);
+  assert.match(script, /INFRA_INCIDENT:KILL_SWITCH_UNREADABLE/);
+  assert.doesNotMatch(script, /KILL_SWITCH_PAUSED\|INCOMPLETE/);
 });

@@ -307,14 +307,18 @@ async function main(): Promise<void> {
     // Kill-switch recheck immediately before scheduling: drift checking ran
     // above, but a pause engaged in the gap must still stop the benchmark.
     // The engine also honors pause for benchmark scope even with a target
-    // country; this runner-side check fails closed first.
+    // country; this runner-side check fails closed first. The read and the
+    // abort are separate so no error-message regex drives control flow: only
+    // a read failure becomes KILL_SWITCH_UNREADABLE, and the PAUSED abort's
+    // own error is never caught here.
+    let killSwitchEngaged: boolean;
     try {
-      if (await haltedByKillSwitch()) {
-        await abortIncomplete('KILL_SWITCH_PAUSED');
-      }
-    } catch (killError) {
-      if (killError instanceof Error && /KILL_SWITCH_PAUSED|INCOMPLETE/.test(killError.message)) throw killError;
-      await abortIncomplete(`INFRA_INCIDENT:KILL_SWITCH_UNREADABLE:${(killError instanceof Error ? killError.message : String(killError)).slice(0, 120)}`);
+      killSwitchEngaged = await haltedByKillSwitch();
+    } catch (readError) {
+      await abortIncomplete(`INFRA_INCIDENT:KILL_SWITCH_UNREADABLE:${(readError instanceof Error ? readError.message : String(readError)).slice(0, 120)}`);
+    }
+    if (killSwitchEngaged) {
+      await abortIncomplete('KILL_SWITCH_PAUSED');
     }
     let report: {
       queuedCount?: number; remainingAutonomousQuota?: number; summary?: string; isPaused?: boolean;
