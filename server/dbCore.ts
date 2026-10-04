@@ -126,16 +126,6 @@ export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=
 export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);}
 export interface DiscordAttemptCandidate {candidateId?:string;rawLocator?:string;locatorType?:string;resolvedLocator?:string;sourceSurface?:string;sourceUrl?:string;observations?:Array<unknown>}
 export interface DiscordInviteClaim {code:string;admitted:boolean;firstChannelId:string|null}
-/** Read-only global ownership lookup (no writes): maps each canonical code
- * to its registry owner, if any. Used where a decision needs admission
- * knowledge without claiming (e.g. pre-validation reconciliation). */
-export async function lookupDiscordInviteOwners(codes:string[]):Promise<Map<string,string>>{
-  const unique=[...new Set((codes||[]).filter(code=>typeof code==='string'&&!!code))];
-  if(!unique.length)return new Map();
-  const db=await getDb();
-  const res=await db.query(`SELECT canonical_code,first_channel_id FROM discord_invite_registry WHERE canonical_code=ANY($1::text[])`,[unique]);
-  return new Map(res.rows.map((row:any)=>[String(row.canonical_code),String(row.first_channel_id)]));
-}
 /**
  * Atomically claims canonical Discord invite codes for a channel. Each code
  * resolves to exactly one global winner via the registry primary key, so
