@@ -852,7 +852,7 @@ export async function incrementQuota(units:number, providerKey:string, operation
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
 
-function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{}),reserved_until:iso(r.reserved_until),next_eligible_at:iso(r.next_eligible_at)} as QueryRecord;}
+export function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{}),reserved_until:iso(r.reserved_until),next_eligible_at:iso(r.next_eligible_at)} as QueryRecord;}
 export async function getAllQueries():Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library ORDER BY performance_score DESC,times_executed DESC'); return res.rows.map(rowToQuery);}
 export async function getQueriesByCountry(country:string):Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND status='ACTIVE' ORDER BY performance_score DESC,times_executed ASC`,[country]); return res.rows.map(rowToQuery);}
 export async function getQueryByText(queryText:string):Promise<QueryRecord|null>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library WHERE LOWER(query)=LOWER($1)',[queryText.trim()]); return res.rows[0]?rowToQuery(res.rows[0]):null;}
@@ -3127,7 +3127,18 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   const code=String((error as any)?.code||'').toUpperCase();
   const failureKind=['INVALID_QUERY','QUERY_INVALID','INVALID_SEARCH_QUERY'].includes(code)?'INVALID_QUERY':capacity ? 'PROVIDER_CAPACITY' : 'PROVIDER_FAILURE';
   const failureMetadata = JSON.stringify({ failureKind, ...capacityMetadata, ...outcomeMetadata });
-  const run = await db.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
+  // Terminal failure records status AND attribution atomically: a worker
+  // crash between the FAILED update and the attribution insert must never
+  // leave a terminal run without its accounting row (benchmark
+  // observations require both). All-or-nothing in one transaction; a late
+  // failure on an already-terminal run mutates nothing (ROLLBACK, no
+  // status/attribution/library/quota writes) but still falls through to the
+  // best-effort observation capture below, so a previously missed
+  // observation can be recovered by a later call.
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const run = await client.query(`UPDATE query_runs SET status='FAILED',error=$2,completed_at=now(),
     provider_requests_attempted=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search') ELSE provider_requests_attempted END,
     provider_requests_succeeded=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_requests_succeeded END,
     provider_requests_failed=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status NOT IN ('SUCCESS','RATE_LIMITED')) ELSE provider_requests_failed END,
@@ -3135,30 +3146,46 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
     provider_pages_retrieved=CASE WHEN provider_key='youtube-search' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube' AND e.operation='search' AND e.status='SUCCESS') WHEN provider_key='youtube-innertube' THEN (SELECT COUNT(*)::int FROM provider_call_events e WHERE e.run_id=$1::text AND e.provider='youtube-innertube' AND e.operation='search' AND e.status='SUCCESS') ELSE provider_pages_retrieved END,
     performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
     WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureMetadata]);
-  if (run.rowCount) {
-    await db.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
-    await db.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
-    // Benchmark attribution conformance (benchmark-preregistration-v1 §8/§9):
-    // terminally failed runs must be deterministically attributable to their
-    // assigned arm and countable in arm denominators. Successful completions
-    // insert this row in completeQueryRun; failures previously left none,
-    // silently dropping provider/network/quota failures from measurement.
-    // The zero-funnel row marks the run as a failed observation (quality 0).
-    // Deliberately does NOT touch query_library aggregates: UCB1/Thompson
-    // counters observe completed runs only (production behavior unchanged).
-    await db.query(
-      `INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics)
-       VALUES($1,$2,'query-run-accounting-v1',0,$3) ON CONFLICT(query_run_id) DO NOTHING`,
-      [runId, run.rows[0].query_id, JSON.stringify({
-        failed: true, terminal: true, failureKind,
-        rawResults: 0, distinctResults: 0, duplicateResults: 0,
-        knownChannels: 0, newChannels: 0, countryRejected: 0,
-        nonTrading: 0, uncertain: 0, needsReview: 0,
-        tradingConfirmed: 0, qualityChannels: 0, communitiesDiscovered: 0,
-        averageQualityScore: 0, noveltyRatio: 0, countryPrecision: 0,
-        tradingPrecision: 0, qualityYield: 0, communityYield: 0, performanceScore: 0,
-      })]
-    );
+  if (!run.rowCount) {
+    // Already terminal: mutate nothing, but do NOT return here — the
+    // best-effort observation capture below must stay reachable so a later
+    // call can recover an observation missed by an earlier capture failure.
+    await client.query('ROLLBACK');
+  } else {
+  await client.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
+  await client.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
+  // Benchmark attribution conformance (benchmark-preregistration-v1 §8/§9):
+  // terminally failed runs must be deterministically attributable to their
+  // assigned arm and countable in arm denominators. Successful completions
+  // insert this row in completeQueryRun; failures previously left none,
+  // silently dropping provider/network/quota failures from measurement.
+  // The zero-funnel row marks the run as a failed observation (quality 0).
+  // Deliberately does NOT touch query_library aggregates: UCB1/Thompson
+  // counters observe completed runs only (production behavior unchanged).
+  // Same-transaction insert: status and attribution commit together, so a
+  // crash can never strand a terminal run without its accounting row.
+  await client.query(
+    `INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics)
+     VALUES($1,$2,'query-run-accounting-v1',0,$3) ON CONFLICT(query_run_id) DO NOTHING`,
+    [runId, run.rows[0].query_id, JSON.stringify({
+      failed: true, terminal: true, failureKind,
+      rawResults: 0, distinctResults: 0, duplicateResults: 0,
+      knownChannels: 0, newChannels: 0, countryRejected: 0,
+      nonTrading: 0, uncertain: 0, needsReview: 0,
+      tradingConfirmed: 0, qualityChannels: 0, communitiesDiscovered: 0,
+      averageQualityScore: 0, noveltyRatio: 0, countryPrecision: 0,
+      tradingPrecision: 0, qualityYield: 0, communityYield: 0, performanceScore: 0,
+    })]
+  );
+  await client.query('COMMIT');
+  }
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* already closed */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+  {
     const { captureCompletedRunObservation } = await import('./discoveryTrustEvaluation');
     await captureCompletedRunObservation(runId).catch(captureError => console.warn('[DiscoveryTrustEvaluation] Failure observation capture failed:', captureError));
   }

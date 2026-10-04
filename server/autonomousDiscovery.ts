@@ -334,7 +334,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
   };
 
   try {
-    if (await isQueryIntelligencePaused() && !targetCountry) {
+    // Direct targets bypass the pause gate by design (operator on-demand),
+    // but benchmark-designated attempts must never bypass it: a pause engaged
+    // after drift checking must still stop scheduling. The raw request is
+    // checked here (normalization happens later); any benchmark scope counts.
+    const hasBenchmarkScope = Boolean((experiment as { benchmark?: unknown } | null | undefined)?.benchmark);
+    if ((await isQueryIntelligencePaused()) && (!targetCountry || hasBenchmarkScope)) {
       return {
         country: 'N/A', query: 'N/A', strategy: 'PAUSED', discoveredCount: 0,
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0,
@@ -463,7 +468,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
 
       let research: { actionId: string; queryRecord: any } | null = null;
       // Persistent Research runs ONLY on the control/legacy path when frontier allocation is NOT authorized
-      if (!frontierAllocationInfo?.authorized) {
+      // and no benchmark-designated scope is active (benchmark attempts must
+      // never schedule unrelated research work as a designated observation).
+      if (!frontierAllocationInfo?.authorized && !normalizedExperiment?.benchmark) {
         research = await getAllocatedResearchQuery(country);
       }
 
@@ -475,6 +482,49 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       const nativeSnapshot = frontierAllocationInfo?.decision?.proposalEvidenceSnapshot;
       const governedConceptProposal = ['COUNTRY_NATIVE', 'EXTERNAL_OSINT'].includes(nativeSnapshot?.proposalFamily);
 
+      // Benchmark-designated attempts (benchmark-preregistration-v1
+      // execution): serve ONLY the designated pool row or nothing. An
+      // authorized frontier/native allocation is declined and released here
+      // so the cycle can never schedule unrelated work while claiming a
+      // designated opportunity; the experiment-selection path below (with
+      // the SELECTED_ANOTHER_QUERY output gate) is the sole scheduling
+      // source on this path. A failed release fails the cycle rather than
+      // stranding a RESERVED decision with held quota while scheduling as
+      // LEGACY. Absent a benchmark scope this block is inert.
+      if (normalizedExperiment?.benchmark && frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
+        const benchmarkDeclinedId = frontierAllocationInfo.decision.decisionId;
+        const released = await releaseAllocationDecision(
+          benchmarkDeclinedId,
+          'Benchmark-designated attempt declines non-designated allocation'
+        ).catch(error => {
+          throw new Error(`BENCHMARK_ALLOCATION_RELEASE_FAILED:${benchmarkDeclinedId}:${error instanceof Error ? error.message : String(error)}`);
+        });
+        if (!released) {
+          // Distinguish a benign race (another worker already consumed or
+          // expired the decision: nothing is held) from a genuinely stranded
+          // decision (quota held or unrelated work already scheduled). Only
+          // the stranded case fails the cycle — and an unreadable ledger
+          // fails closed the same way. COMMITTED is stranded too: scheduling
+          // flips RESERVED to COMMITTED while leaving quota_reserved intact,
+          // meaning unrelated work was already scheduled.
+          let stillReserved = true;
+          try {
+            const releaseCheckDb = await getDb();
+            const releaseCheck = await releaseCheckDb.query(
+              'SELECT decision_status FROM frontier_allocation_decisions WHERE decision_id = $1',
+              [benchmarkDeclinedId]
+            );
+            stillReserved = releaseCheck.rows.length > 0 && ['RESERVED', 'COMMITTED'].includes(String(releaseCheck.rows[0].decision_status));
+          } catch {
+            stillReserved = true;
+          }
+          if (stillReserved) {
+            throw new Error(`BENCHMARK_ALLOCATION_RELEASE_FAILED:${benchmarkDeclinedId}`);
+          }
+        }
+        frontierAllocationInfo.authorized = false;
+      }
+
       if (research) {
         selected = {
           queryRecord: research.queryRecord,
@@ -482,7 +532,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           reason: 'Governed persistent-research portfolio allocation with recorded propensity and immutable provenance.'
         };
         candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'PERSISTENT_RESEARCH', selectedQueryId: selected.queryRecord.id };
-      } else if (frontierAllocationInfo?.authorized && frontierAllocationInfo.targetNeighborhoodDimensions) {
+      } else if (frontierAllocationInfo?.authorized && !normalizedExperiment?.benchmark && frontierAllocationInfo.targetNeighborhoodDimensions) {
         const nativeAuthorization = governedConceptProposal
           ? await authorizeCountryNativeAllocationQuery({
               country,
@@ -593,6 +643,19 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         selected = legacySelection;
         selectedExperiment = legacyExperiment;
         candidateDiagnostic = { ...candidateDiagnostic, selectionSource: 'LEGACY', selectedQueryId: selected.queryRecord.id };
+      }
+
+      // Benchmark-designated output gate (benchmark-preregistration-v1
+      // execution): the arms choose freely among eligible queries under full
+      // production gates, but ONLY the designated pool row may be scheduled
+      // as a benchmark observation. A non-designated selection is declined
+      // here — never scheduled, never labeled — so the cycle cannot schedule
+      // unrelated work while claiming a designated opportunity. Absent a
+      // benchmark scope this gate is inert and legacy flow is byte-identical.
+      if (normalizedExperiment?.benchmark && selected.queryRecord.id !== normalizedExperiment.benchmark.poolRowId) {
+        candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'SELECTED_ANOTHER_QUERY', schedulingOutcome: 'NOT_REACHED' };
+        recordCandidateDiagnostic(candidateDiagnostic);
+        continue;
       }
 
       // Every query source is revalidated immediately before scheduling. Stored

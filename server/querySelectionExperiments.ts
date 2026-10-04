@@ -766,7 +766,7 @@ export function resolvePersistedSelectionArm(metadata: unknown): SelectionExperi
   return arm === 'THOMPSON' || arm === 'CONTEXTUAL' ? arm : 'CONTROL';
 }
 
-function reservableFilter(query: QueryRecord, now: Date): boolean {
+export function reservableFilter(query: QueryRecord, now: Date): boolean {
   const reservedUntil = (query as QueryRecord & { reserved_until?: string | null }).reserved_until;
   const nextEligibleAt = (query as QueryRecord & { next_eligible_at?: string | null }).next_eligible_at;
   return (
