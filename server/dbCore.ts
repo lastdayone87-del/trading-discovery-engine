@@ -3060,7 +3060,10 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   // crash between the FAILED update and the attribution insert must never
   // leave a terminal run without its accounting row (benchmark
   // observations require both). All-or-nothing in one transaction; a late
-  // failure on an already-terminal run stays a silent no-op as before.
+  // failure on an already-terminal run mutates nothing (ROLLBACK, no
+  // status/attribution/library/quota writes) but still falls through to the
+  // best-effort observation capture below, so a previously missed
+  // observation can be recovered by a later call.
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -3073,9 +3076,11 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
     performance_details=COALESCE(performance_details,'{}'::jsonb)||$3::jsonb
     WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED') RETURNING query_id`, [runId, message, failureMetadata]);
   if (!run.rowCount) {
+    // Already terminal: mutate nothing, but do NOT return here — the
+    // best-effort observation capture below must stay reachable so a later
+    // call can recover an observation missed by an earlier capture failure.
     await client.query('ROLLBACK');
-    return;
-  }
+  } else {
   await client.query(`UPDATE query_library SET reserved_at=NULL,reserved_until=NULL,reserved_by=NULL WHERE id=$1`, [run.rows[0].query_id]);
   await client.query(`UPDATE quota_reservations SET status='RELEASED' WHERE operation_type='SEARCH_YOUTUBE' AND operation_id=$1 AND status='RESERVED'`, [runId]);
   // Benchmark attribution conformance (benchmark-preregistration-v1 §8/§9):
@@ -3102,6 +3107,7 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
     })]
   );
   await client.query('COMMIT');
+  }
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch { /* already closed */ }
     throw error;
