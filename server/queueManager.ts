@@ -246,6 +246,16 @@ export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
 }
 
 /**
+ * Maps a worker execution marker to the coverage-borrow bypass flag. Only an
+ * explicit retry-owned reacquisition marker bypasses borrowed coverage; every
+ * other path (absent marker, false flag) borrows normally. Strict equality
+ * keeps unknown marker shapes fail-safe toward borrowing.
+ */
+export function resolveBorrowBypassForInspectionMarker(marker?: { isRetryOwnedReacquire?: boolean }): boolean {
+  return marker?.isRetryOwnedReacquire === true;
+}
+
+/**
  * Pure SEARCH worker wall-time split (observability only): quota-wait vs
  * retrieval vs per-channel processing vs total worker time. Persisted in
  * query-run performance_details; never affects scoring or behavior.
@@ -1308,7 +1318,7 @@ export async function inspectAndValidateChannel(
       socialLinks: rawDetails?.channelLinks || [],
       youtubeUrl: channel.youtube_url,
       forceLiveFetch: isManualScan || !rawDetails?.description,
-      bypassBorrowedCoverage: executionMarker?.isRetryOwnedReacquire === true
+      bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker)
     });
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));

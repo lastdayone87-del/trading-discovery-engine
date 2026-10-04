@@ -29,6 +29,17 @@ assert.ok(true);
 
 test('retry worker reacquires instead of borrowing its own incomplete coverage', () => {
   const qm = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  // The RETRY branch constructs the marker with the retry-owned flag...
   assert.match(qm, /isRetryOwnedReacquire:true/);
-  assert.match(qm, /bypassBorrowedCoverage: executionMarker\?\.isRetryOwnedReacquire === true/);
+  // ...and the inspection call maps the marker through the resolver, so a
+  // rename or disconnect on either side fails this test.
+  assert.match(qm, /bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker\(executionMarker\)/);
+});
+
+test('borrow bypass resolves only for explicit retry-owned markers', async () => {
+  const { resolveBorrowBypassForInspectionMarker } = await import('./queueManager');
+  assert.equal(resolveBorrowBypassForInspectionMarker({ isRetryOwnedReacquire: true }), true);
+  assert.equal(resolveBorrowBypassForInspectionMarker({ isRetryOwnedReacquire: false }), false);
+  assert.equal(resolveBorrowBypassForInspectionMarker({}), false);
+  assert.equal(resolveBorrowBypassForInspectionMarker(undefined), false);
 });
