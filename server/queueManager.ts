@@ -1243,6 +1243,7 @@ export async function inspectAndValidateChannel(
   let inspection: Awaited<ReturnType<typeof runChannelInspection>> | null = null;
   let retryDirective: CommunityRetryDirective | undefined;
   let attemptFree = false;
+  let admittedInspection: typeof inspection;
   try {
     // 1. Re-check Country Validation before Discord scanning
     // Provenance boundary: only creator-level fields may enter P2 matching.
@@ -1372,7 +1373,7 @@ export async function inspectAndValidateChannel(
     const preLoserCodes=[...preClaimSources.keys()].filter(code=>!preAdmittedCodes.has(code));
     if(preLoserCodes.length)await deleteDiscordCandidates(channel.channel_id,preLoserCodes);
     if(preAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:preAdmission.discardedCount,timestamp:new Date().toISOString()}));
-    const admittedInspection={...inspection,discordCandidates:preAdmission.candidates,foundInvite:preAdmission.discoveredInvite};
+    admittedInspection={...inspection,discordCandidates:preAdmission.candidates,foundInvite:preAdmission.discoveredInvite};
 
     // The admitted inspection view (computed once at the authoritative claim
     // above) shapes every downstream gate, so a duplicate-only inspection
@@ -1495,7 +1496,7 @@ export async function inspectAndValidateChannel(
       channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
       channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:attemptFree?Math.max(0,channel.scan_attempts):nextChannelScanAttempts(channel.scan_attempts,false);
       channel.last_checked=now;
-      reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:true});
+      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:true});
       retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined,retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'}:undefined;
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
@@ -1512,7 +1513,7 @@ export async function inspectAndValidateChannel(
         channel.discord_resolution_status=channel.discord_resolution_status||'RESOLVED';
         channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':'NOT_DISCOVERED';
       }
-      reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
+      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
       retryDirective=inspection.retryDirective;
       attemptFree=Boolean(retryDirective?.attemptFree);
       channel.scan_status='FAILED';
@@ -1534,14 +1535,14 @@ export async function inspectAndValidateChannel(
       // Only a complete inspection with no prior discovery may project absence.
       if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
       else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
-      reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
+      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
       channel.last_checked = now;
     }
 
   } catch (err) {
     // Preserve any structured discovery even when validation or later
     // processing throws. This must run before catch persistence and retry.
-    reconcileDiscordDiscoveryFromInspection(channel,inspection,{validationProjected:false});
+    reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
     attemptFree=isAttemptFreeCommunityFailure(err);
     retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:String(err?.message||err),retryAt:retryAtFromUnknown(err),retryReason:retryReasonFromError(err)}:undefined;
     if(!attemptFree)channel.scan_attempts++;
