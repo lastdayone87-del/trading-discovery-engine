@@ -4,7 +4,7 @@ import { InspectionStep } from '../src/types';
 import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, accumulateRouteStats, upsertSiteProfile, type SiteInspectionRow } from './db';
 import { routePatternFor, shouldAccumulateRouteObservation, evaluateDomainWeightShadow, isDomainWeightExperimentConsumptionEnabled, type DomainWeightShadowEvaluation } from './domainLearner';
 import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition, isFrontierEnabled, MAX_FRONTIER_PAGES_PER_SITE, MAX_FRONTIER_QUEUE_PER_SITE, FRONTIER_POLICY_VERSION, type FrontierCrawlOptions } from './frontierManager';
-import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, needsRenderedRecrawl, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
+import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
@@ -652,7 +652,7 @@ export function formatLinkedWebsiteAcquisitionSummary(summary: LinkedWebsiteAcqu
   return `Linked website acquisition: ${parts.join('; ')}.`;
 }
 
-export async function runChannelInspection(channelData:{enableDebug?:boolean;channelId:string;channelName?:string;channelBio:string;channelLinks?:string[];pinnedComment?:string;videoDescriptions?:string[];socialLinks?:string[];youtubeUrl?:string;forceLiveFetch?:boolean;liveChannelDataLoader?:typeof fetchLiveYouTubeChannelData;recentVideoDescriptionsLoader?:(channelId:string)=>Promise<Array<string|{videoId?:string|null;description?:string|null}>>;externalFetchImpl?:typeof fetch;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string)=>Promise<BrowserFallbackResult>;urlFailureHistoryLoader?:(channelId:string,urls?:string[])=>Promise<UrlFailureRow[]>;siteInspectionStore?:SiteInspectionStore;}):Promise<InspectionResult>{
+export async function runChannelInspection(channelData:{enableDebug?:boolean;channelId:string;channelName?:string;channelBio:string;channelLinks?:string[];pinnedComment?:string;videoDescriptions?:string[];socialLinks?:string[];youtubeUrl?:string;forceLiveFetch?:boolean;liveChannelDataLoader?:typeof fetchLiveYouTubeChannelData;recentVideoDescriptionsLoader?:(channelId:string)=>Promise<Array<string|{videoId?:string|null;description?:string|null}>>;externalFetchImpl?:typeof fetch;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string)=>Promise<BrowserFallbackResult>;urlFailureHistoryLoader?:(channelId:string,urls?:string[])=>Promise<UrlFailureRow[]>;siteInspectionStore?:SiteInspectionStore;bypassBorrowedCoverage?:boolean;}):Promise<InspectionResult>{
   const steps:InspectionStep[]=[];const now=new Date().toISOString();let extractedThumbnailUrl:string|undefined;const acquisitionOutcomes:ExternalAcquisitionObservation[]=[];let acquiredAboutUrl:string|undefined;const acquiredRecentDescriptionSurfaces:string[]=[];let debugLog:any=channelData.enableDebug?{rawAboutPageHtml:null,fetchLog:null,extractedUrls:[],redirectsFollowed:[],discordRegexAttempts:[],failureStep:null}:undefined;let bio=channelData.channelBio||'',links=channelData.channelLinks||[],videoDescs=channelData.videoDescriptions||[];let creatorLikelyTrading=channelData.creatorLikelyTrading,creatorName=channelData.channelName||'';
   if((creatorLikelyTrading===undefined||!creatorName)&&channelData.channelId){try{const stored=await getChannelById(channelData.channelId);if(creatorLikelyTrading===undefined)creatorLikelyTrading=stored?.trading_status==='TRADING_CONFIRMED';if(!creatorName)creatorName=stored?.channel_name||'';}catch{if(creatorLikelyTrading===undefined)creatorLikelyTrading=false;}}creatorLikelyTrading=creatorLikelyTrading===true;
   // Channel-sampled descriptions acquired during THIS inspection, kept
@@ -1010,16 +1010,27 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   if(seedCachedRow&&seedReusable&&!seedCovered){
     step5Logs.push(`[Site cache] ${item.url} not covered by cached inspection for ${seedCachedRow.siteIdentity} (cached ${seedCachedRow.lastObservedAt}); recrawling for full path coverage.`);
   }
-  if(seedCachedRow&&seedReusable&&seedCovered){
+  if(seedCachedRow&&seedReusable&&seedCovered&&!(channelData.bypassBorrowedCoverage&&(seedCachedRow.retryable||seedCachedRow.outcome==='PARTIALLY_INSPECTED'))){
+    // Coverage-only borrow (cross-creator invariant): a freshly covered site
+    // is never re-crawled for a later creator, and the originating
+    // investigation's discoveries are never transferred. Only coverage
+    // observations are reused; candidates stay with their own investigation,
+    // so the borrower receives zero of the originator's Discord/Telegram/
+    // community discoveries. Creator-dependent rendered escalation is
+    // intentionally absent here: site-driven recrawls (stale TTL, uncovered
+    // paths) still happen above and below; creator difference alone never
+    // triggers a new crawl.
+    // Retry-owned reacquisitions bypass borrowing ONLY for incomplete site
+    // coverage (retryable or PARTIALLY_INSPECTED): the unresolved site is
+    // re-acquired, while unrelated freshly covered sites still borrow. The
+    // flag alone never disables borrowing for complete coverage.
     const borrowed=buildBorrowedSiteInspection(seedCachedRow,{requestedUrl:item.url,surface:'CREATOR_WEBSITES',required:false,wrapperUrl:item.wrapperUrl,observedAt:now});
-    const borrowedHasOwned=mergeDiscordCandidates(borrowed.candidates as unknown as DiscordCandidate[],ownershipInput).some(c=>c.ownershipStatus==='CREATOR_OWNED');
-    if(!needsRenderedRecrawl(seedCachedRow,{creatorLikelyTrading,staticOutcome:String(seedCachedRow.outcome),hasCreatorOwned:borrowedHasOwned})){
-      step5Logs.push(`[Site cache] ${item.url} reuses site inspection for ${seedCachedRow.siteIdentity} (observed ${seedCachedRow.lastObservedAt}); no recrawl.`);
-      acquisitionOutcomes.push(...borrowed.observations as unknown as ExternalAcquisitionObservation[]);
-      websiteCandidates.push(...borrowed.candidates as unknown as DiscordCandidate[]);
-      continue;
-    }
-    step5Logs.push(`[Site cache] ${item.url} recrawls: rendered coverage missing for this creator.`);
+    step5Logs.push(`[Site cache] ${item.url} reuses site inspection for ${seedCachedRow.siteIdentity} (observed ${seedCachedRow.lastObservedAt}); no recrawl, no borrowed candidates.`);
+    acquisitionOutcomes.push(...borrowed.observations as unknown as ExternalAcquisitionObservation[]);
+    continue;
+  }
+  if(seedCachedRow&&seedReusable&&seedCovered){
+    step5Logs.push(`[Site cache] ${item.url} bypasses borrowed coverage for retry-owned reacquisition of incomplete coverage; re-crawling.`);
   }
   step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights)).crawlRes;acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every discovered website URL — including auxiliary,
 // broker/affiliate-pattern, promotional, and dotless single-label hosts —

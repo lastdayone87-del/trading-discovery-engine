@@ -6,7 +6,6 @@ import {
   SITE_INSPECTION_RETRYABLE_FAILURE_TTL_MS,
   isSiteInspectionReusable,
   buildBorrowedSiteInspection,
-  needsRenderedRecrawl,
   siteInspectionCoversRequest,
   isSufficientRenderedCoverage,
   rootCoverageTerminal,
@@ -108,17 +107,8 @@ test('borrowed observations refresh the audit trail but preserve site-facts', ()
   assert.equal(first.siteCacheHit, true);
   assert.equal(first.siteIdentity, 'apextrader.com');
   assert.equal(first.siteObservedAt, hoursAgo(1));
-  assert.deepEqual(borrowed.candidates, [{ candidateId: 'c1', nativeInviteCode: 'apexroom', sourceUrl: 'https://apextrader.com/home' }]);
-});
-
-test('rendered recrawl rule is conservative toward inspection', () => {
-  const covered = row({ renderedCovered: true });
-  const uncovered = row({ renderedCovered: false });
-  assert.equal(needsRenderedRecrawl(covered, { creatorLikelyTrading: true, staticOutcome: 'INSPECTED_NO_MATCH', hasCreatorOwned: false }), false);
-  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: false, staticOutcome: 'INSPECTED_NO_MATCH', hasCreatorOwned: false }), false);
-  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'INSPECTED_NO_MATCH', hasCreatorOwned: false }), true);
-  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'FOUND', hasCreatorOwned: false }), true, 'FOUND without owned candidate still needs escalation coverage');
-  assert.equal(needsRenderedRecrawl(uncovered, { creatorLikelyTrading: true, staticOutcome: 'FOUND', hasCreatorOwned: true }), false);
+  assert.deepEqual((borrowed as unknown as Record<string, unknown>).candidates, undefined, 'borrowed inspections carry no candidates across creators');
+  assert.deepEqual(borrowed.row.candidates, [], 'borrowed row is candidate-free at the API boundary');
 });
 
 test('coverage gates negative reuse but never blocks positive site-facts', () => {

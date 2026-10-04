@@ -246,6 +246,16 @@ export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
 }
 
 /**
+ * Maps a worker execution marker to the coverage-borrow bypass flag. Only an
+ * explicit retry-owned reacquisition marker bypasses borrowed coverage; every
+ * other path (absent marker, false flag) borrows normally. Strict equality
+ * keeps unknown marker shapes fail-safe toward borrowing.
+ */
+export function resolveBorrowBypassForInspectionMarker(marker?: { isRetryOwnedReacquire?: boolean }): boolean {
+  return marker?.isRetryOwnedReacquire === true;
+}
+
+/**
  * Pure SEARCH worker wall-time split (observability only): quota-wait vs
  * retrieval vs per-channel processing vs total worker time. Persisted in
  * query-run performance_details; never affects scoring or behavior.
@@ -374,7 +384,11 @@ export async function processNextSearchJob(
       // job.attempts is the post-claim number matching this attempt's
       // job_attempts row; the marker call throws on a stale/recovered claim so
       // inspection never starts unmarked.
-      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts});
+      // A RETRY_COMMUNITY_ACQUISITION job exists precisely to continue an
+      // unresolved acquisition for the same channel: its inspection must
+      // re-acquire rather than borrow its own incomplete coverage in a loop.
+      // First-time inspections leave the flag unset and borrow normally.
+      const inspectionResult=await inspectAndValidateChannel(channel,undefined,false,false,false,{jobId:job.id,attemptNumber:job.attempts,isRetryOwnedReacquire:true});
       // Attempt-free deferral is reserved for capacity/browser signals where no
       // real acquisition was attempted (browser runtime unavailable). Genuine
       // acquisition failures (COMMUNITY_REQUIRED) consumed a real inspection
@@ -1199,7 +1213,7 @@ export async function inspectAndValidateChannel(
   isManualScan: boolean = false,
   enableDebug: boolean = false,
   scheduleRetry: boolean = true,
-  executionMarker?: { jobId: string; attemptNumber: number }
+  executionMarker?: { jobId: string; attemptNumber: number; isRetryOwnedReacquire?: boolean }
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   if (isTerminalState(channel) && !isManualScan) {
     console.log(`[Queue Manager] Channel '${channel.channel_name}' (${channel.channel_id}) is in terminal state '${channel.country_status}' / '${channel.trading_status}'. Aborting inspection.`);
@@ -1303,7 +1317,8 @@ export async function inspectAndValidateChannel(
       videoDescriptions: rawDetails?.videoDescriptions || [],
       socialLinks: rawDetails?.channelLinks || [],
       youtubeUrl: channel.youtube_url,
-      forceLiveFetch: isManualScan || !rawDetails?.description
+      forceLiveFetch: isManualScan || !rawDetails?.description,
+      bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker)
     });
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));

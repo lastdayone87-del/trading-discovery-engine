@@ -41,14 +41,19 @@ export interface CachedSiteInspection {
 }
 
 export interface BorrowedSiteInspection {
+  /** The covering row with candidates explicitly stripped: the borrow result
+   * is candidate-free at the API boundary so no future caller can reintroduce
+   * cross-creator candidate propagation through `borrowed.row.candidates`. */
   row: CachedSiteInspection;
   /** Borrowed observations reuse the cached outcome verbatim — including
    * PARTIALLY_INSPECTED and ACQUISITION_FAILED — so downstream retry and
    * freshness policy treats a borrow exactly like a fresh crawl with the
    * same result. Existing maxAttempts/terminal safeguards terminate
-   * repeated borrows of still-failing sites. */
+   * repeated borrows of still-failing sites.
+   * Cross-creator invariant: borrows carry coverage observations ONLY.
+   * Cached discovery candidates are never returned here and must never be
+   * merged into another creator's investigation. */
   observations: Array<Record<string, unknown>>;
-  candidates: Array<Record<string, unknown>>;
 }
 
 const ageMs = (lastObservedAt: string | null, nowMs: number): number | null => {
@@ -76,7 +81,9 @@ export function isSiteInspectionReusable(row: CachedSiteInspection | null | unde
  * final URL are site-facts carried over. Required flags are preserved
  * verbatim: the borrowing call has identical structure to the original, so
  * retry attribution matches a fresh crawl. Provenance marks the borrow so
- * crawled vs reused evidence stays distinguishable downstream. */
+ * crawled vs reused evidence stays distinguishable downstream.
+ * Candidates are deliberately excluded: discoveries belong to the
+ * originating investigation and are never transferred across creators. */
 export function buildBorrowedSiteInspection(
   row: CachedSiteInspection,
   borrower: { requestedUrl: string; surface: string; required: boolean; wrapperUrl?: string; observedAt: string },
@@ -101,21 +108,7 @@ export function buildBorrowedSiteInspection(
       siteObservedAt: row.lastObservedAt,
     };
   });
-  const candidates = Array.isArray(row.candidates) ? row.candidates.map(item => ({ ...(item as Record<string, unknown>) })) : [];
-  return { row, observations, candidates };
-}
-
-/** Whether the borrower must recrawl despite a reusable row because it
- * would escalate to the rendered fallback and the cached row has no
- * rendered coverage. Conservative toward inspection: when in doubt,
- * recrawl. Callers compute hasCreatorOwned by merging the borrowed
- * candidates with the current creator's ownership input first. */
-export function needsRenderedRecrawl(
-  row: CachedSiteInspection,
-  input: { creatorLikelyTrading: boolean; staticOutcome: string; hasCreatorOwned: boolean },
-): boolean {
-  if (!input.creatorLikelyTrading || row.renderedCovered) return false;
-  return input.staticOutcome !== 'FOUND' || !input.hasCreatorOwned;
+  return { row: { ...row, candidates: [] }, observations };
 }
 
 /** Root-page terminal for coverage rows: reflects ONLY the root page's own
