@@ -60,3 +60,59 @@ test('ingestionPipeline enforces country hard-rejection before low-audience budg
   assert.ok(countryRejectedIndex >= 0 && lowAudienceGateIndex >= 0);
   assert.ok(countryRejectedIndex < lowAudienceGateIndex, 'Country hard-rejection must precede low-audience budget gate in ingestion pipeline');
 });
+
+test('handle-shaped and missing counts fail open as unavailable, never as low-audience', () => {
+  for (const raw of ['@KelvinVinny', '@DerivativeTradingAcademy', '', undefined]) {
+    const gate = evaluateLowAudienceGate(raw);
+    assert.equal(gate.shouldSkipDeepEnrichment, false);
+    assert.equal(gate.reasonCode, 'SUBSCRIBER_COUNT_UNAVAILABLE');
+  }
+});
+
+test('ENRICH claim reserves quota before hydrating and releases it on audience skip', () => {
+  const source = read('server/queueManager.ts');
+  // Order: stamp ENRICHING (preserves the existing row lifecycle) →
+  // reserve quota → hydrate → skip with release. A quota-exhausted claim
+  // throws at reservation and never spends the hydration fetch.
+  const stampIdx = source.indexOf("channel.scan_status = 'ENRICHING'");
+  assert.ok(stampIdx >= 0, 'ENRICHING stamp exists');
+  const skipIdx = source.indexOf('if (claimAudienceGate.shouldSkipDeepEnrichment) {');
+  assert.ok(skipIdx > stampIdx, 'audience skip runs after the stamp');
+  const reserveIdx = source.indexOf('tryReserveQuota({', stampIdx);
+  assert.ok(reserveIdx > stampIdx && reserveIdx < skipIdx, 'quota reservation precedes hydration and skip');
+  const hydrateIdx = source.indexOf('fetchYouTubeChannelCountryMetadata(channelId, candidate)', reserveIdx);
+  assert.ok(hydrateIdx > reserveIdx, 'hydration runs under reservation');
+  const releaseIdx = source.indexOf("finishQuotaReservation('ENRICH_CHANNEL',job.id,false)", skipIdx);
+  assert.ok(releaseIdx > skipIdx, 'audience skip releases the reservation');
+  assert.match(source, /reasonCode:'LOW_AUDIENCE_SKIP'/);
+});
+
+test('re-enqueue paths cannot bypass the low-audience gate on known-low counts', () => {
+  const qm = read('server/queueManager.ts');
+  assert.match(qm, /evaluateLowAudienceGate\(channel\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+  const iw = read('server/investigationWorkflow.ts');
+  assert.match(iw, /evaluateLowAudienceGate\(row\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+  const recovery = read('server/operationalEnrichmentRecovery.ts');
+  assert.match(recovery, /evaluateLowAudienceGate\(channel\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+});
+
+test('orphan skip-projection cannot regress rows that left ENRICHMENT_PENDING', () => {
+  const source = read('server/investigationWorkflow.ts');
+  const updateIdx = source.indexOf("scan_status='SKIPPED_LOW_AUDIENCE'");
+  assert.ok(updateIdx >= 0, 'orphan skip projection exists');
+  const guardIdx = source.indexOf("AND scan_status='ENRICHMENT_PENDING'", updateIdx);
+  assert.ok(guardIdx > updateIdx, 'skip projection is guarded by current ENRICHMENT_PENDING status');
+});
+
+test('manual recheck low-audience skip completes instead of failing', () => {
+  const source = read('server/queueManager.ts');
+  assert.match(source, /code: 'MANUAL_RESCAN_LOW_AUDIENCE_SKIP'/);
+  const handlerIdx = source.indexOf("if(result.code==='MANUAL_RESCAN_LOW_AUDIENCE_SKIP'){await completeJob(job.id);return true;}");
+  assert.ok(handlerIdx >= 0, 'policy skip completes the job without consuming retries');
+});
+
+test('confirmed excluded creators reach the claim gate instead of the audience skip', () => {
+  const source = read('server/investigationWorkflow.ts');
+  assert.match(source, /countryPreemptsAudience/);
+  assert.match(source, /findCountryExclusion\(row\.country/);
+});

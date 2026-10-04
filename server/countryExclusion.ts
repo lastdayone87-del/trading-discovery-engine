@@ -1,5 +1,5 @@
 import { getExcludedCountries } from './db';
-import { CountryExclusionMatch, findCountryExclusion } from './countryExclusionRules';
+import { CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
 export { findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
@@ -22,6 +22,27 @@ export async function getCountryExclusion(country: string | null | undefined): P
   // path stays free of any I/O failure mode.
   if (typeof country !== 'string' || !country.trim()) return null;
   return findCountryExclusion(country, await getExcludedCountries());
+}
+
+/**
+ * ENRICH-claim creator-country gate predicate (pure). A stored CONFIRMED
+ * creator country matching the exclusion list blocks enrichment. LIKELY and
+ * below stay fail-open, matching the existing Gate-1 authority semantics
+ * where only confirmed-level evidence rejects. Returns the matched
+ * exclusion, or null when the claim may proceed.
+ */
+export function shouldBlockEnrichClaimForCountry(
+  countryStatus: string | null | undefined,
+  country: string | null | undefined,
+  exclusion: CountryExclusionMatch | null
+): CountryExclusionMatch | null {
+  if (countryStatus !== 'CONFIRMED') return null;
+  if (typeof country !== 'string' || !country.trim()) return null;
+  if (!exclusion) return null;
+  // Defense in depth: the match must belong to this country. A stale or
+  // mismatched lookup result must never block the wrong country.
+  if (normalizeCountryName(exclusion.country) !== normalizeCountryName(country)) return null;
+  return exclusion;
 }
 
 /**

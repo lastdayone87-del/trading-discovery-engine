@@ -1,4 +1,5 @@
 import type { ChannelRecord } from '../src/types';
+import { evaluateLowAudienceGate } from './lowAudienceGate';
 
 export const OPERATIONAL_ENRICHMENT_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 
@@ -145,6 +146,14 @@ export async function reconcileOperationalEnrichmentRecovery(
   for (const row of rows.rows) {
     const channel = await getChannelById(row.channel_id);
     if (!channel) continue;
+    // A stored known-low count must not re-enter enrichment through recovery:
+    // project the low-audience skip instead of re-enqueueing.
+    if (evaluateLowAudienceGate(channel.subscriber_count).shouldSkipDeepEnrichment) {
+      const skipNow = new Date(now).toISOString();
+      await upsertChannel({...channel,subscriber_count:channel.subscriber_count,scan_status:'SKIPPED_LOW_AUDIENCE',last_checked:skipNow,inspection_trail:[...(channel.inspection_trail||[]),{step:'BIO',title:'Low-Audience Budget Gate',status:'SKIPPED',details:`Subscribers: ${channel.subscriber_count} (< 30). Stored and skipped deep enrichment.`,timestamp:skipNow}]});
+      reconciled++;
+      continue;
+    }
     const decision = shouldReactivateOperationalEnrichment(channel, now);
     if (!decision.reactivate) continue;
     const updated = reactivateOperationalEnrichment(channel, decision.reasonCodes, new Date(now).toISOString());

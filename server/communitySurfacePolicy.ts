@@ -274,6 +274,45 @@ export function isDotlessHostnameUrl(raw: string): boolean {
   }
 }
 
+/**
+ * Page-asset infrastructure hosts captured by indiscriminate page scraping
+ * (thumbnail/playback/telemetry/schema/font endpoints embedded in channel
+ * page data). These can never be creator sites and can never carry Discord
+ * invites, so they are filtered at link-collection time and never become
+ * crawl seeds. Dotless single-label hosts are deliberately NOT in this list:
+ * they keep the existing static-attempt-for-recall doctrine. Valid creator,
+ * affiliate, social, and messaging hosts are unaffected.
+ */
+const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
+  'ytimg.com',
+  'googlevideo.com',
+  'googleapis.com',
+  'schema.org',
+  'w3.org',
+  'fonts.googleapis.com',
+  'fonts.gstatic.com',
+  'youtubei-att.googleapis.com',
+  'gstatic.com',
+];
+export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
+  // Scheme-less links get the same https fallback as normalizeExternalUrl so
+  // valid creator links (e.g. `example.com/community`) are never dropped;
+  // only unparseable strings and asset hosts are filtered. A single trailing
+  // dot is DNS-equivalent noise and is stripped before comparison.
+  const candidates = [rawUrl, /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`];
+  for (const candidate of candidates) {
+    try {
+      const host = new URL(candidate).hostname.toLowerCase().replace(/\.$/, '');
+      if (!host) return true;
+      if (PAGE_ASSET_INFRASTRUCTURE_HOSTS.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
+      return false;
+    } catch {
+      continue;
+    }
+  }
+  return true;
+}
+
 export function isKnownBrokerOrExchangeHost(host: string): boolean {
   const lower = host.toLowerCase();
   if (BROKER_EXACT_HOSTS.has(lower)) return true;

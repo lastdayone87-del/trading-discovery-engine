@@ -1077,3 +1077,23 @@ test('genuinely unavailable videos still skip quietly', async () => {
     resetInnertubePacingForTests();
   }
 });
+
+test('subscriber mapping never stores handles or digit-free text as counts', async () => {
+  const { sanitizedSubscriberCountText } = await import('./youtubeInnertubeProvider');
+  assert.equal(sanitizedSubscriberCountText('@KelvinVinny'), undefined);
+  assert.equal(sanitizedSubscriberCountText('@DerivativeTradingAcademy'), undefined);
+  assert.equal(sanitizedSubscriberCountText('@trader123'), undefined);
+  assert.equal(sanitizedSubscriberCountText(''), undefined);
+  assert.equal(sanitizedSubscriberCountText(undefined), undefined);
+  assert.equal(sanitizedSubscriberCountText('10K subscribers'), '10K subscribers');
+  assert.equal(sanitizedSubscriberCountText('24'), '24');
+  assert.equal(sanitizedSubscriberCountText('1.2M subscribers'), '1.2M subscribers');
+});
+
+test('channel mapping drops handle-shaped subscriber nodes', () => {
+  const mapped = mapInnertubeChannelsToRaw([
+    { id: UC, author: { id: UC, name: 'Vinny' }, subscriber_count: { text: '@KelvinVinny' }, description_snippet: { text: '' } },
+  ], 'Sweden');
+  assert.equal(mapped.length, 1);
+  assert.equal(mapped[0].subscriberCount, undefined);
+});

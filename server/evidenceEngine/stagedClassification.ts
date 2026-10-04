@@ -8,6 +8,36 @@ import { dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from '.
 
 export const STAGED_CLASSIFICATION_VERSION = '3.2.1';
 
+/**
+ * Retrieval-only thin input requiring hydration. At enrichment_stage 0 with
+ * retrieval provenance, the matched document's content is deliberately
+ * withheld from evidence (anti-contamination), so the evaluation is known to
+ * rest on title/bio alone with no channel videos, playlists, or transcripts.
+ * Such an evaluation must never terminally REJECT: when contradiction would
+ * otherwise FAIL, it ABSTAINS with THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION
+ * instead, and the normal lifecycle routing applies (ENRICH when evidence
+ * coverage is incomplete, REVIEW when candidate and corroboration already
+ * pass on affirmative positive evidence). Withheld match content is never
+ * fed into evidence. Video fields count as hydration only with the explicit
+ * authoritative-hydration marker (set solely by enrichment hydration):
+ * retrieval-selected titles and fallback video objects at stage 0 never do,
+ * so ordinary stage-0 search candidates cannot bypass the guard.
+ */
+export function isThinRetrievalInputRequiringHydration(input: RawChannelInput): boolean {
+  if (Number(input.enrichment_stage || 0) !== 0) return false;
+  if (!input.search_match_context) return false;
+  // Retrieval-selected video fields are not hydration evidence: at stage 0
+  // they describe the matched retrieval document, never a hydrated channel
+  // sample. Only an explicitly authoritative sample (set by enrichment
+  // hydration) counts, so ordinary stage-0 search candidates cannot bypass
+  // the guard via their own match titles.
+  const videoSampleAuthoritative = input.videoDescriptionsAuthoritative === true;
+  const hasVideos = ((input.video_titles?.length || 0) > 0 || (input.videos?.length || 0) > 0 || (input.video_descriptions?.length || 0) > 0) && videoSampleAuthoritative;
+  const hasPlaylists = (input.playlists?.length || 0) > 0;
+  const hasTranscripts = (input.transcript_excerpts?.length || 0) > 0;
+  return !hasVideos && !hasPlaylists && !hasTranscripts;
+}
+
 function inferredFields(item: EvidenceItem): EvidenceFieldRef[] {
   if (item.provenance?.fields?.length) return item.provenance.fields;
   switch (item.source) {
@@ -108,11 +138,13 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const corroboration = corroborated
     ? result('CORROBORATION', 'PASS', [repeatedCreatorIndependent ? 'REPEATED_VIDEO_SOURCE_FAMILY_INDEPENDENCE_SATISFIED' : 'SOURCE_FAMILY_INDEPENDENCE_SATISFIED'], corroborationEvidence, { sources: sources.size, fields: observations.size, sourceFamilies:Math.max(independence.independentFamilyCount,repeatedIndependence.independentFamilyCount),sourceEntities:Math.max(independence.independentEntityCount,repeatedIndependence.independentEntityCount),dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent })
     : result('CORROBORATION', 'ABSTAIN', [weakVideoTerminologyOnly?'WEAK_VIDEO_TERMINOLOGY_ONLY':corroborating.length&&independence.independentFamilyCount<2?'SOURCE_FAMILY_INDEPENDENCE_REQUIRED':'CORROBORATION_REQUIRED'], corroborating, { sources: sources.size, fields: observations.size, sourceFamilies:independence.independentFamilyCount,sourceEntities:independence.independentEntityCount,dimensions: independentDimensions.size, repeatedVideos: repeated, repeatedCreatorIndependent });
-  const contradiction = semanticUnrelatedCandidate
-    ? result('CONTRADICTION','FAIL',['CREATOR_LEVEL_SEMANTIC_UNRELATED_CANDIDATE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
-    : dominantContradiction
-      ? result('CONTRADICTION', 'FAIL', ['DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION'], terminalNegative, { negativeWeight, positiveWeight, terminalNegativeWeight })
-      : mixedNegativeConflict
+  const contradiction = semanticUnrelatedCandidate || dominantContradiction
+    ? (isThinRetrievalInputRequiringHydration(input)
+      ? result('CONTRADICTION','ABSTAIN',['THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
+      : semanticUnrelatedCandidate
+        ? result('CONTRADICTION','FAIL',['CREATOR_LEVEL_SEMANTIC_UNRELATED_CANDIDATE'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight})
+        : result('CONTRADICTION', 'FAIL', ['DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION'], terminalNegative, { negativeWeight, positiveWeight, terminalNegativeWeight }))
+    : mixedNegativeConflict
         ? result('CONTRADICTION','ABSTAIN',['MIXED_EVIDENCE_TERMINAL_REJECTION_WITHHELD'],negative,{negativeWeight,positiveWeight,terminalNegativeWeight,independentNegativeObservations:collection.terminalNegativeSufficiency?.independentObservations||0,independentNegativeSourceFamilies:collection.terminalNegativeSufficiency?.independentSourceFamilies||0})
         : result('CONTRADICTION', 'PASS', negative.length ? ['CONTRADICTION_NOT_TERMINAL_OR_DOMINANT'] : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight, terminalNegativeWeight });
 
