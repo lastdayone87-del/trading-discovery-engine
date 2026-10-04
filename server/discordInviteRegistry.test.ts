@@ -104,33 +104,60 @@ test('legacy nativeInviteCode carries the case-preserved code, never a URL', () 
   assert.equal(r.candidates[0].rawLocator, 'https://discord.gg/AbC123');
 });
 
-test('choke ordering is persist, claim, delete losers, then validate exactly once', async () => {
+test('flow delegates once to the choke helper and validates its output', async () => {
   const fs = await import('node:fs');
   const { fileURLToPath } = await import('node:url');
   const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
-  const persistIdx = source.indexOf('if(preProvisional.length)await persistDiscordCandidates(');
-  assert.ok(persistIdx >= 0, 'provisional persist exists');
-  const claimIdx = source.indexOf('await claimDiscordInvites([', persistIdx);
-  assert.ok(claimIdx > persistIdx, 'claim follows persist');
-  const deleteIdx = source.indexOf('await deleteDiscordCandidates(', claimIdx);
-  assert.ok(deleteIdx > claimIdx, 'loser delete follows claim');
-  const validateIdx = source.indexOf('await validateDiscordInvite(', deleteIdx);
-  assert.ok(validateIdx > deleteIdx, 'validation runs last, on winners only');
-  assert.equal(source.split('await claimDiscordInvites(').length - 1, 2, 'structured batch claim plus conditional legacy claim');
+  assert.equal(
+    source.split('await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id)').length - 1,
+    1,
+    'single choke delegation per inspection',
+  );
+  assert.match(source, /admittedInspection=\{\.\.\.inspection,discordCandidates:chokeAdmission\.candidates,foundInvite:chokeAdmission\.discoveredInvite\};/);
 });
 
-test('legacy claim runs only when nothing was admitted (no parking)', async () => {
-  const fs = await import('node:fs');
-  const { fileURLToPath } = await import('node:url');
-  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
-  const anchor = source.indexOf('if(!preAdmission.candidates.length&&preFoundCode&&!preClaimSources.has(preFoundCode)){');
-  assert.ok(anchor >= 0, 'conditional legacy claim exists');
-  const persistIdx = source.indexOf('await persistDiscordCandidates(channel.channel_id,[{candidateId:legacyFallback', anchor);
-  assert.ok(persistIdx > anchor, 'legacy row persisted before its claim');
-  const claimIdx = source.indexOf('await claimDiscordInvites([{code:preFoundCode', persistIdx);
-  assert.ok(claimIdx > persistIdx, 'legacy claim follows its persist');
-  const deleteIdx = source.indexOf('await deleteDiscordCandidates(channel.channel_id,[preFoundCode]);', claimIdx);
-  assert.ok(deleteIdx > claimIdx, 'lost legacy claim is cleaned up');
+test('legacy foundInvite is persisted, claimed, and admitted when structured loses', async () => {
+  const { admitInspectionDiscordCandidates } = await import('./queueManager');
+  const calls: Array<{ op: string; arg: unknown }> = [];
+  const mkCand = (code: string) => ({
+    candidateId: `test:${code}`,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CREATOR_WEBSITES',
+    rawLocator: `https://discord.gg/${code}`,
+    normalizedLocator: `https://discord.gg/${code.toLowerCase()}`,
+    nativeInviteCode: code,
+    sourceUrl: `https://owner.example/${code}`,
+    extractionConfidence: 'EXPLICIT',
+  });
+  const deps = {
+    persist: async (channelId: string, candidates: unknown[]) => {
+      calls.push({ op: 'persist', arg: (candidates as Array<{ candidateId: string }>).map(c => c.candidateId) });
+    },
+    claim: async (items: Array<{ code: string }>) => {
+      calls.push({ op: 'claim', arg: items.map(i => i.code) });
+      return items.map(i => ({ code: i.code, admitted: true, firstChannelId: 'chanX' }));
+    },
+    removeLosers: async (channelId: string, codes: string[]) => {
+      calls.push({ op: 'delete', arg: codes });
+      return codes.length;
+    },
+  };
+  // Structured OLD1 loses globally, but the trail foundInvite names an
+  // unevaluated NEW2: legacy path persists, claims, and admits it.
+  const ownedByOther = {
+    persist: deps.persist,
+    claim: async (items: Array<{ code: string }>) => {
+      calls.push({ op: 'claim', arg: items.map(i => i.code) });
+      return items.map(i => i.code === 'new2'
+        ? { code: i.code, admitted: true, firstChannelId: 'chanX' }
+        : { code: i.code, admitted: false, firstChannelId: 'chanOther' });
+    },
+    removeLosers: deps.removeLosers,
+  };
+  const result = await admitInspectionDiscordCandidates([mkCand('OLD1')] as never, 'NEW2', 'chanX', ownedByOther as never);
+  assert.deepEqual(calls.map(c => c.op), ['persist', 'claim', 'persist', 'claim', 'delete']);
+  assert.deepEqual(result.candidates.map(c => (c as { nativeInviteCode: string }).nativeInviteCode), ['NEW2']);
+  assert.equal(result.discoveredInvite, 'NEW2');
 });
 
 test('reconcile and validation share one admitted inspection view', async () => {
@@ -159,4 +186,64 @@ test('duplicate-only inspection preserves an already-validated Discord state', a
   const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
   const gateIdx = source.indexOf('if (!hasInspectionFailure && !hasCandidate && !alreadyValidatedDiscord) {');
   assert.ok(gateIdx >= 0, 'validated-success guard exists on the duplicate-only absence projection');
+});
+
+test('choke invokes persist, claim, delete in order with correct payloads', async () => {
+  const { admitInspectionDiscordCandidates } = await import('./queueManager');
+  const calls: Array<{ op: string; arg: unknown }> = [];
+  const mkCand = (code: string) => ({
+    candidateId: `test:${code}`,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CREATOR_WEBSITES',
+    rawLocator: `https://discord.gg/${code}`,
+    normalizedLocator: `https://discord.gg/${code.toLowerCase()}`,
+    nativeInviteCode: code,
+    sourceUrl: `https://owner.example/${code}`,
+    extractionConfidence: 'EXPLICIT',
+  });
+  const deps = {
+    persist: async (channelId: string, candidates: unknown[]) => {
+      calls.push({ op: 'persist', arg: (candidates as Array<{ candidateId: string }>).map(c => c.candidateId) });
+    },
+    claim: async (items: Array<{ code: string }>) => {
+      calls.push({ op: 'claim', arg: items.map(i => i.code) });
+      return items.map(i => ({ code: i.code, admitted: i.code !== 'old1', firstChannelId: i.code !== 'old1' ? 'chanX' : 'chanOther' }));
+    },
+    removeLosers: async (channelId: string, codes: string[]) => {
+      calls.push({ op: 'delete', arg: codes });
+      return codes.length;
+    },
+  };
+  const result = await admitInspectionDiscordCandidates(
+    [mkCand('NEW1'), mkCand('OLD1')] as never,
+    null,
+    'chanX',
+    deps as never,
+  );
+  assert.deepEqual(calls.map(c => c.op), ['persist', 'claim', 'delete']);
+  assert.deepEqual(result.candidates.map(c => (c as { nativeInviteCode: string }).nativeInviteCode), ['NEW1']);
+  assert.equal(result.discoveredInvite, 'NEW1');
+  const deleteCall = calls.find(c => c.op === 'delete');
+  assert.deepEqual(deleteCall?.arg, ['old1']);
+});
+
+test('choke claims legacy foundInvite only when nothing admitted', async () => {
+  const { admitInspectionDiscordCandidates } = await import('./queueManager');
+  const claimed: string[][] = [];
+  const deps = {
+    persist: async () => undefined,
+    claim: async (items: Array<{ code: string }>) => {
+      claimed.push(items.map(i => i.code));
+      return items.map(i => ({ code: i.code, admitted: true, firstChannelId: 'chanX' }));
+    },
+    removeLosers: async () => 0,
+  };
+  // Structured admitted: foundInvite code must NOT be claimed (no parking).
+  await admitInspectionDiscordCandidates(
+    [{ candidateId: 'x', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', rawLocator: 'https://discord.gg/NEW1', normalizedLocator: 'https://discord.gg/new1', nativeInviteCode: 'NEW1', extractionConfidence: 'EXPLICIT' }] as never,
+    'OTHER2',
+    'chanX',
+    deps as never,
+  );
+  assert.deepEqual(claimed, [['new1']]);
 });

@@ -35,7 +35,9 @@ import {
   countDiscordInvalidObservations,
   appendExternalAcquisitionObservations,
   getNeighborhoodForQueryRun,
-  markCommunityInspectionStarted
+  markCommunityInspectionStarted,
+  type DiscordAttemptCandidate,
+  type DiscordInviteClaim
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -258,6 +260,73 @@ export function resolveBorrowBypassForInspectionMarker(marker?: { isRetryOwnedRe
   return marker?.isRetryOwnedReacquire === true;
 }
 
+/**
+ * Choke-point orchestration for global canonical Discord discard. Crash-safe
+ * ordering per call: persist provisional rows (idempotent upsert), claim all
+ * codes, delete losers. Dependencies are injectable so invocation order,
+ * payloads, and admission outcomes are unit-testable without a database;
+ * production passes the real persist/claim/delete implementations.
+ */
+export interface DiscordChokeDeps {
+  persist(channelId: string, candidates: DiscordAttemptCandidate[]): Promise<void>;
+  claim(items: Array<{ code: string; sourceSurface?: string | null; sourceUrl?: string | null }>, channelId: string): Promise<DiscordInviteClaim[]>;
+  removeLosers(channelId: string, codes: string[]): Promise<number>;
+}
+export async function admitInspectionDiscordCandidates(
+  structuredCandidates: DiscordCandidate[],
+  foundInvite: string | null | undefined,
+  channelId: string,
+  deps: DiscordChokeDeps = {
+    persist: (targetChannelId, candidates) => persistDiscordCandidates(targetChannelId, candidates),
+    claim: (items, targetChannelId) => claimDiscordInvites(items, targetChannelId),
+    removeLosers: (targetChannelId, codes) => deleteDiscordCandidates(targetChannelId, codes),
+  },
+): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number }> {
+  const toPersist = (list: DiscordCandidate[]) => list.map(candidate => ({
+    candidateId: candidate.candidateId,
+    rawLocator: candidate.rawLocator,
+    locatorType: candidate.locatorType,
+    resolvedLocator: candidate.normalizedLocator,
+    sourceSurface: candidate.sourceSurface,
+    sourceUrl: candidate.sourceUrl,
+    observations: candidate.observations,
+  }));
+  const preLegacy = !structuredCandidates.length && foundInvite
+    ? buildLegacyDiscordCandidate(foundInvite, discordInviteCodeOf(foundInvite))
+    : null;
+  const provisional = [...structuredCandidates, ...(preLegacy ? [preLegacy] : [])];
+  if (provisional.length) await deps.persist(channelId, toPersist(provisional));
+  const claimSources = new Map<string, { surface: string | null; url: string | null }>();
+  for (const candidate of provisional) {
+    const code = discordInviteCodeOf(candidate.nativeInviteCode);
+    if (code && !claimSources.has(code)) claimSources.set(code, { surface: candidate.sourceSurface || null, url: candidate.sourceUrl || null });
+  }
+  const inviteClaims = await deps.claim([...claimSources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  let admittedCodes = new Set(inviteClaims.filter(claim => claim.admitted).map(claim => claim.code));
+  let admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
+  // A trail-level foundInvite naming a code outside the structured set is
+  // claimed only when nothing was admitted: claiming it unconditionally
+  // would park codes that are never processed, blackholing later channels.
+  const foundCode = discordInviteCodeOf(foundInvite);
+  if (!admission.candidates.length && foundCode && !claimSources.has(foundCode)) {
+    // Persist-before-claim (crash-safe ordering) also applies here: the
+    // legacy row must exist before its code can be claimed.
+    const legacyFallback = buildLegacyDiscordCandidate(foundInvite, foundCode);
+    if (legacyFallback) {
+      await deps.persist(channelId, toPersist([legacyFallback]));
+      const [legacyClaim] = await deps.claim([{ code: foundCode, sourceSurface: null, sourceUrl: null }], channelId);
+      if (legacyClaim.admitted) {
+        admittedCodes = new Set([...admittedCodes, foundCode]);
+        admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
+      } else {
+        await deps.removeLosers(channelId, [foundCode]);
+      }
+    }
+  }
+  const loserCodes = [...claimSources.keys()].filter(code => !admittedCodes.has(code));
+  if (loserCodes.length) await deps.removeLosers(channelId, loserCodes);
+  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount };
+}
 /**
  * Pure SEARCH worker wall-time split (observability only): quota-wait vs
  * retrieval vs per-channel processing vs total worker time. Persisted in
@@ -1338,42 +1407,13 @@ export async function inspectAndValidateChannel(
     // Structured candidates are authoritative for discovery; foundInvite is a
     // compatibility fallback for older inspection results without the
     // structured collection. The admitted view below preserves that
-    // precedence while enforcing the global canonical discard.
+    // precedence while enforcing the global canonical discard. The choke
+    // orchestration (persist, claim, delete losers) is injectable for tests;
+    // production passes the real implementations below.
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
-    const preLegacy=!structuredCandidates.length&&inspection.foundInvite?buildLegacyDiscordCandidate(inspection.foundInvite,discordInviteCodeOf(inspection.foundInvite)):null;
-    const preProvisional=[...structuredCandidates,...(preLegacy?[preLegacy]:[])];
-    if(preProvisional.length)await persistDiscordCandidates(channel.channel_id,preProvisional.map(candidate=>({candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:candidate.normalizedLocator,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,observations:candidate.observations})));
-    const preClaimSources=new Map<string,{surface:string|null;url:string|null}>();
-    for(const candidate of preProvisional){
-      const code=discordInviteCodeOf(candidate.nativeInviteCode);
-      if(code&&!preClaimSources.has(code))preClaimSources.set(code,{surface:candidate.sourceSurface||null,url:candidate.sourceUrl||null});
-    }
-    const preInviteClaims=await claimDiscordInvites([...preClaimSources.entries()].map(([code,src])=>({code,sourceSurface:src.surface,sourceUrl:src.url})),channel.channel_id);
-    let preAdmittedCodes=new Set(preInviteClaims.filter(claim=>claim.admitted).map(claim=>claim.code));
-    let preAdmission=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,preAdmittedCodes);
-    // A trail-level foundInvite naming a code outside the structured set is
-    // claimed only when nothing was admitted: claiming it unconditionally
-    // would park codes that are never processed, blackholing later channels.
-    const preFoundCode=discordInviteCodeOf(inspection.foundInvite);
-    if(!preAdmission.candidates.length&&preFoundCode&&!preClaimSources.has(preFoundCode)){
-      // Persist-before-claim (crash-safe ordering) also applies here: the
-      // legacy row must exist before its code can be claimed.
-      const legacyFallback=buildLegacyDiscordCandidate(inspection.foundInvite,preFoundCode);
-      if(legacyFallback){
-        await persistDiscordCandidates(channel.channel_id,[{candidateId:legacyFallback.candidateId,rawLocator:legacyFallback.rawLocator,locatorType:legacyFallback.locatorType,resolvedLocator:legacyFallback.normalizedLocator,sourceSurface:legacyFallback.sourceSurface,sourceUrl:legacyFallback.sourceUrl,observations:legacyFallback.observations}]);
-        const [legacyClaim]=await claimDiscordInvites([{code:preFoundCode,sourceSurface:null,sourceUrl:null}],channel.channel_id);
-        if(legacyClaim.admitted){
-          preAdmittedCodes=new Set([...preAdmittedCodes,preFoundCode]);
-          preAdmission=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,preAdmittedCodes);
-        }else{
-          await deleteDiscordCandidates(channel.channel_id,[preFoundCode]);
-        }
-      }
-    }
-    const preLoserCodes=[...preClaimSources.keys()].filter(code=>!preAdmittedCodes.has(code));
-    if(preLoserCodes.length)await deleteDiscordCandidates(channel.channel_id,preLoserCodes);
-    if(preAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:preAdmission.discardedCount,timestamp:new Date().toISOString()}));
-    admittedInspection={...inspection,discordCandidates:preAdmission.candidates,foundInvite:preAdmission.discoveredInvite};
+    const chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
+    if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,timestamp:new Date().toISOString()}));
+    admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
 
     // The admitted inspection view (computed once at the authoritative claim
     // above) shapes every downstream gate, so a duplicate-only inspection
@@ -1461,8 +1501,8 @@ export async function inspectAndValidateChannel(
     // compatibility fallback for older inspection results without the
     // structured collection. Admission was decided once at the authoritative
     // claim above; this block validates the admitted winners only.
-    const candidates=preAdmission.candidates;
-    const discoveredInvite=preAdmission.discoveredInvite;
+    const candidates=chokeAdmission.candidates;
+    const discoveredInvite=chokeAdmission.discoveredInvite;
     if (discoveredInvite) {
       // Validate bounded native candidates until a high-confidence trading
       // community is found. A live-but-ambiguous or live-but-non-trading first

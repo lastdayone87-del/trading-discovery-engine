@@ -164,12 +164,17 @@ export async function claimDiscordInvites(items:Array<{code:string;sourceSurface
  * validation never ran for removed rows (the candidate-attempt trigger only
  * fires on check inserts), so deletion is side-effect free. Returns removed
  * row count. */
+/** Canonical invite code extracted from a stored locator, mirroring the
+ * TypeScript canonicalizer (all supported Discord URL forms, stripped
+ * query/fragment, first path segment, lowercased). Kept inline here and in
+ * the registry backfill so loser cleanup matches exactly the rows the
+ * registry can name. */
 export async function deleteDiscordCandidates(channelId:string,codes:string[]):Promise<number>{
   const unique=[...new Set((codes||[]).filter(code=>typeof code==='string'&&!!code))];
   if(!unique.length||!channelId)return 0;
   const db=await getDb();
   const res=await db.query(
-    `DELETE FROM discord_candidates WHERE channel_id=$1 AND normalized_locator=ANY(SELECT 'https://discord.gg/'||code FROM unnest($2::text[]) AS code)`,
+    `DELETE FROM discord_candidates WHERE channel_id=$1 AND lower(split_part(regexp_replace(regexp_replace(normalized_locator, '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1))=ANY($2::text[])`,
     [channelId,unique]);
   return res.rowCount||0;
 }
