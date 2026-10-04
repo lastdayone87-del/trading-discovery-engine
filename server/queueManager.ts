@@ -30,7 +30,6 @@ import {
   appendDiscordCheckAttempts,
   persistDiscordCandidates,
   claimDiscordInvites,
-  lookupDiscordInviteOwners,
   deleteDiscordCandidates,
   selectDiscordCandidate,
   countDiscordInvalidObservations,
@@ -1327,17 +1326,40 @@ export async function inspectAndValidateChannel(
     if(inspection.acquisitionOutcomes?.length)await appendExternalAcquisitionObservations(channel.channel_id,inspection.acquisitionOutcomes)
       .catch(error=>console.warn(`[ExternalAcquisition] observational write failed for ${channel.channel_id}:`,error instanceof Error?error.message:error));
 
-    // Global canonical pre-check (read-only, no writes): shape downstream
-    // gates on admitted discoveries so a duplicate-only inspection can
-    // neither reconcile nor project a discarded invite. The authoritative
-    // claim happens once at the validation block below.
-    const reconStructured=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
-    const reconProvisionalCode=!reconStructured.length&&inspection.foundInvite?discordInviteCodeOf(inspection.foundInvite):null;
-    const reconClaimCodes=[...new Set([...reconStructured.map(candidate=>discordInviteCodeOf(candidate.nativeInviteCode)),reconProvisionalCode].filter((code):code is string=>!!code))];
-    const reconOwners=reconClaimCodes.length?await lookupDiscordInviteOwners(reconClaimCodes):new Map<string,string>();
-    const reconAdmittedCodes=new Set(reconClaimCodes.filter(code=>!reconOwners.has(code)||reconOwners.get(code)===channel.channel_id));
-    const reconAdmission=admitDiscordCandidates(reconStructured,inspection.foundInvite,reconAdmittedCodes);
-    const admittedInspection={...inspection,discordCandidates:reconAdmission.candidates,foundInvite:reconAdmission.discoveredInvite};
+    // Global canonical discard (single authoritative claim for this
+    // inspection). Crash-safe ordering: persist provisional rows first
+    // (idempotent upsert), then claim, then delete losers. A crash between
+    // steps always converges on retry, and the registry can never name a
+    // code whose candidate row was never written in the same execution.
+    // Codes owned by other channels are discarded completely here (row
+    // deleted, no check record, no validation, no projection); same-channel
+    // and unknown codes proceed exactly as before.
+    // Structured candidates are authoritative for discovery; foundInvite is a
+    // compatibility fallback for older inspection results without the
+    // structured collection. The admitted view below preserves that
+    // precedence while enforcing the global canonical discard.
+    const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
+    const preLegacy=!structuredCandidates.length&&inspection.foundInvite?buildLegacyDiscordCandidate(inspection.foundInvite,discordInviteCodeOf(inspection.foundInvite)):null;
+    const preProvisional=[...structuredCandidates,...(preLegacy?[preLegacy]:[])];
+    if(preProvisional.length)await persistDiscordCandidates(channel.channel_id,preProvisional.map(candidate=>({candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:candidate.normalizedLocator,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,observations:candidate.observations})));
+    const preClaimSources=new Map<string,{surface:string|null;url:string|null}>();
+    for(const candidate of preProvisional){
+      const code=discordInviteCodeOf(candidate.nativeInviteCode);
+      if(code&&!preClaimSources.has(code))preClaimSources.set(code,{surface:candidate.sourceSurface||null,url:candidate.sourceUrl||null});
+    }
+    const preInviteClaims=await claimDiscordInvites([...preClaimSources.entries()].map(([code,src])=>({code,sourceSurface:src.surface,sourceUrl:src.url})),channel.channel_id);
+    const preAdmittedCodes=new Set(preInviteClaims.filter(claim=>claim.admitted).map(claim=>claim.code));
+    const preAdmission=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,preAdmittedCodes);
+    const preLoserCodes=[...preClaimSources.keys()].filter(code=>!preAdmittedCodes.has(code));
+    if(preLoserCodes.length)await deleteDiscordCandidates(channel.channel_id,preLoserCodes);
+    if(preAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:preAdmission.discardedCount,timestamp:new Date().toISOString()}));
+    const admittedInspection={...inspection,discordCandidates:preAdmission.candidates,foundInvite:preAdmission.discoveredInvite};
+
+    // The admitted inspection view (computed once at the authoritative claim
+    // above) shapes every downstream gate, so a duplicate-only inspection
+    // can neither reconcile nor project a discarded invite.
+
+    // Live About-page hydration can reveal stronger country evidence than the
 
     // Live About-page hydration can reveal stronger country evidence than the
     // search snippet. Re-evaluate before persisting any discovered community.
@@ -1412,31 +1434,10 @@ export async function inspectAndValidateChannel(
 
     // Structured candidates are authoritative for discovery; foundInvite is a
     // compatibility fallback for older inspection results without the
-    // structured collection.
-    const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!candidate.nativeInviteCode);
-    // Crash-safe global discard ordering: persist first (idempotent upsert),
-    // then claim, then delete losers. A crash between steps always converges
-    // on retry, and the registry can never name a code whose candidate row
-    // was never written in the same execution.
-    const provisionalLegacy=!structuredCandidates.length&&inspection.foundInvite?buildLegacyDiscordCandidate(inspection.foundInvite,discordInviteCodeOf(inspection.foundInvite)):null;
-    const provisionalCandidates=[...structuredCandidates,...(provisionalLegacy?[provisionalLegacy]:[])];
-    if(provisionalCandidates.length)await persistDiscordCandidates(channel.channel_id,provisionalCandidates.map(candidate=>({candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:candidate.normalizedLocator,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,observations:candidate.observations})));
-    // Global canonical claim with per-code first-source provenance. Unknown
-    // codes are claimed and admitted; codes owned by this channel keep
-    // existing behavior; codes owned by other channels are discarded
-    // completely (row deleted below, no check record, no validation, no
-    // projection).
-    const claimSources=new Map<string,{surface:string|null;url:string|null}>();
-    for(const candidate of provisionalCandidates){
-      const code=discordInviteCodeOf(candidate.nativeInviteCode);
-      if(code&&!claimSources.has(code))claimSources.set(code,{surface:candidate.sourceSurface||null,url:candidate.sourceUrl||null});
-    }
-    const inviteClaims=await claimDiscordInvites([...claimSources.entries()].map(([code,src])=>({code,sourceSurface:src.surface,sourceUrl:src.url})),channel.channel_id);
-    const claimAdmittedCodes=new Set(inviteClaims.filter(claim=>claim.admitted).map(claim=>claim.code));
-    const {candidates,discoveredInvite,discardedCount}=admitDiscordCandidates(structuredCandidates,inspection.foundInvite,claimAdmittedCodes);
-    const loserCodes=[...claimSources.keys()].filter(code=>!claimAdmittedCodes.has(code));
-    if(loserCodes.length)await deleteDiscordCandidates(channel.channel_id,loserCodes);
-    if(discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount,timestamp:new Date().toISOString()}));
+    // structured collection. Admission was decided once at the authoritative
+    // claim above; this block validates the admitted winners only.
+    const candidates=preAdmission.candidates;
+    const discoveredInvite=preAdmission.discoveredInvite;
     if (discoveredInvite) {
       // Validate bounded native candidates until a high-confidence trading
       // community is found. A live-but-ambiguous or live-but-non-trading first

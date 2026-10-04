@@ -103,3 +103,25 @@ test('legacy nativeInviteCode carries the case-preserved code, never a URL', () 
   assert.equal(r.candidates[0].normalizedLocator, 'https://discord.gg/abc123');
   assert.equal(r.candidates[0].rawLocator, 'https://discord.gg/AbC123');
 });
+
+test('choke ordering is persist, claim, delete losers, then validate exactly once', async () => {
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
+  const persistIdx = source.indexOf('if(preProvisional.length)await persistDiscordCandidates(');
+  assert.ok(persistIdx >= 0, 'provisional persist exists');
+  const claimIdx = source.indexOf('await claimDiscordInvites([', persistIdx);
+  assert.ok(claimIdx > persistIdx, 'claim follows persist');
+  const deleteIdx = source.indexOf('await deleteDiscordCandidates(', claimIdx);
+  assert.ok(deleteIdx > claimIdx, 'loser delete follows claim');
+  const validateIdx = source.indexOf('await validateDiscordInvite(', deleteIdx);
+  assert.ok(validateIdx > deleteIdx, 'validation runs last, on winners only');
+  assert.equal(source.split('await claimDiscordInvites(').length - 1, 1, 'exactly one claim call per inspection');
+});
+
+test('reconcile and validation share one admitted inspection view', async () => {
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const source = fs.readFileSync(fileURLToPath(new URL('./queueManager.ts', import.meta.url)), 'utf8');
+  assert.match(source, /reconcileDiscordDiscoveryFromInspection\(channel, admittedInspection,/);
+});
