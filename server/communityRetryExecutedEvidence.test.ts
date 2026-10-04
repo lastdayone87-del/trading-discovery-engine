@@ -20,7 +20,7 @@ test('inspection-start marker lands after channel load and immediately before in
   // therefore leave unmarked rows that can never count as executed.
   assert.match(
     queueManager,
-    /recordExecutionStage\('DISPATCHER','REACHED'[\s\S]*?if\(job\.type==='RETRY_COMMUNITY_ACQUISITION'\)[\s\S]*?getChannelById[\s\S]*?if\(!channel\)[\s\S]*?inspectAndValidateChannel\(channel,undefined,false,false,false,\{jobId:job\.id,attemptNumber:job\.attempts\}\)/,
+    /recordExecutionStage\('DISPATCHER','REACHED'[\s\S]*?if\(job\.type==='RETRY_COMMUNITY_ACQUISITION'\)[\s\S]*?getChannelById[\s\S]*?if\(!channel\)[\s\S]*?inspectAndValidateChannel\(channel,undefined,false,false,false,\{jobId:job\.id,attemptNumber:job\.attempts,isRetryOwnedReacquire:true\}\)/,
   );
   assert.match(
     queueManager,
