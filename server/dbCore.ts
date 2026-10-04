@@ -126,6 +126,16 @@ export async function getOperatorAuditEvents(limit=100):Promise<any[]>{const db=
 export async function appendProviderCallEvent(event:ProviderCallEvent):Promise<void>{const db=await getDb();await db.query(`INSERT INTO provider_call_events(id,provider,operation,request_id,run_id,job_id,request_metadata,attempt,status,latency_ms,reserved_cost,actual_cost,error_class,policy_version,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO NOTHING`,[event.id,event.provider,event.operation,event.requestId||null,event.runId||null,event.jobId||null,JSON.stringify(event.requestMetadata||{}),event.attempt,event.status,event.latencyMs,event.reservedCost,event.actualCost,event.errorClass||null,event.policyVersion,event.occurredAt]);}
 export interface DiscordAttemptCandidate {candidateId?:string;rawLocator?:string;locatorType?:string;resolvedLocator?:string;sourceSurface?:string;sourceUrl?:string;observations?:Array<unknown>}
 export interface DiscordInviteClaim {code:string;admitted:boolean;firstChannelId:string|null}
+/** Read-only global ownership lookup (no writes): maps each canonical code
+ * to its registry owner, if any. Used where a decision needs admission
+ * knowledge without claiming (e.g. pre-validation reconciliation). */
+export async function lookupDiscordInviteOwners(codes:string[]):Promise<Map<string,string>>{
+  const unique=[...new Set((codes||[]).filter(code=>typeof code==='string'&&!!code))];
+  if(!unique.length)return new Map();
+  const db=await getDb();
+  const res=await db.query(`SELECT canonical_code,first_channel_id FROM discord_invite_registry WHERE canonical_code=ANY($1::text[])`,[unique]);
+  return new Map(res.rows.map((row:any)=>[String(row.canonical_code),String(row.first_channel_id)]));
+}
 /**
  * Atomically claims canonical Discord invite codes for a channel. Each code
  * resolves to exactly one global winner via the registry primary key, so
@@ -138,21 +148,40 @@ export interface DiscordInviteClaim {code:string;admitted:boolean;firstChannelId
  * remains a truthful first-seen record — the owning channel's retry
  * rediscovers through the same-channel path and completes normally.
  */
-export async function claimDiscordInvites(codes:string[],channelId:string,source?:{surface?:string|null;url?:string|null}):Promise<DiscordInviteClaim[]>{
-  const unique=[...new Set((codes||[]).filter(code=>typeof code==='string'&&!!code))];
+export async function claimDiscordInvites(items:Array<{code:string;sourceSurface?:string|null;sourceUrl?:string|null}>,channelId:string):Promise<DiscordInviteClaim[]>{
+  const seen=new Map<string,{surface:string|null;url:string|null}>();
+  for(const item of items||[]){
+    if(!item||typeof item.code!=='string'||!item.code)continue;
+    if(!seen.has(item.code))seen.set(item.code,{surface:item.sourceSurface||null,url:item.sourceUrl||null});
+  }
+  const unique=[...seen.keys()];
   if(!unique.length||!channelId)return unique.map(code=>({code,admitted:false,firstChannelId:null}));
   const db=await getDb();
   const claimed=await db.query(
     `INSERT INTO discord_invite_registry(canonical_code,first_channel_id,first_seen_at,first_source_surface,first_source_url)
-     SELECT code,$2,now(),$3,$4 FROM unnest($1::text[]) AS code
+     SELECT code,$2,now(),surface,url FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
      ON CONFLICT(canonical_code) DO NOTHING RETURNING canonical_code`,
-    [unique,channelId,source?.surface||null,source?.url||null]);
+    [unique,channelId,unique.map(code=>seen.get(code)!.surface),unique.map(code=>seen.get(code)!.url)]);
   const won=new Set(claimed.rows.map((row:any)=>String(row.canonical_code)));
   const existing=won.size===unique.length?[]:(await db.query(
     `SELECT canonical_code,first_channel_id FROM discord_invite_registry WHERE canonical_code=ANY($1::text[])`,
     [unique])).rows;
   const owners=new Map(existing.map((row:any)=>[String(row.canonical_code),String(row.first_channel_id)]));
   return unique.map(code=>({code,admitted:won.has(code)||owners.get(code)===channelId,firstChannelId:won.has(code)?channelId:(owners.get(code)||null)}));
+}
+/** Removes this channel's candidate rows for the given canonical codes.
+ * Used after a lost global claim so a duplicate discovery leaves no residue:
+ * validation never ran for removed rows (the candidate-attempt trigger only
+ * fires on check inserts), so deletion is side-effect free. Returns removed
+ * row count. */
+export async function deleteDiscordCandidates(channelId:string,codes:string[]):Promise<number>{
+  const unique=[...new Set((codes||[]).filter(code=>typeof code==='string'&&!!code))];
+  if(!unique.length||!channelId)return 0;
+  const db=await getDb();
+  const res=await db.query(
+    `DELETE FROM discord_candidates WHERE channel_id=$1 AND normalized_locator=ANY(SELECT 'https://discord.gg/'||code FROM unnest($2::text[]) AS code)`,
+    [channelId,unique]);
+  return res.rowCount||0;
 }
 export async function persistDiscordCandidates(channelId:string,candidates:DiscordAttemptCandidate[]):Promise<void>{const db=await getDb();for(const candidate of candidates){if(!candidate.candidateId)continue;await db.query(`INSERT INTO discord_candidates(channel_id,candidate_id,raw_locator,normalized_locator,locator_type,source_surface,source_url,source_observations) VALUES($1,$2,$3,lower($4),$5,$6,$7,$8) ON CONFLICT(channel_id,normalized_locator) DO UPDATE SET raw_locator=COALESCE(NULLIF(discord_candidates.raw_locator,''),excluded.raw_locator),locator_type=excluded.locator_type,source_surface=COALESCE(discord_candidates.source_surface,excluded.source_surface),source_url=COALESCE(discord_candidates.source_url,excluded.source_url),source_observations=COALESCE((SELECT jsonb_agg(DISTINCT observation) FROM jsonb_array_elements(discord_candidates.source_observations||excluded.source_observations) observation),'[]'::jsonb)`,[channelId,candidate.candidateId,candidate.rawLocator||'',candidate.resolvedLocator||candidate.rawLocator||'',candidate.locatorType||'UNKNOWN',candidate.sourceSurface||null,candidate.sourceUrl||null,JSON.stringify(candidate.observations||[{sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl,rawLocator:candidate.rawLocator}])]);}}
 export async function selectDiscordCandidate(channelId:string,candidateId:string):Promise<void>{const db=await getDb();await db.query(`UPDATE discord_candidates SET selected=(candidate_id=$2) WHERE channel_id=$1`,[channelId,candidateId]);}

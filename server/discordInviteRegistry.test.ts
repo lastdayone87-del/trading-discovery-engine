@@ -47,10 +47,14 @@ test('second and third creators discovering the same invite are discarded', () =
   assert.equal(third.discoveredInvite, null);
 });
 
-test('same-channel rediscovery preserves current behavior', () => {
-  const r = admitDiscordCandidates([cand('ABC123')], null, new Set(['abc123']));
+test('structured admission suppresses the legacy fallback for the same code', () => {
+  // foundInvite alongside an admitted structured candidate must not create
+  // a second legacy candidate for the same invite.
+  const r = admitDiscordCandidates([cand('ABC123')], 'ABC123', new Set(['abc123']));
   assert.equal(r.candidates.length, 1);
+  assert.ok(!r.candidates[0].candidateId.startsWith('legacy:'));
   assert.equal(r.discoveredInvite, 'ABC123');
+  assert.equal(r.discardedCount, 0);
 });
 
 test('different URL forms and casings collapse to one admitted identity', () => {
@@ -90,4 +94,12 @@ test('mixed batch keeps admitted and drops duplicates independently', () => {
   assert.equal(r.candidates[0].nativeInviteCode, 'NEW1');
   assert.equal(r.discoveredInvite, 'NEW1');
   assert.equal(r.discardedCount, 1);
+});
+
+test('legacy nativeInviteCode carries the case-preserved code, never a URL', () => {
+  const r = admitDiscordCandidates([], 'https://discord.gg/AbC123', new Set(['abc123']));
+  assert.equal(r.candidates.length, 1);
+  assert.equal(r.candidates[0].nativeInviteCode, 'AbC123');
+  assert.equal(r.candidates[0].normalizedLocator, 'https://discord.gg/abc123');
+  assert.equal(r.candidates[0].rawLocator, 'https://discord.gg/AbC123');
 });

@@ -38,7 +38,17 @@ export const canonicalDiscordInviteId=(code:string)=>`discord:${String(code||'')
  * bare code or any Discord URL form (discord.gg, discord.com/invite, dsc.gg,
  * …) in any casing; returns the lowercase code, or null when unparseable
  * (callers fail open and preserve legacy behavior for such inputs). */
-export interface DiscordInviteClaimInput {code:string;admitted:boolean}
+/** Legacy compatibility candidate built from a trail-level foundInvite when
+ * no structured candidate exists. Shared by the admission decision and the
+ * persistence path so both agree on shape. */
+export function buildLegacyDiscordCandidate(foundInvite:string,legacyCode:string|null):DiscordCandidate|null{
+  if(!foundInvite)return null;
+  if(!legacyCode){
+    return {candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:foundInvite,normalizedLocator:`https://discord.gg/${foundInvite}`,extractionConfidence:'EXPLICIT'};
+  }
+  const rawCode=extractDiscordInviteCodeRaw(foundInvite)||foundInvite;
+  return {candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:rawCode,normalizedLocator:`https://discord.gg/${legacyCode}`,extractionConfidence:'EXPLICIT'};
+}
 export interface AdmittedDiscordCandidates {
   candidates:DiscordCandidate[];
   discoveredInvite:string|null;
@@ -49,15 +59,25 @@ export interface AdmittedDiscordCandidates {
  * bare code or any Discord URL form (discord.gg, discord.com/invite, dsc.gg,
  * …) in any casing; returns the lowercase code, or null when unparseable
  * (callers fail open and preserve legacy behavior for such inputs). */
-export function discordInviteCodeOf(value:string|null|undefined):string|null{
+/** Case-preserved invite code extraction: accepts a bare code or any Discord
+ * URL form and returns the raw code, or null when unparseable. */
+export function extractDiscordInviteCodeRaw(value:string|null|undefined):string|null{
   const text=String(value||'').trim();
   if(!text)return null;
   const match=text.match(/(?:discord\.gg|discord\.(?:com|app)\/invite|discordapp\.com\/invite|discord\.(?:me|io)|dsc\.gg)\/([^\s"'<>\/?#&]+)/i);
   const raw=match?match[1]:text;
   if(/[\s\/]/.test(raw))return null;
-  const code=raw.trim().toLowerCase();
+  const code=raw.trim();
   if(code.length<2||code.length>128)return null;
   return code;
+}
+/** Canonical invite code shared by every layer that must agree on Discord
+ * invite identity (registry claims, choke-point filtering, tests): the
+ * lowercase form of the extracted code, or null when unparseable (callers
+ * fail open and preserve legacy behavior for such inputs). */
+export function discordInviteCodeOf(value:string|null|undefined):string|null{
+  const raw=extractDiscordInviteCodeRaw(value);
+  return raw?raw.toLowerCase():null;
 }
 /**
  * Pure admission decision for the global canonical-discard choke point.
@@ -77,9 +97,9 @@ export function admitDiscordCandidates(
   if(!admitted.length&&foundInvite){
     const legacyCode=discordInviteCodeOf(foundInvite);
     if(!legacyCode){
-      legacy={candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:foundInvite,normalizedLocator:`https://discord.gg/${foundInvite}`,extractionConfidence:'EXPLICIT'};
+      legacy=buildLegacyDiscordCandidate(foundInvite,null);
     }else if(admittedCodes.has(legacyCode)){
-      legacy={candidateId:`legacy:${foundInvite}`,locatorType:'NATIVE_INVITE',sourceSurface:'CHANNEL_EXTERNAL_LINKS',rawLocator:foundInvite,nativeInviteCode:foundInvite,normalizedLocator:`https://discord.gg/${legacyCode}`,extractionConfidence:'EXPLICIT'};
+      legacy=buildLegacyDiscordCandidate(foundInvite,legacyCode);
     }
   }
   const candidates=legacy?[...admitted,legacy]:admitted;

@@ -3,9 +3,20 @@
 -- One row per canonical invite code (lowercase), recording the first-known
 -- discovery. Later discoveries of the same code by other channels are
 -- discarded at the candidate choke point and never create candidate rows.
--- Same-channel rediscoveries always pass (the owning channel keeps its
--- normal validate/persist lifecycle). No existing tables are altered and no
--- existing rows are modified or deleted by this migration.
+-- Same-channel rediscoveries keep their normal lifecycle. No existing tables
+-- are altered and no existing rows are modified or deleted by this migration.
+--
+-- Canonicalization matches the TypeScript canonicalizer exactly: any
+-- supported Discord URL form (discord.gg, discord.com/invite,
+-- discord.app/invite, discordapp.com/invite, discord.me, discord.io,
+-- dsc.gg), optional scheme, stripped query/fragment, first path segment,
+-- lowercased, 2-128 chars, no spaces.
+--
+-- Earliest-known time uses the real historical evidence: the earliest of the
+-- candidate row's discovered_at and that channel's earliest validation
+-- attempt for the same locator. Migration-110-imported rows carry a
+-- migration-time discovered_at, so attempt timestamps are authoritative
+-- where they exist.
 
 CREATE TABLE IF NOT EXISTS discord_invite_registry (
   canonical_code TEXT PRIMARY KEY,
@@ -18,19 +29,44 @@ CREATE TABLE IF NOT EXISTS discord_invite_registry (
 -- Backfill from existing per-channel candidates: earliest discovery wins,
 -- deterministically broken by channel_id. Idempotent on rerun.
 INSERT INTO discord_invite_registry(canonical_code, first_channel_id, first_seen_at, first_source_surface, first_source_url)
-SELECT ranked.code, ranked.channel_id, ranked.discovered_at, ranked.source_surface, ranked.source_url
+SELECT ranked.code, ranked.channel_id, ranked.first_seen, ranked.source_surface, ranked.source_url
 FROM (
-  SELECT lower(regexp_replace(dc.normalized_locator, '^https://discord\.gg/', '')) AS code,
-         dc.channel_id,
-         dc.discovered_at,
-         dc.source_surface,
-         dc.source_url,
+  SELECT coded.code AS code,
+         coded.channel_id AS channel_id,
+         LEAST(coded.discovered_at, COALESCE(coded.first_attempt_at, coded.discovered_at)) AS first_seen,
+         coded.source_surface AS source_surface,
+         coded.source_url AS source_url,
          ROW_NUMBER() OVER (
-           PARTITION BY lower(regexp_replace(dc.normalized_locator, '^https://discord\.gg/', ''))
-           ORDER BY dc.discovered_at ASC, dc.channel_id ASC
+           PARTITION BY coded.code
+           ORDER BY LEAST(coded.discovered_at, COALESCE(coded.first_attempt_at, coded.discovered_at)) ASC,
+                    coded.channel_id ASC
          ) AS rn
-  FROM discord_candidates dc
-  WHERE dc.normalized_locator ~* '^https://discord\.gg/[^/[:space:]]+$'
+  FROM (
+    SELECT lower(
+             split_part(
+               regexp_replace(
+                 regexp_replace(dc.normalized_locator, '[?#].*$', ''),
+                 '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+',
+                 ''
+               ),
+               '/', 1
+             )
+           ) AS code,
+           dc.channel_id AS channel_id,
+           dc.discovered_at AS discovered_at,
+           MIN(dc.source_surface) AS source_surface,
+           MIN(dc.source_url) AS source_url,
+           MIN(ca.checked_at) AS first_attempt_at
+    FROM discord_candidates dc
+    LEFT JOIN discord_check_attempts ca
+      ON ca.channel_id = dc.channel_id
+     AND lower(COALESCE(ca.resolved_locator, ca.invite_locator)) = dc.normalized_locator
+    GROUP BY 1, 2, 3
+  ) coded
+  WHERE coded.code <> ''
+    AND coded.code NOT LIKE '% %'
+    AND coded.code NOT LIKE '%/%'
+    AND length(coded.code) BETWEEN 2 AND 128
 ) ranked
-WHERE ranked.rn = 1 AND ranked.code <> ''
+WHERE ranked.rn = 1
 ON CONFLICT (canonical_code) DO NOTHING;
