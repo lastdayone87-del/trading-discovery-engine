@@ -151,6 +151,12 @@ const OUTCOME_PRECEDENCE: Record<AcquisitionObservationLike['outcome'], number> 
  * audit observations.
  *
  * Selection within a group, in order:
+ * 0. Shared terminal-success evidence shortcut: a terminal-success shared
+ *    row (`sharedEvidenceFrom`) defeats vacuous-only failures outright —
+ *    rows with zero processed evidence of any kind, which proved nothing and
+ *    therefore cannot erase genuine inspection. Runs before rules 2-4; any
+ *    FOUND row or any row with real processed evidence still dominates
+ *    normally, so genuine failures are never hidden.
  * 1. Any FOUND wins — a discovered candidate must never be lost to collapse.
  * 2. Required (retry-eligible, operational) observations dominate auxiliary
  *    notes: a required rendered failure overrides an earlier non-required

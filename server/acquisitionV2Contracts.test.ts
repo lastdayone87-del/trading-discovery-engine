@@ -959,10 +959,19 @@ test('v2 review: required set admits only crawl-eligible URLs', () => {
 test('v2 review: non-terminal lender records do not suppress borrower refetch', async () => {
   const rootHtml = '<a href="/community-page">community page</a>';
   const truncatedInventory = {
-    visitedKeys: [] as string[],
-    roots: new Map([
-      ['https://cut.example.com/', { bySeed: 'https://cut.example.com/', finalUrl: 'https://cut.example.com/', childLinks: [{ url: 'https://cut.example.com/community-page', score: 50 }], terminalSuccess: false }],
-    ]),
+    // Keyed by the exact normalized identity production uses
+    // (normalizeVisitUrl): a hand-written literal could drift from the
+    // lookup rule and pass vacuously, so the test derives it identically.
+    ...(() => {
+      const cutKey = normalizeVisitUrl('https://cut.example.com/');
+      assert.ok(cutKey, 'normalized fixture key must parse');
+      return {
+        visitedKeys: [] as string[],
+        roots: new Map([
+          [cutKey as string, { bySeed: 'https://cut.example.com/', finalUrl: 'https://cut.example.com/', childLinks: [{ url: 'https://cut.example.com/community-page', score: 50 }], terminalSuccess: false }],
+        ]),
+      };
+    })(),
   };
   const fetched: string[] = [];
   const borrowerLog: string[] = [];
