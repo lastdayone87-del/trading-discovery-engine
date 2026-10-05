@@ -1092,6 +1092,9 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
     shouldScheduleFoundGapAcquisitionRetry({ acquisitionOutcomes: [], retryDirective: undefined }),
     false,
   );
+  // No-gap-class guard with a real directive present: a FOUND outcome that is
+  // neither retryable nor gap-classed must not schedule, proving the guard
+  // evaluated is the gap class itself rather than directive presence.
   assert.equal(
     shouldScheduleFoundGapAcquisitionRetry({
       acquisitionOutcomes: [
@@ -1100,7 +1103,12 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
           retryable: false,
         },
       ],
-      retryDirective: undefined,
+      retryDirective: {
+        attemptFree: true,
+        code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+        reason: 'unrelated recovery',
+        retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+      },
     }),
     false,
   );
