@@ -241,7 +241,7 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // for roles without schema CREATE even though every migration is already
     // applied — blocking paths that need no DDL. Behavior is otherwise
     // identical: existing databases skip straight to the version scan below.
-    const migrationTable = await client.query(`SELECT to_regclass('public.schema_migrations') AS oid`);
+    const migrationTable = await client.query(`SELECT to_regclass('schema_migrations') AS oid`);
     if (!migrationTable.rows[0]?.oid) {
       await client.query(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
     }
