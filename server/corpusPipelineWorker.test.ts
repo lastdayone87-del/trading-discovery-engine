@@ -19,19 +19,32 @@ test('corpus pipeline worker uses the existing claim path on a one-second tick',
   // Single consumer: exactly one worker id, no concurrency loop or env scaling.
   assert.match(workers, /startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/);
   assert.doesNotMatch(workers, /CORPUS_PIPELINE.*concurrency|corpus.*CONCURRENCY/);
+  // Cross-replica serialization: the turn lock wraps the claim so two server
+  // processes cannot both observe budget headroom and overshoot the cap.
+  assert.match(workers, /pg_try_advisory_lock\(hashtext\(\$1\)\)/);
+  assert.match(workers, /pg_advisory_unlock\(hashtext\(\$1\)\)/);
 });
 
-test('corpus pipeline starts from operational maintenance startup', async () => {
+const canStartWorkers = !process.env.DATABASE_URL;
+const maybeStart = canStartWorkers ? test : test.skip;
+
+maybeStart('corpus pipeline starts from operational maintenance startup', async () => {
   const { startOperationalMaintenanceWorkers, getCorpusPipelineWorkerHealth } =
     await import('./operationalMaintenanceWorkers');
-  // Behavioral: invoking startup actually starts the worker (no DB needed —
-  // ticks fail safe without DATABASE_URL and reschedule unref'd).
+  // Behavioral: invoking startup actually starts the worker. Skipped when
+  // DATABASE_URL is set (CI): live ticks would claim and dispatch real jobs
+  // against that database. Without DATABASE_URL ticks fail safe (no DB) and
+  // reschedule unref'd.
   startOperationalMaintenanceWorkers();
   const health = getCorpusPipelineWorkerHealth();
   assert.equal(health.started, true);
   assert.ok(health.startedAt);
-  // Scoped backstop: the invocation lives inside the starter body itself, so
-  // deleting the call fails even though the worker definition remains.
+});
+
+test('corpus pipeline invocation lives inside the starter body', () => {
+  // Scoped backstop (always runs, no side effects): the invocation sits
+  // inside startOperationalMaintenanceWorkers itself, so deleting the call
+  // fails even though the worker definition remains elsewhere in the file.
   const starterBody = workers.slice(
     workers.indexOf('export function startOperationalMaintenanceWorkers'),
     workers.indexOf('export function getOperationalMaintenanceJobTypesForTests')
