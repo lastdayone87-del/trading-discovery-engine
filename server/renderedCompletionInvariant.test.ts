@@ -137,14 +137,15 @@ test('zero-page incompleteness never resolves clean across zero-processed varian
 });
 
 // 4. Zero-page https://g/ never counts as successful inspection.
-// 4. Dotless garbage (e.g. https://g/) is statically attempted for recall
-// safety but never escalates to rendered fallback and never owns retry work:
-// no browser run can turn a meaningless input into evidence. Garbage is fully
-// invisible to outcome accounting: with no genuine retry-owning failure, a
-// garbage-only input set resolves to the definitive negative (NOT_FOUND at
-// Step 4) instead of manufacturing UNCERTAIN work.
+// 4. Dotless garbage (e.g. https://g/) is rejected by the crawl admission
+// boundary (DOTLESS_HOST) before scoring, crawling, and retry ownership: no
+// fetch is attempted, no observation is recorded, no browser run can turn a
+// meaningless input into evidence. Garbage is fully invisible: with no
+// genuine candidates at all, Step 4 is skipped and the inspection resolves to
+// the definitive negative instead of manufacturing UNCERTAIN work.
 test('dotless garbage creates no rendered work and no retry', async () => {
   let renderedCalls = 0;
+  const fetched: string[] = [];
   const result = await runChannelInspection({
     channelId: 'UCzeropage0000000000000001',
     channelName: 'Zero Page Channel',
@@ -153,6 +154,7 @@ test('dotless garbage creates no rendered work and no retry', async () => {
     videoDescriptions: fillers,
     creatorLikelyTrading: true,
     externalFetchImpl: (async (input) => {
+      fetched.push(String(input));
       if (String(input).includes('https://g/')) throw new Error('getaddrinfo ENOTFOUND g');
       return noInviteHtml();
     }) as typeof fetch,
@@ -164,12 +166,12 @@ test('dotless garbage creates no rendered work and no retry', async () => {
   assert.equal(renderedCalls, 0);
   assert.equal(result.retryDirective, undefined);
   assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
-  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
-  // The static attempt is still recorded as audit evidence.
+  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'SKIPPED');
+  // Rejected before the crawler: never fetched, never recorded.
+  assert.ok(!fetched.some((url) => url.includes('https://g/')), 'malformed seed must never be fetched');
   assert.ok(
-    (result.acquisitionOutcomes || []).some(
-      (item) => item.requestedUrl === 'https://g/' && item.outcome === 'ACQUISITION_FAILED',
-    ),
+    !(result.acquisitionOutcomes || []).some((item) => item.requestedUrl === 'https://g/'),
+    'malformed seed must not produce observations',
   );
 });
 

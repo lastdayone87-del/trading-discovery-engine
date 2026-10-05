@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { assessCrawlAdmission } from './communitySurfacePolicy';
 
 export const COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE = 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE';
 
@@ -191,10 +192,39 @@ export function retryAtFromUnknown(error: any, now = Date.now()): number | undef
   return undefined;
 }
 
+/**
+ * Failure classes that are deterministically permanent under the existing
+ * acquisition model: refetching the same URL cannot change the outcome, so
+ * they must never own community retry work. Narrow by design — transient
+ * failures (network failures, timeouts, 429s, 5xx/transient HTTP, browser
+ * runtime/capacity classes) are NOT in this set and stay retryable.
+ */
+const DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES = new Set([
+  'UNSUPPORTED_CONTENT_TYPE',
+]);
+
 export function isCommunityRetryableObservation(item: CommunityRetryObservation): boolean {
   // Both failed and partially-inspected required community observations own
   // retries: partial coverage is recoverable/inconclusive, never a terminal
   // negative. YouTube About / recent-video-description surfaces stay upstream.
+  // R6 retry boundary (narrow): candidates rejected by the crawl admission
+  // gate (malformed, asset/resource) and deterministically permanent failure
+  // classes never enter the retry loop — including backlog observations that
+  // predate the gate. A missing requestedUrl cannot be judged and stays
+  // eligible, preserving existing behavior for older callers; an explicitly
+  // stored empty string is invalid input and can never own retry work.
+  const requestedUrl = (item as { requestedUrl?: unknown }).requestedUrl;
+  if (requestedUrl === '') return false;
+  if (typeof requestedUrl === 'string' && requestedUrl) {
+    try {
+      if (!assessCrawlAdmission(requestedUrl).eligible) return false;
+    } catch {
+      return false;
+    }
+  }
+  if (DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES.has(String(item.failureClass || '').toUpperCase())) {
+    return false;
+  }
   return item.required !== false &&
     (item.outcome === 'ACQUISITION_FAILED' || item.outcome === 'PARTIALLY_INSPECTED') &&
     item.retryable &&
