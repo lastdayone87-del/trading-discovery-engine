@@ -14,7 +14,7 @@ import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSite
 import { extractHeadDiscovery, isSiteProfilerEnabled, runSiteProfiler } from './siteProfiler';
 import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, createDropCounter, type CrawlerTelemetry, type CeilingKind, type ExperimentAttribution} from './crawlerTelemetry';
-import {fetchUrlFailureHistory, skippedUrlsFromHistory, normalizeSkipUrl, type UrlFailureRow} from './crawlUrlSkipPolicy';
+import {fetchUrlFailureHistory, skippedUrlsFromHistory, normalizeSkipUrl, hasConsecutiveTimeoutExhaustion, type UrlFailureRow} from './crawlUrlSkipPolicy';
 import { readBoundedResponseText } from './crawlResponseBounds';
 
 export type SampledVideoInput =
@@ -97,6 +97,13 @@ export interface InspectionResult {
   acquisitionStatus?: ExternalAcquisitionStatus;
   acquisitionOutcomes?: ExternalAcquisitionObservation[];
   retryDirective?: CommunityRetryDirective;
+  /**
+   * Normalized seed URLs whose consecutive rendered-timeout tail is exhausted
+   * (see `hasConsecutiveTimeoutExhaustion`). Their observations keep full
+   * outcome/status accounting; they only lose retry ownership, and the queue
+   * projection uses this list so status and job scheduling stay consistent.
+   */
+  retrySuppressedUrls?: string[];
   discordCandidates?: DiscordCandidate[];
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
@@ -749,10 +756,27 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // keyword lists); T-P records a log-only signal and stays eligible as-is.
   // Legitimate domains are preserved: recovery never changes hosts, and
   // uncertain path-prefix candidates are never rewritten.
-  const admissionRecoveryLogs:string[]=[];const admissionTruncationSignals:string[]=[];
+  //
+  // Bare/www duplicate collapse: WEBSITE seeds sharing one canonical site
+  // identity with identical scheme, path, and query whose hosts differ only
+  // by a leading www. (e.g. http://asenna.com.au/ vs http://www.asenna.com.au/)
+  // crawl byte-identical pages, so they share one seed instead of two
+  // independent 6-page/60s rendered runs. Tier B/C path/subdomain tenants
+  // never share an identity and can never collapse; distinct paths, queries,
+  // or schemes never collapse. First seed wins with context-match merging;
+  // every collapse is logged (no silent discards).
+  const admissionRecoveryLogs:string[]=[];const admissionTruncationSignals:string[]=[];const seedDedupeLogs:string[]=[];
+  const bareWwwCollapseKey=(rawUrl:string):string|null=>{let parsed:URL;try{parsed=new URL(rawUrl);}catch{return null;}const identity=canonicalSiteIdentity(rawUrl)?.siteIdentity;if(!identity)return null;const host=parsed.hostname.toLowerCase();const stripped=host.replace(/^www\./,'');if(stripped===host)return null;return `${identity}\u0000${parsed.protocol}\u0000${stripped}\u0000${parsed.pathname}\u0000${parsed.search}`;};
   const siblingValuedKeysByHost=new Map<string,Set<string>>();const siblingPathsByHost=new Map<string,Set<string>>();
   for(const item of collectedExternalUrls){let parsed:URL|null=null;try{parsed=new URL(item.url);}catch{continue;}const host=parsed.hostname.toLowerCase();if(!siblingPathsByHost.has(host))siblingPathsByHost.set(host,new Set());siblingPathsByHost.get(host)!.add(parsed.pathname||'/');for(const [key,value] of parsed.searchParams){if(value){if(!siblingValuedKeysByHost.has(host))siblingValuedKeysByHost.set(host,new Set());siblingValuedKeysByHost.get(host)!.add(key);}}}
-  const uniqueUrls=new Map<string,{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING';contextMatches:boolean;source:string;sitemapUrl?:string}>();for(const item of collectedExternalUrls){let seedUrl=item.url;if(item.kind==='WEBSITE'){try{const host=new URL(seedUrl).hostname.toLowerCase();const recovered=recoverTruncatedQueryToRoot(seedUrl,siblingValuedKeysByHost.get(host)??new Set());if(recovered&&recovered!==seedUrl){admissionRecoveryLogs.push(`Recovered truncated query to host root (TRUNCATED_QUERY_PREFIX): ${seedUrl} → ${recovered}`);seedUrl=recovered;}else if(isPossiblyTruncatedPath(seedUrl,siblingPathsByHost.get(host)??new Set())){admissionTruncationSignals.push(`Possibly truncated path (signal only, still eligible): ${seedUrl}`);}}catch{/* recovery never breaks collection */}}const key=seedUrl;const existing=uniqueUrls.get(key);if(existing){if(item.contextMatches)existing.contextMatches=true;}else uniqueUrls.set(key,{...item,url:seedUrl});}const allCollectedUrls=Array.from(uniqueUrls.values());let websiteUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='WEBSITE'));const socialBioUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='SOCIAL')),messagingUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='MESSAGING'));
+  const uniqueUrls=new Map<string,{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING';contextMatches:boolean;source:string;sitemapUrl?:string}>();const collapseIndex=new Map<string,string>();
+  // Collapse key for bare/www duplicates: same site identity, scheme, path,
+  // and query with hosts equal modulo one leading www. Null when the rule
+  // does not apply (unidentifiable, non-www hosts are keyed distinctly so
+  // unrelated subdomains can never merge).
+  const wwwSchemeCollapseKey=(rawUrl:string):string|null=>{let parsed:URL;try{parsed=new URL(rawUrl);}catch{return null;}const identity=canonicalSiteIdentity(rawUrl)?.siteIdentity;if(!identity)return null;const host=parsed.hostname.toLowerCase();const stripped=host.replace(/^www\./,'');return `${identity}\u0000${parsed.protocol}\u0000${stripped}\u0000${parsed.pathname}\u0000${parsed.search}`;};
+  const hostsDifferOnlyByWww=(a:string,b:string):boolean=>{let ha:string,hb:string;try{ha=new URL(a).hostname.toLowerCase();hb=new URL(b).hostname.toLowerCase();}catch{return false;}return ha!==hb&&(ha===`www.${hb}`||hb===`www.${ha}`);};
+  for(const item of collectedExternalUrls){let seedUrl=item.url;if(item.kind==='WEBSITE'){try{const host=new URL(seedUrl).hostname.toLowerCase();const recovered=recoverTruncatedQueryToRoot(seedUrl,siblingValuedKeysByHost.get(host)??new Set());if(recovered&&recovered!==seedUrl){admissionRecoveryLogs.push(`Recovered truncated query to host root (TRUNCATED_QUERY_PREFIX): ${seedUrl} → ${recovered}`);seedUrl=recovered;}else if(isPossiblyTruncatedPath(seedUrl,siblingPathsByHost.get(host)??new Set())){admissionTruncationSignals.push(`Possibly truncated path (signal only, still eligible): ${seedUrl}`);}}catch{/* recovery never breaks collection */}}const key=seedUrl;const existing=uniqueUrls.get(key);if(existing){if(item.contextMatches)existing.contextMatches=true;continue;}if(item.kind==='WEBSITE'){const collapseKey=wwwSchemeCollapseKey(seedUrl);if(collapseKey){const primaryKey=collapseIndex.get(collapseKey);const primary=primaryKey?uniqueUrls.get(primaryKey):undefined;if(primary&&hostsDifferOnlyByWww(primary.url,seedUrl)){if(item.contextMatches)primary.contextMatches=true;seedDedupeLogs.push(`Seed deduplicated (BARE_WWW_DUPLICATE): ${seedUrl} → kept ${primary.url}`);continue;}if(!primaryKey)collapseIndex.set(collapseKey,key);}}uniqueUrls.set(key,{...item,url:seedUrl});}const allCollectedUrls=Array.from(uniqueUrls.values());let websiteUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='WEBSITE'));const socialBioUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='SOCIAL')),messagingUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='MESSAGING'));
   // P-B acquisition ladder (flag-gated, default off): sitemap-inventoried URLs
   // enter as scored seed nominations through the normal ranking and budgets.
   // Flag off (or missing/failed profiles) yields zero seeds, leaving the
@@ -888,13 +912,18 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // current candidates with a per-URL window, so busy channels cannot push a
   // candidate's streak outside the read.
   let skippedRepeatUrls=new Set<string>();
+  // Failure history for this inspection's candidates (fail-open): drives the
+  // repeat-failure skip set below and the consecutive-timeout retry
+  // suppression at the acquisition-status boundary.
+  let loadedFailureHistory: UrlFailureRow[] = [];
   if(channelData.channelId&&(websiteUrls.length||socialBioUrls.length)){try{
     const skipCandidateUrls=[...websiteUrls,...socialBioUrls].map(item=>normalizeSkipUrl(item.url)).filter(Boolean);
     const historyRows=channelData.urlFailureHistoryLoader
       ?await channelData.urlFailureHistoryLoader(channelData.channelId,skipCandidateUrls)
       :await fetchUrlFailureHistory(channelData.channelId,skipCandidateUrls);
+    loadedFailureHistory = historyRows;
     skippedRepeatUrls=skippedUrlsFromHistory(historyRows);
-  }catch(error){console.warn(`[RepeatFailureSkip] History load failed for ${channelData.channelId}; crawling without skips:`,error instanceof Error?error.message:String(error));bumpRepeatFailureHistoryOutage();skippedRepeatUrls=new Set<string>();}}
+  }catch(error){console.warn(`[RepeatFailureSkip] History load failed for ${channelData.channelId}; crawling without skips:`,error instanceof Error?error.message:String(error));bumpRepeatFailureHistoryOutage();skippedRepeatUrls=new Set<string>();loadedFailureHistory=[];}}
   let repeatSkippedCount=0;
   const repeatSkipLine=(url:string):string|null=>{
     const key=normalizeSkipUrl(url);
@@ -910,6 +939,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   for(const line of admissionRejectionLogs)step5Logs.push(line);
   for(const line of admissionRecoveryLogs)step5Logs.push(line);
   for(const line of admissionTruncationSignals)step5Logs.push(line);
+  for(const line of seedDedupeLogs)step5Logs.push(line);
   // Global site-inspection dedup (WEBSITE-kind seeds only; SOCIAL profiles
   // are inherently per-creator path-tenants and MESSAGING previews are
   // cheap — both bypass the cache and crawl as before). Each seed maps to
@@ -1087,5 +1117,12 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // the definitive negative instead of manufacturing UNCERTAIN work. The
   // dotless note remains in the step logs for audit; no retry is ever owned
   // (communityRequired is empty, so no directive is built).
-  acquisitionStatus:ExternalAcquisitionStatus=failed&&inspected||partialCoverage?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':repeatSkippedCount>0?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,10),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective(communityRequired),discordCandidates:mergedCandidates};
+  acquisitionStatus:ExternalAcquisitionStatus=failed&&inspected||partialCoverage?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':repeatSkippedCount>0?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';
+  // Consecutive-timeout retry suppression: seeds whose loaded failure history
+  // already holds an exhausted identical RENDERED_TIMEOUT tail stop owning new
+  // retries (deterministic re-execution has 0% observed recovery), while their
+  // PARTIAL/FAILED outcomes still drive acquisition status normally.
+  const consecutiveTimeoutSuppressed=new Set<string>();
+  for(const item of communityRequired){const reqUrl=(item as {requestedUrl?:unknown}).requestedUrl;if(typeof reqUrl!=='string'||!reqUrl)continue;const oc=(item as {outcome?:unknown}).outcome;const fc=(item as {failureClass?:unknown}).failureClass;if((oc==='ACQUISITION_FAILED'||oc==='PARTIALLY_INSPECTED')&&String(fc||'')==='RENDERED_TIMEOUT'&&hasConsecutiveTimeoutExhaustion(loadedFailureHistory,reqUrl))consecutiveTimeoutSuppressed.add(normalizeSkipUrl(reqUrl));}
+  return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,10),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective(communityRequired,consecutiveTimeoutSuppressed),retrySuppressedUrls:[...consecutiveTimeoutSuppressed],discordCandidates:mergedCandidates};
 }

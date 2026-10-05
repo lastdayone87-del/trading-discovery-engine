@@ -1555,7 +1555,7 @@ export async function inspectAndValidateChannel(
       // Shared predicate (not a local outcome check): required retryable FAILED
       // and required retryable PARTIALLY_INSPECTED both own the RETRY_PENDING
       // path, so partial-only acquisitions never strand in FAILED_OPERATIONAL.
-      const hasRetryableAcquisitionFailure=hasRetryableCommunityAcquisitionFailure(inspection.acquisitionOutcomes||[]);
+      const hasRetryableAcquisitionFailure=hasRetryableCommunityAcquisitionFailure(inspection.acquisitionOutcomes||[],inspection.retrySuppressedUrls);
       if(!alreadyValidatedSuccess){
         channel.discord_status='UNCERTAIN';
         channel.discord_liveness_status=channel.discord_candidate_locator?channel.discord_liveness_status||'UNCERTAIN':'NOT_CHECKED';

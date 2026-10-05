@@ -76,6 +76,46 @@ export function trailingIdenticalFailure(rows: UrlFailureRow[]): { failureClass:
 }
 
 /**
+ * Consecutive identical RENDERED_TIMEOUT runs before a seed stops owning
+ * community retries. Production 7d: 65 URL targets reached 3+ consecutive
+ * rendered timeouts with 0 recoveries, so the third identical run owns no
+ * new information. Two priors still retry (transient load can genuinely
+ * recover); the suppression only fires on the deterministic tail.
+ */
+export const CONSECUTIVE_TIMEOUT_SUPPRESSION_THRESHOLD = 2;
+
+/**
+ * Whether prior ledger history already holds `threshold` consecutive
+ * identical rendered-timeout runs for one normalized URL. Newest-first
+ * trailing run over ACQUISITION_FAILED/PARTIALLY_INSPECTED rows with
+ * failureClass RENDERED_TIMEOUT; any other outcome or class (including a
+ * later FOUND/clean recovery) breaks the run. Pure and unit-testable.
+ */
+export function hasConsecutiveTimeoutExhaustion(
+  rows: UrlFailureRow[],
+  requestedUrl: string,
+  threshold: number = CONSECUTIVE_TIMEOUT_SUPPRESSION_THRESHOLD,
+): boolean {
+  const key = normalizeSkipUrl(requestedUrl);
+  if (!key) return false;
+  const ordered = rows
+    .filter(row => normalizeSkipUrl(row.requestedUrl) === key)
+    .sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt));
+  if (!ordered.length) return false;
+  const want = Math.max(1, Math.trunc(threshold) || 1);
+  let run = 0;
+  for (const row of ordered) {
+    if (
+      (row.outcome === 'ACQUISITION_FAILED' || row.outcome === 'PARTIALLY_INSPECTED') &&
+      String(row.failureClass || '') === 'RENDERED_TIMEOUT'
+    ) {
+      run++;
+    } else break;
+  }
+  return run >= want;
+}
+
+/**
  * URLs to skip: trailing run is a capped deterministic class at or past the
  * threshold. Keys are normalized exactly like crawl seeds so lookups match
  * ledger keys. Pure and unit-testable; the single caller passes ledger rows.

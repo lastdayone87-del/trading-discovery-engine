@@ -145,6 +145,73 @@ export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
 }
 
 /**
+ * Rendered click targeting (acquisition efficiency): controls whose href
+ * resolves to a same-host navigable document are discovered deterministically
+ * through `enqueueLinks` (same-hostname strategy) and have their text+href
+ * Discord-scanned before any click, so clicking them only burns wall-clock
+ * (up to 2s timeout + waits per click against the 60s total budget) without
+ * adding coverage. Those clicks are skipped; everything else keeps existing
+ * behavior exactly:
+ * - missing/unparseable href → clicked (fail-open toward recall; a JS
+ *   handler may still act),
+ * - fragment-only hrefs (`#section`) → clicked (may reveal in-page content),
+ * - `javascript:`/non-http(s) hrefs → clicked (only a click can act),
+ * - cross-host http(s) hrefs → clicked (current navigation-away semantics
+ *   preserved; `enqueueLinks` would not capture them).
+ * Pure and unit-tested; the handler below only consumes the plan.
+ */
+export interface RenderedControlTarget {
+  index: number;
+  text: string;
+  href: string | null;
+}
+
+export function isSkippableNavigableAnchorClick(
+  target: Pick<RenderedControlTarget, 'href'>,
+  pageUrl: string,
+): boolean {
+  const href = (target.href || '').trim();
+  if (!href) return false;
+  let page: URL;
+  let absolute: URL;
+  try {
+    page = new URL(pageUrl);
+    absolute = new URL(href, pageUrl);
+  } catch {
+    return false;
+  }
+  if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
+  const withoutHash = (url: URL): string => {
+    const copy = new URL(url.toString());
+    copy.hash = '';
+    return copy.toString();
+  };
+  // Fragment-only navigation stays on the same document: clicking may reveal
+  // content, so it is never skipped.
+  if (withoutHash(absolute) === withoutHash(page)) return false;
+  return absolute.origin === page.origin;
+}
+
+export function partitionRenderedClickTargets(
+  controls: RenderedControlTarget[],
+  pageUrl: string,
+  maxClicks: number,
+): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number } {
+  const toClick: RenderedControlTarget[] = [];
+  let skippedNavigableAnchors = 0;
+  const cap = Math.max(0, Math.trunc(maxClicks) || 0);
+  for (const control of controls) {
+    if (isSkippableNavigableAnchorClick(control, pageUrl)) {
+      skippedNavigableAnchors++;
+      continue;
+    }
+    if (toClick.length >= cap) continue;
+    toClick.push(control);
+  }
+  return { toClick, skippedNavigableAnchors };
+}
+
+/**
  * Rendered completion invariant (recall correctness): `complete=true` must
  * never occur when zero pages/requests were processed. The crawler can resolve
  * without ever admitting a request to the request handler (seed rejected
@@ -581,13 +648,17 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
 
             const controls = await page.locator('a,button,[role="button"]').evaluateAll((nodes, pattern) => {
               const re = new RegExp(pattern, 'i');
-              return nodes.map((node, index) => ({index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`})).filter(item => re.test(item.text)).slice(0, 12);
+              return nodes.map((node, index) => ({index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`,href:(node as HTMLAnchorElement).href || null})).filter(item => re.test(item.text)).slice(0, 12);
             }, COMMUNITY_HINTS.source);
-            // Controls beyond the per-page click slice can never be attempted
-            // on this page (the slice binds before the timeout check below).
-            drops.count('control-slice', Math.max(0, controls.length - limits.maxClicksPerPage));
+            // Navigable same-host anchors are already discovered through
+            // enqueueLinks and Discord-scanned before any click, so the click
+            // budget is reserved for controls that only a click can act on
+            // (href-less buttons, fragments, JS links, cross-host targets).
+            // Slice accounting covers the remainder beyond clicks and skips.
+            const clickPlan = partitionRenderedClickTargets(controls, page.url(), limits.maxClicksPerPage);
+            drops.count('control-slice', Math.max(0, controls.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors));
 
-            for (const control of controls.slice(0, limits.maxClicksPerPage)) {
+            for (const control of clickPlan.toClick) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
               const locator=page.locator('a,button,[role="button"]').nth(control.index);
               const href=await locator.getAttribute('href').catch(()=>null);

@@ -233,20 +233,53 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
 }
 
 /**
+ * Normalized ledger key for consecutive-timeout suppression matching.
+ * Mirrors `normalizeSkipUrl` (trim + https fallback) so inspector seeds and
+ * ledger rows meet on one key without importing the DB-backed skip module.
+ */
+export function timeoutSuppressionKey(rawUrl: unknown): string {
+  const url = String(rawUrl || '').trim();
+  if (!url) return '';
+  return url.startsWith('http://') || url.startsWith('https://') ? url : `https://${url}`;
+}
+
+/**
  * Shared validation-lifecycle boundary: whether required community
  * acquisition observations own a retry (RETRY_PENDING path). All callers must
  * use this predicate instead of duplicating outcome checks, so FAILED and
  * retryable PARTIALLY_INSPECTED stay consistent across directive building and
- * validation-state projection.
+ * validation-state projection. `timeoutSuppressedKeys` carries normalized
+ * URLs whose consecutive rendered-timeout tail is exhausted (computed by the
+ * inspector from loaded failure history); those observations keep their
+ * outcome/status accounting and only lose retry ownership.
  */
-export function hasRetryableCommunityAcquisitionFailure(observations: CommunityRetryObservation[]): boolean {
-  return observations.some(item => item.required && isCommunityRetryableObservation(item));
+export function hasRetryableCommunityAcquisitionFailure(
+  observations: CommunityRetryObservation[],
+  timeoutSuppressedKeys?: Set<string> | string[] | null,
+): boolean {
+  const suppressed = timeoutSuppressedKeys instanceof Set
+    ? timeoutSuppressedKeys
+    : new Set(timeoutSuppressedKeys || []);
+  return observations.some(
+    item =>
+      item.required &&
+      isCommunityRetryableObservation(item) &&
+      !suppressed.has(timeoutSuppressionKey((item as { requestedUrl?: unknown }).requestedUrl)),
+  );
 }
 
 export function communityAcquisitionRetryDirective(
   observations: CommunityRetryObservation[],
+  timeoutSuppressedKeys?: Set<string> | string[] | null,
 ): CommunityRetryDirective | undefined {
-  const requiredFailures = observations.filter(isCommunityRetryableObservation);
+  const suppressed = timeoutSuppressedKeys instanceof Set
+    ? timeoutSuppressedKeys
+    : new Set(timeoutSuppressedKeys || []);
+  const requiredFailures = observations.filter(
+    item =>
+      isCommunityRetryableObservation(item) &&
+      !suppressed.has(timeoutSuppressionKey((item as { requestedUrl?: unknown }).requestedUrl)),
+  );
   if (!requiredFailures.length) return undefined;
   const retryTimes = requiredFailures.map(item => Number(item.retryAt)).filter(value => Number.isFinite(value) && value > 0);
   // Attempt-free capacity classification must be unanimous over proven
