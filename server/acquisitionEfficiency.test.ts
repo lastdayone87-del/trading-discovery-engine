@@ -31,6 +31,10 @@ test('acquisition: same-host navigable anchors skip clicks, buttons do not', () 
   // could be lost.
   assert.equal(isSkippableNavigableAnchorClick({ href: '/logo.png' }, PAGE), false);
   assert.equal(isSkippableNavigableAnchorClick({ href: '/plain-page' }, PAGE), false);
+  // Admission-rejected resource links stay skipped: the enqueue transform
+  // drops them and the required set excludes them, so no click is needed
+  // and no obligation is created (all three layers agree).
+  assert.equal(isSkippableNavigableAnchorClick({ href: '/community-help.js' }, PAGE), true);
   // Cross-host navigation keeps current behavior (never silently dropped).
   assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), false);
   // Unparseable hrefs fail open toward recall.

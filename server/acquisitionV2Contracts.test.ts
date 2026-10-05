@@ -18,7 +18,7 @@ import {
   shouldCompleteSuppressedRetryJob,
   enqueueCommunityAcquisitionRetry,
 } from './queueManager';
-import { crawlExternalLinks, runChannelInspection } from './inspector';
+import { crawlExternalLinks, runChannelInspection, isReusableStaticRootLender } from './inspector';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const PAGE = 'https://creator.example.com/guide';
@@ -565,7 +565,7 @@ test('v2 review: shared static roots skip refetch but still acquire children', a
   };
   const borrowerFetched: string[] = [];
   const borrowerLog: string[] = [];
-  await crawlExternalLinks(
+  const borrower = await crawlExternalLinks(
     ['https://dup.example.com/'],
     borrowerLog,
     undefined,
@@ -588,6 +588,13 @@ test('v2 review: shared static roots skip refetch but still acquire children', a
     'borrower still acquires its own children',
   );
   assert.ok(borrowerLog.some((line) => line.includes('[Shared static evidence]')));
+  // Exactly one per-seed record for the shared root: the seed rollup carries
+  // the lender attribution (no duplicate upfront row) with borrower-own page
+  // accounting (no pagesInspected inflation for lender bytes).
+  const rootRows = borrower.observations.filter((item) => item.requestedUrl === 'https://dup.example.com/');
+  assert.equal(rootRows.length, 1);
+  assert.equal(rootRows[0].sharedEvidenceFrom, 'https://dup.example.com/');
+  assert.equal(rootRows[0].telemetry?.pagesInspected, 1);
 });
 
 // REVIEW: bare/www collapse is port-aware.
@@ -813,4 +820,57 @@ test('v2 review e2e: FOUND+gap inspection creates the durable retry job', async 
   assert.equal(payload.channelId, channelId);
   assert.equal(payload.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
   db.close();
+});
+
+// REVIEW P1: only terminal-success static roots enter the shared inventory.
+test('v2 review: incomplete lender roots are never reusable', () => {
+  const nav = [{ url: 'https://lender.example.com/child', score: 50 }];
+  const visited = ['https://lender.example.com/'];
+  assert.equal(
+    isReusableStaticRootLender({ outcome: 'INSPECTED_NO_MATCH', visitedUrls: visited, rootNavigation: nav }),
+    true,
+  );
+  assert.equal(isReusableStaticRootLender({ outcome: 'FOUND', visitedUrls: visited, rootNavigation: nav }), true);
+  assert.equal(
+    isReusableStaticRootLender({ outcome: 'PARTIALLY_INSPECTED', visitedUrls: visited, rootNavigation: nav }),
+    false,
+  );
+  assert.equal(
+    isReusableStaticRootLender({ outcome: 'ACQUISITION_FAILED', visitedUrls: visited, rootNavigation: nav }),
+    false,
+  );
+  assert.equal(isReusableStaticRootLender({ outcome: 'INSPECTED_NO_MATCH', visitedUrls: [], rootNavigation: nav }), false);
+  assert.equal(
+    isReusableStaticRootLender({ outcome: 'INSPECTED_NO_MATCH', visitedUrls: visited, rootNavigation: undefined }),
+    false,
+  );
+});
+
+// REVIEW P1: a PARTIAL (truncated) lender never feeds the shared inventory,
+// so a later borrower refetches instead of inheriting cut coverage.
+test('v2 review: truncated lender roots force borrower refetch', async () => {
+  const sixteen = Array.from({ length: 16 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
+  const lenderFetched: string[] = [];
+  const lender = await crawlExternalLinks(
+    ['https://cap.example.com/'],
+    [],
+    undefined,
+    (async (input) => {
+      lenderFetched.push(String(input));
+      if (String(input) === 'https://cap.example.com/') return html(sixteen);
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.equal(lender.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(isReusableStaticRootLender(lender), false);
+});
+
+// REVIEW P2: admission-rejected hint links never enter the required set and
+// therefore never create REQUIRED_UNVISITED gaps or retry ownership.
+test('v2 review: required set excludes admission-rejected URLs', () => {
+  const links = discoverRequiredSeedLinks(
+    '<a href="/community">c</a><a href="/community-help.js">j</a><a href="/track.css">t</a>',
+    PAGE,
+  );
+  assert.deepEqual(links, ['https://creator.example.com/community']);
 });

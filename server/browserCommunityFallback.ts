@@ -269,12 +269,14 @@ export function classifyRequiredCoverage(input: RequiredCoverageInput): {
  * Required-set discovery (v2 coverage contract): the seed document plus its
  * directly discovered same-host community-hint links. Uses the exact same
  * admission predicate as the enqueue path (same-hostname + community-hint
- * filter), so every required URL is enqueue-eligible by construction and any
- * required-but-unvisited URL at stop is genuinely a bounded-traversal gap
- * rather than a filter artifact. Attribute entities are decoded with the
- * project HTML parser (cheerio, same as the static crawler) so encoded
- * identities such as `?x=1&amp;y=2` resolve exactly like the enqueue path
- * sees them. Pure and unit-tested.
+ * filter + shared crawl admission boundary), so every required URL is
+ * enqueue-eligible by construction, admission-rejected URLs can never become
+ * required obligations (and therefore never REQUIRED_UNVISITED gaps or retry
+ * owners), and any required-but-unvisited URL at stop is genuinely a
+ * bounded-traversal gap rather than a filter artifact. Attribute entities are
+ * decoded with the project HTML parser (cheerio, same as the static crawler)
+ * so encoded identities such as `?x=1&amp;y=2` resolve exactly like the
+ * enqueue path sees them. Pure and unit-tested.
  */
 export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): string[] {
   let page: URL;
@@ -306,6 +308,10 @@ export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): st
     if (absolute.hostname.toLowerCase() !== page.hostname.toLowerCase()) continue;
     absolute.hash = '';
     if (!shouldEnqueueRenderedCommunityLink(absolute.toString())) continue;
+    // R6 admission boundary: a URL the crawl/enqueue path would reject can
+    // never become a required obligation (no false REQUIRED_UNVISITED gaps,
+    // no retry ownership from inadmissible candidates).
+    if (!assessCrawlAdmission(absolute.toString()).eligible) continue;
     const url = absolute.toString();
     if (seen.has(url)) continue;
     seen.add(url);

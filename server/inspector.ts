@@ -109,7 +109,7 @@ export interface InspectionResult {
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
 export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
-export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string}
+export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string;/** Lender seed URL when this row references shared same-inspection evidence instead of a direct fetch. The lender inspected the bytes; this row carries no page counters of its own. */sharedEvidenceFrom?:string}
 
 export interface NormalizedExternalUrl {url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'}
 const socialHosts=new Set(['twitter.com','www.twitter.com','x.com','www.x.com','instagram.com','www.instagram.com','tiktok.com','www.tiktok.com','facebook.com','www.facebook.com']);
@@ -239,6 +239,23 @@ export interface SharedStaticInventory {
   roots: Map<string, { bySeed: string; finalUrl: string; childLinks: Array<{ url: string; score: number }> }>;
 }
 
+/**
+ * Shared-root lender gate (v2 L1): a static root inspection is reusable only
+ * when its evidence proves terminal success at the static tier — a clean or
+ * FOUND crawl outcome with a fetched root and recorded navigation. A
+ * truncated/incomplete (PARTIAL) or failed lender root never enters the
+ * shared inventory, so a borrower can never inherit cut coverage. Pure.
+ */
+export function isReusableStaticRootLender(result: {
+  outcome: unknown;
+  visitedUrls?: unknown;
+  rootNavigation?: unknown;
+}): boolean {
+  if (result.outcome !== 'INSPECTED_NO_MATCH' && result.outcome !== 'FOUND') return false;
+  if (!Array.isArray(result.visitedUrls) || result.visitedUrls.length === 0) return false;
+  return Array.isArray(result.rootNavigation);
+}
+
 function preserveResolvedWrapperProvenance(wrapperCandidate:DiscordCandidate,nativeCandidates:DiscordCandidate[]):DiscordCandidate[]{
   return nativeCandidates.map(native=>{
     if(!native.nativeInviteCode)return native;
@@ -265,7 +282,6 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     : ((preVisited as SharedStaticInventory | undefined)?.visitedKeys || []);
   const sharedVisited=new Set(sharedKeyList.map(u=>normalizeVisitUrl(u)).filter((k):k is string=>typeof k==='string'&&k.length>0));
   const sharedKey=(u:string):string|null=>normalizeVisitUrl(u);
-  const lookupSharedRoot=(u:string):{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>}|null=>{const key=sharedKey(u);if(!key||!sharedRoots)return null;return sharedRoots.get(key)||null;};
   const crawledUrls:string[]=[];
   let rootNavigation: Array<{ url: string; score: number }> | undefined;
   for(const rawUrl of links){
@@ -354,7 +370,6 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     let fetchFailure:{httpStatus?:number;failureClass?:string}|undefined;
     if(sharedRoot){
       logDetails.push(`[Shared static evidence] ${url} reuses root inspection from ${sharedRoot.bySeed}; child acquisition continues below.`);
-      observations.push({requestedUrl:url,finalUrl:sharedRoot.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:`Shared static root evidence from ${sharedRoot.bySeed}; no refetch.`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:1})});
       page={html:'',finalUrl:sharedRoot.finalUrl,truncated:false};
     }else{
       const acquired=await fetchExternalPage(url,fetchImpl);
@@ -456,7 +471,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     }if(next.depth>=2){const unvisitedChildren=children.filter(child=>(!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')));if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else for(const child of children)if((!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')))queue.push({...child,depth:next.depth+1});}
     if(queue.some(item=>!visited.has(item.url)))seedCeiling??='exploration-limit';const leftoverUnvisited=queue.filter(item=>!visited.has(item.url)).length;if(leftoverUnvisited>0)drops.count('exploration-limit',leftoverUnvisited);
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
-    const foundForSeed=discovered.length>beforeSeed;const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':seedCeiling?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:false,httpStatus:200,detail:foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:seedCeiling?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage${truncatedResponse?'; response truncated at the bounded-response cap before full coverage':''}`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:seedCeiling,dropReasons:drops.snapshot(),...(seedExperimentAttribution?{experimentAttribution:{...seedExperimentAttribution,...(seedCeiling==='frontier-yield'?{stoppingReason:'frontier-yield-stop'}:{})}}:{})})});
+    const foundForSeed=discovered.length>beforeSeed;const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':seedCeiling?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';const sharedRootAttribution=sharedRoot?`Shared static root evidence from ${sharedRoot.bySeed}; `:'';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:false,httpStatus:200,detail:`${sharedRootAttribution}${foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:seedCeiling?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage${truncatedResponse?'; response truncated at the bounded-response cap before full coverage':''}`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:seedCeiling,dropReasons:drops.snapshot(),...(seedExperimentAttribution?{experimentAttribution:{...seedExperimentAttribution,...(seedCeiling==='frontier-yield'?{stoppingReason:'frontier-yield-stop'}:{})}}:{})}),...(sharedRoot?{sharedEvidenceFrom:sharedRoot.bySeed}:{})});
     if(frontierOn){
       // P-C root coverage row (flag-gated, best-effort): terminal state
       // reflects the ROOT page's own evidence only (rootCoverageTerminal);
@@ -655,7 +670,11 @@ function isolatedRenderedFallback(seedUrl:string,error:any):BrowserFallbackResul
  * e.g. a fallback resolving `complete:true` without processing anything — must
  * never count as a successful inspection.
  */
-function hasProcessedAcquisitionEvidence(item:{telemetry?:CrawlerTelemetry}):boolean{
+function hasProcessedAcquisitionEvidence(item:{telemetry?:CrawlerTelemetry;sharedEvidenceFrom?:string}):boolean{
+  // Shared-evidence rows reference bytes inspected by the lender run in this
+  // same inspection: genuine evidence, attributed explicitly, with zero
+  // page counters of their own (no inspection is double-counted).
+  if(typeof item.sharedEvidenceFrom==='string'&&item.sharedEvidenceFrom) return true;
   const t=item.telemetry;
   return !!t&&((t.pagesInspected||0)>0||(t.requestsStarted||0)>0||(t.redirectsFollowed||0)>0);
 }
@@ -1050,6 +1069,16 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const sharedRenderedEvidence=new Map<string,SharedRenderedRecord[]>();
   const sharedStaticVisited=new Set<string>();
   const sharedStaticRoots=new Map<string,{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>}>();
+  // Lender feed gate: only terminal-success static roots enter the shared
+  // inventory (see isReusableStaticRootLender). Truncated/incomplete lenders
+  // never become reusable, so borrowers can never inherit cut coverage.
+  const feedSharedStaticRoot=(seedUrl:string,crawlRes:{outcome:unknown;visitedUrls?:unknown;rootNavigation?:unknown}):boolean=>{
+    if(!isReusableStaticRootLender(crawlRes))return false;
+    const rootKey=normalizeVisitUrl(seedUrl);
+    if(!rootKey||sharedStaticRoots.has(rootKey))return false;
+    sharedStaticRoots.set(rootKey,{bySeed:seedUrl,finalUrl:(crawlRes.visitedUrls as string[])[0],childLinks:crawlRes.rootNavigation as Array<{url:string;score:number}>});
+    return true;
+  };
   const recordRenderedEvidence=(seedUrl:string,rendered:{visitedUrls?:string[];pageHintLinks?:Record<string,string[]>;inspectedPages?:number},candidates:{sourceUrl?:string}[]):void=>{const hintIndex=rendered.pageHintLinks||{};for(const raw of rendered.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(!key)continue;const found=candidates.filter(c=>normalizeVisitUrl(c.sourceUrl||'')===key).length;const list=sharedRenderedEvidence.get(key)||[];if(!list.some(r=>r.bySeed===seedUrl))list.push({bySeed:seedUrl,pages:1,candidatesFound:found,hintLinks:[...(hintIndex[key]||[])]});sharedRenderedEvidence.set(key,list);}};
   const findRenderedShare=(seedUrl:string):SharedRenderedRecord|null=>{const key=normalizeVisitUrl(seedUrl);if(!key)return null;const recs=sharedRenderedEvidence.get(key);const rec=recs&&recs[0];if(!rec)return null;for(const raw of rec.hintLinks){const hk=normalizeVisitUrl(raw);if(!hk)continue;if(!sharedRenderedEvidence.get(hk)?.length)return null;}return rec;};
   // R6 admission audit trail: truncation recovery/signal lines join the Step 4
@@ -1212,7 +1241,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   if(seedCachedRow&&seedReusable&&seedCovered){
     step5Logs.push(`[Site cache] ${item.url} bypasses borrowed coverage for retry-owned reacquisition of incomplete coverage; re-crawling.`);
   }
-  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,{visitedKeys:[...sharedStaticVisited,...sharedRenderedEvidence.keys()],roots:sharedStaticRoots})).crawlRes;for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}if(crawlRes.rootNavigation){const rootKey=normalizeVisitUrl(item.url);if(rootKey&&!sharedStaticRoots.has(rootKey)&&crawlRes.visitedUrls&&crawlRes.visitedUrls.length)sharedStaticRoots.set(rootKey,{bySeed:item.url,finalUrl:crawlRes.visitedUrls[0],childLinks:crawlRes.rootNavigation});}acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every admitted website URL — including auxiliary,
+  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,{visitedKeys:[...sharedStaticVisited,...sharedRenderedEvidence.keys()],roots:sharedStaticRoots})).crawlRes;for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}feedSharedStaticRoot(item.url,crawlRes);acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every admitted website URL — including auxiliary,
 // broker/affiliate-pattern and promotional hosts — remains eligible for the
 // normal acquisition path below. Static inspection only orders attempts and
 // provides cheap evidence; it never decides whether a site is worth crawling.
