@@ -246,6 +246,10 @@ export function selectStructuredNavigationCandidates(
       return;
     }
     if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return;
+    // R6 admission boundary (shared): rejected candidates never enter the
+    // scored list and never consume the cap. Explicit non-HTTP schemes stay
+    // rejected above; malformed/dotless/resource URLs are rejected here.
+    if (!assessCrawlAdmission(absolute.toString()).eligible) return;
     if (sameHostOnly && absolute.hostname.toLowerCase() !== pageHost) return;
     const url = absolute.toString();
     if (seen.has(url)) return;

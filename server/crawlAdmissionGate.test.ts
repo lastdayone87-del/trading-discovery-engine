@@ -407,6 +407,26 @@ test('R6 review: rejected sitemap candidates do not consume the seed cap', async
   }
 });
 
+// REVIEW FIX: rejected structured-navigation candidates never consume cap
+// slots — admission runs inside the selector before scoring.
+test('R6 review: rejected structured-navigation URLs never consume cap slots', async () => {
+  const { selectStructuredNavigationCandidates } = await import('./acquisitionLadder');
+  const eligiblePaths = Array.from({ length: 10 }, (_, i) => `/community-${i + 1}`);
+  const out = selectStructuredNavigationCandidates(
+    { canonicalHrefs: ['/discord-community-help.js', ...eligiblePaths], jsonLdSameAs: [] },
+    'https://creator.example.com/guide',
+    10,
+  );
+  assert.equal(out.length, 10);
+  assert.ok(!out.some((c) => c.url.includes('community-help.js')), 'rejected candidate must not take a slot');
+  for (const p of eligiblePaths) {
+    assert.ok(
+      out.some((c) => c.url === `https://creator.example.com${p}`),
+      `eligible candidate pushed out by rejected entry: ${p}`,
+    );
+  }
+});
+
 // REVIEW FIX 6: scheme-less host:port keeps existing normalization behavior;
 // explicit non-HTTP schemes stay rejected; admission and normalization agree.
 test('R6 review: scheme-less host:port admitted, non-HTTP schemes rejected', () => {
