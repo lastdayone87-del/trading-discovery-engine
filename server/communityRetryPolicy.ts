@@ -203,6 +203,18 @@ const DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES = new Set([
   'UNSUPPORTED_CONTENT_TYPE',
 ]);
 
+/**
+ * Failure classes on FOUND rows that may still own bounded recovery: the
+ * run retained invite(s) but left a retryable required gap outstanding
+ * (FOUND_REQUIRED_GAP). Ordinary FOUND rows (no failure class) never retry.
+ * Callers additionally apply consecutive-tail suppression by seed URL.
+ */
+const FOUND_GAP_RETRYABLE_FAILURE_CLASSES = new Set([
+  'REQUIRED_UNVISITED_BUDGET_GAP',
+  'RENDERED_TIMEOUT',
+  'RENDERED_PARTIAL_COVERAGE',
+]);
+
 export function isCommunityRetryableObservation(item: CommunityRetryObservation): boolean {
   // Both failed and partially-inspected required community observations own
   // retries: partial coverage is recoverable/inconclusive, never a terminal
@@ -224,6 +236,14 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   }
   if (DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES.has(String(item.failureClass || '').toUpperCase())) {
     return false;
+  }
+  // FOUND with an outstanding retryable required gap keeps bounded recovery
+  // (multi-invite recall): the invite stays retained while the gap re-runs.
+  // Ordinary FOUND rows carry no failure class and never retry.
+  if (item.outcome === 'FOUND') {
+    return item.required !== false &&
+      item.retryable === true &&
+      FOUND_GAP_RETRYABLE_FAILURE_CLASSES.has(String(item.failureClass || ''));
   }
   return item.required !== false &&
     (item.outcome === 'ACQUISITION_FAILED' || item.outcome === 'PARTIALLY_INSPECTED') &&

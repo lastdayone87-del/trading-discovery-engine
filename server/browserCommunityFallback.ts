@@ -20,6 +20,12 @@ export interface BrowserFallbackBudget {
   maxSessionRotations: number;
   navigationTimeoutMs: number;
   totalTimeoutMs: number;
+  /**
+   * Already-inspected absolute URLs (shared same-inspection evidence): the
+   * enqueue transform drops them as already-visited instead of refetching.
+   * Optional and additive; absent behaves exactly as before.
+   */
+  alreadyVisited?: string[];
 }
 
 export interface BrowserFallbackTelemetry {
@@ -103,6 +109,27 @@ export interface BrowserFallbackResult {
    * control-slice cuts, page-budget and queue-exhausted stops. Sparse.
    */
   dropReasons?: Partial<Record<CrawlDropReason, number>>;
+  /**
+   * Required-set acquisition record (v2 coverage contract, all optional and
+   * additive — producers lacking instrumentation behave exactly as before):
+   * terminal-success page URLs in visit order; the seed document's directly
+   * discovered same-host community-hint links; and the required members left
+   * unvisited or terminally failed at stop, split by class. Lets callers
+   * distinguish sufficient coverage, bounded gaps, and genuine failures
+   * without re-parsing page content.
+   */
+  visitedUrls?: string[];
+  /**
+   * Per visited page, the same-host community-hint links discovered on it,
+   * keyed by normalized visit identity. Present only when pages were
+   * inspected; lets callers prove required-set closure for shared-evidence
+   * reuse. Additive and optional like the other v2 fields.
+   */
+  pageHintLinks?: Record<string, string[]>;
+  requiredTotal?: number;
+  requiredUnvisited?: string[];
+  requiredTransientFailures?: string[];
+  requiredPermanentFailures?: string[];
 }
 
 export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
@@ -142,6 +169,66 @@ export function isTelegramPostPermalink(rawUrl: string): boolean {
 export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
   if (isTelegramPostPermalink(rawUrl)) return false;
   return COMMUNITY_HINTS.test(rawUrl);
+}
+
+/**
+ * Normalized identity for visit-set matching (shared-evidence registry and
+ * already-visited exclusion): scheme + lowercased host + non-default port +
+ * pathname (trailing slash trimmed) + verbatim query. Same rule both sides
+ * so independently recorded URLs meet on one key. Null when unparsable.
+ */
+export function normalizeVisitUrl(rawUrl: string): string | null {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  const path = parsed.pathname.replace(/\/+$/, '') || '/';
+  const port = parsed.port ? `:${parsed.port}` : '';
+  return `${parsed.protocol}//${parsed.hostname.toLowerCase()}${port}${path}${parsed.search}`;
+}
+
+/**
+ * Required-set discovery (v2 coverage contract): the seed document plus its
+ * directly discovered same-host community-hint links. Uses the exact same
+ * admission predicate as the enqueue path (same-hostname + community-hint
+ * filter), so every required URL is enqueue-eligible by construction and any
+ * required-but-unvisited URL at stop is genuinely a bounded-traversal gap
+ * rather than a filter artifact. Pure and unit-tested.
+ */
+export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): string[] {
+  let page: URL;
+  try {
+    page = new URL(seedUrl);
+  } catch {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const pattern = /<a\s[^>]*href\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/gi;
+  for (let match; (match = pattern.exec(String(seedHtml || ''))) !== null;) {
+    const raw = (match[1] || match[2] || match[3] || '').trim();
+    if (!raw) continue;
+    let absolute: URL;
+    try {
+      absolute = new URL(raw, seedUrl);
+    } catch {
+      continue;
+    }
+    if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') continue;
+    if (absolute.hostname.toLowerCase() !== page.hostname.toLowerCase()) continue;
+    absolute.hash = '';
+    if (!shouldEnqueueRenderedCommunityLink(absolute.toString())) continue;
+    const url = absolute.toString();
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
 }
 
 /**
@@ -242,10 +329,17 @@ export function wasRenderedResultProcessed(
 export interface RenderedRequestTracker {
   failedRequestUrls: Set<string>;
   succeededRequestUrls: Set<string>;
+  /**
+   * Terminal failure class per failed URL (v2 required-set accounting):
+   * lets classification split required terminal failures into transient
+   * (bounded recovery) and permanent (visible, never retries). Additive;
+   * entries without a recorded class count as transient-capable.
+   */
+  failedRequestClasses: Map<string, string>;
 }
 
 export function createRenderedRequestTracker(): RenderedRequestTracker {
-  return { failedRequestUrls: new Set<string>(), succeededRequestUrls: new Set<string>() };
+  return { failedRequestUrls: new Set<string>(), succeededRequestUrls: new Set<string>(), failedRequestClasses: new Map<string, string>() };
 }
 
 /**
@@ -253,10 +347,11 @@ export function createRenderedRequestTracker(): RenderedRequestTracker {
  * revoking any earlier success for the same URL (a later terminal failure
  * must not be erased by an earlier success mark).
  */
-export function markRenderedRequestFailed(tracker: RenderedRequestTracker, url: string): void {
+export function markRenderedRequestFailed(tracker: RenderedRequestTracker, url: string, failureClass?: string): void {
   if (!url) return;
   tracker.failedRequestUrls.add(url);
   tracker.succeededRequestUrls.delete(url);
+  if (failureClass) tracker.failedRequestClasses.set(url, failureClass);
 }
 
 /**
@@ -270,6 +365,7 @@ export function markRenderedRequestSucceeded(tracker: RenderedRequestTracker, ur
   if (!url) return;
   tracker.succeededRequestUrls.add(url);
   tracker.failedRequestUrls.delete(url);
+  tracker.failedRequestClasses.delete(url);
 }
 
 /** Terminal unresolved failures for completion accounting. */
@@ -551,6 +647,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // URL; a later success resolves an earlier failure (retry recovery).
   const requestTracker = createRenderedRequestTracker();
   const hostBackoffUntil = new Map<string, number>();
+  // v2 required-set tracking: the seed document plus its directly discovered
+  // same-host community-hint links (computed once from the first inspected
+  // page with the same predicate as the enqueue path). Terminal-success page
+  // URLs accumulate in visit order for the shared-evidence registry.
+  let seedDocumentSeen = false;
+  let seedRequiredLinks: string[] = [];
+  const terminalSuccessUrls: string[] = [];
+  // Per visited page, the same-host community-hint links discovered on it
+  // (same predicate as the enqueue path): lets callers prove required-set
+  // closure for shared-evidence reuse without re-parsing page content.
+  const pageHintLinks = new Map<string, Set<string>>();
+  // Already-inspected URLs from earlier same-inspection work: excluded from
+  // enqueueing (counted as already-visited) instead of being refetched.
+  const alreadyVisitedSet = new Set(
+    (limits.alreadyVisited || [])
+      .map(normalizeVisitUrl)
+      .filter((key): key is string => typeof key === 'string' && key.length > 0),
+  );
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
     try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\\./, '') || 'unknown'; }
@@ -599,10 +713,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           }],
           errorHandler: async ({ request, session }, error) => {
             telemetry.requestsFailed++;
-            markRenderedRequestFailed(requestTracker, request.url);
+            const failureClass = classifyRenderedCrawlerFailure(error);
+            markRenderedRequestFailed(requestTracker, request.url, failureClass);
             const retryCount = request.retryCount || 0;
             const policy = renderedCrawlerRetryPolicy(error, retryCount);
-            const failureClass = classifyRenderedCrawlerFailure(error);
             if (isRenderedNavigationTimeout(error)) telemetry.navigationTimeouts++;
             if (failureClass === 'BLOCKED') telemetry.blockedRequests++;
             if (failureClass === 'RATE_LIMITED') telemetry.rateLimitedRequests++;
@@ -629,6 +743,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const inspect = async () => {
               const url=page.url(),html=await page.content();
               retain(`${url}\n${html}`,url);
+              try {
+                const pageKey = normalizeVisitUrl(url) || url;
+                let bucket = pageHintLinks.get(pageKey);
+                if (!bucket) {
+                  bucket = new Set<string>();
+                  pageHintLinks.set(pageKey, bucket);
+                }
+                for (const link of discoverRequiredSeedLinks(html, url)) bucket.add(link);
+              } catch { /* hint inventory never breaks inspection */ }
             };
             // Page evidence counts only after the required extraction actually
             // succeeds: a throw here leaves zero processed evidence (finding:
@@ -636,6 +759,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             await inspect();
             inspectedPages++;
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
+            if (!seedDocumentSeen) {
+              seedDocumentSeen = true;
+              try {
+                seedRequiredLinks = discoverRequiredSeedLinks(await page.content(), page.url());
+              } catch {
+                seedRequiredLinks = [];
+              }
+            }
 
             for (let i = 0; i < limits.maxScrollsPerPage; i++) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -678,7 +809,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
-              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>{if(shouldEnqueueRenderedCommunityLink(req.url))return req;drops.count('hint-rejected');return false;}});
+              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>{const visitKey=normalizeVisitUrl(req.url);if(visitKey&&alreadyVisitedSet.has(visitKey)){drops.count('already-visited');return false;}if(shouldEnqueueRenderedCommunityLink(req.url))return req;drops.count('hint-rejected');return false;}});
             }
             // Success is recorded only after the request's full page-processing
             // lifecycle completes (load, scroll traversal, control enumeration,
@@ -687,6 +818,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // success resolves an earlier failure (retry recovery). Click
             // handling owns no marks: clicks never affect terminal accounting.
             markRenderedRequestSucceeded(requestTracker, request.url);
+            terminalSuccessUrls.push(request.url);
             } finally {
               telemetry.requestsFinished++;
             }
@@ -731,6 +863,50 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // Terminal stop attribution: a complete crawl below the page budget
         // with nothing still queued ended for lack of enqueueable links;
         // eligible requests still queued mean the request budget cut coverage.
+        // v2 required-set classification: the seed document plus its directly
+        // discovered same-host community-hint links, partitioned by terminal
+        // state. Depth-2+ remainder is opportunistic by definition and never
+        // appears here. BLOCKED terminal failures are permanent access-denial
+        // evidence (identical refetch patterns cannot clear a WAF wall within
+        // any wall-clock); every other recorded class stays transient-capable
+        // under the existing tail-bounded retry rules.
+        const succeededKeys = new Set(
+          [...requestTracker.succeededRequestUrls]
+            .map(normalizeVisitUrl)
+            .filter((key): key is string => typeof key === 'string' && key.length > 0),
+        );
+        const failedByKey = new Map<string, string | undefined>();
+        for (const failed of requestTracker.failedRequestUrls) {
+          const key = normalizeVisitUrl(failed);
+          if (typeof key === 'string' && key.length > 0 && !succeededKeys.has(key) && !failedByKey.has(key)) {
+            failedByKey.set(key, requestTracker.failedRequestClasses.get(failed));
+          }
+        }
+        const requiredUnvisited: string[] = [];
+        const requiredTransientFailures: string[] = [];
+        const requiredPermanentFailures: string[] = [];
+        let requiredTotal = 0;
+        if (seedDocumentSeen) {
+          const requiredKeys = new Set(
+            [seedUrl, ...seedRequiredLinks]
+              .map(normalizeVisitUrl)
+              .filter((key): key is string => typeof key === 'string' && key.length > 0),
+          );
+          requiredTotal = requiredKeys.size;
+          for (const key of requiredKeys) {
+            if (succeededKeys.has(key)) continue;
+            if (!failedByKey.has(key)) {
+              requiredUnvisited.push(key);
+              continue;
+            }
+            // BLOCKED is permanent access-denial evidence: an identical refetch
+            // pattern cannot clear a WAF wall within any wall-clock. Every
+            // other recorded class stays transient-capable under the existing
+            // tail-bounded retry rules.
+            if (failedByKey.get(key) === 'BLOCKED') requiredPermanentFailures.push(key);
+            else requiredTransientFailures.push(key);
+          }
+        }
         if (completion.complete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
         if (pageBudgetExhausted) drops.count('page-budget');
         return {
@@ -744,6 +920,21 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           failureClass:completion.failureClass,
           telemetry,
           dropReasons:drops.snapshot(),
+          visitedUrls: terminalSuccessUrls.length ? [...terminalSuccessUrls] : undefined,
+          pageHintLinks: (() => {
+            const record: Record<string, string[]> = {};
+            let entries = 0;
+            for (const [page, links] of pageHintLinks) {
+              if (entries >= 64) break;
+              record[page] = [...links].slice(0, 64);
+              entries++;
+            }
+            return entries ? record : undefined;
+          })(),
+          requiredTotal: seedDocumentSeen ? requiredTotal : undefined,
+          requiredUnvisited: seedDocumentSeen && requiredUnvisited.length ? requiredUnvisited : undefined,
+          requiredTransientFailures: seedDocumentSeen && requiredTransientFailures.length ? requiredTransientFailures : undefined,
+          requiredPermanentFailures: seedDocumentSeen && requiredPermanentFailures.length ? requiredPermanentFailures : undefined,
           detail:candidates.length
             ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
             : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,

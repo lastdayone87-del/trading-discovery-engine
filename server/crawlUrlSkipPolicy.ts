@@ -85,19 +85,30 @@ export function trailingIdenticalFailure(rows: UrlFailureRow[]): { failureClass:
 export const CONSECUTIVE_TIMEOUT_SUPPRESSION_THRESHOLD = 2;
 
 /**
+ * Failure classes sharing one consecutive-tail budget for retry suppression.
+ * Rendered wall-clock timeouts and rendered required-unvisited budget gaps
+ * are the same deterministic phenomenon (bounded traversal stopped with work
+ * remaining); a mixed tail of the two still proves futility. Defaults to the
+ * timeout class alone so existing callers keep exact behavior.
+ */
+const DEFAULT_TIMEOUT_TAIL_CLASSES = ['RENDERED_TIMEOUT'];
+
+/**
  * Whether prior ledger history already holds `threshold` consecutive
- * identical rendered-timeout runs for one normalized URL. Newest-first
- * trailing run over ACQUISITION_FAILED/PARTIALLY_INSPECTED rows with
- * failureClass RENDERED_TIMEOUT; any other outcome or class (including a
- * later FOUND/clean recovery) breaks the run. Pure and unit-testable.
+ * identical tail-class runs for one normalized URL. Newest-first trailing run
+ * over ACQUISITION_FAILED/PARTIALLY_INSPECTED rows whose failureClass is in
+ * `classes`; any other outcome or class (including a later FOUND/clean
+ * recovery) breaks the run. Pure and unit-testable.
  */
 export function hasConsecutiveTimeoutExhaustion(
   rows: UrlFailureRow[],
   requestedUrl: string,
   threshold: number = CONSECUTIVE_TIMEOUT_SUPPRESSION_THRESHOLD,
+  classes: string[] = DEFAULT_TIMEOUT_TAIL_CLASSES,
 ): boolean {
   const key = normalizeSkipUrl(requestedUrl);
   if (!key) return false;
+  const wanted = new Set(classes);
   const ordered = rows
     .filter(row => normalizeSkipUrl(row.requestedUrl) === key)
     .sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt));
@@ -107,7 +118,7 @@ export function hasConsecutiveTimeoutExhaustion(
   for (const row of ordered) {
     if (
       (row.outcome === 'ACQUISITION_FAILED' || row.outcome === 'PARTIALLY_INSPECTED') &&
-      String(row.failureClass || '') === 'RENDERED_TIMEOUT'
+      wanted.has(String(row.failureClass || ''))
     ) {
       run++;
     } else break;
