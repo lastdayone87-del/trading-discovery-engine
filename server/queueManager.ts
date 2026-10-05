@@ -355,6 +355,22 @@ export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searc
 export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
 /**
+ * Pure admission decision for budget-gated corpus-family claim types
+ * (TERM_HARVEST, SCORE_CANDIDATES), shared by the claim builder so the
+ * paused/budget logic is unit-testable without a database. Paused controls
+ * and exhausted (or unreadable) budgets exclude the type; only an unpaused
+ * control with remaining headroom admits it. Non-numeric budgets fail
+ * closed toward exclusion.
+ */
+export function isBudgetedCorpusClaimAdmitted(args: { paused: unknown; dailyBudget: unknown; consumedToday: unknown }): boolean {
+  if (args.paused) return false;
+  const budget = Number(args.dailyBudget);
+  const consumed = Number(args.consumedToday ?? 0);
+  if (!Number.isFinite(budget) || !Number.isFinite(consumed)) return false;
+  return consumed < budget;
+}
+
+/**
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
@@ -428,14 +444,26 @@ export async function processNextSearchJob(
     claimableTypes.push('RELATIONSHIP_CANARY_EXPANSION');
   }
   if (!claimableOverride || claimableOverride.includes('TERM_HARVEST')) {
-    const db=await getDb();const control=await db.query(`SELECT paused FROM corpus_controls WHERE singleton=true`);
-    if(control.rowCount&&!control.rows[0].paused)claimableTypes.push('TERM_HARVEST');
+    const db=await getDb();const control=await db.query(`SELECT paused,daily_compute_documents FROM corpus_controls WHERE singleton=true`);
+    if(control.rowCount&&!control.rows[0].paused){
+      // Budget-aware admission: when the daily budget is already exhausted,
+      // leave jobs queued for the next window instead of claiming them into
+      // attempt-burning budget failures. The corpus worker is the sole
+      // consumer of this type, so the check-then-claim has no race.
+      const consumed=await db.query(`SELECT count(*)::int n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`);
+      if(isBudgetedCorpusClaimAdmitted({paused:control.rows[0].paused,dailyBudget:control.rows[0].daily_compute_documents,consumedToday:consumed.rows[0]?.n}))claimableTypes.push('TERM_HARVEST');
+    }
   }
   if(!claimableOverride||claimableOverride.includes('PROPOSE_CONCEPT_RESOLUTION')){const db=await getDb();const control=await db.query('SELECT resolution_paused FROM concept_graph_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].resolution_paused)claimableTypes.push('PROPOSE_CONCEPT_RESOLUTION');}
   if(!claimableOverride||claimableOverride.includes('OFFLINE_CANDIDATE_EVALUATION')){const db=await getDb();const control=await db.query('SELECT evaluation_paused,provider_access_allowed FROM offline_evaluation_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].evaluation_paused&&!control.rows[0].provider_access_allowed)claimableTypes.push('OFFLINE_CANDIDATE_EVALUATION');}
   if (!claimableOverride || claimableOverride.includes('SCORE_CANDIDATES') || claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')) {
-    const db=await getDb();const control=await db.query(`SELECT scoring_paused,ai_paused FROM candidate_scoring_controls WHERE singleton=true`);
-    if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES')))claimableTypes.push('SCORE_CANDIDATES');
+    const db=await getDb();const control=await db.query(`SELECT scoring_paused,ai_paused,daily_scoring_candidates FROM candidate_scoring_controls WHERE singleton=true`);
+    if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES'))){
+      // Same budget-aware admission as harvest: exhausted daily budget leaves
+      // jobs queued instead of burning attempts on inevitable budget throws.
+      const spent=await db.query(`SELECT count(*)::int n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
+      if(isBudgetedCorpusClaimAdmitted({paused:control.rows[0].scoring_paused,dailyBudget:control.rows[0].daily_scoring_candidates,consumedToday:spent.rows[0]?.n}))claimableTypes.push('SCORE_CANDIDATES');
+    }
     if(control.rowCount&&!control.rows[0].ai_paused&&(!claimableOverride||claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')))claimableTypes.push('AI_ADJUDICATE_CANDIDATE');
   }
   if (claimableTypes.length === 0) return false;
