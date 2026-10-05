@@ -14,8 +14,9 @@ const PAGE = 'https://creator.example.com/guide';
 const anchor = (index: number, href: string) => ({ index, text: `community ${href}`, href });
 const button = (index: number) => ({ index, text: 'join VIP group', href: null });
 
-// Traversal: ordinary navigable same-host anchors are skipped (discoverable
-// via enqueueLinks, text retained pre-click); everything else keeps clicks.
+// Traversal: ordinary navigable same-host anchors passing the enqueue rule
+// are skipped (discoverable via enqueueLinks, text retained pre-click);
+// everything else keeps clicks.
 test('acquisition: same-host navigable anchors skip clicks, buttons do not', () => {
   assert.equal(isSkippableNavigableAnchorClick({ href: '/community' }, PAGE), true);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'https://creator.example.com/join' }, PAGE), true);
@@ -25,6 +26,11 @@ test('acquisition: same-host navigable anchors skip clicks, buttons do not', () 
   assert.equal(isSkippableNavigableAnchorClick({ href: '#section' }, PAGE), false);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'javascript:void(0)' }, PAGE), false);
   assert.equal(isSkippableNavigableAnchorClick({ href: 'mailto:a@b.com' }, PAGE), false);
+  // Same-host anchors failing the enqueue rule must still be clicked:
+  // otherwise they would be neither clicked nor enqueued and discovery
+  // could be lost.
+  assert.equal(isSkippableNavigableAnchorClick({ href: '/logo.png' }, PAGE), false);
+  assert.equal(isSkippableNavigableAnchorClick({ href: '/plain-page' }, PAGE), false);
   // Cross-host navigation keeps current behavior (never silently dropped).
   assert.equal(isSkippableNavigableAnchorClick({ href: 'https://other.example.net/join' }, PAGE), false);
   // Unparseable hrefs fail open toward recall.
@@ -33,11 +39,11 @@ test('acquisition: same-host navigable anchors skip clicks, buttons do not', () 
 
 test('acquisition: mixed ordering reaches buttons past skipped anchors with locator indexes intact', () => {
   const controls = [
-    anchor(0, '/a1'),
-    anchor(1, '/a2'),
-    anchor(2, '/a3'),
-    anchor(3, '/a4'),
-    anchor(4, '/a5'),
+    anchor(0, '/community-1'),
+    anchor(1, '/community-2'),
+    anchor(2, '/community-3'),
+    anchor(3, '/community-4'),
+    anchor(4, '/community-5'),
     button(5),
     button(6),
   ];
@@ -46,6 +52,16 @@ test('acquisition: mixed ordering reaches buttons past skipped anchors with loca
   // budget applies to attempted clicks only.
   assert.deepEqual(plan.toClick.map((c) => c.index), [5, 6]);
   assert.equal(plan.skippedNavigableAnchors, 5);
+});
+
+test('acquisition: click budget binds attempted clicks beyond the old take-12 window', () => {
+  const anchors = Array.from({ length: 13 }, (_, i) => anchor(i, `/community-${i}`));
+  const controls = [...anchors, button(13)];
+  const plan = partitionRenderedClickTargets(controls, PAGE, 4);
+  // Partitioning sees the complete bounded set first: the click-only button
+  // at index 13 is never hidden behind skipped anchors.
+  assert.deepEqual(plan.toClick.map((c) => c.index), [13]);
+  assert.equal(plan.skippedNavigableAnchors, 13);
 });
 
 test('acquisition: click budget binds attempted clicks, slice remainder stays accurate', () => {

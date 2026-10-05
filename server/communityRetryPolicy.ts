@@ -208,8 +208,9 @@ const DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES = new Set([
  * run retained invite(s) but left a retryable required gap outstanding
  * (FOUND_REQUIRED_GAP). Ordinary FOUND rows (no failure class) never retry.
  * Callers additionally apply consecutive-tail suppression by seed URL.
+ * Exported so scheduler wiring uses the identical set (single source).
  */
-const FOUND_GAP_RETRYABLE_FAILURE_CLASSES = new Set([
+export const FOUND_GAP_RETRYABLE_FAILURE_CLASSES = new Set([
   'REQUIRED_UNVISITED_BUDGET_GAP',
   'RENDERED_TIMEOUT',
   'RENDERED_PARTIAL_COVERAGE',

@@ -225,7 +225,19 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch):Promise<{pag
   finally { clearTimeout(timer); }
 }
 
-export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocation?:string;details:string;outcome:ExternalAcquisitionStatus;observations:ExternalAcquisitionObservation[];candidates:DiscordCandidate[];domainWeightShadows?:DomainWeightShadowEvaluation[];/** Terminal-success page URLs (finals) in visit order for the shared-evidence registry. Additive; absent on early failure paths. */visitedUrls?:string[]}
+export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocation?:string;details:string;outcome:ExternalAcquisitionStatus;observations:ExternalAcquisitionObservation[];candidates:DiscordCandidate[];domainWeightShadows?:DomainWeightShadowEvaluation[];/** Terminal-success page URLs (finals) in visit order for the shared-evidence registry. Additive; absent on early failure paths. */visitedUrls?:string[];/** Root-page scored navigation targets (single-seed calls) for lender inventory. Additive. */rootNavigation?:Array<{url:string;score:number}>}
+
+/**
+ * Shared static lender inventory (v2 L1): terminal-success root inspections
+ * keyed by normalized visit identity, carrying the lender's scored root
+ * navigation so a borrower can skip the duplicate root fetch yet still
+ * acquire its own children. Same-inspection scope only; rendered-tier needs
+ * never consult it (tier monotonicity).
+ */
+export interface SharedStaticInventory {
+  visitedKeys: string[];
+  roots: Map<string, { bySeed: string; finalUrl: string; childLinks: Array<{ url: string; score: number }> }>;
+}
 
 function preserveResolvedWrapperProvenance(wrapperCandidate:DiscordCandidate,nativeCandidates:DiscordCandidate[]):DiscordCandidate[]{
   return nativeCandidates.map(native=>{
@@ -237,14 +249,25 @@ function preserveResolvedWrapperProvenance(wrapperCandidate:DiscordCandidate,nat
 
 /** Bounded static acquisition that retains every Discord candidate observed
  * within the page budget. A first invite is evidence, not a stop condition. */
-export async function crawlExternalLinks(links:string[],logDetails:string[]=[],debugLog?:any,fetchImpl:typeof fetch=fetch,surface:AcquisitionSurface='CREATOR_WEBSITES',required=false,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]):Promise<ExternalDiscordCrawlResult>{
+export async function crawlExternalLinks(links:string[],logDetails:string[]=[],debugLog?:any,fetchImpl:typeof fetch=fetch,surface:AcquisitionSurface='CREATOR_WEBSITES',required=false,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]|SharedStaticInventory):Promise<ExternalDiscordCrawlResult>{
   let scannedCount=0;const observations:ExternalAcquisitionObservation[]=[];const discovered:DiscordCandidate[]=[];const domainWeightShadows:DomainWeightShadowEvaluation[]=[];
   // Shared-visit pre-seeding (v2 L1): terminal-success finals inspected by an
   // earlier same-inspection crawl are never refetched. Same-tier evidence
-  // only (static tier here); higher-tier needs are unaffected.
-  const sharedVisited=new Set((preVisited||[]).map(u=>normalizeVisitUrl(u)).filter((k):k is string=>typeof k==='string'&&k.length>0));
+  // only (static tier here); higher-tier needs are unaffected. Accepts raw
+  // key lists or a lender inventory (whose root records additionally let a
+  // borrower skip a duplicate root fetch yet still acquire its own children
+  // from the lender's scored navigation).
+  const sharedRoots = preVisited && typeof preVisited === 'object' && !Array.isArray(preVisited)
+    ? (preVisited as SharedStaticInventory).roots
+    : undefined;
+  const sharedKeyList: string[] = Array.isArray(preVisited)
+    ? preVisited
+    : ((preVisited as SharedStaticInventory | undefined)?.visitedKeys || []);
+  const sharedVisited=new Set(sharedKeyList.map(u=>normalizeVisitUrl(u)).filter((k):k is string=>typeof k==='string'&&k.length>0));
   const sharedKey=(u:string):string|null=>normalizeVisitUrl(u);
+  const lookupSharedRoot=(u:string):{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>}|null=>{const key=sharedKey(u);if(!key||!sharedRoots)return null;return sharedRoots.get(key)||null;};
   const crawledUrls:string[]=[];
+  let rootNavigation: Array<{ url: string; score: number }> | undefined;
   for(const rawUrl of links){
     if(!rawUrl||typeof rawUrl!=='string')continue;let url=rawUrl.trim();if(!url.startsWith('http://')&&!url.startsWith('https://'))url=`https://${url}`;
     // R6 admission boundary (shared): rejected candidates never reach scoring
@@ -325,14 +348,26 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
         }));
       }catch{/* admission is best-effort persistence, never crawl behavior */}
     };
-    const acquired=await fetchExternalPage(url,fetchImpl),page=acquired.page;if(acquired.observation)observations.push({...acquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected})});
+    const lookupSharedStaticRoot=(u:string):{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>}|null=>{const key=sharedKey(u);if(!key||!sharedRoots)return null;return sharedRoots.get(key)||null;};
+    const sharedRoot=lookupSharedStaticRoot(url);
+    let page:{html:string;finalUrl:string;truncated:boolean}|null;
+    let fetchFailure:{httpStatus?:number;failureClass?:string}|undefined;
+    if(sharedRoot){
+      logDetails.push(`[Shared static evidence] ${url} reuses root inspection from ${sharedRoot.bySeed}; child acquisition continues below.`);
+      observations.push({requestedUrl:url,finalUrl:sharedRoot.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:`Shared static root evidence from ${sharedRoot.bySeed}; no refetch.`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:1})});
+      page={html:'',finalUrl:sharedRoot.finalUrl,truncated:false};
+    }else{
+      const acquired=await fetchExternalPage(url,fetchImpl);
+      page=acquired.page;
+      if(acquired.observation){observations.push({...acquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected})});fetchFailure=acquired.observation;}
+    }
     // A truncated prefix is incomplete coverage, never a complete inspection:
     // force the partial path so a cut-off response can never resolve a
     // definitive clean negative for this seed.
     let truncatedResponse=page?.truncated===true;if(truncatedResponse){seedCeiling??='response-cap';drops.count('response-cap');}
     if(debugLog&&page)debugLog.redirectsFollowed.push({from:url,to:page.finalUrl});if(page&&page.finalUrl!==url)redirectsFollowed++;if(!page){
       if(frontierOn){
-        const failedRoot=acquired.observation;
+        const failedRoot=fetchFailure;
         const terminal=classifyBlockedAcquisition({httpStatus:failedRoot?.httpStatus,failureClass:failedRoot?.failureClass,timedOut:failedRoot?.failureClass==='TIMEOUT',transportFailed:failedRoot?.failureClass==='NETWORK_FAILURE'});
         if(terminal!=='OK')frontierBlockedTerminals+=1;
         await frontierRecordCoverage(url,terminal==='OK'?'ACQUISITION_FAILED':terminal,'HTTP_STATIC',0);
@@ -364,7 +399,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       navigation.sort((a,b)=>b.score-a.score);return navigation;
     };
 
-    const visited=new Set<string>([page.finalUrl,url]);const beforeRootYield=discovered.length;const firstNavigation=inspectPage(page,0);const rootYield=Math.max(0,discovered.length-beforeRootYield);if(frontierOn){frontierYieldHistory.push(rootYield);frontierEvidenceUnits+=rootYield;}// Deduplicate eligible navigation targets (keeping the best score) BEFORE
+    const visited=new Set<string>([page.finalUrl,url]);const beforeRootYield=discovered.length;const firstNavigation=sharedRoot?sharedRoot.childLinks:inspectPage(page,0);rootNavigation=firstNavigation;const rootYield=Math.max(0,discovered.length-beforeRootYield);if(frontierOn){frontierYieldHistory.push(rootYield);frontierEvidenceUnits+=rootYield;}// Deduplicate eligible navigation targets (keeping the best score) BEFORE
     // the queue bound: duplicate URLs must never consume budget while unique
     // eligible targets are dropped. Truncation of eligible uniques is itself
     // incomplete coverage.
@@ -433,7 +468,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
   }
   const candidates=mergeDiscordCandidates(discovered);const failed=observations.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspected=observations.filter(item=>item.outcome==='INSPECTED_NO_MATCH').length,partial=observations.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,found=observations.some(item=>item.outcome==='FOUND');const outcome:ExternalAcquisitionStatus=found?'FOUND':(failed&&inspected)||partial>0?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';
   logDetails.push(`Crawled ${scannedCount} external link(s); retained ${candidates.length} distinct Discord candidate(s).`);
-  return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:logDetails.join('\n'),outcome,observations,candidates,domainWeightShadows,visitedUrls:crawledUrls};
+  return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:logDetails.join('\n'),outcome,observations,candidates,domainWeightShadows,visitedUrls:crawledUrls,rootNavigation};
 }
 
 /**
@@ -566,6 +601,10 @@ function renderedAcquisitionOutcome(rendered:BrowserFallbackResult,renderedProce
   const pageBudgetCut=(rendered.dropReasons?.['page-budget']||0)>0;
   const timeoutClass=rendered.timedOut?(pageBudgetCut?'RENDERED_BUDGET_EXPIRED':'RENDERED_TIMEOUT'):undefined;
   if (hasUnvisited) return{outcome:'PARTIALLY_INSPECTED',failureClass:'REQUIRED_UNVISITED_BUDGET_GAP',gapRetryable:true};
+  // Required permanent-only failure (e.g. BLOCKED wall on a required member
+  // with no other gap) stays visible but never owns retry work: identical
+  // refetch patterns cannot clear access denial.
+  if (hasPermanentOnly) return{outcome:rendered.inspectedPages>0?'PARTIALLY_INSPECTED':'ACQUISITION_FAILED',failureClass:rendered.timedOut?'RENDERED_TIMEOUT':'RENDERED_PARTIAL_COVERAGE',gapRetryable:false};
   if(rendered.inspectedPages>0)return{outcome:'PARTIALLY_INSPECTED',failureClass:timeoutClass||'RENDERED_PARTIAL_COVERAGE'};
   return{outcome:'ACQUISITION_FAILED',failureClass:timeoutClass||rendered.failureClass||'NO_PAGE_PROCESSED'};
 }
@@ -591,7 +630,7 @@ function requiredGapFromRendered(rendered:BrowserFallbackResult):RenderedRequire
  * single item can never throw out of the Step 4/5 loops and prevent subsequent
  * candidates from being attempted.
  */
-async function safeCrawlStatic(seedUrl:string,debugLog:any,fetchImpl:typeof fetch,surface:AcquisitionSurface,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]):Promise<{crawlRes:ExternalDiscordCrawlResult}>{
+async function safeCrawlStatic(seedUrl:string,debugLog:any,fetchImpl:typeof fetch,surface:AcquisitionSurface,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]|SharedStaticInventory):Promise<{crawlRes:ExternalDiscordCrawlResult}>{
   try{
     return {crawlRes:await crawlExternalLinks([seedUrl],[],debugLog,fetchImpl,surface,false,wrapperUrl,ladderStructured,frontier,seedAdmission,evaluateDomainWeights,preVisited)};
   }catch(error:any){
@@ -835,8 +874,8 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // and query with hosts equal modulo one leading www. Null when the rule
   // does not apply (unidentifiable, non-www hosts are keyed distinctly so
   // unrelated subdomains can never merge).
-  const wwwSchemeCollapseKey=(rawUrl:string):string|null=>{let parsed:URL;try{parsed=new URL(rawUrl);}catch{return null;}const identity=canonicalSiteIdentity(rawUrl)?.siteIdentity;if(!identity)return null;const host=parsed.hostname.toLowerCase();const stripped=host.replace(/^www\./,'');return `${identity}\u0000${parsed.protocol}\u0000${stripped}\u0000${parsed.pathname}\u0000${parsed.search}`;};
-  const hostsDifferOnlyByWww=(a:string,b:string):boolean=>{let ha:string,hb:string;try{ha=new URL(a).hostname.toLowerCase();hb=new URL(b).hostname.toLowerCase();}catch{return false;}return ha!==hb&&(ha===`www.${hb}`||hb===`www.${ha}`);};
+  const wwwSchemeCollapseKey=(rawUrl:string):string|null=>{let parsed:URL;try{parsed=new URL(rawUrl);}catch{return null;}const identity=canonicalSiteIdentity(rawUrl)?.siteIdentity;if(!identity)return null;const host=parsed.hostname.toLowerCase();const stripped=host.replace(/^www\./,'');return `${identity}\u0000${parsed.protocol}\u0000${stripped}\u0000${parsed.port}\u0000${parsed.pathname}\u0000${parsed.search}`;};
+  const hostsDifferOnlyByWww=(a:string,b:string):boolean=>{let pa:URL,pb:URL;try{pa=new URL(a);pb=new URL(b);}catch{return false;}const ha=pa.hostname.toLowerCase(),hb=pb.hostname.toLowerCase();return ha!==hb&&(ha===`www.${hb}`||hb===`www.${ha}`)&&pa.port===pb.port;};
   for(const item of collectedExternalUrls){let seedUrl=item.url;if(item.kind==='WEBSITE'){try{const host=new URL(seedUrl).hostname.toLowerCase();const recovered=recoverTruncatedQueryToRoot(seedUrl,siblingValuedKeysByHost.get(host)??new Set());if(recovered&&recovered!==seedUrl){admissionRecoveryLogs.push(`Recovered truncated query to host root (TRUNCATED_QUERY_PREFIX): ${seedUrl} → ${recovered}`);seedUrl=recovered;}else if(isPossiblyTruncatedPath(seedUrl,siblingPathsByHost.get(host)??new Set())){admissionTruncationSignals.push(`Possibly truncated path (signal only, still eligible): ${seedUrl}`);}}catch{/* recovery never breaks collection */}}const key=seedUrl;const existing=uniqueUrls.get(key);if(existing){if(item.contextMatches)existing.contextMatches=true;continue;}if(item.kind==='WEBSITE'){const collapseKey=wwwSchemeCollapseKey(seedUrl);if(collapseKey){const primaryKey=collapseIndex.get(collapseKey);const primary=primaryKey?uniqueUrls.get(primaryKey):undefined;if(primary&&hostsDifferOnlyByWww(primary.url,seedUrl)){if(item.contextMatches)primary.contextMatches=true;seedDedupeLogs.push(`Seed deduplicated (BARE_WWW_DUPLICATE): ${seedUrl} → kept ${primary.url}`);continue;}if(!primaryKey)collapseIndex.set(collapseKey,key);}}uniqueUrls.set(key,{...item,url:seedUrl});}const allCollectedUrls=Array.from(uniqueUrls.values());let websiteUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='WEBSITE'));const socialBioUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='SOCIAL')),messagingUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='MESSAGING'));
   // P-B acquisition ladder (flag-gated, default off): sitemap-inventoried URLs
   // enter as scored seed nominations through the normal ranking and budgets.
@@ -1010,6 +1049,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   interface SharedRenderedRecord {bySeed:string;pages:number;candidatesFound:number;hintLinks:string[];}
   const sharedRenderedEvidence=new Map<string,SharedRenderedRecord[]>();
   const sharedStaticVisited=new Set<string>();
+  const sharedStaticRoots=new Map<string,{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>}>();
   const recordRenderedEvidence=(seedUrl:string,rendered:{visitedUrls?:string[];pageHintLinks?:Record<string,string[]>;inspectedPages?:number},candidates:{sourceUrl?:string}[]):void=>{const hintIndex=rendered.pageHintLinks||{};for(const raw of rendered.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(!key)continue;const found=candidates.filter(c=>normalizeVisitUrl(c.sourceUrl||'')===key).length;const list=sharedRenderedEvidence.get(key)||[];if(!list.some(r=>r.bySeed===seedUrl))list.push({bySeed:seedUrl,pages:1,candidatesFound:found,hintLinks:[...(hintIndex[key]||[])]});sharedRenderedEvidence.set(key,list);}};
   const findRenderedShare=(seedUrl:string):SharedRenderedRecord|null=>{const key=normalizeVisitUrl(seedUrl);if(!key)return null;const recs=sharedRenderedEvidence.get(key);const rec=recs&&recs[0];if(!rec)return null;for(const raw of rec.hintLinks){const hk=normalizeVisitUrl(raw);if(!hk)continue;if(!sharedRenderedEvidence.get(hk)?.length)return null;}return rec;};
   // R6 admission audit trail: truncation recovery/signal lines join the Step 4
@@ -1172,7 +1212,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   if(seedCachedRow&&seedReusable&&seedCovered){
     step5Logs.push(`[Site cache] ${item.url} bypasses borrowed coverage for retry-owned reacquisition of incomplete coverage; re-crawling.`);
   }
-  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,[...sharedStaticVisited,...sharedRenderedEvidence.keys()])).crawlRes;for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every admitted website URL — including auxiliary,
+  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,{visitedKeys:[...sharedStaticVisited,...sharedRenderedEvidence.keys()],roots:sharedStaticRoots})).crawlRes;for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}if(crawlRes.rootNavigation){const rootKey=normalizeVisitUrl(item.url);if(rootKey&&!sharedStaticRoots.has(rootKey)&&crawlRes.visitedUrls&&crawlRes.visitedUrls.length)sharedStaticRoots.set(rootKey,{bySeed:item.url,finalUrl:crawlRes.visitedUrls[0],childLinks:crawlRes.rootNavigation});}acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every admitted website URL — including auxiliary,
 // broker/affiliate-pattern and promotional hosts — remains eligible for the
 // normal acquisition path below. Static inspection only orders attempts and
 // provides cheap evidence; it never decides whether a site is worth crawling.

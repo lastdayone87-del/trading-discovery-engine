@@ -93,7 +93,7 @@ import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { canContinueCommunityInspectionAfterDegradedManualClassification } from './manualRecheckPolicy';
-import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
+import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, discordInviteCodeOf, type DiscordCandidate } from './discordCandidates';
@@ -478,6 +478,12 @@ export async function processNextSearchJob(
         throw deferred;
       }
       const refreshed=await getChannelById(channel.channel_id);
+      // Suppression-owned completion: no active retry directive exists
+      // because deterministic-tail suppression deliberately took retry
+      // ownership away. Completing normally instead of re-entering the same
+      // work through the generic unresolved-failure path below.
+      // Browser-capacity attempt-free deferral throws above and is untouched.
+      if(shouldCompleteSuppressedRetryJob(inspectionResult,refreshed?.scan_status)){await completeJob(job.id);return true;}
       if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT')throw new Error('Retryable community acquisition remains unresolved');
       await completeJob(job.id);return true;
     }
@@ -1549,6 +1555,7 @@ export async function inspectAndValidateChannel(
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:true});
       retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined,retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'}:undefined;
       if(selected.retryable&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
+      if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
     } else if(inspection.acquisitionStatus==='ACQUISITION_FAILED'||inspection.acquisitionStatus==='PARTIALLY_INSPECTED') {
       // A failed or partial crawl is operational uncertainty, not confirmed absence.
       const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
@@ -1698,16 +1705,59 @@ export async function handleRelationshipCanaryExpansionJob(
   }
   return result;
 }
-async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION'):Promise<void>{
+/**
+ * FOUND_REQUIRED_GAP scheduler decision (v2): the discovered-invite
+ * validation branch must not swallow an outstanding retryable required
+ * gap. Invite A stays retained/displayed through the validation projection
+ * below; returning true schedules B's bounded recovery into the same durable
+ * per-channel job (idempotent merge). Validation retry behavior is untouched:
+ * this only *adds* the acquisition directive alongside it. Pure and
+ * unit-tested; the only caller is the discovered-invite branch.
+ */
+export function shouldScheduleFoundGapAcquisitionRetry(inspection:{
+  acquisitionOutcomes?:Array<{outcome?:unknown;retryable?:unknown;failureClass?:unknown}>;
+  retryDirective?:unknown;
+}|null|undefined):boolean{
+  if(!inspection||typeof inspection!=='object')return false;
+  if(!inspection.retryDirective||typeof inspection.retryDirective!=='object')return false;
+  const outcomes=Array.isArray(inspection.acquisitionOutcomes)?inspection.acquisitionOutcomes:[];
+  return outcomes.some(item=>item&&typeof item==='object'
+    &&(item as {outcome?:unknown}).outcome==='FOUND'
+    &&(item as {retryable?:unknown}).retryable===true
+    &&FOUND_GAP_RETRYABLE_FAILURE_CLASSES.has(String((item as {failureClass?:unknown}).failureClass||'')));
+}
+
+/**
+ * Suppressed-retry job completion (v2): when no active retry directive
+ * exists precisely because deterministic-tail suppression took retry
+ * ownership away, the current retry job must complete normally instead of
+ * re-entering the same work through the generic unresolved-failure path.
+ * True only with a non-empty suppression list and a failed scan state;
+ * browser-capacity attempt-free deferral (which throws before this check)
+ * and all other paths are untouched. Pure and unit-tested.
+ */
+export function shouldCompleteSuppressedRetryJob(inspection:{
+  retryDirective?:unknown;
+  retrySuppressedUrls?:unknown;
+}|null|undefined|void,scanStatus:unknown):boolean{
+  if(!inspection||typeof inspection!=='object')return false;
+  if(inspection.retryDirective)return false;
+  const suppressed=(inspection as {retrySuppressedUrls?:unknown}).retrySuppressedUrls;
+  if(!Array.isArray(suppressed)||!suppressed.length)return false;
+  return scanStatus==='FAILED'||scanStatus==='FAILED_PERMANENT';
+}
+
+export async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION',clientOverride?:{query:(sql:string,params?:unknown[])=>Promise<{rows:unknown[];rowCount:number}>}):Promise<void>{
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryReason:directive?.retryReason||'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
     retrySource:source
   });
-  const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined});
+  const job=await enqueueJob('RETRY_COMMUNITY_ACQUISITION',{channelId,...metadata},{idempotencyKey:communityAcquisitionRetryKey(channelId),priority:15,maxAttempts:5,runAfter:directive?.retryAt?new Date(directive.retryAt).toISOString():undefined,clientOverride});
   // Preserve a pending job's original ownership and retry window while merging
   // the latest attributable reason into its durable payload.
-  await (await getDb()).query(`UPDATE jobs SET payload=payload || $2::jsonb,updated_at=now() WHERE id=$1 AND status IN('PENDING','PROCESSING')`,[job.id,JSON.stringify(metadata)]);
+  const runner:{query:(sql:string,params?:unknown[])=>Promise<unknown>} = clientOverride||await getDb();
+  await runner.query(`UPDATE jobs SET payload=payload || $2::jsonb,updated_at=now() WHERE id=$1 AND status IN('PENDING','PROCESSING')`,[job.id,JSON.stringify(metadata)]);
 }
 
 export function operationalEnrichmentRecoveryKey(channelId:string):string{return `operational-enrichment-recovery:${channelId}`;}

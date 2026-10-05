@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
+import initSqlJs from 'sql.js';
 import {
   partitionRenderedClickTargets,
   isSkippableNavigableAnchorClick,
   discoverRequiredSeedLinks,
   normalizeVisitUrl,
+  visitIdentityKeys,
+  classifyRequiredCoverage,
   resolveRenderedCompletionState,
 } from './browserCommunityFallback';
 import { hasConsecutiveTimeoutExhaustion } from './crawlUrlSkipPolicy';
 import { communityAcquisitionRetryDirective } from './communityRetryPolicy';
-import { runChannelInspection } from './inspector';
+import {
+  shouldScheduleFoundGapAcquisitionRetry,
+  shouldCompleteSuppressedRetryJob,
+  enqueueCommunityAcquisitionRetry,
+} from './queueManager';
+import { crawlExternalLinks, runChannelInspection } from './inspector';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
 
 const PAGE = 'https://creator.example.com/guide';
@@ -31,7 +40,7 @@ test('v2: same-host navigable anchors skip clicks, buttons do not', () => {
 });
 
 test('v2: mixed ordering reaches buttons past skipped anchors with indexes intact', () => {
-  const controls = [anchor(0, '/a1'), anchor(1, '/a2'), anchor(2, '/a3'), anchor(3, '/a4'), anchor(4, '/a5'), button(5), button(6)];
+  const controls = [anchor(0, '/community-1'), anchor(1, '/community-2'), anchor(2, '/community-3'), anchor(3, '/community-4'), anchor(4, '/community-5'), button(5), button(6)];
   const plan = partitionRenderedClickTargets(controls, PAGE, 4);
   assert.deepEqual(plan.toClick.map((c) => c.index), [5, 6]);
   assert.equal(plan.skippedNavigableAnchors, 5);
@@ -65,6 +74,15 @@ const emptyRendered = async (seedUrl: string): Promise<BrowserFallbackResult> =>
 });
 const fillers = ['one', 'two', 'three', 'four', 'five'];
 
+// Isolated stores: no test may depend on ambient database state or test
+// ordering. Every inspection below runs against fresh in-memory
+// coverage/history unless the test explicitly provides its own rows.
+const makeIsolatedStore = () => ({
+  read: async () => [],
+  write: async () => {},
+  recordLinks: async () => {},
+});
+
 async function inspectLinks(channelLinks: string[], overrides: Record<string, unknown> = {}) {
   const fetched: string[] = [];
   const result = await runChannelInspection({
@@ -79,6 +97,8 @@ async function inspectLinks(channelLinks: string[], overrides: Record<string, un
       return noInviteHtml();
     }) as typeof fetch,
     renderedFallback: emptyRendered,
+    urlFailureHistoryLoader: (async () => []) as never,
+    siteInspectionStore: makeIsolatedStore(),
     ...(overrides as Record<string, unknown>),
   } as never);
   return { fetched, result };
@@ -107,6 +127,7 @@ test('v2: multiple invite URLs on one site are all retained', async () => {
     channelId: 'v2-multi-invite',
     channelName: 'Multi Invite Channel',
     channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
     channelLinks: ['https://creator.example.com/vip', 'https://creator.example.com/free'],
     videoDescriptions: fillers,
     creatorLikelyTrading: false,
@@ -162,6 +183,7 @@ test('v2: required-unvisited budget gap owns bounded recovery without hiding sta
     channelId: 'v2-budget-gap',
     channelName: 'Budget Gap Channel',
     channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
     channelLinks: ['https://gap.example.com/'],
     videoDescriptions: fillers,
     creatorLikelyTrading: true,
@@ -191,6 +213,7 @@ test('v2: deterministic budget-gap tail stops re-owning retries visibly', async 
     channelId: 'v2-budget-gap-tail',
     channelName: 'Budget Gap Tail Channel',
     channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
     channelLinks: ['https://gap.example.com/'],
     videoDescriptions: fillers,
     creatorLikelyTrading: true,
@@ -214,6 +237,7 @@ test('v2: FOUND with required gap retains invites and keeps bounded recovery', a
     channelId: 'v2-found-gap',
     channelName: 'Found Gap Channel',
     channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
     channelLinks: ['https://creator.example.com/hub'],
     videoDescriptions: fillers,
     creatorLikelyTrading: true,
@@ -263,6 +287,7 @@ test('v2: fully covered seeds reuse rendered evidence without refetch', async ()
     channelId: 'v2-shared-rendered',
     channelName: 'Shared Rendered Channel',
     channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
     channelLinks: ['https://share.example.com/', 'https://share.example.com/shared'],
     videoDescriptions: fillers,
     creatorLikelyTrading: true,
@@ -306,6 +331,7 @@ test('v2: Skool-shaped healthy timeout with required coverage resolves sufficien
     channelId: 'v2-skool-sufficient',
     channelName: 'Skool Sufficient Channel',
     channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
     channelLinks: ['https://skool.example.com/freedomalgo'],
     videoDescriptions: fillers,
     creatorLikelyTrading: true,
@@ -365,4 +391,426 @@ test('v2: consecutive budget-gap tails suppress like timeout tails', () => {
     ),
     undefined,
   );
+});
+
+// REVIEW: redirect-safe visit identities keep closure correct.
+test('v2 review: visit identities unify request and final page evidence', () => {
+  assert.deepEqual(visitIdentityKeys('https://redir.example.com/go', 'https://redir.example.com/go'), [
+    'https://redir.example.com/go',
+  ]);
+  assert.deepEqual(visitIdentityKeys('https://redir.example.com/go', 'https://redir.example.com/landing'), [
+    'https://redir.example.com/go',
+    'https://redir.example.com/landing',
+  ]);
+  assert.ok(visitIdentityKeys('', '').length === 0);
+});
+
+// REVIEW: shared-covered members satisfy required items; fresh terminal
+// failures always win over borrowed success.
+test('v2 review: coverage classifier honors shared evidence without hiding fresh failures', () => {
+  const base = {
+    requiredKeys: ['https://x.example/a', 'https://x.example/b', 'https://x.example/c'],
+    succeededKeys: ['https://x.example/a'],
+    failedClassesByKey: new Map(),
+  };
+  assert.deepEqual(classifyRequiredCoverage({ ...base, sharedCoveredKeys: ['https://x.example/b'] }), {
+    unvisited: ['https://x.example/c'],
+    transientFailures: [],
+    permanentFailures: [],
+  });
+  assert.deepEqual(
+    classifyRequiredCoverage({
+      ...base,
+      sharedCoveredKeys: ['https://x.example/b'],
+      failedClassesByKey: new Map([['https://x.example/b', 'TRANSIENT']]),
+    }),
+    {
+      unvisited: ['https://x.example/c'],
+      transientFailures: ['https://x.example/b'],
+      permanentFailures: [],
+    },
+  );
+  assert.deepEqual(
+    classifyRequiredCoverage({
+      ...base,
+      failedClassesByKey: new Map([['https://x.example/b', 'BLOCKED']]),
+    }).permanentFailures,
+    ['https://x.example/b'],
+  );
+});
+
+// REVIEW: required BLOCKED-only failure is visible but never retryable.
+test('v2 review: required permanent failure owns no retry', async () => {
+  const result = await runChannelInspection({
+    channelId: 'v2-blocked-permanent',
+    channelName: 'Blocked Permanent Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: ['https://blocked.example.com/'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => {
+      throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => ({
+      foundInvite: null,
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 1,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: false,
+      telemetry: undefined,
+      detail: 'walled garden',
+      visitedUrls: [seedUrl],
+      requiredTotal: 1,
+      requiredPermanentFailures: [seedUrl],
+    })),
+    urlFailureHistoryLoader: (async () => []) as never,
+  });
+  assert.notEqual(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  const permObs = (result.acquisitionOutcomes || []).find(
+    (item) => item.requestedUrl === 'https://blocked.example.com/' && item.required === true,
+  );
+  assert.ok(permObs, 'permanent required failure stays visible');
+  assert.equal(permObs?.retryable, false);
+  assert.equal(result.retryDirective, undefined);
+});
+
+// REVIEW: FOUND rows carrying gap classes accumulate tails; plain FOUND breaks them.
+test('v2 review: FOUND+gap history accumulates, plain FOUND breaks the tail', () => {
+  const at = (day: number) => new Date(Date.UTC(2026, 9, day, 12)).toISOString();
+  const gapRow = (day: number) => ({
+    requestedUrl: 'https://gap.example.com/',
+    failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
+    outcome: 'FOUND',
+    observedAt: at(day),
+  });
+  assert.equal(
+    hasConsecutiveTimeoutExhaustion(
+      [gapRow(4), gapRow(3)],
+      'https://gap.example.com/',
+      2,
+      ['RENDERED_TIMEOUT', 'REQUIRED_UNVISITED_BUDGET_GAP'],
+    ),
+    true,
+  );
+  const brokenByCleanFound = [
+    gapRow(4),
+    {
+      requestedUrl: 'https://gap.example.com/',
+      failureClass: null,
+      outcome: 'FOUND',
+      observedAt: at(3),
+    },
+    gapRow(2),
+  ];
+  assert.equal(
+    hasConsecutiveTimeoutExhaustion(brokenByCleanFound, 'https://gap.example.com/', 2, [
+      'RENDERED_TIMEOUT',
+      'REQUIRED_UNVISITED_BUDGET_GAP',
+    ]),
+    false,
+  );
+});
+
+// REVIEW: tail ordering uses acquisition-attempt order — a static companion
+// sharing an exact acquisition timestamp never breaks a genuine rendered
+// tail, while drift at any other timestamp still breaks it.
+test('v2 review: static companions do not break rendered tails, drift does', () => {
+  const stamp = new Date(Date.UTC(2026, 9, 4, 12)).toISOString();
+  const older = new Date(Date.UTC(2026, 9, 3, 12)).toISOString();
+  const companion = [
+    { requestedUrl: 'https://tail.example.com/', failureClass: 'TIMEOUT', outcome: 'ACQUISITION_FAILED', observedAt: stamp },
+    { requestedUrl: 'https://tail.example.com/', failureClass: 'RENDERED_TIMEOUT', outcome: 'PARTIALLY_INSPECTED', observedAt: stamp },
+    { requestedUrl: 'https://tail.example.com/', failureClass: 'RENDERED_TIMEOUT', outcome: 'PARTIALLY_INSPECTED', observedAt: older },
+  ];
+  assert.equal(hasConsecutiveTimeoutExhaustion(companion, 'https://tail.example.com/'), true);
+  const drifted = [
+    { requestedUrl: 'https://tail.example.com/', failureClass: 'RENDERED_TIMEOUT', outcome: 'PARTIALLY_INSPECTED', observedAt: stamp },
+    { requestedUrl: 'https://tail.example.com/', failureClass: 'HTTP_ERROR', outcome: 'ACQUISITION_FAILED', observedAt: older },
+  ];
+  assert.equal(hasConsecutiveTimeoutExhaustion(drifted, 'https://tail.example.com/'), false);
+});
+
+// REVIEW: static L1 root-share avoids the duplicate root fetch while the
+// borrower still acquires its own children; rendered needs never consult it.
+test('v2 review: shared static roots skip refetch but still acquire children', async () => {
+  const rootHtml = '<a href="/community-page">community page</a>';
+  const lenderFetched: string[] = [];
+  const lender = await crawlExternalLinks(
+    ['https://dup.example.com/'],
+    [],
+    undefined,
+    (async (input) => {
+      lenderFetched.push(String(input));
+      const url = String(input);
+      if (url === 'https://dup.example.com/') return html(rootHtml);
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(lender.rootNavigation?.some((item) => item.url === 'https://dup.example.com/community-page'));
+  const rootKey = normalizeVisitUrl('https://dup.example.com/');
+  assert.ok(rootKey);
+  // Lender discovered the child but only terminally inspected the root
+  // itself: the borrower must skip the duplicate root fetch yet still
+  // acquire the undiscovered child on its own.
+  const inventory = {
+    visitedKeys: ['https://dup.example.com/'],
+    roots: new Map([
+      [rootKey as string, { bySeed: 'https://dup.example.com/', finalUrl: 'https://dup.example.com/', childLinks: lender.rootNavigation || [] }],
+    ]),
+  };
+  const borrowerFetched: string[] = [];
+  const borrowerLog: string[] = [];
+  await crawlExternalLinks(
+    ['https://dup.example.com/'],
+    borrowerLog,
+    undefined,
+    (async (input) => {
+      borrowerFetched.push(String(input));
+      return noInviteHtml();
+    }) as typeof fetch,
+    'CREATOR_WEBSITES',
+    false,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    inventory,
+  );
+  assert.ok(!borrowerFetched.includes('https://dup.example.com/'), 'shared root must not be refetched');
+  assert.ok(
+    borrowerFetched.includes('https://dup.example.com/community-page'),
+    'borrower still acquires its own children',
+  );
+  assert.ok(borrowerLog.some((line) => line.includes('[Shared static evidence]')));
+});
+
+// REVIEW: bare/www collapse is port-aware.
+test('v2 review: collapse requires equal normalized ports', async () => {
+  const samePort = await inspectLinks(['https://port.example.com:8443/a', 'https://www.port.example.com:8443/a']);
+  assert.equal(samePort.fetched.filter((url) => url.includes('port.example.com')).length, 1);
+  const diffPort = await inspectLinks(['https://port.example.com:8443/a', 'https://www.port.example.com/a']);
+  assert.equal(diffPort.fetched.filter((url) => url.includes('port.example.com')).length, 2);
+});
+
+// REVIEW: HTML entities decode to the enqueue-visible identity.
+test('v2 review: encoded href entities resolve to normalized identities', () => {
+  assert.deepEqual(discoverRequiredSeedLinks('<a href="/community?x=1&amp;y=2">join us</a>', PAGE), [
+    'https://creator.example.com/community?x=1&y=2',
+  ]);
+});
+
+// REVIEW: scheduler decision helper for FOUND+gap acquisition recovery.
+test('v2 review: scheduler helper targets FOUND+gap directives only', () => {
+  const gapDirective = { retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' };
+  assert.equal(
+    shouldScheduleFoundGapAcquisitionRetry({
+      acquisitionOutcomes: [
+        { outcome: 'FOUND', retryable: true, failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP' },
+      ],
+      retryDirective: gapDirective,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldScheduleFoundGapAcquisitionRetry({
+      acquisitionOutcomes: [{ outcome: 'FOUND', retryable: false }],
+      retryDirective: undefined,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldScheduleFoundGapAcquisitionRetry({
+      acquisitionOutcomes: [{ outcome: 'FOUND', retryable: true, failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP' }],
+      retryDirective: undefined,
+    }),
+    false,
+  );
+  assert.equal(shouldScheduleFoundGapAcquisitionRetry(null), false);
+});
+
+// REVIEW: suppressed retry jobs complete instead of re-executing.
+test('v2 review: suppressed retry ownership completes the job normally', () => {
+  assert.equal(shouldCompleteSuppressedRetryJob({ retryDirective: undefined, retrySuppressedUrls: ['https://x.example/'] }, 'FAILED'), true);
+  assert.equal(
+    shouldCompleteSuppressedRetryJob({ retryDirective: undefined, retrySuppressedUrls: ['https://x.example/'] }, 'FAILED_PERMANENT'),
+    true,
+  );
+  assert.equal(
+    shouldCompleteSuppressedRetryJob({ retryDirective: { retryReason: 'X' }, retrySuppressedUrls: ['https://x.example/'] }, 'FAILED'),
+    false,
+  );
+  assert.equal(shouldCompleteSuppressedRetryJob({ retryDirective: undefined, retrySuppressedUrls: [] }, 'FAILED'), false);
+  assert.equal(
+    shouldCompleteSuppressedRetryJob({ retryDirective: undefined, retrySuppressedUrls: ['https://x.example/'] }, 'COMPLETED'),
+    false,
+  );
+});
+
+// REVIEW: redirect-shared rendered evidence satisfies final-identity borrowers.
+test('v2 review: redirect identities share rendered evidence correctly', async () => {
+  const renderedCalls: string[] = [];
+  const result = await runChannelInspection({
+    channelId: 'v2-redirect-share',
+    channelName: 'Redirect Share Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: ['https://redir.example.com/go', 'https://redir.example.com/landing'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => noInviteHtml()) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      renderedCalls.push(seedUrl);
+      if (seedUrl === 'https://redir.example.com/go') {
+        return {
+          foundInvite: null,
+          foundLocation: seedUrl,
+          candidates: [],
+          inspectedPages: 2,
+          scrolls: 0,
+          clicks: 0,
+          complete: true,
+          retryable: false,
+          timedOut: false,
+          telemetry: undefined,
+          detail: 'lender with redirect',
+          visitedUrls: ['https://redir.example.com/go', 'https://redir.example.com/landing'],
+          requiredTotal: 2,
+          pageHintLinks: {
+            'https://redir.example.com/go': [],
+            'https://redir.example.com/landing': [],
+          },
+        };
+      }
+      return {
+        foundInvite: null,
+        foundLocation: seedUrl,
+        candidates: [],
+        inspectedPages: 1,
+        scrolls: 0,
+        clicks: 0,
+        complete: true,
+        retryable: false,
+        timedOut: false,
+        telemetry: undefined,
+        detail: 'must not run for covered borrower',
+      };
+    }),
+    urlFailureHistoryLoader: (async () => []) as never,
+  });
+  assert.deepEqual(renderedCalls, ['https://redir.example.com/go']);
+  assert.ok(
+    JSON.stringify(result.steps || []).includes(
+      '[Shared evidence] https://redir.example.com/landing reuses rendered inspection',
+    ),
+  );
+});
+
+// REVIEW: wiring contracts pinned at the call sites (repo source-assertion pattern).
+test('v2 review: scheduler and worker wiring call sites are pinned', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /shouldScheduleFoundGapAcquisitionRetry\(inspection\)/);
+  assert.match(queue, /shouldCompleteSuppressedRetryJob\(inspectionResult,refreshed\?\.scan_status\)/);
+  const fallback = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  const enqueuePos = fallback.indexOf('Capture the original page');
+  const clickPos = fallback.indexOf('for (const control of clickPlan.toClick)');
+  assert.ok(enqueuePos !== -1 && clickPos !== -1 && enqueuePos < clickPos, 'anchors enqueue before navigating clicks');
+});
+
+// REVIEW e2e: a FOUND+required-gap inspection actually creates the durable
+// acquisition retry job through the real enqueue path (sql.js-backed jobs
+// table; only the transport is swapped — SQL, idempotency, metadata shape,
+// and row assertions all execute for real).
+test('v2 review e2e: FOUND+gap inspection creates the durable retry job', async () => {
+  const SQL = await initSqlJs();
+  const db = new SQL.Database();
+  db.run(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+      type TEXT NOT NULL,
+      payload TEXT,
+      priority INTEGER DEFAULT 0,
+      max_attempts INTEGER DEFAULT 3,
+      run_after TEXT,
+      idempotency_key TEXT UNIQUE,
+      catalog_version_id TEXT,
+      catalog_policy_version TEXT,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      locked_by TEXT,
+      locked_at TEXT,
+      last_error TEXT,
+      completed_at TEXT,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  const client = {
+    query: async (sql: string, params: unknown[] = []) => {
+      let processed = sql.replace(/::jsonb/gi, '').replace(/now\(\)/gi, `datetime('now')`);
+      try {
+        const stmt = db.prepare(processed);
+        if (params && params.length) stmt.bind(params as never);
+        const rows: Record<string, unknown>[] = [];
+        while (stmt.step()) rows.push(stmt.getAsObject() as Record<string, unknown>);
+        stmt.free();
+        return { rows, rowCount: rows.length || db.getRowsModified() };
+      } catch (err) {
+        db.run(processed, params as never);
+        return { rows: [], rowCount: db.getRowsModified() };
+      }
+    },
+  };
+  const channelId = 'UCe2efoundgap000000000001';
+  const inspection = await runChannelInspection({
+    channelId,
+    channelName: 'E2E Found Gap Channel',
+    channelBio: 'Trading notes',
+    siteInspectionStore: makeIsolatedStore(),
+    channelLinks: ['https://creator.example.com/hub'],
+    videoDescriptions: fillers,
+    creatorLikelyTrading: true,
+    externalFetchImpl: (async () => {
+      throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }) as typeof fetch,
+    renderedFallback: (async (seedUrl: string): Promise<BrowserFallbackResult> => ({
+      foundInvite: 'room-a',
+      foundLocation: seedUrl,
+      candidates: [],
+      inspectedPages: 2,
+      scrolls: 0,
+      clicks: 0,
+      complete: false,
+      retryable: true,
+      timedOut: true,
+      telemetry: undefined,
+      detail: 'invite retained with required gap outstanding',
+      visitedUrls: [seedUrl],
+      requiredTotal: 2,
+      requiredUnvisited: ['https://creator.example.com/community'],
+    })),
+    urlFailureHistoryLoader: (async () => []) as never,
+  });
+  assert.equal(inspection.foundInvite, 'room-a');
+  assert.ok(inspection.retryDirective, 'FOUND+gap must own a retry directive');
+  // Scheduler decision on the real inspection result.
+  assert.equal(shouldScheduleFoundGapAcquisitionRetry(inspection), true);
+  // Durable job creation through the real enqueue function.
+  await enqueueCommunityAcquisitionRetry(channelId, inspection.retryDirective, 'INSPECTION', client as never);
+  const check = db.prepare(`SELECT type, status, payload, idempotency_key FROM jobs WHERE idempotency_key = ?`);
+  check.bind([`community-acquisition-retry:${channelId}`]);
+  assert.ok(check.step(), 'expected the durable retry job row to exist');
+  const row = check.getAsObject() as Record<string, unknown>;
+  check.free();
+  assert.equal(row.type, 'RETRY_COMMUNITY_ACQUISITION');
+  assert.equal(row.status, 'PENDING');
+  const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
+  assert.equal(payload.channelId, channelId);
+  assert.equal(payload.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  db.close();
 });

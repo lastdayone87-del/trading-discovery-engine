@@ -95,10 +95,15 @@ const DEFAULT_TIMEOUT_TAIL_CLASSES = ['RENDERED_TIMEOUT'];
 
 /**
  * Whether prior ledger history already holds `threshold` consecutive
- * identical tail-class runs for one normalized URL. Newest-first trailing run
- * over ACQUISITION_FAILED/PARTIALLY_INSPECTED rows whose failureClass is in
- * `classes`; any other outcome or class (including a later FOUND/clean
- * recovery) breaks the run. Pure and unit-testable.
+ * tail-class runs for one normalized URL. Newest-first trailing run over
+ * ACQUISITION_FAILED/PARTIALLY_INSPECTED rows whose failureClass is in
+ * `classes` (default timeout-only; callers pass the mixed budget/timeout set
+ * to count deterministic budget exhaustion together — a mixed tail of those
+ * classes still proves futility). Any other outcome or class breaks the run,
+ * except same-attempt companions (a static row sharing an exact acquisition
+ * timestamp with a counted tail row never breaks it); a FOUND row always
+ * breaks, since invite discovery is a recovery signal no companion rule may
+ * swallow. Pure and unit-testable.
  */
 export function hasConsecutiveTimeoutExhaustion(
   rows: UrlFailureRow[],
@@ -114,14 +119,36 @@ export function hasConsecutiveTimeoutExhaustion(
     .sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt));
   if (!ordered.length) return false;
   const want = Math.max(1, Math.trunc(threshold) || 1);
+  const isTailRow = (row: UrlFailureRow): boolean => {
+    if (!wanted.has(String(row.failureClass || ''))) return false;
+    // FAILED/PARTIAL rows accumulate; FOUND rows count only when carrying a
+    // gap class (FOUND_REQUIRED_GAP persistence). Ordinary FOUND rows (no
+    // failure class) always break the tail as recovery signals.
+    return row.outcome === 'ACQUISITION_FAILED' || row.outcome === 'PARTIALLY_INSPECTED' || row.outcome === 'FOUND';
+  };
+  // Same-attempt companions share one acquisition timestamp: static and
+  // rendered observations from a single inspection carry the same
+  // `observedAt` (one `now` per inspection), so a static companion row beside
+  // its rendered row must not break the rendered tail. Only a tail-class-free
+  // timestamp breaks the run. Timestamp comparison is numeric (ISO shape
+  // independent); distinct inspections are milliseconds apart in practice.
+  const tailTimestamps = new Set<number>();
+  for (const row of ordered) {
+    const at = Date.parse(row.observedAt);
+    if (isTailRow(row) && Number.isFinite(at)) tailTimestamps.add(at);
+  }
   let run = 0;
   for (const row of ordered) {
-    if (
-      (row.outcome === 'ACQUISITION_FAILED' || row.outcome === 'PARTIALLY_INSPECTED') &&
-      wanted.has(String(row.failureClass || ''))
-    ) {
+    if (isTailRow(row)) {
       run++;
-    } else break;
+      continue;
+    }
+    // A FOUND row always breaks the tail: invite discovery is a recovery
+    // signal no companion rule may swallow.
+    if (row.outcome === 'FOUND') break;
+    const at = Date.parse(row.observedAt);
+    if (Number.isFinite(at) && tailTimestamps.has(at)) continue;
+    break;
   }
   return run >= want;
 }
