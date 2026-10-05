@@ -23,9 +23,10 @@ test('valid creator, affiliate, social, and messaging hosts are preserved', () =
   assert.equal(isPageAssetInfrastructureUrl('https://www.youtube.com/@SomeChannel'), false);
 });
 
-test('dotless single-label hosts keep the existing static-attempt doctrine', () => {
-  // isDotlessHostnameUrl semantics unchanged: these are NOT asset-filtered,
-  // so the recall-safe static attempt path is preserved.
+test('dotless single-label hosts are rejected by admission, not asset-filtered', () => {
+  // isDotlessHostnameUrl semantics unchanged. Dotless hosts are NOT
+  // asset-filtered here; they are rejected earlier by the crawl admission
+  // boundary (`assessCrawlAdmission` → DOTLESS_HOST) before scoring/crawling.
   assert.equal(isPageAssetInfrastructureUrl('https://g/'), false);
 });
 

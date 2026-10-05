@@ -279,9 +279,11 @@ export function isDotlessHostnameUrl(raw: string): boolean {
  * (thumbnail/playback/telemetry/schema/font endpoints embedded in channel
  * page data). These can never be creator sites and can never carry Discord
  * invites, so they are filtered at link-collection time and never become
- * crawl seeds. Dotless single-label hosts are deliberately NOT in this list:
- * they keep the existing static-attempt-for-recall doctrine. Valid creator,
- * affiliate, social, and messaging hosts are unaffected.
+ * crawl seeds. Dotless single-label hosts are NOT filtered here: they are
+ * rejected earlier by the crawl admission boundary
+ * (`assessCrawlAdmission`, DOTLESS_HOST), which runs before scoring and
+ * crawling. Valid creator, affiliate, social, and messaging hosts are
+ * unaffected.
  */
 const PAGE_ASSET_INFRASTRUCTURE_HOSTS = [
   'ytimg.com',
@@ -311,6 +313,131 @@ export function isPageAssetInfrastructureUrl(rawUrl: string): boolean {
     }
   }
   return true;
+}
+
+/**
+ * Crawl admission boundary (R6). Generic, deterministic, and pre-scoring:
+ * `EXTRACT → NORMALIZE → VALIDATE → ASSET/RESOURCE CHECK → (safe truncation
+ * recovery/signal) → SCORE/RANK → CRAWL`.
+ *
+ * This is the single shared validity boundary for website crawl seeds. Every
+ * admission path (`normalizeExternalUrl`, `crawlExternalLinks`, the Step 4/5
+ * seed loops, and the retry-eligibility predicate) consults it, so future
+ * callers cannot bypass it. It is deliberately NOT a relevance ranker and
+ * NOT a domain blacklist/whitelist: dotted hosts of any kind — including
+ * unfamiliar, commercial, or affiliate hosts — stay eligible here. Only
+ * candidates whose invalidity or resource status is deterministically
+ * established from the URL itself are rejected. Scoring (`scoreCommunitySurface`)
+ * only orders eligible candidates and never decides admission.
+ */
+export const CRAWL_ADMISSION_POLICY_VERSION = 'crawl-admission-v1';
+
+export type CrawlAdmissionReasonCode =
+  | 'ELIGIBLE'
+  | 'INVALID_URL'
+  | 'INVALID_SCHEME'
+  | 'EMPTY_HOST'
+  | 'DOTLESS_HOST'
+  | 'EMPTY_LABEL'
+  | 'ASSET_HOST'
+  | 'RESOURCE_EXTENSION';
+
+export interface CrawlAdmissionDecision {
+  eligible: boolean;
+  reasonCode: CrawlAdmissionReasonCode;
+}
+
+// Page-resource path suffixes that can never be community websites,
+// regardless of host. Mirrors the extraction-time asset-extension filter so
+// stored links cannot bypass it; document/feed types (pdf/rss/xml) are
+// intentionally NOT in this list and stay eligible.
+const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|mp3|wav|ogg|avi|mov|zip|gz|rar|7z|exe|dmg)(?:$)/i;
+
+export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
+  const candidates = [rawUrl, /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`];
+  for (const candidate of candidates) {
+    let parsed: URL;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      continue;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { eligible: false, reasonCode: 'INVALID_SCHEME' };
+    }
+    const rawHost = parsed.hostname;
+    // A single trailing dot is DNS-equivalent noise (same stripping as the
+    // asset filter) and must not turn a single-label host into a dotted one.
+    const host = rawHost.toLowerCase().replace(/\.$/, '');
+    if (!host) return { eligible: false, reasonCode: 'EMPTY_HOST' };
+    // Bracketed IP literals (IPv6) are genuine website targets under the
+    // existing URL model (same carve-out as `isDotlessHostnameUrl`).
+    if (!rawHost.startsWith('[')) {
+      // Same dotless semantic as `isDotlessHostnameUrl`: a single-label host
+      // has no public domain. No second validation system.
+      if (!host.includes('.')) return { eligible: false, reasonCode: 'DOTLESS_HOST' };
+      if (host.split('.').some(label => label.length === 0)) {
+        return { eligible: false, reasonCode: 'EMPTY_LABEL' };
+      }
+    }
+    if (isPageAssetInfrastructureUrl(parsed.toString())) {
+      return { eligible: false, reasonCode: 'ASSET_HOST' };
+    }
+    if (RESOURCE_PATH_EXTENSION.test(parsed.pathname)) {
+      return { eligible: false, reasonCode: 'RESOURCE_EXTENSION' };
+    }
+    return { eligible: true, reasonCode: 'ELIGIBLE' };
+  }
+  return { eligible: false, reasonCode: 'INVALID_URL' };
+}
+
+/**
+ * Safe truncation recovery (R6 T-Q): recovers a cut affiliate-style query to
+ * the valid host root, but ONLY under the approved high-confidence rule — the
+ * query must be a single bare key (no `=value`, length ≥ 4) that is a strict
+ * prefix of a longer value-taking key observed for the same host in the
+ * current inspection's own candidate corpus (no keyword lists). Returns the
+ * recovered root URL, or null when the rule is not satisfied (the candidate
+ * stays eligible as-is). Corpus-free callers must not guess: without sibling
+ * evidence there is no recovery.
+ */
+export function recoverTruncatedQueryToRoot(rawUrl: string, siblingValuedKeys: Set<string> | string[]): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+  } catch {
+    return null;
+  }
+  if (!/^\?[A-Za-z0-9_]{4,64}$/.test(parsed.search)) return null;
+  const token = parsed.search.slice(1);
+  for (const key of siblingValuedKeys) {
+    if (key !== token && key.startsWith(token)) return `${parsed.origin}/`;
+  }
+  return null;
+}
+
+/**
+ * Possibly-truncated path signal (R6 T-P): detection/logging ONLY, never a
+ * rewrite. True when the path (other than `/`) is a strict prefix of a longer
+ * sibling path observed for the same host with a mid-token continuation
+ * (e.g. `/day-tra` vs `/day-trading-guide`). Short slugs that merely share a
+ * prefix at a segment boundary (e.g. `/books` vs `/bookstore`) also match, so
+ * callers must keep the candidate eligible as-is and treat this as an
+ * extraction-quality signal for the follow-up investigation.
+ */
+export function isPossiblyTruncatedPath(rawUrl: string, siblingPaths: Set<string> | string[]): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+  } catch {
+    return false;
+  }
+  const path = parsed.pathname || '/';
+  if (path === '/' || path.length < 4 || path.endsWith('/')) return false;
+  for (const sibling of siblingPaths) {
+    if (sibling !== path && sibling.startsWith(path) && sibling[path.length] !== '/') return true;
+  }
+  return false;
 }
 
 export function isKnownBrokerOrExchangeHost(host: string): boolean {

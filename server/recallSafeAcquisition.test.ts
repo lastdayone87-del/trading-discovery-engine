@@ -401,12 +401,13 @@ test('exhausted crawl budget produces PARTIALLY_INSPECTED at channel level', asy
   assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
 });
 
-test('dotless single-label hosts are attempted, labeled narrowly, and own no rendered/retry work', async () => {
-  // Quarantine means "malformed/non-public single-label host, attempted
-  // statically first and labeled" — plus no rendered escalation and no retry
-  // ownership: no browser run can turn a meaningless input into evidence, so
-  // escalation would only manufacture garbage retry jobs. Forensic basis
-  // (PR #434 §7A): zero historical FOUND for dotless seeds.
+test('dotless single-label hosts are rejected before scoring or crawling and own no retry work', async () => {
+  // R6 admission boundary: malformed/non-public single-label hosts are
+  // rejected generically (DOTLESS_HOST) before scoring, crawling, and retry
+  // ownership. No fetch is attempted, no observation is recorded, and no
+  // rendered escalation or retry can follow. Forensic basis (PR #434 §7A):
+  // zero historical FOUND for dotless seeds.
+  const fetched: string[] = [];
   let renderedCalls = 0;
   const result = await runChannelInspection({
     channelId: 'dotless-channel',
@@ -416,6 +417,7 @@ test('dotless single-label hosts are attempted, labeled narrowly, and own no ren
     videoDescriptions: fillers,
     creatorLikelyTrading: true,
     externalFetchImpl: (async (input) => {
+      fetched.push(String(input));
       if (String(input).includes('https://g/')) throw new Error('getaddrinfo ENOTFOUND g');
       return noInviteHtml();
     }) as typeof fetch,
@@ -424,14 +426,13 @@ test('dotless single-label hosts are attempted, labeled narrowly, and own no ren
       return emptyRendered(seedUrl);
     },
   });
-  // Statically attempted and recorded (never silently dropped).
+  // Rejected before the crawler: never fetched, never recorded.
+  assert.ok(!fetched.some((url) => url.includes('https://g/')), 'malformed seed must never be fetched');
   assert.ok(
-    (result.acquisitionOutcomes || []).some(
-      (item) => item.requestedUrl === 'https://g/' && item.outcome === 'ACQUISITION_FAILED' && item.required === false,
-    ),
+    !(result.acquisitionOutcomes || []).some((item) => item.requestedUrl === 'https://g/'),
+    'malformed seed must not produce observations',
   );
-  // Malformed input owns no rendered work and no retry: statically attempted
-  // and recorded, then filtered from escalation and retry ownership.
+  // Malformed input owns no rendered work and no retry.
   assert.equal(renderedCalls, 0);
   assert.equal(result.retryDirective, undefined);
 });
