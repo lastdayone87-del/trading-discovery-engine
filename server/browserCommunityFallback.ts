@@ -1,3 +1,5 @@
+import * as cheerio from 'cheerio';
+import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
 import type { RenderedLifecycleStage, RenderedZeroPageReason, CrawlDropReason } from './crawlerTelemetry';
@@ -20,6 +22,16 @@ export interface BrowserFallbackBudget {
   maxSessionRotations: number;
   navigationTimeoutMs: number;
   totalTimeoutMs: number;
+  /**
+   * Already-inspected absolute URLs (shared same-inspection evidence): the
+   * enqueue transform drops them as already-visited instead of refetching,
+   * and required classification counts them as visited. Contract: entries
+   * must be terminal-success RENDERED evidence at the caller's required tier
+   * — static-only evidence must never be passed here, since it cannot satisfy
+   * a rendered requirement. Optional and additive; absent behaves exactly as
+   * before.
+   */
+  alreadyVisited?: string[];
 }
 
 export interface BrowserFallbackTelemetry {
@@ -103,6 +115,27 @@ export interface BrowserFallbackResult {
    * control-slice cuts, page-budget and queue-exhausted stops. Sparse.
    */
   dropReasons?: Partial<Record<CrawlDropReason, number>>;
+  /**
+   * Required-set acquisition record (v2 coverage contract, all optional and
+   * additive — producers lacking instrumentation behave exactly as before):
+   * terminal-success page URLs in visit order; the seed document's directly
+   * discovered same-host community-hint links; and the required members left
+   * unvisited or terminally failed at stop, split by class. Lets callers
+   * distinguish sufficient coverage, bounded gaps, and genuine failures
+   * without re-parsing page content.
+   */
+  visitedUrls?: string[];
+  /**
+   * Per visited page, the same-host community-hint links discovered on it,
+   * keyed by normalized visit identity. Present only when pages were
+   * inspected; lets callers prove required-set closure for shared-evidence
+   * reuse. Additive and optional like the other v2 fields.
+   */
+  pageHintLinks?: Record<string, string[]>;
+  requiredTotal?: number;
+  requiredUnvisited?: string[];
+  requiredTransientFailures?: string[];
+  requiredPermanentFailures?: string[];
 }
 
 export const DEFAULT_BROWSER_FALLBACK_BUDGET: BrowserFallbackBudget = {
@@ -145,6 +178,223 @@ export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
 }
 
 /**
+ * Visit identities for one inspected request (redirect-safe evidence
+ * filing): the normalized request URL plus, when different, the normalized
+ * final page URL. Both identities were terminally inspected, so required
+ * closure and shared-evidence decisions stay correct whichever identity a
+ * later seed presents. Pure and unit-tested.
+ */
+export function visitIdentityKeys(requestUrl: string, finalUrl: string): string[] {
+  const keys: string[] = [];
+  for (const raw of [requestUrl, finalUrl]) {
+    const key = normalizeVisitUrl(raw);
+    const fallback = (typeof key === 'string' && key.length > 0 ? key : String(raw || '').trim());
+    if (fallback && !keys.includes(fallback)) keys.push(fallback);
+  }
+  return keys;
+}
+
+/**
+ * Normalized identity for visit-set matching (shared-evidence registry and
+ * already-visited exclusion): scheme + lowercased host + non-default port +
+ * pathname (trailing slash trimmed) + verbatim query. Same rule both sides
+ * so independently recorded URLs meet on one key. Null when unparsable.
+ */
+export function normalizeVisitUrl(rawUrl: string): string | null {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  const path = parsed.pathname.replace(/\/+$/, '') || '/';
+  const port = parsed.port ? `:${parsed.port}` : '';
+  return `${parsed.protocol}//${parsed.hostname.toLowerCase()}${port}${path}${parsed.search}`;
+}
+
+/**
+ * Required-set classification (v2 coverage contract), pure and unit-tested:
+ * partitions a required URL set into unvisited, transient-failed, and
+ * permanent-failed members given terminal-success keys, per-URL terminal
+ * failure classes, and already-covered shared keys. BLOCKED is the only
+ * permanent access-denial evidence (identical refetch patterns cannot clear
+ * a WAF wall within any wall-clock); every other recorded class stays
+ * transient-capable under tail-bounded retry rules. Shared-covered members
+ * count as visited: exclusion sets passed to crawls must contain only
+ * terminal-success evidence at the required-or-higher tier.
+ */
+export interface RequiredCoverageInput {
+  requiredKeys: Iterable<string>;
+  succeededKeys: Iterable<string>;
+  failedClassesByKey: Map<string, string> | Record<string, string>;
+  sharedCoveredKeys?: Iterable<string>;
+}
+
+export function classifyRequiredCoverage(input: RequiredCoverageInput): {
+  unvisited: string[];
+  transientFailures: string[];
+  permanentFailures: string[];
+} {
+  const failedByKey = input.failedClassesByKey instanceof Map
+    ? input.failedClassesByKey
+    : new Map(Object.entries(input.failedClassesByKey || {}));
+  const succeeded = new Set(input.succeededKeys);
+  if (input.sharedCoveredKeys) {
+    // Shared evidence satisfies a required member only when the current run
+    // did not terminally fail it: fresh failure evidence always wins over
+    // borrowed success (last-terminal-wins philosophy applied across runs).
+    for (const key of input.sharedCoveredKeys) {
+      if (key && !failedByKey.has(key)) succeeded.add(key);
+    }
+  }
+  const unvisited: string[] = [];
+  const transientFailures: string[] = [];
+  const permanentFailures: string[] = [];
+  for (const key of new Set(input.requiredKeys)) {
+    if (!key || succeeded.has(key)) continue;
+    if (!failedByKey.has(key)) {
+      unvisited.push(key);
+      continue;
+    }
+    if (failedByKey.get(key) === 'BLOCKED') permanentFailures.push(key);
+    else transientFailures.push(key);
+  }
+  return { unvisited, transientFailures, permanentFailures };
+}
+
+/**
+ * Required-set discovery (v2 coverage contract): the seed document plus its
+ * directly discovered same-host community-hint links. Uses the exact same
+ * admission predicate as the enqueue path (same-hostname + community-hint
+ * filter + shared crawl admission boundary), so every required URL is
+ * enqueue-eligible by construction, admission-rejected URLs can never become
+ * required obligations (and therefore never REQUIRED_UNVISITED gaps or retry
+ * owners), and any required-but-unvisited URL at stop is genuinely a
+ * bounded-traversal gap rather than a filter artifact. Attribute entities are
+ * decoded with the project HTML parser (cheerio, same as the static crawler)
+ * so encoded identities such as `?x=1&amp;y=2` resolve exactly like the
+ * enqueue path sees them. Pure and unit-tested.
+ */
+export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): string[] {
+  let page: URL;
+  try {
+    page = new URL(seedUrl);
+  } catch {
+    return [];
+  }
+  let hrefs: string[];
+  try {
+    const $ = cheerio.load(String(seedHtml || ''));
+    hrefs = $('a[href]')
+      .map((_, el) => String($(el).attr('href') || '').trim())
+      .get()
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of hrefs) {
+    let absolute: URL;
+    try {
+      absolute = new URL(raw, seedUrl);
+    } catch {
+      continue;
+    }
+    if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') continue;
+    if (absolute.hostname.toLowerCase() !== page.hostname.toLowerCase()) continue;
+    absolute.hash = '';
+    if (!shouldEnqueueRenderedCommunityLink(absolute.toString())) continue;
+    // R6 admission boundary: a URL the crawl/enqueue path would reject can
+    // never become a required obligation (no false REQUIRED_UNVISITED gaps,
+    // no retry ownership from inadmissible candidates).
+    if (!assessCrawlAdmission(absolute.toString()).eligible) continue;
+    const url = absolute.toString();
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+/**
+ * Rendered click targeting (acquisition efficiency): controls whose href
+ * resolves to a same-host navigable document that also passes the rendered
+ * enqueue/admission rule are discovered deterministically through
+ * `enqueueLinks` (same-hostname strategy) and have their text+href
+ * Discord-scanned before any click, so clicking them only burns wall-clock
+ * (up to 2s timeout + waits per click against the 60s total budget) without
+ * adding coverage. Those clicks are skipped; everything else keeps existing
+ * behavior exactly:
+ * - missing/unparseable href → clicked (fail-open toward recall; a JS
+ *   handler may still act),
+ * - fragment-only hrefs (`#section`) → clicked (may reveal in-page content),
+ * - `javascript:`/non-http(s) hrefs → clicked (only a click can act),
+ * - same-host hrefs failing the enqueue rule → clicked (otherwise the URL
+ *   would be neither clicked nor enqueued and discovery could be lost),
+ * - cross-host http(s) hrefs → clicked (current navigation-away semantics
+ *   preserved; `enqueueLinks` would not capture them).
+ * Pure and unit-tested; the handler below only consumes the plan.
+ */
+export interface RenderedControlTarget {
+  index: number;
+  text: string;
+  href: string | null;
+}
+
+export function isSkippableNavigableAnchorClick(
+  target: Pick<RenderedControlTarget, 'href'>,
+  pageUrl: string,
+): boolean {
+  const href = (target.href || '').trim();
+  if (!href) return false;
+  let page: URL;
+  let absolute: URL;
+  try {
+    page = new URL(pageUrl);
+    absolute = new URL(href, pageUrl);
+  } catch {
+    return false;
+  }
+  if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return false;
+  const withoutHash = (url: URL): string => {
+    const copy = new URL(url.toString());
+    copy.hash = '';
+    return copy.toString();
+  };
+  // Fragment-only navigation stays on the same document: clicking may reveal
+  // content, so it is never skipped.
+  if (withoutHash(absolute) === withoutHash(page)) return false;
+  if (absolute.origin !== page.origin) return false;
+  // Same admission predicate as the enqueue path: a same-origin anchor that
+  // the enqueue rule would reject must still be clicked, otherwise it is
+  // neither clicked nor enqueued and discovery could be lost.
+  return shouldEnqueueRenderedCommunityLink(absolute.toString());
+}
+
+export function partitionRenderedClickTargets(
+  controls: RenderedControlTarget[],
+  pageUrl: string,
+  maxClicks: number,
+): { toClick: RenderedControlTarget[]; skippedNavigableAnchors: number } {
+  const toClick: RenderedControlTarget[] = [];
+  let skippedNavigableAnchors = 0;
+  const cap = Math.max(0, Math.trunc(maxClicks) || 0);
+  for (const control of controls) {
+    if (isSkippableNavigableAnchorClick(control, pageUrl)) {
+      skippedNavigableAnchors++;
+      continue;
+    }
+    if (toClick.length >= cap) continue;
+    toClick.push(control);
+  }
+  return { toClick, skippedNavigableAnchors };
+}
+
+/**
  * Rendered completion invariant (recall correctness): `complete=true` must
  * never occur when zero pages/requests were processed. The crawler can resolve
  * without ever admitting a request to the request handler (seed rejected
@@ -175,10 +425,17 @@ export function wasRenderedResultProcessed(
 export interface RenderedRequestTracker {
   failedRequestUrls: Set<string>;
   succeededRequestUrls: Set<string>;
+  /**
+   * Terminal failure class per failed URL (v2 required-set accounting):
+   * lets classification split required terminal failures into transient
+   * (bounded recovery) and permanent (visible, never retries). Additive;
+   * entries without a recorded class count as transient-capable.
+   */
+  failedRequestClasses: Map<string, string>;
 }
 
 export function createRenderedRequestTracker(): RenderedRequestTracker {
-  return { failedRequestUrls: new Set<string>(), succeededRequestUrls: new Set<string>() };
+  return { failedRequestUrls: new Set<string>(), succeededRequestUrls: new Set<string>(), failedRequestClasses: new Map<string, string>() };
 }
 
 /**
@@ -186,10 +443,11 @@ export function createRenderedRequestTracker(): RenderedRequestTracker {
  * revoking any earlier success for the same URL (a later terminal failure
  * must not be erased by an earlier success mark).
  */
-export function markRenderedRequestFailed(tracker: RenderedRequestTracker, url: string): void {
+export function markRenderedRequestFailed(tracker: RenderedRequestTracker, url: string, failureClass?: string): void {
   if (!url) return;
   tracker.failedRequestUrls.add(url);
   tracker.succeededRequestUrls.delete(url);
+  if (failureClass) tracker.failedRequestClasses.set(url, failureClass);
 }
 
 /**
@@ -203,6 +461,7 @@ export function markRenderedRequestSucceeded(tracker: RenderedRequestTracker, ur
   if (!url) return;
   tracker.succeededRequestUrls.add(url);
   tracker.failedRequestUrls.delete(url);
+  tracker.failedRequestClasses.delete(url);
 }
 
 /** Terminal unresolved failures for completion accounting. */
@@ -484,6 +743,24 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // URL; a later success resolves an earlier failure (retry recovery).
   const requestTracker = createRenderedRequestTracker();
   const hostBackoffUntil = new Map<string, number>();
+  // v2 required-set tracking: the seed document plus its directly discovered
+  // same-host community-hint links (computed once from the first inspected
+  // page with the same predicate as the enqueue path). Terminal-success page
+  // URLs accumulate in visit order for the shared-evidence registry.
+  let seedDocumentSeen = false;
+  let seedRequiredLinks: string[] = [];
+  const terminalSuccessUrls: string[] = [];
+  // Per visited page, the same-host community-hint links discovered on it
+  // (same predicate as the enqueue path): lets callers prove required-set
+  // closure for shared-evidence reuse without re-parsing page content.
+  const pageHintLinks = new Map<string, Set<string>>();
+  // Already-inspected URLs from earlier same-inspection work: excluded from
+  // enqueueing (counted as already-visited) instead of being refetched.
+  const alreadyVisitedSet = new Set(
+    (limits.alreadyVisited || [])
+      .map(normalizeVisitUrl)
+      .filter((key): key is string => typeof key === 'string' && key.length > 0),
+  );
   const discovered:DiscordCandidate[]=[];
   const hostKey = (rawUrl: string): string => {
     try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\\./, '') || 'unknown'; }
@@ -532,10 +809,10 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           }],
           errorHandler: async ({ request, session }, error) => {
             telemetry.requestsFailed++;
-            markRenderedRequestFailed(requestTracker, request.url);
+            const failureClass = classifyRenderedCrawlerFailure(error);
+            markRenderedRequestFailed(requestTracker, request.url, failureClass);
             const retryCount = request.retryCount || 0;
             const policy = renderedCrawlerRetryPolicy(error, retryCount);
-            const failureClass = classifyRenderedCrawlerFailure(error);
             if (isRenderedNavigationTimeout(error)) telemetry.navigationTimeouts++;
             if (failureClass === 'BLOCKED') telemetry.blockedRequests++;
             if (failureClass === 'RATE_LIMITED') telemetry.rateLimitedRequests++;
@@ -562,6 +839,21 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             const inspect = async () => {
               const url=page.url(),html=await page.content();
               retain(`${url}\n${html}`,url);
+              try {
+                // Request and final-page identities share one evidence bucket
+                // (see visitIdentityKeys): for a redirected request both
+                // identities were terminally inspected, so required-closure
+                // and shared-evidence decisions stay correct whichever
+                // identity a later seed presents.
+                for (const identity of visitIdentityKeys(request.url, url)) {
+                  let bucket = pageHintLinks.get(identity);
+                  if (!bucket) {
+                    bucket = new Set<string>();
+                    pageHintLinks.set(identity, bucket);
+                  }
+                  for (const link of discoverRequiredSeedLinks(html, url)) bucket.add(link);
+                }
+              } catch { /* hint inventory never breaks inspection */ }
             };
             // Page evidence counts only after the required extraction actually
             // succeeds: a throw here leaves zero processed evidence (finding:
@@ -569,6 +861,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             await inspect();
             inspectedPages++;
             telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'PAGE_PROCESSED');
+            if (!seedDocumentSeen) {
+              seedDocumentSeen = true;
+              try {
+                seedRequiredLinks = discoverRequiredSeedLinks(await page.content(), page.url());
+              } catch {
+                seedRequiredLinks = [];
+              }
+            }
 
             for (let i = 0; i < limits.maxScrollsPerPage; i++) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
@@ -581,13 +881,48 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
 
             const controls = await page.locator('a,button,[role="button"]').evaluateAll((nodes, pattern) => {
               const re = new RegExp(pattern, 'i');
-              return nodes.map((node, index) => ({index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`})).filter(item => re.test(item.text)).slice(0, 12);
+              // Bounded candidate pool (64): the click plan partitions the
+              // complete matching set FIRST so skipped navigable anchors can
+              // never hide a later click-only control behind the old take-12
+              // window. Locator indexes stay positional in the full query.
+              return nodes.map((node, index) => ({index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`,href:(node as HTMLAnchorElement).href || null})).filter(item => re.test(item.text)).slice(0, 64);
             }, COMMUNITY_HINTS.source);
-            // Controls beyond the per-page click slice can never be attempted
-            // on this page (the slice binds before the timeout check below).
-            drops.count('control-slice', Math.max(0, controls.length - limits.maxClicksPerPage));
+            // Navigable same-host anchors are already discovered through
+            // enqueueLinks and Discord-scanned before any click, so the click
+            // budget is reserved for controls that only a click can act on
+            // (href-less buttons, fragments, JS links, cross-host targets).
+            // Slice accounting covers the remainder beyond clicks and skips.
+            const clickPlan = partitionRenderedClickTargets(controls, page.url(), limits.maxClicksPerPage);
+            drops.count('control-slice', Math.max(0, controls.length - clickPlan.toClick.length - clickPlan.skippedNavigableAnchors));
+            // Shared enqueue admission (single rule definition): already-visited
+            // exclusion, then the shared crawl admission boundary, then the
+            // community-hint filter. Used by both enqueue passes below.
+            const admitEnqueueRequest = (url: string): boolean => {
+              const visitKey = normalizeVisitUrl(url);
+              if (visitKey && alreadyVisitedSet.has(visitKey)) {
+                drops.count('already-visited');
+                return false;
+              }
+              if (!assessCrawlAdmission(url).eligible) {
+                drops.count('admission-rejected');
+                return false;
+              }
+              if (shouldEnqueueRenderedCommunityLink(url)) return true;
+              drops.count('hint-rejected');
+              return false;
+            };
+            // Capture the original page's discoverable anchors BEFORE executing
+            // controls that may navigate away: a button/cross-host click can
+            // replace the document, and the post-click enqueue below would
+            // then scan the new page instead. The post-click enqueue is kept
+            // (JS-revealed links), so both DOM states contribute; queue
+            // dedupe makes repeats free. Hint-rejected double counts across
+            // the two passes are bounded diagnostic noise (≤1 extra pass).
+            if (Date.now() - startedAt < limits.totalTimeoutMs) {
+              await enqueueLinks({ strategy: 'same-hostname', transformRequestFunction: req => (admitEnqueueRequest(req.url) ? req : false) });
+            }
 
-            for (const control of controls.slice(0, limits.maxClicksPerPage)) {
+            for (const control of clickPlan.toClick) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
               const locator=page.locator('a,button,[role="button"]').nth(control.index);
               const href=await locator.getAttribute('href').catch(()=>null);
@@ -607,7 +942,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {
-              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>{if(shouldEnqueueRenderedCommunityLink(req.url))return req;drops.count('hint-rejected');return false;}});
+              await enqueueLinks({strategy:'same-hostname',transformRequestFunction:req=>(admitEnqueueRequest(req.url)?req:false)});
             }
             // Success is recorded only after the request's full page-processing
             // lifecycle completes (load, scroll traversal, control enumeration,
@@ -616,6 +951,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // success resolves an earlier failure (retry recovery). Click
             // handling owns no marks: clicks never affect terminal accounting.
             markRenderedRequestSucceeded(requestTracker, request.url);
+            for (const identity of visitIdentityKeys(request.url, page.url())) {
+              if (!terminalSuccessUrls.includes(identity)) terminalSuccessUrls.push(identity);
+            }
             } finally {
               telemetry.requestsFinished++;
             }
@@ -660,6 +998,46 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // Terminal stop attribution: a complete crawl below the page budget
         // with nothing still queued ended for lack of enqueueable links;
         // eligible requests still queued mean the request budget cut coverage.
+        // v2 required-set classification (pure helper): the seed document plus
+        // its directly discovered same-host community-hint links, partitioned
+        // by terminal state. Shared-covered members count as visited: the
+        // already-visited exclusion set carries terminal-success rendered
+        // evidence by contract, so it can never manufacture a false
+        // REQUIRED_UNVISITED gap. Depth-2+ remainder is opportunistic by
+        // definition and never appears here.
+        const succeededKeys = new Set(
+          [...requestTracker.succeededRequestUrls]
+            .map(normalizeVisitUrl)
+            .filter((key): key is string => typeof key === 'string' && key.length > 0),
+        );
+        const failedByKey = new Map<string, string | undefined>();
+        for (const failed of requestTracker.failedRequestUrls) {
+          const key = normalizeVisitUrl(failed);
+          if (typeof key === 'string' && key.length > 0 && !succeededKeys.has(key) && !failedByKey.has(key)) {
+            failedByKey.set(key, requestTracker.failedRequestClasses.get(failed));
+          }
+        }
+        const requiredUnvisited: string[] = [];
+        const requiredTransientFailures: string[] = [];
+        const requiredPermanentFailures: string[] = [];
+        let requiredTotal = 0;
+        if (seedDocumentSeen) {
+          const requiredKeys = new Set(
+            [seedUrl, ...seedRequiredLinks]
+              .map(normalizeVisitUrl)
+              .filter((key): key is string => typeof key === 'string' && key.length > 0),
+          );
+          requiredTotal = requiredKeys.size;
+          const classified = classifyRequiredCoverage({
+            requiredKeys,
+            succeededKeys,
+            failedClassesByKey: failedByKey,
+            sharedCoveredKeys: alreadyVisitedSet,
+          });
+          requiredUnvisited.push(...classified.unvisited);
+          requiredTransientFailures.push(...classified.transientFailures);
+          requiredPermanentFailures.push(...classified.permanentFailures);
+        }
         if (completion.complete && !pageBudgetExhausted && inspectedPages < limits.maxPages) drops.count('queue-exhausted');
         if (pageBudgetExhausted) drops.count('page-budget');
         return {
@@ -673,6 +1051,21 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           failureClass:completion.failureClass,
           telemetry,
           dropReasons:drops.snapshot(),
+          visitedUrls: terminalSuccessUrls.length ? [...terminalSuccessUrls] : undefined,
+          pageHintLinks: (() => {
+            const record: Record<string, string[]> = {};
+            let entries = 0;
+            for (const [page, links] of pageHintLinks) {
+              if (entries >= 64) break;
+              record[page] = [...links].slice(0, 64);
+              entries++;
+            }
+            return entries ? record : undefined;
+          })(),
+          requiredTotal: seedDocumentSeen ? requiredTotal : undefined,
+          requiredUnvisited: seedDocumentSeen && requiredUnvisited.length ? requiredUnvisited : undefined,
+          requiredTransientFailures: seedDocumentSeen && requiredTransientFailures.length ? requiredTransientFailures : undefined,
+          requiredPermanentFailures: seedDocumentSeen && requiredPermanentFailures.length ? requiredPermanentFailures : undefined,
           detail:candidates.length
             ? `Rendered fallback retained ${candidates.length} distinct Discord candidate(s) across ${inspectedPages} page(s); ${telemetry.requestsFailed} request(s) failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`
             : timedOut?`Rendered acquisition budget expired before coverage completed; ${browserFallbackTelemetrySummary(telemetry)}`:telemetry.unresolvedFailedRequests>0?`Rendered acquisition incomplete: ${telemetry.unresolvedFailedRequests} request(s) terminally failed within the bounded crawl; ${browserFallbackTelemetrySummary(telemetry)}`:noPageProcessed?`Rendered acquisition incomplete: no page was processed (NO_PAGE_PROCESSED); ${browserFallbackTelemetrySummary(telemetry)}`:`Rendered acquisition completed across ${inspectedPages} page(s) without an invite; ${browserFallbackTelemetrySummary(telemetry)}`,

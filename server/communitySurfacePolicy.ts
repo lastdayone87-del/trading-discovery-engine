@@ -151,6 +151,12 @@ const OUTCOME_PRECEDENCE: Record<AcquisitionObservationLike['outcome'], number> 
  * audit observations.
  *
  * Selection within a group, in order:
+ * 0. Shared terminal-success evidence shortcut: a terminal-success shared
+ *    row (`sharedEvidenceFrom`) defeats vacuous-only failures outright —
+ *    rows with zero processed evidence of any kind, which proved nothing and
+ *    therefore cannot erase genuine inspection. Runs before rules 2-4; any
+ *    FOUND row or any row with real processed evidence still dominates
+ *    normally, so genuine failures are never hidden.
  * 1. Any FOUND wins — a discovered candidate must never be lost to collapse.
  * 2. Required (retry-eligible, operational) observations dominate auxiliary
  *    notes: a required rendered failure overrides an earlier non-required
@@ -188,6 +194,21 @@ export function effectiveAcquisitionOutcomes<T extends AcquisitionObservationLik
   const pick = (entries: Array<{ item: T; index: number }>): { item: T; index: number } => {
     const found = entries.filter((entry) => entry.item.outcome === 'FOUND');
     const pool = found.length > 0 ? found : entries;
+    // Shared-evidence authority (v2): a terminal-success shared row for this
+    // URL defeats vacuous failures outright — rows with zero processed
+    // evidence of any kind, which proved nothing and therefore cannot erase
+    // genuine inspection. Evidenced signals (FOUND, or any row with real
+    // processed evidence) still dominate through the normal path below, so
+    // genuine failures are never hidden.
+    const sharedClean = pool.find(
+      (entry) =>
+        entry.item.outcome === 'INSPECTED_NO_MATCH' &&
+        typeof (entry.item as { sharedEvidenceFrom?: unknown }).sharedEvidenceFrom === 'string' &&
+        (entry.item as { sharedEvidenceFrom?: unknown }).sharedEvidenceFrom !== '',
+    );
+    if (sharedClean && !pool.some((entry) => entry !== sharedClean && (entry.item.outcome === 'FOUND' || hasProcessedEvidence(entry)))) {
+      return sharedClean;
+    }
     const required = pool.filter((entry) => (entry.item as { required?: unknown }).required === true);
     const eligible = required.length > 0 ? required : pool;
     const evidenced = eligible.filter(

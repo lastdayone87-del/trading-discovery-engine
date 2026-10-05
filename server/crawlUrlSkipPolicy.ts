@@ -76,6 +76,84 @@ export function trailingIdenticalFailure(rows: UrlFailureRow[]): { failureClass:
 }
 
 /**
+ * Consecutive identical RENDERED_TIMEOUT runs before a seed stops owning
+ * community retries. Production 7d: 65 URL targets reached 3+ consecutive
+ * rendered timeouts with 0 recoveries, so the third identical run owns no
+ * new information. Two priors still retry (transient load can genuinely
+ * recover); the suppression only fires on the deterministic tail.
+ */
+export const CONSECUTIVE_TIMEOUT_SUPPRESSION_THRESHOLD = 2;
+
+/**
+ * Failure classes sharing one consecutive-tail budget for retry suppression.
+ * Rendered wall-clock timeouts and rendered required-unvisited budget gaps
+ * are the same deterministic phenomenon (bounded traversal stopped with work
+ * remaining); a mixed tail of the two still proves futility. Defaults to the
+ * timeout class alone so existing callers keep exact behavior.
+ */
+const DEFAULT_TIMEOUT_TAIL_CLASSES = ['RENDERED_TIMEOUT'];
+
+/**
+ * Whether prior ledger history already holds `threshold` consecutive
+ * tail-class runs for one normalized URL. Newest-first trailing run over
+ * ACQUISITION_FAILED/PARTIALLY_INSPECTED rows whose failureClass is in
+ * `classes` (default timeout-only; callers pass the mixed budget/timeout set
+ * to count deterministic budget exhaustion together — a mixed tail of those
+ * classes still proves futility). Any other outcome or class breaks the run,
+ * except same-attempt companions (a static row sharing an exact acquisition
+ * timestamp with a counted tail row never breaks it); a FOUND row always
+ * breaks, since invite discovery is a recovery signal no companion rule may
+ * swallow. Pure and unit-testable.
+ */
+export function hasConsecutiveTimeoutExhaustion(
+  rows: UrlFailureRow[],
+  requestedUrl: string,
+  threshold: number = CONSECUTIVE_TIMEOUT_SUPPRESSION_THRESHOLD,
+  classes: string[] = DEFAULT_TIMEOUT_TAIL_CLASSES,
+): boolean {
+  const key = normalizeSkipUrl(requestedUrl);
+  if (!key) return false;
+  const wanted = new Set(classes);
+  const ordered = rows
+    .filter(row => normalizeSkipUrl(row.requestedUrl) === key)
+    .sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt));
+  if (!ordered.length) return false;
+  const want = Math.max(1, Math.trunc(threshold) || 1);
+  const isTailRow = (row: UrlFailureRow): boolean => {
+    if (!wanted.has(String(row.failureClass || ''))) return false;
+    // FAILED/PARTIAL rows accumulate; FOUND rows count only when carrying a
+    // gap class (FOUND_REQUIRED_GAP persistence). Ordinary FOUND rows (no
+    // failure class) always break the tail as recovery signals.
+    return row.outcome === 'ACQUISITION_FAILED' || row.outcome === 'PARTIALLY_INSPECTED' || row.outcome === 'FOUND';
+  };
+  // Same-attempt companions share one acquisition timestamp: static and
+  // rendered observations from a single inspection carry the same
+  // `observedAt` (one `now` per inspection), so a static companion row beside
+  // its rendered row must not break the rendered tail. Only a tail-class-free
+  // timestamp breaks the run. Timestamp comparison is numeric (ISO shape
+  // independent); distinct inspections are milliseconds apart in practice.
+  const tailTimestamps = new Set<number>();
+  for (const row of ordered) {
+    const at = Date.parse(row.observedAt);
+    if (isTailRow(row) && Number.isFinite(at)) tailTimestamps.add(at);
+  }
+  let run = 0;
+  for (const row of ordered) {
+    if (isTailRow(row)) {
+      run++;
+      continue;
+    }
+    // A FOUND row always breaks the tail: invite discovery is a recovery
+    // signal no companion rule may swallow.
+    if (row.outcome === 'FOUND') break;
+    const at = Date.parse(row.observedAt);
+    if (Number.isFinite(at) && tailTimestamps.has(at)) continue;
+    break;
+  }
+  return run >= want;
+}
+
+/**
  * URLs to skip: trailing run is a capped deterministic class at or past the
  * threshold. Keys are normalized exactly like crawl seeds so lookups match
  * ledger keys. Pure and unit-testable; the single caller passes ledger rows.
