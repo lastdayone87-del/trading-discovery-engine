@@ -17,6 +17,7 @@ import {
   shouldScheduleFoundGapAcquisitionRetry,
   shouldCompleteSuppressedRetryJob,
   enqueueCommunityAcquisitionRetry,
+  projectNotFoundAfterInspection,
 } from './queueManager';
 import { crawlExternalLinks, runChannelInspection, isReusableStaticRootLender } from './inspector';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
@@ -998,4 +999,117 @@ test('v2 review: non-terminal lender records do not suppress borrower refetch', 
   assert.ok(fetched.includes('https://cut.example.com/community-page'), 'borrower acquires complete evidence');
   assert.ok(!borrowerLog.some((line) => line.includes('[Shared static evidence]')));
   assert.ok(borrower.observations.some((item) => item.requestedUrl === 'https://cut.example.com/'));
+});
+
+// Ashish path, executed for real: FOUND + retryable required gap, but no
+// admitted/discovered invite, so flow reaches the final NOT_FOUND branch.
+// The outstanding gap directive must still schedule exactly one durable
+// retry job there instead of being silently discarded alongside the
+// unadmitted candidates — while status projection stays exactly as before.
+test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
+  const gapDirective = {
+    attemptFree: true,
+    code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+    reason: 'REQUIRED_UNVISITED_BUDGET_GAP',
+    retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+  };
+  const inspection = {
+    acquisitionStatus: 'FOUND',
+    acquisitionOutcomes: [
+      {
+        requestedUrl: 'https://linktr.example.com/creator',
+        surface: 'CREATOR_WEBSITES',
+        required: true,
+        outcome: 'FOUND',
+        retryable: true,
+        failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
+      },
+    ],
+    retryDirective: gapDirective,
+  };
+  const blankChannel = () => ({
+    channel_id: 'UCashish0000000000000001',
+    discord_discovery_status: 'NOT_DISCOVERED',
+    discord_status: 'UNCERTAIN',
+    discord_candidate_locator: null,
+    discord_resolution_status: 'NOT_ATTEMPTED',
+    discord_liveness_status: 'NOT_CHECKED',
+    discord_relevance_status: 'NOT_CHECKED',
+    discord_validation_status: 'NOT_STARTED',
+    scan_status: 'ENRICHING',
+    scan_attempts: 3,
+  });
+  const calls: Array<{ channelId: string; directive: unknown }> = [];
+  const stubEnqueue = (async (channelId: string, directive?: unknown) => {
+    calls.push({ channelId, directive });
+  }) as (channelId: string, directive?: import('./communityRetryPolicy').CommunityRetryDirective) => Promise<void>;
+  const channel = blankChannel() as never;
+  await projectNotFoundAfterInspection(
+    channel,
+    inspection as never,
+    { discordCandidates: [], foundInvite: null, steps: [] } as never,
+    true,
+    stubEnqueue,
+  );
+  assert.equal(calls.length, 1, 'exactly one durable retry job must be scheduled');
+  assert.equal(calls[0].channelId, 'UCashish0000000000000001');
+  assert.equal(calls[0].directive, gapDirective, 'the queued job must contain inspection.retryDirective');
+  assert.equal((channel as { scan_status?: unknown }).scan_status, 'COMPLETED');
+  assert.equal((channel as { discord_status?: unknown }).discord_status, 'NOT_FOUND');
+  assert.equal((channel as { discord_discovery_status?: unknown }).discord_discovery_status, 'NOT_DISCOVERED');
+  // FOUND_COMPLETE (directive absent) schedules nothing; status identical.
+  // The clean fixture carries a real retryable FOUND+required-gap outcome so
+  // the missing-directive case is exercised meaningfully rather than
+  // vacuously: gap rows alone must never schedule without their directive.
+  const cleanCalls: unknown[] = [];
+  const cleanChannel = blankChannel() as never;
+  await projectNotFoundAfterInspection(
+    cleanChannel,
+    {
+      acquisitionOutcomes: [
+        {
+          requestedUrl: 'https://linktr.example.com/creator',
+          surface: 'CREATOR_WEBSITES',
+          required: true,
+          outcome: 'FOUND',
+          retryable: true,
+          failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
+        },
+      ],
+      retryDirective: undefined,
+    } as never,
+    { discordCandidates: [], foundInvite: null, steps: [] } as never,
+    true,
+    (async () => {
+      cleanCalls.push(1);
+    }) as never,
+  );
+  assert.equal(cleanCalls.length, 0);
+  assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'COMPLETED');
+  // A missing retry directive never schedules, even with gap rows present;
+  // a plain FOUND_COMPLETE row without any gap class likewise never does.
+  assert.equal(
+    shouldScheduleFoundGapAcquisitionRetry({ acquisitionOutcomes: [], retryDirective: undefined }),
+    false,
+  );
+  // No-gap-class guard with a real directive present: a FOUND outcome that is
+  // neither retryable nor gap-classed must not schedule, proving the guard
+  // evaluated is the gap class itself rather than directive presence.
+  assert.equal(
+    shouldScheduleFoundGapAcquisitionRetry({
+      acquisitionOutcomes: [
+        {
+          outcome: 'FOUND',
+          retryable: false,
+        },
+      ],
+      retryDirective: {
+        attemptFree: true,
+        code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+        reason: 'unrelated recovery',
+        retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+      },
+    }),
+    false,
+  );
 });

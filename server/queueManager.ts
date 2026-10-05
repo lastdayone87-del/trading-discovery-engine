@@ -1581,19 +1581,10 @@ export async function inspectAndValidateChannel(
       channel.last_checked=now;
       if(retryDirective?.attemptFree&&scheduleRetry)await enqueueCommunityAcquisitionRetry(channel.channel_id,retryDirective);
     } else {
-      // Nothing Found After All Steps
-      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
-      if(!alreadyValidatedSuccess){
-        channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
-        if(!channel.discord_candidate_locator){channel.discord_resolution_status='NOT_ATTEMPTED';channel.discord_liveness_status='NOT_CHECKED';channel.discord_relevance_status='NOT_CHECKED';channel.discord_validation_status='COMPLETED';}
-      }
-      channel.scan_status = 'COMPLETED';
-      channel.scan_attempts = 0;
-      // Only a complete inspection with no prior discovery may project absence.
-      if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
-      else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
-      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
-      channel.last_checked = now;
+      // Final NOT_FOUND projection after all steps (no admitted/discovered
+      // invite and no FAILED/PARTIAL acquisition status). Extracted for
+      // direct runtime testing without changing behavior.
+      await projectNotFoundAfterInspection(channel,inspection,admittedInspection,scheduleRetry);
     }
 
   } catch (err) {
@@ -1714,6 +1705,45 @@ export async function handleRelationshipCanaryExpansionJob(
  * this only *adds* the acquisition directive alongside it. Pure and
  * unit-tested; the only caller is the discovered-invite branch.
  */
+/**
+ * Final NOT_FOUND projection after all steps (extracted for direct runtime
+ * testing): no admitted/discovered invite and no FAILED/PARTIAL acquisition
+ * status. Projects absence state exactly as before, then schedules bounded
+ * recovery when a FOUND+required-gap directive is outstanding (Ashish path:
+ * invites retained but unadmitted, required gap unresolved). The enqueue
+ * transport defaults to the durable scheduler and is injectable in tests;
+ * validation, choke, status, and retry-policy semantics are untouched.
+ */
+export async function projectNotFoundAfterInspection(
+  channel: ChannelRecord,
+  inspection: {
+    acquisitionOutcomes?: Array<{ outcome?: unknown; retryable?: unknown; failureClass?: unknown }>;
+    retryDirective?: CommunityRetryDirective;
+  } | null | undefined,
+  admittedInspection: Parameters<typeof reconcileDiscordDiscoveryFromInspection>[1],
+  scheduleRetry: boolean,
+  enqueue: (channelId: string, directive?: CommunityRetryDirective) => Promise<void> = enqueueCommunityAcquisitionRetry,
+): Promise<void> {
+      // Nothing Found After All Steps
+      const alreadyValidatedSuccess=channel.discord_discovery_status==='VALIDATED'&&(channel.discord_status==='ACTIVE'||channel.discord_status==='DEAD');
+      if(!alreadyValidatedSuccess){
+        channel.discord_status = channel.discord_candidate_locator?'UNCERTAIN':'NOT_FOUND';
+        if(!channel.discord_candidate_locator){channel.discord_resolution_status='NOT_ATTEMPTED';channel.discord_liveness_status='NOT_CHECKED';channel.discord_relevance_status='NOT_CHECKED';channel.discord_validation_status='COMPLETED';}
+      }
+      channel.scan_status = 'COMPLETED';
+      channel.scan_attempts = 0;
+      // Only a complete inspection with no prior discovery may project absence.
+      if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
+      else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
+      reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
+      // FOUND_REQUIRED_GAP with no admitted invite: the validation branch and
+      // the FAILED/PARTIAL branch both skipped, so an outstanding retryable
+      // required gap would be silently lost here. Schedule its bounded
+      // recovery into the same durable per-channel job instead. Status,
+      // choke admission, and validation behavior above are untouched.
+      if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueue(channel.channel_id,inspection.retryDirective);
+      channel.last_checked = new Date().toISOString();
+}
 export function shouldScheduleFoundGapAcquisitionRetry(inspection:{
   acquisitionOutcomes?:Array<{outcome?:unknown;retryable?:unknown;failureClass?:unknown}>;
   retryDirective?:unknown;
