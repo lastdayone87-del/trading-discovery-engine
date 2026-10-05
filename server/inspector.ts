@@ -236,7 +236,11 @@ export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocati
  */
 export interface SharedStaticInventory {
   visitedKeys: string[];
-  roots: Map<string, { bySeed: string; finalUrl: string; childLinks: Array<{ url: string; score: number }> }>;
+  // terminalSuccess marks lender records proven terminal-success at the
+  // static tier. Lookup refuses explicit `false` records (truncated lenders)
+  // so borrowers never inherit cut coverage; missing flags predate the gate
+  // and are treated as terminal (they were fed under it).
+  roots: Map<string, { bySeed: string; finalUrl: string; childLinks: Array<{ url: string; score: number }>; terminalSuccess?: boolean }>;
 }
 
 /**
@@ -364,7 +368,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
         }));
       }catch{/* admission is best-effort persistence, never crawl behavior */}
     };
-    const lookupSharedStaticRoot=(u:string):{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>}|null=>{const key=sharedKey(u);if(!key||!sharedRoots)return null;return sharedRoots.get(key)||null;};
+    const lookupSharedStaticRoot=(u:string):{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>;terminalSuccess?:boolean}|null=>{const key=sharedKey(u);if(!key||!sharedRoots)return null;const rec=sharedRoots.get(key)||null;if(rec&&rec.terminalSuccess===false)return null;return rec;};
     const sharedRoot=lookupSharedStaticRoot(url);
     let page:{html:string;finalUrl:string;truncated:boolean}|null;
     let fetchFailure:{httpStatus?:number;failureClass?:string}|undefined;
@@ -885,7 +889,6 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // or schemes never collapse. First seed wins with context-match merging;
   // every collapse is logged (no silent discards).
   const admissionRecoveryLogs:string[]=[];const admissionTruncationSignals:string[]=[];const seedDedupeLogs:string[]=[];
-  const bareWwwCollapseKey=(rawUrl:string):string|null=>{let parsed:URL;try{parsed=new URL(rawUrl);}catch{return null;}const identity=canonicalSiteIdentity(rawUrl)?.siteIdentity;if(!identity)return null;const host=parsed.hostname.toLowerCase();const stripped=host.replace(/^www\./,'');if(stripped===host)return null;return `${identity}\u0000${parsed.protocol}\u0000${stripped}\u0000${parsed.pathname}\u0000${parsed.search}`;};
   const siblingValuedKeysByHost=new Map<string,Set<string>>();const siblingPathsByHost=new Map<string,Set<string>>();
   for(const item of collectedExternalUrls){let parsed:URL|null=null;try{parsed=new URL(item.url);}catch{continue;}const host=parsed.hostname.toLowerCase();if(!siblingPathsByHost.has(host))siblingPathsByHost.set(host,new Set());siblingPathsByHost.get(host)!.add(parsed.pathname||'/');for(const [key,value] of parsed.searchParams){if(value){if(!siblingValuedKeysByHost.has(host))siblingValuedKeysByHost.set(host,new Set());siblingValuedKeysByHost.get(host)!.add(key);}}}
   const uniqueUrls=new Map<string,{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING';contextMatches:boolean;source:string;sitemapUrl?:string}>();const collapseIndex=new Map<string,string>();
@@ -1068,7 +1071,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   interface SharedRenderedRecord {bySeed:string;pages:number;candidatesFound:number;hintLinks:string[];}
   const sharedRenderedEvidence=new Map<string,SharedRenderedRecord[]>();
   const sharedStaticVisited=new Set<string>();
-  const sharedStaticRoots=new Map<string,{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>}>();
+  const sharedStaticRoots=new Map<string,{bySeed:string;finalUrl:string;childLinks:Array<{url:string;score:number}>;terminalSuccess?:boolean}>();
   // Lender feed gate: only terminal-success static roots enter the shared
   // inventory (see isReusableStaticRootLender). Truncated/incomplete lenders
   // never become reusable, so borrowers can never inherit cut coverage.
@@ -1076,7 +1079,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     if(!isReusableStaticRootLender(crawlRes))return false;
     const rootKey=normalizeVisitUrl(seedUrl);
     if(!rootKey||sharedStaticRoots.has(rootKey))return false;
-    sharedStaticRoots.set(rootKey,{bySeed:seedUrl,finalUrl:(crawlRes.visitedUrls as string[])[0],childLinks:crawlRes.rootNavigation as Array<{url:string;score:number}>});
+    sharedStaticRoots.set(rootKey,{bySeed:seedUrl,finalUrl:(crawlRes.visitedUrls as string[])[0],childLinks:crawlRes.rootNavigation as Array<{url:string;score:number}>,terminalSuccess:true});
     return true;
   };
   const recordRenderedEvidence=(seedUrl:string,rendered:{visitedUrls?:string[];pageHintLinks?:Record<string,string[]>;inspectedPages?:number},candidates:{sourceUrl?:string}[]):void=>{const hintIndex=rendered.pageHintLinks||{};for(const raw of rendered.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(!key)continue;const found=candidates.filter(c=>normalizeVisitUrl(c.sourceUrl||'')===key).length;const list=sharedRenderedEvidence.get(key)||[];if(!list.some(r=>r.bySeed===seedUrl))list.push({bySeed:seedUrl,pages:1,candidatesFound:found,hintLinks:[...(hintIndex[key]||[])]});sharedRenderedEvidence.set(key,list);}};

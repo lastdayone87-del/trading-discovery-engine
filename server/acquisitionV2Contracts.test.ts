@@ -560,7 +560,7 @@ test('v2 review: shared static roots skip refetch but still acquire children', a
   const inventory = {
     visitedKeys: ['https://dup.example.com/'],
     roots: new Map([
-      [rootKey as string, { bySeed: 'https://dup.example.com/', finalUrl: 'https://dup.example.com/', childLinks: lender.rootNavigation || [] }],
+      [rootKey as string, { bySeed: 'https://dup.example.com/', finalUrl: 'https://dup.example.com/', childLinks: lender.rootNavigation || [], terminalSuccess: true }],
     ]),
   };
   const borrowerFetched: string[] = [];
@@ -873,4 +873,120 @@ test('v2 review: required set excludes admission-rejected URLs', () => {
     PAGE,
   );
   assert.deepEqual(links, ['https://creator.example.com/community']);
+});
+
+// REVIEW P1 (round 3): shared evidence stays authoritative in collapse — a
+// terminal-success shared row defeats vacuous (zero-evidence) failures for
+// the same URL, while evidenced signals still dominate normally.
+test('v2 review: shared evidence survives zero-evidence failures in collapse', async () => {
+  const { effectiveAcquisitionOutcomes } = await import('./communitySurfacePolicy');
+  const shared = {
+    requestedUrl: 'https://shared.example.com/',
+    surface: 'CREATOR_WEBSITES',
+    outcome: 'INSPECTED_NO_MATCH',
+    required: false,
+    retryable: false,
+    sharedEvidenceFrom: 'https://lender.example.com/',
+    observedAt: '2026-10-04T12:00:00.000Z',
+  };
+  const zeroPageFailure = {
+    requestedUrl: 'https://shared.example.com/',
+    surface: 'CREATOR_WEBSITES',
+    outcome: 'ACQUISITION_FAILED',
+    required: true,
+    retryable: true,
+    failureClass: 'NO_PAGE_PROCESSED',
+    telemetry: { pagesInspected: 0, requestsStarted: 0, redirectsFollowed: 0 },
+    observedAt: '2026-10-04T12:01:00.000Z',
+  };
+  const collapsed = effectiveAcquisitionOutcomes([shared, zeroPageFailure] as never);
+  assert.equal(collapsed.length, 1);
+  assert.equal(collapsed[0].outcome, 'INSPECTED_NO_MATCH');
+  assert.equal((collapsed[0] as { sharedEvidenceFrom?: unknown }).sharedEvidenceFrom, 'https://lender.example.com/');
+  // No false retry is owned: the surviving row is non-required.
+  const { communityAcquisitionRetryDirective } = await import('./communityRetryPolicy');
+  assert.equal(communityAcquisitionRetryDirective(collapsed as never), undefined);
+  // ...while an evidenced failure still dominates the shared row.
+  const evidencedFailure = { ...zeroPageFailure, telemetry: { pagesInspected: 2 } };
+  const collapsed2 = effectiveAcquisitionOutcomes([shared, evidencedFailure] as never);
+  assert.equal(collapsed2.length, 1);
+  assert.equal(collapsed2[0].outcome, 'ACQUISITION_FAILED');
+});
+
+// REVIEW P1 (round 3): truncated/incomplete lender roots are not reusable,
+// and borrowers of partial lenders refetch instead of inheriting cuts.
+test('v2 review: lender reuse requires terminal success', () => {
+  const nav = [{ url: 'https://lender.example.com/child', score: 50 }];
+  const visited = ['https://lender.example.com/'];
+  assert.equal(isReusableStaticRootLender({ outcome: 'INSPECTED_NO_MATCH', visitedUrls: visited, rootNavigation: nav }), true);
+  assert.equal(isReusableStaticRootLender({ outcome: 'FOUND', visitedUrls: visited, rootNavigation: nav }), true);
+  assert.equal(isReusableStaticRootLender({ outcome: 'PARTIALLY_INSPECTED', visitedUrls: visited, rootNavigation: nav }), false);
+  assert.equal(isReusableStaticRootLender({ outcome: 'ACQUISITION_FAILED', visitedUrls: visited, rootNavigation: nav }), false);
+  assert.equal(isReusableStaticRootLender({ outcome: 'INSPECTED_NO_MATCH', visitedUrls: [], rootNavigation: nav }), false);
+  assert.equal(isReusableStaticRootLender({ outcome: 'INSPECTED_NO_MATCH', visitedUrls: visited, rootNavigation: undefined }), false);
+});
+
+test('v2 review: partial-lender inventory never suppresses borrower refetch', async () => {
+  const sixteen = Array.from({ length: 16 }, (_, i) => `<a href="/community-${i}">community ${i}</a>`).join('');
+  const lenderFetched: string[] = [];
+  const lender = await crawlExternalLinks(
+    ['https://captrunc.example.com/'],
+    [],
+    undefined,
+    (async (input) => {
+      lenderFetched.push(String(input));
+      if (String(input) === 'https://captrunc.example.com/') return html(sixteen);
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  // Queue-cap truncation makes the lender PARTIAL: not reusable by construction.
+  assert.equal(lender.outcome, 'PARTIALLY_INSPECTED');
+  assert.equal(isReusableStaticRootLender(lender), false);
+});
+
+// REVIEW P2 (round 3): admission-rejected hint links never enter the required set.
+test('v2 review: required set admits only crawl-eligible URLs', () => {
+  const links = discoverRequiredSeedLinks(
+    '<a href="/community">c</a><a href="/community-help.js">j</a><a href="/track.css">t</a><a href="https://other.example.net/join">x</a>',
+    PAGE,
+  );
+  assert.deepEqual(links, ['https://creator.example.com/community']);
+});
+
+// REVIEW P3 (round 4): a truncated-lender record never suppresses borrower
+// acquisition — the borrower refetches the root itself and acquires the
+// complete evidence available to it.
+test('v2 review: non-terminal lender records do not suppress borrower refetch', async () => {
+  const rootHtml = '<a href="/community-page">community page</a>';
+  const truncatedInventory = {
+    visitedKeys: [] as string[],
+    roots: new Map([
+      ['https://cut.example.com/', { bySeed: 'https://cut.example.com/', finalUrl: 'https://cut.example.com/', childLinks: [{ url: 'https://cut.example.com/community-page', score: 50 }], terminalSuccess: false }],
+    ]),
+  };
+  const fetched: string[] = [];
+  const borrowerLog: string[] = [];
+  const borrower = await crawlExternalLinks(
+    ['https://cut.example.com/'],
+    borrowerLog,
+    undefined,
+    (async (input) => {
+      fetched.push(String(input));
+      const url = String(input);
+      if (url === 'https://cut.example.com/') return html(rootHtml);
+      return noInviteHtml();
+    }) as typeof fetch,
+    'CREATOR_WEBSITES',
+    false,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    truncatedInventory,
+  );
+  assert.ok(fetched.includes('https://cut.example.com/'), 'borrower must fetch the root itself');
+  assert.ok(fetched.includes('https://cut.example.com/community-page'), 'borrower acquires complete evidence');
+  assert.ok(!borrowerLog.some((line) => line.includes('[Shared static evidence]')));
+  assert.ok(borrower.observations.some((item) => item.requestedUrl === 'https://cut.example.com/'));
 });
