@@ -1593,6 +1593,12 @@ export async function inspectAndValidateChannel(
       if(!channel.discord_candidate_locator)channel.discord_discovery_status='NOT_DISCOVERED';
       else channel.discord_discovery_status='DISCOVERED_VALIDATION_FAILED';
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
+      // FOUND_REQUIRED_GAP with no admitted invite: the validation branch and
+      // the FAILED/PARTIAL branch both skipped, so an outstanding retryable
+      // required gap would be silently lost here. Schedule its bounded
+      // recovery into the same durable per-channel job instead. Status,
+      // choke admission, and validation behavior above are untouched.
+      if(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry(inspection))await enqueueCommunityAcquisitionRetry(channel.channel_id,inspection.retryDirective);
       channel.last_checked = now;
     }
 

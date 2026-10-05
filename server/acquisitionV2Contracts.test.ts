@@ -999,3 +999,50 @@ test('v2 review: non-terminal lender records do not suppress borrower refetch', 
   assert.ok(!borrowerLog.some((line) => line.includes('[Shared static evidence]')));
   assert.ok(borrower.observations.some((item) => item.requestedUrl === 'https://cut.example.com/'));
 });
+
+// Ashish path: FOUND + retryable required gap, but no admitted/discovered
+// invite, so flow reaches the final NOT_FOUND branch. The outstanding gap
+// directive must still schedule bounded recovery there instead of being
+// silently discarded alongside the unadmitted candidates.
+test('found-gap retry survives the no-admission NOT_FOUND branch', () => {
+  const gapDirective = {
+    attemptFree: true,
+    code: 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE',
+    reason: 'REQUIRED_UNVISITED_BUDGET_GAP',
+    retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
+  };
+  const inspection = {
+    acquisitionStatus: 'FOUND',
+    acquisitionOutcomes: [
+      {
+        requestedUrl: 'https://linktr.example.com/creator',
+        surface: 'CREATOR_WEBSITES',
+        required: true,
+        outcome: 'FOUND',
+        retryable: true,
+        failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
+      },
+    ],
+    retryDirective: gapDirective,
+  };
+  // Decision inputs: FOUND retained, gap retryable, directive present.
+  assert.equal(shouldScheduleFoundGapAcquisitionRetry(inspection), true);
+  assert.equal(
+    shouldScheduleFoundGapAcquisitionRetry({ acquisitionOutcomes: [], retryDirective: undefined }),
+    false,
+  );
+  // Wiring: the NOT_FOUND else branch (no admitted invite, no FAILED/PARTIAL
+  // status) schedules exactly this directive without touching status, choke
+  // admission, or validation behavior around it.
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const notFoundBranch = queue.slice(
+    queue.indexOf('// Nothing Found After All Steps'),
+    queue.indexOf('} catch (err) {'),
+  );
+  assert.match(
+    notFoundBranch,
+    /if\(scheduleRetry&&shouldScheduleFoundGapAcquisitionRetry\(inspection\)\)await enqueueCommunityAcquisitionRetry\(channel\.channel_id,inspection\.retryDirective\);/,
+  );
+  assert.doesNotMatch(notFoundBranch, /discord_status\s*=\s*'UNCERTAIN'/);
+  assert.match(notFoundBranch, /channel\.scan_status\s*=\s*'COMPLETED'/);
+});
