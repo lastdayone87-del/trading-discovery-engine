@@ -1058,11 +1058,26 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
   assert.equal((channel as { discord_status?: unknown }).discord_status, 'NOT_FOUND');
   assert.equal((channel as { discord_discovery_status?: unknown }).discord_discovery_status, 'NOT_DISCOVERED');
   // FOUND_COMPLETE (directive absent) schedules nothing; status identical.
+  // The clean fixture carries a real retryable FOUND+required-gap outcome so
+  // the missing-directive case is exercised meaningfully rather than
+  // vacuously: gap rows alone must never schedule without their directive.
   const cleanCalls: unknown[] = [];
   const cleanChannel = blankChannel() as never;
   await projectNotFoundAfterInspection(
     cleanChannel,
-    { acquisitionOutcomes: [], retryDirective: undefined } as never,
+    {
+      acquisitionOutcomes: [
+        {
+          requestedUrl: 'https://linktr.example.com/creator',
+          surface: 'CREATOR_WEBSITES',
+          required: true,
+          outcome: 'FOUND',
+          retryable: true,
+          failureClass: 'REQUIRED_UNVISITED_BUDGET_GAP',
+        },
+      ],
+      retryDirective: undefined,
+    } as never,
     { discordCandidates: [], foundInvite: null, steps: [] } as never,
     true,
     (async () => {
@@ -1071,9 +1086,22 @@ test('found-gap retry survives the no-admission NOT_FOUND branch', async () => {
   );
   assert.equal(cleanCalls.length, 0);
   assert.equal((cleanChannel as { scan_status?: unknown }).scan_status, 'COMPLETED');
-  // A missing retry directive never schedules, even with gap rows present.
+  // A missing retry directive never schedules, even with gap rows present;
+  // a plain FOUND_COMPLETE row without any gap class likewise never does.
   assert.equal(
     shouldScheduleFoundGapAcquisitionRetry({ acquisitionOutcomes: [], retryDirective: undefined }),
+    false,
+  );
+  assert.equal(
+    shouldScheduleFoundGapAcquisitionRetry({
+      acquisitionOutcomes: [
+        {
+          outcome: 'FOUND',
+          retryable: false,
+        },
+      ],
+      retryDirective: undefined,
+    }),
     false,
   );
 });
