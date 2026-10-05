@@ -17,6 +17,13 @@ const COMMUNITY_RETRY_TYPES: ClaimableOverride = ['RETRY_COMMUNITY_ACQUISITION']
 const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORCE_REVIEW_RESCAN'];
 const FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN';
 const COUNTRY_BOUNDARY_RECOVERY_TYPES: ClaimableOverride = [COUNTRY_BOUNDARY_RECOVERY_JOB];
+/**
+ * Corpus pipeline claim list: harvest + scoring only. Resolution, research,
+ * and all other gated families stay unwired until their own activations.
+ * Every type here remains authorized by its existing control/budget gates
+ * inside processNextSearchJob; the list itself grants no authority.
+ */
+export const CORPUS_PIPELINE_TYPES: ClaimableOverride = ['TERM_HARVEST', 'SCORE_CANDIDATES'];
 const QUOTA_BACKOFF_MS = 30_000;
 const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
   0,
@@ -69,6 +76,32 @@ function classifyWorkerError(error: unknown): CommunityRetryWorkerHealth['lastEr
 
 export function getCommunityRetryWorkerHealth(): CommunityRetryWorkerHealth {
   return { ...communityRetryHealth };
+}
+
+type CorpusPipelineWorkerHealth = {
+  started: boolean;
+  startedAt: string | null;
+  lastTickAt: string | null;
+  ticks: number;
+  claimed: number;
+  noWork: number;
+  errors: number;
+  lastOutcome: 'CLAIMED' | 'NO_DUE_JOB' | 'ERROR' | null;
+};
+
+const corpusPipelineHealth: CorpusPipelineWorkerHealth = {
+  started: false,
+  startedAt: null,
+  lastTickAt: null,
+  ticks: 0,
+  claimed: 0,
+  noWork: 0,
+  errors: 0,
+  lastOutcome: null
+};
+
+export function getCorpusPipelineWorkerHealth(): CorpusPipelineWorkerHealth {
+  return { ...corpusPipelineHealth };
 }
 
 function schedule(next: () => void, delayMs: number): void {
@@ -261,6 +294,38 @@ function startCountryBoundaryRecoveryWorker(workerId: string): void {
   void tick();
 }
 
+/**
+ * Dedicated corpus-pipeline consumer: harvest + scoring only, through the
+ * existing processNextSearchJob path and its existing control/budget gates.
+ * Concurrency is intentionally 1 (single consumer); corpus work is DB-local
+ * and must never compete with provider-bound pools by scaling here.
+ */
+function startCorpusPipelineWorker(workerId: string): void {
+  corpusPipelineHealth.started = true;
+  corpusPipelineHealth.startedAt ??= new Date().toISOString();
+  const tick = async () => {
+    corpusPipelineHealth.ticks += 1;
+    corpusPipelineHealth.lastTickAt = new Date().toISOString();
+    try {
+      const claimed = await processNextSearchJob(CORPUS_PIPELINE_TYPES, workerId);
+      if (claimed) {
+        corpusPipelineHealth.claimed += 1;
+        corpusPipelineHealth.lastOutcome = 'CLAIMED';
+      } else {
+        corpusPipelineHealth.noWork += 1;
+        corpusPipelineHealth.lastOutcome = 'NO_DUE_JOB';
+      }
+    } catch (error) {
+      corpusPipelineHealth.errors += 1;
+      corpusPipelineHealth.lastOutcome = 'ERROR';
+      console.error(`[Queue Worker:${workerId}] Corpus pipeline tick failed:`, error);
+    } finally {
+      schedule(tick, 1000);
+    }
+  };
+  void tick();
+}
+
 /** Dedicated consumers for operational jobs outside the three core pools. */
 export function startOperationalMaintenanceWorkers(): void {
   if (started) return;
@@ -275,8 +340,12 @@ export function startOperationalMaintenanceWorkers(): void {
   // Recovery is intentionally single-consumer and low-volume regardless of the
   // generic maintenance concurrency setting.
   startFalseNegativeRecoveryWorker(`false_negative_recovery_${process.pid}_0`);
+  // Corpus pipeline is intentionally a single consumer regardless of the
+  // generic maintenance concurrency setting: harvest/scoring work is DB-local
+  // and strictly gated by corpus/scoring controls and budgets.
+  startCorpusPipelineWorker(`corpus_pipeline_${process.pid}_0`);
 }
 
 export function getOperationalMaintenanceJobTypesForTests(): string[] {
-  return [...COMMUNITY_RETRY_TYPES, ...OFFICIAL_RECHECK_TYPES, FALSE_NEGATIVE_RECOVERY_JOB, ...COUNTRY_BOUNDARY_RECOVERY_TYPES];
+  return [...COMMUNITY_RETRY_TYPES, ...OFFICIAL_RECHECK_TYPES, FALSE_NEGATIVE_RECOVERY_JOB, ...COUNTRY_BOUNDARY_RECOVERY_TYPES, ...CORPUS_PIPELINE_TYPES];
 }
