@@ -211,8 +211,10 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   // gate (malformed, asset/resource) and deterministically permanent failure
   // classes never enter the retry loop — including backlog observations that
   // predate the gate. A missing requestedUrl cannot be judged and stays
-  // eligible, preserving existing behavior for older callers.
+  // eligible, preserving existing behavior for older callers; an explicitly
+  // stored empty string is invalid input and can never own retry work.
   const requestedUrl = (item as { requestedUrl?: unknown }).requestedUrl;
+  if (requestedUrl === '') return false;
   if (typeof requestedUrl === 'string' && requestedUrl) {
     try {
       if (!assessCrawlAdmission(requestedUrl).eligible) return false;

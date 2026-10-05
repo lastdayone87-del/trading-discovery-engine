@@ -127,8 +127,8 @@ test('static exploration bound is 12 with drop accounting at every rule', () => 
   }
   // Accepted cross-origin links are navigated, never counted as drops.
   assert.ok(!source.includes("drops.count('cross-origin-allowed')"));
-  assert.equal(CRAWL_DROP_REASONS.length, 14, 'frontier-yield-stop extends the closed taxonomy additively');
-  assert.ok(CRAWL_DROP_REASONS.includes('frontier-yield-stop'));
+  assert.equal(CRAWL_DROP_REASONS.length, 15, 'admission-rejected extends the closed taxonomy additively');
+  assert.ok(CRAWL_DROP_REASONS.includes('admission-rejected'));
 });
 
 test('rendered control-slice, hint-reject, scroll, and stop accounting are wired', () => {

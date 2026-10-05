@@ -18,6 +18,7 @@
 import { shouldEscalateToRenderedFallback } from './browserCommunityFallback';
 import { getAppSetting } from './dbCore';
 import { communityNavigationScore } from './inspector';
+import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { canonicalSiteIdentity } from './siteIdentity';
 import type { HeadDiscovery } from './siteProfiler';
 
@@ -128,6 +129,10 @@ export function selectSitemapSeedCandidates(
       continue;
     }
     if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') continue;
+    // R6 admission boundary (shared): rejected inventory URLs are dropped
+    // BEFORE scoring and capping so they can never consume one of the
+    // MAX_LADDER_SITEMAP_SEEDS slots.
+    if (!assessCrawlAdmission(absolute.toString()).eligible) continue;
     const url = absolute.toString();
     if (seen.has(url)) continue;
     seen.add(url);

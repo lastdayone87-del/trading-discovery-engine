@@ -49,6 +49,7 @@ test('R6: https://g/ is rejected before scoring or crawling', async () => {
   const trail = JSON.stringify(result.steps || []);
   assert.ok(!trail.includes('[Crawling] https://g/'), 'rejected seed must never receive a priority score or queue entry');
   assert.ok(trail.includes('Admission rejected (DOTLESS_HOST): https://g/'));
+  assert.ok(!trail.includes('Dotless single-label host note'), 'dead post-gate branch must not appear in the trail');
 });
 
 // 2. Generic dotless hosts are rejected, not just "g".
@@ -312,5 +313,134 @@ test('R6: transient failures on eligible URLs remain retryable', () => {
     ] as never);
     assert.ok(directive, `expected retry for ${failureClass}`);
     assert.equal(directive?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+  }
+});
+
+// REVIEW FIX 1: percent-encoded resource suffixes cannot bypass admission.
+test('R6 review: encoded resource extensions are rejected without throwing', () => {
+  for (const raw of [
+    'https://creator.example.com/app%2Ejs',
+    'https://creator.example.com/app%2ecss',
+    'https://creator.example.com/img%2Epng',
+    'https://creator.example.com/app%252Ejs',
+    'https://creator.example.com/app%.js',
+  ]) {
+    const decision = assessCrawlAdmission(raw);
+    assert.equal(decision.eligible, false, `expected rejection: ${raw}`);
+    assert.equal(decision.reasonCode, 'RESOURCE_EXTENSION', `unexpected reason for ${raw}`);
+    assert.equal(normalizeExternalUrl(raw), null, `normalize must reject: ${raw}`);
+  }
+  // Encoded dots outside a resource suffix, and legitimate encoded queries,
+  // stay eligible: decoding applies to extension classification only.
+  for (const raw of [
+    'https://creator.example.com/search?q=a%2Eb',
+    'https://creator.example.com/100%25leads',
+    'https://creator.example.com/guide',
+  ]) {
+    assert.deepEqual(assessCrawlAdmission(raw), { eligible: true, reasonCode: 'ELIGIBLE' }, raw);
+    assert.ok(normalizeExternalUrl(raw), `normalize must admit: ${raw}`);
+  }
+});
+
+// REVIEW FIX 2: an explicitly stored empty requestedUrl can never own retry
+// work, while a missing requestedUrl keeps backward-compatible behavior.
+test('R6 review: empty requestedUrl owns no retry, missing stays eligible', () => {
+  assert.equal(
+    communityAcquisitionRetryDirective([
+      { requestedUrl: '', surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'NETWORK_FAILURE' },
+    ] as never),
+    undefined,
+  );
+  const legacy = communityAcquisitionRetryDirective([
+    { surface: 'CREATOR_WEBSITES', required: true, outcome: 'ACQUISITION_FAILED', retryable: true, failureClass: 'NETWORK_FAILURE' },
+  ] as never);
+  assert.ok(legacy, 'missing requestedUrl preserves existing retry behavior');
+  assert.equal(legacy?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+// REVIEW FIX 3: discovered child/navigation URLs pass the shared admission
+// boundary before scoring, fetching, or queue-cap accounting.
+test('R6 review: rejected discovered children never reach fetch or navigation', async () => {
+  const fetched: string[] = [];
+  const result = await crawlExternalLinks(
+    ['https://creator.example.com/'],
+    [],
+    undefined,
+    (async (input) => {
+      fetched.push(String(input));
+      const url = String(input);
+      if (url === 'https://creator.example.com/') {
+        return html(
+          '<a href="/community-help.js">community files</a>' +
+            '<a href="https://g/">g community hub</a>' +
+            '<div data-href="/community-widget.css">x</div>' +
+            '<a href="/community-guide">community guide</a>',
+        );
+      }
+      return noInviteHtml();
+    }) as typeof fetch,
+  );
+  assert.ok(!fetched.some((url) => url.includes('community-help.js')), 'asset child must never be fetched');
+  assert.ok(!fetched.some((url) => url.includes('community-widget.css')), 'dynamic asset child must never be fetched');
+  assert.ok(!fetched.some((url) => url === 'https://g/'), 'dotless child must never be fetched');
+  assert.ok(fetched.some((url) => url === 'https://creator.example.com/community-guide'), 'legitimate child stays eligible');
+  const seedObservation = result.observations.find((item) => item.requestedUrl === 'https://creator.example.com/');
+  const drops = (seedObservation?.telemetry as { dropReasons?: Record<string, number> } | undefined)?.dropReasons || {};
+  assert.ok((drops['admission-rejected'] || 0) >= 3, `expected admission-rejected drops, got ${JSON.stringify(drops)}`);
+});
+
+// REVIEW FIX 4: admission-rejected sitemap inventory URLs never consume one
+// of the five seed slots.
+test('R6 review: rejected sitemap candidates do not consume the seed cap', async () => {
+  const { selectSameSiteSitemapSeedCandidates } = await import('./acquisitionLadder');
+  const eligible = [1, 2, 3, 4, 5].map((n) => ({ loc: `https://creator.example.com/community-${n}` }));
+  const seeds = selectSameSiteSitemapSeedCandidates(
+    'https://creator.example.com/',
+    [{ loc: 'https://creator.example.com/community-help.js' }, ...eligible],
+    'https://creator.example.com/sitemap.xml',
+    5,
+  );
+  assert.equal(seeds.length, 5);
+  assert.ok(!seeds.some((seed) => seed.url.includes('community-help.js')), 'rejected inventory URL must not take a slot');
+  for (const entry of eligible) {
+    assert.ok(seeds.some((seed) => seed.url === entry.loc), `eligible seed lost its slot: ${entry.loc}`);
+  }
+});
+
+// REVIEW FIX 6: scheme-less host:port keeps existing normalization behavior;
+// explicit non-HTTP schemes stay rejected; admission and normalization agree.
+test('R6 review: scheme-less host:port admitted, non-HTTP schemes rejected', () => {
+  assert.deepEqual(assessCrawlAdmission('example.com:8080/path'), { eligible: true, reasonCode: 'ELIGIBLE' });
+  const normalized = normalizeExternalUrl('example.com:8080/path');
+  assert.ok(normalized, 'normalize must admit scheme-less host:port');
+  assert.equal(new URL(normalized!.url).hostname, 'example.com');
+  assert.equal(new URL(normalized!.url).port, '8080');
+  assert.equal(assessCrawlAdmission('ftp://example.com/file').eligible, false);
+  assert.equal(assessCrawlAdmission('ftp://example.com/file').reasonCode, 'INVALID_SCHEME');
+  assert.equal(normalizeExternalUrl('ftp://example.com/file'), null);
+  // Agreement battery (youtube/discord wrappers excluded: normalization owns
+  // those classifications on top of admission).
+  const bothAdmit = ['https://g.co/', 'https://creator.example.com/guide', 'example.com:8080/path', 'http://[::1]/'];
+  for (const raw of bothAdmit) {
+    assert.ok(assessCrawlAdmission(raw).eligible && normalizeExternalUrl(raw), `both must admit: ${raw}`);
+  }
+  const bothReject = ['https://g/', 'https://i.ytimg.com/x.jpg', 'ftp://example.com/f', 'https://', 'https://.com/'];
+  for (const raw of bothReject) {
+    assert.ok(!assessCrawlAdmission(raw).eligible && !normalizeExternalUrl(raw), `both must reject: ${raw}`);
+  }
+});
+
+// Bookmap and legitimate trading discovery safety: the gate must not become
+// more aggressive toward genuine trading/community targets.
+test('R6 review: Bookmap and legitimate trading domains remain eligible', () => {
+  for (const raw of [
+    'https://bookmap.com/members/aff/go/spyda96?i=19',
+    'https://bookmap.com/',
+    'https://www.tradingview.com/',
+    'https://myfundedfutures.com/',
+    'https://apextraderfunding.com/member/aff/go/chartfanatics',
+  ]) {
+    assert.deepEqual(assessCrawlAdmission(raw), { eligible: true, reasonCode: 'ELIGIBLE' }, raw);
+    assert.ok(normalizeExternalUrl(raw), `normalize must admit: ${raw}`);
   }
 });

@@ -7,6 +7,12 @@ export type CrawlerAcquisitionMode = 'STATIC' | 'RENDERED';
  */
 export const CRAWL_DROP_REASONS = [
   'invalid-protocol',
+  /**
+   * Shared crawl admission rejection (R6): a discovered seed or navigation
+   * target failed VALIDATE or ASSET/RESOURCE checks and was excluded before
+   * scoring, fetching, or queue-cap accounting.
+   */
+  'admission-rejected',
   'cross-origin-disallowed',
   'score-zero',
   'hint-rejected',

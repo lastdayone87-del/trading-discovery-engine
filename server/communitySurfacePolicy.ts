@@ -354,41 +354,68 @@ export interface CrawlAdmissionDecision {
 const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|mp3|wav|ogg|avi|mov|zip|gz|rar|7z|exe|dmg)(?:$)/i;
 
 export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
-  const candidates = [rawUrl, /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`];
-  for (const candidate of candidates) {
-    let parsed: URL;
-    try {
-      parsed = new URL(candidate);
-    } catch {
-      continue;
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return { eligible: false, reasonCode: 'INVALID_SCHEME' };
-    }
-    const rawHost = parsed.hostname;
-    // A single trailing dot is DNS-equivalent noise (same stripping as the
-    // asset filter) and must not turn a single-label host into a dotted one.
-    const host = rawHost.toLowerCase().replace(/\.$/, '');
-    if (!host) return { eligible: false, reasonCode: 'EMPTY_HOST' };
-    // Bracketed IP literals (IPv6) are genuine website targets under the
-    // existing URL model (same carve-out as `isDotlessHostnameUrl`).
-    if (!rawHost.startsWith('[')) {
-      // Same dotless semantic as `isDotlessHostnameUrl`: a single-label host
-      // has no public domain. No second validation system.
-      if (!host.includes('.')) return { eligible: false, reasonCode: 'DOTLESS_HOST' };
-      if (host.split('.').some(label => label.length === 0)) {
-        return { eligible: false, reasonCode: 'EMPTY_LABEL' };
-      }
-    }
-    if (isPageAssetInfrastructureUrl(parsed.toString())) {
-      return { eligible: false, reasonCode: 'ASSET_HOST' };
-    }
-    if (RESOURCE_PATH_EXTENSION.test(parsed.pathname)) {
-      return { eligible: false, reasonCode: 'RESOURCE_EXTENSION' };
-    }
-    return { eligible: true, reasonCode: 'ELIGIBLE' };
+  // Same scheme handling as `normalizeExternalUrl`: scheme-less input gets
+  // the https fallback BEFORE parsing, so `example.com:8080/path` is read as
+  // a host:port URL rather than an opaque `example.com:` scheme. A present
+  // scheme is honored as-is (dots excluded from scheme detection so dotted
+  // host:port pairs are never misread as schemes): explicit non-HTTP schemes
+  // (ftp:, mailto:, ...) fail closed below, and admission never disagrees
+  // with normalization about the same candidate.
+  const hasExplicitScheme = /^[a-zA-Z][a-zA-Z0-9+-]*:/.test(rawUrl);
+  const candidate = hasExplicitScheme ? rawUrl : `https://${rawUrl}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return { eligible: false, reasonCode: 'INVALID_URL' };
   }
-  return { eligible: false, reasonCode: 'INVALID_URL' };
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { eligible: false, reasonCode: 'INVALID_SCHEME' };
+  }
+  const rawHost = parsed.hostname;
+  // A single trailing dot is DNS-equivalent noise (same stripping as the
+  // asset filter) and must not turn a single-label host into a dotted one.
+  const host = rawHost.toLowerCase().replace(/\.$/, '');
+  if (!host) return { eligible: false, reasonCode: 'EMPTY_HOST' };
+  // Bracketed IP literals (IPv6) are genuine website targets under the
+  // existing URL model (same carve-out as `isDotlessHostnameUrl`).
+  if (!rawHost.startsWith('[')) {
+    // Same dotless semantic as `isDotlessHostnameUrl`: a single-label host
+    // has no public domain. No second validation system.
+    if (!host.includes('.')) return { eligible: false, reasonCode: 'DOTLESS_HOST' };
+    if (host.split('.').some(label => label.length === 0)) {
+      return { eligible: false, reasonCode: 'EMPTY_LABEL' };
+    }
+  }
+  if (isPageAssetInfrastructureUrl(parsed.toString())) {
+    return { eligible: false, reasonCode: 'ASSET_HOST' };
+  }
+  if (RESOURCE_PATH_EXTENSION.test(decodeResourcePathname(parsed.pathname))) {
+    return { eligible: false, reasonCode: 'RESOURCE_EXTENSION' };
+  }
+  return { eligible: true, reasonCode: 'ELIGIBLE' };
+}
+
+/**
+ * Decodes a pathname for resource-extension classification only (never for
+ * fetching): percent-encoded dots (`/app%2Ejs`) must not bypass the check.
+ * Decodes repeatedly (bounded) so double-encoded suffixes are also caught;
+ * malformed sequences throw and fall back to the last decodable form, never
+ * out of this function.
+ */
+function decodeResourcePathname(pathname: string): string {
+  let current = pathname;
+  for (let i = 0; i < 3; i++) {
+    if (!/%[0-9a-fA-F]{2}/.test(current)) break;
+    try {
+      const decoded = decodeURIComponent(current);
+      if (decoded === current) break;
+      current = decoded;
+    } catch {
+      break;
+    }
+  }
+  return current;
 }
 
 /**
