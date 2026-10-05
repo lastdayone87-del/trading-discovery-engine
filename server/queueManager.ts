@@ -3,6 +3,7 @@ import {
   getDb,
   enqueueJob,
   claimNextJob,
+  type ClaimBudgetGuard,
   completeJob,
   failJob,
   recoverStaleJobs,
@@ -371,6 +372,50 @@ export function isBudgetedCorpusClaimAdmitted(args: { paused: unknown; dailyBudg
 }
 
 /**
+ * Atomic daily-budget guards evaluated inside the claim transaction (see
+ * claimNextJob): each takes its control row FOR UPDATE — serializing
+ * check-then-claim across replicas/processes — then admits only with
+ * remaining headroom counting both completed units and in-flight claims
+ * made today. Denial filters the guarded types out of the claim (jobs stay
+ * queued); pause/kill-switch semantics are unchanged and evaluated first by
+ * the claim builder. No other caller is affected: guards apply only when the
+ * claim filter overlaps their types.
+ */
+export const TERM_HARVEST_BUDGET_GUARD: ClaimBudgetGuard = {
+  types: ['TERM_HARVEST'],
+  lockSql: `SELECT * FROM corpus_controls WHERE singleton=true FOR UPDATE`,
+  isAdmitted: async (client) => {
+    const control = await client.query(`SELECT paused,daily_compute_documents AS budget FROM corpus_controls WHERE singleton=true`);
+    if (!control.rows.length) return false;
+    const consumed = await client.query(`SELECT count(*)::int AS n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`);
+    const inFlight = await client.query(`SELECT count(*)::int AS n FROM jobs WHERE type='TERM_HARVEST' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`);
+    return isBudgetedCorpusClaimAdmitted({
+      paused: control.rows[0].paused,
+      dailyBudget: control.rows[0].budget,
+      consumedToday: Number(consumed.rows[0]?.n || 0) + Number(inFlight.rows[0]?.n || 0),
+    });
+  },
+};
+
+export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
+  types: ['SCORE_CANDIDATES'],
+  lockSql: `SELECT * FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`,
+  isAdmitted: async (client) => {
+    const control = await client.query(`SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls WHERE singleton=true`);
+    if (!control.rows.length) return false;
+    const spent = await client.query(`SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
+    const inFlight = await client.query(`SELECT count(*)::int AS n FROM jobs WHERE type='SCORE_CANDIDATES' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`);
+    return isBudgetedCorpusClaimAdmitted({
+      paused: control.rows[0].paused,
+      dailyBudget: control.rows[0].budget,
+      consumedToday: Number(spent.rows[0]?.n || 0) + Number(inFlight.rows[0]?.n || 0),
+    });
+  },
+};
+
+export const CORPUS_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD];
+
+/**
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
@@ -444,32 +489,20 @@ export async function processNextSearchJob(
     claimableTypes.push('RELATIONSHIP_CANARY_EXPANSION');
   }
   if (!claimableOverride || claimableOverride.includes('TERM_HARVEST')) {
-    const db=await getDb();const control=await db.query(`SELECT paused,daily_compute_documents FROM corpus_controls WHERE singleton=true`);
-    if(control.rowCount&&!control.rows[0].paused){
-      // Budget-aware admission: when the daily budget is already exhausted,
-      // leave jobs queued for the next window instead of claiming them into
-      // attempt-burning budget failures. The corpus worker is the sole
-      // consumer of this type, so the check-then-claim has no race.
-      const consumed=await db.query(`SELECT count(*)::int n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`);
-      if(isBudgetedCorpusClaimAdmitted({paused:control.rows[0].paused,dailyBudget:control.rows[0].daily_compute_documents,consumedToday:consumed.rows[0]?.n}))claimableTypes.push('TERM_HARVEST');
-    }
+    const db=await getDb();const control=await db.query(`SELECT paused FROM corpus_controls WHERE singleton=true`);
+    if(control.rowCount&&!control.rows[0].paused)claimableTypes.push('TERM_HARVEST');
   }
   if(!claimableOverride||claimableOverride.includes('PROPOSE_CONCEPT_RESOLUTION')){const db=await getDb();const control=await db.query('SELECT resolution_paused FROM concept_graph_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].resolution_paused)claimableTypes.push('PROPOSE_CONCEPT_RESOLUTION');}
   if(!claimableOverride||claimableOverride.includes('OFFLINE_CANDIDATE_EVALUATION')){const db=await getDb();const control=await db.query('SELECT evaluation_paused,provider_access_allowed FROM offline_evaluation_controls WHERE singleton=true');if(control.rowCount&&!control.rows[0].evaluation_paused&&!control.rows[0].provider_access_allowed)claimableTypes.push('OFFLINE_CANDIDATE_EVALUATION');}
   if (!claimableOverride || claimableOverride.includes('SCORE_CANDIDATES') || claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')) {
-    const db=await getDb();const control=await db.query(`SELECT scoring_paused,ai_paused,daily_scoring_candidates FROM candidate_scoring_controls WHERE singleton=true`);
-    if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES'))){
-      // Same budget-aware admission as harvest: exhausted daily budget leaves
-      // jobs queued instead of burning attempts on inevitable budget throws.
-      const spent=await db.query(`SELECT count(*)::int n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
-      if(isBudgetedCorpusClaimAdmitted({paused:control.rows[0].scoring_paused,dailyBudget:control.rows[0].daily_scoring_candidates,consumedToday:spent.rows[0]?.n}))claimableTypes.push('SCORE_CANDIDATES');
-    }
+    const db=await getDb();const control=await db.query(`SELECT scoring_paused,ai_paused FROM candidate_scoring_controls WHERE singleton=true`);
+    if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES')))claimableTypes.push('SCORE_CANDIDATES');
     if(control.rowCount&&!control.rows[0].ai_paused&&(!claimableOverride||claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')))claimableTypes.push('AI_ADJUDICATE_CANDIDATE');
   }
   if (claimableTypes.length === 0) return false;
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
-  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED']);
+  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], CORPUS_CLAIM_BUDGET_GUARDS);
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');

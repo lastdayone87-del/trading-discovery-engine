@@ -19,32 +19,31 @@ test('corpus pipeline worker uses the existing claim path on a one-second tick',
   // Single consumer: exactly one worker id, no concurrency loop or env scaling.
   assert.match(workers, /startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/);
   assert.doesNotMatch(workers, /CORPUS_PIPELINE.*concurrency|corpus.*CONCURRENCY/);
-  // Cross-replica serialization: the turn lock wraps the claim so two server
-  // processes cannot both observe budget headroom and overshoot the cap.
-  assert.match(workers, /pg_try_advisory_lock\(hashtext\(\$1\)\)/);
-  assert.match(workers, /pg_advisory_unlock\(hashtext\(\$1\)\)/);
+  // Cross-replica safety lives at the claim boundary (budget guard row lock
+  // inside claimNextJob), not in this tick: no in-process lock here.
+  assert.doesNotMatch(workers, /pg_try_advisory_lock|pg_advisory_unlock/);
 });
 
-const canStartWorkers = !process.env.DATABASE_URL;
-const maybeStart = canStartWorkers ? test : test.skip;
-
-maybeStart('corpus pipeline starts from operational maintenance startup', async () => {
-  const { startOperationalMaintenanceWorkers, getCorpusPipelineWorkerHealth } =
-    await import('./operationalMaintenanceWorkers');
-  // Behavioral: invoking startup actually starts the worker. Skipped when
-  // DATABASE_URL is set (CI): live ticks would claim and dispatch real jobs
-  // against that database. Without DATABASE_URL ticks fail safe (no DB) and
-  // reschedule unref'd.
-  startOperationalMaintenanceWorkers();
-  const health = getCorpusPipelineWorkerHealth();
-  assert.equal(health.started, true);
-  assert.ok(health.startedAt);
+test('budget guards are defined for exactly the corpus claim types', async () => {
+  const { TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD, CORPUS_CLAIM_BUDGET_GUARDS } =
+    await import('./queueManager');
+  assert.deepEqual(TERM_HARVEST_BUDGET_GUARD.types, ['TERM_HARVEST']);
+  assert.deepEqual(SCORE_CANDIDATES_BUDGET_GUARD.types, ['SCORE_CANDIDATES']);
+  assert.deepEqual(CORPUS_CLAIM_BUDGET_GUARDS, [TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD]);
+  for (const guard of CORPUS_CLAIM_BUDGET_GUARDS) {
+    assert.match(guard.lockSql, /FOR UPDATE/);
+  }
+  // The claim path passes the guards into claimNextJob, where admission is
+  // evaluated atomically inside the claim transaction.
+  assert.match(queueManager, /claimNextJob\(workerId, claimableTypes, browserBlockedRetryPatterns, \['RECONCILIATION_REQUIRED'\], CORPUS_CLAIM_BUDGET_GUARDS\)/);
 });
 
 test('corpus pipeline invocation lives inside the starter body', () => {
-  // Scoped backstop (always runs, no side effects): the invocation sits
-  // inside startOperationalMaintenanceWorkers itself, so deleting the call
-  // fails even though the worker definition remains elsewhere in the file.
+  // No workers are started by this suite: invoking startup would claim real
+  // jobs when DATABASE_URL is configured (live-DB claim coverage lives in
+  // corpusClaimBudget.postgres.test.ts instead). The starter-body slice must
+  // contain the invocation, so deleting the call fails even though the worker
+  // definition remains elsewhere in the file.
   const starterBody = workers.slice(
     workers.indexOf('export function startOperationalMaintenanceWorkers'),
     workers.indexOf('export function getOperationalMaintenanceJobTypesForTests')
@@ -72,10 +71,12 @@ test('budget-gated admission excludes paused and exhausted controls', async () =
 test('corpus claim types stay authorized by their existing paused controls', () => {
   // The claim builder routes both types through the budgeted admission
   // decision above; removing that call re-admits paused/exhausted controls.
-  assert.match(queueManager, /isBudgetedCorpusClaimAdmitted\(\{paused:control\.rows\[0\]\.paused/);
+  // Budget reads live in the atomic guards (evaluated inside the claim
+  // transaction), with the builder keeping its original paused-only checks.
+  assert.match(queueManager, /isBudgetedCorpusClaimAdmitted\(\{\s*paused:\s*control\.rows\[0\]\.paused/);
   assert.match(queueManager, /claimableOverride\.includes\('TERM_HARVEST'\)/);
-  assert.match(queueManager, /SELECT paused,daily_compute_documents FROM corpus_controls/);
-  assert.match(queueManager, /SELECT scoring_paused,ai_paused,daily_scoring_candidates FROM candidate_scoring_controls/);
+  assert.match(queueManager, /SELECT paused,daily_compute_documents AS budget FROM corpus_controls/);
+  assert.match(queueManager, /SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls/);
 });
 
 test('harvest producer/consumer share the exact extractor version contract', async () => {

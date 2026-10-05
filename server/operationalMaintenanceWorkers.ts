@@ -306,48 +306,14 @@ function startCorpusPipelineWorker(workerId: string): void {
   const tick = async () => {
     corpusPipelineHealth.ticks += 1;
     corpusPipelineHealth.lastTickAt = new Date().toISOString();
-    // Globally serialize corpus claims across server replicas/processes: the
-    // claim-time budget read and claimNextJob run in separate transactions,
-    // so two consumers could otherwise both observe headroom and overshoot
-    // the daily cap. A best-effort advisory turn lock makes check-then-claim
-    // atomic; the loser skips quietly until the next tick. Lock failures fall
-    // through to the normal path, which fails safe on its own.
-    let lockClient: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<{ locked?: boolean }> }>; release: () => void } | null = null;
-    let turnHeld = false;
     try {
-      try {
-        const { getDb } = await import('./db');
-        const db = await getDb();
-        lockClient = await db.connect();
-        const res = await lockClient.query(`SELECT pg_try_advisory_lock(hashtext($1)) AS locked`, ['corpus-pipeline-claim']);
-        turnHeld = res.rows[0]?.locked === true;
-      } catch {
-        if (lockClient) {
-          try { lockClient.release(); } catch { /* already closed */ }
-          lockClient = null;
-        }
-      }
-      if (lockClient && !turnHeld) {
-        lockClient.release();
-        lockClient = null;
+      const claimed = await processNextSearchJob(CORPUS_PIPELINE_TYPES, workerId);
+      if (claimed) {
+        corpusPipelineHealth.claimed += 1;
+        corpusPipelineHealth.lastOutcome = 'CLAIMED';
+      } else {
         corpusPipelineHealth.noWork += 1;
         corpusPipelineHealth.lastOutcome = 'NO_DUE_JOB';
-        return;
-      }
-      try {
-        const claimed = await processNextSearchJob(CORPUS_PIPELINE_TYPES, workerId);
-        if (claimed) {
-          corpusPipelineHealth.claimed += 1;
-          corpusPipelineHealth.lastOutcome = 'CLAIMED';
-        } else {
-          corpusPipelineHealth.noWork += 1;
-          corpusPipelineHealth.lastOutcome = 'NO_DUE_JOB';
-        }
-      } finally {
-        if (lockClient) {
-          try { await lockClient.query(`SELECT pg_advisory_unlock(hashtext($1))`, ['corpus-pipeline-claim']); } catch { /* already closed */ }
-          lockClient.release();
-        }
       }
     } catch (error) {
       corpusPipelineHealth.errors += 1;
