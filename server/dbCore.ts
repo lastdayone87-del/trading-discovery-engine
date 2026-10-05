@@ -236,7 +236,15 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
   const client = await db.connect();
   try {
     await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_ADVISORY_LOCK]);
-    await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    // Least-privilege compatible: only attempt CREATE when the table is
+    // genuinely absent (fresh database). An unconditional CREATE TABLE fails
+    // for roles without schema CREATE even though every migration is already
+    // applied — blocking paths that need no DDL. Behavior is otherwise
+    // identical: existing databases skip straight to the version scan below.
+    const migrationTable = await client.query(`SELECT to_regclass('public.schema_migrations') AS oid`);
+    if (!migrationTable.rows[0]?.oid) {
+      await client.query(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    }
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
