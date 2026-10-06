@@ -306,28 +306,34 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       actor: 'test:research-e2e',
     })) as unknown as {
       decision: string;
-      candidate: { effectiveSampleSize: number; unsupportedTargetActions: number };
-      baseline: { effectiveSampleSize: number; unsupportedTargetActions: number };
-      incrementalDifference: number;
-      confidenceInterval: { lower: number; upper: number };
-      segmentGuardrails: Record<string, { pass: boolean }>;
+      metrics: {
+        candidate: { effectiveSampleSize: number; unsupportedTargetActions: number };
+        baseline: { effectiveSampleSize: number; unsupportedTargetActions: number };
+        incrementalDifference: number;
+        confidenceInterval: { lower: number; upper: number };
+        segmentGuardrails: Record<string, { pass: boolean }>;
+      };
     };
+    // evaluatePersistentResearchPolicy returns the evaluation ROW: statistics
+    // live under metrics; decision is top-level.
+    const metrics = evaluation.metrics;
+    assert.ok(metrics && metrics.candidate && metrics.baseline, 'evaluation must carry metrics');
     console.log(
       `E2E evaluation decision=${evaluation.decision} ` +
-        `candidateN=${evaluation.candidate.effectiveSampleSize} baselineN=${evaluation.baseline.effectiveSampleSize} ` +
-        `diff=${evaluation.incrementalDifference} ci=[${evaluation.confidenceInterval.lower},${evaluation.confidenceInterval.upper}]`
+        `candidateN=${metrics.candidate.effectiveSampleSize} baselineN=${metrics.baseline.effectiveSampleSize} ` +
+        `diff=${metrics.incrementalDifference} ci=[${metrics.confidenceInterval.lower},${metrics.confidenceInterval.upper}]`
     );
     assert.equal(evaluation.decision, 'PASS', 'designed data must genuinely PASS');
-    assert.ok(evaluation.candidate.effectiveSampleSize >= 30, 'candidate needs ≥30 effective samples');
-    assert.ok(evaluation.baseline.effectiveSampleSize >= 30, 'baseline needs ≥30 effective samples');
-    assert.equal(evaluation.candidate.unsupportedTargetActions, 0, 'no unsupported candidate actions');
-    assert.equal(evaluation.baseline.unsupportedTargetActions, 0, 'no unsupported baseline actions');
-    assert.ok(evaluation.incrementalDifference > 0, 'candidate must improve on baseline');
+    assert.ok(metrics.candidate.effectiveSampleSize >= 30, 'candidate needs ≥30 effective samples');
+    assert.ok(metrics.baseline.effectiveSampleSize >= 30, 'baseline needs ≥30 effective samples');
+    assert.equal(metrics.candidate.unsupportedTargetActions, 0, 'no unsupported candidate actions');
+    assert.equal(metrics.baseline.unsupportedTargetActions, 0, 'no unsupported baseline actions');
+    assert.ok(metrics.incrementalDifference > 0, 'candidate must improve on baseline');
     assert.ok(
-      evaluation.confidenceInterval.lower > 0,
+      metrics.confidenceInterval.lower > 0,
       'improvement confidence interval must exclude zero'
     );
-    const guardrails = Object.values(evaluation.segmentGuardrails || {});
+    const guardrails = Object.values(metrics.segmentGuardrails || {});
     assert.ok(guardrails.length > 0, 'at least one segment guardrail must be evaluated');
     assert.ok(
       guardrails.every(entry => entry.pass),
