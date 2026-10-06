@@ -7,8 +7,8 @@ import assert from 'node:assert/strict';
  *
  *   bootstrap creation → bounded allocation (2 runs × 30) → real cycle driver
  *   → outcomes → effective samples → policy evaluation (genuine PASS) →
- *   promotion attempt (fail-closed on main) → CANARY gate negative → CANARY
- *   operation with genuine PASS evidence.
+ *   governed promotion DRAFT→APPROVED→CANARY on that PASS → PASS-backed
+ *   CANARY allocation (with pre-evidence CANARY refusal asserted first).
  *
  * Run ONLY with an explicitly provided dedicated test database:
  *
@@ -38,11 +38,12 @@ import assert from 'node:assert/strict';
  *
  * Promotion/CANARY boundary (explicitly preserved): the suite NEVER writes
  * portfolio_policy_evaluations. The persistent-research PASS evaluation is
- * genuine; the canonical CANARY/promotion path's refusal (its required legacy
- * evidence is not supplied by the persistent evaluator) is documented, not
- * bypassed. The CANARY status flip itself is harness-only setup (that flip is
- * what is broken on main); the PASS-evidence gate is genuinely exercised in
- * both directions (rejected before evidence, allocating after).
+ * genuine, and governed promotion consumes exactly that artifact (PASS with
+ * non-null baseline for the promoted candidate). The CANARY status reached in
+ * stage 5 purely to set up the pre-evidence refusal remains harness-only
+ * setup; every status change after the PASS goes through transitionPolicy.
+ * The PASS-evidence gate is genuinely exercised in both directions (rejected
+ * before evidence, allocating after).
  */
 const dedicated = process.env.RESEARCH_E2E_TEST_DATABASE_URL;
 
