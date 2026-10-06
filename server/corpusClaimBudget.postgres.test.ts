@@ -71,7 +71,7 @@ async function assertIsolatedTestDb(database: Db) {
   assert.equal(
     Number(live.rows[0]?.n || 0),
     0,
-    'refusing to run while harvest/scoring jobs are live: a worker may be active on this database'
+    'refusing to run while harvest/scoring/resolution jobs are live: a worker may be active on this database'
   );
 }
 
@@ -638,9 +638,8 @@ maybe('processed resolution job transitions to COMPLETED, never stuck PROCESSING
     )
   ).rows[0];
   const jobIds: string[] = [];
-  // term_surfaces rows are append-only; the unique per-run literal keeps
-  // reruns deterministic without deleting them.
-  const surfaceLiterals: string[] = [`test resolution complete ${tag}`];
+  // term_surfaces rows are append-only; resolutionPayload() generates a unique
+  // per-run surface literal, keeping reruns deterministic without deleting them.
   try {
     await database.query(
       `UPDATE concept_graph_controls SET resolution_paused=false, daily_resolution_documents=$1 WHERE singleton=true`,
