@@ -891,20 +891,27 @@ maybe('allocation cannot commit against a concurrently paused candidate', async 
   });
   try {
     await configureBootstrapArming({ runId: run.id, actor: 'test:research-bootstrap', reason: `test pauserace-arm:${tag}` });
-    // Hold the policy row lock, start allocation (it must wait at the policy
-    // lock in control → run → policy order), then pause and release: the
-    // allocator must observe PAUSED and abort without allocating.
+    // Hold the policy row lock and start allocation: it must block at the
+    // policy lock (control → run → policy order) instead of racing ahead.
     const holder = await (await getDb()).connect();
     await holder.query('BEGIN');
     await holder.query(`SELECT * FROM portfolio_policies WHERE id=$1 FOR UPDATE`, [policy.id]);
     const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
-    const pending = allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
-    await new Promise(resolve => setTimeout(resolve, 400));
-    const pauser = database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
-    await new Promise(resolve => setTimeout(resolve, 200));
+    let settled = false;
+    const pending = allocateBootstrapAssignments(control, new Date().toISOString(), run.id).then(
+      result => {
+        settled = true;
+        return result;
+      }
+    );
+    await new Promise(resolve => setTimeout(resolve, 500));
+    assert.equal(settled, false, 'allocator must wait on the held policy lock');
+    // Pause and release atomically in the holder transaction: no interleaving
+    // is possible between the release and the pause, so the allocator must
+    // observe PAUSED and abort without allocating.
+    await holder.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
     await holder.query('COMMIT');
     holder.release();
-    await pauser;
     const result = await pending;
     assert.equal(result.allocated, 0, 'no allocation against a paused candidate');
     const status = (
