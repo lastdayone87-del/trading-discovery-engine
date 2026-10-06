@@ -489,6 +489,37 @@ export function isPossiblyTruncatedPath(rawUrl: string, siblingPaths: Set<string
 }
 
 /**
+ * Affiliate/referral query-parameter key families, matched per key
+ * (case-insensitive) with common `Id`/`Code` variants: `referralCode` and
+ * `aff_id` match via their `referral`/`aff` stems, while bare `id`, `code`,
+ * `cid`, `sid`, and arbitrary unfamiliar keys (e.g. `utm_source`, `fbclid`)
+ * never match — the rule fails open so unknown tracking stays eligible.
+ * Used ONLY for final-outcome failure ownership, never admission or ranking.
+ */
+const AFFILIATE_QUERY_FAMILIES = new Set([
+  'ref',
+  'referral',
+  'aff',
+  'affiliate',
+  'partner',
+  'campaign',
+  'promo',
+  'coupon',
+  'parrainage',
+  'cpa',
+]);
+
+function affiliateQueryKeyMatches(rawKey: string): boolean {
+  const key = String(rawKey || '').toLowerCase();
+  if (!key) return false;
+  const stems = [
+    key,
+    key.replace(/[-_](id|code)$/, ''),
+    key.replace(/(id|code)$/, '').replace(/[-_.]$/, ''),
+  ];
+  return stems.some(stem => AFFILIATE_QUERY_FAMILIES.has(stem));
+}
+/**
  * Affiliate/commerce meaning carried by a hostname itself, matched per
  * segment (split on '.' and '-'), never by substring: `investing-referral`
  * matches via segment `referral`, while `referralx`, `myreferral`, or
@@ -556,6 +587,21 @@ const AUXILIARY_COMMERCE_SUFFIXES = [
 ];
 
 /**
+ * The single URL-selection rule for final-outcome ownership and retry
+ * classification: the actually fetched resource (`requestedUrl`), falling
+ * back to the seed provenance (`rootUrl`) only when requested is missing.
+ * Both the outcome-ownership filter and the retry predicate use this rule,
+ * so retry ownership can never disagree with final outcome ownership about
+ * which URL was judged. (The dotless check in `isMeaningfulWebsiteObservation`
+ * intentionally keeps its own root-first order — a distinct concern.)
+ */
+export function acquisitionOwnershipUrl(item: { rootUrl?: unknown; requestedUrl?: unknown }): string {
+  const requested = typeof item.requestedUrl === 'string' ? item.requestedUrl : '';
+  if (requested) return requested;
+  return typeof item.rootUrl === 'string' ? item.rootUrl : '';
+}
+
+/**
  * Whether a URL is auxiliary/demoted for FINAL-OUTCOME purposes: its failure
  * must not independently own the channel-level Discord acquisition outcome
  * or retry. This is a failure-ownership boundary only — it never affects
@@ -582,6 +628,12 @@ export function isAuxiliaryForOutcome(rawUrl: string): boolean {
   if (!host) return false;
   if (isKnownBrokerOrExchangeHost(host)) return true;
   if (AFFILIATE_HINT.test(rawUrl)) return true;
+  // Affiliate query keys (fail-open: only the documented families match).
+  // Evaluated on the live query string; bare `ref` survives normalization
+  // precisely so this signal reaches classification (see normalizeExternalUrl).
+  for (const key of parsed.searchParams.keys()) {
+    if (affiliateQueryKeyMatches(key)) return true;
+  }
   const segments = host
     .split('.')
     .flatMap(label => label.split('-'))

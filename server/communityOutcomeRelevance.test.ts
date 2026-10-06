@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { runChannelInspection } from './inspector';
-import { isAuxiliaryForOutcome } from './communitySurfacePolicy';
+import {
+  runChannelInspection,
+  isCommunityRelevantObservation,
+  summarizeEffectiveLinkedWebsiteAcquisition,
+  summarizeLinkedWebsiteAcquisition,
+  normalizeExternalUrl,
+} from './inspector';
+import { isAuxiliaryForOutcome, acquisitionOwnershipUrl } from './communitySurfacePolicy';
 import {
   communityAcquisitionRetryDirective,
   hasRetryableCommunityAcquisitionFailure,
+  isCommunityRetryableObservation,
 } from './communityRetryPolicy';
 import { decideJobFailure } from './db';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
@@ -40,7 +47,12 @@ const fillers = ['one', 'two', 'three', 'four', 'five'];
 const isolatedStore = () => ({ read: async () => [], write: async () => {}, recordLinks: async () => {} });
 const noHistory = (async () => []) as never;
 
-async function inspect(channelLinks: string[], fetchImpl: typeof fetch, renderedFallback: typeof emptyRendered) {
+async function inspect(
+  channelLinks: string[],
+  fetchImpl: typeof fetch,
+  renderedFallback: typeof emptyRendered,
+  historyLoader: never = noHistory,
+) {
   const renderedCalls: string[] = [];
   const result = await runChannelInspection({
     channelId: `aux-${Math.random().toString(36).slice(2)}`,
@@ -54,11 +66,19 @@ async function inspect(channelLinks: string[], fetchImpl: typeof fetch, rendered
       renderedCalls.push(seedUrl);
       return renderedFallback(seedUrl);
     }) as typeof emptyRendered,
-    urlFailureHistoryLoader: noHistory,
+    urlFailureHistoryLoader: historyLoader,
     siteInspectionStore: isolatedStore(),
   } as never);
   return { result, renderedCalls };
 }
+
+const cappedHistoryFor = (url: string) =>
+  Array.from({ length: 5 }, (_, index) => ({
+    requestedUrl: url,
+    failureClass: 'HTTP_ERROR',
+    outcome: 'ACQUISITION_FAILED',
+    observedAt: new Date(Date.UTC(2026, 8, 10 - index, 12)).toISOString(),
+  }));
 
 const relevant5 = [
   'https://creator.example.com/',
@@ -68,7 +88,10 @@ const relevant5 = [
   'https://creator.example.com/contact',
 ];
 
-// 1. Five clean relevant pages + one failed affiliate URL → clean, no channel retry.
+// 1. Five clean relevant pages + one retryably-failed affiliate URL (HTTP 500
+// static, incomplete rendered) → clean, no channel retry. Non-vacuous: the
+// raw auxiliary row stays a genuinely retryable failure, so only the
+// auxiliary classifier can explain the clean channel outcome.
 test('auxiliary outcome: affiliate-only failure cannot own the final Discord outcome', async () => {
   const fetched: string[] = [];
   const { result, renderedCalls } = await inspect(
@@ -76,10 +99,13 @@ test('auxiliary outcome: affiliate-only failure cannot own the final Discord out
     (async (input) => {
       const url = String(input);
       fetched.push(url);
-      if (url.includes('investing-referral.com')) return httpError(403)(input);
+      if (url.includes('investing-referral.com')) return httpError(500)(input);
       return noInviteHtml();
     }) as typeof fetch,
-    emptyRendered,
+    (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      if (seedUrl.includes('investing-referral.com')) return timeoutRendered(seedUrl);
+      return emptyRendered(seedUrl);
+    }) as typeof emptyRendered,
   );
   assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
   assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
@@ -87,18 +113,25 @@ test('auxiliary outcome: affiliate-only failure cannot own the final Discord out
   // Crawling/recall preserved: the affiliate URL was still attempted.
   assert.ok(fetched.some((url) => url.includes('investing-referral.com')));
   assert.ok(renderedCalls.some((url) => url.includes('investing-referral.com')));
-  // Telemetry preserved: the rendered observation row still exists with its
-  // pre-existing required:true stage flag — but relevance filtering keeps it
-  // out of outcome ownership and retry (proven by the clean status and the
-  // undefined directive above, plus the predicate check below).
+  // The raw auxiliary failure is genuinely retryable at the observation
+  // level — the test would be vacuous (pass without the guard) otherwise.
   const auxRows = (result.acquisitionOutcomes || []).filter((item) =>
     item.requestedUrl.includes('investing-referral.com'),
   );
   assert.ok(auxRows.length > 0, 'auxiliary telemetry must be preserved, not discarded');
+  assert.ok(
+    auxRows.some((item) => item.outcome === 'ACQUISITION_FAILED' && item.retryable),
+    'fixture must hold a genuinely retryable auxiliary failure',
+  );
+  // …yet it owns neither retry nor outcome.
   assert.equal(
     hasRetryableCommunityAcquisitionFailure(auxRows as never),
     false,
     'auxiliary rows must never own retry regardless of stage flags',
+  );
+  assert.equal(
+    communityAcquisitionRetryDirective(auxRows.filter((item) => item.required) as never),
+    undefined,
   );
 });
 
@@ -128,7 +161,7 @@ test('auxiliary outcome: valid Discord survives an auxiliary failure', async () 
     externalFetchImpl: (async (input) => {
       const url = String(input);
       if (url.includes('/vip')) return html('Join https://discord.gg/vip-room');
-      if (url.includes('shop.example.com')) return httpError(403)(input);
+      if (url.includes('shop.example.com')) return httpError(500)(input);
       return noInviteHtml();
     }) as typeof fetch,
     renderedFallback: emptyRendered,
@@ -268,7 +301,6 @@ test('auxiliary outcome: genuine failures remain retryable, exhaustion stays bou
 
 // 10-11. Asset/resource admission: .css.map rejected; .js/.css/images intact.
 test('auxiliary outcome: sourcemap and asset extensions never become website seeds', async () => {
-  const { normalizeExternalUrl } = await import('./inspector');
   for (const raw of [
     'https://creator.example.com/app.css.map',
     'https://creator.example.com/app.js.map',
@@ -327,7 +359,11 @@ test('auxiliary outcome: rendered success supersedes static failure', async () =
   assert.equal(result.foundInvite, 'rendered-room');
 });
 
-// 13. Click failures with processed pages are not final failures.
+// 13. Real click failure/noise with processed pages is not a final failure.
+// Clicks are opportunistic traversal, never acquisition evidence: 3 clicks
+// attempted with 3 click-level failures on top of 3 successfully inspected
+// pages must still resolve clean. If click outcomes ever fed the acquisition
+// outcome, this fixture (clicksFailed > 0, complete) would flip to failure.
 test('auxiliary outcome: click failures never decide the outcome', async () => {
   const result = await runChannelInspection({
     channelId: 'aux-clicks',
@@ -342,11 +378,16 @@ test('auxiliary outcome: click failures never decide the outcome', async () => {
       foundLocation: seedUrl,
       candidates: [],
       inspectedPages: 3,
-      scrolls: 0,
-      clicks: 0,
+      scrolls: 1,
+      clicks: 3,
       complete: true,
       retryable: false,
-      detail: 'clean despite click noise elsewhere',
+      telemetry: {
+        clicksStarted: 5,
+        clicksSucceeded: 2,
+        clicksFailed: 3,
+      } as never,
+      detail: 'clean inspection with click-level noise elsewhere',
     })),
     urlFailureHistoryLoader: noHistory,
     siteInspectionStore: isolatedStore(),
@@ -407,4 +448,249 @@ test('auxiliary outcome: pending retries never equal exhausted retries', () => {
     true,
   );
   assert.equal(decideJobFailure(new Error('x'), 0, 5, Date.now()).disposition !== 'FAILED', true);
+});
+
+// 17. Query-only affiliate signal survives normalization: a bare `?ref=`
+// link is auxiliary even though it carries no affiliate path or host
+// segment, and its failure cannot own the outcome.
+test('auxiliary outcome: query-only ref link stays auxiliary end to end', async () => {
+  const refUrl = 'https://creator.example.com/?ref=BRANDON';
+  assert.ok(normalizeExternalUrl(refUrl), 'bare-ref URL must still be admitted for crawling');
+  assert.equal(isAuxiliaryForOutcome(refUrl), true, 'bare ?ref= must classify auxiliary');
+  assert.equal(
+    isCommunityRelevantObservation({ requestedUrl: refUrl }),
+    false,
+    'query-only affiliate observation must not be community-relevant',
+  );
+  const { result } = await inspect(
+    [...relevant5.slice(0, 2), refUrl],
+    (async (input) => {
+      if (String(input).includes('ref=BRANDON')) return httpError(500)(input);
+      return noInviteHtml();
+    }) as typeof fetch,
+    (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      if (seedUrl.includes('ref=BRANDON')) return timeoutRendered(seedUrl);
+      return emptyRendered(seedUrl);
+    }) as typeof emptyRendered,
+  );
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective, undefined);
+});
+
+// 18. Common affiliate query-key families (incl. Code/Id variants) classify
+// auxiliary; unfamiliar keys fail open to required.
+test('auxiliary outcome: affiliate query-key families classify deterministically', () => {
+  for (const key of [
+    'referralCode',
+    'referral_code',
+    'referralId',
+    'aff_id',
+    'affiliateCode',
+    'partnerId',
+    'partner_code',
+    'campaignId',
+    'campaignCode',
+    'promoCode',
+    'promo_id',
+    'couponCode',
+    'couponId',
+    'promo-code',
+    'partner-id',
+    'ref',
+    'REF',
+  ]) {
+    assert.equal(
+      isAuxiliaryForOutcome(`https://creator.example.com/guide?${key}=BRANDON`),
+      true,
+      `${key} must classify auxiliary`,
+    );
+  }
+  for (const key of ['id', 'code', 'cid', 'sid', 'utm_source', 'fbclid', 'sessionId', 'page']) {
+    assert.equal(
+      isAuxiliaryForOutcome(`https://creator.example.com/guide?${key}=BRANDON`),
+      false,
+      `${key} must fail open to required`,
+    );
+  }
+});
+
+// 19. referralCode end to end: genuinely retryable failure, no channel ownership.
+test('auxiliary outcome: referralCode failure cannot own the outcome', async () => {
+  const refUrl = 'https://creator.example.com/guide?referralCode=BRANDON';
+  assert.equal(isAuxiliaryForOutcome(refUrl), true);
+  const { result } = await inspect(
+    [...relevant5.slice(0, 2), refUrl],
+    (async (input) => {
+      if (String(input).includes('referralCode=')) return httpError(500)(input);
+      return noInviteHtml();
+    }) as typeof fetch,
+    (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      if (seedUrl.includes('referralCode=')) return timeoutRendered(seedUrl);
+      return emptyRendered(seedUrl);
+    }) as typeof emptyRendered,
+  );
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective, undefined);
+  const auxRows = (result.acquisitionOutcomes || []).filter((item) =>
+    item.requestedUrl.includes('referralCode='),
+  );
+  assert.ok(auxRows.length > 0, 'auxiliary telemetry must be retained');
+  assert.equal(hasRetryableCommunityAcquisitionFailure(auxRows as never), false);
+});
+
+// 20. Retry and outcome share one URL-precedence rule: the fetched resource
+// (requestedUrl) wins over seed provenance (rootUrl) on both paths.
+test('auxiliary outcome: retry and outcome use identical URL precedence', () => {
+  const auxRequested = {
+    rootUrl: 'https://creator.example.com/guide',
+    requestedUrl: 'https://investing-referral.com/x',
+  };
+  assert.equal(acquisitionOwnershipUrl(auxRequested), 'https://investing-referral.com/x');
+  assert.equal(isCommunityRelevantObservation(auxRequested as never), false);
+  assert.equal(
+    isCommunityRetryableObservation({
+      ...auxRequested,
+      surface: 'CREATOR_WEBSITES',
+      required: true,
+      outcome: 'ACQUISITION_FAILED',
+      retryable: true,
+    } as never),
+    false,
+    'retry must agree with outcome: requested-auxiliary owns neither',
+  );
+  const relevantRequested = {
+    rootUrl: 'https://investing-referral.com/x',
+    requestedUrl: 'https://creator.example.com/guide',
+  };
+  assert.equal(acquisitionOwnershipUrl(relevantRequested), 'https://creator.example.com/guide');
+  assert.equal(isCommunityRelevantObservation(relevantRequested as never), true);
+  assert.equal(
+    isCommunityRetryableObservation({
+      ...relevantRequested,
+      surface: 'CREATOR_WEBSITES',
+      required: true,
+      outcome: 'ACQUISITION_FAILED',
+      retryable: true,
+    } as never),
+    true,
+    'retry must agree with outcome: requested-relevant stays retryable',
+  );
+});
+
+// 21. Auxiliary URL skipped by the repeat-failure cap cannot manufacture
+// PARTIAL: skip telemetry is logged, but Step 4 and final status stay clean.
+test('auxiliary outcome: auxiliary-only repeat skip resolves clean', async () => {
+  const auxUrl = 'https://investing-referral.com/skip-me';
+  const { result } = await inspect(
+    [auxUrl],
+    (async () => {
+      throw new Error('must not fetch skipped auxiliary URL');
+    }) as typeof fetch,
+    emptyRendered,
+    (async () => cappedHistoryFor(auxUrl)) as never,
+  );
+  assert.ok(
+    !(result.acquisitionOutcomes || []).some((item) => item.requestedUrl === auxUrl),
+    'skipped URL must not produce failure observations',
+  );
+  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'NOT_FOUND');
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+  assert.equal(result.retryDirective, undefined);
+});
+
+// 22. Relevant URL skipped by the repeat-failure cap keeps uncertainty:
+// the PARTIAL contract for genuinely uninspected community surfaces is intact.
+test('auxiliary outcome: relevant repeat skip keeps uncertainty', async () => {
+  const deadUrl = 'https://dead.example/';
+  const { result } = await inspect(
+    [deadUrl],
+    (async () => {
+      throw new Error('must not fetch skipped URL');
+    }) as typeof fetch,
+    emptyRendered,
+    (async () => cappedHistoryFor(deadUrl)) as never,
+  );
+  assert.equal(result.steps.find((step) => step.step === 'CUSTOM_DOMAINS')?.status, 'PARTIAL');
+  assert.equal(result.acquisitionStatus, 'PARTIALLY_INSPECTED');
+});
+
+// 23. Genuine relevant HTTP 500 + failed rendered fallback owns channel retry
+// (control for the non-vacuous auxiliary test above).
+test('auxiliary outcome: relevant HTTP 500 with failed fallback owns channel retry', async () => {
+  const { result } = await inspect(
+    [...relevant5.slice(0, 2), 'https://flaky.example.com/'],
+    (async (input) => {
+      if (String(input).includes('flaky.example.com')) return httpError(500)(input);
+      return noInviteHtml();
+    }) as typeof fetch,
+    (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      if (seedUrl.includes('flaky.example.com')) return timeoutRendered(seedUrl);
+      return emptyRendered(seedUrl);
+    }) as typeof emptyRendered,
+  );
+  const relRows = (result.acquisitionOutcomes || []).filter((item) =>
+    item.requestedUrl.includes('flaky.example.com'),
+  );
+  assert.ok(
+    relRows.some((item) => item.outcome === 'ACQUISITION_FAILED' && item.retryable),
+    'control fixture must hold a genuinely retryable relevant failure',
+  );
+  assert.ok(result.retryDirective, 'relevant failure must own channel retry');
+  assert.equal(result.retryDirective?.retryReason, 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
+});
+
+// 24. Effective Step-4 summary excludes auxiliary ownership while the raw
+// ledger retains it: clean relevant pages + auxiliary 500 → raw summary
+// still counts the failure, effective summary and step status stay clean.
+test('auxiliary outcome: effective Step-4 summary never contradicts the final outcome', async () => {
+  const { result } = await inspect(
+    [...relevant5.slice(0, 2), 'https://investing-referral.com/elliottwaver'],
+    (async (input) => {
+      if (String(input).includes('investing-referral.com')) return httpError(500)(input);
+      return noInviteHtml();
+    }) as typeof fetch,
+    (async (seedUrl: string): Promise<BrowserFallbackResult> => {
+      if (seedUrl.includes('investing-referral.com')) return timeoutRendered(seedUrl);
+      return emptyRendered(seedUrl);
+    }) as typeof emptyRendered,
+  );
+  const raw = summarizeLinkedWebsiteAcquisition((result.acquisitionOutcomes || []) as never);
+  const effective = summarizeEffectiveLinkedWebsiteAcquisition((result.acquisitionOutcomes || []) as never);
+  assert.ok(raw.retryableFailures > 0, 'raw telemetry must retain the auxiliary failure');
+  assert.equal(effective.retryableFailures, 0, 'effective summary must exclude auxiliary ownership');
+  assert.equal(effective.renderedFailed, 0);
+  const step = result.steps.find((s) => s.step === 'CUSTOM_DOMAINS');
+  assert.equal(step?.status, 'NOT_FOUND');
+  assert.ok(
+    JSON.stringify(step).includes('2 unique website URL(s)'),
+    'step text must count the effective set (auxiliary excluded), not the raw ledger',
+  );
+  assert.ok(
+    JSON.stringify(step).includes('0 retryable failure(s)'),
+    'step text must show zero effective retryable failures despite the raw auxiliary failure',
+  );
+  assert.equal(result.acquisitionStatus, 'INSPECTED_NO_MATCH');
+});
+
+// 25. R6 admission intact: legitimate, trading-evidence, and messaging URLs
+// admitted; malformed, asset, and infrastructure URLs rejected.
+test('auxiliary outcome: existing R6 admission behavior remains intact', () => {
+  for (const raw of [
+    'https://creator.example.com/',
+    'https://creator.example.com/day-trading-guide',
+    'https://www.amazon.com/Gambler-Trader/dp/B0GVMN5ZNL',
+    'https://t.me/tradingroom',
+    'https://creator.example.com/?ref=BRANDON',
+    'https://creator.example.com/guide?referralCode=BRANDON',
+  ]) {
+    assert.ok(normalizeExternalUrl(raw), `must admit: ${raw}`);
+  }
+  for (const raw of [
+    'https://g/',
+    'https://i.ytimg.com/vi/abc/hqdefault.jpg',
+    'http://schema.org/Person',
+    'https://creator.example.com/app.css.map',
+  ]) {
+    assert.equal(normalizeExternalUrl(raw), null, `must reject: ${raw}`);
+  }
 });

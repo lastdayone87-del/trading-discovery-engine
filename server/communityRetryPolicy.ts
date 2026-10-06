@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { assessCrawlAdmission, isAuxiliaryForOutcome } from './communitySurfacePolicy';
+import { assessCrawlAdmission, isAuxiliaryForOutcome, acquisitionOwnershipUrl } from './communitySurfacePolicy';
 
 export const COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE = 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE';
 
@@ -241,10 +241,13 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   // Auxiliary/demoted URLs (affiliate, broker, transactional, no-community
   // commerce) never own channel-level retry: their evidence is retained on
   // success and their telemetry stays in the ledger, but a failure there
-  // cannot independently determine the Discord outcome or retry.
-  if (typeof requestedUrl === 'string' && requestedUrl) {
+  // cannot independently determine the Discord outcome or retry. Classified
+  // by the shared ownership URL (requested resource, root fallback) so retry
+  // ownership can never disagree with final outcome ownership.
+  const ownershipUrl = acquisitionOwnershipUrl(item as { rootUrl?: unknown; requestedUrl?: unknown });
+  if (ownershipUrl) {
     try {
-      if (isAuxiliaryForOutcome(requestedUrl)) return false;
+      if (isAuxiliaryForOutcome(ownershipUrl)) return false;
     } catch {
       return false;
     }
