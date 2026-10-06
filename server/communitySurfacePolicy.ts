@@ -372,7 +372,7 @@ export interface CrawlAdmissionDecision {
 // regardless of host. Mirrors the extraction-time asset-extension filter so
 // stored links cannot bypass it; document/feed types (pdf/rss/xml) are
 // intentionally NOT in this list and stay eligible.
-const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|mp3|wav|ogg|avi|mov|zip|gz|rar|7z|exe|dmg)(?:$)/i;
+const RESOURCE_PATH_EXTENSION = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|mp3|wav|ogg|avi|mov|zip|gz|rar|7z|exe|dmg)(?:$)/i;
 
 export function assessCrawlAdmission(rawUrl: string): CrawlAdmissionDecision {
   // Same scheme handling as `normalizeExternalUrl`: scheme-less input gets
@@ -485,6 +485,110 @@ export function isPossiblyTruncatedPath(rawUrl: string, siblingPaths: Set<string
   for (const sibling of siblingPaths) {
     if (sibling !== path && sibling.startsWith(path) && sibling[path.length] !== '/') return true;
   }
+  return false;
+}
+
+/**
+ * Affiliate/commerce meaning carried by a hostname itself, matched per
+ * segment (split on '.' and '-'), never by substring: `investing-referral`
+ * matches via segment `referral`, while `referralx`, `myreferral`, or
+ * `preferrals` do not. Mirrors the label-exact discipline of
+ * BROKER_HOST_LABELS. Generic lexemes only — no domain lists.
+ */
+const AFFILIATE_HOST_SEGMENTS = new Set([
+  'referral',
+  'referrals',
+  'affiliate',
+  'affiliates',
+  'affiliation',
+  'partner',
+  'partners',
+  'partnership',
+  'promo',
+  'promos',
+  'promotion',
+  'promotions',
+  'coupon',
+  'coupons',
+  'cashback',
+  'rebate',
+  'rebates',
+]);
+
+/**
+ * Transactional/product-unit path shapes: product-detail, checkout, cart,
+ * and storefront buy units on ANY host. Generic path shapes only — no domain
+ * lists. A creator funnel page that matches (e.g. a `/product` or `/shop`
+ * page) is still crawled and its evidence still retained; only failure
+ * ownership is affected (see `isAuxiliaryForOutcome`).
+ */
+const TRANSACTION_PATH_PATTERN = /(?:\/|^)(?:dp|gp\/product|gp\/aw|exec\/order|ap\/signin|checkout|check-out|cart|basket|stores?|shop|products?|buy(?:-now)?|purchase|order)(?:\/|$|[?#])/i;
+
+/**
+ * Affiliate-redirector/commerce platforms with no community function, matched
+ * by suffix like the asset list. Each entry is grounded in production crawl
+ * evidence; the list is intentionally minimal. Used ONLY for final-outcome
+ * failure ownership and status — never admission, ranking, recall, or retry
+ * classification of other hosts.
+ * - sjv.io: Impact.com affiliate redirector infrastructure (tenant
+ *   subdomains redirect to brand domains; production: tracking timeouts on
+ *   `*.sjv.io` URLs, zero community function).
+ * - amzn.to: Amazon's single-purpose product shortener (production:
+ *   amzn.to/* product links; generic shorteners such as bit.ly stay
+ *   eligible because their destinations are opaque).
+ * - calendly.com: appointment scheduling pages (production: scheduling links,
+ *   no community surface).
+ * - teespring.com: merchandise storefront (production: `/stores/*` pages).
+ * - payhip.com: digital storefront buy links (production: `/b/*` pages).
+ * - open.spotify.com: media episodes (production: `/episode/*` podcast audio).
+ * - streamyard.com: streaming tool links (production: `/pal/*` pages).
+ * - forms.gle: generic form links (no community surface either way).
+ */
+const AUXILIARY_COMMERCE_SUFFIXES = [
+  'sjv.io',
+  'amzn.to', // Amazon's single-purpose product shortener (production: amzn.to/* product links; generic shorteners like bit.ly stay eligible as opaque)
+  'calendly.com',
+  'teespring.com',
+  'payhip.com',
+  'open.spotify.com',
+  'streamyard.com',
+  'forms.gle',
+];
+
+/**
+ * Whether a URL is auxiliary/demoted for FINAL-OUTCOME purposes: its failure
+ * must not independently own the channel-level Discord acquisition outcome
+ * or retry. This is a failure-ownership boundary only — it never affects
+ * admission, scoring/ranking, crawling, candidate recall, or evidence
+ * retention: an auxiliary URL that succeeds keeps its evidence and
+ * candidates exactly like any other URL.
+ *
+ * Deterministic and generic: broker/exchange identity (label-exact),
+ * affiliate patterns (path/query + host segments), transactional units, and
+ * the documented no-community commerce platforms above. Anything else —
+ * including unfamiliar custom domains, opaque shorteners, social profiles,
+ * link hubs, and community platforms — fails open to community-required,
+ * so genuine creator surfaces always keep full outcome ownership.
+ */
+export function isAuxiliaryForOutcome(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (!host) return false;
+  if (isKnownBrokerOrExchangeHost(host)) return true;
+  if (AFFILIATE_HINT.test(rawUrl)) return true;
+  const segments = host
+    .split('.')
+    .flatMap(label => label.split('-'))
+    .filter(Boolean);
+  if (segments.some(segment => AFFILIATE_HOST_SEGMENTS.has(segment))) return true;
+  if (AUXILIARY_COMMERCE_SUFFIXES.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
+  if (TRANSACTION_PATH_PATTERN.test(`${parsed.pathname}${parsed.search}`)) return true;
   return false;
 }
 

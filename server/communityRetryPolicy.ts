@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { assessCrawlAdmission } from './communitySurfacePolicy';
+import { assessCrawlAdmission, isAuxiliaryForOutcome } from './communitySurfacePolicy';
 
 export const COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE = 'COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE';
 
@@ -237,6 +237,17 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   }
   if (DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES.has(String(item.failureClass || '').toUpperCase())) {
     return false;
+  }
+  // Auxiliary/demoted URLs (affiliate, broker, transactional, no-community
+  // commerce) never own channel-level retry: their evidence is retained on
+  // success and their telemetry stays in the ledger, but a failure there
+  // cannot independently determine the Discord outcome or retry.
+  if (typeof requestedUrl === 'string' && requestedUrl) {
+    try {
+      if (isAuxiliaryForOutcome(requestedUrl)) return false;
+    } catch {
+      return false;
+    }
   }
   // FOUND with an outstanding retryable required gap keeps bounded recovery
   // (multi-invite recall): the invite stays retained while the gap re-runs.
