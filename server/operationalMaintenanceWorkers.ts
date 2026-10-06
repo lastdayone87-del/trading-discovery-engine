@@ -331,13 +331,20 @@ function startCorpusPipelineWorker(workerId: string): void {
 export function startOperationalMaintenanceWorkers(): void {
   if (started) return;
   started = true;
-  const configured = Number(process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY || 1);
-  const concurrency = Math.min(5, Math.max(1, Number.isFinite(configured) ? Math.floor(configured) : 1));
-  for (let index = 0; index < concurrency; index++) {
+  // Community retry consumer loops only: COMMUNITY_RETRY_WORKER_CONCURRENCY
+  // scales startCommunityRetryWorker (default 1, cap 5). The transitional
+  // OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY fallback preserves prior
+  // behavior for existing deployments. Every other maintenance family below
+  // (official recheck, country-boundary recovery, false-negative recovery,
+  // corpus pipeline) intentionally runs exactly one loop each and never
+  // reads either concurrency setting.
+  const configured = Number(process.env.COMMUNITY_RETRY_WORKER_CONCURRENCY || process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY || 1);
+  const communityRetryConcurrency = Math.min(5, Math.max(1, Number.isFinite(configured) ? Math.floor(configured) : 1));
+  for (let index = 0; index < communityRetryConcurrency; index++) {
     startCommunityRetryWorker(`community_retry_${process.pid}_${index}`);
-    startOfficialRecheckWorker(`official_recheck_${process.pid}_${index}`);
-    startCountryBoundaryRecoveryWorker(`country_boundary_recovery_${process.pid}_${index}`);
   }
+  startOfficialRecheckWorker(`official_recheck_${process.pid}_0`);
+  startCountryBoundaryRecoveryWorker(`country_boundary_recovery_${process.pid}_0`);
   // Recovery is intentionally single-consumer and low-volume regardless of the
   // generic maintenance concurrency setting.
   startFalseNegativeRecoveryWorker(`false_negative_recovery_${process.pid}_0`);

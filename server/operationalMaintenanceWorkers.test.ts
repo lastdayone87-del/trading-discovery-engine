@@ -60,11 +60,31 @@ test('false-negative recovery grants attempt-free retries only to typed transien
 });
 
 test('maintenance concurrency is bounded and starts after database readiness in server runtime', () => {
-  assert.match(workers, /OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY/);
+  assert.match(workers, /COMMUNITY_RETRY_WORKER_CONCURRENCY/);
   assert.match(workers, /Math\.min\(5/);
   assert.match(startup, /if \(isServerRuntime\(\)\) \{[\s\S]*startOperationalMaintenanceWorkers\(\);/);
   assert.match(startup, /markDatabaseReady/);
   assert.match(startup, /Operational maintenance consumers started after database readiness/);
+});
+
+test('only the community retry consumer scales; every other family runs exactly one loop', () => {
+  // The scaling loop starts community retry workers and nothing else.
+  const loopBody = workers.slice(
+    workers.indexOf('for (let index = 0; index < communityRetryConcurrency; index++)'),
+  );
+  const loopEnd = loopBody.indexOf('\n  }\n');
+  assert.ok(loopEnd > 0, 'community scaling loop must be a closed block');
+  const loopBlock = loopBody.slice(0, loopEnd);
+  assert.match(loopBlock, /startCommunityRetryWorker\(`community_retry_\$\{process\.pid\}_\$\{index\}`\)/);
+  assert.doesNotMatch(loopBlock, /startOfficialRecheckWorker/);
+  assert.doesNotMatch(loopBlock, /startCountryBoundaryRecoveryWorker/);
+  assert.doesNotMatch(loopBlock, /startFalseNegativeRecoveryWorker/);
+  assert.doesNotMatch(loopBlock, /startCorpusPipelineWorker/);
+  // The remaining families start exactly once each with a fixed worker id.
+  assert.equal(workers.match(/startOfficialRecheckWorker\(`official_recheck_\$\{process\.pid\}_0`\)/g)?.length, 1);
+  assert.equal(workers.match(/startCountryBoundaryRecoveryWorker\(`country_boundary_recovery_\$\{process\.pid\}_0`\)/g)?.length, 1);
+  assert.equal(workers.match(/startFalseNegativeRecoveryWorker\(`false_negative_recovery_\$\{process\.pid\}_0`\)/g)?.length, 1);
+  assert.equal(workers.match(/startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/g)?.length, 1);
 });
 
 test('legacy community reconciliation restores completed history without a stale-retry worker pass', () => {
