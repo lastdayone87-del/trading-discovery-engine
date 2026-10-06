@@ -710,7 +710,7 @@ maybe('crashed-after-persist resolution recovers to terminal instead of strandin
       [Number(done?.n || 0)]
     );
     const fresh = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 0), {
-      priority: 2,
+      priority: 1,
       maxAttempts: 3,
       idempotencyKey: `test-resolution-recover:${tag}:fresh`,
     });
@@ -731,7 +731,7 @@ maybe('crashed-after-persist resolution recovers to terminal instead of strandin
       [Number(done?.n || 0) + 1]
     );
     const crashed = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 1), {
-      priority: 2,
+      priority: 5,
       maxAttempts: 3,
       idempotencyKey: `test-resolution-recover:${tag}:crashed`,
     });
