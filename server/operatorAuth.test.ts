@@ -96,3 +96,24 @@ test('bootstrap lifecycle routes enforce authentication at the middleware layer'
   const missing=await run('admin','/api/persistent-research/bootstrap-runs/extra/segments','GET');
   assert.equal(missing.next,false); assert.equal(missing.status,404); assert.equal(missing.code,'ROUTE_POLICY_MISSING');
 });
+
+test('denied bootstrap requests still answer when the audit writer fails',async ()=>{
+  // The denial path awaits the audit write with a catch: a rejecting writer
+  // must never swallow the 401/403 response or escape as an unhandled rejection.
+  const failingWriter=async ()=>{ throw new Error('audit database unavailable'); };
+  const runDenied=(role:'operator'|undefined,path:string):Promise<{next:boolean;status?:number;code?:string}>=>new Promise((resolve,reject)=>{
+    const handler=operatorAuthorization(failingWriter,{ NODE_ENV:'test', ADMIN_API_TOKEN:'admin-token', OPERATOR_API_TOKEN:'operator-token' } as NodeJS.ProcessEnv);
+    const token=role==='operator'?'operator-token':undefined;
+    const req={ method:'POST', path, baseUrl:'', query:{}, header:(name:string)=>(name.toLowerCase()==='authorization'&&token?`Bearer ${token}`:undefined) };
+    let status=0; let code='';
+    const res={ status:(code_:number)=>{ status=code_; return res; }, json:(body:Record<string,unknown>)=>{ code=String(body.code||''); resolve({next:false,status,code}); }, setHeader:()=>{}, once:()=>{} };
+    try {
+      const out=(handler as unknown as (req:never,res:never,next:()=>void)=>unknown)(req as never,res as never,()=>resolve({next:true}));
+      if (out instanceof Promise) out.catch(reject);
+    } catch (error) { reject(error); }
+  });
+  const anonymous=await runDenied(undefined,'/api/persistent-research/bootstrap-runs');
+  assert.equal(anonymous.next,false); assert.equal(anonymous.status,401);
+  const forbidden=await runDenied('operator','/api/persistent-research/bootstrap-runs');
+  assert.equal(forbidden.next,false); assert.equal(forbidden.status,403);
+});
