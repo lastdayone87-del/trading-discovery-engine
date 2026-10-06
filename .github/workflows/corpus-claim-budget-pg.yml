@@ -11,6 +11,9 @@ on:
       - 'server/operationalMaintenanceWorkers.ts'
       - 'server/corpusPipelineWorker.test.ts'
       - 'server/corpusClaimBudget.postgres.test.ts'
+      - 'server/persistentResearchController.ts'
+      - 'server/researchBootstrap.test.ts'
+      - 'server/researchBootstrap.postgres.test.ts'
       - 'server/db/migrations/**'
       - 'scripts/runMigrations.ts'
       - 'package.json'
@@ -59,3 +62,38 @@ jobs:
         run: npx tsx --test server/corpusClaimBudget.postgres.test.ts
       - name: Corpus pipeline unit tests
         run: npx tsx --test server/corpusPipelineWorker.test.ts
+  bootstrap-pg-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: research_bootstrap_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d research_bootstrap_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/research_bootstrap_test
+      RESEARCH_BOOTSTRAP_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/research_bootstrap_test
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Apply migrations to isolated test database
+        run: npx tsx scripts/runMigrations.ts
+      - name: Research bootstrap PostgreSQL tests (must be 0 skipped)
+        run: npx tsx --test server/researchBootstrap.postgres.test.ts
+      - name: Research bootstrap unit tests
+        run: npx tsx --test server/researchBootstrap.test.ts

@@ -5,15 +5,17 @@ import assert from 'node:assert/strict';
  * Live-database tests for the provisional evidence-gathering CANARY
  * bootstrap. Run ONLY against an explicitly provided dedicated test database:
  *
- *   RESEARCH_BOOTSTRAP_TEST_DATABASE_URL=postgresql://... npx tsx --test ...
+ *   RESEARCH_BOOTSTRAP_TEST_DATABASE_URL=postgresql://... npx tsx --test server/researchBootstrap.postgres.test.ts
  *
  * Without that variable every test below skips. When enabled, the suite
- * proves isolation first (empty library/actions/assignments/outcomes) and
- * fails loudly before mutating anything otherwise. Fixtures use unique
- * per-run keys; jobs/actions/assignments created here are deleted in finally
- * blocks (append-only corpus/evaluation tables are never touched by these
- * tests). Control rows are restored; policies created here are DRAFT and
- * inert (never promoted).
+ * requires the dedicated database to hold no ACTIVE bootstrap run and then
+ * uses unique per-test fixtures. `discovery_action_assignments` is
+ * append-only (immutable trigger: UPDATE/DELETE raise), and assignment rows
+ * FK-block their actions/programs, so NOTHING created here is deleted:
+ * leftover fixture actions are retired to the terminal EXPIRED lifecycle
+ * (invisible to future allocation) and assignments/programs/policies persist
+ * under unique keys. Control rows are restored; every started run is aborted
+ * in a t.after/finally so a failed test can never poison the database.
  */
 const dedicated = process.env.RESEARCH_BOOTSTRAP_TEST_DATABASE_URL;
 
@@ -36,23 +38,22 @@ async function db(): Promise<Db> {
   return getDb();
 }
 
-async function assertIsolatedBootstrapDb(database: Db) {
-  const library = await database.query('SELECT count(*)::int AS n FROM query_library');
-  assert.equal(Number(library.rows[0]?.n || 0), 0, 'refusing non-empty database: query_library must be empty');
-  const actions = await database.query('SELECT count(*)::int AS n FROM discovery_actions');
-  assert.equal(Number(actions.rows[0]?.n || 0), 0, 'refusing non-empty database: discovery_actions must be empty');
-  const assignments = await database.query('SELECT count(*)::int AS n FROM discovery_action_assignments');
-  assert.equal(Number(assignments.rows[0]?.n || 0), 0, 'refusing non-empty database: no assignments allowed');
+/** Dedicated-DB gate: migrations applied and no ACTIVE run that could leak between tests. */
+async function assertBootstrapDbReady(database: Db) {
+  const table = await database.query(`SELECT to_regclass('research_bootstrap_runs') AS oid`);
+  assert.ok(table.rows[0]?.oid, 'research_bootstrap_runs missing: run migrations against the dedicated test database');
   const runs = await database.query(
     `SELECT count(*)::int AS n FROM research_bootstrap_runs WHERE status='ACTIVE'`
   );
   assert.equal(Number(runs.rows[0]?.n || 0), 0, 'refusing database with an ACTIVE bootstrap run');
+  const control = await database.query('SELECT * FROM research_control WHERE singleton=true');
+  assert.ok(control.rows.length, 'research_control singleton must exist');
 }
 
 const POLICY_CONFIG = {
-  totalProviderBudget: 5,
-  totalReviewBudget: 0,
-  clusterCap: 1,
+  totalProviderBudget: 1000,
+  totalReviewBudget: 100,
+  clusterCap: 2,
   curatedSearchFloor: 0,
   programFloors: {},
   actionCaps: {},
@@ -88,13 +89,51 @@ async function ensureProvider(database: Db) {
   );
 }
 
+async function saveControl(database: Db) {
+  return (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+}
+
+async function restoreControl(database: Db, prev: Record<string, any>) {
+  await database.query(
+    `UPDATE research_control SET enabled=$1, mode=$2, paused=$3, kill_switch=$4,
+      daily_provider_cost_cap=$5, daily_review_cost_cap=$6, max_actions_per_cycle=$7, active_policy_id=$8 WHERE singleton=true`,
+    [
+      prev.enabled,
+      prev.mode,
+      prev.paused,
+      prev.kill_switch,
+      prev.daily_provider_cost_cap,
+      prev.daily_review_cost_cap,
+      prev.max_actions_per_cycle,
+      prev.active_policy_id,
+    ]
+  );
+}
+
+async function armCanaryControl(database: Db, policyId: string | null) {
+  await database.query(
+    `UPDATE research_control SET enabled=true, mode='CANARY', paused=false, kill_switch=false,
+      daily_provider_cost_cap=100000, daily_review_cost_cap=100000, max_actions_per_cycle=5,
+      active_policy_id=$1 WHERE singleton=true`,
+    [policyId]
+  );
+}
+
+/** Retires leftover fixture actions to a terminal lifecycle (never eligible for allocation). */
+async function retireFixtureActions(database: Db, tag: string) {
+  await database.query(
+    `UPDATE discovery_actions SET lifecycle='EXPIRED' WHERE action_key LIKE $1 AND lifecycle IN('PROPOSED','ALLOCATED')`,
+    [`test-bootstrap-action:${tag}:%`]
+  );
+}
+
 maybe('bootstrap run lifecycle is singleton, bounded, and abortable', async t => {
   const { startResearchBootstrapRun, abortResearchBootstrapRun } = await import(
     './persistentResearchController'
   );
   const { createPolicy } = await import('./portfolioAllocator');
   const database = await db();
-  await assertIsolatedBootstrapDb(database);
+  await assertBootstrapDbReady(database);
   const tag = `lifecycle:${Date.now()}:${process.pid}`;
   const policy = await createPolicy({
     policyKey: `test-bootstrap-policy:${tag}`,
@@ -109,6 +148,12 @@ maybe('bootstrap run lifecycle is singleton, bounded, and abortable', async t =>
     windowHours: 24,
     reason: 'test lifecycle',
     actor: 'test:research-bootstrap',
+  });
+  // Guaranteed cleanup: a failed assertion below must not leave an ACTIVE run behind.
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(
+      () => undefined
+    );
   });
   assert.equal(run.status, 'ACTIVE');
   assert.equal(Number(run.max_assignments), 5);
@@ -127,13 +172,60 @@ maybe('bootstrap run lifecycle is singleton, bounded, and abortable', async t =>
   const aborted = await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test done');
   assert.ok(aborted);
   assert.equal(aborted?.status, 'ABORTED');
+  assert.equal(aborted?.aborted_by, 'test:research-bootstrap');
+  assert.equal(aborted?.abort_reason, 'test done');
+});
+
+maybe('bootstrap starter rejects paused candidates', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `paused-start:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-paused:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: POLICY_CONFIG,
+    actor: 'test:research-bootstrap',
+  });
+  await database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
+  try {
+    await assert.rejects(
+      startResearchBootstrapRun({
+        candidatePolicyId: policy.id,
+        maxAssignments: 5,
+        maxProviderCost: 500,
+        windowHours: 24,
+        reason: 'test paused candidate',
+        actor: 'test:research-bootstrap',
+      }),
+      /BOOTSTRAP_CANDIDATE_PAUSED/
+    );
+    // No run was created, but guard the singleton either way.
+    const active = await database.query(
+      `SELECT count(*)::int AS n FROM research_bootstrap_runs WHERE status='ACTIVE'`
+    );
+    assert.equal(Number(active.rows[0]?.n || 0), 0);
+  } finally {
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [policy.id]);
+    const strays = await database.query(
+      `SELECT id FROM research_bootstrap_runs WHERE status='ACTIVE'`
+    );
+    for (const stray of strays.rows) {
+      await abortResearchBootstrapRun(stray.id, 'test:research-bootstrap', 'test cleanup');
+    }
+  }
 });
 
 maybe('bootstrap allocates boundedly and auto-completes at its ceiling', async t => {
-  const { startResearchBootstrapRun } = await import('./persistentResearchController');
+  const { startResearchBootstrapRun, abortResearchBootstrapRun } = await import(
+    './persistentResearchController'
+  );
   const { createPolicy } = await import('./portfolioAllocator');
   const database = await db();
-  await assertIsolatedBootstrapDb(database);
+  await assertBootstrapDbReady(database);
   const tag = `alloc:${Date.now()}:${process.pid}`;
   await ensureProvider(database);
   const programId = await ensureProgram(database, tag);
@@ -155,7 +247,7 @@ maybe('bootstrap allocates boundedly and auto-completes at its ceiling', async t
         JSON.stringify({ country: 'US', intent: 'strategy' }),
         JSON.stringify({}),
         JSON.stringify(['test']),
-        `bootstrap-cluster:${tag}`,
+        `bootstrap-cluster:${tag}:${index}`,
       ]
     );
     actionIds.push(String(action.rows[0].id));
@@ -168,76 +260,148 @@ maybe('bootstrap allocates boundedly and auto-completes at its ceiling', async t
     reason: 'test bounded allocation',
     actor: 'test:research-bootstrap',
   });
-  try {
-    // Control must be CANARY-armed for the allocator; save and restore it.
-    const prevControl = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
-    await database.query(
-      `UPDATE research_control SET enabled=true, mode='CANARY', paused=false, kill_switch=false,
-        daily_provider_cost_cap=100000, daily_review_cost_cap=100000, max_actions_per_cycle=5,
-        active_policy_id=$1 WHERE singleton=true`,
-      [policy.id]
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(
+      () => undefined
     );
-    try {
-      const { allocateBootstrapAssignments } = await import('./persistentResearchController');
-      const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
-      const first = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
-      assert.equal(first.allocated, 2);
-      assert.ok(first.providerReserved > 0);
-      // Ceiling reached (2 of 2): run auto-completed.
-      const status = (
-        await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
-      ).rows[0];
-      assert.equal(status.status, 'COMPLETED');
-      // Allocated actions moved out of PROPOSED with bootstrap-marked assignments.
-      const states = (
-        await database.query('SELECT lifecycle, count(*)::int AS n FROM discovery_actions WHERE id = ANY($1::uuid[]) GROUP BY 1', [
-          actionIds,
-        ])
-      ).rows as Array<{ lifecycle: string; n: number }>;
-      assert.equal(
-        states.filter(row => row.lifecycle === 'ALLOCATED').reduce((n, row) => n + Number(row.n), 0),
-        2
-      );
-      const marked = await database.query(
-        `SELECT count(*)::int AS n FROM discovery_action_assignments
-         WHERE context_snapshot->>'bootstrapRunId'=$1 AND selected=true AND reason_codes::jsonb ? 'BOOTSTRAP_EVIDENCE_GATHERING'`,
-        [run.id]
-      );
-      assert.equal(Number(marked.rows[0]?.n || 0), 2);
-      // A further allocation attempt finds the run completed: zero work.
-      const control2 = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
-      const again = await allocateBootstrapAssignments(control2, new Date().toISOString(), run.id);
-      assert.equal(again.allocated, 0);
-      assert.equal(again.completed, true);
-    } finally {
-      await database.query(
-        `UPDATE research_control SET enabled=$1, mode=$2, paused=$3, kill_switch=$4,
-          daily_provider_cost_cap=$5, daily_review_cost_cap=$6, max_actions_per_cycle=$7, active_policy_id=$8 WHERE singleton=true`,
-        [
-          prevControl.enabled,
-          prevControl.mode,
-          prevControl.paused,
-          prevControl.kill_switch,
-          prevControl.daily_provider_cost_cap,
-          prevControl.daily_review_cost_cap,
-          prevControl.max_actions_per_cycle,
-          prevControl.active_policy_id,
-        ]
-      );
-    }
+  });
+  const prevControl = await saveControl(database);
+  await armCanaryControl(database, policy.id);
+  try {
+    const { allocateBootstrapAssignments } = await import('./persistentResearchController');
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const first = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
+    assert.equal(first.allocated, 2);
+    assert.equal(first.selected, 2);
+    assert.equal(first.choices.length, 2);
+    assert.ok(first.providerReserved > 0);
+    assert.equal(first.completed, true);
+    assert.equal(first.bootstrapRunId, run.id);
+    assert.equal(first.bootstrapPolicyId, policy.id);
+    // Ceiling reached (2 of 2): run auto-completed.
+    const status = (
+      await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
+    ).rows[0];
+    assert.equal(status.status, 'COMPLETED');
+    // Allocated actions moved out of PROPOSED with bootstrap-marked assignments.
+    const states = (
+      await database.query('SELECT lifecycle, count(*)::int AS n FROM discovery_actions WHERE id = ANY($1::uuid[]) GROUP BY 1', [
+        actionIds,
+      ])
+    ).rows as Array<{ lifecycle: string; n: number }>;
+    assert.equal(
+      states.filter(row => row.lifecycle === 'ALLOCATED').reduce((n, row) => n + Number(row.n), 0),
+      2
+    );
+    const marked = await database.query(
+      `SELECT count(*)::int AS n FROM discovery_action_assignments
+       WHERE context_snapshot->>'bootstrapRunId'=$1 AND selected=true AND reason_codes::jsonb ? 'BOOTSTRAP_EVIDENCE_GATHERING'`,
+      [run.id]
+    );
+    assert.equal(Number(marked.rows[0]?.n || 0), 2);
+    // A terminal run is idempotent: further allocation returns zero work, never throws.
+    const control2 = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const again = await allocateBootstrapAssignments(control2, new Date().toISOString(), run.id);
+    assert.equal(again.allocated, 0);
+    assert.equal(again.selected, 0);
+    assert.equal(again.completed, true);
   } finally {
-    if (actionIds.length > 0) {
-      await database.query('DELETE FROM discovery_action_assignments WHERE action_id = ANY($1::uuid[])', [actionIds]);
-      await database.query('DELETE FROM discovery_actions WHERE id = ANY($1::uuid[])', [actionIds]);
-    }
-    await database.query(`DELETE FROM research_programs WHERE program_key=$1`, [`test-bootstrap-program:${tag}`]);
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
+
+maybe('bootstrap aborts when the candidate policy is paused or the window expires', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `abort:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-abort:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: POLICY_CONFIG,
+    actor: 'test:research-bootstrap',
+  });
+  const prevControl = await saveControl(database);
+  await armCanaryControl(database, policy.id);
+  try {
+    const { allocateBootstrapAssignments } = await import('./persistentResearchController');
+    // Case 1: policy paused after the run started aborts the run without allocating.
+    const pausedRun = await startResearchBootstrapRun({
+      candidatePolicyId: policy.id,
+      maxAssignments: 5,
+      maxProviderCost: 500,
+      windowHours: 24,
+      reason: 'test paused mid-run',
+      actor: 'test:research-bootstrap',
+    });
+    t.after(async () => {
+      await abortResearchBootstrapRun(pausedRun.id, 'test:research-bootstrap', 'test cleanup').catch(
+        () => undefined
+      );
+    });
+    await database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
+    const armed = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const pausedResult = await allocateBootstrapAssignments(armed, new Date().toISOString(), pausedRun.id);
+    assert.equal(pausedResult.allocated, 0);
+    assert.equal(pausedResult.completed, true);
+    const pausedStatus = (
+      await database.query(
+        'SELECT status,aborted_by,abort_reason FROM research_bootstrap_runs WHERE id=$1',
+        [pausedRun.id]
+      )
+    ).rows[0];
+    assert.equal(pausedStatus.status, 'ABORTED');
+    assert.equal(pausedStatus.aborted_by, 'system:research-controller');
+    assert.match(pausedStatus.abort_reason, /ineligible/);
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [policy.id]);
+
+    // Case 2: an expired ACTIVE run aborts (never COMPLETED, never resumed).
+    const expiredRun = await startResearchBootstrapRun({
+      candidatePolicyId: policy.id,
+      maxAssignments: 5,
+      maxProviderCost: 500,
+      windowHours: 1,
+      reason: 'test expiry',
+      actor: 'test:research-bootstrap',
+    });
+    t.after(async () => {
+      await abortResearchBootstrapRun(expiredRun.id, 'test:research-bootstrap', 'test cleanup').catch(
+        () => undefined
+      );
+    });
+    await database.query(
+      `UPDATE research_bootstrap_runs SET expires_at=now()-interval '1 minute' WHERE id=$1`,
+      [expiredRun.id]
+    );
+    const armed2 = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const expiredResult = await allocateBootstrapAssignments(armed2, new Date().toISOString(), expiredRun.id);
+    assert.equal(expiredResult.allocated, 0);
+    assert.equal(expiredResult.completed, true);
+    const expiredStatus = (
+      await database.query(
+        'SELECT status,abort_reason FROM research_bootstrap_runs WHERE id=$1',
+        [expiredRun.id]
+      )
+    ).rows[0];
+    assert.equal(expiredStatus.status, 'ABORTED');
+    assert.match(expiredStatus.abort_reason, /expired/);
+  } finally {
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [policy.id]).catch(
+      () => undefined
+    );
+    await restoreControl(database, prevControl);
   }
 });
 
 maybe('normal CANARY allocation still requires a PASS-backed policy', async t => {
   const { createPolicy } = await import('./portfolioAllocator');
+  const { allocateCanonical } = await import('./persistentResearchController');
   const database = await db();
-  await assertIsolatedBootstrapDb(database);
+  await assertBootstrapDbReady(database);
   const tag = `canary-gate:${Date.now()}:${process.pid}`;
   const policy = await createPolicy({
     policyKey: `test-canary-gate:${tag}`,
@@ -245,12 +409,20 @@ maybe('normal CANARY allocation still requires a PASS-backed policy', async t =>
     configuration: POLICY_CONFIG,
     actor: 'test:research-bootstrap',
   });
-  // Directly exercise the guard shape allocateCanonical enforces: a DRAFT
-  // policy without any PASS evaluation must not satisfy the CANARY gate.
-  const gate = await database.query(
-    `SELECT p.* FROM portfolio_policies p WHERE p.id=$1 AND p.status='CANARY'
-     AND EXISTS(SELECT 1 FROM persistent_research_policy_evaluations e WHERE e.policy_id=p.id AND e.decision='PASS')`,
-    [policy.id]
-  );
-  assert.equal(gate.rows.length, 0);
+  // Promote to CANARY status directly (the governed transition requires a
+  // PASS evaluation, which is exactly what this policy lacks) and prove the
+  // PRODUCTION allocator still rejects it.
+  await database.query(`UPDATE portfolio_policies SET status='CANARY' WHERE id=$1`, [policy.id]);
+  const prevControl = await saveControl(database);
+  await armCanaryControl(database, policy.id);
+  try {
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    await assert.rejects(
+      allocateCanonical(control, 'CANARY', new Date().toISOString()),
+      /EVALUATED_CANARY_POLICY_REQUIRED/
+    );
+  } finally {
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [policy.id]);
+    await restoreControl(database, prevControl);
+  }
 });

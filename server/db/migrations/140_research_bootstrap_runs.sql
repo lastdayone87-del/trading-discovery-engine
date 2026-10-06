@@ -4,8 +4,10 @@
 -- not an efficacy claim, grants no promotion, and never relaxes the
 -- evaluator's minimum-sample requirement. At most one ACTIVE run may exist;
 -- completion/abort is terminal. See allocateBootstrapAssignments: the run is
--- marked COMPLETED automatically when its ceilings are reached, and any
--- operator kill-switch/paused control aborts further allocation.
+-- marked COMPLETED automatically when its ceilings are reached, ABORTED
+-- (with aborted_by/abort_reason) when it expires, when research is disarmed,
+-- or when its candidate policy becomes ineligible. Normal CANARY allocation
+-- (allocateCanonical, PASS-gated) is untouched.
 CREATE TABLE IF NOT EXISTS research_bootstrap_runs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   candidate_policy_id UUID NOT NULL REFERENCES portfolio_policies(id) ON DELETE RESTRICT,
@@ -15,10 +17,12 @@ CREATE TABLE IF NOT EXISTS research_bootstrap_runs (
   starts_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at TIMESTAMPTZ NOT NULL,
   completed_at TIMESTAMPTZ,
+  aborted_by TEXT,
+  abort_reason TEXT,
   reason TEXT NOT NULL,
   actor TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK(expires_at > starts_at)
+  CHECK(expires_at > starts_at AND expires_at <= starts_at + interval '30 days')
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_research_bootstrap_single_active
   ON research_bootstrap_runs (status) WHERE status = 'ACTIVE';

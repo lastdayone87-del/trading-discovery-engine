@@ -4,7 +4,7 @@ import { enqueuePlaylistCanary } from './evidenceGraphAdapters';
 import { materializeCreatorPlaylistCanary } from './creatorIntelligence/playlistCanary';
 import { materializeCreatorFeaturedChannelCanary } from './creatorIntelligence/featuredChannelCanary';
 import { observeTerminology } from './terminologyIntelligence';
-import { allocateContextualPortfolio, coverageCellKey, generateCoverageGapActions, PERSISTENT_RESEARCH_POLICY_VERSION, researchChecksum, type ContextualPolicy, type DiscoveryActionCandidate, type ResearchCoordinates } from './persistentResearch';
+import { allocateContextualPortfolio, coverageCellKey, generateCoverageGapActions, PERSISTENT_RESEARCH_POLICY_VERSION, researchChecksum, type ContextualChoice, type ContextualPolicy, type DiscoveryActionCandidate, type ResearchCoordinates } from './persistentResearch';
 import { evaluateCounterfactualPolicy, replayDecisionRows, type PolicySample } from './persistentResearchPhase6';
 import { classifyExternalIdentity, enqueueStructuredProviderSweep, resolveExactExternalIdentity } from './persistentResearchPhase5';
 import { coverageEstimate, coverageSnapshotKey, deterministicCoverageLifecycle, ecosystemOverlap, expandCoverageHierarchy } from './persistentResearchPhase4';
@@ -89,10 +89,14 @@ async function refreshOverlapPenalties(cutoff:string){const db=await getDb(),com
  * may create selected=true behavior assignments without a PASS-backed active
  * policy, and it exists solely to break the initial-evidence deadlock. Every
  * use is bounded by an explicit research_bootstrap_runs row (max 30
- * assignments, explicit provider-cost cap, expiry window); a single ACTIVE
- * run may exist; ceilings auto-complete it; operator kill-switch/paused
- * controls abort it. It never promotes policies, never writes evaluations,
- * and never alters the evaluator's minimum-sample requirement. Normal CANARY
+ * assignments, explicit provider-cost cap, 30-day-maximum window); a single
+ * ACTIVE run may exist. Ceilings auto-COMPLETE the run; expiry, a disarmed
+ * research control (disabled/paused/non-CANARY/kill-switch), an error spike,
+ * or an ineligible candidate policy ABORT it with a persisted actor+reason.
+ * Allocation always re-reads the live research_control row inside its own
+ * transaction, so a stale cycle snapshot can never allocate after an operator
+ * stop. Bootstrap never promotes policies, never writes evaluations, and
+ * never alters the evaluator's minimum-sample requirement. Normal CANARY
  * allocation (allocateCanonical, PASS-gated) is untouched.
  */
 export interface BootstrapBounds { maxAssignments: number; maxProviderCost: number; windowHours: number }
@@ -113,6 +117,16 @@ export function validateBootstrapBounds(input: {
   }
   return { maxAssignments: maxAssignments as number, maxProviderCost: maxProviderCost as number, windowHours: windowHours as number };
 }
+export const BOOTSTRAP_SYSTEM_ACTOR = 'system:research-controller';
+/** True when research must not serve CANARY work: bootstrap runs abort instead of allocating. */
+export function isResearchDisarmed(control: DbRow | null | undefined): boolean {
+  if (!control) return true;
+  if (!control.enabled) return true;
+  if (control.paused) return true;
+  if (control.mode !== 'CANARY') return true;
+  if (control.kill_switch) return true;
+  return false;
+}
 export async function startResearchBootstrapRun(input: {
   candidatePolicyId: string; maxAssignments?: number; maxProviderCost?: number;
   windowHours?: number; reason: string; actor: string;
@@ -124,6 +138,7 @@ export async function startResearchBootstrapRun(input: {
   const policy = (await db.query(`SELECT * FROM portfolio_policies WHERE id=$1`, [input.candidatePolicyId])).rows[0];
   if (!policy || policy.policy_type !== 'CONTEXTUAL_BANDIT') throw new Error('BOOTSTRAP_CANDIDATE_POLICY_REQUIRED');
   if (policy.status === 'RETIRED') throw new Error('BOOTSTRAP_CANDIDATE_RETIRED');
+  if (policy.status === 'PAUSED') throw new Error('BOOTSTRAP_CANDIDATE_PAUSED');
   const expires = new Date(Date.now() + bounds.windowHours * 3600_000).toISOString();
   try {
     const row = await db.query(
@@ -141,13 +156,39 @@ export async function abortResearchBootstrapRun(id: string, actor: string, reaso
   if (!reason?.trim() || !actor?.trim()) throw new Error('BOOTSTRAP_ABORT_IDENTITY_REQUIRED');
   const db = await getDb();
   const row = await db.query(
-    `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now() WHERE id=$1 AND status='ACTIVE' RETURNING *`,
-    [id]
+    `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$2,abort_reason=$3 WHERE id=$1 AND status='ACTIVE' RETURNING *`,
+    [id, actor.trim(), reason.trim()]
   );
   return row.rows[0] || null;
 }
+/** Aborts every ACTIVE bootstrap run (idempotent). Used when research is disarmed. Returns the aborted count. */
+export async function abortAllActiveBootstrapRuns(actor: string, reason: string): Promise<number> {
+  if (!reason?.trim() || !actor?.trim()) throw new Error('BOOTSTRAP_ABORT_IDENTITY_REQUIRED');
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$1,abort_reason=$2 WHERE status='ACTIVE'`,
+    [actor.trim(), reason.trim()]
+  );
+  return result.rows.length;
+}
+export async function listResearchBootstrapRuns(limit = 50): Promise<DbRow[]> {
+  const db = await getDb();
+  const n = Math.min(200, Math.max(1, Math.trunc(limit) || 50));
+  return (await db.query(`SELECT * FROM research_bootstrap_runs ORDER BY created_at DESC LIMIT $1`, [n])).rows;
+}
 async function completeBootstrapRun(client: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> }, id: string): Promise<void> {
   await client.query(`UPDATE research_bootstrap_runs SET status='COMPLETED',completed_at=now() WHERE id=$1 AND status='ACTIVE'`, [id]);
+}
+async function abortBootstrapRunTx(
+  client: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> },
+  id: string,
+  actor: string,
+  reason: string
+): Promise<void> {
+  await client.query(
+    `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$2,abort_reason=$3 WHERE id=$1 AND status='ACTIVE'`,
+    [id, actor, reason]
+  );
 }
 /** Counts selected bootstrap assignments + their provider cost for one run. */
 async function bootstrapUsage(
@@ -169,24 +210,16 @@ async function bootstrapUsage(
  * candidate policy's deterministic scoring (same allocateContextualPortfolio
  * methodology as canonical allocation — no invented propensities). Assignments
  * are marked BOOTSTRAP_EVIDENCE_GATHERING with the run id in context_snapshot
- * so the evaluator consumes genuine logged behavior. Respects the control's
- * daily caps, per-cycle cap, provider eligibility, and kill-switch/paused
- * state on top of the run bounds. Throws BOOTSTRAP_* on governance failure;
- * returns zero-allocation (never throws) when legitimately out of scope.
+ * so the evaluator consumes genuine logged behavior. The live
+ * research_control row is re-read inside the allocation transaction: a stale
+ * caller snapshot can never allocate after an operator pause or CANARY
+ * kill-switch. Provider daily caps count both recorded outcomes AND all
+ * reserved/in-flight action costs; only serving provider modes
+ * (CANARY/ACTIVE/ACTIVE_GLOBAL, consistent with providerSupports) are
+ * eligible — SHADOW providers never receive selected bootstrap assignments.
+ * Terminal runs return a zero-allocation result (idempotent); only an unknown
+ * run id throws. Returns the allocated choices so cycle accounting is exact.
  */
-/**
- * Allocation entry for research cycles: an ACTIVE bootstrap run takes the
- * bounded provisional path; otherwise the normal PASS-gated canonical path
- * runs unchanged.
- */
-async function allocateResearch(control: DbRow, mode: 'SHADOW' | 'CANARY', cutoff: string) {
-  const db = await getDb();
-  const active = await db.query(
-    `SELECT id FROM research_bootstrap_runs WHERE status='ACTIVE' AND starts_at<=now() AND expires_at>now() LIMIT 1`
-  );
-  if (active.rowCount) return allocateBootstrapAssignments(control, cutoff, String(active.rows[0].id));
-  return allocateCanonical(control, mode, cutoff);
-}
 export async function allocateBootstrapAssignments(
   control: DbRow,
   cutoff: string,
@@ -197,35 +230,61 @@ export async function allocateBootstrapAssignments(
   selected: number;
   providerReserved: number;
   reviewReserved: number;
-  choices: unknown[];
+  choices: ContextualChoice[];
   completed: boolean;
+  bootstrapRunId: string;
+  bootstrapPolicyId: string | null;
 }> {
+  void control;
   const db = await getDb();
   const client = await db.connect();
+  const zero = (bootstrapPolicyId: string | null) => ({
+    runId,
+    allocated: 0,
+    selected: 0,
+    providerReserved: 0,
+    reviewReserved: 0,
+    choices: [] as ContextualChoice[],
+    completed: true,
+    bootstrapRunId: runId,
+    bootstrapPolicyId,
+  });
   try {
     await client.query('BEGIN');
     const run = (
       await client.query(`SELECT * FROM research_bootstrap_runs WHERE id=$1 FOR UPDATE`, [runId])
     ).rows[0];
-    if (!run || run.status !== 'ACTIVE') throw new Error('BOOTSTRAP_RUN_NOT_ACTIVE');
-    // Governance state: any operator stop or mode change aborts the run.
-    if (control.kill_switch || control.paused || control.mode !== 'CANARY') {
-      await completeBootstrapRunAborted(client, runId, 'control disarmed during bootstrap');
+    if (!run) {
+      await client.query('ROLLBACK');
+      throw new Error('BOOTSTRAP_RUN_NOT_FOUND');
+    }
+    const runPolicyId = run.candidate_policy_id ? String(run.candidate_policy_id) : null;
+    if (run.status !== 'ACTIVE') {
       await client.query('COMMIT');
-      return { runId, allocated: 0, selected: 0, providerReserved: 0, reviewReserved: 0, choices: [], completed: true };
+      return zero(runPolicyId);
+    }
+    // Governance state is re-read live: any operator stop or mode change
+    // aborts the run instead of allocating.
+    const fresh = (
+      await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
+    ).rows[0];
+    if (isResearchDisarmed(fresh)) {
+      await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'research control disarmed during bootstrap');
+      await client.query('COMMIT');
+      return zero(runPolicyId);
     }
     if (new Date(run.expires_at).getTime() <= Date.now()) {
-      await completeBootstrapRun(client, runId);
+      await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'bootstrap window expired');
       await client.query('COMMIT');
-      return { runId, allocated: 0, selected: 0, providerReserved: 0, reviewReserved: 0, choices: [], completed: true };
+      return zero(runPolicyId);
     }
     const policy = (
       await client.query(`SELECT * FROM portfolio_policies WHERE id=$1`, [run.candidate_policy_id])
     ).rows[0];
-    if (!policy || policy.policy_type !== 'CONTEXTUAL_BANDIT' || policy.status === 'RETIRED') {
-      await completeBootstrapRunAborted(client, runId, 'candidate policy invalid or retired');
+    if (!policy || policy.policy_type !== 'CONTEXTUAL_BANDIT' || policy.status === 'RETIRED' || policy.status === 'PAUSED') {
+      await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'candidate policy ineligible during bootstrap');
       await client.query('COMMIT');
-      return { runId, allocated: 0, selected: 0, providerReserved: 0, reviewReserved: 0, choices: [], completed: true };
+      return zero(runPolicyId);
     }
     const used = await bootstrapUsage(client, runId);
     const remainingAssignments = Number(run.max_assignments) - used.assignments;
@@ -233,7 +292,7 @@ export async function allocateBootstrapAssignments(
     if (remainingAssignments <= 0 || remainingCost <= 0) {
       await completeBootstrapRun(client, runId);
       await client.query('COMMIT');
-      return { runId, allocated: 0, selected: 0, providerReserved: 0, reviewReserved: 0, choices: [], completed: true };
+      return zero(runPolicyId);
     }
     // Error-spike guard: three recently FAILED research cycles abort the run
     // rather than letting a broken loop consume the remaining budget.
@@ -241,9 +300,9 @@ export async function allocateBootstrapAssignments(
       `SELECT count(*)::int AS n FROM persistent_research_cycles WHERE status='FAILED' AND started_at>=now()-interval '1 hour'`
     );
     if (Number(recentFailures.rows[0]?.n || 0) >= 3) {
-      await completeBootstrapRunAborted(client, runId, 'error spike: 3+ failed cycles in the last hour');
+      await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'error spike: 3+ failed cycles in the last hour');
       await client.query('COMMIT');
-      return { runId, allocated: 0, selected: 0, providerReserved: 0, reviewReserved: 0, choices: [], completed: true };
+      return zero(runPolicyId);
     }
     const spent = await client.query(
       `SELECT coalesce(sum(provider_cost),0)::int provider,coalesce(sum(review_cost),0)::int review
@@ -255,26 +314,27 @@ export async function allocateBootstrapAssignments(
     );
     const provider = Math.min(
       remainingCost,
-      Math.max(0, Number(control.daily_provider_cost_cap) - Number(spent.rows[0].provider) - Number(reserved.rows[0].provider))
+      Math.max(0, Number(fresh.daily_provider_cost_cap) - Number(spent.rows[0].provider) - Number(reserved.rows[0].provider))
     );
     const review = Math.max(
       0,
-      Number(control.daily_review_cost_cap) - Number(spent.rows[0].review) - Number(reserved.rows[0].review)
+      Number(fresh.daily_review_cost_cap) - Number(spent.rows[0].review) - Number(reserved.rows[0].review)
     );
     const policyConfig = researchPolicyFromConfiguration(policy.configuration, {
       provider,
       review,
-      exploration: Number(control.exploration_basis_points),
+      exploration: Number(fresh.exploration_basis_points),
     });
     const rows = await client.query(
-      `WITH eligible AS (SELECT a.*,p.daily_cost_cap,coalesce((SELECT sum(o.provider_cost) FROM discovery_action_outcomes o JOIN discovery_actions prior ON prior.id=o.action_id WHERE prior.provider_key=a.provider_key AND o.observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')),0) provider_spent,sum(a.provider_cost) OVER(PARTITION BY a.provider_key ORDER BY a.created_at,a.action_key) provider_candidate_cost FROM discovery_actions a JOIN discovery_provider_registry p ON p.provider_key=a.provider_key WHERE a.lifecycle='PROPOSED' AND (a.expires_at IS NULL OR a.expires_at>$1) AND p.mode NOT IN('PAUSED','RETIRED') AND p.capabilities ? a.action_type) SELECT * FROM eligible WHERE daily_cost_cap=0 OR provider_spent+provider_candidate_cost<=daily_cost_cap ORDER BY created_at LIMIT 500`,
+      `WITH eligible AS (SELECT a.*,p.daily_cost_cap,coalesce((SELECT sum(o.provider_cost) FROM discovery_action_outcomes o JOIN discovery_actions prior ON prior.id=o.action_id WHERE prior.provider_key=a.provider_key AND o.observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')),0)+coalesce((SELECT sum(a2.provider_cost) FROM discovery_actions a2 WHERE a2.provider_key=a.provider_key AND a2.lifecycle IN('ALLOCATED','RESERVED','QUEUED','RUNNING')),0) provider_spent,sum(a.provider_cost) OVER(PARTITION BY a.provider_key ORDER BY a.created_at,a.action_key) provider_candidate_cost FROM discovery_actions a JOIN discovery_provider_registry p ON p.provider_key=a.provider_key WHERE a.lifecycle='PROPOSED' AND (a.expires_at IS NULL OR a.expires_at>$1) AND p.mode IN('CANARY','ACTIVE','ACTIVE_GLOBAL') AND p.capabilities ? a.action_type) SELECT * FROM eligible WHERE daily_cost_cap=0 OR provider_spent+provider_candidate_cost<=daily_cost_cap ORDER BY created_at LIMIT 500`,
       [cutoff]
     );
     const allChoices = allocateContextualPortfolio(
       rows.rows.map(actionFromRow),
       policyConfig
     );
-    const perCycleCap = Math.max(0, Number(control.max_actions_per_cycle) || 0);
+    const perCycleCap = Math.max(0, Number(fresh.max_actions_per_cycle) || 0);
+    const allocatedChoices: ContextualChoice[] = [];
     let allocated = 0;
     let providerReserved = 0;
     let reviewReserved = 0;
@@ -310,6 +370,7 @@ export async function allocateBootstrapAssignments(
       await client.query(`UPDATE discovery_actions SET lifecycle='ALLOCATED' WHERE id=$1 AND lifecycle='PROPOSED'`, [
         choice.actionId,
       ]);
+      allocatedChoices.push(choice);
       allocated++;
       providerReserved += choice.providerCost;
       reviewReserved += choice.reviewCost;
@@ -327,7 +388,7 @@ export async function allocateBootstrapAssignments(
       completed = true;
     }
     await client.query('COMMIT');
-    return { runId, allocated, selected: allocated, providerReserved, reviewReserved, choices: [], completed };
+    return { runId, allocated, selected: allocated, providerReserved, reviewReserved, choices: allocatedChoices, completed, bootstrapRunId: runId, bootstrapPolicyId: String(policy.id) };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
@@ -335,23 +396,37 @@ export async function allocateBootstrapAssignments(
     client.release();
   }
 }
-async function completeBootstrapRunAborted(
-  client: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> },
-  id: string,
-  reason: string
-): Promise<void> {
-  await client.query(`UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now() WHERE id=$1 AND status='ACTIVE'`, [
-    id,
-  ]);
-  void reason;
+/**
+ * Allocation entry for research cycles: an ACTIVE bootstrap run takes the
+ * bounded provisional path; an expired ACTIVE run is ABORTED (never resumed)
+ * and the cycle falls through to normal allocation. Otherwise the normal
+ * PASS-gated canonical path runs unchanged.
+ */
+export async function allocateResearch(control: DbRow, mode: 'SHADOW' | 'CANARY', cutoff: string) {
+  const db = await getDb();
+  const active = await db.query(
+    `SELECT * FROM research_bootstrap_runs WHERE status='ACTIVE' ORDER BY created_at LIMIT 1`
+  );
+  const run = active.rows[0];
+  if (run && new Date(run.expires_at).getTime() <= Date.now()) {
+    await abortAllActiveBootstrapRuns(
+      BOOTSTRAP_SYSTEM_ACTOR,
+      `bootstrap run ${String(run.id)} expired before allocation`
+    );
+    const canonical = await allocateCanonical(control, mode, cutoff);
+    return { ...canonical, bootstrapRunId: null as string | null, bootstrapPolicyId: (canonical.policyId ?? null) as string | null };
+  }
+  if (run) return allocateBootstrapAssignments(control, cutoff, String(run.id));
+  const canonical = await allocateCanonical(control, mode, cutoff);
+  return { ...canonical, bootstrapRunId: null as string | null, bootstrapPolicyId: (canonical.policyId ?? null) as string | null };
 }
-async function allocateCanonical(control:DbRow,mode:'SHADOW'|'CANARY',cutoff:string){const db=await getDb(),policyRow=control.active_policy_id?(await db.query(`SELECT p.* FROM portfolio_policies p WHERE p.id=$1 AND p.status=CASE WHEN $2='CANARY' THEN 'CANARY' ELSE p.status END AND ($2<>'CANARY' OR EXISTS(SELECT 1 FROM persistent_research_policy_evaluations e WHERE e.policy_id=p.id AND e.decision='PASS'))`,[control.active_policy_id,mode])).rows[0]:null;if(mode==='CANARY'&&!policyRow)throw new Error('EVALUATED_CANARY_POLICY_REQUIRED');const spent=await db.query(`SELECT coalesce(sum(provider_cost),0)::int provider,coalesce(sum(review_cost),0)::int review FROM discovery_action_outcomes WHERE observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')`),reserved=await db.query(`SELECT coalesce(sum(provider_cost),0)::int provider,coalesce(sum(review_cost),0)::int review FROM discovery_actions WHERE lifecycle IN('ALLOCATED','RESERVED','QUEUED','RUNNING')`),provider=Math.max(0,Number(control.daily_provider_cost_cap)-Number(spent.rows[0].provider)-Number(reserved.rows[0].provider)),review=Math.max(0,Number(control.daily_review_cost_cap)-Number(spent.rows[0].review)-Number(reserved.rows[0].review)),limits={provider,review,exploration:Number(control.exploration_basis_points)},policy=researchPolicyFromConfiguration(policyRow?.configuration,limits);const rows=await db.query(`WITH eligible AS (SELECT a.*,p.daily_cost_cap,coalesce((SELECT sum(o.provider_cost) FROM discovery_action_outcomes o JOIN discovery_actions prior ON prior.id=o.action_id WHERE prior.provider_key=a.provider_key AND o.observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')),0) provider_spent,sum(a.provider_cost) OVER(PARTITION BY a.provider_key ORDER BY a.created_at,a.action_key) provider_candidate_cost FROM discovery_actions a JOIN discovery_provider_registry p ON p.provider_key=a.provider_key WHERE a.lifecycle='PROPOSED' AND (a.expires_at IS NULL OR a.expires_at>$1) AND p.mode NOT IN('PAUSED','RETIRED') AND p.capabilities ? a.action_type) SELECT * FROM eligible WHERE daily_cost_cap=0 OR provider_spent+provider_candidate_cost<=daily_cost_cap ORDER BY created_at LIMIT 500`,[cutoff]),actions=rows.rows.map(actionFromRow),allChoices=allocateContextualPortfolio(actions,policy),selectedChoices=allChoices.filter(choice=>choice.selected);if(mode==='CANARY'&&selectedChoices.length>Number(control.max_actions_per_cycle))throw new Error('RESEARCH_CYCLE_CAP_CONFLICT');const choices=mode==='CANARY'?selectedChoices:allChoices.slice(0,Number(control.max_actions_per_cycle));const client=await db.connect();try{await client.query('BEGIN');for(const choice of choices){const selected=mode==='CANARY'&&choice.selected,key=researchChecksum({actionId:choice.actionId,cutoff,policy:policyRow?.id||'shadow-default'});await client.query(`INSERT INTO discovery_action_assignments(assignment_key,action_id,policy_key,policy_version,selected,rank,propensity_basis_points,utility,reason_codes,context_snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(assignment_key) DO NOTHING`,[key,choice.actionId,policyRow?.policy_key||'shadow-default',String(policyRow?.version||1),selected,choice.rank,choice.propensityBasisPoints,choice.utility,JSON.stringify([...choice.reasonCodes,mode==='SHADOW'?'SHADOW_COUNTERFACTUAL':'CANARY_ASSIGNMENT']),JSON.stringify({coordinates:choice.coordinates,providerKey:choice.providerKey,clusterKey:choice.clusterKey,cost:{provider:choice.providerCost,review:choice.reviewCost},policyChecksum:checksum(policy)})]);if(selected)await client.query(`UPDATE discovery_actions SET lifecycle='ALLOCATED' WHERE id=$1 AND lifecycle='PROPOSED'`,[choice.actionId]);}await client.query('COMMIT');return {choices,selected:choices.filter(c=>mode==='CANARY'&&c.selected).length,policyId:policyRow?.id||null,providerReserved:choices.filter(c=>mode==='CANARY'&&c.selected).reduce((n,c)=>n+c.providerCost,0),reviewReserved:choices.filter(c=>mode==='CANARY'&&c.selected).reduce((n,c)=>n+c.reviewCost,0)};}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
+export async function allocateCanonical(control:DbRow,mode:'SHADOW'|'CANARY',cutoff:string){const db=await getDb(),policyRow=control.active_policy_id?(await db.query(`SELECT p.* FROM portfolio_policies p WHERE p.id=$1 AND p.status=CASE WHEN $2='CANARY' THEN 'CANARY' ELSE p.status END AND ($2<>'CANARY' OR EXISTS(SELECT 1 FROM persistent_research_policy_evaluations e WHERE e.policy_id=p.id AND e.decision='PASS'))`,[control.active_policy_id,mode])).rows[0]:null;if(mode==='CANARY'&&!policyRow)throw new Error('EVALUATED_CANARY_POLICY_REQUIRED');const spent=await db.query(`SELECT coalesce(sum(provider_cost),0)::int provider,coalesce(sum(review_cost),0)::int review FROM discovery_action_outcomes WHERE observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')`),reserved=await db.query(`SELECT coalesce(sum(provider_cost),0)::int provider,coalesce(sum(review_cost),0)::int review FROM discovery_actions WHERE lifecycle IN('ALLOCATED','RESERVED','QUEUED','RUNNING')`),provider=Math.max(0,Number(control.daily_provider_cost_cap)-Number(spent.rows[0].provider)-Number(reserved.rows[0].provider)),review=Math.max(0,Number(control.daily_review_cost_cap)-Number(spent.rows[0].review)-Number(reserved.rows[0].review)),limits={provider,review,exploration:Number(control.exploration_basis_points)},policy=researchPolicyFromConfiguration(policyRow?.configuration,limits);const rows=await db.query(`WITH eligible AS (SELECT a.*,p.daily_cost_cap,coalesce((SELECT sum(o.provider_cost) FROM discovery_action_outcomes o JOIN discovery_actions prior ON prior.id=o.action_id WHERE prior.provider_key=a.provider_key AND o.observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')),0) provider_spent,sum(a.provider_cost) OVER(PARTITION BY a.provider_key ORDER BY a.created_at,a.action_key) provider_candidate_cost FROM discovery_actions a JOIN discovery_provider_registry p ON p.provider_key=a.provider_key WHERE a.lifecycle='PROPOSED' AND (a.expires_at IS NULL OR a.expires_at>$1) AND p.mode NOT IN('PAUSED','RETIRED') AND p.capabilities ? a.action_type) SELECT * FROM eligible WHERE daily_cost_cap=0 OR provider_spent+provider_candidate_cost<=daily_cost_cap ORDER BY created_at LIMIT 500`,[cutoff]),actions=rows.rows.map(actionFromRow),allChoices=allocateContextualPortfolio(actions,policy),selectedChoices=allChoices.filter(choice=>choice.selected);if(mode==='CANARY'&&selectedChoices.length>Number(control.max_actions_per_cycle))throw new Error('RESEARCH_CYCLE_CAP_CONFLICT');const choices=mode==='CANARY'?selectedChoices:allChoices.slice(0,Number(control.max_actions_per_cycle));const client=await db.connect();try{await client.query('BEGIN');for(const choice of choices){const selected=mode==='CANARY'&&choice.selected,key=researchChecksum({actionId:choice.actionId,cutoff,policy:policyRow?.id||'shadow-default'});await client.query(`INSERT INTO discovery_action_assignments(assignment_key,action_id,policy_key,policy_version,selected,rank,propensity_basis_points,utility,reason_codes,context_snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(assignment_key) DO NOTHING`,[key,choice.actionId,policyRow?.policy_key||'shadow-default',String(policyRow?.version||1),selected,choice.rank,choice.propensityBasisPoints,choice.utility,JSON.stringify([...choice.reasonCodes,mode==='SHADOW'?'SHADOW_COUNTERFACTUAL':'CANARY_ASSIGNMENT']),JSON.stringify({coordinates:choice.coordinates,providerKey:choice.providerKey,clusterKey:choice.clusterKey,cost:{provider:choice.providerCost,review:choice.reviewCost},policyChecksum:checksum(policy)})]);if(selected)await client.query(`UPDATE discovery_actions SET lifecycle='ALLOCATED' WHERE id=$1 AND lifecycle='PROPOSED'`,[choice.actionId]);}await client.query('COMMIT');return {choices,selected:choices.filter(c=>mode==='CANARY'&&c.selected).length,policyId:policyRow?.id||null,providerReserved:choices.filter(c=>mode==='CANARY'&&c.selected).reduce((n,c)=>n+c.providerCost,0),reviewReserved:choices.filter(c=>mode==='CANARY'&&c.selected).reduce((n,c)=>n+c.reviewCost,0)};}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 
 async function materializePlaylists(cutoff:string){const db=await getDb(),rows=await db.query(`SELECT id,provenance,context FROM discovery_actions WHERE lifecycle='ALLOCATED' AND action_type='INSPECT_PLAYLIST' ORDER BY created_at LIMIT 10`);let n=0;for(const row of rows.rows){const provenance=json<Record<string,any>>(row.provenance,{}),context=json<Record<string,any>>(row.context,{});if(!provenance.frontierActionId||!context.country)continue;const result=await enqueuePlaylistCanary(provenance.frontierActionId,context.country);if(result.queued){n++;await db.query(`UPDATE discovery_actions SET lifecycle='QUEUED',materialization_key=$2 WHERE id=$1 AND lifecycle='ALLOCATED'`,[row.id,`playlist-job:${result.jobId}`]);await db.query(`INSERT INTO discovery_action_execution_links(link_key,action_id,executor_type,executor_id,job_id,policy_version) VALUES($1,$2,'PLAYLIST_JOB',$3,$3,$4) ON CONFLICT(link_key) DO NOTHING`,[`research-action:${row.id}:playlist-job:${result.jobId}`,row.id,result.jobId,PERSISTENT_RESEARCH_POLICY_VERSION]);}}const creator=await materializeCreatorPlaylistCanary(cutoff).catch(error=>{console.warn('[CreatorIntelligence] Playlist canary fallback:',error instanceof Error?error.message:error);return {queued:0};});return n+creator.queued;}
 
 async function materializeFeaturedChannels(cutoff:string){const result=await materializeCreatorFeaturedChannelCanary(cutoff).catch(error=>{console.warn('[CreatorIntelligence] Featured-channel canary fallback:',error instanceof Error?error.message:error);return {queued:0};});return result.queued;}
 
-export async function runPersistentResearchCycle(owner=`research-controller:${process.pid}`,now=new Date().toISOString()){const enabledControl=(await (await getDb()).query('SELECT enabled FROM research_control WHERE singleton=true')).rows[0];if(!enabledControl?.enabled)return {status:'DISABLED' as const};const token=await acquireLease(owner);if(!token)return {status:'LEASE_UNAVAILABLE' as const};const db=await getDb(),control=(await db.query('SELECT * FROM research_control WHERE singleton=true')).rows[0],cutoff=new Date(now).toISOString(),cycleKey=researchChecksum({cutoff:cutoff.slice(0,16),owner,version:RESEARCH_CONTROLLER_VERSION});let cycleId:string|undefined;try{if(!control||control.paused||control.kill_switch&&control.mode==='CANARY')return {status:'DISABLED' as const};const cycle=await db.query(`INSERT INTO persistent_research_cycles(cycle_key,mode,policy_id,lease_owner,input_cutoff,input_checksum,status) VALUES($1,$2,$3,$4,$5,$6,'STARTED') ON CONFLICT(cycle_key) DO NOTHING RETURNING id`,[cycleKey,control.mode,control.active_policy_id||null,owner,cutoff,researchChecksum({cutoff,checkpoint:control.checkpoint})]);if(!cycle.rowCount)return {status:'DUPLICATE' as const};cycleId=cycle.rows[0].id;const queryEvents=await projectQueryOutcomes(cutoff),reviewEvents=await projectReviewOutcomes(cutoff),playlistEvents=await projectPlaylistOutcomes(cutoff),entityCredits=await projectEntityCredits(cutoff),incrementality=await projectIncrementality(cutoff),relationshipOutcomes=await finalizeCreatorRelationshipActions(cutoff),terminologyEvaluations=await evaluateTerminologyTrials(cutoff),externalProviderJobs=await scheduleStructuredExternalProviders(),corpusMiningActions=await generateCorpusMiningActions(cutoff),bursts=await detectAndReactivateTerminology(cutoff),corpus=await generateCorpusHypotheses(cutoff),relationships=await generateCreatorRelationshipActions(cutoff),multilingual=await generateMultilingualActions(cutoff),playlists=await adaptPlaylistFrontier(cutoff),temporal=await adaptTemporalFrontier(cutoff),staleRefreshes=await generateStaleFrontierRefreshActions(cutoff),coverage=await projectCoverage(cutoff),coverageProbes=await generateCoverageProbes(cutoff),overlapUpdates=await refreshOverlapPenalties(cutoff),allocation=await allocateResearch(control,control.mode,cutoff),materialized=control.mode==='CANARY'?await materializePlaylists(cutoff):0,featuredMaterialized=control.mode==='CANARY'?await materializeFeaturedChannels(cutoff):0,corpusMaterialized=control.mode==='CANARY'?await materializeCorpusMiningActions():0,externalMaterialized=control.mode==='CANARY'?await materializeExternalActions():0,checkpoint={cutoff,queryEvents,reviewEvents,playlistEvents,entityCredits,incrementality,relationshipOutcomes,terminologyEvaluations,externalProviderJobs,corpusMiningActions,bursts,corpus,relationships,multilingual,playlists,temporal,staleRefreshes,coverage,coverageProbes,overlapUpdates,candidates:allocation.choices.length,selected:allocation.selected,materialized,featuredMaterialized,corpusMaterialized,externalMaterialized};await db.query(`UPDATE persistent_research_cycles SET candidate_count=$2,selected_count=$3,materialized_count=$4,provider_cost_reserved=$5,review_cost_reserved=$6,status='COMPLETED',checkpoint=$7,completed_at=now() WHERE id=$1`,[cycleId,allocation.choices.length,allocation.selected,materialized+featuredMaterialized+corpusMaterialized+externalMaterialized,allocation.providerReserved,allocation.reviewReserved,JSON.stringify(checkpoint)]);return {status:'COMPLETED' as const,cycleId,...checkpoint};}catch(error){if(cycleId)await db.query(`UPDATE persistent_research_cycles SET status='FAILED',failure_class=$2,completed_at=now() WHERE id=$1`,[cycleId,error instanceof Error?error.name:'UnknownError']).catch(()=>undefined);throw error;}finally{await releaseLease(token,{cutoff,cycleId}).catch(()=>undefined);}}
+export async function runPersistentResearchCycle(owner=`research-controller:${process.pid}`,now=new Date().toISOString()){const enabledControl=(await (await getDb()).query('SELECT enabled FROM research_control WHERE singleton=true')).rows[0];if(!enabledControl?.enabled){await abortAllActiveBootstrapRuns(BOOTSTRAP_SYSTEM_ACTOR,'research control disabled; aborting provisional bootstrap runs');return {status:'DISABLED' as const};}const token=await acquireLease(owner);if(!token){const leaseControl=(await (await getDb()).query('SELECT * FROM research_control WHERE singleton=true')).rows[0];if(isResearchDisarmed(leaseControl))await abortAllActiveBootstrapRuns(BOOTSTRAP_SYSTEM_ACTOR,'research control disarmed while lease unavailable; aborting provisional bootstrap runs');return {status:'LEASE_UNAVAILABLE' as const};}const db=await getDb(),control=(await db.query('SELECT * FROM research_control WHERE singleton=true')).rows[0],cutoff=new Date(now).toISOString(),cycleKey=researchChecksum({cutoff:cutoff.slice(0,16),owner,version:RESEARCH_CONTROLLER_VERSION});let cycleId:string|undefined;try{if(!control||control.paused||control.kill_switch&&control.mode==='CANARY'){await abortAllActiveBootstrapRuns(BOOTSTRAP_SYSTEM_ACTOR,'research control disarmed before cycle; aborting provisional bootstrap runs');return {status:'DISABLED' as const};}const cycle=await db.query(`INSERT INTO persistent_research_cycles(cycle_key,mode,policy_id,lease_owner,input_cutoff,input_checksum,status) VALUES($1,$2,$3,$4,$5,$6,'STARTED') ON CONFLICT(cycle_key) DO NOTHING RETURNING id`,[cycleKey,control.mode,control.active_policy_id||null,owner,cutoff,researchChecksum({cutoff,checkpoint:control.checkpoint})]);if(!cycle.rowCount)return {status:'DUPLICATE' as const};cycleId=cycle.rows[0].id;const queryEvents=await projectQueryOutcomes(cutoff),reviewEvents=await projectReviewOutcomes(cutoff),playlistEvents=await projectPlaylistOutcomes(cutoff),entityCredits=await projectEntityCredits(cutoff),incrementality=await projectIncrementality(cutoff),relationshipOutcomes=await finalizeCreatorRelationshipActions(cutoff),terminologyEvaluations=await evaluateTerminologyTrials(cutoff),externalProviderJobs=await scheduleStructuredExternalProviders(),corpusMiningActions=await generateCorpusMiningActions(cutoff),bursts=await detectAndReactivateTerminology(cutoff),corpus=await generateCorpusHypotheses(cutoff),relationships=await generateCreatorRelationshipActions(cutoff),multilingual=await generateMultilingualActions(cutoff),playlists=await adaptPlaylistFrontier(cutoff),temporal=await adaptTemporalFrontier(cutoff),staleRefreshes=await generateStaleFrontierRefreshActions(cutoff),coverage=await projectCoverage(cutoff),coverageProbes=await generateCoverageProbes(cutoff),overlapUpdates=await refreshOverlapPenalties(cutoff),allocation=await allocateResearch(control,control.mode,cutoff),materialized=control.mode==='CANARY'?await materializePlaylists(cutoff):0,featuredMaterialized=control.mode==='CANARY'?await materializeFeaturedChannels(cutoff):0,corpusMaterialized=control.mode==='CANARY'?await materializeCorpusMiningActions():0,externalMaterialized=control.mode==='CANARY'?await materializeExternalActions():0,checkpoint={cutoff,queryEvents,reviewEvents,playlistEvents,entityCredits,incrementality,relationshipOutcomes,terminologyEvaluations,externalProviderJobs,corpusMiningActions,bursts,corpus,relationships,multilingual,playlists,temporal,staleRefreshes,coverage,coverageProbes,overlapUpdates,candidates:allocation.choices.length,selected:allocation.selected,materialized,featuredMaterialized,corpusMaterialized,externalMaterialized};await db.query(`UPDATE persistent_research_cycles SET candidate_count=$2,selected_count=$3,materialized_count=$4,provider_cost_reserved=$5,review_cost_reserved=$6,status='COMPLETED',checkpoint=$7,policy_id=COALESCE($8,policy_id),completed_at=now() WHERE id=$1`,[cycleId,allocation.choices.length,allocation.selected,materialized+featuredMaterialized+corpusMaterialized+externalMaterialized,allocation.providerReserved,allocation.reviewReserved,JSON.stringify(checkpoint),allocation.bootstrapPolicyId||null]);return {status:'COMPLETED' as const,cycleId,...checkpoint};}catch(error){if(cycleId)await db.query(`UPDATE persistent_research_cycles SET status='FAILED',failure_class=$2,completed_at=now() WHERE id=$1`,[cycleId,error instanceof Error?error.name:'UnknownError']).catch(()=>undefined);throw error;}finally{await releaseLease(token,{cutoff,cycleId}).catch(()=>undefined);}}
 
 export async function recordExternalNominations(input:{providerKey:string;items:ExternalNomination[]}){const normalized=normalizeExternalNominations(input.providerKey,input.items),db=await getDb(),provider=await db.query(`SELECT * FROM discovery_provider_registry WHERE provider_key=$1 AND provider_kind='RETRIEVAL' AND mode IN('SHADOW','CANARY','ACTIVE')`,[input.providerKey]);if(!provider.rowCount)throw new Error('EXTERNAL_PROVIDER_NOT_ELIGIBLE');let inserted=0,actions=0;for(const item of normalized){const result=await db.query(`INSERT INTO external_nomination_observations(nomination_key,provider_key,provider_native_id,display_name,youtube_locator,country,language,source_family_id,source_locator,observed_at,payload_checksum,policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(nomination_key) DO NOTHING RETURNING id`,[item.nominationKey,input.providerKey,item.providerNativeId,item.displayName||null,item.youtubeLocator||null,item.country||null,item.language||null,item.sourceFamilyId,JSON.stringify(item.sourceLocator),item.observedAt,item.payloadChecksum,PERSISTENT_RESEARCH_POLICY_VERSION]);if(!result.rowCount)continue;inserted++;const identity=classifyExternalIdentity({providerKey:input.providerKey,providerNativeId:item.providerNativeId,youtubeLocator:item.youtubeLocator,sourceFamilyId:item.sourceFamilyId});await db.query(`INSERT INTO external_identity_resolution_observations(observation_key,nomination_key,provider_key,provider_namespace,provider_native_id,youtube_channel_id,resolution_status,confidence_basis_points,source_family_id,evidence,observed_at,policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(observation_key) DO NOTHING`,[researchChecksum({nominationKey:item.nominationKey,identity}),item.nominationKey,input.providerKey,identity.providerNamespace,identity.providerNativeId,identity.youtubeChannelId,identity.resolutionStatus,identity.confidenceBasisPoints,identity.sourceFamilyId,JSON.stringify({sourceLocator:item.sourceLocator,youtubeLocator:item.youtubeLocator,exactProviderNative:identity.resolutionStatus==='EXACT_NATIVE'}),item.observedAt,PERSISTENT_RESEARCH_POLICY_VERSION]);const programs=await db.query(`SELECT id,scope FROM research_programs WHERE lifecycle='ACTIVE'`);for(const program of programs.rows){const scope=json<ResearchCoordinates>(program.scope,{});if(scope.country&&item.country&&scope.country!==item.country)continue;const hypothesisKey=researchChecksum({programId:program.id,nominationKey:item.nominationKey}),hyp=await db.query(`INSERT INTO discovery_hypotheses(hypothesis_key,program_id,hypothesis_type,statement,coordinates,provenance,source_family_ids,confidence_basis_points,policy_version) VALUES($1,$2,'EXTERNAL_NOMINATION',$3,$4,$5,$6,6000,$7) ON CONFLICT(hypothesis_key) DO NOTHING RETURNING id`,[hypothesisKey,program.id,`Resolve structured nomination ${item.displayName||item.providerNativeId}`,JSON.stringify({...scope,country:item.country||scope.country,language:item.language||scope.language}),JSON.stringify({providerKey:input.providerKey,nominationKey:item.nominationKey,providerNativeId:item.providerNativeId,youtubeLocator:item.youtubeLocator,sourceLocator:item.sourceLocator,nominationOnly:true}),JSON.stringify([item.sourceFamilyId]),PERSISTENT_RESEARCH_POLICY_VERSION]);if(!hyp.rowCount)continue;const target=item.displayName||item.youtubeLocator||item.providerNativeId,actionKey=researchChecksum({hypothesisId:hyp.rows[0].id,type:'RESOLVE_EXTERNAL_ENTITY',target}),action=await db.query(`INSERT INTO discovery_actions(action_key,program_id,hypothesis_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at) VALUES($1,$2,$3,'RESOLVE_EXTERNAL_ENTITY','youtube-search',$4,$5,$6,$7,0,$8,.5,1,.5,.8,100,1,0,$9,now()+interval '30 days') ON CONFLICT(action_key) DO NOTHING RETURNING id`,[actionKey,program.id,hyp.rows[0].id,target,JSON.stringify({...scope,country:item.country||scope.country,language:item.language||scope.language,intent:'strategy'}),JSON.stringify({providerKey:input.providerKey,nominationKey:item.nominationKey,youtubeLocator:item.youtubeLocator,nominationOnly:true}),JSON.stringify([item.sourceFamilyId]),`external:${input.providerKey}:${item.providerNativeId}`,PERSISTENT_RESEARCH_POLICY_VERSION]);if(action.rowCount)actions++;}}return {received:input.items.length,normalized:normalized.length,inserted,actions,servingAuthority:false};}
 
