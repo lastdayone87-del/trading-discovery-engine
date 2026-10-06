@@ -75,34 +75,6 @@ async function assertIsolatedTestDb(database: Db) {
   );
 }
 
-async function readControls(database: Db) {
-  const corpus = (
-    await database.query('SELECT paused, daily_compute_documents FROM corpus_controls WHERE singleton=true')
-  ).rows[0];
-  const scoring = (
-    await database.query(
-      'SELECT scoring_paused, daily_scoring_candidates FROM candidate_scoring_controls WHERE singleton=true'
-    )
-  ).rows[0];
-  assert.ok(corpus, 'corpus_controls singleton must exist');
-  assert.ok(scoring, 'candidate_scoring_controls singleton must exist');
-  return { corpus, scoring };
-}
-
-async function restoreControls(
-  database: Db,
-  prev: { corpus: Record<string, unknown>; scoring: Record<string, unknown> }
-) {
-  await database.query('UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true', [
-    prev.corpus.paused,
-    prev.corpus.daily_compute_documents,
-  ]);
-  await database.query(
-    'UPDATE candidate_scoring_controls SET scoring_paused=$1, daily_scoring_candidates=$2 WHERE singleton=true',
-    [prev.scoring.scoring_paused, prev.scoring.daily_scoring_candidates]
-  );
-}
-
 async function spentToday(database: Db) {
   const runs = (
     await database.query(
