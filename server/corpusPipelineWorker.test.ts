@@ -212,9 +212,17 @@ test('resolution guard admits one unit with headroom, denies when exhausted', as
   ]);
   const client = {
     query: async (text: string) => {
-      if (text.includes('FROM concept_graph_controls')) return { rows: rows.get('concept_graph_controls')! };
-      if (text.includes('FROM concept_resolution_proposals')) return { rows: rows.get('proposals')! };
-      return { rows: rows.get('inflight')! };
+      const rowsFor = (() => {
+        if (text.includes('FROM concept_graph_controls')) return rows.get('concept_graph_controls')!;
+        // The idempotent-retry existence probe (by candidate_key) finds
+        // nothing in these scenarios; the hatch-positive case below supplies
+        // its own row. Without this split the count rows would falsely
+        // satisfy the probe.
+        if (text.includes('candidate_key')) return [];
+        if (text.includes('FROM concept_resolution_proposals')) return rows.get('proposals')!;
+        return rows.get('inflight')!;
+      })();
+      return { rows: rowsFor, rowCount: rowsFor.length };
     },
   };
   const job = { id: 'job-1', payload: { candidateKey: 'k', literal: 'x' } };
@@ -230,12 +238,47 @@ test('resolution guard admits one unit with headroom, denies when exhausted', as
     exhausted: true,
   });
   // Paused control denies regardless of headroom.
-  rows.set('concept_graph_controls', [{ paused: true, budget: 10 }]);
-  rows.set('proposals', [{ n: 0 }]);
+  rows.set('concept_graph_controls', [{ paused: false, budget: 10 }]);
+  rows.set('proposals', [{ n: 8 }]);
+  rows.set('inflight', [{ n: 1 }]);
+  // 8 done + 1 live in-flight of 10: one unit remains, admitted.
+  assert.deepEqual(await RESOLUTION_BUDGET_GUARD.isAdmitted(client, job), {
+    admitted: true,
+    exhausted: false,
+  });
+  // A second live in-flight claim fills the budget: denied + exhausted even
+  // though completed proposals alone would leave headroom.
+  rows.set('inflight', [{ n: 2 }]);
   assert.deepEqual(await RESOLUTION_BUDGET_GUARD.isAdmitted(client, job), {
     admitted: false,
     exhausted: true,
   });
+  rows.set('concept_graph_controls', [{ paused: true, budget: 10 }]);
+  rows.set('proposals', [{ n: 0 }]);
+  rows.set('inflight', [{ n: 0 }]);
+  assert.deepEqual(await RESOLUTION_BUDGET_GUARD.isAdmitted(client, job), {
+    admitted: false,
+    exhausted: true,
+  });
+  // Idempotent-retry escape hatch: the same candidateKey already recorded
+  // (persist succeeded, completion lost) re-admits with zero new units even
+  // though the budget is exhausted — the retry creates nothing new.
+  rows.set('concept_graph_controls', [{ paused: false, budget: 10 }]);
+  rows.set('proposals', [{ n: 10 }]);
+  const hatchClient = {
+    query: async (text: string) => {
+      if (text.includes('FROM concept_graph_controls')) {
+        return { rows: [{ paused: false, budget: 10 }], rowCount: 1 };
+      }
+      if (text.includes('candidate_key')) return { rows: [{ '?column?': 1 }], rowCount: 1 };
+      if (text.includes('FROM concept_resolution_proposals')) return { rows: [{ n: 10 }], rowCount: 1 };
+      return { rows: [{ n: 0 }], rowCount: 1 };
+    },
+  };
+  assert.deepEqual(
+    await RESOLUTION_BUDGET_GUARD.isAdmitted(hatchClient, { id: 'job-9', payload: { candidateKey: 'k' } }),
+    { admitted: true, exhausted: true }
+  );
 });
 
 test('corpus claim types stay authorized by their existing paused controls', () => {

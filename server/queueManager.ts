@@ -425,7 +425,7 @@ export const CORPUS_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [TERM_HARVEST_BUDG
 export const RESOLUTION_BUDGET_GUARD: ClaimBudgetGuard = {
   types: ['PROPOSE_CONCEPT_RESOLUTION'],
   lockSql: `SELECT * FROM concept_graph_controls WHERE singleton=true FOR UPDATE`,
-  isAdmitted: async (client) => {
+  isAdmitted: async (client, job) => {
     const control = await client.query(
       `SELECT resolution_paused AS paused,daily_resolution_documents AS budget FROM concept_graph_controls WHERE singleton=true FOR UPDATE`
     );
@@ -437,11 +437,33 @@ export const RESOLUTION_BUDGET_GUARD: ClaimBudgetGuard = {
     const done = await client.query(
       `SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE created_at>=date_trunc('day',now())`
     );
+    // In-flight counts every live PROCESSING claim with no date bound: a unit
+    // stays reserved until the job completes or fails, so a pre-midnight
+    // claim cannot silently drop out of today's accounting at rollover.
+    // Stale locks are recovered to PENDING by recoverStaleJobs on every tick,
+    // so only genuinely live claims hold units here.
     const inFlight = await client.query(
-      `SELECT count(*)::int AS n FROM jobs WHERE type='PROPOSE_CONCEPT_RESOLUTION' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`
+      `SELECT count(*)::int AS n FROM jobs WHERE type='PROPOSE_CONCEPT_RESOLUTION' AND status='PROCESSING'`
     );
     const remaining = budget - Number(done.rows[0]?.n || 0) - Number(inFlight.rows[0]?.n || 0);
-    if (remaining < 1) return { admitted: false, exhausted: true };
+    if (remaining < 1) {
+      // Idempotent-retry escape hatch: if this exact job's proposal is already
+      // recorded (persist succeeded but completion never landed, e.g. crash
+      // between the insert and completeJob), re-running creates nothing new
+      // (proposal_key is idempotent), so admit with zero additional units and
+      // let the job reach its terminal state instead of stranding it forever
+      // behind a budget its own prior persistence consumed. New literals still
+      // require headroom because they would create new proposal rows.
+      const candidateKey = job?.payload?.candidateKey;
+      if (typeof candidateKey === 'string' && candidateKey) {
+        const prior = await client.query(
+          `SELECT 1 FROM concept_resolution_proposals WHERE candidate_key=$1 LIMIT 1`,
+          [candidateKey]
+        );
+        if (prior.rows.length) return { admitted: true, exhausted: true };
+      }
+      return { admitted: false, exhausted: true };
+    }
     return { admitted: true, exhausted: false };
   },
 };
