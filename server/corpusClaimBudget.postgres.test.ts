@@ -66,12 +66,12 @@ async function assertIsolatedTestDb(database: Db) {
     'refusing to run against a non-empty (shared/production?) database: query_library must be empty'
   );
   const live = await database.query(
-    `SELECT count(*)::int AS n FROM jobs WHERE type IN ('TERM_HARVEST','SCORE_CANDIDATES') AND status IN ('PENDING','PROCESSING')`
+    `SELECT count(*)::int AS n FROM jobs WHERE type IN ('TERM_HARVEST','SCORE_CANDIDATES','PROPOSE_CONCEPT_RESOLUTION') AND status IN ('PENDING','PROCESSING')`
   );
   assert.equal(
     Number(live.rows[0]?.n || 0),
     0,
-    'refusing to run while harvest/scoring jobs are live: a worker may be active on this database'
+    'refusing to run while harvest/scoring/resolution jobs are live: a worker may be active on this database'
   );
 }
 
@@ -436,5 +436,350 @@ maybe('shared corpus budget blocks both harvest claims and research writes', asy
       prev.paused,
       prev.daily_compute_documents,
     ]);
+  }
+});
+
+function resolutionPayload(tag: string, index: number) {
+  return {
+    payloadSchemaVersion: 1,
+    candidateKey: `test-resolution:${tag}:${index}`,
+    literal: `test resolution probe ${tag} ${index}`,
+    language: 'und',
+    script: 'Zyyy',
+    locale: 'und',
+    resolverVersion: 'concept-resolution-v1',
+  };
+}
+
+maybe('resolution admission with headroom and denial when exhausted', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
+  const { RESOLUTION_BUDGET_GUARD } = await import('./queueManager');
+  const database = await db();
+  await assertIsolatedTestDb(database);
+  const tag = `resolution:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-resolution:%'`);
+  const prev = (
+    await database.query(
+      'SELECT resolution_paused, daily_resolution_documents FROM concept_graph_controls WHERE singleton=true'
+    )
+  ).rows[0];
+  assert.ok(prev, 'concept_graph_controls singleton must exist');
+  const done = (
+    await database.query(
+      `SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE created_at>=date_trunc('day',now())`
+    )
+  ).rows[0];
+  const jobIds: string[] = [];
+  try {
+    // Exactly one unit of headroom over current usage.
+    await database.query(
+      `UPDATE concept_graph_controls SET resolution_paused=false, daily_resolution_documents=$1 WHERE singleton=true`,
+      [Number(done?.n || 0) + 1]
+    );
+    const first = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 0), {
+      priority: 2,
+      maxAttempts: 3,
+      idempotencyKey: `test-resolution:${tag}:0`,
+    });
+    jobIds.push(first.id);
+    const admitted = await claimNextJob(`test-resolution`, ['PROPOSE_CONCEPT_RESOLUTION'], undefined, undefined, [
+      RESOLUTION_BUDGET_GUARD,
+    ]);
+    assert.ok(admitted);
+    assert.equal(admitted?.id, first.id);
+    // Budget now exhausted: a second job is denied, stays PENDING, attempts untouched.
+    const second = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 1), {
+      priority: 2,
+      maxAttempts: 3,
+      idempotencyKey: `test-resolution:${tag}:1`,
+    });
+    jobIds.push(second.id);
+    const denied = await claimNextJob(`test-resolution-2`, ['PROPOSE_CONCEPT_RESOLUTION'], undefined, undefined, [
+      RESOLUTION_BUDGET_GUARD,
+    ]);
+    assert.equal(denied, null);
+    const state = (
+      await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [second.id])
+    ).rows[0] as { status: string; attempts: number };
+    assert.equal(state.status, 'PENDING');
+    assert.equal(Number(state.attempts), 0);
+  } finally {
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
+    }
+    await database.query(
+      'UPDATE concept_graph_controls SET resolution_paused=$1, daily_resolution_documents=$2 WHERE singleton=true',
+      [prev.resolution_paused, prev.daily_resolution_documents]
+    );
+  }
+});
+
+maybe('concurrent resolution claims admit at most remaining headroom', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
+  const { RESOLUTION_BUDGET_GUARD } = await import('./queueManager');
+  const database = await db();
+  await assertIsolatedTestDb(database);
+  const tag = `resolution-race:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-resolution-race:%'`);
+  const prev = (
+    await database.query(
+      'SELECT resolution_paused, daily_resolution_documents FROM concept_graph_controls WHERE singleton=true'
+    )
+  ).rows[0];
+  const done = (
+    await database.query(
+      `SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE created_at>=date_trunc('day',now())`
+    )
+  ).rows[0];
+  const jobIds: string[] = [];
+  try {
+    await database.query(
+      `UPDATE concept_graph_controls SET resolution_paused=false, daily_resolution_documents=$1 WHERE singleton=true`,
+      [Number(done?.n || 0) + 1]
+    );
+    for (let index = 0; index < 3; index++) {
+      const job = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(`${tag}`, index), {
+        priority: 2,
+        maxAttempts: 3,
+        idempotencyKey: `test-resolution-race:${tag}:${index}`,
+      });
+      jobIds.push(job.id);
+    }
+    const results = await Promise.all(
+      [0, 1, 2].map(n =>
+        claimNextJob(`test-resolution-race-${n}`, ['PROPOSE_CONCEPT_RESOLUTION'], undefined, undefined, [
+          RESOLUTION_BUDGET_GUARD,
+        ])
+      )
+    );
+    const claimed = results.filter(Boolean);
+    assert.equal(claimed.length, 1);
+    const states = (
+      await database.query('SELECT status, attempts FROM jobs WHERE id = ANY($1::uuid[])', [jobIds])
+    ).rows as Array<{ status: string; attempts: number }>;
+    assert.equal(states.filter(row => row.status === 'PROCESSING').length, 1);
+    assert.equal(states.filter(row => row.status === 'PENDING').length, 2);
+    assert.ok(states.every(row => row.status !== 'FAILED'));
+    assert.ok(
+      states.filter(row => row.status === 'PENDING').every(row => Number(row.attempts) === 0),
+      'denied jobs must not consume attempts'
+    );
+  } finally {
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
+    }
+    await database.query(
+      'UPDATE concept_graph_controls SET resolution_paused=$1, daily_resolution_documents=$2 WHERE singleton=true',
+      [prev.resolution_paused, prev.daily_resolution_documents]
+    );
+  }
+});
+
+maybe('paused resolution control denies claims without consuming attempts', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
+  const { RESOLUTION_BUDGET_GUARD } = await import('./queueManager');
+  const database = await db();
+  await assertIsolatedTestDb(database);
+  const tag = `resolution-paused:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-resolution-paused:%'`);
+  const prev = (
+    await database.query(
+      'SELECT resolution_paused, daily_resolution_documents FROM concept_graph_controls WHERE singleton=true'
+    )
+  ).rows[0];
+  const jobIds: string[] = [];
+  try {
+    await database.query(
+      `UPDATE concept_graph_controls SET resolution_paused=true, daily_resolution_documents=100 WHERE singleton=true`
+    );
+    const job = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 0), {
+      priority: 2,
+      maxAttempts: 3,
+      idempotencyKey: `test-resolution-paused:${tag}`,
+    });
+    jobIds.push(job.id);
+    const denied = await claimNextJob(`test-resolution-paused`, ['PROPOSE_CONCEPT_RESOLUTION'], undefined, undefined, [
+      RESOLUTION_BUDGET_GUARD,
+    ]);
+    assert.equal(denied, null);
+    const state = (
+      await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [job.id])
+    ).rows[0] as { status: string; attempts: number };
+    assert.equal(state.status, 'PENDING');
+    assert.equal(Number(state.attempts), 0);
+  } finally {
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
+    }
+    await database.query(
+      'UPDATE concept_graph_controls SET resolution_paused=$1, daily_resolution_documents=$2 WHERE singleton=true',
+      [prev.resolution_paused, prev.daily_resolution_documents]
+    );
+  }
+});
+
+maybe('processed resolution job transitions to COMPLETED, never stuck PROCESSING', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
+  const { RESOLUTION_BUDGET_GUARD } = await import('./queueManager');
+  const { processConceptResolutionJob } = await import('./conceptGraph');
+  const database = await db();
+  await assertIsolatedTestDb(database);
+  const tag = `resolution-complete:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-resolution-complete:%'`);
+  const prev = (
+    await database.query(
+      'SELECT resolution_paused, daily_resolution_documents FROM concept_graph_controls WHERE singleton=true'
+    )
+  ).rows[0];
+  assert.ok(prev, 'concept_graph_controls singleton must exist');
+  const done = (
+    await database.query(
+      `SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE created_at>=date_trunc('day',now())`
+    )
+  ).rows[0];
+  const jobIds: string[] = [];
+  // term_surfaces rows are append-only; resolutionPayload() generates a unique
+  // per-run surface literal, keeping reruns deterministic without deleting them.
+  try {
+    await database.query(
+      `UPDATE concept_graph_controls SET resolution_paused=false, daily_resolution_documents=$1 WHERE singleton=true`,
+      [Number(done?.n || 0) + 1]
+    );
+    const job = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 0), {
+      priority: 2,
+      maxAttempts: 3,
+      idempotencyKey: `test-resolution-complete:${tag}`,
+    });
+    jobIds.push(job.id);
+    const claimed = await claimNextJob(`test-resolution-complete`, ['PROPOSE_CONCEPT_RESOLUTION'], undefined, undefined, [
+      RESOLUTION_BUDGET_GUARD,
+    ]);
+    assert.ok(claimed);
+    assert.equal(claimed?.id, job.id);
+    // Successful processing transitions the job out of PROCESSING exactly
+    // like every other queue processor: it must not remain PROCESSING.
+    await processConceptResolutionJob({ id: job.id, payload: resolutionPayload(tag, 0) });
+    const state = (
+      await database.query('SELECT status FROM jobs WHERE id=$1::uuid', [job.id])
+    ).rows[0] as { status: string };
+    assert.equal(state.status, 'COMPLETED');
+    // And the proposal is deterministically recorded exactly once.
+    const proposals = (
+      await database.query(
+        `SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE candidate_key=$1`,
+        [`test-resolution:${tag}:0`]
+      )
+    ).rows[0];
+    assert.equal(Number(proposals?.n || 0), 1);
+  } finally {
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
+    }
+    await database.query(
+      'UPDATE concept_graph_controls SET resolution_paused=$1, daily_resolution_documents=$2 WHERE singleton=true',
+      [prev.resolution_paused, prev.daily_resolution_documents]
+    );
+  }
+});
+
+maybe('crashed-after-persist resolution recovers to terminal instead of stranding', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
+  const { RESOLUTION_BUDGET_GUARD } = await import('./queueManager');
+  const { processConceptResolutionJob } = await import('./conceptGraph');
+  const database = await db();
+  await assertIsolatedTestDb(database);
+  const tag = `resolution-recover:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-resolution-recover:%'`);
+  const prev = (
+    await database.query(
+      'SELECT resolution_paused, daily_resolution_documents FROM concept_graph_controls WHERE singleton=true'
+    )
+  ).rows[0];
+  assert.ok(prev, 'concept_graph_controls singleton must exist');
+  const done = (
+    await database.query(
+      `SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE created_at>=date_trunc('day',now())`
+    )
+  ).rows[0];
+  const jobIds: string[] = [];
+  try {
+    // Zero headroom: the budget is exactly spent. A fresh job is denied…
+    await database.query(
+      `UPDATE concept_graph_controls SET resolution_paused=false, daily_resolution_documents=$1 WHERE singleton=true`,
+      [Number(done?.n || 0)]
+    );
+    const fresh = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 0), {
+      priority: 1,
+      maxAttempts: 3,
+      idempotencyKey: `test-resolution-recover:${tag}:fresh`,
+    });
+    jobIds.push(fresh.id);
+    assert.equal(
+      await claimNextJob(`test-resolution-recover-fresh`, ['PROPOSE_CONCEPT_RESOLUTION'], undefined, undefined, [
+        RESOLUTION_BUDGET_GUARD,
+      ]),
+      null
+    );
+    // …but a job whose proposal was already persisted (crash between the
+    // insert and completeJob) is re-admitted with zero new units: the retry
+    // creates nothing new (proposal_key idempotent) and the run below
+    // completes it instead of stranding it behind its own spent budget.
+    // Reproduce the persisted state by processing once with headroom.
+    await database.query(
+      `UPDATE concept_graph_controls SET daily_resolution_documents=$1 WHERE singleton=true`,
+      [Number(done?.n || 0) + 1]
+    );
+    const crashed = await enqueueJob('PROPOSE_CONCEPT_RESOLUTION', resolutionPayload(tag, 1), {
+      priority: 5,
+      maxAttempts: 3,
+      idempotencyKey: `test-resolution-recover:${tag}:crashed`,
+    });
+    jobIds.push(crashed.id);
+    const firstClaim = await claimNextJob(
+      `test-resolution-recover-claim`,
+      ['PROPOSE_CONCEPT_RESOLUTION'],
+      undefined,
+      undefined,
+      [RESOLUTION_BUDGET_GUARD]
+    );
+    assert.ok(firstClaim);
+    assert.equal(firstClaim?.id, crashed.id);
+    // Simulate the crash: proposal persisted by processing, but completion
+    // lost — put the job back to PENDING as stale recovery would, then close
+    // the budget exactly (its own proposal now consumes the single unit).
+    await processConceptResolutionJob({ id: crashed.id, payload: resolutionPayload(tag, 1) });
+    await database.query(
+      `UPDATE jobs SET status='PENDING', locked_by=NULL, locked_at=NULL, updated_at=now() WHERE id=$1::uuid`,
+      [crashed.id]
+    );
+    const retry = await claimNextJob(
+      `test-resolution-recover-retry`,
+      ['PROPOSE_CONCEPT_RESOLUTION'],
+      undefined,
+      undefined,
+      [RESOLUTION_BUDGET_GUARD]
+    );
+    assert.ok(retry, 'idempotent retry must be admitted despite the exhausted budget');
+    assert.equal(retry?.id, crashed.id);
+    await processConceptResolutionJob({ id: crashed.id, payload: resolutionPayload(tag, 1) });
+    const terminal = (
+      await database.query('SELECT status FROM jobs WHERE id=$1::uuid', [crashed.id])
+    ).rows[0] as { status: string };
+    assert.equal(terminal.status, 'COMPLETED');
+    // Still exactly one proposal: no duplicate creation, no double counting.
+    const proposals = (
+      await database.query(`SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE candidate_key=$1`, [
+        `test-resolution:${tag}:1`,
+      ])
+    ).rows[0];
+    assert.equal(Number(proposals?.n || 0), 1);
+  } finally {
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
+    }
+    await database.query(
+      'UPDATE concept_graph_controls SET resolution_paused=$1, daily_resolution_documents=$2 WHERE singleton=true',
+      [prev.resolution_paused, prev.daily_resolution_documents]
+    );
   }
 });

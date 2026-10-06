@@ -18,12 +18,12 @@ const OFFICIAL_RECHECK_TYPES: ClaimableOverride = ['POST_APPROVAL_ENRICH', 'FORC
 const FALSE_NEGATIVE_RECOVERY_JOB = 'CLASSIFICATION_FALSE_NEGATIVE_RESCAN';
 const COUNTRY_BOUNDARY_RECOVERY_TYPES: ClaimableOverride = [COUNTRY_BOUNDARY_RECOVERY_JOB];
 /**
- * Corpus pipeline claim list: harvest + scoring only. Resolution, research,
- * and all other gated families stay unwired until their own activations.
- * Every type here remains authorized by its existing control/budget gates
- * inside processNextSearchJob; the list itself grants no authority.
+ * Corpus pipeline claim list: harvest, scoring, and concept resolution. Each
+ * type remains authorized by its existing control/budget gates inside
+ * processNextSearchJob; the list itself grants no authority. Research and all
+ * other gated families stay unwired until their own activations.
  */
-export const CORPUS_PIPELINE_TYPES: ClaimableOverride = ['TERM_HARVEST', 'SCORE_CANDIDATES'];
+export const CORPUS_PIPELINE_TYPES: ClaimableOverride = ['TERM_HARVEST', 'SCORE_CANDIDATES', 'PROPOSE_CONCEPT_RESOLUTION'];
 const QUOTA_BACKOFF_MS = 30_000;
 const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
   0,
@@ -295,10 +295,11 @@ function startCountryBoundaryRecoveryWorker(workerId: string): void {
 }
 
 /**
- * Dedicated corpus-pipeline consumer: harvest + scoring only, through the
- * existing processNextSearchJob path and its existing control/budget gates.
- * Concurrency is intentionally 1 (single consumer); corpus work is DB-local
- * and must never compete with provider-bound pools by scaling here.
+ * Dedicated corpus-pipeline consumer: harvest, scoring, and concept
+ * resolution, through the existing processNextSearchJob path and its existing
+ * control/budget gates. Concurrency is intentionally 1 (single consumer);
+ * this work is DB-local and must never compete with provider-bound pools by
+ * scaling here.
  */
 function startCorpusPipelineWorker(workerId: string): void {
   corpusPipelineHealth.started = true;
