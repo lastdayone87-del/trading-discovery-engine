@@ -50,14 +50,21 @@ async function assertBootstrapDbReady(database: Db) {
   assert.ok(control.rows.length, 'research_control singleton must exist');
 }
 
-const POLICY_CONFIG = {
+const POLICY_CONFIG_BASE = {
   totalProviderBudget: 1000,
   totalReviewBudget: 100,
   clusterCap: 2,
   curatedSearchFloor: 0,
-  programFloors: {},
   actionCaps: {},
 };
+/**
+ * Per-test configuration. portfolio_policies enforces a UNIQUE
+ * configuration_checksum, and policies persist in the dedicated database, so
+ * every test mints a distinct (zero-weight, allocation-inert) program floor.
+ */
+function policyConfigFor(tag: string) {
+  return { ...POLICY_CONFIG_BASE, programFloors: { [`test:bootstrap:${tag}`]: 0 } };
+}
 
 async function ensureProgram(database: Db, tag: string): Promise<string> {
   const row = await database.query(
@@ -138,7 +145,7 @@ maybe('bootstrap run lifecycle is singleton, bounded, and abortable', async t =>
   const policy = await createPolicy({
     policyKey: `test-bootstrap-policy:${tag}`,
     policyType: 'CONTEXTUAL_BANDIT',
-    configuration: POLICY_CONFIG,
+    configuration: policyConfigFor(tag),
     actor: 'test:research-bootstrap',
   });
   const run = await startResearchBootstrapRun({
@@ -187,7 +194,7 @@ maybe('bootstrap starter rejects paused candidates', async t => {
   const policy = await createPolicy({
     policyKey: `test-bootstrap-paused:${tag}`,
     policyType: 'CONTEXTUAL_BANDIT',
-    configuration: POLICY_CONFIG,
+    configuration: policyConfigFor(tag),
     actor: 'test:research-bootstrap',
   });
   await database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
@@ -232,7 +239,7 @@ maybe('bootstrap allocates boundedly and auto-completes at its ceiling', async t
   const policy = await createPolicy({
     policyKey: `test-bootstrap-alloc:${tag}`,
     policyType: 'CONTEXTUAL_BANDIT',
-    configuration: POLICY_CONFIG,
+    configuration: policyConfigFor(tag),
     actor: 'test:research-bootstrap',
   });
   const actionIds: string[] = [];
@@ -322,7 +329,7 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
   const policy = await createPolicy({
     policyKey: `test-bootstrap-abort:${tag}`,
     policyType: 'CONTEXTUAL_BANDIT',
-    configuration: POLICY_CONFIG,
+    configuration: policyConfigFor(tag),
     actor: 'test:research-bootstrap',
   });
   const prevControl = await saveControl(database);
@@ -406,7 +413,7 @@ maybe('normal CANARY allocation still requires a PASS-backed policy', async t =>
   const policy = await createPolicy({
     policyKey: `test-canary-gate:${tag}`,
     policyType: 'CONTEXTUAL_BANDIT',
-    configuration: POLICY_CONFIG,
+    configuration: policyConfigFor(tag),
     actor: 'test:research-bootstrap',
   });
   // Promote to CANARY status directly (the governed transition requires a
