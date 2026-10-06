@@ -137,6 +137,20 @@ async function armCanaryControl(database: Db, policyId: string | null) {
   );
 }
 
+async function fundControlCaps(database: Db) {
+  await database.query(
+    `UPDATE research_control SET daily_provider_cost_cap=100000, daily_review_cost_cap=100000,
+      max_actions_per_cycle=5, exploration_basis_points=0, active_policy_id=NULL WHERE singleton=true`
+  );
+}
+
+async function armRun(
+  configureBootstrapArming: (input: { runId: string; actor: string; reason: string }) => Promise<unknown>,
+  runId: string
+): Promise<void> {
+  await configureBootstrapArming({ runId, actor: 'test:research-bootstrap', reason: 'test arm' });
+}
+
 /** Retires leftover fixture actions to a terminal lifecycle (never eligible for allocation). */
 async function retireFixtureActions(database: Db, tag: string) {
   await database.query(
@@ -284,9 +298,12 @@ maybe('bootstrap allocates boundedly and auto-completes at its ceiling', async t
     );
   });
   const prevControl = await saveControl(database);
-  await armCanaryControl(database, policy.id);
+  await fundControlCaps(database);
   try {
-    const { allocateBootstrapAssignments } = await import('./persistentResearchController');
+    const { allocateBootstrapAssignments, configureBootstrapArming } = await import(
+      './persistentResearchController'
+    );
+    await armRun(configureBootstrapArming, run.id);
     const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
     const first = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
     assert.equal(first.allocated, 2);
@@ -344,9 +361,11 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
     actor: 'test:research-bootstrap',
   });
   const prevControl = await saveControl(database);
-  await armCanaryControl(database, policy.id);
+  await fundControlCaps(database);
   try {
-    const { allocateBootstrapAssignments } = await import('./persistentResearchController');
+    const { allocateBootstrapAssignments, configureBootstrapArming } = await import(
+      './persistentResearchController'
+    );
     // Case 1: policy paused after the run started aborts the run without allocating.
     const pausedRun = await startResearchBootstrapRun({
       candidatePolicyId: policy.id,
@@ -362,6 +381,7 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
       );
     });
     await database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
+    await armRun(configureBootstrapArming, pausedRun.id);
     const armed = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
     const pausedResult = await allocateBootstrapAssignments(armed, new Date().toISOString(), pausedRun.id);
     assert.equal(pausedResult.allocated, 0);
@@ -391,8 +411,10 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
         () => undefined
       );
     });
-    // Simulate expiry without violating the table CHECK (expires_at must stay
-    // within (starts_at, starts_at + 30 days]): shift the whole window into the past.
+    // Arm while still valid, then simulate expiry without violating the
+    // table CHECK (expires_at must stay within (starts_at, starts_at +
+    // 30 days]): shift the whole window into the past.
+    await armRun(configureBootstrapArming, expiredRun.id);
     await database.query(
       `UPDATE research_bootstrap_runs SET starts_at=now()-interval '2 hours', expires_at=now()-interval '1 hour' WHERE id=$1`,
       [expiredRun.id]
