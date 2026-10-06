@@ -46,6 +46,14 @@ async function assertBootstrapDbReady(database: Db) {
     `SELECT count(*)::int AS n FROM research_bootstrap_runs WHERE status='ACTIVE'`
   );
   assert.equal(Number(runs.rows[0]?.n || 0), 0, 'refusing database with an ACTIVE bootstrap run');
+  // Allocation selects from every PROPOSED action in the database, so any
+  // leftover (interrupted test, manual data) would silently change what the
+  // allocation assertions cover. Retired fixtures use EXPIRED; PROPOSED means
+  // pollution: fail loudly instead of testing the wrong candidate pool.
+  const proposed = await database.query(
+    `SELECT count(*)::int AS n FROM discovery_actions WHERE lifecycle='PROPOSED'`
+  );
+  assert.equal(Number(proposed.rows[0]?.n || 0), 0, 'refusing database with PROPOSED actions: clear or retire leftovers first');
   const control = await database.query('SELECT * FROM research_control WHERE singleton=true');
   assert.ok(control.rows.length, 'research_control singleton must exist');
 }

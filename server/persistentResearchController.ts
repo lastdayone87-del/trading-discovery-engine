@@ -169,7 +169,7 @@ export async function abortAllActiveBootstrapRuns(actor: string, reason: string)
     `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$1,abort_reason=$2 WHERE status='ACTIVE'`,
     [actor.trim(), reason.trim()]
   );
-  return result.rows.length;
+  return result.rowCount ?? 0;
 }
 export async function listResearchBootstrapRuns(limit = 50): Promise<DbRow[]> {
   const db = await getDb();

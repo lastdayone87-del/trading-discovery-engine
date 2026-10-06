@@ -14,6 +14,7 @@ on:
       - 'server/persistentResearchController.ts'
       - 'server/researchBootstrap.test.ts'
       - 'server/researchBootstrap.postgres.test.ts'
+      - 'server.ts'
       - 'server/db/migrations/**'
       - 'scripts/runMigrations.ts'
       - 'package.json'
