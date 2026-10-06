@@ -380,8 +380,10 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
         () => undefined
       );
     });
+    // Simulate expiry without violating the table CHECK (expires_at must stay
+    // within (starts_at, starts_at + 30 days]): shift the whole window into the past.
     await database.query(
-      `UPDATE research_bootstrap_runs SET expires_at=now()-interval '1 minute' WHERE id=$1`,
+      `UPDATE research_bootstrap_runs SET starts_at=now()-interval '2 hours', expires_at=now()-interval '1 hour' WHERE id=$1`,
       [expiredRun.id]
     );
     const armed2 = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
