@@ -94,6 +94,7 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
   const {
     startResearchBootstrapRun,
     abortResearchBootstrapRun,
+    configureBootstrapArming,
     runPersistentResearchCycle,
     evaluatePersistentResearchPolicy,
     allocateCanonical,
@@ -145,9 +146,10 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
           ])
         ).rows[0].id
     );
+    // Budget setup only (control stays dormant): the governed arm call in
+    // stage 3 is the sole path to an armed control.
     await database.query(
-      `UPDATE research_control SET enabled=true, mode='CANARY', paused=false, kill_switch=false,
-        daily_provider_cost_cap=100000, daily_review_cost_cap=100000,
+      `UPDATE research_control SET daily_provider_cost_cap=100000, daily_review_cost_cap=100000,
         exploration_basis_points=0, max_actions_per_cycle=5, active_policy_id=NULL WHERE singleton=true`
     );
 
@@ -225,6 +227,13 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       });
       startedRunIds.push(run.id);
       assert.equal(run.status, 'ACTIVE');
+      const armed = await configureBootstrapArming({
+        runId: run.id,
+        actor: 'test:research-e2e',
+        reason: `test e2e arm ${runIndex}`,
+      });
+      assert.equal(armed.bootstrap_armed, true);
+      assert.equal(String(armed.bootstrap_run_id), run.id);
       for (let cycle = 0; cycle < 6; cycle++) {
         const result = await runPersistentResearchCycle(
           `test-e2e:${tag}:r${runIndex}c${cycle}`,
@@ -238,6 +247,12 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
         await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
       ).rows[0];
       assert.equal(status.status, 'COMPLETED', `run ${runIndex} must auto-complete at its ceiling`);
+    // Auto-disarm: the completed run releases the control back to dormant.
+    const postControl = (
+      await database.query('SELECT enabled, mode, kill_switch, bootstrap_armed FROM research_control WHERE singleton=true')
+    ).rows[0];
+    assert.equal(postControl.enabled, false, 'control must disarm when the run completes');
+    assert.equal(postControl.bootstrap_armed, false, 'fence must clear when the run completes');
       // Genuine outcomes through the real ingestion path. Each action's 100
       // provider cost is recorded exactly once: high-yield actions earn one
       // incremental outcome, low-yield actions log one non-incremental outcome.

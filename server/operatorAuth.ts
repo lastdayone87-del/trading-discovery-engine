@@ -31,6 +31,8 @@ const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; acti
   { method:'GET', pattern:/^\/api\/persistent-research\/bootstrap-runs$/, policy:'operator', action:'research.bootstrap.read' },
   { method:'POST', pattern:/^\/api\/persistent-research\/bootstrap-runs$/, policy:'admin', action:'research.bootstrap.start' },
   { method:'POST', pattern:/^\/api\/persistent-research\/bootstrap-runs\/[^/]+\/abort$/, policy:'admin', action:'research.bootstrap.abort' },
+  { method:'POST', pattern:/^\/api\/persistent-research\/bootstrap-runs\/[^/]+\/arm$/, policy:'admin', action:'research.bootstrap.arm' },
+  { method:'POST', pattern:/^\/api\/persistent-research\/bootstrap-runs\/disarm$/, policy:'admin', action:'research.bootstrap.disarm' },
   { method:'GET', pattern:/^\/api\/corpus(?:\/documents\/[^/]+)?$/, policy:'operator', action:'corpus.read' },
   { method:'GET', pattern:/^\/api\/candidate-assertions$/, policy:'operator', action:'candidate.assertions.read' },
   { method:'GET', pattern:/^\/api\/(discovery-nominations(?:\/[^/]+)?|channels\/[^/]+\/nominations|discovery-attribution\/(queries|paths)|candidate-admission\/baseline|admission\/(decisions|channels\/[^/]+|metrics)|evidence-(documents|assertions|coverage)|creator-focus\/shadow|investigations\/gap-plans|dashboard\/corpora|review-eligibility\/v2|release5\/rollout)$/, policy:'operator', action:'decision-plane.read' },

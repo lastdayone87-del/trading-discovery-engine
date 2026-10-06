@@ -159,6 +159,19 @@ export async function abortResearchBootstrapRun(id: string, actor: string, reaso
     `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$2,abort_reason=$3 WHERE id=$1 AND status='ACTIVE' RETURNING *`,
     [id, actor.trim(), reason.trim()]
   );
+  if (row.rows[0]) {
+    // A manually aborted run releases the control fence with it, so an armed
+    // control can never outlive its run. Conditional: untouched when clear.
+    await db.query(
+      `UPDATE research_control SET enabled=false, mode='SHADOW', paused=false, kill_switch=true,
+        bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
+        bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL,
+        configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
+       WHERE singleton=true AND bootstrap_armed AND bootstrap_run_id=$2
+         AND NOT EXISTS(SELECT 1 FROM research_bootstrap_runs WHERE status='ACTIVE')`,
+      [actor.trim(), id]
+    );
+  }
   return row.rows[0] || null;
 }
 /** Aborts every ACTIVE bootstrap run (idempotent). Used when research is disarmed. Returns the aborted count. */
@@ -169,12 +182,159 @@ export async function abortAllActiveBootstrapRuns(actor: string, reason: string)
     `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$1,abort_reason=$2 WHERE status='ACTIVE'`,
     [actor.trim(), reason.trim()]
   );
+  await db.query(
+    `UPDATE research_control SET enabled=false, mode='SHADOW', paused=false, kill_switch=true,
+      bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
+      bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL,
+      configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
+     WHERE singleton=true AND bootstrap_armed
+       AND NOT EXISTS(SELECT 1 FROM research_bootstrap_runs WHERE status='ACTIVE')`,
+    [actor.trim()]
+  );
   return result.rowCount ?? 0;
 }
 export async function listResearchBootstrapRuns(limit = 50): Promise<DbRow[]> {
   const db = await getDb();
   const n = Math.min(200, Math.max(1, Math.trunc(limit) || 50));
   return (await db.query(`SELECT * FROM research_bootstrap_runs ORDER BY created_at DESC LIMIT $1`, [n])).rows;
+}
+type TxClient = { query: (text: string, params?: any[]) => Promise<{ rows: any[]; rowCount?: number | null }> };
+/**
+ * Resets research_control to the dormant safe state and clears any bootstrap
+ * fence, with a configuration event for audit. Runs inside the caller's
+ * transaction.
+ */
+async function disarmControlTx(client: TxClient, actor: string, reason: string): Promise<void> {
+  const prior = (
+    await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
+  ).rows[0];
+  if (!prior) return;
+  const next = (
+    await client.query(
+      `UPDATE research_control SET enabled=false, mode='SHADOW', paused=false, kill_switch=true,
+        bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
+        bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL,
+        configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
+       WHERE singleton=true RETURNING *`,
+      [actor]
+    )
+  ).rows[0];
+  await client.query(
+    `INSERT INTO research_configuration_events(event_key,configuration_version,prior_configuration,next_configuration,actor,reason) VALUES($1,$2,$3,$4,$5,$6)`,
+    [
+      researchChecksum({ purpose: 'bootstrap-auto-disarm', prior: prior.configuration_version, actor, reason, at: Date.now() }),
+      next.configuration_version,
+      JSON.stringify(prior),
+      JSON.stringify(next),
+      actor,
+      reason,
+    ]
+  );
+}
+/**
+ * Governed bootstrap arming: the ONLY path that arms research_control for
+ * provisional allocation without a PASS-backed active policy. Requires an
+ * ACTIVE unexpired run with an eligible candidate, a currently disarmed
+ * control, and a daily provider cap covering the run ceiling. Normal CANARY
+ * governance (configurePersistentResearch) is untouched.
+ */
+export async function configureBootstrapArming(input: {
+  runId: string; actor: string; reason: string;
+}): Promise<DbRow> {
+  if (!input.reason?.trim() || !input.actor?.trim()) throw new Error('BOOTSTRAP_ARM_IDENTITY_REQUIRED');
+  if (!input.runId?.trim()) throw new Error('BOOTSTRAP_RUN_NOT_FOUND');
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const fresh = (
+      await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
+    ).rows[0];
+    if (!fresh) throw new Error('RESEARCH_CONTROL_MISSING');
+    if (!isResearchDisarmed(fresh) || fresh.bootstrap_armed) {
+      throw new Error('BOOTSTRAP_ARM_CONFLICT');
+    }
+    const run = (
+      await client.query(`SELECT * FROM research_bootstrap_runs WHERE id=$1 FOR UPDATE`, [input.runId])
+    ).rows[0];
+    if (!run || run.status !== 'ACTIVE') throw new Error('BOOTSTRAP_RUN_NOT_ACTIVE');
+    if (new Date(run.expires_at).getTime() <= Date.now()) {
+      await abortBootstrapRunTx(client, input.runId, BOOTSTRAP_SYSTEM_ACTOR, 'bootstrap window expired before arming');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'expired run cannot arm bootstrap control');
+      await client.query('COMMIT');
+      throw new Error('BOOTSTRAP_RUN_EXPIRED');
+    }
+    const policy = (
+      await client.query(`SELECT * FROM portfolio_policies WHERE id=$1`, [run.candidate_policy_id])
+    ).rows[0];
+    if (!policy || policy.policy_type !== 'CONTEXTUAL_BANDIT' || policy.status === 'RETIRED' || policy.status === 'PAUSED') {
+      await abortBootstrapRunTx(client, input.runId, BOOTSTRAP_SYSTEM_ACTOR, 'candidate policy ineligible at arming');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ineligible candidate cannot arm bootstrap control');
+      await client.query('COMMIT');
+      throw new Error('BOOTSTRAP_CANDIDATE_NOT_ELIGIBLE');
+    }
+    if (Number(fresh.daily_provider_cost_cap) < Number(run.max_provider_cost)) {
+      throw new Error('BOOTSTRAP_ARM_INSUFFICIENT_BUDGET');
+    }
+    const next = (
+      await client.query(
+        `UPDATE research_control SET enabled=true, mode='CANARY', paused=false, kill_switch=false,
+          bootstrap_armed=true, bootstrap_run_id=$1, bootstrap_armed_by=$2, bootstrap_armed_reason=$3,
+          bootstrap_armed_at=now(), configuration_version=configuration_version+1, updated_by=$2, updated_at=now()
+         WHERE singleton=true RETURNING *`,
+        [input.runId, input.actor.trim(), input.reason.trim()]
+      )
+    ).rows[0];
+    await client.query(
+      `INSERT INTO research_configuration_events(event_key,configuration_version,prior_configuration,next_configuration,actor,reason) VALUES($1,$2,$3,$4,$5,$6)`,
+      [
+        researchChecksum({ purpose: 'bootstrap-arm', runId: input.runId, version: next.configuration_version, actor: input.actor.trim() }),
+        next.configuration_version,
+        JSON.stringify(fresh),
+        JSON.stringify(next),
+        input.actor.trim(),
+        input.reason.trim(),
+      ]
+    );
+    await client.query('COMMIT');
+    return next;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+/**
+ * Manual bootstrap disarm: aborts the fenced ACTIVE run (if any) and resets
+ * the control to dormant. Never allocates; the allocator aborts runs under
+ * disarmed control on its own if a cycle fires first.
+ */
+export async function disarmBootstrapControl(actor: string, reason: string): Promise<DbRow | null> {
+  if (!reason?.trim() || !actor?.trim()) throw new Error('BOOTSTRAP_ABORT_IDENTITY_REQUIRED');
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const fresh = (
+      await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
+    ).rows[0];
+    if (!fresh || !fresh.bootstrap_armed) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    if (fresh.bootstrap_run_id) {
+      await abortBootstrapRunTx(client, String(fresh.bootstrap_run_id), actor.trim(), reason.trim());
+    }
+    await disarmControlTx(client, actor.trim(), reason.trim());
+    await client.query('COMMIT');
+    return (await db.query(`SELECT * FROM research_control WHERE singleton=true`)).rows[0];
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 async function completeBootstrapRun(client: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> }, id: string): Promise<void> {
   await client.query(`UPDATE research_bootstrap_runs SET status='COMPLETED',completed_at=now() WHERE id=$1 AND status='ACTIVE'`, [id]);
@@ -268,13 +428,21 @@ export async function allocateBootstrapAssignments(
     const fresh = (
       await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
     ).rows[0];
+    if (!fresh?.bootstrap_armed || String(fresh.bootstrap_run_id || '') !== runId) {
+      await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'bootstrap control not armed for this run');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'unarmed run cannot hold an armed control');
+      await client.query('COMMIT');
+      return zero(runPolicyId);
+    }
     if (isResearchDisarmed(fresh)) {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'research control disarmed during bootstrap');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'disarmed control cannot stay bootstrap-armed');
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
     if (new Date(run.expires_at).getTime() <= Date.now()) {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'bootstrap window expired');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'expired run releases bootstrap control');
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
@@ -283,6 +451,7 @@ export async function allocateBootstrapAssignments(
     ).rows[0];
     if (!policy || policy.policy_type !== 'CONTEXTUAL_BANDIT' || policy.status === 'RETIRED' || policy.status === 'PAUSED') {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'candidate policy ineligible during bootstrap');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ineligible candidate releases bootstrap control');
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
@@ -291,6 +460,7 @@ export async function allocateBootstrapAssignments(
     const remainingCost = Number(run.max_provider_cost) - used.providerCost;
     if (remainingAssignments <= 0 || remainingCost <= 0) {
       await completeBootstrapRun(client, runId);
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'exhausted run releases bootstrap control');
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
@@ -301,6 +471,7 @@ export async function allocateBootstrapAssignments(
     );
     if (Number(recentFailures.rows[0]?.n || 0) >= 3) {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'error spike: 3+ failed cycles in the last hour');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'error spike releases bootstrap control');
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
@@ -385,6 +556,7 @@ export async function allocateBootstrapAssignments(
       finalUsage.providerCost >= Number(run.max_provider_cost)
     ) {
       await completeBootstrapRun(client, runId);
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ceiling reached; bootstrap control released');
       completed = true;
     }
     await client.query('COMMIT');
