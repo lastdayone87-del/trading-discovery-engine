@@ -372,7 +372,7 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
     const stillDraft = (
       await database.query('SELECT status FROM portfolio_policies WHERE id=$1', [candidate.id])
     ).rows[0];
-    assert.equal(stillDraft.status, 'CANARY', 'failed promotion must not change policy status');
+    assert.equal(stillDraft.status, 'DRAFT', 'failed promotion must not change policy status');
 
     // ---- Stage 8: CANARY allocates with the GENUINE PASS evidence. ----
     // CANARY status is re-established here (same harness-only flip as stage
