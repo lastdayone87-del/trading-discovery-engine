@@ -130,11 +130,33 @@ test('domain weight batch and approval routes are explicit admin-only routes',()
   assert.equal(batch.length,1); assert.equal(batch[0].policy,'admin'); assert.equal(batch[0].action,'research.domain-weights.batch');
   const approve=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/domain-weights/snapshots/abc123/approve'));
   assert.equal(approve.length,1); assert.equal(approve[0].policy,'admin'); assert.equal(approve[0].action,'research.domain-weights.approve');
+});
+
 test('operator-triggered research cycles are an explicit admin-only route',()=>{
   const matching=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/persistent-research/cycles'));
   assert.equal(matching.length,1,'POST /api/persistent-research/cycles must resolve to exactly one explicit route policy');
   assert.equal(matching[0].policy,'admin');
   assert.equal(matching[0].action,'research.cycle.trigger');
+});
+
+test('unlisted cycle-shaped paths fail closed with ROUTE_POLICY_MISSING',async ()=>{
+  const run=(role:'admin'|'operator'|undefined,path:string,method='POST'):Promise<{next:boolean;status?:number;code?:string}>=>new Promise(resolve=>{
+    const handler=operatorAuthorization(async ()=>{},{ NODE_ENV:'test', ADMIN_API_TOKEN:'admin-token', OPERATOR_API_TOKEN:'operator-token' } as NodeJS.ProcessEnv);
+    const token=role==='admin'?'admin-token':role==='operator'?'operator-token':undefined;
+    const req={ method, path, baseUrl:'', query:{}, header:(name:string)=>(name.toLowerCase()==='authorization'&&token?`Bearer ${token}`:undefined) };
+    let status=0; let code='';
+    const res={ status:(code_:number)=>{ status=code_; return res; }, json:(body:Record<string,unknown>)=>{ code=String(body.code||''); resolve({next:false,status,code}); }, setHeader:()=>{}, once:()=>{} };
+    handler(req as never,res as never,()=>resolve({next:true}));
+  });
+  // The allowlist is exact-match, never prefix-based: even an authenticated
+  // admin hitting a cycle-shaped but unlisted path is rejected before auth.
+  for (const path of ['/api/persistent-research/cycles/segment','/api/persistent-research/cycles/','/api/persistent-research/cyclesX']) {
+    const missing=await run('admin',path);
+    assert.equal(missing.next,false); assert.equal(missing.status,404); assert.equal(missing.code,'ROUTE_POLICY_MISSING');
+  }
+  // And the real route keeps its exact policy.
+  const listed=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/persistent-research/cycles'));
+  assert.equal(listed.length,1); assert.equal(listed[0].policy,'admin'); assert.equal(listed[0].action,'research.cycle.trigger');
 });
 
 test('research cycle trigger enforces admin authentication at the middleware layer',async ()=>{
