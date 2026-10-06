@@ -1433,9 +1433,74 @@ export async function performManualDatabaseBackup():Promise<{success:boolean;tim
 
 export type JobStatus='PENDING'|'PROCESSING'|'COMPLETED'|'FAILED';
 export interface DurableJob{ id:string; type:string; status:JobStatus; payload:any; attempts:number; max_attempts:number; run_after:string; locked_by?:string|null; locked_at?:string|null; last_error?:string|null; created_at:string; }
+/** Minimal client surface for budget guards evaluated inside the claim transaction. */
+export interface ClaimBudgetClient { query: (text: string, params?: any[]) => Promise<{ rows: any[] }>; }
+/**
+ * Daily-budget admission evaluated atomically inside the claim transaction.
+ * The lock row serializes check-then-claim across replicas/processes: every
+ * claimant takes the same lock before reading budget state, so two replicas
+ * cannot both observe headroom and overshoot the cap. Admission is decided
+ * per candidate row in global priority order (see claimNextJob): denial
+ * skips that row or, when the budget is exhausted for the whole type, the
+ * type — jobs stay queued for the next window instead of burning attempts
+ * on budget throws.
+ */
+export interface ClaimBudgetGuard {
+  types: string[];
+  lockSql: string;
+  isAdmitted: (client: ClaimBudgetClient, job?: { id: string; payload: any }) => Promise<BudgetAdmission>;
+}
+/** Guard verdict: admission of one candidate row, plus whether any later row
+ * of the same guarded types could still be admitted on this call. */
+export interface BudgetAdmission { admitted: boolean; exhausted: boolean; }
+/**
+ * Evaluates one budget guard with savepoint recovery: a transient guard-query
+ * failure fails closed (denied, type treated as exhausted for this call)
+ * without leaving the claim transaction aborted — subsequent statements in
+ * the same transaction keep working.
+ */
+export async function evaluateClaimGuard(client: ClaimBudgetClient, guard: ClaimBudgetGuard, job?: { id: string; payload: any }): Promise<BudgetAdmission> {
+  await client.query('SAVEPOINT claim_guard');
+  try {
+    const verdict = await guard.isAdmitted(client, job);
+    await client.query('RELEASE SAVEPOINT claim_guard');
+    return verdict;
+  } catch {
+    try { await client.query('ROLLBACK TO SAVEPOINT claim_guard'); } catch { /* transaction already unusable; caller fails closed */ }
+    return { admitted: false, exhausted: true };
+  }
+}
 export async function enqueueJob(type:string,payload:any,opts:{priority?:number;maxAttempts?:number;runAfter?:string;idempotencyKey?:string;clientOverride?:any;preventReopen?:boolean}={}):Promise<DurableJob>{const db=opts.clientOverride||await getDb(); const sql=opts.preventReopen?`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=jobs.updated_at RETURNING *`:`INSERT INTO jobs(type,payload,priority,max_attempts,run_after,idempotency_key,catalog_version_id,catalog_policy_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(idempotency_key) DO UPDATE SET payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END RETURNING *`; const res=await db.query(sql,[type,JSON.stringify(payload),opts.priority||0,opts.maxAttempts||3,opts.runAfter||new Date().toISOString(),opts.idempotencyKey||null,payload?.catalogPin?.catalogVersionId||null,payload?.catalogPin?.policyVersion||null]); return rowToJob(res.rows[0]);}
 function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||''};}
-export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN'); const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) ORDER BY priority DESC,created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`,[types||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,$2,'PROCESSING')`,[job.id,upd.rows[0].attempts]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);}catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}
+export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
+    // Single priority-preserving claim loop: always consider the globally
+    // highest-priority pending candidate first. Unguarded candidates claim
+    // immediately (identical to the legacy path); guarded candidates evaluate
+    // their budget guard atomically in this same transaction (control-row
+    // lock serializes check-then-claim across replicas). A denied row is
+    // skipped via its id; a budget-exhausted type is filtered out so lower-
+    // priority admittable work still claims. Every iteration either claims or
+    // excludes at least one row/type, so the loop terminates. Denied jobs
+    // stay queued without consuming attempts.
+    let effectiveTypes: string[] | null = types || null;
+    const deniedIds: string[] = [];
+    const lockedGuards = new Set<ClaimBudgetGuard>();
+    for (;;) {
+      const res=await client.query(`SELECT id,type,payload FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (id = ANY($4::uuid[])) ORDER BY priority DESC,created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]);
+      if (!res.rowCount) break;
+      const row = res.rows[0];
+      const guard = budgetGuards.find(g => g.types.includes(String(row.type)) && (!effectiveTypes || effectiveTypes.some(t => g.types.includes(t))));
+      if (!guard) break;
+      if (!lockedGuards.has(guard)) { await client.query(guard.lockSql); lockedGuards.add(guard); }
+      const candidate = { id: String(row.id), payload: parseJson(row.payload,{}) };
+      const verdict = await evaluateClaimGuard(client, guard, candidate);
+      if (verdict.admitted) break;
+      deniedIds.push(candidate.id);
+      if (verdict.exhausted && effectiveTypes) effectiveTypes = effectiveTypes.filter(t => !guard.types.includes(t));
+    }
+    if (deniedIds.length && effectiveTypes !== null && !effectiveTypes.length) { await client.query('COMMIT'); return null; }
+    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (id = ANY($4::uuid[])) ORDER BY priority DESC,created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,status) VALUES($1,$2,'PROCESSING')`,[job.id,upd.rows[0].attempts]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
+    }catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}
   // Trace persistence is deliberately outside the claim transaction. The old
   // implementation inserted diagnostic rows before COMMIT, so any trace-only
   // failure rolled back the PROCESSING transition and the worker could never

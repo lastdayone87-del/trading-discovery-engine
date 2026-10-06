@@ -9,6 +9,34 @@ const word=/[\p{L}\p{N}][\p{L}\p{N}\p{M}'’.-]*/gu;
 const sha=(value:string)=>createHash('sha256').update(value).digest('hex');
 export interface CandidateSpan { literal:string; normalized:string; startOffset:number; endOffset:number; ngramSize:number; occurrenceKey:string }
 export function contentHash(text:string):string{return sha(text.normalize('NFC'));}
+/** Minimal row-reader surface for corpus budget admission (real pg client or test double). */
+export interface CorpusBudgetClient { query: (text: string, params?: any[]) => Promise<{ rows: any[] }>; }
+export interface CorpusBudgetState { paused: boolean; dailyBudget: number; consumedToday: number; clusterWindowCap: number; }
+/**
+ * Authoritative daily-compute admission for the shared corpus document
+ * budget (corpus_controls.daily_compute_documents). Reads the control row
+ * FOR UPDATE so concurrent consumers serialize check-then-act in one
+ * transaction: TERM_HARVEST processing and persistent-research corpus
+ * insertion both funnel through here and can never jointly exceed the cap.
+ * Pure decision in corpusBudgetAdmits(); this function only loads state.
+ */
+export async function readCorpusBudgetForUpdate(client: CorpusBudgetClient): Promise<CorpusBudgetState | null> {
+  const control = await client.query(`SELECT paused,daily_compute_documents AS budget,cluster_window_cap FROM corpus_controls WHERE singleton=true FOR UPDATE`);
+  if (!control.rows.length) return null;
+  const consumed = await client.query(`SELECT count(*)::int AS n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`);
+  return {
+    paused: Boolean(control.rows[0].paused),
+    dailyBudget: Number(control.rows[0].budget),
+    consumedToday: Number(consumed.rows[0]?.n || 0),
+    clusterWindowCap: Number(control.rows[0].cluster_window_cap),
+  };
+}
+/** Pure admission: unpaused control with room for requestedUnits. Non-numeric budgets fail closed. */
+export function corpusBudgetAdmits(state: CorpusBudgetState | null, requestedUnits = 1): boolean {
+  if (!state || state.paused) return false;
+  if (!Number.isFinite(state.dailyBudget) || !Number.isFinite(state.consumedToday)) return false;
+  return state.consumedToday + Math.max(0, Math.floor(requestedUnits)) <= state.dailyBudget;
+}
 export function sliceCodePoints(text:string,start:number,end:number):string{return Array.from(text)[Symbol.iterator] && Array.from(text).slice(start,end).join('');}
 export function extractCandidateSpans(text:string,documentHash=contentHash(text)):CandidateSpan[]{
   const points=Array.from(text.normalize('NFC')); const normalized=points.join(''); const tokens:Array<{text:string;start:number;end:number}>=[];
@@ -30,11 +58,11 @@ export async function enqueueTermHarvest(input:{channelId:string;text:string;lin
 export async function processTermHarvestJob(job:{id:string;payload:any}):Promise<void>{
   const p=job.payload;if(p.payloadSchemaVersion!==1||p.extractorVersion!==EXTRACTOR_VERSION)throw new Error('Unsupported TERM_HARVEST payload version.');
   if(contentHash(String(p.text))!==p.contentHash)throw new Error('TERM_HARVEST content hash mismatch.');const spans=extractCandidateSpans(p.text,p.contentHash);const db=await getDb();const client=await db.connect();
-  let scoredDocumentId:string|undefined;try{await client.query('BEGIN');const control=await client.query('SELECT * FROM corpus_controls WHERE singleton=true');if(!control.rowCount||control.rows[0].paused)throw new Error('TERM_HARVEST is paused.');
-    const consumed=await client.query(`SELECT count(*)::int n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`);if(consumed.rows[0].n>=control.rows[0].daily_compute_documents)throw new Error('TERM_HARVEST daily compute budget is exhausted.');
+  let scoredDocumentId:string|undefined;try{await client.query('BEGIN');const budget=await readCorpusBudgetForUpdate(client);if(!budget||budget.paused)throw new Error('TERM_HARVEST is paused.');
+    if(!corpusBudgetAdmits(budget,1))throw new Error('TERM_HARVEST daily compute budget is exhausted.');
     const artifact=await client.query(`WITH inserted AS (INSERT INTO corpus_source_artifacts(source_type,source_key,creator_channel_id,discovery_lineage,entity_cluster_key,observed_at,policy_version) VALUES('CHANNEL_METADATA',$1,$1,$2,$3,$4,$5) ON CONFLICT(source_type,source_key,observed_at) DO NOTHING RETURNING id) SELECT id FROM inserted UNION ALL SELECT id FROM corpus_source_artifacts WHERE source_type='CHANNEL_METADATA' AND source_key=$1 AND observed_at=$4 LIMIT 1`,[p.channelId,p.lineage,p.entityClusterKey,p.observedAt,CORPUS_POLICY_VERSION]);
     const document=await client.query(`INSERT INTO corpus_documents(artifact_id,document_kind,content_hash,retained_excerpt,retention_class,extractor_eligible,retention_expires_at) VALUES($1,'CHANNEL_METADATA',$2,$3,'MINIMAL_EXCERPT',true,now()+interval '90 days') ON CONFLICT(content_hash,document_kind) DO UPDATE SET content_hash=excluded.content_hash RETURNING id`,[artifact.rows[0].id,p.contentHash,String(p.text).slice(0,8000)]);const documentId=document.rows[0].id;
-    const window=new Date(p.observedAt);window.setUTCHours(0,0,0,0);const used=await client.query(`SELECT count(*)::int n FROM corpus_qualification_decisions WHERE entity_cluster_key=$1 AND window_start=$2 AND decision='QUALIFIED'`,[p.entityClusterKey,window.toISOString()]);const qualified=used.rows[0].n<control.rows[0].cluster_window_cap;
+    const window=new Date(p.observedAt);window.setUTCHours(0,0,0,0);const used=await client.query(`SELECT count(*)::int n FROM corpus_qualification_decisions WHERE entity_cluster_key=$1 AND window_start=$2 AND decision='QUALIFIED'`,[p.entityClusterKey,window.toISOString()]);const qualified=used.rows[0].n<budget.clusterWindowCap;
     await client.query(`INSERT INTO corpus_qualification_decisions(document_id,decision,reason_codes,policy_version,entity_cluster_key,window_start,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(idempotency_key) DO NOTHING`,[documentId,qualified?'QUALIFIED':'CAPPED',JSON.stringify([qualified?'ELIGIBLE_CONFIRMED_CREATOR':'ENTITY_CLUSTER_WINDOW_CAP']),CORPUS_POLICY_VERSION,p.entityClusterKey,window.toISOString(),`qualify:${documentId}:${CORPUS_POLICY_VERSION}`]);
     const run=await client.query(`INSERT INTO corpus_extraction_runs(document_id,extractor_version,status,token_count,candidate_count) VALUES($1,$2,$3,$4,$5) ON CONFLICT(document_id,extractor_version) DO NOTHING RETURNING id`,[documentId,EXTRACTOR_VERSION,qualified?'COMPLETED':'REJECTED',spans.length?Math.max(...spans.map(s=>s.ngramSize)):0,qualified?spans.length:0]);
     if(run.rowCount&&qualified)for(const s of spans)await client.query(`INSERT INTO corpus_candidate_occurrences(extraction_run_id,document_id,literal_span,normalized_span,start_offset,end_offset,ngram_size,occurrence_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(occurrence_key) DO NOTHING`,[run.rows[0].id,documentId,s.literal,s.normalized,s.startOffset,s.endOffset,s.ngramSize,s.occurrenceKey]);

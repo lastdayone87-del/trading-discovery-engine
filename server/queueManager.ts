@@ -3,6 +3,7 @@ import {
   getDb,
   enqueueJob,
   claimNextJob,
+  type ClaimBudgetGuard,
   completeJob,
   failJob,
   recoverStaleJobs,
@@ -72,7 +73,7 @@ import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecove
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
-import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
+import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate } from './candidateCorpus';
 import { selectExplicitTerminologyLanguageContext, type ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
@@ -355,6 +356,66 @@ export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searc
 export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
 /**
+ * Atomic daily-budget guards evaluated inside the claim transaction (see
+ * claimNextJob): each takes its control row FOR UPDATE — serializing
+ * check-then-claim across replicas/processes — then admits only with
+ * remaining headroom counting both completed units and in-flight claims
+ * made today. Denial filters the guarded types out of the claim (jobs stay
+ * queued); pause/kill-switch semantics are unchanged and evaluated first by
+ * the claim builder. No other caller is affected: guards apply only when the
+ * claim filter overlaps their types.
+ */
+export const TERM_HARVEST_BUDGET_GUARD: ClaimBudgetGuard = {
+  types: ['TERM_HARVEST'],
+  lockSql: `SELECT * FROM corpus_controls WHERE singleton=true FOR UPDATE`,
+  isAdmitted: async (client) => {
+    // Shared authoritative budget: same control row, same consumed ledger,
+    // same decision helper as the processors and persistent research.
+    // Harvest always costs exactly one unit (one extraction run per job), so
+    // denial always means global exhaustion: no smaller request exists.
+    const state = await readCorpusBudgetForUpdate(client);
+    if (!state || state.paused) return { admitted: false, exhausted: true };
+    const inFlight = await client.query(`SELECT count(*)::int AS n FROM jobs WHERE type='TERM_HARVEST' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`);
+    const remaining = state.dailyBudget - state.consumedToday - Number(inFlight.rows[0]?.n || 0);
+    if (!Number.isFinite(remaining)) return { admitted: false, exhausted: true };
+    return { admitted: remaining >= 1, exhausted: remaining < 1 };
+  },
+};
+
+export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
+  types: ['SCORE_CANDIDATES'],
+  lockSql: `SELECT * FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`,
+  isAdmitted: async (client, job) => {
+    // Reservation unit is the job's normalized-span group count: one job can
+    // create multiple snapshots, so per-job admission would overshoot the cap.
+    // Mirrors the processor exactly (spent check first, then per-job units):
+    // a zero-group job with no remaining headroom is denied rather than
+    // routed into the processor's budget throw.
+    const documentId = job?.payload?.documentId;
+    if (typeof documentId !== 'string' || !documentId) return { admitted: false, exhausted: false };
+    const control = await client.query(`SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`);
+    if (!control.rows.length) return { admitted: false, exhausted: true };
+    const budget = Number(control.rows[0].budget);
+    if (Boolean(control.rows[0].paused) || !Number.isFinite(budget)) {
+      return { admitted: false, exhausted: true };
+    }
+    const groups = await client.query(`SELECT count(DISTINCT normalized_span)::int AS n FROM corpus_candidate_occurrences WHERE document_id=$1::uuid`, [documentId]);
+    const spent = await client.query(`SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
+    const inFlight = await client.query(
+      `SELECT COALESCE(sum(g.n),0)::int AS u FROM jobs p LEFT JOIN LATERAL
+       (SELECT count(DISTINCT o.normalized_span)::int AS n FROM corpus_candidate_occurrences o
+        WHERE o.document_id::text=(p.payload->>'documentId')) g ON true
+       WHERE p.type='SCORE_CANDIDATES' AND p.status='PROCESSING' AND p.locked_at>=date_trunc('day',now())`
+    );
+    const remaining = budget - Number(spent.rows[0]?.n || 0) - Number(inFlight.rows[0]?.u || 0);
+    if (remaining < 1) return { admitted: false, exhausted: true };
+    return { admitted: Number(groups.rows[0]?.n || 0) <= remaining, exhausted: false };
+  },
+};
+
+export const CORPUS_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD];
+
+/**
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
@@ -441,7 +502,7 @@ export async function processNextSearchJob(
   if (claimableTypes.length === 0) return false;
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
-  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED']);
+  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], CORPUS_CLAIM_BUDGET_GUARDS);
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
