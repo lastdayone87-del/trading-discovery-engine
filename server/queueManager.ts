@@ -73,7 +73,7 @@ import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecove
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
-import { enqueueTermHarvest, processTermHarvestJob } from './candidateCorpus';
+import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate, corpusBudgetAdmits } from './candidateCorpus';
 import { selectExplicitTerminologyLanguageContext, type ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
@@ -356,22 +356,6 @@ export function buildSearchLatencyBreakdownMs(searchWorkerStartMs: number, searc
 export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
 /**
- * Pure admission decision for budget-gated corpus-family claim types
- * (TERM_HARVEST, SCORE_CANDIDATES), shared by the claim builder so the
- * paused/budget logic is unit-testable without a database. Paused controls
- * and exhausted (or unreadable) budgets exclude the type; only an unpaused
- * control with remaining headroom admits it. Non-numeric budgets fail
- * closed toward exclusion.
- */
-export function isBudgetedCorpusClaimAdmitted(args: { paused: unknown; dailyBudget: unknown; consumedToday: unknown }): boolean {
-  if (args.paused) return false;
-  const budget = Number(args.dailyBudget);
-  const consumed = Number(args.consumedToday ?? 0);
-  if (!Number.isFinite(budget) || !Number.isFinite(consumed)) return false;
-  return consumed < budget;
-}
-
-/**
  * Atomic daily-budget guards evaluated inside the claim transaction (see
  * claimNextJob): each takes its control row FOR UPDATE — serializing
  * check-then-claim across replicas/processes — then admits only with
@@ -385,31 +369,39 @@ export const TERM_HARVEST_BUDGET_GUARD: ClaimBudgetGuard = {
   types: ['TERM_HARVEST'],
   lockSql: `SELECT * FROM corpus_controls WHERE singleton=true FOR UPDATE`,
   isAdmitted: async (client) => {
-    const control = await client.query(`SELECT paused,daily_compute_documents AS budget FROM corpus_controls WHERE singleton=true`);
-    if (!control.rows.length) return false;
-    const consumed = await client.query(`SELECT count(*)::int AS n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`);
+    // Shared authoritative budget: same control row, same consumed ledger,
+    // same decision helper as the processors and persistent research.
+    const state = await readCorpusBudgetForUpdate(client);
+    if (!state) return false;
     const inFlight = await client.query(`SELECT count(*)::int AS n FROM jobs WHERE type='TERM_HARVEST' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`);
-    return isBudgetedCorpusClaimAdmitted({
-      paused: control.rows[0].paused,
-      dailyBudget: control.rows[0].budget,
-      consumedToday: Number(consumed.rows[0]?.n || 0) + Number(inFlight.rows[0]?.n || 0),
-    });
+    return corpusBudgetAdmits({ ...state, consumedToday: state.consumedToday + Number(inFlight.rows[0]?.n || 0) }, 1);
   },
 };
 
 export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
   types: ['SCORE_CANDIDATES'],
   lockSql: `SELECT * FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`,
-  isAdmitted: async (client) => {
-    const control = await client.query(`SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls WHERE singleton=true`);
+  isAdmitted: async (client, job) => {
+    // Reservation unit is the job's normalized-span group count: one job can
+    // create multiple snapshots, so per-job admission would overshoot the cap.
+    const documentId = job?.payload?.documentId;
+    if (typeof documentId !== 'string' || !documentId) return false;
+    const control = await client.query(`SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`);
     if (!control.rows.length) return false;
+    const groups = await client.query(`SELECT count(DISTINCT normalized_span)::int AS n FROM corpus_candidate_occurrences WHERE document_id=$1::uuid`, [documentId]);
     const spent = await client.query(`SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
-    const inFlight = await client.query(`SELECT count(*)::int AS n FROM jobs WHERE type='SCORE_CANDIDATES' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`);
-    return isBudgetedCorpusClaimAdmitted({
-      paused: control.rows[0].paused,
-      dailyBudget: control.rows[0].budget,
-      consumedToday: Number(spent.rows[0]?.n || 0) + Number(inFlight.rows[0]?.n || 0),
-    });
+    const inFlight = await client.query(
+      `SELECT COALESCE(sum(g.n),0)::int AS u FROM jobs p LEFT JOIN LATERAL
+       (SELECT count(DISTINCT o.normalized_span)::int AS n FROM corpus_candidate_occurrences o
+        WHERE o.document_id::text=(p.payload->>'documentId')) g ON true
+       WHERE p.type='SCORE_CANDIDATES' AND p.status='PROCESSING' AND p.locked_at>=date_trunc('day',now())`
+    );
+    return corpusBudgetAdmits({
+      paused: Boolean(control.rows[0].paused),
+      dailyBudget: Number(control.rows[0].budget),
+      consumedToday: Number(spent.rows[0]?.n || 0) + Number(inFlight.rows[0]?.u || 0),
+      clusterWindowCap: 0,
+    }, Number(groups.rows[0]?.n || 0));
   },
 };
 

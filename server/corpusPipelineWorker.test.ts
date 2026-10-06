@@ -38,6 +38,55 @@ test('budget guards are defined for exactly the corpus claim types', async () =>
   assert.match(queueManager, /claimNextJob\(workerId, claimableTypes, browserBlockedRetryPatterns, \['RECONCILIATION_REQUIRED'\], CORPUS_CLAIM_BUDGET_GUARDS\)/);
 });
 
+test('guard evaluation recovers the claim transaction after transient failure', async () => {
+  const { evaluateClaimGuard } = await import('./dbCore');
+  // A throwing guard fails closed AND leaves the transaction usable: the
+  // savepoint is rolled back, so a subsequent statement still runs instead
+  // of dying with an aborted-transaction error.
+  const calls: string[] = [];
+  let recovered = false;
+  const failingGuard = {
+    types: ['TERM_HARVEST'],
+    lockSql: 'SELECT 1',
+    isAdmitted: async () => {
+      throw new Error('transient guard read failure');
+    },
+  };
+  const recoveringClient = {
+    query: async (text: string) => {
+      calls.push(text);
+      if (text === 'SAVEPOINT claim_guard' || text === 'ROLLBACK TO SAVEPOINT claim_guard') {
+        if (text.startsWith('ROLLBACK')) recovered = true;
+        return { rows: [] };
+      }
+      // Before recovery the guard read fails; after the savepoint rollback
+      // the same transaction accepts statements normally again.
+      if (recovered) return { rows: [] };
+      throw new Error('transient guard read failure');
+    },
+  };
+  assert.equal(await evaluateClaimGuard(recoveringClient, failingGuard), false);
+  assert.deepEqual(calls, ['SAVEPOINT claim_guard', 'ROLLBACK TO SAVEPOINT claim_guard']);
+  // Post-recovery the same transaction accepts new statements.
+  const followup = await recoveringClient.query('SELECT 1');
+  assert.deepEqual(followup, { rows: [] });
+  // Success path releases the savepoint and admits.
+  const successCalls: string[] = [];
+  const passingGuard = {
+    types: ['TERM_HARVEST'],
+    lockSql: 'SELECT 1',
+    isAdmitted: async () => true,
+  };
+  const successClient = {
+    query: async (text: string) => {
+      successCalls.push(text);
+      return { rows: [] };
+    },
+  };
+  assert.equal(await evaluateClaimGuard(successClient, passingGuard), true);
+  assert.deepEqual(successCalls, ['SAVEPOINT claim_guard', 'RELEASE SAVEPOINT claim_guard']);
+});
+
 test('corpus pipeline invocation lives inside the starter body', () => {
   // No workers are started by this suite: invoking startup would claim real
   // jobs when DATABASE_URL is configured (live-DB claim coverage lives in
@@ -51,32 +100,85 @@ test('corpus pipeline invocation lives inside the starter body', () => {
   assert.match(starterBody, /startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/);
 });
 
-test('budget-gated admission excludes paused and exhausted controls', async () => {
-  const { isBudgetedCorpusClaimAdmitted } = await import('./queueManager');
-  // Paused controls never admit, regardless of budget headroom.
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: true, dailyBudget: 100, consumedToday: 0 }), false);
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: 1, dailyBudget: 100, consumedToday: 0 }), false);
-  // Exhausted or zero budgets never admit (matches the processor throw boundary).
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: false, dailyBudget: 100, consumedToday: 100 }), false);
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: false, dailyBudget: 100, consumedToday: 150 }), false);
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: false, dailyBudget: 0, consumedToday: 0 }), false);
-  // Unreadable budgets fail closed toward exclusion.
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: false, dailyBudget: undefined, consumedToday: 0 }), false);
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: false, dailyBudget: 'many', consumedToday: 0 }), false);
-  // Open control with headroom admits.
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: false, dailyBudget: 100, consumedToday: 0 }), true);
-  assert.equal(isBudgetedCorpusClaimAdmitted({ paused: false, dailyBudget: 100, consumedToday: 99 }), true);
+test('shared corpus budget decision is exact on paused, budget, and units', async () => {
+  const { corpusBudgetAdmits } = await import('./candidateCorpus');
+  const open = { paused: false, dailyBudget: 100, consumedToday: 0, clusterWindowCap: 5 };
+  assert.equal(corpusBudgetAdmits(null), false);
+  assert.equal(corpusBudgetAdmits({ ...open, paused: true }), false);
+  assert.equal(corpusBudgetAdmits({ ...open, consumedToday: 99 }), true);
+  assert.equal(corpusBudgetAdmits({ ...open, consumedToday: 100 }), false);
+  assert.equal(corpusBudgetAdmits({ ...open, consumedToday: 150 }), false);
+  assert.equal(corpusBudgetAdmits({ ...open, dailyBudget: 0 }), false);
+  assert.equal(corpusBudgetAdmits({ ...open, dailyBudget: NaN }), false);
+  // Multi-unit requests reserve exactly: headroom 3 admits 3, not 5.
+  assert.equal(corpusBudgetAdmits({ ...open, consumedToday: 97 }, 3), true);
+  assert.equal(corpusBudgetAdmits({ ...open, consumedToday: 97 }, 5), false);
+  assert.equal(corpusBudgetAdmits({ ...open, consumedToday: 97 }, 0), true);
+});
+
+test('budget guards observe pause, units, and in-flight usage', async () => {
+  const { TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD } = await import('./queueManager');
+  const harvestRows = new Map<string, Array<Record<string, unknown>>>([
+    ['corpus_controls', [{ paused: false, budget: 100, cluster_window_cap: 5 }]],
+    ['corpus_extraction_runs', [{ n: 99 }]],
+    ['jobs:TERM_HARVEST', [{ n: 0 }]],
+  ]);
+  const harvestClient = {
+    query: async (text: string) => {
+      if (text.includes('FROM corpus_controls')) return { rows: harvestRows.get('corpus_controls')! };
+      if (text.includes('FROM corpus_extraction_runs')) return { rows: harvestRows.get('corpus_extraction_runs')! };
+      return { rows: harvestRows.get('jobs:TERM_HARVEST')! };
+    },
+  };
+  // 99 consumed + 0 in flight + 1 requested <= 100: admitted.
+  assert.equal(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), true);
+  // One in-flight claim fills the budget: denied without consuming attempts.
+  harvestRows.set('jobs:TERM_HARVEST', [{ n: 1 }]);
+  assert.equal(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), false);
+  // Paused control denies regardless of headroom.
+  harvestRows.set('corpus_controls', [{ paused: true, budget: 100, cluster_window_cap: 5 }]);
+  harvestRows.set('jobs:TERM_HARVEST', [{ n: 0 }]);
+  assert.equal(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), false);
+
+  const docId = '11111111-2222-4333-8444-555555555555';
+  const scoringRows = new Map<string, Array<Record<string, unknown>>>([
+    ['candidate_scoring_controls', [{ paused: false, budget: 10 }]],
+    ['occurrences', [{ n: 5 }]],
+    ['snapshots', [{ n: 4 }]],
+    ['inflight', [{ u: 0 }]],
+  ]);
+  const scoringClient = {
+    query: async (text: string) => {
+      if (text.includes('FROM candidate_scoring_controls')) return { rows: scoringRows.get('candidate_scoring_controls')! };
+      if (text.includes('FROM corpus_candidate_occurrences') && !text.includes('LEFT JOIN LATERAL')) {
+        return { rows: scoringRows.get('occurrences')! };
+      }
+      if (text.includes('FROM candidate_feature_snapshots')) return { rows: scoringRows.get('snapshots')! };
+      return { rows: scoringRows.get('inflight')! };
+    },
+  };
+  const job = { id: 'job-1', payload: { documentId: docId } };
+  // 5 groups against 4 spent + 0 in flight of 10: 9 <= 10 admitted.
+  assert.equal(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), true);
+  // Two more spent units fill it beyond the 5-group reservation: denied.
+  scoringRows.set('snapshots', [{ n: 6 }]);
+  assert.equal(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), false);
+  // Missing document identity cannot reserve unknown units: denied.
+  assert.equal(
+    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, { id: 'job-2', payload: {} }),
+    false
+  );
 });
 
 test('corpus claim types stay authorized by their existing paused controls', () => {
-  // The claim builder routes both types through the budgeted admission
-  // decision above; removing that call re-admits paused/exhausted controls.
-  // Budget reads live in the atomic guards (evaluated inside the claim
-  // transaction), with the builder keeping its original paused-only checks.
-  assert.match(queueManager, /isBudgetedCorpusClaimAdmitted\(\{\s*paused:\s*control\.rows\[0\]\.paused/);
+  // The atomic guards (evaluated inside the claim transaction) route both
+  // types through the shared budget decision; removing that wiring re-admits
+  // paused/exhausted controls. The builder keeps its original paused-only
+  // checks as a fast path.
+  assert.match(queueManager, /corpusBudgetAdmits\(/);
   assert.match(queueManager, /claimableOverride\.includes\('TERM_HARVEST'\)/);
-  assert.match(queueManager, /SELECT paused,daily_compute_documents AS budget FROM corpus_controls/);
-  assert.match(queueManager, /SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls/);
+  assert.match(queueManager, /readCorpusBudgetForUpdate\(client\)/);
+  assert.match(queueManager, /count\(DISTINCT normalized_span\)/);
 });
 
 test('harvest producer/consumer share the exact extractor version contract', async () => {
