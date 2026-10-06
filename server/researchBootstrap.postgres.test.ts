@@ -380,8 +380,10 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
         () => undefined
       );
     });
-    await database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
+    // Arm while eligible, THEN pause: the allocator (not the arm) must observe
+    // the mid-run ineligibility and abort without allocating.
     await armRun(configureBootstrapArming, pausedRun.id);
+    await database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
     const armed = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
     const pausedResult = await allocateBootstrapAssignments(armed, new Date().toISOString(), pausedRun.id);
     assert.equal(pausedResult.allocated, 0);
