@@ -14,6 +14,7 @@ on:
       - 'server/db.ts'
       - 'server/dbCore.ts'
       - 'server/researchBootstrap.e2e.postgres.test.ts'
+      - 'server/policyPromotion.postgres.test.ts'
       - 'server/db/migrations/**'
       - 'scripts/runMigrations.ts'
       - 'package.json'
@@ -60,3 +61,5 @@ jobs:
         run: npx tsx scripts/runMigrations.ts
       - name: Research bootstrap end-to-end lifecycle test
         run: npx tsx --test server/researchBootstrap.e2e.postgres.test.ts
+      - name: Promotion gate matrix tests
+        run: npx tsx --test server/policyPromotion.postgres.test.ts

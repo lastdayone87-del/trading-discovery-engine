@@ -340,46 +340,34 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       'every segment guardrail must pass'
     );
 
-    // ---- Stage 7: promotion fails closed on main (structural gap, documented). ----
-    // NOTHING writes portfolio_policy_evaluations, and transitionPolicy reads
-    // a nonexistent status column there (pre-#506): promotion must refuse with
-    // the gate/database-path error itself — not with an unrelated validation
-    // or NOT_FOUND error (which would mean the test never reached the gate).
-    // Harness reset (labeled): APPROVE is only a legal transition from DRAFT,
-    // so the status returns to DRAFT first; stage 8 re-establishes CANARY.
+    // ---- Stage 7: governed promotion on the genuine PASS evaluation. ----
+    // The bridge gate reads persistent_research_policy_evaluations for this
+    // candidate (PASS + non-null baseline). Harness reset (labeled): APPROVE
+    // is only a legal transition from DRAFT, so the stage-5 CANARY setup
+    // returns to DRAFT first. No portfolio_policy_evaluations row is written.
     await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [candidate.id]);
-    const promotionError = await transitionPolicy({
+    const approved = await transitionPolicy({
       id: candidate.id,
       action: 'APPROVE',
-      reason: 'test e2e promotion attempt',
+      reason: 'test e2e promotion on genuine PASS',
       idempotencyKey: `test-e2e-approve:${tag}`,
       actor: 'test:research-e2e',
-    }).then(
-      () => null,
-      (error: unknown) => (error instanceof Error ? error : new Error(String(error)))
-    );
-    assert.ok(promotionError, 'promotion must fail closed on current main');
-    assert.match(
-      promotionError.message,
-      /ADAPTIVE_POLICY_EVALUATION_REQUIRED|status/i,
-      'failure must be the promotion-gate/database path, not an unrelated error'
-    );
-    assert.doesNotMatch(
-      promotionError.message,
-      /POLICY_REASON_AND_IDEMPOTENCY|PORTFOLIO_POLICY_NOT_FOUND|INVALID_POLICY_TRANSITION/,
-      'failure must occur AT the gate, after validation passes'
-    );
-    const stillDraft = (
-      await database.query('SELECT status FROM portfolio_policies WHERE id=$1', [candidate.id])
-    ).rows[0];
-    assert.equal(stillDraft.status, 'DRAFT', 'failed promotion must not change policy status');
+    });
+    assert.equal(approved.status, 'APPROVED', 'genuine PASS must promote DRAFT to APPROVED');
+    const canaryPolicy = await transitionPolicy({
+      id: candidate.id,
+      action: 'CANARY',
+      reason: 'test e2e canary advance on genuine PASS',
+      idempotencyKey: `test-e2e-canary:${tag}`,
+      actor: 'test:research-e2e',
+    });
+    assert.equal(canaryPolicy.status, 'CANARY', 'APPROVED policy with PASS must advance to CANARY');
 
     // ---- Stage 8: CANARY allocates with the GENUINE PASS evidence. ----
-    // CANARY status is re-established here (same harness-only flip as stage
-    // 5); the only change since the stage-5 refusal is the now-existing PASS
-    // evaluation. No portfolio_policy_evaluations row is ever written: the
-    // persistent-vs-legacy mismatch is preserved, not bypassed.
-    await database.query(`UPDATE portfolio_policies SET status='CANARY' WHERE id=$1`, [candidate.id]);
+    // Status reached through the governed promotion path above (the only
+    // direct status write left is the stage-5 negative setup). The delta
+    // since the stage-5 refusal remains exactly the now-existing PASS
+    // evaluation.
     const extraIds: string[] = [];
     for (let index = 0; index < 5; index++) {
       const row = await database.query(
