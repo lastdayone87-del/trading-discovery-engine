@@ -164,7 +164,19 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       configuration: { ...BASELINE_CONFIG, programFloors: { [`test:e2e:baseline:${tag}`]: 0 } },
       actor: 'test:research-e2e',
     });
-    const windowStart = new Date().toISOString();
+    // Single-clock harness rule: derive the evaluation window start from the
+  // database timestamps themselves, so created_at <= windowStart holds
+  // regardless of runner/database clock skew.
+  const windowStart = new Date(
+    String(
+      (
+        await database.query(
+          `SELECT max(created_at) AS t FROM portfolio_policies WHERE id = ANY($1::uuid[])`,
+          [[candidate.id, baseline.id]]
+        )
+      ).rows[0].t
+    )
+  ).toISOString();
 
     // ---- Stage 2: seed 30 high-yield + 30 low-yield PROPOSED actions. ----
     // Controlled provider-generation boundary (see header): realistic action
