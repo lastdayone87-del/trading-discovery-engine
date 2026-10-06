@@ -6,9 +6,9 @@ import { CORPUS_PIPELINE_TYPES } from './operationalMaintenanceWorkers';
 const workers = readFileSync(new URL('./operationalMaintenanceWorkers.ts', import.meta.url), 'utf8');
 const queueManager = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
 
-test('corpus pipeline claims exactly harvest and scoring, nothing else', () => {
-  assert.deepEqual([...CORPUS_PIPELINE_TYPES].sort(), ['SCORE_CANDIDATES', 'TERM_HARVEST']);
-  for (const gated of ['PROPOSE_CONCEPT_RESOLUTION', 'AI_ADJUDICATE_CANDIDATE', 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER', 'RETRY_COMMUNITY_ACQUISITION', 'SEARCH_YOUTUBE', 'ENRICH_CHANNEL']) {
+test('corpus pipeline claims exactly harvest, scoring, and resolution, nothing else', () => {
+  assert.deepEqual([...CORPUS_PIPELINE_TYPES].sort(), ['PROPOSE_CONCEPT_RESOLUTION', 'SCORE_CANDIDATES', 'TERM_HARVEST']);
+  for (const gated of ['AI_ADJUDICATE_CANDIDATE', 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER', 'RETRY_COMMUNITY_ACQUISITION', 'SEARCH_YOUTUBE', 'ENRICH_CHANNEL']) {
     assert.ok(!CORPUS_PIPELINE_TYPES.includes(gated as never), `${gated} must not be in the corpus claim list`);
   }
 });
@@ -33,17 +33,19 @@ test('corpus pipeline worker uses the existing claim path on a one-second tick',
 });
 
 test('budget guards are defined for exactly the corpus claim types', async () => {
-  const { TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD, CORPUS_CLAIM_BUDGET_GUARDS } =
+  const { TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD, RESOLUTION_BUDGET_GUARD, CORPUS_CLAIM_BUDGET_GUARDS, RESOLUTION_CLAIM_BUDGET_GUARDS } =
     await import('./queueManager');
   assert.deepEqual(TERM_HARVEST_BUDGET_GUARD.types, ['TERM_HARVEST']);
   assert.deepEqual(SCORE_CANDIDATES_BUDGET_GUARD.types, ['SCORE_CANDIDATES']);
+  assert.deepEqual(RESOLUTION_BUDGET_GUARD.types, ['PROPOSE_CONCEPT_RESOLUTION']);
   assert.deepEqual(CORPUS_CLAIM_BUDGET_GUARDS, [TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD]);
-  for (const guard of CORPUS_CLAIM_BUDGET_GUARDS) {
+  assert.deepEqual(RESOLUTION_CLAIM_BUDGET_GUARDS, [RESOLUTION_BUDGET_GUARD]);
+  for (const guard of [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS]) {
     assert.match(guard.lockSql, /FOR UPDATE/);
   }
   // The claim path passes the guards into claimNextJob, where admission is
   // evaluated atomically inside the claim transaction.
-  assert.match(queueManager, /claimNextJob\(workerId, claimableTypes, browserBlockedRetryPatterns, \['RECONCILIATION_REQUIRED'\], CORPUS_CLAIM_BUDGET_GUARDS\)/);
+  assert.match(queueManager, /\['RECONCILIATION_REQUIRED'\], \[\.\.\.CORPUS_CLAIM_BUDGET_GUARDS, \.\.\.RESOLUTION_CLAIM_BUDGET_GUARDS\]\)/);
 });
 
 test('guard evaluation recovers the claim transaction after transient failure', async () => {
@@ -199,6 +201,41 @@ test('budget guards observe pause, units, and in-flight usage', async () => {
     await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, { id: 'job-2', payload: {} }),
     { admitted: false, exhausted: false }
   );
+});
+
+test('resolution guard admits one unit with headroom, denies when exhausted', async () => {
+  const { RESOLUTION_BUDGET_GUARD } = await import('./queueManager');
+  const rows = new Map<string, Array<Record<string, unknown>>>([
+    ['concept_graph_controls', [{ paused: false, budget: 10 }]],
+    ['proposals', [{ n: 9 }]],
+    ['inflight', [{ n: 0 }]],
+  ]);
+  const client = {
+    query: async (text: string) => {
+      if (text.includes('FROM concept_graph_controls')) return { rows: rows.get('concept_graph_controls')! };
+      if (text.includes('FROM concept_resolution_proposals')) return { rows: rows.get('proposals')! };
+      return { rows: rows.get('inflight')! };
+    },
+  };
+  const job = { id: 'job-1', payload: { candidateKey: 'k', literal: 'x' } };
+  // 9 done + 0 in flight of 10: one unit fits.
+  assert.deepEqual(await RESOLUTION_BUDGET_GUARD.isAdmitted(client, job), {
+    admitted: true,
+    exhausted: false,
+  });
+  // One more completed proposal exhausts: denied, type skipped.
+  rows.set('proposals', [{ n: 10 }]);
+  assert.deepEqual(await RESOLUTION_BUDGET_GUARD.isAdmitted(client, job), {
+    admitted: false,
+    exhausted: true,
+  });
+  // Paused control denies regardless of headroom.
+  rows.set('concept_graph_controls', [{ paused: true, budget: 10 }]);
+  rows.set('proposals', [{ n: 0 }]);
+  assert.deepEqual(await RESOLUTION_BUDGET_GUARD.isAdmitted(client, job), {
+    admitted: false,
+    exhausted: true,
+  });
 });
 
 test('corpus claim types stay authorized by their existing paused controls', () => {

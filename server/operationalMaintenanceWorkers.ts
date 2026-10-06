@@ -23,7 +23,7 @@ const COUNTRY_BOUNDARY_RECOVERY_TYPES: ClaimableOverride = [COUNTRY_BOUNDARY_REC
  * Every type here remains authorized by its existing control/budget gates
  * inside processNextSearchJob; the list itself grants no authority.
  */
-export const CORPUS_PIPELINE_TYPES: ClaimableOverride = ['TERM_HARVEST', 'SCORE_CANDIDATES'];
+export const CORPUS_PIPELINE_TYPES: ClaimableOverride = ['TERM_HARVEST', 'SCORE_CANDIDATES', 'PROPOSE_CONCEPT_RESOLUTION'];
 const QUOTA_BACKOFF_MS = 30_000;
 const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
   0,

@@ -416,6 +416,39 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
 export const CORPUS_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD];
 
 /**
+ * Concept-resolution daily budget guard: one admitted job costs exactly one
+ * unit (at most one proposal row per job, idempotent by proposal_key), mirroring
+ * the processor which inserts a single surface + proposal pair. Counts today's
+ * completed proposals plus in-flight PROCESSING resolution claims under the
+ * same control-row lock; denial leaves jobs queued without consuming attempts.
+ */
+export const RESOLUTION_BUDGET_GUARD: ClaimBudgetGuard = {
+  types: ['PROPOSE_CONCEPT_RESOLUTION'],
+  lockSql: `SELECT * FROM concept_graph_controls WHERE singleton=true FOR UPDATE`,
+  isAdmitted: async (client) => {
+    const control = await client.query(
+      `SELECT resolution_paused AS paused,daily_resolution_documents AS budget FROM concept_graph_controls WHERE singleton=true FOR UPDATE`
+    );
+    if (!control.rows.length) return { admitted: false, exhausted: true };
+    const budget = Number(control.rows[0].budget);
+    if (Boolean(control.rows[0].paused) || !Number.isFinite(budget)) {
+      return { admitted: false, exhausted: true };
+    }
+    const done = await client.query(
+      `SELECT count(*)::int AS n FROM concept_resolution_proposals WHERE created_at>=date_trunc('day',now())`
+    );
+    const inFlight = await client.query(
+      `SELECT count(*)::int AS n FROM jobs WHERE type='PROPOSE_CONCEPT_RESOLUTION' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`
+    );
+    const remaining = budget - Number(done.rows[0]?.n || 0) - Number(inFlight.rows[0]?.n || 0);
+    if (remaining < 1) return { admitted: false, exhausted: true };
+    return { admitted: true, exhausted: false };
+  },
+};
+
+export const RESOLUTION_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [RESOLUTION_BUDGET_GUARD];
+
+/**
  * Worker loop that processes one durable search or enrichment job.
  */
 export async function processNextSearchJob(
@@ -502,7 +535,7 @@ export async function processNextSearchJob(
   if (claimableTypes.length === 0) return false;
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
-  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], CORPUS_CLAIM_BUDGET_GUARDS);
+  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS]);
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
