@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'; import test from 'node:test';
-import { authenticate, routePolicyInventory, validateOperatorConfiguration } from './operatorAuth';
+import { authenticate, operatorAuthorization, routePolicyInventory, validateOperatorConfiguration } from './operatorAuth';
 
 test('Phase 12 diagnostics and materialization routes are governed',()=>{
  assert.ok(routePolicyInventory.some(r=>r.method==='GET'&&r.pattern.includes('discovery\\/evaluation')));
@@ -52,4 +52,47 @@ test('version diagnostics is an explicit operator-only read route',()=>{
  assert.equal(matching.length,1,'/api/version must resolve to exactly one explicit route policy');
  assert.equal(matching[0].policy,'operator');
  assert.equal(matching[0].action,'diagnostics.version.read');
+});
+
+test('bootstrap lifecycle routes are explicit and least-privileged (never public)',()=>{
+  const cases=[
+    { method:'GET', path:'/api/persistent-research/bootstrap-runs', policy:'operator', action:'research.bootstrap.read' },
+    { method:'POST', path:'/api/persistent-research/bootstrap-runs', policy:'admin', action:'research.bootstrap.start' },
+    { method:'POST', path:'/api/persistent-research/bootstrap-runs/00000000-0000-4000-8000-000000000000/abort', policy:'admin', action:'research.bootstrap.abort' },
+  ] as const;
+  for (const expected of cases) {
+    const matching=routePolicyInventory.filter(item=>item.method===expected.method&&new RegExp(item.pattern).test(expected.path));
+    assert.equal(matching.length,1,`${expected.method} ${expected.path} must resolve to exactly one explicit route policy`);
+    assert.equal(matching[0].policy,expected.policy);
+    assert.equal(matching[0].action,expected.action);
+  }
+  assert.ok(!routePolicyInventory.some(x=>x.policy==='public'&&/bootstrap-runs/.test(x.pattern)));
+});
+
+test('bootstrap lifecycle routes enforce authentication at the middleware layer',async ()=>{
+  const run=(role:'admin'|'operator'|undefined,path='/api/persistent-research/bootstrap-runs',method='POST'):Promise<{next:boolean;status?:number;code?:string}>=>new Promise(resolve=>{
+    const handler=operatorAuthorization(async ()=>{},{ NODE_ENV:'test', ADMIN_API_TOKEN:'admin-token', OPERATOR_API_TOKEN:'operator-token' } as NodeJS.ProcessEnv);
+    const token=role==='admin'?'admin-token':role==='operator'?'operator-token':undefined;
+    const req={ method, path, baseUrl:'', query:{}, header:(name:string)=>(name.toLowerCase()==='authorization'&&token?`Bearer ${token}`:undefined) };
+    let status=0; let code='';
+    const res={ status:(code_:number)=>{ status=code_; return res; }, json:(body:Record<string,unknown>)=>{ code=String(body.code||''); resolve({next:false,status,code}); }, setHeader:()=>{}, once:()=>{} };
+    handler(req as never,res as never,()=>resolve({next:true}));
+  });
+  // Read path: operators pass, anonymous callers are rejected before any handler runs.
+  assert.deepEqual(await run('operator','/api/persistent-research/bootstrap-runs','GET'),{next:true});
+  assert.deepEqual(await run('admin','/api/persistent-research/bootstrap-runs','GET'),{next:true});
+  const anonymousRead=await run(undefined,'/api/persistent-research/bootstrap-runs','GET');
+  assert.equal(anonymousRead.next,false); assert.equal(anonymousRead.status,401);
+  // State-changing paths: admin passes, operator role is insufficient, anonymous is rejected.
+  assert.deepEqual(await run('admin'),{next:true});
+  const operatorStart=await run('operator');
+  assert.equal(operatorStart.next,false); assert.equal(operatorStart.status,403);
+  const anonymousStart=await run(undefined);
+  assert.equal(anonymousStart.next,false); assert.equal(anonymousStart.status,401);
+  assert.deepEqual(await run('admin','/api/persistent-research/bootstrap-runs/00000000-0000-4000-8000-000000000000/abort'),{next:true});
+  const operatorAbort=await run('operator','/api/persistent-research/bootstrap-runs/00000000-0000-4000-8000-000000000000/abort');
+  assert.equal(operatorAbort.next,false); assert.equal(operatorAbort.status,403);
+  // Unknown bootstrap-shaped paths still fail closed at the policy layer.
+  const missing=await run('admin','/api/persistent-research/bootstrap-runs/extra/segments','GET');
+  assert.equal(missing.next,false); assert.equal(missing.status,404); assert.equal(missing.code,'ROUTE_POLICY_MISSING');
 });
