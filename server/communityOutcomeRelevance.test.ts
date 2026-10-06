@@ -694,3 +694,92 @@ test('auxiliary outcome: existing R6 admission behavior remains intact', () => {
     assert.equal(normalizeExternalUrl(raw), null, `must reject: ${raw}`);
   }
 });
+
+// 26. Query VALUE containing an affiliate-looking path does not demote a
+// genuine creator URL: `?next=/referral` is navigation state, not affiliate
+// function. The pathname-only AFFILIATE_HINT evaluation must ignore it,
+// and `next` is not an affiliate query-key family member.
+test('auxiliary outcome: affiliate-looking query value never demotes a creator URL', () => {
+  assert.equal(
+    isAuxiliaryForOutcome('https://creator.example.com/?next=/referral'),
+    false,
+    '?next=/referral must stay community-relevant',
+  );
+  assert.equal(
+    isCommunityRelevantObservation({ requestedUrl: 'https://creator.example.com/?next=/referral' }),
+    true,
+  );
+});
+
+// 27. Query VALUE containing a transaction-looking URL does not demote a
+// genuine creator URL: `?return=https://other.example/order` classifies the
+// creator URL, not the referenced target. Pathname-only transaction
+// evaluation must ignore it.
+test('auxiliary outcome: transaction-looking query value never demotes a creator URL', () => {
+  assert.equal(
+    isAuxiliaryForOutcome('https://creator.example.com/?return=https://other.example/order'),
+    false,
+    '?return=.../order must stay community-relevant',
+  );
+  assert.equal(
+    isCommunityRelevantObservation({
+      requestedUrl: 'https://creator.example.com/?return=https://other.example/order',
+    }),
+    true,
+  );
+});
+
+// 28. Genuine affiliate pathnames remain auxiliary (path-only detection intact).
+test('auxiliary outcome: genuine affiliate pathnames stay auxiliary', () => {
+  for (const path of ['/referral', '/referral/', '/affiliate', '/partner', '/promo', '/coupon']) {
+    assert.equal(
+      isAuxiliaryForOutcome(`https://creator.example.com${path}`),
+      true,
+      `${path} must classify auxiliary`,
+    );
+  }
+});
+
+// 29. Genuine transaction pathnames remain auxiliary (path-only detection intact).
+test('auxiliary outcome: genuine transaction pathnames stay auxiliary', () => {
+  for (const path of [
+    '/checkout',
+    '/cart',
+    '/shop',
+    '/product',
+    '/products',
+    '/buy',
+    '/buy-now',
+    '/purchase',
+    '/order',
+  ]) {
+    assert.equal(
+      isAuxiliaryForOutcome(`https://creator.example.com${path}`),
+      true,
+      `${path} must classify auxiliary`,
+    );
+  }
+});
+
+// 30. Affiliate query-key parameters remain auxiliary (parsed-key detection
+// intact after the pathname-only AFFILIATE_HINT change).
+test('auxiliary outcome: affiliate query parameters stay auxiliary', () => {
+  for (const query of ['ref=x', 'referralCode=BRANDON', 'affiliateId=1', 'partner_id=2']) {
+    assert.equal(
+      isAuxiliaryForOutcome(`https://creator.example.com/guide?${query}`),
+      true,
+      `?${query} must classify auxiliary`,
+    );
+  }
+});
+
+// 31. Arbitrary/unknown query keys still fail open to required.
+test('auxiliary outcome: unknown query keys still fail open', () => {
+  for (const query of ['next=/referral', 'return=https://other.example/order', 'sessionId=abc', 'page=2']) {
+    assert.equal(
+      isAuxiliaryForOutcome(`https://creator.example.com/guide?${query}`),
+      false,
+      `?${query} must fail open to required`,
+    );
+  }
+});

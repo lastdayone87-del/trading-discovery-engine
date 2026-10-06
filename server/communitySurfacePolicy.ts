@@ -627,7 +627,13 @@ export function isAuxiliaryForOutcome(rawUrl: string): boolean {
   const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
   if (!host) return false;
   if (isKnownBrokerOrExchangeHost(host)) return true;
-  if (AFFILIATE_HINT.test(rawUrl)) return true;
+  // Affiliate path shapes are evaluated against the pathname only: an
+  // affiliate-looking string inside a query VALUE (e.g. `?next=/referral`)
+  // describes the target's navigation, not this URL's affiliate function,
+  // and must not demote a genuine creator URL. Genuine affiliate query
+  // PARAMETERS (`?ref=`, `?referralCode=`, ...) stay covered by the parsed
+  // per-key family match below, which is a superset of the hint's key forms.
+  if (AFFILIATE_HINT.test(parsed.pathname)) return true;
   // Affiliate query keys (fail-open: only the documented families match).
   // Evaluated on the live query string; bare `ref` survives normalization
   // precisely so this signal reaches classification (see normalizeExternalUrl).
@@ -640,7 +646,11 @@ export function isAuxiliaryForOutcome(rawUrl: string): boolean {
     .filter(Boolean);
   if (segments.some(segment => AFFILIATE_HOST_SEGMENTS.has(segment))) return true;
   if (AUXILIARY_COMMERCE_SUFFIXES.some(entry => host === entry || host.endsWith(`.${entry}`))) return true;
-  if (TRANSACTION_PATH_PATTERN.test(`${parsed.pathname}${parsed.search}`)) return true;
+  // Transaction shapes are evaluated against the pathname only: a
+  // transaction-looking path inside a query VALUE (e.g.
+  // `?return=https://other.example/order`) belongs to the referenced
+  // target, not to this URL, and must not demote a genuine creator URL.
+  if (TRANSACTION_PATH_PATTERN.test(parsed.pathname)) return true;
   return false;
 }
 
