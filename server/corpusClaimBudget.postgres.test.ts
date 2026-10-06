@@ -13,9 +13,15 @@ import { createHash } from 'node:crypto';
  * logged by the first test). When enabled, the suite first proves isolation
  * (empty query_library, no pending/processing harvest/scoring jobs, all
  * required tables present) and fails loudly before mutating anything
- * otherwise. All fixtures use unique tags with pre-cleanup (interrupted runs
- * cannot pollute later ones) and every control mutation is restored in
- * finally blocks; claimed jobs are deleted (attempts cascade).
+ * otherwise.
+ *
+ * Corpus tables are append-only by design (reject_immutable_event_mutation),
+ * so fixtures there are NEVER deleted. Instead every fixture uses a unique
+ * per-run tag and every budget assertion is delta-scoped (budgets are set
+ * relative to measured usage), keeping each run deterministic no matter what
+ * prior runs left behind. The only cleanup is jobs-table rows (allowed) and
+ * control-row restoration — and cleanup failures propagate loudly rather
+ * than being swallowed.
  */
 const dedicated = process.env.CORPUS_BUDGET_TEST_DATABASE_URL;
 
@@ -31,12 +37,14 @@ test('corpus budget claim tests require a dedicated database (skipped otherwise)
 if (dedicated) process.env.DATABASE_URL = dedicated;
 const maybe = dedicated ? test : test.skip;
 
-async function db() {
+type Db = { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> };
+
+async function db(): Promise<Db> {
   const { getDb } = await import('./dbCore');
   return getDb();
 }
 
-async function assertIsolatedTestDb(database: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> }) {
+async function assertIsolatedTestDb(database: Db) {
   for (const table of [
     'corpus_controls',
     'candidate_scoring_controls',
@@ -65,23 +73,90 @@ async function assertIsolatedTestDb(database: { query: (text: string, params?: a
     0,
     'refusing to run while harvest/scoring jobs are live: a worker may be active on this database'
   );
-  // Deterministic budgets: today's ledgers must be empty so exact headroom
-  // assertions (budget 1, groups 5 vs 3) cannot be skewed by other activity.
-  const runsToday = await database.query(
-    `SELECT count(*)::int AS n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`
-  );
-  assert.equal(Number(runsToday.rows[0]?.n || 0), 0, 'refusing to run with pre-existing daily extraction usage');
-  const snapshotsToday = await database.query(
-    `SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`
-  );
-  assert.equal(Number(snapshotsToday.rows[0]?.n || 0), 0, 'refusing to run with pre-existing daily scoring usage');
 }
 
-async function cleanupProbeJobs(
-  database: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> },
-  like: string
+async function readControls(database: Db) {
+  const corpus = (
+    await database.query('SELECT paused, daily_compute_documents FROM corpus_controls WHERE singleton=true')
+  ).rows[0];
+  const scoring = (
+    await database.query(
+      'SELECT scoring_paused, daily_scoring_candidates FROM candidate_scoring_controls WHERE singleton=true'
+    )
+  ).rows[0];
+  assert.ok(corpus, 'corpus_controls singleton must exist');
+  assert.ok(scoring, 'candidate_scoring_controls singleton must exist');
+  return { corpus, scoring };
+}
+
+async function restoreControls(
+  database: Db,
+  prev: { corpus: Record<string, unknown>; scoring: Record<string, unknown> }
 ) {
-  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE $1`, [like]).catch(() => undefined);
+  await database.query('UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true', [
+    prev.corpus.paused,
+    prev.corpus.daily_compute_documents,
+  ]);
+  await database.query(
+    'UPDATE candidate_scoring_controls SET scoring_paused=$1, daily_scoring_candidates=$2 WHERE singleton=true',
+    [prev.scoring.scoring_paused, prev.scoring.daily_scoring_candidates]
+  );
+}
+
+async function spentToday(database: Db) {
+  const runs = (
+    await database.query(
+      `SELECT count(*)::int AS n FROM corpus_extraction_runs WHERE completed_at>=date_trunc('day',now())`
+    )
+  ).rows[0];
+  const snapshots = (
+    await database.query(
+      `SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`
+    )
+  ).rows[0];
+  return { runs: Number(runs?.n || 0), snapshots: Number(snapshots?.n || 0) };
+}
+
+function harvestPayload(tag: string, index: number) {
+  const text = `budget race probe ${tag} ${index}`;
+  return {
+    payloadSchemaVersion: 1,
+    channelId: 'UCbudgetrace00000000000000',
+    text,
+    contentHash: createHash('sha256').update(text.normalize('NFC')).digest('hex'),
+    lineage: 'AUTONOMOUS',
+    entityClusterKey: `budget-race-${tag}`,
+    observedAt: new Date().toISOString(),
+    extractorVersion: 'deterministic-ngram-v1',
+  };
+}
+
+/** Fixture document with exactly `spans` distinct normalized spans (append-only; unique tag). */
+async function fixtureScoringDocument(database: Db, tag: string, spans: number): Promise<string> {
+  const artifact = await database.query(
+    `INSERT INTO corpus_source_artifacts(source_type,source_key,creator_channel_id,discovery_lineage,entity_cluster_key,observed_at,policy_version)
+     VALUES('CHANNEL_METADATA',$1,NULL,'AUTONOMOUS',$2,now(),'corpus-policy-v1') RETURNING id`,
+    [`test-scoring-units:${tag}`, `scoring-units-${tag}`]
+  );
+  const document = await database.query(
+    `INSERT INTO corpus_documents(artifact_id,document_kind,language,content_hash,retained_excerpt,retention_class,extractor_eligible,retention_expires_at)
+     VALUES($1,'CHANNEL_METADATA','und',$2,'excerpt','MINIMAL_EXCERPT',true,now()+interval '90 days') RETURNING id`,
+    [artifact.rows[0].id, `scoring-units-hash-${tag}`]
+  );
+  const documentId = String(document.rows[0].id);
+  const run = await database.query(
+    `INSERT INTO corpus_extraction_runs(document_id,extractor_version,status,token_count,candidate_count)
+     VALUES($1,'deterministic-ngram-v1','COMPLETED',1,$2) RETURNING id`,
+    [documentId, spans]
+  );
+  for (let span = 0; span < spans; span++) {
+    await database.query(
+      `INSERT INTO corpus_candidate_occurrences(extraction_run_id,document_id,literal_span,normalized_span,start_offset,end_offset,ngram_size,occurrence_key)
+       VALUES($1,$2,$3,$3,$4,$5,1,$6) ON CONFLICT(occurrence_key) DO NOTHING`,
+      [run.rows[0].id, documentId, `scoring span ${tag} ${span}`, span * 10, span * 10 + 5, `test-scoring-units:${tag}:${span}`]
+    );
+  }
+  return documentId;
 }
 
 maybe('concurrent budget-guarded claims admit at most remaining headroom', async t => {
@@ -90,34 +165,27 @@ maybe('concurrent budget-guarded claims admit at most remaining headroom', async
   const database = await db();
   await assertIsolatedTestDb(database);
   const tag = `budget-race:${Date.now()}:${process.pid}`;
-  await cleanupProbeJobs(database, 'test-budget-race:%');
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-budget-race:%'`);
   const prev = (
     await database.query('SELECT paused, daily_compute_documents FROM corpus_controls WHERE singleton=true')
   ).rows[0];
-  assert.ok(prev, 'corpus_controls singleton must exist');
+  const before = await spentToday(database);
   const jobIds: string[] = [];
   try {
-    await database.query(`UPDATE corpus_controls SET paused=false, daily_compute_documents=1 WHERE singleton=true`);
+    // Delta-scoped budget: exactly one unit of headroom over current usage.
+    await database.query(`UPDATE corpus_controls SET paused=false, daily_compute_documents=$1 WHERE singleton=true`, [
+      before.runs + 1,
+    ]);
     for (let index = 0; index < 3; index++) {
-      const text = `budget race probe ${tag} ${index}`;
-      const job = await enqueueJob(
-        'TERM_HARVEST',
-        {
-          payloadSchemaVersion: 1,
-          channelId: 'UCbudgetrace00000000000000',
-          text,
-          contentHash: createHash('sha256').update(text.normalize('NFC')).digest('hex'),
-          lineage: 'AUTONOMOUS',
-          entityClusterKey: `budget-race-${tag}`,
-          observedAt: new Date().toISOString(),
-          extractorVersion: 'deterministic-ngram-v1',
-        },
-        { priority: 5, maxAttempts: 3, idempotencyKey: `test-budget-race:${tag}:${index}` }
-      );
+      const job = await enqueueJob('TERM_HARVEST', harvestPayload(tag, index), {
+        priority: 5,
+        maxAttempts: 3,
+        idempotencyKey: `test-budget-race:${tag}:${index}`,
+      });
       jobIds.push(job.id);
     }
-    // Three concurrent guarded claims against a budget of 1: exactly one may
-    // be admitted (control-row lock serializes check-then-claim; in-flight
+    // Three concurrent guarded claims with one unit of headroom: exactly one
+    // is admitted (control-row lock serializes check-then-claim; in-flight
     // counting closes the claim/completion gap). The rest return null with
     // their jobs still PENDING and attempts untouched.
     const results = await Promise.all(
@@ -141,107 +209,183 @@ maybe('concurrent budget-guarded claims admit at most remaining headroom', async
     );
   } finally {
     if (jobIds.length > 0) {
-      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]).catch(() => undefined);
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
     }
-    await database
-      .query('UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true', [
-        prev.paused,
-        prev.daily_compute_documents,
-      ])
-      .catch(() => undefined);
+    await database.query('UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true', [
+      prev.paused,
+      prev.daily_compute_documents,
+    ]);
   }
 });
 
-maybe('multi-span scoring job is denied when groups exceed remaining budget', async t => {
-  const { getDb, enqueueJob, claimNextJob } = await import('./dbCore');
+maybe('oversized scoring job does not block a smaller admittable job', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
   const { SCORE_CANDIDATES_BUDGET_GUARD } = await import('./queueManager');
   const { FEATURE_SET_VERSION } = await import('./candidateScoring');
-  const database = await getDb();
+  const database = await db();
   await assertIsolatedTestDb(database);
-  const tag = `scoring-units:${Date.now()}:${process.pid}`;
-  const sourceKey = `test-scoring-units:${tag}`;
-  await cleanupProbeJobs(database, 'test-scoring-units:%');
+  const tag = `oversized:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-oversized:%'`);
   const prev = (
     await database.query(
       'SELECT scoring_paused, daily_scoring_candidates FROM candidate_scoring_controls WHERE singleton=true'
     )
   ).rows[0];
-  assert.ok(prev, 'candidate_scoring_controls singleton must exist');
   const jobIds: string[] = [];
   try {
-    // Fixture document with 5 distinct normalized spans.
-    const artifact = await database.query(
-      `INSERT INTO corpus_source_artifacts(source_type,source_key,creator_channel_id,discovery_lineage,entity_cluster_key,observed_at,policy_version)
-       VALUES('CHANNEL_METADATA',$1,'UCscoringunits00000000','AUTONOMOUS',$2,now(),'corpus-policy-v1') RETURNING id`,
-      [sourceKey, `scoring-units-${tag}`]
+    const bigDoc = await fixtureScoringDocument(database, `${tag}:big`, 5);
+    const smallDoc = await fixtureScoringDocument(database, `${tag}:small`, 1);
+    const before = await spentToday(database);
+    // Exactly one unit of headroom: the 5-group job cannot fit, the 1-group
+    // job can. Higher priority first proves scanning continues past denial.
+    await database.query(
+      `UPDATE candidate_scoring_controls SET scoring_paused=false, daily_scoring_candidates=$1 WHERE singleton=true`,
+      [before.snapshots + 1]
     );
-    const document = await database.query(
-      `INSERT INTO corpus_documents(artifact_id,document_kind,content_hash,retained_excerpt,retention_class,extractor_eligible,retention_expires_at)
-       VALUES($1,'CHANNEL_METADATA',$2,'excerpt','MINIMAL_EXCERPT',true,now()+interval '90 days') RETURNING id`,
-      [artifact.rows[0].id, `scoring-units-hash-${tag}`]
+    const big = await enqueueJob(
+      'SCORE_CANDIDATES',
+      { payloadSchemaVersion: 1, documentId: bigDoc, featureSetVersion: FEATURE_SET_VERSION },
+      { priority: 9, maxAttempts: 3, idempotencyKey: `test-oversized:${tag}:big` }
     );
-    const documentId = String(document.rows[0].id);
-    const run = await database.query(
-      `INSERT INTO corpus_extraction_runs(document_id,extractor_version,status,token_count,candidate_count)
-       VALUES($1,'deterministic-ngram-v1','COMPLETED',1,5) RETURNING id`,
-      [documentId]
+    const small = await enqueueJob(
+      'SCORE_CANDIDATES',
+      { payloadSchemaVersion: 1, documentId: smallDoc, featureSetVersion: FEATURE_SET_VERSION },
+      { priority: 1, maxAttempts: 3, idempotencyKey: `test-oversized:${tag}:small` }
     );
-    for (let span = 0; span < 5; span++) {
-      await database.query(
-        `INSERT INTO corpus_candidate_occurrences(extraction_run_id,document_id,literal_span,normalized_span,start_offset,end_offset,ngram_size,occurrence_key)
-         VALUES($1,$2,$3,$3,$4,$5,1,$6) ON CONFLICT(occurrence_key) DO NOTHING`,
-        [run.rows[0].id, documentId, `scoring span ${tag} ${span}`, span * 10, span * 10 + 5, `test-scoring-units:${tag}:${span}`]
-      );
+    jobIds.push(big.id, small.id);
+    const claimed = await claimNextJob(`test-oversized`, ['SCORE_CANDIDATES'], undefined, undefined, [
+      SCORE_CANDIDATES_BUDGET_GUARD,
+    ]);
+    assert.ok(claimed, 'the smaller job must claim despite the oversized higher-priority job');
+    assert.equal(claimed?.id, small.id);
+    const bigState = (
+      await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [big.id])
+    ).rows[0] as { status: string; attempts: number };
+    assert.equal(bigState.status, 'PENDING');
+    assert.equal(Number(bigState.attempts), 0);
+  } finally {
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
     }
     await database.query(
-      `UPDATE candidate_scoring_controls SET scoring_paused=false, daily_scoring_candidates=3 WHERE singleton=true`
+      'UPDATE candidate_scoring_controls SET scoring_paused=$1, daily_scoring_candidates=$2 WHERE singleton=true',
+      [prev.scoring_paused, prev.daily_scoring_candidates]
+    );
+  }
+});
+
+maybe('zero-span scoring job is denied under an exhausted budget', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
+  const { SCORE_CANDIDATES_BUDGET_GUARD } = await import('./queueManager');
+  const { FEATURE_SET_VERSION } = await import('./candidateScoring');
+  const database = await db();
+  await assertIsolatedTestDb(database);
+  const tag = `zerospan:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-zerospan:%'`);
+  const prev = (
+    await database.query(
+      'SELECT scoring_paused, daily_scoring_candidates FROM candidate_scoring_controls WHERE singleton=true'
+    )
+  ).rows[0];
+  const jobIds: string[] = [];
+  try {
+    // Document with no occurrences: zero normalized-span groups.
+    const artifact = await database.query(
+      `INSERT INTO corpus_source_artifacts(source_type,source_key,creator_channel_id,discovery_lineage,entity_cluster_key,observed_at,policy_version)
+       VALUES('CHANNEL_METADATA',$1,NULL,'AUTONOMOUS',$2,now(),'corpus-policy-v1') RETURNING id`,
+      [`test-zerospan:${tag}`, `zerospan-${tag}`]
+    );
+    const document = await database.query(
+      `INSERT INTO corpus_documents(artifact_id,document_kind,language,content_hash,retained_excerpt,retention_class,extractor_eligible,retention_expires_at)
+       VALUES($1,'CHANNEL_METADATA','und',$2,'excerpt','MINIMAL_EXCERPT',true,now()+interval '90 days') RETURNING id`,
+      [artifact.rows[0].id, `zerospan-hash-${tag}`]
+    );
+    const documentId = String(document.rows[0].id);
+    const before = await spentToday(database);
+    // Budget exactly spent: remaining is zero, so even a zero-unit job is
+    // denied rather than routed into the processor's budget throw.
+    await database.query(
+      `UPDATE candidate_scoring_controls SET scoring_paused=false, daily_scoring_candidates=$1 WHERE singleton=true`,
+      [before.snapshots]
     );
     const job = await enqueueJob(
       'SCORE_CANDIDATES',
       { payloadSchemaVersion: 1, documentId, featureSetVersion: FEATURE_SET_VERSION },
-      { priority: 4, maxAttempts: 3, idempotencyKey: `test-scoring-units:${tag}` }
+      { priority: 5, maxAttempts: 3, idempotencyKey: `test-zerospan:${tag}` }
     );
     jobIds.push(job.id);
-    // 5 groups > 3 remaining: denied, job stays PENDING with attempts untouched.
-    const denied = await claimNextJob(`test-scoring-units`, ['SCORE_CANDIDATES'], undefined, undefined, [
+    const denied = await claimNextJob(`test-zerospan`, ['SCORE_CANDIDATES'], undefined, undefined, [
       SCORE_CANDIDATES_BUDGET_GUARD,
     ]);
     assert.equal(denied, null);
-    const deniedState = (
+    const state = (
       await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [job.id])
     ).rows[0] as { status: string; attempts: number };
-    assert.equal(deniedState.status, 'PENDING');
-    assert.equal(Number(deniedState.attempts), 0);
-    // Raise the budget to exactly cover the groups: admitted.
-    await database.query(
-      `UPDATE candidate_scoring_controls SET daily_scoring_candidates=5 WHERE singleton=true`
-    );
-    const admitted = await claimNextJob(`test-scoring-units-2`, ['SCORE_CANDIDATES'], undefined, undefined, [
-      SCORE_CANDIDATES_BUDGET_GUARD,
-    ]);
-    assert.ok(admitted);
-    assert.equal(admitted?.id, job.id);
+    assert.equal(state.status, 'PENDING');
+    assert.equal(Number(state.attempts), 0);
   } finally {
     if (jobIds.length > 0) {
-      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]).catch(() => undefined);
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
     }
-    await database
-      .query(
-        `DELETE FROM corpus_candidate_occurrences WHERE occurrence_key LIKE 'test-scoring-units:%'`
-      )
-      .catch(() => undefined);
-    await database
-      .query(`DELETE FROM corpus_documents WHERE content_hash LIKE 'scoring-units-hash-%'`)
-      .catch(() => undefined);
-    await database
-      .query(`DELETE FROM corpus_source_artifacts WHERE source_key LIKE 'test-scoring-units:%'`)
-      .catch(() => undefined);
-    await database
-      .query('UPDATE candidate_scoring_controls SET scoring_paused=$1, daily_scoring_candidates=$2 WHERE singleton=true', [
-        prev.scoring_paused,
-        prev.daily_scoring_candidates,
-      ])
-      .catch(() => undefined);
+    await database.query(
+      'UPDATE candidate_scoring_controls SET scoring_paused=$1, daily_scoring_candidates=$2 WHERE singleton=true',
+      [prev.scoring_paused, prev.daily_scoring_candidates]
+    );
+  }
+});
+
+maybe('guarded corpus job cannot jump ahead of higher-priority ordinary work', async t => {
+  const { enqueueJob, claimNextJob } = await import('./dbCore');
+  const { TERM_HARVEST_BUDGET_GUARD } = await import('./queueManager');
+  const database = await db();
+  await assertIsolatedTestDb(database);
+  const tag = `mixedprio:${Date.now()}:${process.pid}`;
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-mixedprio:%'`);
+  const prev = (
+    await database.query('SELECT paused, daily_compute_documents FROM corpus_controls WHERE singleton=true')
+  ).rows[0];
+  const jobIds: string[] = [];
+  try {
+    const before = await spentToday(database);
+    // Exhaust the harvest budget so the high-priority harvest row is denied;
+    // the lower-priority unguarded SEARCH row must still claim first.
+    await database.query(`UPDATE corpus_controls SET paused=false, daily_compute_documents=$1 WHERE singleton=true`, [
+      before.runs,
+    ]);
+    const harvest = await enqueueJob('TERM_HARVEST', harvestPayload(tag, 0), {
+      priority: 20,
+      maxAttempts: 3,
+      idempotencyKey: `test-mixedprio:${tag}:harvest`,
+    });
+    const search = await enqueueJob(
+      'SEARCH_YOUTUBE',
+      { payloadSchemaVersion: 1, probe: tag },
+      { priority: 5, maxAttempts: 3, idempotencyKey: `test-mixedprio:${tag}:search` }
+    );
+    jobIds.push(harvest.id, search.id);
+    const claimed = await claimNextJob(
+      `test-mixedprio`,
+      ['SEARCH_YOUTUBE', 'TERM_HARVEST'],
+      undefined,
+      undefined,
+      [TERM_HARVEST_BUDGET_GUARD]
+    );
+    assert.ok(claimed);
+    assert.equal(claimed?.type, 'SEARCH_YOUTUBE');
+    assert.equal(claimed?.id, search.id);
+    const harvestState = (
+      await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [harvest.id])
+    ).rows[0] as { status: string; attempts: number };
+    assert.equal(harvestState.status, 'PENDING');
+    assert.equal(Number(harvestState.attempts), 0);
+  } finally {
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
+    }
+    await database.query('UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true', [
+      prev.paused,
+      prev.daily_compute_documents,
+    ]);
   }
 });
 
@@ -252,18 +396,20 @@ maybe('shared corpus budget blocks both harvest claims and research writes', asy
   const database = await getDb();
   await assertIsolatedTestDb(database);
   const tag = `both-consumers:${Date.now()}:${process.pid}`;
-  await cleanupProbeJobs(database, 'test-both-consumers:%');
+  await database.query(`DELETE FROM jobs WHERE idempotency_key LIKE 'test-both-consumers:%'`);
   const prev = (
     await database.query('SELECT paused, daily_compute_documents FROM corpus_controls WHERE singleton=true')
   ).rows[0];
   assert.ok(prev, 'corpus_controls singleton must exist');
   const text = `both consumers probe ${tag} trading markets analysis`;
-  const contentHash = createHash('sha256').update(text.normalize('NFC')).digest('hex');
+  const jobIds: string[] = [];
   const researchDocumentIds: string[] = [];
   try {
-    await database.query(`UPDATE corpus_controls SET paused=false, daily_compute_documents=1 WHERE singleton=true`);
-    // Consume the single unit through the research path first. (This also
-    // enqueues a scoring job for the new document; tracked for cleanup.)
+    const before = await spentToday(database);
+    // Exactly one unit of headroom; the research path consumes it.
+    await database.query(`UPDATE corpus_controls SET paused=false, daily_compute_documents=$1 WHERE singleton=true`, [
+      before.runs + 1,
+    ]);
     const first = await persistResearchCorpusDocument({
       sourceType: 'VIDEO_TAGS',
       sourceKey: `test-both-consumers:${tag}`,
@@ -275,56 +421,48 @@ maybe('shared corpus budget blocks both harvest claims and research writes', asy
     researchDocumentIds.push(String(first.documentId));
     // A harvest claim must now be denied: the shared cap is spent, even
     // though this consumer never wrote anything itself.
-    const job = await enqueueJob(
-      'TERM_HARVEST',
-      {
-        payloadSchemaVersion: 1,
-        channelId: 'UCbothconsumers0000000000',
-        text: `both consumers harvest ${tag}`,
-        contentHash: createHash('sha256').update(`both consumers harvest ${tag}`.normalize('NFC')).digest('hex'),
+    const job = await enqueueJob('TERM_HARVEST', harvestPayload(tag, 0), {
+      priority: 5,
+      maxAttempts: 3,
+      idempotencyKey: `test-both-consumers:${tag}`,
+    });
+    jobIds.push(job.id);
+    const denied = await claimNextJob(`test-both-consumers`, ['TERM_HARVEST'], undefined, undefined, [
+      TERM_HARVEST_BUDGET_GUARD,
+    ]);
+    assert.equal(denied, null);
+    const harvestState = (
+      await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [job.id])
+    ).rows[0] as { status: string; attempts: number };
+    assert.equal(harvestState.status, 'PENDING');
+    assert.equal(Number(harvestState.attempts), 0);
+    // And a second research write is likewise refused: one cap, both paths.
+    await assert.rejects(
+      persistResearchCorpusDocument({
+        sourceType: 'VIDEO_TAGS',
+        sourceKey: `test-both-consumers:${tag}:second`,
+        text: `both consumers second ${tag} trading markets analysis`,
         lineage: 'AUTONOMOUS',
         entityClusterKey: `both-consumers-${tag}`,
         observedAt: new Date().toISOString(),
-        extractorVersion: 'deterministic-ngram-v1',
-      },
-      { priority: 5, maxAttempts: 3, idempotencyKey: `test-both-consumers:${tag}` }
+      }),
+      /BUDGET_EXHAUSTED/
     );
-    try {
-      const denied = await claimNextJob(`test-both-consumers`, ['TERM_HARVEST'], undefined, undefined, [
-        TERM_HARVEST_BUDGET_GUARD,
-      ]);
-      assert.equal(denied, null);
-      // And a second research write is likewise refused: one cap, both paths.
-      await assert.rejects(
-        persistResearchCorpusDocument({
-          sourceType: 'VIDEO_TAGS',
-          sourceKey: `test-both-consumers:${tag}:second`,
-          text: `both consumers second ${tag} trading markets analysis`,
-          lineage: 'AUTONOMOUS',
-          entityClusterKey: `both-consumers-${tag}`,
-          observedAt: new Date().toISOString(),
-        }),
-        /BUDGET_EXHAUSTED/
-      );
-    } finally {
-      await database.query('DELETE FROM jobs WHERE id=$1::uuid', [job.id]).catch(() => undefined);
-    }
   } finally {
     if (researchDocumentIds.length > 0) {
-      await database
-        .query(`DELETE FROM jobs WHERE payload->>'documentId' = ANY($1::text[])`, [researchDocumentIds])
-        .catch(() => undefined);
+      await database.query(`DELETE FROM jobs WHERE payload->>'documentId' = ANY($1::text[])`, [
+        researchDocumentIds,
+      ]);
     }
-    await database.query('DELETE FROM corpus_candidate_occurrences WHERE document_id IN (SELECT id FROM corpus_documents WHERE content_hash LIKE $1)', [`both consumers%${tag}%`]).catch(() => undefined);
-    await database.query('DELETE FROM corpus_extraction_runs WHERE document_id IN (SELECT id FROM corpus_documents WHERE content_hash LIKE $1)', [`both consumers%${tag}%`]).catch(() => undefined);
-    await database.query('DELETE FROM corpus_qualification_decisions WHERE document_id IN (SELECT id FROM corpus_documents WHERE content_hash LIKE $1)', [`both consumers%${tag}%`]).catch(() => undefined);
-    await database.query('DELETE FROM corpus_documents WHERE content_hash LIKE $1', [`both consumers%${tag}%`]).catch(() => undefined);
-    await database.query('DELETE FROM corpus_source_artifacts WHERE source_key LIKE $1', [`test-both-consumers:%`]).catch(() => undefined);
-    await database
-      .query('UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true', [
-        prev.paused,
-        prev.daily_compute_documents,
-      ])
-      .catch(() => undefined);
+    if (jobIds.length > 0) {
+      await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
+    }
+    // Corpus fixture rows are append-only (immutable trigger) and keyed by
+    // unique per-run tags, so reruns stay deterministic without deleting
+    // them; all budget assertions above are delta-scoped for the same reason.
+    await database.query('UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true', [
+      prev.paused,
+      prev.daily_compute_documents,
+    ]);
   }
 });

@@ -14,14 +14,22 @@ test('corpus pipeline claims exactly harvest and scoring, nothing else', () => {
 });
 
 test('corpus pipeline worker uses the existing claim path on a one-second tick', () => {
-  assert.match(workers, /processNextSearchJob\(CORPUS_PIPELINE_TYPES, workerId\)/);
-  assert.match(workers, /schedule\(tick, 1000\)/);
-  // Single consumer: exactly one worker id, no concurrency loop or env scaling.
-  assert.match(workers, /startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/);
-  assert.doesNotMatch(workers, /CORPUS_PIPELINE.*concurrency|corpus.*CONCURRENCY/);
+  // Scoped to the corpus worker body (not the whole file): another worker
+  // contains the same scheduling expression, so a global match would pass
+  // even if this worker's scheduling were removed.
+  const workerBody = workers.slice(
+    workers.indexOf('function startCorpusPipelineWorker'),
+    workers.indexOf('/** Dedicated consumers for operational jobs outside the three core pools. */')
+  );
+  assert.ok(workerBody.length > 0);
+  assert.match(workerBody, /processNextSearchJob\(CORPUS_PIPELINE_TYPES, workerId\)/);
+  assert.match(workerBody, /schedule\(tick, 1000\)/);
+  // Single consumer: no concurrency loop or env scaling in this worker
+  // (the lone invocation site is pinned by the starter-body test below).
+  assert.doesNotMatch(workerBody, /CORPUS_PIPELINE.*concurrency|corpus.*CONCURRENCY/);
   // Cross-replica safety lives at the claim boundary (budget guard row lock
   // inside claimNextJob), not in this tick: no in-process lock here.
-  assert.doesNotMatch(workers, /pg_try_advisory_lock|pg_advisory_unlock/);
+  assert.doesNotMatch(workerBody, /pg_try_advisory_lock|pg_advisory_unlock/);
 });
 
 test('budget guards are defined for exactly the corpus claim types', async () => {
@@ -65,7 +73,7 @@ test('guard evaluation recovers the claim transaction after transient failure', 
       throw new Error('transient guard read failure');
     },
   };
-  assert.equal(await evaluateClaimGuard(recoveringClient, failingGuard), false);
+  assert.deepEqual(await evaluateClaimGuard(recoveringClient, failingGuard), { admitted: false, exhausted: true });
   assert.deepEqual(calls, ['SAVEPOINT claim_guard', 'ROLLBACK TO SAVEPOINT claim_guard']);
   // Post-recovery the same transaction accepts new statements.
   const followup = await recoveringClient.query('SELECT 1');
@@ -75,7 +83,7 @@ test('guard evaluation recovers the claim transaction after transient failure', 
   const passingGuard = {
     types: ['TERM_HARVEST'],
     lockSql: 'SELECT 1',
-    isAdmitted: async () => true,
+    isAdmitted: async () => ({ admitted: true, exhausted: false }),
   };
   const successClient = {
     query: async (text: string) => {
@@ -83,7 +91,7 @@ test('guard evaluation recovers the claim transaction after transient failure', 
       return { rows: [] };
     },
   };
-  assert.equal(await evaluateClaimGuard(successClient, passingGuard), true);
+  assert.deepEqual(await evaluateClaimGuard(successClient, passingGuard), { admitted: true, exhausted: false });
   assert.deepEqual(successCalls, ['SAVEPOINT claim_guard', 'RELEASE SAVEPOINT claim_guard']);
 });
 
@@ -130,15 +138,25 @@ test('budget guards observe pause, units, and in-flight usage', async () => {
       return { rows: harvestRows.get('jobs:TERM_HARVEST')! };
     },
   };
-  // 99 consumed + 0 in flight + 1 requested <= 100: admitted.
-  assert.equal(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), true);
-  // One in-flight claim fills the budget: denied without consuming attempts.
+  // 99 consumed + 0 in flight + 1 requested <= 100: admitted, not exhausted.
+  assert.deepEqual(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), {
+    admitted: true,
+    exhausted: false,
+  });
+  // One in-flight claim fills the budget: denied without consuming attempts,
+  // and exhausted so the claim loop skips the whole type.
   harvestRows.set('jobs:TERM_HARVEST', [{ n: 1 }]);
-  assert.equal(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), false);
+  assert.deepEqual(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), {
+    admitted: false,
+    exhausted: true,
+  });
   // Paused control denies regardless of headroom.
   harvestRows.set('corpus_controls', [{ paused: true, budget: 100, cluster_window_cap: 5 }]);
   harvestRows.set('jobs:TERM_HARVEST', [{ n: 0 }]);
-  assert.equal(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), false);
+  assert.deepEqual(await TERM_HARVEST_BUDGET_GUARD.isAdmitted(harvestClient), {
+    admitted: false,
+    exhausted: true,
+  });
 
   const docId = '11111111-2222-4333-8444-555555555555';
   const scoringRows = new Map<string, Array<Record<string, unknown>>>([
@@ -159,25 +177,38 @@ test('budget guards observe pause, units, and in-flight usage', async () => {
   };
   const job = { id: 'job-1', payload: { documentId: docId } };
   // 5 groups against 4 spent + 0 in flight of 10: 9 <= 10 admitted.
-  assert.equal(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), true);
-  // Two more spent units fill it beyond the 5-group reservation: denied.
+  assert.deepEqual(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), {
+    admitted: true,
+    exhausted: false,
+  });
+  // Two more spent units fill it beyond the 5-group reservation: denied but
+  // not exhausted (a smaller job could still fit, so scanning continues).
   scoringRows.set('snapshots', [{ n: 6 }]);
-  assert.equal(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), false);
+  assert.deepEqual(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), {
+    admitted: false,
+    exhausted: false,
+  });
+  // Fully spent budget exhausts the type even for smaller jobs.
+  scoringRows.set('snapshots', [{ n: 10 }]);
+  assert.deepEqual(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), {
+    admitted: false,
+    exhausted: true,
+  });
   // Missing document identity cannot reserve unknown units: denied.
-  assert.equal(
+  assert.deepEqual(
     await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, { id: 'job-2', payload: {} }),
-    false
+    { admitted: false, exhausted: false }
   );
 });
 
 test('corpus claim types stay authorized by their existing paused controls', () => {
-  // The atomic guards (evaluated inside the claim transaction) route both
-  // types through the shared budget decision; removing that wiring re-admits
-  // paused/exhausted controls. The builder keeps its original paused-only
-  // checks as a fast path.
-  assert.match(queueManager, /corpusBudgetAdmits\(/);
-  assert.match(queueManager, /claimableOverride\.includes\('TERM_HARVEST'\)/);
+  // The atomic guards (evaluated inside the claim transaction) admit each
+  // type only with remaining headroom; the shared corpusBudgetAdmits helper
+  // remains the single decision for both processors and persistent research.
+  // The builder keeps its original paused-only checks as a fast path.
   assert.match(queueManager, /readCorpusBudgetForUpdate\(client\)/);
+  assert.match(queueManager, /remaining >= 1/);
+  assert.match(queueManager, /claimableOverride\.includes\('TERM_HARVEST'\)/);
   assert.match(queueManager, /count\(DISTINCT normalized_span\)/);
 });
 

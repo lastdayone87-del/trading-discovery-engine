@@ -73,7 +73,7 @@ import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecove
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import { autonomousPageExists, getAutonomousContinuationState, getAutonomousRunMetrics, recordAutonomousPage } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
-import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate, corpusBudgetAdmits } from './candidateCorpus';
+import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate } from './candidateCorpus';
 import { selectExplicitTerminologyLanguageContext, type ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
@@ -371,10 +371,14 @@ export const TERM_HARVEST_BUDGET_GUARD: ClaimBudgetGuard = {
   isAdmitted: async (client) => {
     // Shared authoritative budget: same control row, same consumed ledger,
     // same decision helper as the processors and persistent research.
+    // Harvest always costs exactly one unit (one extraction run per job), so
+    // denial always means global exhaustion: no smaller request exists.
     const state = await readCorpusBudgetForUpdate(client);
-    if (!state) return false;
+    if (!state || state.paused) return { admitted: false, exhausted: true };
     const inFlight = await client.query(`SELECT count(*)::int AS n FROM jobs WHERE type='TERM_HARVEST' AND status='PROCESSING' AND locked_at>=date_trunc('day',now())`);
-    return corpusBudgetAdmits({ ...state, consumedToday: state.consumedToday + Number(inFlight.rows[0]?.n || 0) }, 1);
+    const remaining = state.dailyBudget - state.consumedToday - Number(inFlight.rows[0]?.n || 0);
+    if (!Number.isFinite(remaining)) return { admitted: false, exhausted: true };
+    return { admitted: remaining >= 1, exhausted: remaining < 1 };
   },
 };
 
@@ -384,10 +388,17 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
   isAdmitted: async (client, job) => {
     // Reservation unit is the job's normalized-span group count: one job can
     // create multiple snapshots, so per-job admission would overshoot the cap.
+    // Mirrors the processor exactly (spent check first, then per-job units):
+    // a zero-group job with no remaining headroom is denied rather than
+    // routed into the processor's budget throw.
     const documentId = job?.payload?.documentId;
-    if (typeof documentId !== 'string' || !documentId) return false;
+    if (typeof documentId !== 'string' || !documentId) return { admitted: false, exhausted: false };
     const control = await client.query(`SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`);
-    if (!control.rows.length) return false;
+    if (!control.rows.length) return { admitted: false, exhausted: true };
+    const budget = Number(control.rows[0].budget);
+    if (Boolean(control.rows[0].paused) || !Number.isFinite(budget)) {
+      return { admitted: false, exhausted: true };
+    }
     const groups = await client.query(`SELECT count(DISTINCT normalized_span)::int AS n FROM corpus_candidate_occurrences WHERE document_id=$1::uuid`, [documentId]);
     const spent = await client.query(`SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
     const inFlight = await client.query(
@@ -396,12 +407,9 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
         WHERE o.document_id::text=(p.payload->>'documentId')) g ON true
        WHERE p.type='SCORE_CANDIDATES' AND p.status='PROCESSING' AND p.locked_at>=date_trunc('day',now())`
     );
-    return corpusBudgetAdmits({
-      paused: Boolean(control.rows[0].paused),
-      dailyBudget: Number(control.rows[0].budget),
-      consumedToday: Number(spent.rows[0]?.n || 0) + Number(inFlight.rows[0]?.u || 0),
-      clusterWindowCap: 0,
-    }, Number(groups.rows[0]?.n || 0));
+    const remaining = budget - Number(spent.rows[0]?.n || 0) - Number(inFlight.rows[0]?.u || 0);
+    if (remaining < 1) return { admitted: false, exhausted: true };
+    return { admitted: Number(groups.rows[0]?.n || 0) <= remaining, exhausted: false };
   },
 };
 
