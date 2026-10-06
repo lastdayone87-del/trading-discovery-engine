@@ -11,6 +11,12 @@ on:
       - 'server/operationalMaintenanceWorkers.ts'
       - 'server/corpusPipelineWorker.test.ts'
       - 'server/corpusClaimBudget.postgres.test.ts'
+      - 'server/db/migrations/**'
+      - 'scripts/runMigrations.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'bun.lock'
+      - 'tsconfig.json'
       - '.github/workflows/corpus-claim-budget-pg.yml'
   workflow_dispatch:
 
