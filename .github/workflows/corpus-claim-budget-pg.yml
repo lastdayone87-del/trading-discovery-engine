@@ -14,6 +14,11 @@ on:
       - 'server/persistentResearchController.ts'
       - 'server/researchBootstrap.test.ts'
       - 'server/researchBootstrap.postgres.test.ts'
+      - 'server/projectEntityCredits.postgres.test.ts'
+      - 'server/policyPromotion.postgres.test.ts'
+      - 'server/domainWeightApproval.postgres.test.ts'
+      - 'server/operatorAuth.ts'
+      - 'server/operatorAuth.test.ts'
       - 'server.ts'
       - 'server/db/migrations/**'
       - 'scripts/runMigrations.ts'
@@ -98,3 +103,11 @@ jobs:
         run: npx tsx --test server/researchBootstrap.postgres.test.ts
       - name: Research bootstrap unit tests
         run: npx tsx --test server/researchBootstrap.test.ts
+      - name: Entity credit regression tests
+        run: npx tsx --test server/projectEntityCredits.postgres.test.ts
+      - name: Promotion gate matrix tests
+        run: npx tsx --test server/policyPromotion.postgres.test.ts
+      - name: Domain weight approval tests
+        run: npx tsx --test server/domainWeightApproval.postgres.test.ts
+      - name: Operator auth tests
+        run: npx tsx --test server/operatorAuth.test.ts
