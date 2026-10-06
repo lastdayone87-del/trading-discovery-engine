@@ -155,43 +155,51 @@ export async function startResearchBootstrapRun(input: {
 export async function abortResearchBootstrapRun(id: string, actor: string, reason: string): Promise<DbRow | null> {
   if (!reason?.trim() || !actor?.trim()) throw new Error('BOOTSTRAP_ABORT_IDENTITY_REQUIRED');
   const db = await getDb();
-  const row = await db.query(
-    `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$2,abort_reason=$3 WHERE id=$1 AND status='ACTIVE' RETURNING *`,
-    [id, actor.trim(), reason.trim()]
-  );
-  if (row.rows[0]) {
-    // A manually aborted run releases the control fence with it, so an armed
-    // control can never outlive its run. Conditional: untouched when clear.
-    await db.query(
-      `UPDATE research_control SET enabled=false, mode='SHADOW', paused=false, kill_switch=true,
-        bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
-        bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL,
-        configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
-       WHERE singleton=true AND bootstrap_armed AND bootstrap_run_id=$2
-         AND NOT EXISTS(SELECT 1 FROM research_bootstrap_runs WHERE status='ACTIVE')`,
-      [actor.trim(), id]
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`);
+    const row = await client.query(
+      `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$2,abort_reason=$3 WHERE id=$1 AND status='ACTIVE' RETURNING *`,
+      [id, actor.trim(), reason.trim()]
     );
+    if (row.rows[0]) {
+      // Same transaction: the aborted run releases its fence, so an armed
+      // control can never outlive its run and a partial failure rolls back.
+      await disarmControlTx(client, actor.trim(), reason.trim(), id);
+    }
+    await client.query('COMMIT');
+    return row.rows[0] || null;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
   }
-  return row.rows[0] || null;
 }
 /** Aborts every ACTIVE bootstrap run (idempotent). Used when research is disarmed. Returns the aborted count. */
 export async function abortAllActiveBootstrapRuns(actor: string, reason: string): Promise<number> {
   if (!reason?.trim() || !actor?.trim()) throw new Error('BOOTSTRAP_ABORT_IDENTITY_REQUIRED');
   const db = await getDb();
-  const result = await db.query(
-    `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$1,abort_reason=$2 WHERE status='ACTIVE'`,
-    [actor.trim(), reason.trim()]
-  );
-  await db.query(
-    `UPDATE research_control SET enabled=false, mode='SHADOW', paused=false, kill_switch=true,
-      bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
-      bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL,
-      configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
-     WHERE singleton=true AND bootstrap_armed
-       AND NOT EXISTS(SELECT 1 FROM research_bootstrap_runs WHERE status='ACTIVE')`,
-    [actor.trim()]
-  );
-  return result.rowCount ?? 0;
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`);
+    const result = await client.query(
+      `UPDATE research_bootstrap_runs SET status='ABORTED',completed_at=now(),aborted_by=$1,abort_reason=$2 WHERE status='ACTIVE'`,
+      [actor.trim(), reason.trim()]
+    );
+    // Same transaction: fence release is atomic with terminalization, with an
+    // audit event. A null run id accepts whatever fence is set.
+    await disarmControlTx(client, actor.trim(), reason.trim(), null);
+    await client.query('COMMIT');
+    return result.rowCount ?? 0;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 export async function listResearchBootstrapRuns(limit = 50): Promise<DbRow[]> {
   const db = await getDb();
@@ -200,29 +208,50 @@ export async function listResearchBootstrapRuns(limit = 50): Promise<DbRow[]> {
 }
 type TxClient = { query: (text: string, params?: any[]) => Promise<{ rows: any[]; rowCount?: number | null }> };
 /**
- * Resets research_control to the dormant safe state and clears any bootstrap
- * fence, with a configuration event for audit. Runs inside the caller's
- * transaction.
+ * Releases a bootstrap fence transactionally with a configuration event.
+ * Full dormant reset happens ONLY when the fence is owned by the given run
+ * (or any run when expectedRunId is null) AND no reconfiguration intervened
+ * since arming (configuration_version match): a newer unrelated normal
+ * configuration is never overwritten — only the stale fence columns clear.
+ * Returns true when the serving fields were reset, false otherwise.
  */
-async function disarmControlTx(client: TxClient, actor: string, reason: string): Promise<void> {
+async function disarmControlTx(
+  client: TxClient,
+  actor: string,
+  reason: string,
+  expectedRunId: string | null
+): Promise<boolean> {
   const prior = (
     await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
   ).rows[0];
-  if (!prior) return;
-  const next = (
-    await client.query(
-      `UPDATE research_control SET enabled=false, mode='SHADOW', paused=false, kill_switch=true,
-        bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
-        bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL,
-        configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
-       WHERE singleton=true RETURNING *`,
-      [actor]
-    )
-  ).rows[0];
+  if (!prior || !prior.bootstrap_armed) return false;
+  if (expectedRunId && String(prior.bootstrap_run_id || '') !== expectedRunId) return false;
+  const pristine =
+    Number(prior.configuration_version) === Number(prior.bootstrap_armed_config_version);
+  const next = pristine
+    ? (
+        await client.query(
+          `UPDATE research_control SET enabled=false, mode='SHADOW', paused=false, kill_switch=true,
+            bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
+            bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL, bootstrap_armed_config_version=NULL,
+            configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
+           WHERE singleton=true RETURNING *`,
+          [actor]
+        )
+      ).rows[0]
+    : (
+        await client.query(
+          `UPDATE research_control SET bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
+            bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL, bootstrap_armed_config_version=NULL,
+            configuration_version=configuration_version+1, updated_by=$1, updated_at=now()
+           WHERE singleton=true RETURNING *`,
+          [actor]
+        )
+      ).rows[0];
   await client.query(
     `INSERT INTO research_configuration_events(event_key,configuration_version,prior_configuration,next_configuration,actor,reason) VALUES($1,$2,$3,$4,$5,$6)`,
     [
-      researchChecksum({ purpose: 'bootstrap-auto-disarm', prior: prior.configuration_version, actor, reason, at: Date.now() }),
+      researchChecksum({ purpose: 'bootstrap-disarm', fullReset: pristine, prior: prior.configuration_version, actor, reason, at: Date.now() }),
       next.configuration_version,
       JSON.stringify(prior),
       JSON.stringify(next),
@@ -230,6 +259,7 @@ async function disarmControlTx(client: TxClient, actor: string, reason: string):
       reason,
     ]
   );
+  return pristine;
 }
 /**
  * Governed bootstrap arming: the ONLY path that arms research_control for
@@ -260,16 +290,16 @@ export async function configureBootstrapArming(input: {
     if (!run || run.status !== 'ACTIVE') throw new Error('BOOTSTRAP_RUN_NOT_ACTIVE');
     if (new Date(run.expires_at).getTime() <= Date.now()) {
       await abortBootstrapRunTx(client, input.runId, BOOTSTRAP_SYSTEM_ACTOR, 'bootstrap window expired before arming');
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'expired run cannot arm bootstrap control');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'expired run cannot arm bootstrap control', input.runId);
       await client.query('COMMIT');
       throw new Error('BOOTSTRAP_RUN_EXPIRED');
     }
     const policy = (
-      await client.query(`SELECT * FROM portfolio_policies WHERE id=$1`, [run.candidate_policy_id])
+      await client.query(`SELECT * FROM portfolio_policies WHERE id=$1 FOR UPDATE`, [run.candidate_policy_id])
     ).rows[0];
     if (!policy || policy.policy_type !== 'CONTEXTUAL_BANDIT' || policy.status === 'RETIRED' || policy.status === 'PAUSED') {
       await abortBootstrapRunTx(client, input.runId, BOOTSTRAP_SYSTEM_ACTOR, 'candidate policy ineligible at arming');
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ineligible candidate cannot arm bootstrap control');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ineligible candidate cannot arm bootstrap control', input.runId);
       await client.query('COMMIT');
       throw new Error('BOOTSTRAP_CANDIDATE_NOT_ELIGIBLE');
     }
@@ -280,7 +310,8 @@ export async function configureBootstrapArming(input: {
       await client.query(
         `UPDATE research_control SET enabled=true, mode='CANARY', paused=false, kill_switch=false,
           bootstrap_armed=true, bootstrap_run_id=$1, bootstrap_armed_by=$2, bootstrap_armed_reason=$3,
-          bootstrap_armed_at=now(), configuration_version=configuration_version+1, updated_by=$2, updated_at=now()
+          bootstrap_armed_at=now(), bootstrap_armed_config_version=configuration_version+1,
+          configuration_version=configuration_version+1, updated_by=$2, updated_at=now()
          WHERE singleton=true RETURNING *`,
         [input.runId, input.actor.trim(), input.reason.trim()]
       )
@@ -326,7 +357,7 @@ export async function disarmBootstrapControl(actor: string, reason: string): Pro
     if (fresh.bootstrap_run_id) {
       await abortBootstrapRunTx(client, String(fresh.bootstrap_run_id), actor.trim(), reason.trim());
     }
-    await disarmControlTx(client, actor.trim(), reason.trim());
+    await disarmControlTx(client, actor.trim(), reason.trim(), fresh.bootstrap_run_id ? String(fresh.bootstrap_run_id) : null);
     await client.query('COMMIT');
     return (await db.query(`SELECT * FROM research_control WHERE singleton=true`)).rows[0];
   } catch (error) {
@@ -411,6 +442,12 @@ export async function allocateBootstrapAssignments(
   });
   try {
     await client.query('BEGIN');
+    // Canonical lock order across all bootstrap paths: research_control,
+    // then the run, then the candidate policy. Any other order risks
+    // PostgreSQL deadlocks under concurrent arm/allocate/disarm.
+    const fresh = (
+      await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
+    ).rows[0];
     const run = (
       await client.query(`SELECT * FROM research_bootstrap_runs WHERE id=$1 FOR UPDATE`, [runId])
     ).rows[0];
@@ -425,33 +462,33 @@ export async function allocateBootstrapAssignments(
     }
     // Governance state is re-read live: any operator stop or mode change
     // aborts the run instead of allocating.
-    const fresh = (
-      await client.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`)
-    ).rows[0];
     if (!fresh?.bootstrap_armed || String(fresh.bootstrap_run_id || '') !== runId) {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'bootstrap control not armed for this run');
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'unarmed run cannot hold an armed control');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'unarmed run cannot hold an armed control', runId);
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
     if (isResearchDisarmed(fresh)) {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'research control disarmed during bootstrap');
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'disarmed control cannot stay bootstrap-armed');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'disarmed control cannot stay bootstrap-armed', runId);
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
     if (new Date(run.expires_at).getTime() <= Date.now()) {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'bootstrap window expired');
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'expired run releases bootstrap control');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'expired run releases bootstrap control', runId);
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
+    // Locked (control -> run -> policy order): a concurrent PAUSE via
+    // transitionPolicy serializes here, so the status below is current at
+    // commit and allocation can never commit against a paused candidate.
     const policy = (
-      await client.query(`SELECT * FROM portfolio_policies WHERE id=$1`, [run.candidate_policy_id])
+      await client.query(`SELECT * FROM portfolio_policies WHERE id=$1 FOR UPDATE`, [run.candidate_policy_id])
     ).rows[0];
     if (!policy || policy.policy_type !== 'CONTEXTUAL_BANDIT' || policy.status === 'RETIRED' || policy.status === 'PAUSED') {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'candidate policy ineligible during bootstrap');
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ineligible candidate releases bootstrap control');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ineligible candidate releases bootstrap control', runId);
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
@@ -460,7 +497,7 @@ export async function allocateBootstrapAssignments(
     const remainingCost = Number(run.max_provider_cost) - used.providerCost;
     if (remainingAssignments <= 0 || remainingCost <= 0) {
       await completeBootstrapRun(client, runId);
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'exhausted run releases bootstrap control');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'exhausted run releases bootstrap control', runId);
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
@@ -471,7 +508,7 @@ export async function allocateBootstrapAssignments(
     );
     if (Number(recentFailures.rows[0]?.n || 0) >= 3) {
       await abortBootstrapRunTx(client, runId, BOOTSTRAP_SYSTEM_ACTOR, 'error spike: 3+ failed cycles in the last hour');
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'error spike releases bootstrap control');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'error spike releases bootstrap control', runId);
       await client.query('COMMIT');
       return zero(runPolicyId);
     }
@@ -556,7 +593,7 @@ export async function allocateBootstrapAssignments(
       finalUsage.providerCost >= Number(run.max_provider_cost)
     ) {
       await completeBootstrapRun(client, runId);
-      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ceiling reached; bootstrap control released');
+      await disarmControlTx(client, BOOTSTRAP_SYSTEM_ACTOR, 'ceiling reached; bootstrap control released', runId);
       completed = true;
     }
     await client.query('COMMIT');
@@ -585,7 +622,14 @@ export async function allocateResearch(control: DbRow, mode: 'SHADOW' | 'CANARY'
       BOOTSTRAP_SYSTEM_ACTOR,
       `bootstrap run ${String(run.id)} expired before allocation`
     );
-    const canonical = await allocateCanonical(control, mode, cutoff);
+    // The sweep may have reset the persisted control: reload and revalidate
+    // transactionally instead of authorizing canonical work from the stale
+    // caller snapshot. A disarmed control allocates nothing this cycle.
+    const reloaded = (await db.query(`SELECT * FROM research_control WHERE singleton=true`)).rows[0];
+    if (isResearchDisarmed(reloaded)) {
+      return { choices: [], selected: 0, providerReserved: 0, reviewReserved: 0, bootstrapRunId: null as string | null, bootstrapPolicyId: null as string | null };
+    }
+    const canonical = await allocateCanonical(reloaded, mode, cutoff);
     return { ...canonical, bootstrapRunId: null as string | null, bootstrapPolicyId: (canonical.policyId ?? null) as string | null };
   }
   if (run) return allocateBootstrapAssignments(control, cutoff, String(run.id));
@@ -594,9 +638,9 @@ export async function allocateResearch(control: DbRow, mode: 'SHADOW' | 'CANARY'
 }
 export async function allocateCanonical(control:DbRow,mode:'SHADOW'|'CANARY',cutoff:string){const db=await getDb(),policyRow=control.active_policy_id?(await db.query(`SELECT p.* FROM portfolio_policies p WHERE p.id=$1 AND p.status=CASE WHEN $2='CANARY' THEN 'CANARY' ELSE p.status END AND ($2<>'CANARY' OR EXISTS(SELECT 1 FROM persistent_research_policy_evaluations e WHERE e.policy_id=p.id AND e.decision='PASS'))`,[control.active_policy_id,mode])).rows[0]:null;if(mode==='CANARY'&&!policyRow)throw new Error('EVALUATED_CANARY_POLICY_REQUIRED');const spent=await db.query(`SELECT coalesce(sum(provider_cost),0)::int provider,coalesce(sum(review_cost),0)::int review FROM discovery_action_outcomes WHERE observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')`),reserved=await db.query(`SELECT coalesce(sum(provider_cost),0)::int provider,coalesce(sum(review_cost),0)::int review FROM discovery_actions WHERE lifecycle IN('ALLOCATED','RESERVED','QUEUED','RUNNING')`),provider=Math.max(0,Number(control.daily_provider_cost_cap)-Number(spent.rows[0].provider)-Number(reserved.rows[0].provider)),review=Math.max(0,Number(control.daily_review_cost_cap)-Number(spent.rows[0].review)-Number(reserved.rows[0].review)),limits={provider,review,exploration:Number(control.exploration_basis_points)},policy=researchPolicyFromConfiguration(policyRow?.configuration,limits);const rows=await db.query(`WITH eligible AS (SELECT a.*,p.daily_cost_cap,coalesce((SELECT sum(o.provider_cost) FROM discovery_action_outcomes o JOIN discovery_actions prior ON prior.id=o.action_id WHERE prior.provider_key=a.provider_key AND o.observed_at>=date_trunc('day',now() AT TIME ZONE 'UTC')),0) provider_spent,sum(a.provider_cost) OVER(PARTITION BY a.provider_key ORDER BY a.created_at,a.action_key) provider_candidate_cost FROM discovery_actions a JOIN discovery_provider_registry p ON p.provider_key=a.provider_key WHERE a.lifecycle='PROPOSED' AND (a.expires_at IS NULL OR a.expires_at>$1) AND p.mode NOT IN('PAUSED','RETIRED') AND p.capabilities ? a.action_type) SELECT * FROM eligible WHERE daily_cost_cap=0 OR provider_spent+provider_candidate_cost<=daily_cost_cap ORDER BY created_at LIMIT 500`,[cutoff]),actions=rows.rows.map(actionFromRow),allChoices=allocateContextualPortfolio(actions,policy),selectedChoices=allChoices.filter(choice=>choice.selected);if(mode==='CANARY'&&selectedChoices.length>Number(control.max_actions_per_cycle))throw new Error('RESEARCH_CYCLE_CAP_CONFLICT');const choices=mode==='CANARY'?selectedChoices:allChoices.slice(0,Number(control.max_actions_per_cycle));const client=await db.connect();try{await client.query('BEGIN');for(const choice of choices){const selected=mode==='CANARY'&&choice.selected,key=researchChecksum({actionId:choice.actionId,cutoff,policy:policyRow?.id||'shadow-default'});await client.query(`INSERT INTO discovery_action_assignments(assignment_key,action_id,policy_key,policy_version,selected,rank,propensity_basis_points,utility,reason_codes,context_snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(assignment_key) DO NOTHING`,[key,choice.actionId,policyRow?.policy_key||'shadow-default',String(policyRow?.version||1),selected,choice.rank,choice.propensityBasisPoints,choice.utility,JSON.stringify([...choice.reasonCodes,mode==='SHADOW'?'SHADOW_COUNTERFACTUAL':'CANARY_ASSIGNMENT']),JSON.stringify({coordinates:choice.coordinates,providerKey:choice.providerKey,clusterKey:choice.clusterKey,cost:{provider:choice.providerCost,review:choice.reviewCost},policyChecksum:checksum(policy)})]);if(selected)await client.query(`UPDATE discovery_actions SET lifecycle='ALLOCATED' WHERE id=$1 AND lifecycle='PROPOSED'`,[choice.actionId]);}await client.query('COMMIT');return {choices,selected:choices.filter(c=>mode==='CANARY'&&c.selected).length,policyId:policyRow?.id||null,providerReserved:choices.filter(c=>mode==='CANARY'&&c.selected).reduce((n,c)=>n+c.providerCost,0),reviewReserved:choices.filter(c=>mode==='CANARY'&&c.selected).reduce((n,c)=>n+c.reviewCost,0)};}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 
-async function materializePlaylists(cutoff:string){const db=await getDb(),rows=await db.query(`SELECT id,provenance,context FROM discovery_actions WHERE lifecycle='ALLOCATED' AND action_type='INSPECT_PLAYLIST' ORDER BY created_at LIMIT 10`);let n=0;for(const row of rows.rows){const provenance=json<Record<string,any>>(row.provenance,{}),context=json<Record<string,any>>(row.context,{});if(!provenance.frontierActionId||!context.country)continue;const result=await enqueuePlaylistCanary(provenance.frontierActionId,context.country);if(result.queued){n++;await db.query(`UPDATE discovery_actions SET lifecycle='QUEUED',materialization_key=$2 WHERE id=$1 AND lifecycle='ALLOCATED'`,[row.id,`playlist-job:${result.jobId}`]);await db.query(`INSERT INTO discovery_action_execution_links(link_key,action_id,executor_type,executor_id,job_id,policy_version) VALUES($1,$2,'PLAYLIST_JOB',$3,$3,$4) ON CONFLICT(link_key) DO NOTHING`,[`research-action:${row.id}:playlist-job:${result.jobId}`,row.id,result.jobId,PERSISTENT_RESEARCH_POLICY_VERSION]);}}const creator=await materializeCreatorPlaylistCanary(cutoff).catch(error=>{console.warn('[CreatorIntelligence] Playlist canary fallback:',error instanceof Error?error.message:error);return {queued:0};});return n+creator.queued;}
+export async function materializePlaylists(cutoff:string){const db=await getDb(),serving=(await db.query(`SELECT 1 FROM research_control WHERE singleton=true AND enabled AND mode='CANARY' AND NOT paused AND NOT kill_switch`)).rowCount;if(!serving)return 0;const rows=await db.query(`SELECT id,provenance,context FROM discovery_actions WHERE lifecycle='ALLOCATED' AND action_type='INSPECT_PLAYLIST' ORDER BY created_at LIMIT 10`);let n=0;for(const row of rows.rows){const provenance=json<Record<string,any>>(row.provenance,{}),context=json<Record<string,any>>(row.context,{});if(!provenance.frontierActionId||!context.country)continue;const result=await enqueuePlaylistCanary(provenance.frontierActionId,context.country);if(result.queued){n++;await db.query(`UPDATE discovery_actions SET lifecycle='QUEUED',materialization_key=$2 WHERE id=$1 AND lifecycle='ALLOCATED'`,[row.id,`playlist-job:${result.jobId}`]);await db.query(`INSERT INTO discovery_action_execution_links(link_key,action_id,executor_type,executor_id,job_id,policy_version) VALUES($1,$2,'PLAYLIST_JOB',$3,$3,$4) ON CONFLICT(link_key) DO NOTHING`,[`research-action:${row.id}:playlist-job:${result.jobId}`,row.id,result.jobId,PERSISTENT_RESEARCH_POLICY_VERSION]);}}const creator=await materializeCreatorPlaylistCanary(cutoff).catch(error=>{console.warn('[CreatorIntelligence] Playlist canary fallback:',error instanceof Error?error.message:error);return {queued:0};});return n+creator.queued;}
 
-async function materializeFeaturedChannels(cutoff:string){const result=await materializeCreatorFeaturedChannelCanary(cutoff).catch(error=>{console.warn('[CreatorIntelligence] Featured-channel canary fallback:',error instanceof Error?error.message:error);return {queued:0};});return result.queued;}
+export async function materializeFeaturedChannels(cutoff:string){const db=await getDb(),serving=(await db.query(`SELECT 1 FROM research_control WHERE singleton=true AND enabled AND mode='CANARY' AND NOT paused AND NOT kill_switch`)).rowCount;if(!serving)return 0;const result=await materializeCreatorFeaturedChannelCanary(cutoff).catch(error=>{console.warn('[CreatorIntelligence] Featured-channel canary fallback:',error instanceof Error?error.message:error);return {queued:0};});return result.queued;}
 
 export async function runPersistentResearchCycle(owner=`research-controller:${process.pid}`,now=new Date().toISOString()){const enabledControl=(await (await getDb()).query('SELECT enabled FROM research_control WHERE singleton=true')).rows[0];if(!enabledControl?.enabled){await abortAllActiveBootstrapRuns(BOOTSTRAP_SYSTEM_ACTOR,'research control disabled; aborting provisional bootstrap runs');return {status:'DISABLED' as const};}const token=await acquireLease(owner);if(!token){const leaseControl=(await (await getDb()).query('SELECT * FROM research_control WHERE singleton=true')).rows[0];if(isResearchDisarmed(leaseControl))await abortAllActiveBootstrapRuns(BOOTSTRAP_SYSTEM_ACTOR,'research control disarmed while lease unavailable; aborting provisional bootstrap runs');return {status:'LEASE_UNAVAILABLE' as const};}const db=await getDb(),control=(await db.query('SELECT * FROM research_control WHERE singleton=true')).rows[0],cutoff=new Date(now).toISOString(),cycleKey=researchChecksum({cutoff:cutoff.slice(0,16),owner,version:RESEARCH_CONTROLLER_VERSION});let cycleId:string|undefined;try{if(!control||control.paused||control.kill_switch&&control.mode==='CANARY'){await abortAllActiveBootstrapRuns(BOOTSTRAP_SYSTEM_ACTOR,'research control disarmed before cycle; aborting provisional bootstrap runs');return {status:'DISABLED' as const};}const cycle=await db.query(`INSERT INTO persistent_research_cycles(cycle_key,mode,policy_id,lease_owner,input_cutoff,input_checksum,status) VALUES($1,$2,$3,$4,$5,$6,'STARTED') ON CONFLICT(cycle_key) DO NOTHING RETURNING id`,[cycleKey,control.mode,control.active_policy_id||null,owner,cutoff,researchChecksum({cutoff,checkpoint:control.checkpoint})]);if(!cycle.rowCount)return {status:'DUPLICATE' as const};cycleId=cycle.rows[0].id;const queryEvents=await projectQueryOutcomes(cutoff),reviewEvents=await projectReviewOutcomes(cutoff),playlistEvents=await projectPlaylistOutcomes(cutoff),entityCredits=await projectEntityCredits(cutoff),incrementality=await projectIncrementality(cutoff),relationshipOutcomes=await finalizeCreatorRelationshipActions(cutoff),terminologyEvaluations=await evaluateTerminologyTrials(cutoff),externalProviderJobs=await scheduleStructuredExternalProviders(),corpusMiningActions=await generateCorpusMiningActions(cutoff),bursts=await detectAndReactivateTerminology(cutoff),corpus=await generateCorpusHypotheses(cutoff),relationships=await generateCreatorRelationshipActions(cutoff),multilingual=await generateMultilingualActions(cutoff),playlists=await adaptPlaylistFrontier(cutoff),temporal=await adaptTemporalFrontier(cutoff),staleRefreshes=await generateStaleFrontierRefreshActions(cutoff),coverage=await projectCoverage(cutoff),coverageProbes=await generateCoverageProbes(cutoff),overlapUpdates=await refreshOverlapPenalties(cutoff),allocation=await allocateResearch(control,control.mode,cutoff),materialized=control.mode==='CANARY'?await materializePlaylists(cutoff):0,featuredMaterialized=control.mode==='CANARY'?await materializeFeaturedChannels(cutoff):0,corpusMaterialized=control.mode==='CANARY'?await materializeCorpusMiningActions():0,externalMaterialized=control.mode==='CANARY'?await materializeExternalActions():0,checkpoint={cutoff,queryEvents,reviewEvents,playlistEvents,entityCredits,incrementality,relationshipOutcomes,terminologyEvaluations,externalProviderJobs,corpusMiningActions,bursts,corpus,relationships,multilingual,playlists,temporal,staleRefreshes,coverage,coverageProbes,overlapUpdates,candidates:allocation.choices.length,selected:allocation.selected,materialized,featuredMaterialized,corpusMaterialized,externalMaterialized};await db.query(`UPDATE persistent_research_cycles SET candidate_count=$2,selected_count=$3,materialized_count=$4,provider_cost_reserved=$5,review_cost_reserved=$6,status='COMPLETED',checkpoint=$7,policy_id=COALESCE($8,policy_id),completed_at=now() WHERE id=$1`,[cycleId,allocation.choices.length,allocation.selected,materialized+featuredMaterialized+corpusMaterialized+externalMaterialized,allocation.providerReserved,allocation.reviewReserved,JSON.stringify(checkpoint),allocation.bootstrapPolicyId||null]);return {status:'COMPLETED' as const,cycleId,...checkpoint};}catch(error){if(cycleId)await db.query(`UPDATE persistent_research_cycles SET status='FAILED',failure_class=$2,completed_at=now() WHERE id=$1`,[cycleId,error instanceof Error?error.name:'UnknownError']).catch(()=>undefined);throw error;}finally{await releaseLease(token,{cutoff,cycleId}).catch(()=>undefined);}}
 

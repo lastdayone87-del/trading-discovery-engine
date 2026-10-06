@@ -12,4 +12,5 @@ ALTER TABLE research_control
   ADD COLUMN IF NOT EXISTS bootstrap_run_id UUID REFERENCES research_bootstrap_runs(id) ON DELETE RESTRICT,
   ADD COLUMN IF NOT EXISTS bootstrap_armed_by TEXT,
   ADD COLUMN IF NOT EXISTS bootstrap_armed_reason TEXT,
-  ADD COLUMN IF NOT EXISTS bootstrap_armed_at TIMESTAMPTZ;
+  ADD COLUMN IF NOT EXISTS bootstrap_armed_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS bootstrap_armed_config_version INTEGER;
