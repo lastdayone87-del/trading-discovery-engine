@@ -33,6 +33,7 @@ const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; acti
   { method:'POST', pattern:/^\/api\/persistent-research\/bootstrap-runs\/[^/]+\/abort$/, policy:'admin', action:'research.bootstrap.abort' },
   { method:'POST', pattern:/^\/api\/persistent-research\/bootstrap-runs\/[^/]+\/arm$/, policy:'admin', action:'research.bootstrap.arm' },
   { method:'POST', pattern:/^\/api\/persistent-research\/bootstrap-runs\/disarm$/, policy:'admin', action:'research.bootstrap.disarm' },
+  { method:'POST', pattern:/^\/api\/persistent-research\/cycles$/, policy:'admin', action:'research.cycle.trigger' },
   { method:'POST', pattern:/^\/api\/domain-weights\/batch$/, policy:'admin', action:'research.domain-weights.batch' },
   { method:'POST', pattern:/^\/api\/domain-weights\/snapshots\/[^/]+\/approve$/, policy:'admin', action:'research.domain-weights.approve' },
   { method:'GET', pattern:/^\/api\/corpus(?:\/documents\/[^/]+)?$/, policy:'operator', action:'corpus.read' },
