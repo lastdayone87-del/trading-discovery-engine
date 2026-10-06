@@ -165,18 +165,20 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       actor: 'test:research-e2e',
     });
     // Single-clock harness rule: derive the evaluation window start from the
-  // database timestamps themselves, so created_at <= windowStart holds
-  // regardless of runner/database clock skew. Full text precision is kept
-  // (no JS Date round-trip): node-pg truncates timestamptz to milliseconds,
-  // which can fall strictly below a microsecond-precision created_at.
+  // database timestamps themselves, plus a 1s buffer, so created_at <=
+  // windowStart holds regardless of runner/database clock skew AND
+  // microsecond truncation (the replay compares with millisecond ISO bounds).
+  // The sleeps below guarantee every subsequent action/assignment/outcome
+  // timestamp falls strictly inside the window.
   const windowStart = String(
     (
       await database.query(
-        `SELECT max(created_at)::text AS t FROM portfolio_policies WHERE id = ANY($1::uuid[])`,
+        `SELECT (max(created_at) + interval '1 second')::text AS t FROM portfolio_policies WHERE id = ANY($1::uuid[])`,
         [[candidate.id, baseline.id]]
       )
     ).rows[0].t
   );
+  await new Promise(resolve => setTimeout(resolve, 1200));
 
     // ---- Stage 2: seed 30 high-yield + 30 low-yield PROPOSED actions. ----
     // Controlled provider-generation boundary (see header): realistic action
@@ -264,6 +266,7 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       [...highSet].sort(),
       'run 0 must allocate exactly the 30 high-yield actions'
     );
+    await new Promise(resolve => setTimeout(resolve, 1200));
     const cutoff = new Date().toISOString();
 
     // ---- Stage 4: lifecycle integrity (cycles attributed to the candidate). ----
