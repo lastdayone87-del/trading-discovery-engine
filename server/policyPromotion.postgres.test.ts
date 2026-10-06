@@ -59,19 +59,21 @@ async function seedEvaluation(
   tag: string,
   policyId: string,
   baselineId: string | null,
-  decision: 'PASS' | 'FAIL' | 'ABSTAIN'
+  decision: 'PASS' | 'FAIL' | 'ABSTAIN',
+  evaluatedAt?: string
 ) {
   await database.query(
-    `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by)
-     VALUES($1,$2,$3,now()-interval '1 hour',now(),30,$4,$5,$6,$7,'test:promotion-gate')`,
+    `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at)
+     VALUES($1,$2,$3,now()-interval '1 hour',now(),30,$4,$5,$6,$7,'test:promotion-gate',COALESCE($8::timestamptz,now()))`,
     [
-      `test-promotion-eval:${tag}:${decision}`,
+      `test-promotion-eval:${tag}:${decision}:${evaluatedAt || 'now'}`,
       policyId,
       baselineId,
       JSON.stringify({}),
       decision,
       JSON.stringify([]),
       `test-checksum-${tag}`,
+      evaluatedAt || null,
     ]
   );
 }
@@ -194,6 +196,29 @@ maybe('APPROVED policy with genuine PASS advances to CANARY', async () => {
   assert.equal(canary.status, 'CANARY');
 });
 
+async function approveAs(
+  transitionPolicy: (input: {
+    id: string; action: 'APPROVE'; reason: string; idempotencyKey: string; actor: string;
+  }) => Promise<{ status: string }>,
+  database: Db,
+  id: string,
+  key: string
+): Promise<{ ok: boolean; status: string }> {
+  try {
+    const result = await transitionPolicy({
+      id,
+      action: 'APPROVE',
+      reason: 'test latest-semantics matrix',
+      idempotencyKey: key,
+      actor: 'test:promotion-gate',
+    });
+    return { ok: true, status: result.status };
+  } catch (error) {
+    assert.match(String((error as Error)?.message || error), /ADAPTIVE_POLICY_EVALUATION_REQUIRED/);
+    return { ok: false, status: await statusOf(database, id) };
+  }
+}
+
 maybe('non-evaluated transitions and CANARY singleton behave correctly', async () => {
   const database = await db();
   const { transitionPolicy } = await import('./portfolioAllocator');
@@ -297,4 +322,85 @@ maybe('non-evaluated transitions and CANARY singleton behave correctly', async (
     await database.query(`SELECT count(*)::int AS n FROM portfolio_policies WHERE status='CANARY'`)
   ).rows[0];
   assert.equal(Number(canaryCount.n), 1, 'at most one CANARY policy may exist');
+});
+
+maybe('only the latest evaluation for the candidate authorizes promotion', async () => {
+  const database = await db();
+  const { transitionPolicy } = await import('./portfolioAllocator');
+  const base = `latest:${Date.now()}:${process.pid}`;
+  const hour = 3600_000;
+  const stamps = { old: new Date(Date.now() - 3 * hour).toISOString(), mid: new Date(Date.now() - 2 * hour).toISOString(), now: new Date(Date.now() - 1 * hour).toISOString() };
+
+  async function candidateWithHistory(
+    name: string,
+    history: Array<{ decision: 'PASS' | 'FAIL' | 'ABSTAIN'; at: string; baseline: boolean }>
+  ) {
+    const candidate = await freshPolicy(database, `${base}:${name}`);
+    const baseline = await freshPolicy(database, `${base}:${name}:base`);
+    let seq = 0;
+    for (const entry of history) {
+      await seedEvaluation(
+        database,
+        `${base}:${name}:${seq++}`,
+        candidate.id,
+        entry.baseline ? baseline.id : null,
+        entry.decision,
+        entry.at
+      );
+    }
+    return candidate;
+  }
+
+  // PASS only → allowed.
+  const passOnly = await candidateWithHistory('pass-only', [{ decision: 'PASS', at: stamps.now, baseline: true }]);
+  assert.deepEqual(
+    await approveAs(transitionPolicy, database, passOnly.id, `test-latest-pass-only:${base}`),
+    { ok: true, status: 'APPROVED' }
+  );
+  // PASS → FAIL → rejected (stale PASS must not authorize).
+  const passFail = await candidateWithHistory('pass-fail', [
+    { decision: 'PASS', at: stamps.mid, baseline: true },
+    { decision: 'FAIL', at: stamps.now, baseline: true },
+  ]);
+  assert.deepEqual(
+    await approveAs(transitionPolicy, database, passFail.id, `test-latest-pass-fail:${base}`),
+    { ok: false, status: 'DRAFT' }
+  );
+  // PASS → ABSTAIN → rejected.
+  const passAbstain = await candidateWithHistory('pass-abstain', [
+    { decision: 'PASS', at: stamps.mid, baseline: true },
+    { decision: 'ABSTAIN', at: stamps.now, baseline: true },
+  ]);
+  assert.deepEqual(
+    await approveAs(transitionPolicy, database, passAbstain.id, `test-latest-pass-abstain:${base}`),
+    { ok: false, status: 'DRAFT' }
+  );
+  // FAIL only → rejected; ABSTAIN only → rejected.
+  for (const decision of ['FAIL', 'ABSTAIN'] as const) {
+    const solo = await candidateWithHistory(`solo-${decision.toLowerCase()}`, [
+      { decision, at: stamps.now, baseline: true },
+    ]);
+    assert.deepEqual(
+      await approveAs(transitionPolicy, database, solo.id, `test-latest-solo:${base}:${decision}`),
+      { ok: false, status: 'DRAFT' }
+    );
+  }
+  // Latest PASS with older FAIL → allowed.
+  const failPass = await candidateWithHistory('fail-pass', [
+    { decision: 'FAIL', at: stamps.mid, baseline: true },
+    { decision: 'PASS', at: stamps.now, baseline: true },
+  ]);
+  assert.deepEqual(
+    await approveAs(transitionPolicy, database, failPass.id, `test-latest-fail-pass:${base}`),
+    { ok: true, status: 'APPROVED' }
+  );
+  // Latest PASS without baseline → rejected (baselineless PASS never authorizes).
+  const noBase = await candidateWithHistory('no-base', [
+    { decision: 'FAIL', at: stamps.mid, baseline: true },
+    { decision: 'PASS', at: stamps.now, baseline: false },
+  ]);
+  assert.deepEqual(
+    await approveAs(transitionPolicy, database, noBase.id, `test-latest-no-base:${base}`),
+    { ok: false, status: 'DRAFT' }
+  );
 });

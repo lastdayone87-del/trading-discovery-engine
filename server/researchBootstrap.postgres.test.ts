@@ -550,6 +550,89 @@ maybe('bootstrap arming is explicit, budgeted, and fenced', async t => {
   }
 });
 
+maybe('control-plane CANARY arming also requires the latest evaluation to be PASS', async t => {
+  const { configurePersistentResearch } = await import('./persistentResearch');
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `control-gate:${Date.now()}:${process.pid}`;
+  const candidate = await createPolicy({
+    policyKey: `test-control-gate:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  await database.query(`UPDATE portfolio_policies SET status='CANARY' WHERE id=$1`, [candidate.id]);
+  const prevControl = await saveControl(database);
+  try {
+    async function tryArm() {
+      const version = (
+        await database.query('SELECT configuration_version FROM research_control WHERE singleton=true')
+      ).rows[0].configuration_version;
+      return configurePersistentResearch({
+        expectedVersion: Number(version),
+        enabled: true,
+        mode: 'CANARY',
+        paused: false,
+        killSwitch: false,
+        dailyProviderCostCap: 100000,
+        dailyReviewCostCap: 100000,
+        explorationBasisPoints: 2000,
+        maxActionsPerCycle: 5,
+        activePolicyId: candidate.id,
+        actor: 'test:research-bootstrap',
+        reason: 'test control latest gate',
+      });
+    }
+    // No evaluation at all: refuses.
+    await assert.rejects(tryArm(), /EVALUATED_CANARY_POLICY_REQUIRED/);
+    // Stale PASS superseded by FAIL: refuses.
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at)
+       VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'PASS',$5,$6,'test:research-bootstrap',now()-interval '2 hours')`,
+      [
+        `test-control-gate:${tag}:pass`,
+        candidate.id,
+        candidate.id,
+        JSON.stringify({}),
+        JSON.stringify([]),
+        `test-checksum-${tag}-pass`,
+      ]
+    );
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at)
+       VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'FAIL',$5,$6,'test:research-bootstrap',now()-interval '1 hour')`,
+      [
+        `test-control-gate:${tag}:fail`,
+        candidate.id,
+        candidate.id,
+        JSON.stringify({}),
+        JSON.stringify([]),
+        `test-checksum-${tag}-fail`,
+      ]
+    );
+    await assert.rejects(tryArm(), /EVALUATED_CANARY_POLICY_REQUIRED/);
+    // Newer PASS restores eligibility.
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at)
+       VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'PASS',$5,$6,'test:research-bootstrap',now())`,
+      [
+        `test-control-gate:${tag}:pass2`,
+        candidate.id,
+        candidate.id,
+        JSON.stringify({}),
+        JSON.stringify([]),
+        `test-checksum-${tag}-pass2`,
+      ]
+    );
+    const armed = await tryArm();
+    assert.equal(armed.mode, 'CANARY');
+  } finally {
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [candidate.id]);
+    await restoreControl(database, prevControl);
+  }
+});
+
 maybe('bootstrap allocation refuses without a fenced arm', async t => {
   const { startResearchBootstrapRun, allocateBootstrapAssignments } = await import(
     './persistentResearchController'
