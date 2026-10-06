@@ -105,7 +105,10 @@ maybe('projectEntityCredits aggregates uuid canonical ids without min(uuid)', as
      VALUES($1,$2,'UCcredit2',NULL,'CONFIRMED',true,$3,'test',now(),$4)`,
     [`test-credit-capture:${tag}:2`, actionId, JSON.stringify({}), 'persistent-research-controller-v1']
   );
-  const written = await projectEntityCredits(new Date().toISOString());
+  // Future cutoff: observed_at uses microsecond timestamps while the cutoff
+  // bound is millisecond ISO; a same-millisecond capture could otherwise fall
+  // outside its own window. A future bound is legitimate for a cutoff.
+  const written = await projectEntityCredits(new Date(Date.now() + 2000).toISOString());
   assert.equal(written, 2, 'one credit snapshot per entity group');
   // Credit keys hash entity/action/cutoff (not the tag); scope by the fixture action.
   const scoped = (
