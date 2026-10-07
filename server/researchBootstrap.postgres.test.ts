@@ -111,7 +111,9 @@ async function saveControl(database: Db) {
 async function restoreControl(database: Db, prev: Record<string, any>) {
   await database.query(
     `UPDATE research_control SET enabled=$1, mode=$2, paused=$3, kill_switch=$4,
-      daily_provider_cost_cap=$5, daily_review_cost_cap=$6, max_actions_per_cycle=$7, active_policy_id=$8 WHERE singleton=true`,
+      daily_provider_cost_cap=$5, daily_review_cost_cap=$6, max_actions_per_cycle=$7, active_policy_id=$8,
+      exploration_basis_points=$9, bootstrap_armed=false, bootstrap_run_id=NULL, bootstrap_armed_by=NULL,
+      bootstrap_armed_reason=NULL, bootstrap_armed_at=NULL WHERE singleton=true`,
     [
       prev.enabled,
       prev.mode,
@@ -121,6 +123,7 @@ async function restoreControl(database: Db, prev: Record<string, any>) {
       prev.daily_review_cost_cap,
       prev.max_actions_per_cycle,
       prev.active_policy_id,
+      prev.exploration_basis_points,
     ]
   );
 }
@@ -132,6 +135,20 @@ async function armCanaryControl(database: Db, policyId: string | null) {
       active_policy_id=$1 WHERE singleton=true`,
     [policyId]
   );
+}
+
+async function fundControlCaps(database: Db) {
+  await database.query(
+    `UPDATE research_control SET daily_provider_cost_cap=100000, daily_review_cost_cap=100000,
+      max_actions_per_cycle=5, exploration_basis_points=0, active_policy_id=NULL WHERE singleton=true`
+  );
+}
+
+async function armRun(
+  configureBootstrapArming: (input: { runId: string; actor: string; reason: string }) => Promise<unknown>,
+  runId: string
+): Promise<void> {
+  await configureBootstrapArming({ runId, actor: 'test:research-bootstrap', reason: 'test arm' });
 }
 
 /** Retires leftover fixture actions to a terminal lifecycle (never eligible for allocation). */
@@ -281,9 +298,12 @@ maybe('bootstrap allocates boundedly and auto-completes at its ceiling', async t
     );
   });
   const prevControl = await saveControl(database);
-  await armCanaryControl(database, policy.id);
+  await fundControlCaps(database);
   try {
-    const { allocateBootstrapAssignments } = await import('./persistentResearchController');
+    const { allocateBootstrapAssignments, configureBootstrapArming } = await import(
+      './persistentResearchController'
+    );
+    await armRun(configureBootstrapArming, run.id);
     const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
     const first = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
     assert.equal(first.allocated, 2);
@@ -341,9 +361,11 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
     actor: 'test:research-bootstrap',
   });
   const prevControl = await saveControl(database);
-  await armCanaryControl(database, policy.id);
+  await fundControlCaps(database);
   try {
-    const { allocateBootstrapAssignments } = await import('./persistentResearchController');
+    const { allocateBootstrapAssignments, configureBootstrapArming } = await import(
+      './persistentResearchController'
+    );
     // Case 1: policy paused after the run started aborts the run without allocating.
     const pausedRun = await startResearchBootstrapRun({
       candidatePolicyId: policy.id,
@@ -358,6 +380,9 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
         () => undefined
       );
     });
+    // Arm while eligible, THEN pause: the allocator (not the arm) must observe
+    // the mid-run ineligibility and abort without allocating.
+    await armRun(configureBootstrapArming, pausedRun.id);
     await database.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
     const armed = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
     const pausedResult = await allocateBootstrapAssignments(armed, new Date().toISOString(), pausedRun.id);
@@ -388,8 +413,10 @@ maybe('bootstrap aborts when the candidate policy is paused or the window expire
         () => undefined
       );
     });
-    // Simulate expiry without violating the table CHECK (expires_at must stay
-    // within (starts_at, starts_at + 30 days]): shift the whole window into the past.
+    // Arm while still valid, then simulate expiry without violating the
+    // table CHECK (expires_at must stay within (starts_at, starts_at +
+    // 30 days]): shift the whole window into the past.
+    await armRun(configureBootstrapArming, expiredRun.id);
     await database.query(
       `UPDATE research_bootstrap_runs SET starts_at=now()-interval '2 hours', expires_at=now()-interval '1 hour' WHERE id=$1`,
       [expiredRun.id]
@@ -440,6 +467,89 @@ maybe('normal CANARY allocation still requires a PASS-backed policy', async t =>
     );
   } finally {
     await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [policy.id]);
+    await restoreControl(database, prevControl);
+  }
+});
+
+maybe('bootstrap arming is explicit, budgeted, and fenced', async t => {
+  const { startResearchBootstrapRun, configureBootstrapArming, disarmBootstrapControl } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `arm:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-arm:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const prevControl = await saveControl(database);
+  try {
+    const run = await startResearchBootstrapRun({
+      candidatePolicyId: policy.id,
+      maxAssignments: 2,
+      maxProviderCost: 500,
+      windowHours: 24,
+      reason: 'test arming',
+      actor: 'test:research-bootstrap',
+    });
+    t.after(async () => {
+      const { abortResearchBootstrapRun } = await import('./persistentResearchController');
+      await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(
+        () => undefined
+      );
+    });
+    // Insufficient provider cap refuses without consuming the run.
+    await assert.rejects(
+      configureBootstrapArming({ runId: run.id, actor: 'test:research-bootstrap', reason: `test poor:${tag}` }),
+      /BOOTSTRAP_ARM_INSUFFICIENT_BUDGET/
+    );
+    const stillActive = (
+      await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
+    ).rows[0];
+    assert.equal(stillActive.status, 'ACTIVE');
+    // Fund the caps (budget setup, still disarmed) then arm.
+    await database.query(
+      `UPDATE research_control SET daily_provider_cost_cap=100000, daily_review_cost_cap=100000,
+        max_actions_per_cycle=5, exploration_basis_points=0 WHERE singleton=true`
+    );
+    const armed = await configureBootstrapArming({
+      runId: run.id,
+      actor: 'test:research-bootstrap',
+      reason: `test arm:${tag}`,
+    });
+    assert.equal(armed.enabled, true);
+    assert.equal(armed.mode, 'CANARY');
+    assert.equal(armed.paused, false);
+    assert.equal(armed.kill_switch, false);
+    assert.equal(armed.bootstrap_armed, true);
+    assert.equal(String(armed.bootstrap_run_id), run.id);
+    // Double arming conflicts.
+    await assert.rejects(
+      configureBootstrapArming({ runId: run.id, actor: 'test:research-bootstrap', reason: `test again:${tag}` }),
+      /BOOTSTRAP_ARM_CONFLICT/
+    );
+    // Manual disarm aborts the run and returns control to dormant.
+    const disarmed = await disarmBootstrapControl('test:research-bootstrap', `test disarm:${tag}`);
+    assert.ok(disarmed);
+    assert.equal(disarmed?.enabled, false);
+    assert.equal(disarmed?.bootstrap_armed, false);
+    const runStatus = (
+      await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
+    ).rows[0];
+    assert.equal(runStatus.status, 'ABORTED');
+    // Configuration events audit the arm and the disarm — run-specific
+    // reasons, so stale events from other runs cannot satisfy this.
+    for (const reason of [`test arm:${tag}`, `test disarm:${tag}`]) {
+      const events = await database.query(
+        `SELECT configuration_version, reason FROM research_configuration_events WHERE actor='test:research-bootstrap' AND reason=$1`,
+        [reason]
+      );
+      assert.equal(events.rows.length, 1, `exactly one event for ${reason}`);
+    }
+  } finally {
     await restoreControl(database, prevControl);
   }
 });
@@ -527,6 +637,417 @@ maybe('control-plane CANARY arming also requires the latest evaluation to be PAS
   }
 });
 
+maybe('bootstrap allocation refuses without a fenced arm', async t => {
+  const { startResearchBootstrapRun, allocateBootstrapAssignments } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `nofence:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-nofence:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const prevControl = await saveControl(database);
+  // Fully armed-looking control but no fence: allocation must still refuse.
+  await database.query(
+    `UPDATE research_control SET enabled=true, mode='CANARY', paused=false, kill_switch=false,
+      daily_provider_cost_cap=100000, daily_review_cost_cap=100000, max_actions_per_cycle=5,
+      active_policy_id=NULL WHERE singleton=true`
+  );
+  const armedSnapshot = (
+    await database.query('SELECT * FROM research_control WHERE singleton=true')
+  ).rows[0];
+  try {
+    const run = await startResearchBootstrapRun({
+      candidatePolicyId: policy.id,
+      maxAssignments: 2,
+      maxProviderCost: 500,
+      windowHours: 24,
+      reason: 'test unfenced allocation',
+      actor: 'test:research-bootstrap',
+    });
+    try {
+      const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+      const result = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
+      assert.equal(result.allocated, 0);
+      assert.equal(result.completed, true);
+      const status = (
+        await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
+      ).rows[0];
+      assert.equal(status.status, 'ABORTED');
+      // The unrelated armed control must be exactly unchanged: no reset, no
+      // version bump, no fence side effects.
+      const afterControl = (
+        await database.query('SELECT * FROM research_control WHERE singleton=true')
+      ).rows[0];
+      assert.deepEqual(
+        { ...afterControl, updated_at: null },
+        { ...armedSnapshot, updated_at: null },
+        'normal CANARY control untouched by unfenced abort'
+      );
+    } finally {
+      const { abortResearchBootstrapRun } = await import('./persistentResearchController');
+      await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(
+        () => undefined
+      );
+    }
+  } finally {
+    await restoreControl(database, prevControl);
+  }
+});
+
+maybe('concurrent arm, allocate, and disarm serialize without deadlock', async t => {
+  const { startResearchBootstrapRun, configureBootstrapArming, disarmBootstrapControl, allocateBootstrapAssignments } =
+    await import('./persistentResearchController');
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `race:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-race:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  for (let index = 0; index < 4; index++) {
+    await database.query(
+      `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+       VALUES($1,$2,'SEARCH_YOUTUBE','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,10,0,0,'persistent-research-controller-v1',now()+interval '14 days')`,
+      [
+        `test-bootstrap-action:${tag}:${index}`,
+        programId,
+        `race probe ${tag} ${index}`,
+        JSON.stringify({ country: 'US', intent: 'strategy' }),
+        JSON.stringify({}),
+        JSON.stringify(['test']),
+        `race-cluster:${tag}:${index}`,
+      ]
+    );
+  }
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id,
+    maxAssignments: 4,
+    maxProviderCost: 1000,
+    windowHours: 24,
+    reason: `test race:${tag}`,
+    actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    const { abortResearchBootstrapRun } = await import('./persistentResearchController');
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', `test cleanup:${tag}`).catch(
+      () => undefined
+    );
+  });
+  try {
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const cutoff = new Date().toISOString();
+    // Overlapping arm / allocate / disarm: lock order (control → run →
+    // policy) must serialize them; no deadlock, no lost run.
+    const outcomes = await Promise.allSettled([
+      configureBootstrapArming({ runId: run.id, actor: 'test:research-bootstrap', reason: `test race-arm:${tag}` }),
+      allocateBootstrapAssignments(control, cutoff, run.id),
+      disarmBootstrapControl('test:research-bootstrap', `test race-disarm:${tag}`),
+      allocateBootstrapAssignments(control, cutoff, run.id),
+    ]);
+    for (const outcome of outcomes) {
+      if (outcome.status === 'rejected') {
+        assert.doesNotMatch(
+          String(outcome.reason?.message || outcome.reason),
+          /deadlock/i,
+          'concurrent bootstrap operations must serialize, never deadlock'
+        );
+      }
+    }
+    // Coherent end state: either the run is terminal with the fence cleared,
+    // or it is ACTIVE with the fence still bound to it and control armed.
+    const endRun = (await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id]))
+      .rows[0];
+    const endControl = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    if (endRun.status === 'ACTIVE') {
+      assert.equal(endControl.bootstrap_armed, true);
+      assert.equal(String(endControl.bootstrap_run_id), run.id);
+      assert.equal(endControl.enabled, true);
+    } else {
+      assert.equal(endControl.bootstrap_armed, false, 'terminal run must not hold an armed control');
+    }
+  } finally {
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
+
+maybe('expired fence never authorizes canonical allocation from a stale snapshot', async t => {
+  const { startResearchBootstrapRun, allocateResearch } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `stale:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-stale:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id,
+    maxAssignments: 2,
+    maxProviderCost: 500,
+    windowHours: 1,
+    reason: `test stale:${tag}`,
+    actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    const { abortResearchBootstrapRun } = await import('./persistentResearchController');
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', `test cleanup:${tag}`).catch(
+      () => undefined
+    );
+  });
+  try {
+    const { configureBootstrapArming } = await import('./persistentResearchController');
+    await configureBootstrapArming({ runId: run.id, actor: 'test:research-bootstrap', reason: `test stale-arm:${tag}` });
+    // Expire the window, then dispatch with a deliberately stale armed snapshot.
+    await database.query(
+      `UPDATE research_bootstrap_runs SET starts_at=now()-interval '2 hours', expires_at=now()-interval '1 hour' WHERE id=$1`,
+      [run.id]
+    );
+    const staleControl = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(staleControl.bootstrap_armed, true);
+    const before = (
+      await database.query('SELECT count(*)::int AS n FROM discovery_action_assignments')
+    ).rows[0];
+    const result = await allocateResearch(staleControl, 'CANARY', new Date().toISOString());
+    assert.equal(result.selected, 0, 'no allocation after fence expiry');
+    assert.equal((result.choices as unknown[]).length, 0, 'no candidates after fence expiry');
+    const after = (
+      await database.query('SELECT count(*)::int AS n FROM discovery_action_assignments')
+    ).rows[0];
+    assert.equal(Number(after.n), Number(before.n), 'no assignments created after fence expiry');
+    const status = (
+      await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
+    ).rows[0];
+    assert.equal(status.status, 'ABORTED');
+  } finally {
+    await restoreControl(database, prevControl);
+  }
+});
+
+maybe('allocation cannot commit against a concurrently paused candidate', async t => {
+  const { startResearchBootstrapRun, configureBootstrapArming, allocateBootstrapAssignments } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const { getDb } = await import('./dbCore');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `pauserace:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-pauserace:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  await database.query(
+    `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+     VALUES($1,$2,'SEARCH_YOUTUBE','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,10,0,0,'persistent-research-controller-v1',now()+interval '14 days')`,
+    [
+      `test-bootstrap-action:${tag}:0`,
+      programId,
+      `pause race probe ${tag}`,
+      JSON.stringify({ country: 'US', intent: 'strategy' }),
+      JSON.stringify({}),
+      JSON.stringify(['test']),
+      `pauserace-cluster:${tag}`,
+    ]
+  );
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id,
+    maxAssignments: 2,
+    maxProviderCost: 500,
+    windowHours: 24,
+    reason: `test pauserace:${tag}`,
+    actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    const { abortResearchBootstrapRun } = await import('./persistentResearchController');
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', `test cleanup:${tag}`).catch(
+      () => undefined
+    );
+  });
+  try {
+    await configureBootstrapArming({ runId: run.id, actor: 'test:research-bootstrap', reason: `test pauserace-arm:${tag}` });
+    // Hold the policy row lock and start allocation: it must block at the
+    // policy lock (control → run → policy order) instead of racing ahead.
+    const holder = await (await getDb()).connect();
+    await holder.query('BEGIN');
+    await holder.query(`SELECT * FROM portfolio_policies WHERE id=$1 FOR UPDATE`, [policy.id]);
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    let settled = false;
+    const pending = allocateBootstrapAssignments(control, new Date().toISOString(), run.id).then(
+      result => {
+        settled = true;
+        return result;
+      }
+    );
+    await new Promise(resolve => setTimeout(resolve, 500));
+    assert.equal(settled, false, 'allocator must wait on the held policy lock');
+    // Pause and release atomically in the holder transaction: no interleaving
+    // is possible between the release and the pause, so the allocator must
+    // observe PAUSED and abort without allocating.
+    await holder.query(`UPDATE portfolio_policies SET status='PAUSED' WHERE id=$1`, [policy.id]);
+    await holder.query('COMMIT');
+    holder.release();
+    const result = await pending;
+    assert.equal(result.allocated, 0, 'no allocation against a paused candidate');
+    const status = (
+      await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
+    ).rows[0];
+    assert.equal(status.status, 'ABORTED');
+    const assignments = await database.query(
+      `SELECT count(*)::int AS n FROM discovery_action_assignments WHERE context_snapshot->>'bootstrapRunId'=$1 AND selected=true`,
+      [run.id]
+    );
+    assert.equal(Number(assignments.rows[0]?.n || 0), 0, 'no selected assignments committed');
+  } finally {
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [policy.id]).catch(
+      () => undefined
+    );
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
+
+maybe('bootstrap termination never overwrites a newer normal configuration', async t => {
+  const { startResearchBootstrapRun, configureBootstrapArming, allocateBootstrapAssignments, configurePersistentResearch } = await import(
+    './persistentResearchController'
+  ).then(async controller => ({ ...(controller as object), configurePersistentResearch: (await import('./persistentResearch')).configurePersistentResearch }) as typeof import('./persistentResearchController') & { configurePersistentResearch: typeof import('./persistentResearch').configurePersistentResearch });
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `versionfence:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-bootstrap-versionfence:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id,
+    maxAssignments: 1,
+    maxProviderCost: 500,
+    windowHours: 24,
+    reason: `test versionfence:${tag}`,
+    actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    const { abortResearchBootstrapRun } = await import('./persistentResearchController');
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', `test cleanup:${tag}`).catch(
+      () => undefined
+    );
+  });
+  try {
+    await configureBootstrapArming({ runId: run.id, actor: 'test:research-bootstrap', reason: `test versionfence-arm:${tag}` });
+    // Operator installs a newer normal configuration (paused CANARY with new
+    // caps): version advances, fence columns untouched by the governed route.
+    const armed = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    await configurePersistentResearch({
+      expectedVersion: Number(armed.configuration_version),
+      enabled: true,
+      mode: 'CANARY',
+      paused: true,
+      killSwitch: true,
+      dailyProviderCostCap: 424242,
+      dailyReviewCostCap: 434343,
+      explorationBasisPoints: 2000,
+      maxActionsPerCycle: 5,
+      actor: 'test:research-bootstrap',
+      reason: `test versionfence-reconfigure:${tag}`,
+    });
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const result = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
+    assert.equal(result.allocated, 0);
+    const status = (
+      await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])
+    ).rows[0];
+    assert.equal(status.status, 'ABORTED');
+    const after = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    // Newer operator configuration preserved exactly; only the stale fence clears.
+    assert.equal(after.paused, true, 'operator pause preserved');
+    assert.equal(Number(after.daily_provider_cost_cap), 424242, 'operator caps preserved');
+    assert.equal(Number(after.daily_review_cost_cap), 434343, 'operator review caps preserved');
+    assert.equal(after.bootstrap_armed, false, 'stale fence cleared');
+    assert.equal(after.bootstrap_run_id, null);
+  } finally {
+    await restoreControl(database, prevControl);
+  }
+});
+
+maybe('materialization stops when the control is not serving', async t => {
+  const { materializePlaylists, materializeFeaturedChannels } = await import(
+    './persistentResearchController'
+  );
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `matgate:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const actionId = String(
+    (
+      await database.query(
+        `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+         VALUES($1,$2,'INSPECT_PLAYLIST','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,10,0,0,'persistent-research-controller-v1',now()+interval '14 days') RETURNING id`,
+        [
+          `test-matgate-action:${tag}`,
+          programId,
+          `matgate probe ${tag}`,
+          JSON.stringify({ country: 'US', intent: 'strategy' }),
+          JSON.stringify({}),
+          JSON.stringify(['test']),
+          `matgate-cluster:${tag}`,
+        ]
+      )
+    ).rows[0].id
+  );
+  // Allocate it without provenance that could enqueue (missing frontier
+  // action/country): even an armed control must not reach the provider here.
+  await database.query(`UPDATE discovery_actions SET lifecycle='ALLOCATED' WHERE id=$1`, [actionId]);
+  try {
+    const prevControl = await saveControl(database);
+    try {
+      // Dormant control: materializers must return 0 without touching state.
+      const playlists = await materializePlaylists(new Date().toISOString());
+      assert.equal(playlists, 0);
+      const featured = await materializeFeaturedChannels(new Date().toISOString());
+      assert.equal(featured, 0);
+      const lifecycle = (
+        await database.query('SELECT lifecycle FROM discovery_actions WHERE id=$1', [actionId])
+      ).rows[0];
+      assert.equal(lifecycle.lifecycle, 'ALLOCATED', 'no state change while disarmed');
+    } finally {
+      await restoreControl(database, prevControl);
+    }
+  } finally {
+    await database.query(`UPDATE discovery_actions SET lifecycle='EXPIRED' WHERE id=$1`, [actionId]);
+  }
+});
+
 maybe('CANARY allocation requires latest evaluation PASS with baseline (stale PASS refused)', async t => {
   const { createPolicy } = await import('./portfolioAllocator');
   const { allocateCanonical } = await import('./persistentResearchController');
@@ -573,6 +1094,96 @@ maybe('CANARY allocation requires latest evaluation PASS with baseline (stale PA
   }
 });
 
+maybe('control lease is not stealable by a concurrent same-owner cycle', async t => {
+  const { acquireLease, releaseLease } = await import('./persistentResearchController');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const owner = `test-lease-owner:${Date.now()}:${process.pid}`;
+  const first = await acquireLease(owner, 120);
+  assert.ok(first, 'first acquire holds the lease');
+  try {
+    // Same owner re-request while the lease is live must fail closed: the
+    // previous holder keeps its token and overlapping cycles cannot start.
+    assert.equal(await acquireLease(owner, 120), null);
+    assert.equal(await acquireLease(`${owner}:other`, 120), null);
+  } finally {
+    await releaseLease(first as string, { test: 'lease-steal' });
+  }
+  const after = await acquireLease(`${owner}:other`, 120);
+  assert.ok(after, 'lease acquirable after release');
+  await releaseLease(after as string, { test: 'lease-steal' });
+});
+
+maybe('ceiling completion defers disarm until the batch materializes, then settles without orphans', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, allocateBootstrapAssignments, configureBootstrapArming, settleCeilingBootstrap } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `ceiling-settle:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const policy = await createPolicy({
+    policyKey: `test-ceiling-settle:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  for (let index = 0; index < 2; index++) {
+    await database.query(
+      `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+       VALUES($1,$2,'SEARCH_YOUTUBE','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,100,1,0,'persistent-research-controller-v1',now()+interval '14 days')`,
+      [
+        `test-bootstrap-action:${tag}:${index}`,
+        programId,
+        `ceiling settle probe ${tag} ${index}`,
+        JSON.stringify({ country: 'US', intent: 'strategy' }),
+        JSON.stringify({}),
+        JSON.stringify(['test']),
+        `ceiling-settle-cluster:${tag}:${index}`,
+      ]
+    );
+  }
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id,
+    maxAssignments: 2,
+    maxProviderCost: 3000,
+    windowHours: 24,
+    reason: 'test ceiling settle',
+    actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  try {
+    await armRun(configureBootstrapArming, run.id);
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const result = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
+    assert.equal(result.allocated, 2);
+    assert.equal(result.completed, true);
+    // Disarm is deferred: the fence is still held so materializers stay serving.
+    const fenced = (await database.query('SELECT bootstrap_armed, bootstrap_run_id FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fenced.bootstrap_armed, true);
+    assert.equal(String(fenced.bootstrap_run_id), run.id);
+    // Settle (as runPersistentResearchCycle does after materialization):
+    // leftovers re-enter the pool, fence releases, newer config untouched.
+    await settleCeilingBootstrap(run.id, true);
+    const states = (
+      await database.query(`SELECT lifecycle, count(*)::int AS n FROM discovery_actions WHERE action_key LIKE $1 GROUP BY 1`, [`test-bootstrap-action:${tag}:%`])
+    ).rows as Array<{ lifecycle: string; n: number }>;
+    assert.equal(states.filter(row => row.lifecycle === 'ALLOCATED').reduce((n, row) => n + Number(row.n), 0), 0);
+    assert.equal(states.filter(row => row.lifecycle === 'EXPIRED').reduce((n, row) => n + Number(row.n), 0), 2);
+    const released = (await database.query('SELECT bootstrap_armed FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(released.bootstrap_armed, false);
+  } finally {
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
+
 maybe('allocation from a stale control snapshot cannot authorize CANARY work', async t => {
   const { createPolicy } = await import('./portfolioAllocator');
   const { allocateCanonical } = await import('./persistentResearchController');
@@ -616,5 +1227,340 @@ maybe('allocation from a stale control snapshot cannot authorize CANARY work', a
   } finally {
     await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [candidate.id]);
     await restoreControl(database, prevControl);
+  }
+});
+
+maybe('stale settlement for a terminal run never disarms a newer armed run', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, settleCeilingBootstrap } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `stalesettle:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-stale-settle:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const runA = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 2, maxProviderCost: 3000, windowHours: 24,
+    reason: 'test stale settle A', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(runA.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  let runBId: string | null = null;
+  try {
+    await armRun(configureBootstrapArming, runA.id);
+    // A reaches a terminal state and releases the fence through the normal path.
+    await abortResearchBootstrapRun(runA.id, 'test:research-bootstrap', 'test terminate A');
+    // B arms on the released control.
+    runBId = String((await startResearchBootstrapRun({
+      candidatePolicyId: policy.id, maxAssignments: 2, maxProviderCost: 3000, windowHours: 24,
+      reason: 'test stale settle B', actor: 'test:research-bootstrap',
+    })).id);
+    await armRun(configureBootstrapArming, runBId as string);
+    // A late/duplicate settlement for terminal A executes after B armed.
+    const settled = await settleCeilingBootstrap(runA.id, true);
+    assert.equal(settled, false, 'stale settlement must not act on another run fence');
+    const fence = (await database.query('SELECT bootstrap_armed, bootstrap_run_id FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fence.bootstrap_armed, true, 'B fence must remain armed');
+    assert.equal(String(fence.bootstrap_run_id), runBId as string, 'fence must still belong to B');
+    assert.equal((await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [runBId])).rows[0].status, 'ACTIVE', 'B must remain ACTIVE');
+  } finally {
+    if (runBId) await abortResearchBootstrapRun(runBId, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+    await restoreControl(database, prevControl);
+  }
+});
+
+maybe('bootstrap materialization stops once bootstrap authority is lost', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, allocateBootstrapAssignments, disarmBootstrapControl, materializeCycleBatch } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `matrace:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const policy = await createPolicy({
+    policyKey: `test-mat-race:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  await database.query(
+    `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+     VALUES($1,$2,'SEARCH_YOUTUBE','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,100,1,0,'persistent-research-controller-v1',now()+interval '14 days')`,
+    [
+      `test-bootstrap-action:${tag}:0`,
+      programId,
+      `mat race probe ${tag}`,
+      JSON.stringify({ country: 'US', intent: 'strategy' }),
+      JSON.stringify({}),
+      JSON.stringify(['test']),
+      `mat-race-cluster:${tag}`,
+    ]
+  );
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 5, maxProviderCost: 5000, windowHours: 24,
+    reason: 'test mat race', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  try {
+    await armRun(configureBootstrapArming, run.id);
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const alloc = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
+    assert.equal(alloc.allocated, 1);
+    // Authority held: batch materialization runs (nothing consumable here, zeros, no provider work).
+    const held = await materializeCycleBatch({ bootstrapRunId: run.id, cutoff: new Date().toISOString() });
+    assert.deepEqual(held, { materialized: 0, featuredMaterialized: 0, corpusMaterialized: 0, externalMaterialized: 0 });
+    // Authority lost mid-flight: nothing may begin afterwards.
+    await disarmBootstrapControl('test:research-bootstrap', 'test race disarm');
+    const lost = await materializeCycleBatch({ bootstrapRunId: run.id, cutoff: new Date().toISOString() });
+    assert.deepEqual(lost, { materialized: 0, featuredMaterialized: 0, corpusMaterialized: 0, externalMaterialized: 0 });
+    const lifecycle = (await database.query(`SELECT lifecycle FROM discovery_actions WHERE action_key=$1`, [`test-bootstrap-action:${tag}:0`])).rows[0];
+    assert.equal(lifecycle.lifecycle, 'ALLOCATED', 'no bootstrap-owned work continues after authority loss');
+  } finally {
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
+
+maybe('disarm cannot commit while a bootstrap materialization holds authority', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, disarmBootstrapControl } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const { getDb } = await import('./dbCore');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `lockrace:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-lock-race:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 2, maxProviderCost: 3000, windowHours: 24,
+    reason: 'test lock race', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const pool = await getDb();
+  const holder = await pool.connect();
+  try {
+    await armRun(configureBootstrapArming, run.id);
+    // Simulate a materialization row holding bootstrap authority: lock the
+    // control row exactly as holdBootstrapRowAuthority does, then race a real
+    // disarm against it. The disarm must block until authority is released,
+    // so a check-then-disarm-then-enqueue interleaving cannot commit.
+    await holder.query('BEGIN');
+    await holder.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`);
+    let disarmed = false;
+    const racing = disarmBootstrapControl('test:research-bootstrap', 'test racing disarm').then(
+      result => { disarmed = true; return result; }
+    );
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(disarmed, false, 'disarm must block while row authority is held');
+    await holder.query('ROLLBACK');
+    const released = await racing;
+    assert.equal(disarmed, true, 'disarm proceeds once authority is released');
+    assert.ok(released, 'disarm commits after the holder releases');
+    const fence = (await database.query('SELECT bootstrap_armed FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fence.bootstrap_armed, false);
+  } finally {
+    try { await holder.query('ROLLBACK'); } catch { /* already settled */ }
+    holder.release();
+    await restoreControl(database, prevControl);
+  }
+});
+
+maybe('terminal settlement failure cannot report a clean completed cycle', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, runPersistentResearchCycle } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `settlefail:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const policy = await createPolicy({
+    policyKey: `test-settle-fail:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  await database.query(
+    `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+     VALUES($1,$2,'SEARCH_YOUTUBE','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,100,1,0,'persistent-research-controller-v1',now()+interval '14 days')`,
+    [
+      `test-bootstrap-action:${tag}:0`,
+      programId,
+      `settle fail probe ${tag}`,
+      JSON.stringify({ country: 'US', intent: 'strategy' }),
+      JSON.stringify({}),
+      JSON.stringify(['test']),
+      `settle-fail-cluster:${tag}`,
+    ]
+  );
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 1, maxProviderCost: 5000, windowHours: 24,
+    reason: 'test settle fail', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const owner = `test-settle-fail:${tag}`;
+  try {
+    await armRun(configureBootstrapArming, run.id);
+    // Force terminal settlement to fail: settling retires the untouched
+    // ceiling batch to EXPIRED, so a temporary CHECK ban on that transition
+    // makes the settlement transaction abort. Nothing else in the cycle
+    // writes EXPIRED, so only the settlement step can trip this.
+    await database.query(`ALTER TABLE discovery_actions DROP CONSTRAINT IF EXISTS test_settle_fail_ck`);
+    await database.query(`ALTER TABLE discovery_actions ADD CONSTRAINT test_settle_fail_ck CHECK (lifecycle <> 'EXPIRED' OR action_key NOT LIKE 'test-bootstrap-action:settlefail:%')`);
+    await assert.rejects(
+      runPersistentResearchCycle(owner, new Date().toISOString()),
+      /check constraint/i
+    );
+    // The cycle must not report clean completion with an uncleared fence.
+    const cycle = (
+      await database.query(`SELECT status FROM persistent_research_cycles WHERE lease_owner=$1 ORDER BY started_at DESC LIMIT 1`, [owner])
+    ).rows[0];
+    assert.equal(cycle.status, 'FAILED', 'settlement failure must fail the cycle, not complete it');
+    const fence = (await database.query('SELECT bootstrap_armed, bootstrap_run_id FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fence.bootstrap_armed, true, 'uncleaned fence must stay visible, not silently dropped');
+    assert.equal(String(fence.bootstrap_run_id), run.id);
+    assert.equal((await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])).rows[0].status, 'COMPLETED');
+  } finally {
+    await database.query(`ALTER TABLE discovery_actions DROP CONSTRAINT IF EXISTS test_settle_fail_ck`);
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
+
+maybe('bootstrap materialization never consumes another run allocated actions', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, materializeCycleBatch } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `scopebatch:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const policy = await createPolicy({
+    policyKey: `test-scope-batch:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  async function fixtureAction(suffix: string): Promise<string> {
+    return String(
+      (
+        await database.query(
+          `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+           VALUES($1,$2,'MINE_TRANSCRIPT_KEYPHRASES','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,100,1,0,'persistent-research-controller-v1',now()+interval '14 days') RETURNING id`,
+          [
+            `test-bootstrap-action:${tag}:${suffix}`,
+            programId,
+            `scope probe ${tag} ${suffix}`,
+            JSON.stringify({ country: 'US', language: 'en', intent: 'strategy' }),
+            JSON.stringify({
+              sourceType: 'test-scope',
+              sourceKey: `scope-key:${tag}:${suffix}`,
+              creatorChannelId: null,
+              lineage: 'AUTONOMOUS',
+              text: `genuine scope fixture content ${tag} ${suffix} with enough words to extract candidate spans`,
+              observedAt: new Date().toISOString(),
+            }),
+            JSON.stringify(['test']),
+            `scope-cluster:${tag}:${suffix}`,
+          ]
+        )
+      ).rows[0].id
+    );
+  }
+  async function fixtureAssignment(actionId: string, suffix: string, snapshot: Record<string, unknown>): Promise<void> {
+    await database.query(
+      `INSERT INTO discovery_action_assignments(assignment_key,action_id,policy_key,policy_version,selected,rank,propensity_basis_points,utility,reason_codes,context_snapshot)
+       VALUES($1,$2,$3,$4,true,1,0,1.0,$5,$6)`,
+      [
+        `test-scope-assignment:${tag}:${suffix}`,
+        actionId,
+        `test-scope-policy:${tag}`,
+        '1',
+        JSON.stringify(['TEST_SCOPE_FIXTURE']),
+        JSON.stringify(snapshot),
+      ]
+    );
+  }
+  const actionA = await fixtureAction('a');
+  const actionB = await fixtureAction('b');
+  const actionC = await fixtureAction('c');
+  for (const id of [actionA, actionB, actionC]) {
+    await database.query(`UPDATE discovery_actions SET lifecycle='ALLOCATED' WHERE id=$1`, [id]);
+  }
+  const runA = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 5, maxProviderCost: 5000, windowHours: 24,
+    reason: 'test scope A', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(runA.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  const prevBudget = (await database.query(`SELECT paused, daily_compute_documents FROM corpus_controls WHERE singleton=true`)).rows[0];
+  await fundControlCaps(database);
+  let runBId: string | null = null;
+  try {
+    await fixtureAssignment(actionA, 'a', { bootstrapRunId: runA.id });
+    // Run A dies with its batch untouched: abort retires no actions.
+    await abortResearchBootstrapRun(runA.id, 'test:research-bootstrap', 'test terminate A');
+    runBId = String((await startResearchBootstrapRun({
+      candidatePolicyId: policy.id, maxAssignments: 5, maxProviderCost: 5000, windowHours: 24,
+      reason: 'test scope B', actor: 'test:research-bootstrap',
+    })).id);
+    await fixtureAssignment(actionB, 'b', { bootstrapRunId: runBId as string });
+    await fixtureAssignment(actionC, 'c', { policyKey: `test-scope-policy:${tag}` });
+    await armRun(configureBootstrapArming, runBId as string);
+    // Corpus persist is budget-gated; provision room for exactly this test.
+    await database.query(`UPDATE corpus_controls SET paused=false, daily_compute_documents=100000 WHERE singleton=true`);
+    const batch = await materializeCycleBatch({
+      bootstrapRunId: runBId as string,
+      cutoff: new Date().toISOString(),
+    });
+    assert.equal(batch.corpusMaterialized, 2, 'only own-run and canonical rows may materialize');
+    const lifecycles = Object.fromEntries(
+      (
+        await database.query(`SELECT action_key, lifecycle FROM discovery_actions WHERE action_key LIKE $1`, [`test-bootstrap-action:${tag}:%`])
+      ).rows.map((r: { action_key: string; lifecycle: string }) => [r.action_key, r.lifecycle])
+    );
+    assert.equal(lifecycles[`test-bootstrap-action:${tag}:a`], 'ALLOCATED', 'run A row must never materialize under run B');
+    assert.equal(lifecycles[`test-bootstrap-action:${tag}:b`], 'COMPLETED', 'run B own row stays materializable');
+    assert.equal(lifecycles[`test-bootstrap-action:${tag}:c`], 'COMPLETED', 'canonical row stays materializable');
+    const fence = (await database.query('SELECT bootstrap_armed, bootstrap_run_id FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fence.bootstrap_armed, true);
+    assert.equal(String(fence.bootstrap_run_id), runBId as string);
+  } finally {
+    if (runBId) await abortResearchBootstrapRun(runBId, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+    await database.query(`UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true`, [prevBudget.paused, prevBudget.daily_compute_documents]).catch(() => undefined);
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
   }
 });

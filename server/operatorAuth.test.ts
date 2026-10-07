@@ -117,3 +117,17 @@ test('denied bootstrap requests still answer when the audit writer fails',async 
   const forbidden=await runDenied('operator','/api/persistent-research/bootstrap-runs');
   assert.equal(forbidden.next,false); assert.equal(forbidden.status,403);
 });
+
+test('bootstrap arm/disarm routes are explicit admin-only routes',()=>{
+  const arm=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/persistent-research/bootstrap-runs/00000000-0000-4000-8000-000000000000/arm'));
+  assert.equal(arm.length,1); assert.equal(arm[0].policy,'admin'); assert.equal(arm[0].action,'research.bootstrap.arm');
+  const disarm=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/persistent-research/bootstrap-runs/disarm'));
+  assert.equal(disarm.length,1); assert.equal(disarm[0].policy,'admin'); assert.equal(disarm[0].action,'research.bootstrap.disarm');
+});
+
+test('domain weight batch and approval routes are explicit admin-only routes',()=>{
+  const batch=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/domain-weights/batch'));
+  assert.equal(batch.length,1); assert.equal(batch[0].policy,'admin'); assert.equal(batch[0].action,'research.domain-weights.batch');
+  const approve=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/domain-weights/snapshots/abc123/approve'));
+  assert.equal(approve.length,1); assert.equal(approve[0].policy,'admin'); assert.equal(approve[0].action,'research.domain-weights.approve');
+});

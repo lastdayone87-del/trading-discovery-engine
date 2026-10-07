@@ -78,29 +78,6 @@ async function seedEvaluation(
   );
 }
 
-async function approveAs(
-  transitionPolicy: (input: {
-    id: string; action: 'APPROVE'; reason: string; idempotencyKey: string; actor: string;
-  }) => Promise<{ status: string }>,
-  database: Db,
-  id: string,
-  key: string
-): Promise<{ ok: boolean; status: string }> {
-  try {
-    const result = await transitionPolicy({
-      id,
-      action: 'APPROVE',
-      reason: 'test latest-semantics matrix',
-      idempotencyKey: key,
-      actor: 'test:promotion-gate',
-    });
-    return { ok: true, status: result.status };
-  } catch (error) {
-    assert.match(String((error as Error)?.message || error), /ADAPTIVE_POLICY_EVALUATION_REQUIRED/);
-    return { ok: false, status: await statusOf(database, id) };
-  }
-}
-
 async function statusOf(database: Db, id: string): Promise<string> {
   return (
     await database.query('SELECT status FROM portfolio_policies WHERE id=$1', [id])
@@ -217,6 +194,134 @@ maybe('APPROVED policy with genuine PASS advances to CANARY', async () => {
     actor: 'test:promotion-gate',
   });
   assert.equal(canary.status, 'CANARY');
+});
+
+async function approveAs(
+  transitionPolicy: (input: {
+    id: string; action: 'APPROVE'; reason: string; idempotencyKey: string; actor: string;
+  }) => Promise<{ status: string }>,
+  database: Db,
+  id: string,
+  key: string
+): Promise<{ ok: boolean; status: string }> {
+  try {
+    const result = await transitionPolicy({
+      id,
+      action: 'APPROVE',
+      reason: 'test latest-semantics matrix',
+      idempotencyKey: key,
+      actor: 'test:promotion-gate',
+    });
+    return { ok: true, status: result.status };
+  } catch (error) {
+    assert.match(String((error as Error)?.message || error), /ADAPTIVE_POLICY_EVALUATION_REQUIRED/);
+    return { ok: false, status: await statusOf(database, id) };
+  }
+}
+
+maybe('non-evaluated transitions and CANARY singleton behave correctly', async () => {
+  const database = await db();
+  const { transitionPolicy } = await import('./portfolioAllocator');
+  const tag = `matrix:${Date.now()}:${process.pid}`;
+  // FIXED_BEST_FIRST policies carry no evaluation requirement.
+  const { createPolicy } = await import('./portfolioAllocator');
+  const fixed = await createPolicy({
+    policyKey: `test-matrix-fixed:${tag}`,
+    policyType: 'FIXED_BEST_FIRST',
+    configuration: { ...BASE_CONFIG, programFloors: { [`test:matrix:fixed:${tag}`]: 0 } },
+    actor: 'test:promotion-gate',
+  });
+  const approvedFixed = await transitionPolicy({
+    id: fixed.id,
+    action: 'APPROVE',
+    reason: 'test fixed approve needs no eval',
+    idempotencyKey: `test-matrix-fixed-approve:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  assert.equal(approvedFixed.status, 'APPROVED');
+  // BANDIT PAUSE/ROLLBACK need no evaluation; PAUSED can return to CANARY only with PASS.
+  const bandit = await createPolicy({
+    policyKey: `test-matrix-bandit:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: { ...BASE_CONFIG, programFloors: { [`test:matrix:bandit:${tag}`]: 0 } },
+    actor: 'test:promotion-gate',
+  });
+  await assert.rejects(
+    transitionPolicy({
+      id: bandit.id,
+      action: 'PAUSE',
+      reason: 'test invalid draft pause',
+      idempotencyKey: `test-matrix-bandit-pause:${tag}`,
+      actor: 'test:promotion-gate',
+    }),
+    /INVALID_POLICY_TRANSITION/
+  );
+  const banditBase = await freshPolicy(database, `banditbase:${tag}`);
+  await seedEvaluation(database, `bandit:${tag}`, bandit.id, banditBase.id, 'PASS');
+  await transitionPolicy({
+    id: bandit.id,
+    action: 'APPROVE',
+    reason: 'test bandit approve',
+    idempotencyKey: `test-matrix-bandit-approve:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  const paused = await transitionPolicy({
+    id: bandit.id,
+    action: 'PAUSE',
+    reason: 'test approved pause needs no eval',
+    idempotencyKey: `test-matrix-bandit-pause2:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  assert.equal(paused.status, 'PAUSED');
+  const retired = await transitionPolicy({
+    id: bandit.id,
+    action: 'ROLLBACK',
+    reason: 'test paused rollback retires',
+    idempotencyKey: `test-matrix-bandit-rollback:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  assert.equal(retired.status, 'RETIRED');
+  // Second CANARY pauses the first (singleton invariant).
+  const first = await freshPolicy(database, `first:${tag}`);
+  const firstBase = await freshPolicy(database, `firstbase:${tag}`);
+  await seedEvaluation(database, `first:${tag}`, first.id, firstBase.id, 'PASS');
+  await transitionPolicy({
+    id: first.id,
+    action: 'APPROVE',
+    reason: 'test first approve',
+    idempotencyKey: `test-matrix-first-approve:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  await transitionPolicy({
+    id: first.id,
+    action: 'CANARY',
+    reason: 'test first canary',
+    idempotencyKey: `test-matrix-first-canary:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  const second = await freshPolicy(database, `second:${tag}`);
+  const secondBase = await freshPolicy(database, `secondbase:${tag}`);
+  await seedEvaluation(database, `second:${tag}`, second.id, secondBase.id, 'PASS');
+  await transitionPolicy({
+    id: second.id,
+    action: 'APPROVE',
+    reason: 'test second approve',
+    idempotencyKey: `test-matrix-second-approve:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  await transitionPolicy({
+    id: second.id,
+    action: 'CANARY',
+    reason: 'test second canary pauses first',
+    idempotencyKey: `test-matrix-second-canary:${tag}`,
+    actor: 'test:promotion-gate',
+  });
+  assert.equal(await statusOf(database, second.id), 'CANARY');
+  assert.equal(await statusOf(database, first.id), 'PAUSED');
+  const canaryCount = (
+    await database.query(`SELECT count(*)::int AS n FROM portfolio_policies WHERE status='CANARY'`)
+  ).rows[0];
+  assert.equal(Number(canaryCount.n), 1, 'at most one CANARY policy may exist');
 });
 
 maybe('only the latest evaluation for the candidate authorizes promotion', async () => {
