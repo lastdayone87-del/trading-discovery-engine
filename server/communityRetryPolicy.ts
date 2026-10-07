@@ -21,6 +21,9 @@ export interface CommunityRetryObservation {
   retryable: boolean;
   retryAt?: number;
   failureClass?: string;
+  requestedUrl?: string;
+  rootUrl?: string;
+  relevanceTier?: string;
   telemetry?: {
     pagesInspected?: unknown;
     requestsStarted?: unknown;
@@ -201,7 +204,20 @@ export function retryAtFromUnknown(error: any, now = Date.now()): number | undef
  */
 const DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES = new Set([
   'UNSUPPORTED_CONTENT_TYPE',
+  // Confirmed permanent barriers are terminal: refetching the identical
+  // login form / paywall cannot produce community evidence. Rate limits,
+  // 403s, 999s, NO_PAGE, transient/network/bot failures stay retryable per
+  // bounded policy (uncertain barrier → retryable; conclusive → terminal).
+  'LOGIN_WALL',
+  'PAYWALL_WALL',
 ]);
+
+/**
+ * Static budget-gap partials that may own bounded retry when the
+ * partial-static flag enables them. Independent of relevance: relevance
+ * never decides retry eligibility for these rows.
+ */
+export const STATIC_BUDGET_GAP_FAILURE_CLASS = 'STATIC_BUDGET_GAP';
 
 /**
  * Failure classes on FOUND rows that may still own bounded recovery: the
@@ -238,6 +254,13 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   if (DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES.has(String(item.failureClass || '').toUpperCase())) {
     return false;
   }
+  // Clearly-unrelated URLs classified BLOCKED by the acquisition relevance
+  // layer never own retry. Independent: when the classifier is disabled,
+  // errored, or missing, no observation carries relevanceTier BLOCKED, so
+  // existing PR #504 behavior is byte-identical. This check never makes an
+  // otherwise ineligible observation eligible.
+  const relevanceTier = (item as { relevanceTier?: unknown }).relevanceTier;
+  if (relevanceTier === 'BLOCKED') return false;
   // Auxiliary/demoted URLs (affiliate, broker, transactional, no-community
   // commerce) never own channel-level retry: their evidence is retained on
   // success and their telemetry stays in the ledger, but a failure there
@@ -259,6 +282,20 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
     return item.required !== false &&
       item.retryable === true &&
       FOUND_GAP_RETRYABLE_FAILURE_CLASSES.has(String(item.failureClass || ''));
+  }
+  // Safe partial-static gaps own bounded retry even though static seeds run
+  // with required=false: the ceiling truncated real coverage (queue/depth/
+  // explore/response caps or truncated response), so absence is unproven.
+  // Independent of relevance; existing budgets/bounds still apply, and retry
+  // re-runs static first with browser escalation only per existing policy.
+  if (
+    item.outcome === 'PARTIALLY_INSPECTED' &&
+    String(item.failureClass || '') === STATIC_BUDGET_GAP_FAILURE_CLASS &&
+    item.retryable === true &&
+    item.surface !== 'YOUTUBE_ABOUT' &&
+    item.surface !== 'RECENT_VIDEO_DESCRIPTIONS'
+  ) {
+    return true;
   }
   return item.required !== false &&
     (item.outcome === 'ACQUISITION_FAILED' || item.outcome === 'PARTIALLY_INSPECTED') &&

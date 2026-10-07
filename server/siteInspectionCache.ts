@@ -168,8 +168,18 @@ function normalizeCoverageKey(raw: string): string | null {
 export function siteInspectionCoversRequest(
   row: Pick<CachedSiteInspection, 'outcome' | 'canonicalUrl' | 'finalUrl' | 'observations' | 'candidates'>,
   requestedUrl: string,
+  options?: { strictFoundCoverage?: boolean },
 ): boolean {
-  if (row.outcome === 'FOUND') return true;
+  // Path-aware FOUND borrowing (R6 follow-up, flag-gated by caller):
+  // legacy borrows FOUND regardless of path (registrable-domain-only),
+  // letting unrelated short-link slugs inherit another URL's FOUND merely
+  // via shared domain. Strict mode requires a valid coverage-key/binding
+  // match for FOUND too; borrowers without a match fall through to their
+  // own acquisition. Same-site brand sharing that spans paths recrawls
+  // (recall-safe cost); genuine redirect chains resolve via exact bindings.
+  const strictFound = options?.strictFoundCoverage !== false;
+  if (row.outcome === 'FOUND' && !strictFound) return true;
+  // Strict (default): FOUND falls through to coverage-key check below.
   const want = normalizeCoverageKey(requestedUrl);
   if (!want) return false;
   const covered = new Set<string>();
