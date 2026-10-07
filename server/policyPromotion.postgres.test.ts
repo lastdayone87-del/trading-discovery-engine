@@ -424,3 +424,28 @@ maybe('duplicate transition_key across policies fails closed without silent audi
   );
   assert.equal(await statusOf(database, second.id), 'DRAFT');
 });
+
+maybe('identical evaluated_at resolves by insertion order, never UUID order', async () => {
+  const database = await db();
+  const { transitionPolicy } = await import('./portfolioAllocator');
+  const stamp = new Date(Date.now() - 3600_000).toISOString();
+  // PASS inserted first, FAIL second, same evaluated_at: FAIL (inserted later) wins.
+  const tagA = `tie-pf:${Date.now()}:${process.pid}`;
+  const candA = await freshPolicy(database, tagA);
+  const baseA = await freshPolicy(database, `base:${tagA}`);
+  await seedEvaluation(database, `${tagA}:pass`, candA.id, baseA.id, 'PASS', stamp);
+  await seedEvaluation(database, `${tagA}:fail`, candA.id, baseA.id, 'FAIL', stamp);
+  await assert.rejects(
+    transitionPolicy({ id: candA.id, action: 'APPROVE', reason: 'tie: later FAIL must win', idempotencyKey: `test-tie-pf:${tagA}`, actor: 'test:promotion-gate' }),
+    /ADAPTIVE_POLICY_EVALUATION_REQUIRED/
+  );
+  assert.equal(await statusOf(database, candA.id), 'DRAFT');
+  // FAIL inserted first, PASS second, same evaluated_at: PASS (inserted later) wins.
+  const tagB = `tie-fp:${Date.now()}:${process.pid}`;
+  const candB = await freshPolicy(database, tagB);
+  const baseB = await freshPolicy(database, `base:${tagB}`);
+  await seedEvaluation(database, `${tagB}:fail`, candB.id, baseB.id, 'FAIL', stamp);
+  await seedEvaluation(database, `${tagB}:pass`, candB.id, baseB.id, 'PASS', stamp);
+  const promoted = await transitionPolicy({ id: candB.id, action: 'APPROVE', reason: 'tie: later PASS must win', idempotencyKey: `test-tie-fp:${tagB}`, actor: 'test:promotion-gate' });
+  assert.equal(promoted.status, 'APPROVED');
+});
