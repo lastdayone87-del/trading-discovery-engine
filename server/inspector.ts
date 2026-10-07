@@ -4,7 +4,7 @@ import { InspectionStep } from '../src/types';
 import { getChannelById, getSiteInspections, upsertSiteInspection, recordCreatorSiteLinks, getSiteProfiles, recordPageCoverage, upsertFrontierQueueItem, countFrontierQueue, accumulateRouteStats, upsertSiteProfile, type SiteInspectionRow } from './db';
 import { routePatternFor, shouldAccumulateRouteObservation, evaluateDomainWeightShadow, isDomainWeightExperimentConsumptionEnabled, type DomainWeightShadowEvaluation } from './domainLearner';
 import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition, isFrontierEnabled, MAX_FRONTIER_PAGES_PER_SITE, MAX_FRONTIER_QUEUE_PER_SITE, FRONTIER_POLICY_VERSION, type FrontierCrawlOptions } from './frontierManager';
-import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
+import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, isExactBarrierPageCover, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
@@ -13,10 +13,21 @@ import { normalizeVisitUrl, type BrowserFallbackBudget } from './browserCommunit
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isAuxiliaryForOutcome,acquisitionOwnershipUrl,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface,assessCrawlAdmission,recoverTruncatedQueryToRoot,isPossiblyTruncatedPath} from './communitySurfacePolicy';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
 import { extractHeadDiscovery, isSiteProfilerEnabled, runSiteProfiler } from './siteProfiler';
-import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
+import {clampRetryAtTimestamp, communityAcquisitionRetryDirective, isCommunityRetryableObservation, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
 import {renderedCrawlerTelemetry, staticCrawlerTelemetry, createDropCounter, type CrawlerTelemetry, type CeilingKind, type ExperimentAttribution} from './crawlerTelemetry';
 import {fetchUrlFailureHistory, skippedUrlsFromHistory, normalizeSkipUrl, hasConsecutiveTimeoutExhaustion, type UrlFailureRow} from './crawlUrlSkipPolicy';
 import { readBoundedResponseText } from './crawlResponseBounds';
+import { classifyUrlRelevance, type RelevanceDecision } from './acquisitionRelevance';
+import {
+  isRelevanceEnforcementEnabled,
+  isLoginBlockSemanticsEnabled,
+  isPathAwareShortlinkBorrowEnabled,
+  isPartialStaticRetryEnabled,
+} from './r6FollowupFlags';
+import { isConfirmedLoginWall, LOGIN_WALL_FAILURE_CLASS, isConfirmedPaywall, PAYWALL_FAILURE_CLASS } from './loginWallDetection';
+import { hasBlockMarkers } from './permanentBlockDetection';
+import { isConclusivePermanentBlock, PERMANENT_ACCESS_BLOCK_FAILURE_CLASS } from './permanentBlockDetection';
+import { STATIC_BUDGET_GAP_FAILURE_CLASS } from './communityRetryPolicy';
 
 export type SampledVideoInput =
   | string
@@ -217,7 +228,27 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch):Promise<{pag
   try{
     const response=await fetchImpl(url,{signal:controller.signal,headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8','Accept-Language':'en-US,en;q=0.5'},redirect:'follow'});
     const contentType=response.headers.get('content-type')||'';
-    if(!response.ok){const retryable=response.status===429||response.status>=500,retryAfter=response.headers.get('retry-after')||'',retryAfterSeconds=Number(retryAfter),retryAt=retryable?(Number.isFinite(retryAfterSeconds)?clampRetryAtTimestamp(Date.now()+Math.max(0,retryAfterSeconds*1000)):clampRetryAtTimestamp(Date.parse(retryAfter)||undefined)):undefined;return {page:null,observation:{requestedUrl:url,finalUrl:response.url||url,outcome:'ACQUISITION_FAILED',retryable,httpStatus:response.status,failureClass:response.status===429?'RATE_LIMIT':response.status>=500?'TRANSIENT_HTTP':'HTTP_ERROR',retryAt,detail:`HTTP ${response.status}`}};}
+    if(!response.ok){
+      // Uncertain barrier → retryable (only conclusive permanent barriers go
+      // terminal): 401/403 stay retryable until the bounded identical-history
+      // + markers rule establishes permanence at the seed loop. 429/5xx keep
+      // existing retryable behavior with Retry-After clamping.
+      const retryable=response.status===429||response.status>=500||response.status===401||response.status===403,retryAfter=response.headers.get('retry-after')||'',retryAfterSeconds=Number(retryAfter),retryAt=retryable?(Number.isFinite(retryAfterSeconds)?clampRetryAtTimestamp(Date.now()+Math.max(0,retryAfterSeconds*1000)):clampRetryAtTimestamp(Date.parse(retryAfter)||undefined)):undefined;
+      // Permanent-block content probe (additive, still a failure): on
+      // 401/403, bounded body read for block markers. Read from the ORIGINAL
+      // response (never clone: tee-ing would leave the other branch buffering
+      // unboundedly while holding the connection; the failure path needs
+      // nothing else from the body). Markers inform the conclusive
+      // permanent-block rule at the seed loop (which additionally requires
+      // identical bounded-retry history, otherwise retryable).
+      let blockMarkers = false;
+      if(response.status===401||response.status===403){
+        try{
+          const probe = await readBoundedResponseText(response);
+          blockMarkers = hasBlockMarkers(probe.text);
+        }catch{ blockMarkers = false; }
+      }
+      return {page:null,observation:{requestedUrl:url,finalUrl:response.url||url,outcome:'ACQUISITION_FAILED',retryable,httpStatus:response.status,failureClass:response.status===429?'RATE_LIMIT':response.status>=500?'TRANSIENT_HTTP':'HTTP_ERROR',retryAt,detail:`HTTP ${response.status}`,...(blockMarkers?{blockMarkers:true}:{})}};}
     if(!contentType.includes('text/html')&&!contentType.includes('json')&&!contentType.includes('plain'))return {page:null,observation:{requestedUrl:url,finalUrl:response.url||url,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:response.status,failureClass:'UNSUPPORTED_CONTENT_TYPE',detail:`Unsupported content type ${contentType||'unknown'}`}};
     const bounded=await readBoundedResponseText(response);
     return {page:{html:bounded.text,finalUrl:response.url||url,truncated:bounded.truncated}};
@@ -270,7 +301,7 @@ function preserveResolvedWrapperProvenance(wrapperCandidate:DiscordCandidate,nat
 
 /** Bounded static acquisition that retains every Discord candidate observed
  * within the page budget. A first invite is evidence, not a stop condition. */
-export async function crawlExternalLinks(links:string[],logDetails:string[]=[],debugLog?:any,fetchImpl:typeof fetch=fetch,surface:AcquisitionSurface='CREATOR_WEBSITES',required=false,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]|SharedStaticInventory):Promise<ExternalDiscordCrawlResult>{
+export async function crawlExternalLinks(links:string[],logDetails:string[]=[],debugLog?:any,fetchImpl:typeof fetch=fetch,surface:AcquisitionSurface='CREATOR_WEBSITES',required=false,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]|SharedStaticInventory,r6Options?:{loginSemantics?:boolean;partialStaticRetry?:boolean}):Promise<ExternalDiscordCrawlResult>{
   let scannedCount=0;const observations:ExternalAcquisitionObservation[]=[];const discovered:DiscordCandidate[]=[];const domainWeightShadows:DomainWeightShadowEvaluation[]=[];
   // Shared-visit pre-seeding (v2 L1): terminal-success finals inspected by an
   // earlier same-inspection crawl are never refetched. Same-tier evidence
@@ -475,7 +506,44 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     }if(next.depth>=2){const unvisitedChildren=children.filter(child=>(!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')));if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else for(const child of children)if((!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')))queue.push({...child,depth:next.depth+1});}
     if(queue.some(item=>!visited.has(item.url)))seedCeiling??='exploration-limit';const leftoverUnvisited=queue.filter(item=>!visited.has(item.url)).length;if(leftoverUnvisited>0)drops.count('exploration-limit',leftoverUnvisited);
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
-    const foundForSeed=discovered.length>beforeSeed;const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':seedCeiling?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';const sharedRootAttribution=sharedRoot?`Shared static root evidence from ${sharedRoot.bySeed}; `:'';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:false,httpStatus:200,detail:`${sharedRootAttribution}${foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:seedCeiling?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage${truncatedResponse?'; response truncated at the bounded-response cap before full coverage':''}`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:seedCeiling,dropReasons:drops.snapshot(),...(seedExperimentAttribution?{experimentAttribution:{...seedExperimentAttribution,...(seedCeiling==='frontier-yield'?{stoppingReason:'frontier-yield-stop'}:{})}}:{})}),...(sharedRoot?{sharedEvidenceFrom:sharedRoot.bySeed}:{})});
+    const foundForSeed=discovered.length>beforeSeed;
+    // Confirmed login-wall terminal (resolved-flag gated, fail-open):
+    // redirect-to-login + content markers from already-fetched root html,
+    // never on FOUND rows, never URL-only, never shared as final across URLs
+    // (borrow guarded at call site). Generic 429/403/999/NO_PAGE/transient/
+    // network/bot remain retryable per bounded policy. Flags arrive via
+    // r6Options from the inspection runner (single resolved source); direct
+    // callers omitting options get the enabled defaults.
+    const loginFlag = r6Options?.loginSemantics ?? true;
+    let confirmedLogin = false;
+    let confirmedPaywall = false;
+    try {
+      // Truncated roots never confirm barriers: the detector only sees the
+      // bounded prefix, and decisive content past the cut could contradict
+      // the classification. Truncated pages keep incomplete/retryable
+      // semantics (STATIC_BUDGET_GAP) instead of terminal results.
+      if (loginFlag && !foundForSeed && page && page.finalUrl && page.html && page.truncated !== true) {
+        confirmedLogin = isConfirmedLoginWall({
+          requestedUrl: url, finalUrl: page.finalUrl, html: page.html, httpStatus: 200, hasCandidates: false,
+        });
+        if (!confirmedLogin) {
+          confirmedPaywall = isConfirmedPaywall({
+            finalUrl: page.finalUrl, html: page.html, hasCandidates: false,
+          });
+        }
+      }
+    } catch { confirmedLogin = false; confirmedPaywall = false; }
+    const confirmedBarrier = confirmedLogin || confirmedPaywall;
+    const barrierClass = confirmedLogin ? LOGIN_WALL_FAILURE_CLASS : PAYWALL_FAILURE_CLASS;
+    // Safe partial-static gaps (resolved-flag gated, independent):
+    // ceiling-truncated real coverage becomes retryable STATIC_BUDGET_GAP
+    // instead of silent non-retryable partial. Retry re-runs static first;
+    // browser escalation still only per existing policy (no silent expensive
+    // acquisition).
+    const partialFlag = r6Options?.partialStaticRetry ?? true;
+    const staticCeilingKinds = new Set(['queue-cap', 'depth-limit', 'exploration-limit', 'response-cap', 'frontier-yield']);
+    const staticGapRetryable = partialFlag && !foundForSeed && !confirmedBarrier && !!seedCeiling && staticCeilingKinds.has(String(seedCeiling));
+    const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':(seedCeiling||confirmedBarrier)?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';const sharedRootAttribution=sharedRoot?`Shared static root evidence from ${sharedRoot.bySeed}; `:'';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:confirmedBarrier?false:(staticGapRetryable?true:false),httpStatus:200,failureClass:confirmedBarrier?barrierClass:(staticGapRetryable?STATIC_BUDGET_GAP_FAILURE_CLASS:''),detail:`${sharedRootAttribution}${foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:confirmedLogin?`Login wall confirmed at ${page.finalUrl}; absence is not confirmed, no further identical retry`:confirmedPaywall?`Paywall confirmed at ${page.finalUrl}; absence is not confirmed, no further identical retry`:seedCeiling?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage${truncatedResponse?'; response truncated at the bounded-response cap before full coverage':''}`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:seedCeiling,dropReasons:drops.snapshot(),...(seedExperimentAttribution?{experimentAttribution:{...seedExperimentAttribution,...(seedCeiling==='frontier-yield'?{stoppingReason:'frontier-yield-stop'}:{})}}:{})}),...(sharedRoot?{sharedEvidenceFrom:sharedRoot.bySeed}:{})});
     if(frontierOn){
       // P-C root coverage row (flag-gated, best-effort): terminal state
       // reflects the ROOT page's own evidence only (rootCoverageTerminal);
@@ -649,9 +717,9 @@ function requiredGapFromRendered(rendered:BrowserFallbackResult):RenderedRequire
  * single item can never throw out of the Step 4/5 loops and prevent subsequent
  * candidates from being attempted.
  */
-async function safeCrawlStatic(seedUrl:string,debugLog:any,fetchImpl:typeof fetch,surface:AcquisitionSurface,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]|SharedStaticInventory):Promise<{crawlRes:ExternalDiscordCrawlResult}>{
+async function safeCrawlStatic(seedUrl:string,debugLog:any,fetchImpl:typeof fetch,surface:AcquisitionSurface,wrapperUrl?:string,ladderStructured?:boolean,frontier?:FrontierCrawlOptions,seedAdmission?:{admitted:number;considered:number}|null,evaluateDomainWeights?:boolean,preVisited?:string[]|SharedStaticInventory,r6Options?:{loginSemantics?:boolean;partialStaticRetry?:boolean}):Promise<{crawlRes:ExternalDiscordCrawlResult}>{
   try{
-    return {crawlRes:await crawlExternalLinks([seedUrl],[],debugLog,fetchImpl,surface,false,wrapperUrl,ladderStructured,frontier,seedAdmission,evaluateDomainWeights,preVisited)};
+    return {crawlRes:await crawlExternalLinks([seedUrl],[],debugLog,fetchImpl,surface,false,wrapperUrl,ladderStructured,frontier,seedAdmission,evaluateDomainWeights,preVisited,r6Options)};
   }catch(error:any){
     const detail=`Static acquisition isolated for ${seedUrl}; remaining candidates continue.`;
     return {crawlRes:{foundInvite:null,details:detail,outcome:'ACQUISITION_FAILED',observations:[{requestedUrl:seedUrl,wrapperUrl,surface,required:false,outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'ISOLATED_ACQUISITION_ERROR',detail:`${detail} ${error instanceof Error?error.message:String(error)}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})}],candidates:[]}};
@@ -674,7 +742,7 @@ function isolatedRenderedFallback(seedUrl:string,error:any):BrowserFallbackResul
  * e.g. a fallback resolving `complete:true` without processing anything — must
  * never count as a successful inspection.
  */
-function hasProcessedAcquisitionEvidence(item:{telemetry?:CrawlerTelemetry;sharedEvidenceFrom?:string}):boolean{
+export function hasProcessedAcquisitionEvidence(item:{telemetry?:CrawlerTelemetry;sharedEvidenceFrom?:string}):boolean{
   // Shared-evidence rows reference bytes inspected by the lender run in this
   // same inspection: genuine evidence, attributed explicitly, with zero
   // page counters of their own (no inspection is double-counted).
@@ -726,6 +794,15 @@ export function isMeaningfulWebsiteObservation(item: { rootUrl?: string; request
  * unaffected — this gates outcome ownership only.
  */
 export function isCommunityRelevantObservation(item: { rootUrl?: string; requestedUrl: string }): boolean {
+  // Clearly-unrelated BLOCK and low-value DEMOTE tiers never own outcome
+  // (acquisition-layer decision, separate from PR #504 auxiliary logic below
+  // which is preserved). Absent tier (legacy/disabled/failed-open) preserves
+  // existing behavior. Exclusion is outcome-ownership only: demoted seeds are
+  // still crawled static-only and their candidates join websiteCandidates
+  // unfiltered, so a demoted FOUND still retains its invite through the
+  // candidate path exactly like auxiliary successes.
+  const tier = (item as { relevanceTier?: unknown }).relevanceTier;
+  if (tier === 'BLOCK' || tier === 'DEMOTE') return false;
   return isMeaningfulWebsiteObservation(item) && !isAuxiliaryForOutcome(acquisitionOwnershipUrl(item));
 }
 
@@ -1227,11 +1304,105 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     // hold the invite, so a cut-off prefix without bridge evidence still keeps
     // its rendered-fallback eligibility instead of resolving clean.
     if(preview.outcome==='ACQUISITION_FAILED'||(!preview.bridgeEvidence&&!preview.truncated))continue;const {crawlRenderedCommunitySurface:renderMessagingSurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const rendered=await (channelData.renderedFallback||renderMessagingSurface)(item.url).catch((error:any)=>isolatedRenderedFallback(item.url,error));const renderedProcessed=wasRenderedResultProcessed(rendered);const renderedCandidates=normalizedRenderedCandidates(rendered,'CREATOR_WEBSITES',item.url);websiteCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:renderedOutcome,retryable:renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons})});step5Logs.push(renderedCandidates.length?`Messaging rendered fallback retained ${renderedCandidates.length} candidate(s).`:rendered.detail);}}
-  if(websiteUrls.length||messagingUrls.length){step5Logs.push(`Crawling ${websiteUrls.length} website URLs${messagingUrls.length?` (plus ${messagingUrls.length} messaging preview(s) inspected above)`:''}; discovery continues after a first invite.`);for(const item of websiteUrls){
+  if(websiteUrls.length||messagingUrls.length){step5Logs.push(`Crawling ${websiteUrls.length} website URLs${messagingUrls.length?` (plus ${messagingUrls.length} messaging preview(s) inspected above)`:''}; discovery continues after a first invite.`);
+  // R6 relevance pre-pass (flag-gated, fail-open): classify each website seed
+  // from stored pre-acquisition signals only (no fetch). BLOCKED seeds skip
+  // below with audit only (no observation/failure/retry/NO_MATCH); DEMOTED
+  // seeds crawl after eligible, static-only, no render unless bridge/FOUND.
+  // Disabled/errored → legacy order byte-identical.
+  let relevanceEnforcement = false;
+  try { relevanceEnforcement = await isRelevanceEnforcementEnabled(); } catch { relevanceEnforcement = false; }
+  let loginSemantics = true;
+  try { loginSemantics = await isLoginBlockSemanticsEnabled(); } catch { loginSemantics = true; }
+  let strictBorrow = true;
+  try { strictBorrow = await isPathAwareShortlinkBorrowEnabled(); } catch { strictBorrow = true; }
+  let partialStaticRetry = true;
+  try { partialStaticRetry = await isPartialStaticRetryEnabled(); } catch { partialStaticRetry = true; }
+  const relevanceDecisions = new Map<string, RelevanceDecision>();
+  let creatorCanonicalHosts: Set<string> = new Set();
+  try {
+    // Live-refreshed channel links (About-page refresh above merges into
+    // `links`): a creator site discovered during the current inspection gets
+    // the same canonical treatment and never demotes for being new.
+    creatorCanonicalHosts = new Set(creatorWebsiteHostsFromLinks(links || []));
+  } catch { creatorCanonicalHosts = new Set(); }
+  if (relevanceEnforcement && websiteUrls.length > 1) {
+    try {
+      const scored = websiteUrls.map((item, index) => {
+        let decision: RelevanceDecision;
+        try {
+          decision = classifyUrlRelevance({
+            url: item.url,
+            source: (item as { source?: string }).source || '',
+            contextMatches: (item as { contextMatches?: boolean }).contextMatches === true,
+            wrapperUrl: (item as { wrapperUrl?: string }).wrapperUrl,
+            creatorCanonicalHosts,
+          });
+        } catch {
+          decision = classifyUrlRelevance({ url: item.url, source: '', contextMatches: false });
+        }
+        relevanceDecisions.set(item.url, decision);
+        return { item, index, demoted: decision.tier === 'DEMOTE' ? 1 : 0 };
+      });
+      scored.sort((a, b) => a.demoted - b.demoted || a.index - b.index);
+      websiteUrls = scored.map(s => s.item);
+    } catch { /* ordering never breaks inspection */ }
+  }
+  if (debugLog && !Array.isArray((debugLog as { relevanceDecisions?: unknown }).relevanceDecisions)) {
+    (debugLog as { relevanceDecisions?: unknown[] }).relevanceDecisions = [];
+  }
+  for(const item of websiteUrls){
   // R6 admission boundary (shared, defense-in-depth for non-collection seeds
   // such as sitemap nominations): rejected candidates never reach scoring or
   // crawling. Collection-time admission already filters observed links.
   const seedAdmissionCheck=assessCrawlAdmission(item.url);if(!seedAdmissionCheck.eligible){step5Logs.push(`Admission rejected (${seedAdmissionCheck.reasonCode}): ${item.url}; not crawled.`);continue;}
+  // R6 relevance enforcement (flag-gated, fail-open, audit-preserving):
+  // BLOCKED URLs are logged with classification/reason/signals/source/
+  // channel/URL/timestamp, discovery evidence stays recorded via
+  // recordLinks above, and no acquisition observation is created (no
+  // failure, retry ownership, or false INSPECTED_NO_MATCH).
+  let seedRelevance: RelevanceDecision | undefined;
+  if (relevanceEnforcement) {
+    try {
+      seedRelevance = relevanceDecisions.get(item.url) || classifyUrlRelevance({
+        url: item.url,
+        source: (item as { source?: string }).source || '',
+        contextMatches: (item as { contextMatches?: boolean }).contextMatches === true,
+        wrapperUrl: (item as { wrapperUrl?: string }).wrapperUrl,
+        creatorCanonicalHosts,
+      });
+      relevanceDecisions.set(item.url, seedRelevance);
+    } catch { seedRelevance = undefined; }
+    if (seedRelevance && seedRelevance.tier === 'BLOCK') {
+      const audit = `[Relevance BLOCKED] ${item.url} (reason: ${seedRelevance.reason}; signals: host=${seedRelevance.signals.hostname} family=${seedRelevance.signals.platformFamily} path=${seedRelevance.signals.path} source=${seedRelevance.signals.source}; channel=${(channelData as { channelId?: string }).channelId || 'unknown'}; ${new Date().toISOString()})`;
+      step5Logs.push(audit);
+      try {
+        ((debugLog as { relevanceDecisions?: unknown[] }).relevanceDecisions || []).push({
+          url: item.url, tier: 'BLOCK', reason: seedRelevance.reason, signals: seedRelevance.signals,
+          source: (item as { source?: string }).source || '', channelId: (channelData as { channelId?: string }).channelId || null,
+          observedAt: new Date().toISOString(), policyVersion: seedRelevance.policyVersion,
+        });
+      } catch { /* audit never breaks inspection */ }
+      continue;
+    }
+    if (seedRelevance && seedRelevance.tier === 'DEMOTE') {
+      step5Logs.push(`[Relevance DEMOTED] ${item.url} (reason: ${seedRelevance.reason}; static-only, order-last, no render unless bridge/FOUND).`);
+    }
+    // Per-URL audit (flag-gated): every classified seed records tier/reason/
+    // signals/source/channel/URL/timestamp so the classification of any
+    // discovered URL (blocked, demoted, or eligible) is determinable later.
+    if (relevanceEnforcement && seedRelevance) {
+    try {
+      ((debugLog as { relevanceDecisions?: unknown[] }).relevanceDecisions || []).push({
+        url: item.url, tier: seedRelevance.tier,
+        reason: seedRelevance.reason,
+        signals: seedRelevance.signals,
+        source: (item as { source?: string }).source || '', channelId: (channelData as { channelId?: string }).channelId || null,
+        observedAt: new Date().toISOString(), policyVersion: seedRelevance.policyVersion,
+      });
+    } catch { /* audit never breaks inspection */ }
+    }
+  }
   const seedOutcomeStart=acquisitionOutcomes.length,seedCandidateStart=websiteCandidates.length;let seedRenderedCovered=false;
   const repeatSkipWeb=repeatSkipLine(item.url);if(repeatSkipWeb){step5Logs.push(repeatSkipWeb);continue;}
   const seedSiteIdentity=siteIdentityByUrl.get(item.url);
@@ -1254,7 +1425,17 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     else{seedCachedRow=undefined;}
   }
   const seedReusable=seedCachedRow?isSiteInspectionReusable(seedCachedRow,Date.now()):false;
-  const seedCovered=seedCachedRow?siteInspectionCoversRequest(seedCachedRow,coverageUrl):false;
+  const seedCovered=seedCachedRow?siteInspectionCoversRequest(seedCachedRow,coverageUrl,{ strictFoundCoverage: strictBorrow }):false;
+  // Blocked results are never shared as final across URLs: LOGIN_WALL,
+  // PAYWALL_WALL, and PERMANENT_ACCESS_BLOCK rows are coverage facts for
+  // their own exact page only when strictBorrow holds; legacy (flag off)
+  // preserves prior borrow behavior. Exact-page means the borrower's URL
+  // matches the row's canonical/final OR a previously requested/root URL on
+  // the row (same page, e.g. after a login redirect) — never another path on
+  // the same host.
+  if(seedCachedRow&&(seedCachedRow.failureClass==='LOGIN_WALL'||seedCachedRow.failureClass==='PAYWALL_WALL'||seedCachedRow.failureClass==='PERMANENT_ACCESS_BLOCK')&&strictBorrow){
+    if(!isExactBarrierPageCover(seedCachedRow,coverageUrl)){seedCachedRow=undefined;}
+  }
   if(seedCachedRow&&seedReusable&&!seedCovered){
     step5Logs.push(`[Site cache] ${item.url} not covered by cached inspection for ${seedCachedRow.siteIdentity} (cached ${seedCachedRow.lastObservedAt}); recrawling for full path coverage.`);
   }
@@ -1274,13 +1455,78 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     // flag alone never disables borrowing for complete coverage.
     const borrowed=buildBorrowedSiteInspection(seedCachedRow,{requestedUrl:item.url,surface:'CREATOR_WEBSITES',required:false,wrapperUrl:item.wrapperUrl,observedAt:now});
     step5Logs.push(`[Site cache] ${item.url} reuses site inspection for ${seedCachedRow.siteIdentity} (observed ${seedCachedRow.lastObservedAt}); no recrawl, no borrowed candidates.`);
+    // Relevance tagging for borrows (flag-gated): a DEMOTE seed reusing
+    // cached coverage stays non-owning exactly like a fresh demoted crawl.
+    // BLOCKED seeds never reach borrowing (skipped with audit only above).
+    if (relevanceEnforcement && seedRelevance) {
+      for (const obs of borrowed.observations) {
+        (obs as unknown as Record<string, unknown>).relevanceTier = seedRelevance.tier;
+        (obs as unknown as Record<string, unknown>).relevanceReason = seedRelevance.reason;
+      }
+    }
     acquisitionOutcomes.push(...borrowed.observations as unknown as ExternalAcquisitionObservation[]);
     continue;
   }
   if(seedCachedRow&&seedReusable&&seedCovered){
     step5Logs.push(`[Site cache] ${item.url} bypasses borrowed coverage for retry-owned reacquisition of incomplete coverage; re-crawling.`);
   }
-  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,{visitedKeys:[...sharedStaticVisited,...sharedRenderedEvidence.keys()],roots:sharedStaticRoots})).crawlRes;for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}feedSharedStaticRoot(item.url,crawlRes);acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every admitted website URL — including auxiliary,
+  step5Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Context Match: ${item.contextMatches}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'CREATOR_WEBSITES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),ladderOn?ladderSeedAdmission:undefined,evaluateDomainWeights,{visitedKeys:[...sharedStaticVisited,...sharedRenderedEvidence.keys()],roots:sharedStaticRoots},{ loginSemantics, partialStaticRetry })).crawlRes;for(const raw of crawlRes.visitedUrls||[]){const key=normalizeVisitUrl(raw);if(key)sharedStaticVisited.add(key);}feedSharedStaticRoot(item.url,crawlRes);
+  // Relevance telemetry (additive, no semantics): tag static observations with
+  // tier/reason so retry ownership, outcome collapse, and audit can determine
+  // eligibility without changing legacy behavior when disabled (ELIGIBLE).
+  if (relevanceEnforcement && seedRelevance) {
+    for (const obs of crawlRes.observations) {
+      (obs as unknown as Record<string, unknown>).relevanceTier = seedRelevance.tier;
+      (obs as unknown as Record<string, unknown>).relevanceReason = seedRelevance.reason;
+    }
+  }
+  // Conclusive static terminal barrier (visible PARTIAL/FAILED, non-retryable)
+  // never escalates this seed into rendered acquisition, which could
+  // hide/replace the terminal result or restore retry ownership. Site facts
+  // are still captured below as usual.
+  const staticTerminalBarrier = loginSemantics && crawlRes.observations.some(o =>
+    (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
+    (String(o.failureClass || '') === LOGIN_WALL_FAILURE_CLASS ||
+     String(o.failureClass || '') === PAYWALL_FAILURE_CLASS ||
+     String(o.failureClass || '') === PERMANENT_ACCESS_BLOCK_FAILURE_CLASS));
+  // Conclusive permanent block (flag-gated, fail-closed): identical
+  // deterministic 401/403 + markers across bounded retries → terminal
+  // PERMANENT_ACCESS_BLOCK (visible FAILED, non-retryable, never NO_MATCH).
+  // Single failures, missing fields, or non-identical history stay retryable.
+  if (loginSemantics) {
+    try {
+      const seedObs = crawlRes.observations.filter(o => o.requestedUrl === item.url && o.outcome === 'ACQUISITION_FAILED' && String(o.failureClass || '') === 'HTTP_ERROR' && (Number(o.httpStatus) === 401 || Number(o.httpStatus) === 403));
+      for (const obs of seedObs) {
+        const markers = (obs as unknown as Record<string, unknown>).blockMarkers === true;
+        if (!markers) continue;
+        const conclusive = isConclusivePermanentBlock({
+          current: {
+            requestedUrl: obs.requestedUrl, failureClass: obs.failureClass, httpStatus: obs.httpStatus,
+            finalUrl: (obs as { finalUrl?: unknown }).finalUrl, outcome: obs.outcome,
+            pagesInspected: (obs.telemetry as { pagesInspected?: unknown } | undefined)?.pagesInspected,
+            hasCandidates: false, blockMarkers: true,
+          },
+          history: (loadedFailureHistory || [])
+            // Scope to this seed: another candidate URL must neither
+            // contribute to nor break this seed's permanence streak. Timestamps
+            // are preserved so the detector reconstructs true chronology.
+            .filter(row => String(row.requestedUrl || '').trim() === String(obs.requestedUrl || '').trim())
+            .map(row => ({
+              requestedUrl: row.requestedUrl, failureClass: row.failureClass, httpStatus: row.httpStatus,
+              finalUrl: row.finalUrl, outcome: row.outcome, pagesInspected: 0, hasCandidates: false,
+              observedAt: (row as { observedAt?: unknown }).observedAt,
+            })),
+        });
+        if (conclusive) {
+          obs.failureClass = PERMANENT_ACCESS_BLOCK_FAILURE_CLASS;
+          obs.retryable = false;
+          obs.detail = `${obs.detail}; conclusive permanent access block established over bounded identical retries (terminal, no further identical retry)`;
+          step5Logs.push(`[Permanent block] ${item.url} conclusive PERMANENT_ACCESS_BLOCK (identical 401/403 + markers over bounded retries); terminal, visible, no retry.`);
+        }
+      }
+    } catch { /* permanent-block check never breaks inspection */ }
+  }
+  acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step5Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);websiteCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput);const hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');// Eligibility doctrine: every admitted website URL — including auxiliary,
 // broker/affiliate-pattern and promotional hosts — remains eligible for the
 // normal acquisition path below. Static inspection only orders attempts and
 // provides cheap evidence; it never decides whether a site is worth crawling.
@@ -1291,10 +1537,53 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
 // no static attempt, rendered escalation, or retry work can follow. Any
 // syntactically legitimate public website, including a creator URL containing
 // `/referral/`, keeps full rendered eligibility under the existing policy.
-    if(isAuxiliaryTriageCandidate(item)){step5Logs.push(`Auxiliary triage (static-first, still fully eligible for deeper acquisition): ${item.url}`);}if(creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'CREATOR_WEBSITES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step5Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const sharedHit=findRenderedShare(item.url);if(sharedHit){acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:false,outcome:sharedHit.candidatesFound>0?'FOUND':'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:`Shared rendered evidence from ${sharedHit.bySeed} (terminal success, no refetch).`,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:1,clicks:0,complete:true})});step5Logs.push(`[Shared evidence] ${item.url} reuses rendered inspection from ${sharedHit.bySeed}; no refetch.`);await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,false);continue;}const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url,{alreadyVisited:[...sharedRenderedEvidence.keys()]}).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'CREATOR_WEBSITES',item.url);websiteCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:renderedOutcome,retryable:renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});if(renderedCandidates.length&&renderedResult.gapRetryable!==undefined&&!isAuxiliaryForOutcome(item.url))foundGapSeeds.push({url:item.url,retryable:renderedResult.gapRetryable});recordRenderedEvidence(item.url,rendered,renderedCandidates);step5Logs.push(renderedCandidates.length?`Rendered fallback retained ${renderedCandidates.length} candidate(s).`:rendered.detail);seedRenderedCovered=isSufficientRenderedCoverage({complete:rendered.complete,timedOut:rendered.timedOut},renderedProcessed);}}await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,seedRenderedCovered);}if(repeatSkippedCount>0)step5Logs.push(`Skipped ${repeatSkippedCount} repeatedly-failing website URL(s) under the repeat-failure cap; remaining surfaces inspected normally.`);retainCandidates(websiteCandidates);const mergedWebsite=mergeDiscordCandidates(websiteCandidates,ownershipInput),websiteOutcomes=effectiveAcquisitionOutcomes(acquisitionOutcomes.filter(item=>item.surface==='CREATOR_WEBSITES'&&isMeaningfulWebsiteObservation(item)&&isCommunityRelevantObservation(item as {rootUrl?:string;requestedUrl:string})));if(mergedWebsite.length){const inviteCodes=mergedWebsite.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step5Logs.push(`Linked website acquisition retained ${mergedWebsite.length} distinct Discord candidate(s).`);step5Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);const foundRetryableGap=foundGapSeeds.filter(s=>s.retryable).length,foundExhaustedGap=foundGapSeeds.length-foundRetryableGap;if(foundRetryableGap>0)step5Logs.push(`${foundRetryableGap} retained invite surface(s) still have outstanding required evidence with bounded recovery.`);if(foundExhaustedGap>0)step5Logs.push(`${foundExhaustedGap} retained invite surface(s) have exhausted/permanent required gaps (no further retry).`);step5Logs.push(formatLinkedWebsiteAcquisitionSummary(summarizeEffectiveLinkedWebsiteAcquisition(acquisitionOutcomes)));addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites','FOUND',step5Logs,mergedWebsite[0].nativeInviteCode||null,'CUSTOM_DOMAIN',inviteCodes);}else{const websiteSkippedOnly=repeatSkippedRelevantCount>0&&!mergedWebsite.length,failedCount=websiteOutcomes.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspectedCount=websiteOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&hasProcessedAcquisitionEvidence(item)).length,partialCount=websiteOutcomes.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,unevidencedCount=websiteOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&!hasProcessedAcquisitionEvidence(item)).length,failed=failedCount>0,inspected=inspectedCount>0,partial=partialCount>0||unevidencedCount>0;const acquisitionSummary=summarizeEffectiveLinkedWebsiteAcquisition(acquisitionOutcomes);step5Logs.push(formatLinkedWebsiteAcquisitionSummary(acquisitionSummary));step5Logs.push(failed&&inspected?`Effective outcome across unique URLs: ${inspectedCount} inspected successfully; ${failedCount} unavailable after fallback.`:failed?`Effective outcome across unique URLs: ${failedCount} unavailable after fallback; absence is not confirmed.`:(failed||inspected)&&partial?`${partialCount} linked website surface(s) were only partially inspected (crawl budget exhausted before full coverage); absence is not confirmed.`:partialCount>0?`${partialCount} linked website surface(s) were only partially inspected (crawl budget exhausted before full coverage); absence is not confirmed.`:unevidencedCount>0?`${unevidencedCount} linked website surface(s) produced no inspection evidence (zero pages/requests processed); absence is not confirmed.`:'No Discord invite found in successfully inspected linked websites.');addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites',failed?(inspected||partial?'PARTIAL':'ERROR'):partial||websiteSkippedOnly?'PARTIAL':'NOT_FOUND',step5Logs);}}else addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites','SKIPPED',[...admissionRejectionLogs,...admissionRecoveryLogs,...admissionTruncationSignals,'No website or messaging URLs to crawl.']);
+    if(isAuxiliaryTriageCandidate(item)){step5Logs.push(`Auxiliary triage (static-first, still fully eligible for deeper acquisition): ${item.url}`);}
+    // DEMOTE tier (flag-gated, strict static-only): crawled after eligible
+    // with existing static caps (small bounded budget), no browser rendering,
+    // no scrolling/clicking/interaction, and no escalation for any reason —
+    // including static FOUND (invite already retained statically; ownership
+    // is established from static evidence, never via browser for demoted
+    // seeds). Budget remaining is never a reason to escalate demoted seeds.
+    const isDemotedSeed = relevanceEnforcement && seedRelevance && seedRelevance.tier === 'DEMOTE';
+    const demoteSkipsRender = isDemotedSeed === true;
+    if (demoteSkipsRender) {
+      step5Logs.push(`[Relevance DEMOTED] ${item.url} static-only complete (${crawlRes.outcome}); no rendered escalation under any outcome.`);
+    }
+    if (staticTerminalBarrier) {
+      step5Logs.push(`[Terminal barrier] ${item.url} conclusive permanent barrier established statically (${crawlRes.outcome}); no rendered escalation.`);
+    }
+    if(!staticTerminalBarrier && !demoteSkipsRender && creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'CREATOR_WEBSITES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step5Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const sharedHit=findRenderedShare(item.url);if(sharedHit){acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:item.url,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:false,outcome:sharedHit.candidatesFound>0?'FOUND':'INSPECTED_NO_MATCH',retryable:false,httpStatus:200,detail:`Shared rendered evidence from ${sharedHit.bySeed} (terminal success, no refetch).`,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:1,clicks:0,complete:true})});step5Logs.push(`[Shared evidence] ${item.url} reuses rendered inspection from ${sharedHit.bySeed}; no refetch.`);await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,false);continue;}const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url,{alreadyVisited:[...sharedRenderedEvidence.keys()]}).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'CREATOR_WEBSITES',item.url);websiteCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'CREATOR_WEBSITES',required:true,outcome:renderedOutcome,retryable:renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});if(renderedCandidates.length&&renderedResult.gapRetryable!==undefined&&!isAuxiliaryForOutcome(item.url))foundGapSeeds.push({url:item.url,retryable:renderedResult.gapRetryable});recordRenderedEvidence(item.url,rendered,renderedCandidates);step5Logs.push(renderedCandidates.length?`Rendered fallback retained ${renderedCandidates.length} candidate(s).`:rendered.detail);seedRenderedCovered=isSufficientRenderedCoverage({complete:rendered.complete,timedOut:rendered.timedOut},renderedProcessed);}}
+    // Seed-slice relevance tagging (flag-gated): covers rendered + shared-hit
+    // observations pushed above so DEMOTE seeds stay non-owning through every
+    // acquisition path. Static observations were tagged identically earlier.
+    if (relevanceEnforcement && seedRelevance) {
+      for (let tagIndex = seedOutcomeStart; tagIndex < acquisitionOutcomes.length; tagIndex++) {
+        (acquisitionOutcomes[tagIndex] as unknown as Record<string, unknown>).relevanceTier = seedRelevance.tier;
+        (acquisitionOutcomes[tagIndex] as unknown as Record<string, unknown>).relevanceReason = seedRelevance.reason;
+      }
+    }
+    await captureSeedSiteInspection(item,seedOutcomeStart,seedCandidateStart,seedRenderedCovered);}if(repeatSkippedCount>0)step5Logs.push(`Skipped ${repeatSkippedCount} repeatedly-failing website URL(s) under the repeat-failure cap; remaining surfaces inspected normally.`);retainCandidates(websiteCandidates);const mergedWebsite=mergeDiscordCandidates(websiteCandidates,ownershipInput),websiteOutcomes=effectiveAcquisitionOutcomes(acquisitionOutcomes.filter(item=>item.surface==='CREATOR_WEBSITES'&&isMeaningfulWebsiteObservation(item)&&isCommunityRelevantObservation(item as {rootUrl?:string;requestedUrl:string})));if(mergedWebsite.length){const inviteCodes=mergedWebsite.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step5Logs.push(`Linked website acquisition retained ${mergedWebsite.length} distinct Discord candidate(s).`);step5Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);const foundRetryableGap=foundGapSeeds.filter(s=>s.retryable).length,foundExhaustedGap=foundGapSeeds.length-foundRetryableGap;if(foundRetryableGap>0)step5Logs.push(`${foundRetryableGap} retained invite surface(s) still have outstanding required evidence with bounded recovery.`);if(foundExhaustedGap>0)step5Logs.push(`${foundExhaustedGap} retained invite surface(s) have exhausted/permanent required gaps (no further retry).`);step5Logs.push(formatLinkedWebsiteAcquisitionSummary(summarizeEffectiveLinkedWebsiteAcquisition(acquisitionOutcomes)));addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites','FOUND',step5Logs,mergedWebsite[0].nativeInviteCode||null,'CUSTOM_DOMAIN',inviteCodes);}else{const websiteSkippedOnly=repeatSkippedRelevantCount>0&&!mergedWebsite.length,failedCount=websiteOutcomes.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspectedCount=websiteOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&hasProcessedAcquisitionEvidence(item)).length,partialCount=websiteOutcomes.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,unevidencedCount=websiteOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&!hasProcessedAcquisitionEvidence(item)).length,failed=failedCount>0,inspected=inspectedCount>0,partial=partialCount>0||unevidencedCount>0;const acquisitionSummary=summarizeEffectiveLinkedWebsiteAcquisition(acquisitionOutcomes);step5Logs.push(formatLinkedWebsiteAcquisitionSummary(acquisitionSummary));step5Logs.push(failed&&inspected?`Effective outcome across unique URLs: ${inspectedCount} inspected successfully; ${failedCount} unavailable after fallback.`:failed?`Effective outcome across unique URLs: ${failedCount} unavailable after fallback; absence is not confirmed.`:(failed||inspected)&&partial?`${partialCount} linked website surface(s) were only partially inspected (crawl budget exhausted before full coverage); absence is not confirmed.`:partialCount>0?`${partialCount} linked website surface(s) were only partially inspected (crawl budget exhausted before full coverage); absence is not confirmed.`:unevidencedCount>0?`${unevidencedCount} linked website surface(s) produced no inspection evidence (zero pages/requests processed); absence is not confirmed.`:'No Discord invite found in successfully inspected linked websites.');addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites',failed?(inspected||partial?'PARTIAL':'ERROR'):partial||websiteSkippedOnly?'PARTIAL':'NOT_FOUND',step5Logs);}}else addStep('CUSTOM_DOMAINS','Step 4 — Linked Websites','SKIPPED',[...admissionRejectionLogs,...admissionRecoveryLogs,...admissionTruncationSignals,'No website or messaging URLs to crawl.']);
 
   const step6Logs:string[]=[];const socialCandidates:DiscordCandidate[]=[];
-  const repeatSkippedWebsites=repeatSkippedCount;const repeatSkippedRelevantWebsites=repeatSkippedRelevantCount;if(socialBioUrls.length){step6Logs.push(`Crawling ${socialBioUrls.length} social profile URLs; discovery continues after a first invite.`);for(const item of socialBioUrls){const socialAdmissionCheck=assessCrawlAdmission(item.url);if(!socialAdmissionCheck.eligible){step6Logs.push(`Admission rejected (${socialAdmissionCheck.reasonCode}): ${item.url}; not crawled.`);continue;}const repeatSkipSoc=repeatSkipLine(item.url);if(repeatSkipSoc){step6Logs.push(repeatSkipSoc);continue;}step6Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'SOCIAL_PROFILES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),undefined,evaluateDomainWeights)).crawlRes;acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step6Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);socialCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput),hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');if(creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'SOCIAL_PROFILES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step6Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'SOCIAL_PROFILES',item.url);socialCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'SOCIAL_PROFILES',required:true,outcome:renderedOutcome,retryable:renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});}}}if(repeatSkippedCount>repeatSkippedWebsites)step6Logs.push(`Skipped ${repeatSkippedCount-repeatSkippedWebsites} repeatedly-failing social URL(s) under the repeat-failure cap; remaining surfaces inspected normally.`);retainCandidates(socialCandidates);const mergedSocial=mergeDiscordCandidates(socialCandidates,ownershipInput),socialOutcomes=effectiveAcquisitionOutcomes(acquisitionOutcomes.filter(item=>item.surface==='SOCIAL_PROFILES'));if(mergedSocial.length){const inviteCodes=mergedSocial.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step6Logs.push(`Social acquisition retained ${mergedSocial.length} distinct Discord candidate(s).`);step6Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);addStep('SOCIAL_BIO','Step 5 — Social Profile Bios','FOUND',step6Logs,mergedSocial[0].nativeInviteCode||null,'SOCIAL_BIO',inviteCodes);}else{const socialSkippedOnly=(repeatSkippedRelevantCount-repeatSkippedRelevantWebsites)>0&&!mergedSocial.length,failedCount=socialOutcomes.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspectedCount=socialOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&hasProcessedAcquisitionEvidence(item)).length,partialCount=socialOutcomes.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,unevidencedCount=socialOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&!hasProcessedAcquisitionEvidence(item)).length,failed=failedCount>0,inspected=inspectedCount>0,partial=partialCount>0||unevidencedCount>0;step6Logs.push(failed&&inspected?`${inspectedCount} social profile surface(s) were inspected; ${failedCount} remained unavailable after rendered fallback.`:failed?'Social profile acquisition remained incomplete after rendered fallback; absence is not confirmed.':partialCount>0?'Social profile acquisition was only partially inspected (crawl budget exhausted before full coverage); absence is not confirmed.':unevidencedCount>0?'Social profile acquisition produced no inspection evidence (zero pages/requests processed); absence is not confirmed.':'No Discord invite found in inspected social profile bios.');addStep('SOCIAL_BIO','Step 5 — Social Profile Bios',failed?(inspected||partial?'PARTIAL':'ERROR'):partial||socialSkippedOnly?'PARTIAL':'NOT_FOUND',step6Logs);}}else addStep('SOCIAL_BIO','Step 5 — Social Profile Bios','SKIPPED',['No social profile URLs to crawl.']);
+  const repeatSkippedWebsites=repeatSkippedCount;const repeatSkippedRelevantWebsites=repeatSkippedRelevantCount;if(socialBioUrls.length){step6Logs.push(`Crawling ${socialBioUrls.length} social profile URLs; discovery continues after a first invite.`);
+  // Resolved R6 flags for the social loop (single source: DB-backed settings;
+  // disabled settings actually disable the corresponding static behavior here).
+  let socialLoginSemantics = true, socialPartialRetry = true;
+  try { socialLoginSemantics = await isLoginBlockSemanticsEnabled(); } catch { socialLoginSemantics = true; }
+  try { socialPartialRetry = await isPartialStaticRetryEnabled(); } catch { socialPartialRetry = true; }
+  for(const item of socialBioUrls){const socialAdmissionCheck=assessCrawlAdmission(item.url);if(!socialAdmissionCheck.eligible){step6Logs.push(`Admission rejected (${socialAdmissionCheck.reasonCode}): ${item.url}; not crawled.`);continue;}const repeatSkipSoc=repeatSkipLine(item.url);if(repeatSkipSoc){step6Logs.push(repeatSkipSoc);continue;}step6Logs.push(`[Crawling] ${item.url} (Priority Score: ${scoreCommunitySurface(item)}, Source: ${item.source})`);const crawlRes=(await safeCrawlStatic(item.url,debugLog,channelData.externalFetchImpl||fetch,'SOCIAL_PROFILES',item.wrapperUrl,ladderOn,frontierOptsFor(item.url),undefined,evaluateDomainWeights,undefined,{ loginSemantics: socialLoginSemantics, partialStaticRetry: socialPartialRetry })).crawlRes;acquisitionOutcomes.push(...crawlRes.observations);for(const shadow of crawlRes.domainWeightShadows||[])step6Logs.push(`[DomainWeightShadow] site=${shadow.siteIdentity} weights=${shadow.weightsVersion} routes=${shadow.routeCount} baseline=${shadow.baselineTopUrl} shadow=${shadow.shadowPickUrl} agreement=${shadow.agreement}.`);socialCandidates.push(...crawlRes.candidates);const staticMerged=mergeDiscordCandidates(crawlRes.candidates,ownershipInput),hasCreatorOwned=staticMerged.some(c=>c.ownershipStatus==='CREATOR_OWNED');
+    // Conclusive static terminal barrier: same no-escalation rule as website
+    // seeds — a terminal LOGIN_WALL/PAYWALL_WALL/PERMANENT_ACCESS_BLOCK must
+    // stay visible and non-retryable, never replaced by rendered work.
+    const socialTerminalBarrier = socialLoginSemantics && crawlRes.observations.some(o =>
+      (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
+      (String(o.failureClass || '') === 'LOGIN_WALL' ||
+       String(o.failureClass || '') === 'PAYWALL_WALL' ||
+       String(o.failureClass || '') === 'PERMANENT_ACCESS_BLOCK'));
+    if (socialTerminalBarrier) {
+      step6Logs.push(`[Terminal barrier] ${item.url} conclusive permanent barrier established statically (${crawlRes.outcome}); no rendered escalation.`);
+    }
+    if(!socialTerminalBarrier && creatorLikelyTrading&&(crawlRes.outcome!=='FOUND'||!hasCreatorOwned)){const {crawlRenderedCommunitySurface,wasRenderedResultProcessed}=await import('./browserCommunityFallback');const ladderDecision=resolveRenderEscalation({staticOutcome:crawlRes.outcome,creatorLikelyTrading:true,surface:'SOCIAL_PROFILES',hasCreatorOwnedEvidence:crawlRes.outcome==='FOUND'&&hasCreatorOwned});if(ladderOn)step6Logs.push(`[Ladder] render decision for ${item.url}: ${ladderDecision.justification} (${ACQUISITION_LADDER_POLICY_VERSION}).`);const shouldRendered=ladderDecision.escalate;if(shouldRendered){const rendered=await (channelData.renderedFallback||crawlRenderedCommunitySurface)(item.url).catch((error:any)=>isolatedRenderedFallback(item.url,error)),renderedProcessed=wasRenderedResultProcessed(rendered),renderedCandidates=normalizedRenderedCandidates(rendered,'SOCIAL_PROFILES',item.url);socialCandidates.push(...renderedCandidates);const renderedResult=renderedAcquisitionOutcome(rendered,renderedProcessed,renderedCandidates,requiredGapFromRendered(rendered)),renderedOutcome:ExternalAcquisitionStatus=renderedResult.outcome;acquisitionOutcomes.push({requestedUrl:item.url,finalUrl:rendered.foundLocation,wrapperUrl:item.wrapperUrl,surface:'SOCIAL_PROFILES',required:true,outcome:renderedOutcome,retryable:renderedResult.gapRetryable!==undefined?renderedResult.gapRetryable:(rendered.retryable||!renderedProcessed),failureClass:renderedResult.failureClass,detail:rendered.detail,observedAt:now,telemetry:renderedCrawlerTelemetry({inspectedPages:rendered.inspectedPages,clicks:rendered.clicks,complete:rendered.complete,timedOut:rendered.timedOut,telemetry:rendered.telemetry,scrollsUsed:rendered.scrolls||0,dropReasons:rendered.dropReasons,experimentAttribution:ladderRenderAttribution})});}}}if(repeatSkippedCount>repeatSkippedWebsites)step6Logs.push(`Skipped ${repeatSkippedCount-repeatSkippedWebsites} repeatedly-failing social URL(s) under the repeat-failure cap; remaining surfaces inspected normally.`);retainCandidates(socialCandidates);const mergedSocial=mergeDiscordCandidates(socialCandidates,ownershipInput),socialOutcomes=effectiveAcquisitionOutcomes(acquisitionOutcomes.filter(item=>item.surface==='SOCIAL_PROFILES'));if(mergedSocial.length){const inviteCodes=mergedSocial.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step6Logs.push(`Social acquisition retained ${mergedSocial.length} distinct Discord candidate(s).`);step6Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);addStep('SOCIAL_BIO','Step 5 — Social Profile Bios','FOUND',step6Logs,mergedSocial[0].nativeInviteCode||null,'SOCIAL_BIO',inviteCodes);}else{const socialSkippedOnly=(repeatSkippedRelevantCount-repeatSkippedRelevantWebsites)>0&&!mergedSocial.length,failedCount=socialOutcomes.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspectedCount=socialOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&hasProcessedAcquisitionEvidence(item)).length,partialCount=socialOutcomes.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,unevidencedCount=socialOutcomes.filter(item=>item.outcome==='INSPECTED_NO_MATCH'&&!hasProcessedAcquisitionEvidence(item)).length,failed=failedCount>0,inspected=inspectedCount>0,partial=partialCount>0||unevidencedCount>0;step6Logs.push(failed&&inspected?`${inspectedCount} social profile surface(s) were inspected; ${failedCount} remained unavailable after rendered fallback.`:failed?'Social profile acquisition remained incomplete after rendered fallback; absence is not confirmed.':partialCount>0?'Social profile acquisition was only partially inspected (crawl budget exhausted before full coverage); absence is not confirmed.':unevidencedCount>0?'Social profile acquisition produced no inspection evidence (zero pages/requests processed); absence is not confirmed.':'No Discord invite found in inspected social profile bios.');addStep('SOCIAL_BIO','Step 5 — Social Profile Bios',failed?(inspected||partial?'PARTIAL':'ERROR'):partial||socialSkippedOnly?'PARTIAL':'NOT_FOUND',step6Logs);}}else addStep('SOCIAL_BIO','Step 5 — Social Profile Bios','SKIPPED',['No social profile URLs to crawl.']);
 
   if(debugLog&&!debugLog.failureStep)debugLog.failureStep='ALL_EXHAUSTED';const mergedCandidates=mergeDiscordCandidates(discoveredCandidates,ownershipInput);const required=effectiveAcquisitionOutcomes(acquisitionOutcomes.filter(item=>item.required)),communityRequired=required.filter(item=>isDiscordCommunityAcquisitionSurface(item.surface)&&isMeaningfulWebsiteObservation(item as {rootUrl?:string;requestedUrl:string})&&isCommunityRelevantObservation(item as {rootUrl?:string;requestedUrl:string})),failed=communityRequired.some(item=>item.outcome==='ACQUISITION_FAILED'),inspected=communityRequired.some(item=>item.outcome==='INSPECTED_NO_MATCH'&&hasProcessedAcquisitionEvidence(item)),partialCoverage=effectiveAcquisitionOutcomes(acquisitionOutcomes.filter(item=>isDiscordCommunityAcquisitionSurface(item.surface)&&isMeaningfulWebsiteObservation(item as {rootUrl?:string;requestedUrl:string})&&isCommunityRelevantObservation(item as {rootUrl?:string;requestedUrl:string}))).some(item=>item.outcome==='PARTIALLY_INSPECTED'||(item.outcome==='INSPECTED_NO_MATCH'&&!hasProcessedAcquisitionEvidence(item))),
   // Garbage inputs are fully invisible to outcome accounting: only genuine
@@ -1315,5 +1604,12 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const timeoutTailClasses=['RENDERED_TIMEOUT','REQUIRED_UNVISITED_BUDGET_GAP'];
   for(const item of communityRequired){const reqUrl=(item as {requestedUrl?:unknown}).requestedUrl;if(typeof reqUrl!=='string'||!reqUrl)continue;const oc=(item as {outcome?:unknown}).outcome;const fc=String((item as {failureClass?:unknown}).failureClass||'');const timeoutRow=(oc==='ACQUISITION_FAILED'||oc==='PARTIALLY_INSPECTED')&&(fc==='RENDERED_TIMEOUT'||fc==='REQUIRED_UNVISITED_BUDGET_GAP');const foundGapRow=oc==='FOUND'&&(fc==='REQUIRED_UNVISITED_BUDGET_GAP'||fc==='RENDERED_TIMEOUT'||fc==='RENDERED_PARTIAL_COVERAGE');if((timeoutRow||foundGapRow)&&hasConsecutiveTimeoutExhaustion(loadedFailureHistory,reqUrl,2,timeoutTailClasses))consecutiveTimeoutSuppressed.add(normalizeSkipUrl(reqUrl));}
   if(consecutiveTimeoutSuppressed.size){const customStep=steps.find(s=>s.step==='CUSTOM_DOMAINS');if(customStep)customStep.details+=`\nRetry suppressed (consecutive identical budget/timeout tail): ${[...consecutiveTimeoutSuppressed].join(', ')}`;}
-  return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,10),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective(communityRequired,consecutiveTimeoutSuppressed),retrySuppressedUrls:[...consecutiveTimeoutSuppressed],discordCandidates:mergedCandidates};
+  // Eligible static budget gaps join the retry directive input despite
+  // required=false (their predicate exception owns bounded retry); DEMOTE /
+  // BLOCK / auxiliary gaps stay excluded via the predicate itself, and URLs
+  // already covered by communityRequired are deduped. Status accounting above
+  // is unchanged.
+  const coveredRetryUrls=new Set(communityRequired.map(o=>(o as {requestedUrl?:unknown}).requestedUrl));
+  const staticGapExtras=acquisitionOutcomes.filter(o=>!o.required&&(o as {failureClass?:unknown}).failureClass===STATIC_BUDGET_GAP_FAILURE_CLASS&&(o as {retryable?:unknown}).retryable===true&&isCommunityRetryableObservation(o as never)&&!coveredRetryUrls.has((o as {requestedUrl?:unknown}).requestedUrl));
+  return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,10),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective([...communityRequired,...staticGapExtras],consecutiveTimeoutSuppressed),retrySuppressedUrls:[...consecutiveTimeoutSuppressed],discordCandidates:mergedCandidates};
 }

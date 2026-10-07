@@ -53,7 +53,7 @@ test('later successful no-match supersedes an earlier raw acquisition failure fo
   assert.equal(communityAcquisitionRetryDirective(effective),undefined);
   const inspector=readFileSync('server/inspector.ts','utf8');
   assert.match(inspector,/communityRequired=required\.filter\(item=>isDiscordCommunityAcquisitionSurface\(item\.surface\)&&isMeaningfulWebsiteObservation/);
-  assert.match(inspector,/retryDirective:communityAcquisitionRetryDirective\(communityRequired,consecutiveTimeoutSuppressed\)/);
+  assert.match(inspector,/retryDirective:communityAcquisitionRetryDirective\(\[...communityRequired,...staticGapExtras\],consecutiveTimeoutSuppressed\)/);
 });
 
 test('fully inspected no-invite acquisition is completed negative and emits no retry',async()=>{

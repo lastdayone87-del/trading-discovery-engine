@@ -22,6 +22,10 @@ export interface UrlFailureRow {
   failureClass: string | null;
   outcome: string;
   observedAt: string;
+  /** Additive R6 fields for permanent-block establishment (nullable for
+   * legacy callers/rows; absent → rule fails closed to retryable). */
+  httpStatus?: number | null;
+  finalUrl?: string | null;
 }
 
 /**
@@ -200,8 +204,9 @@ export async function fetchUrlFailureHistory(
   if (cleanUrls.length > 0) {
     const res = await db.query(
       `SELECT requested_url AS "requestedUrl", failure_class AS "failureClass",
-              outcome, observed_at AS "observedAt"
-       FROM (SELECT requested_url, failure_class, outcome, observed_at,
+              outcome, observed_at AS "observedAt",
+              http_status AS "httpStatus", final_url AS "finalUrl"
+       FROM (SELECT requested_url, failure_class, outcome, observed_at, http_status, final_url,
                     ROW_NUMBER() OVER (PARTITION BY requested_url ORDER BY observed_at DESC, id DESC) AS rn
              FROM external_acquisition_observations
              WHERE channel_id = $1 AND requested_url = ANY($2::text[])) ranked
@@ -213,7 +218,8 @@ export async function fetchUrlFailureHistory(
   }
   const res = await db.query(
     `SELECT requested_url AS "requestedUrl", failure_class AS "failureClass",
-            outcome, observed_at AS "observedAt"
+            outcome, observed_at AS "observedAt",
+            http_status AS "httpStatus", final_url AS "finalUrl"
      FROM external_acquisition_observations
      WHERE channel_id = $1
      ORDER BY observed_at DESC, id DESC
