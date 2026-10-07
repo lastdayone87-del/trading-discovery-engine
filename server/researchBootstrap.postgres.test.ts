@@ -1334,3 +1334,56 @@ maybe('bootstrap materialization stops once bootstrap authority is lost', async 
     await retireFixtureActions(database, tag);
   }
 });
+
+maybe('disarm cannot commit while a bootstrap materialization holds authority', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, disarmBootstrapControl } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const { getDb } = await import('./dbCore');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `lockrace:${Date.now()}:${process.pid}`;
+  const policy = await createPolicy({
+    policyKey: `test-lock-race:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 2, maxProviderCost: 3000, windowHours: 24,
+    reason: 'test lock race', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const pool = await getDb();
+  const holder = await pool.connect();
+  try {
+    await armRun(configureBootstrapArming, run.id);
+    // Simulate a materialization row holding bootstrap authority: lock the
+    // control row exactly as holdBootstrapRowAuthority does, then race a real
+    // disarm against it. The disarm must block until authority is released,
+    // so a check-then-disarm-then-enqueue interleaving cannot commit.
+    await holder.query('BEGIN');
+    await holder.query(`SELECT * FROM research_control WHERE singleton=true FOR UPDATE`);
+    let disarmed = false;
+    const racing = disarmBootstrapControl('test:research-bootstrap', 'test racing disarm').then(
+      result => { disarmed = true; return result; }
+    );
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(disarmed, false, 'disarm must block while row authority is held');
+    await holder.query('ROLLBACK');
+    const released = await racing;
+    assert.equal(disarmed, true, 'disarm proceeds once authority is released');
+    assert.ok(released, 'disarm commits after the holder releases');
+    const fence = (await database.query('SELECT bootstrap_armed FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fence.bootstrap_armed, false);
+  } finally {
+    try { await holder.query('ROLLBACK'); } catch { /* already settled */ }
+    holder.release();
+    await restoreControl(database, prevControl);
+  }
+});
