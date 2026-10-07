@@ -299,3 +299,23 @@ maybe('only the latest evaluation for the candidate authorizes promotion', async
     { ok: false, status: 'DRAFT' }
   );
 });
+
+maybe('duplicate transition_key across policies fails closed without silent audit skip', async () => {
+  const database = await db();
+  const { transitionPolicy } = await import('./portfolioAllocator');
+  const tag = `conflict:${Date.now()}:${process.pid}`;
+  const first = await freshPolicy(database, `${tag}:first`);
+  const firstBase = await freshPolicy(database, `${tag}:first-base`);
+  await seedEvaluation(database, `${tag}:first`, first.id, firstBase.id, 'PASS');
+  const sharedKey = `test-promotion-shared:${tag}`;
+  const ok = await transitionPolicy({ id: first.id, action: 'APPROVE', reason: 'test first with shared key', idempotencyKey: sharedKey, actor: 'test:promotion-gate' });
+  assert.equal(ok.status, 'APPROVED');
+  const second = await freshPolicy(database, `${tag}:second`);
+  const secondBase = await freshPolicy(database, `${tag}:second-base`);
+  await seedEvaluation(database, `${tag}:second`, second.id, secondBase.id, 'PASS');
+  await assert.rejects(
+    transitionPolicy({ id: second.id, action: 'APPROVE', reason: 'test second reuses shared key', idempotencyKey: sharedKey, actor: 'test:promotion-gate' }),
+    /POLICY_TRANSITION_CONFLICT/
+  );
+  assert.equal(await statusOf(database, second.id), 'DRAFT');
+});

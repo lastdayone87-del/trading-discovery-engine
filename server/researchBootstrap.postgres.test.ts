@@ -526,3 +526,49 @@ maybe('control-plane CANARY arming also requires the latest evaluation to be PAS
     await restoreControl(database, prevControl);
   }
 });
+
+maybe('CANARY allocation requires latest evaluation PASS with baseline (stale PASS refused)', async t => {
+  const { createPolicy } = await import('./portfolioAllocator');
+  const { allocateCanonical } = await import('./persistentResearchController');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `alloc-latest:${Date.now()}:${process.pid}`;
+  const candidate = await createPolicy({
+    policyKey: `test-alloc-latest:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const baseline = await createPolicy({
+    policyKey: `test-alloc-latest-base:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(`base:${tag}`),
+    actor: 'test:research-bootstrap',
+  });
+  await database.query(`UPDATE portfolio_policies SET status='CANARY' WHERE id=$1`, [candidate.id]);
+  const prevControl = await saveControl(database);
+  await armCanaryControl(database, candidate.id);
+  try {
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    // Stale PASS superseded by FAIL must refuse allocation even though a PASS exists.
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at) VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'PASS',$5,$6,'test:research-bootstrap',now()-interval '2 hours')`,
+      [`test-alloc-latest:${tag}:pass`, candidate.id, baseline.id, JSON.stringify({}), JSON.stringify([]), `cs-${tag}-pass`]
+    );
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at) VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'FAIL',$5,$6,'test:research-bootstrap',now()-interval '1 hour')`,
+      [`test-alloc-latest:${tag}:fail`, candidate.id, baseline.id, JSON.stringify({}), JSON.stringify([]), `cs-${tag}-fail`]
+    );
+    await assert.rejects(allocateCanonical(control, 'CANARY', new Date().toISOString()), /EVALUATED_CANARY_POLICY_REQUIRED/);
+    // Newer PASS restores allocation eligibility.
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at) VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'PASS',$5,$6,'test:research-bootstrap',now())`,
+      [`test-alloc-latest:${tag}:pass2`, candidate.id, baseline.id, JSON.stringify({}), JSON.stringify([]), `cs-${tag}-pass2`]
+    );
+    const ok = await allocateCanonical(control, 'CANARY', new Date().toISOString());
+    assert.equal(ok.policyId, candidate.id);
+  } finally {
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [candidate.id]);
+    await restoreControl(database, prevControl);
+  }
+});
