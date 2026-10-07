@@ -518,7 +518,11 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     let confirmedLogin = false;
     let confirmedPaywall = false;
     try {
-      if (loginFlag && !foundForSeed && page && page.finalUrl && page.html) {
+      // Truncated roots never confirm barriers: the detector only sees the
+      // bounded prefix, and decisive content past the cut could contradict
+      // the classification. Truncated pages keep incomplete/retryable
+      // semantics (STATIC_BUDGET_GAP) instead of terminal results.
+      if (loginFlag && !foundForSeed && page && page.finalUrl && page.html && page.truncated !== true) {
         confirmedLogin = isConfirmedLoginWall({
           requestedUrl: url, finalUrl: page.finalUrl, html: page.html, httpStatus: 200, hasCandidates: false,
         });
@@ -1502,10 +1506,16 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
             pagesInspected: (obs.telemetry as { pagesInspected?: unknown } | undefined)?.pagesInspected,
             hasCandidates: false, blockMarkers: true,
           },
-          history: (loadedFailureHistory || []).map(row => ({
-            requestedUrl: row.requestedUrl, failureClass: row.failureClass, httpStatus: row.httpStatus,
-            finalUrl: row.finalUrl, outcome: row.outcome, pagesInspected: 0, hasCandidates: false,
-          })),
+          history: (loadedFailureHistory || [])
+            // Scope to this seed: another candidate URL must neither
+            // contribute to nor break this seed's permanence streak. Timestamps
+            // are preserved so the detector reconstructs true chronology.
+            .filter(row => String(row.requestedUrl || '').trim() === String(obs.requestedUrl || '').trim())
+            .map(row => ({
+              requestedUrl: row.requestedUrl, failureClass: row.failureClass, httpStatus: row.httpStatus,
+              finalUrl: row.finalUrl, outcome: row.outcome, pagesInspected: 0, hasCandidates: false,
+              observedAt: (row as { observedAt?: unknown }).observedAt,
+            })),
         });
         if (conclusive) {
           obs.failureClass = PERMANENT_ACCESS_BLOCK_FAILURE_CLASS;

@@ -112,6 +112,22 @@ describe('confirmed paywall detection (markers + payment, never status-only)', (
     );
   });
 
+  it('quoted JSON-LD isAccessibleForFree is conclusive structured evidence', () => {
+    assert.equal(
+      isConfirmedPaywall({
+        finalUrl: 'https://example.com/article/1',
+        html: '<html><head><script type="application/ld+json">{"@type":"NewsArticle","isAccessibleForFree": false}</script></head><body>subscribe now, billing</body></html>',
+      }),
+      true,
+    );
+    assert.equal(
+      isConfirmedPaywall({
+        finalUrl: 'https://example.com/article/1',
+        html: "<html><body>{'isAccessibleForFree': false} subscription required, premium</body></html>",
+      }),
+      true,
+    );
+  });
   it('disabled/hidden paywall UI with payment text stays non-terminal', () => {
     assert.equal(
       isConfirmedPaywall({

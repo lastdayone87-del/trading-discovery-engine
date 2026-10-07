@@ -177,7 +177,129 @@ test('demoted borrow stays non-owning (tier carried onto borrowed observations)'
   }
 });
 
-// Finding 2: single-attempt 401/403 stays retryable (uncertain → retryable).
+// Finding 1 (Macroscope HIGH): a truncated root response never confirms a
+// login/paywall barrier — the detector only sees the bounded prefix. The
+// truncated page keeps incomplete/retryable STATIC_BUDGET_GAP semantics and
+// never becomes terminal or clean.
+test('truncated root cannot become a conclusive login barrier', async () => {
+  const seed = 'https://example.com/gated-page';
+  const loginPrefix =
+    '<html><body><form action="/login"><input name="user"><input type="password" name="pass">Sign in</form>';
+  const huge = loginPrefix + 'x'.repeat(2_100_000) + '</body></html>';
+  const { result } = await inspect(
+    { channelLinks: [seed] },
+    (async (input: unknown) => {
+      const res = new globalThis.Response(huge, { status: 200, headers: { 'content-type': 'text/html' } });
+      // Redirect-shaped final (would confirm without the truncation guard).
+      Object.defineProperty(res, 'url', { value: `${seed}/login?next=/` });
+      return res;
+    }) as typeof fetch,
+  );
+  const seedObs = result.acquisitionOutcomes.filter(o => o.requestedUrl === seed);
+  assert.ok(seedObs.length > 0, 'seed observations recorded');
+  assert.ok(
+    seedObs.every(o => o.failureClass !== 'LOGIN_WALL' && o.failureClass !== 'PAYWALL_WALL'),
+    'truncated page never terminal',
+  );
+  // Static rows (required:false) keep incomplete/retryable gap semantics; a
+  // complete rendered run may still legitimately resolve clean afterwards.
+  const staticObs = seedObs.filter(o => o.required === false);
+  const partial = staticObs.find(o => o.outcome === 'PARTIALLY_INSPECTED');
+  assert.ok(partial, 'truncated page stays incomplete');
+  assert.equal(partial.retryable, true, 'truncated page stays retryable');
+  assert.equal(partial.failureClass, 'STATIC_BUDGET_GAP', 'budget-gap semantics preserved');
+  assert.ok(
+    staticObs.every(o => o.outcome !== 'INSPECTED_NO_MATCH'),
+    'truncated static page never clean',
+  );
+});
+
+// Findings 3+4: permanent-block history is scoped to the seed URL with real
+// chronology — other URLs neither contribute nor break the streak, and an
+// intervening same-URL success resets it.
+test('permanent block: unrelated URLs ignored, same-URL success resets', async () => {
+  const blockedBody = 'Attention Required! cf-chl Cloudflare challenge';
+  const fetch403 = (async () =>
+    new Response(blockedBody, { status: 403, headers: { 'content-type': 'text/html' } })) as typeof fetch;
+  const seedA = 'https://example.com/gated-a';
+  const historyWithNoise = (async () => [
+    {
+      requestedUrl: seedA, failureClass: 'HTTP_ERROR', httpStatus: 403,
+      finalUrl: seedA, outcome: 'ACQUISITION_FAILED', observedAt: '2026-10-01T00:00:00.000Z',
+    },
+    {
+      requestedUrl: 'https://other.example/unrelated', failureClass: 'HTTP_ERROR', httpStatus: 403,
+      finalUrl: 'https://other.example/unrelated', outcome: 'ACQUISITION_FAILED', observedAt: '2026-10-05T00:00:00.000Z',
+    },
+    {
+      requestedUrl: seedA, failureClass: 'HTTP_ERROR', httpStatus: 403,
+      finalUrl: seedA, outcome: 'ACQUISITION_FAILED', observedAt: '2026-10-06T00:00:00.000Z',
+    },
+  ]) as never;
+  const noisy = await runChannelInspection({
+    channelId: `r6-${Math.random().toString(36).slice(2)}`,
+    channelName: 'R6 Barrier Channel',
+    channelBio: 'Trading notes',
+    channelLinks: [seedA],
+    videoDescriptions: ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'],
+    creatorLikelyTrading: true,
+    enableDebug: false,
+    externalFetchImpl: fetch403,
+    renderedFallback: (async (s: string) => ({
+      foundInvite: null, foundLocation: s, inspectedPages: 1, scrolls: 0, clicks: 0,
+      complete: true, retryable: false, detail: 'x',
+    })) as never,
+    urlFailureHistoryLoader: historyWithNoise,
+    siteInspectionStore: { read: async () => [], write: async () => {}, recordLinks: async () => {} },
+    recentVideoDescriptionsLoader: (async () => []) as never,
+  } as never);
+  const seedObs = noisy.acquisitionOutcomes.filter(o => o.requestedUrl === seedA);
+  assert.ok(
+    seedObs.some(o => o.failureClass === 'PERMANENT_ACCESS_BLOCK' && o.retryable === false),
+    'scoped trailing run (2 priors + current, noise ignored) establishes permanence',
+  );
+
+  const historyWithReset = (async () => [
+    {
+      requestedUrl: seedA, failureClass: 'HTTP_ERROR', httpStatus: 403,
+      finalUrl: seedA, outcome: 'ACQUISITION_FAILED', observedAt: '2026-10-01T00:00:00.000Z',
+    },
+    {
+      requestedUrl: seedA, failureClass: 'HTTP_ERROR', httpStatus: 403,
+      finalUrl: seedA, outcome: 'ACQUISITION_FAILED', observedAt: '2026-10-02T00:00:00.000Z',
+    },
+    {
+      requestedUrl: seedA, failureClass: '', httpStatus: 200,
+      finalUrl: seedA, outcome: 'INSPECTED_NO_MATCH', observedAt: '2026-10-03T00:00:00.000Z',
+    },
+  ]) as never;
+  const reset = await runChannelInspection({
+    channelId: `r6-${Math.random().toString(36).slice(2)}`,
+    channelName: 'R6 Barrier Channel',
+    channelBio: 'Trading notes',
+    channelLinks: [seedA],
+    videoDescriptions: ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'],
+    creatorLikelyTrading: true,
+    enableDebug: false,
+    externalFetchImpl: fetch403,
+    renderedFallback: (async (s: string) => ({
+      foundInvite: null, foundLocation: s, inspectedPages: 1, scrolls: 0, clicks: 0,
+      complete: true, retryable: false, detail: 'x',
+    })) as never,
+    urlFailureHistoryLoader: historyWithReset,
+    siteInspectionStore: { read: async () => [], write: async () => {}, recordLinks: async () => {} },
+    recentVideoDescriptionsLoader: (async () => []) as never,
+  } as never);
+  const resetObs = reset.acquisitionOutcomes.filter(o => o.requestedUrl === seedA);
+  assert.ok(
+    resetObs.every(o => o.failureClass !== 'PERMANENT_ACCESS_BLOCK'),
+    'post-success 403 stays retryable: old failures do not combine across the reset',
+  );
+  assert.ok(
+    resetObs.some(o => o.retryable === true),
+    'post-reset failure remains retryable',
+  );
+});
 test('single 403 remains retryable acquisition failure (not terminal)', async () => {
   const { result } = await inspect(
     { channelLinks: ['https://example.com/gated-page'] },

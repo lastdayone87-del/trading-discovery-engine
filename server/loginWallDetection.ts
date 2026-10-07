@@ -81,8 +81,9 @@ export const PAYWALL_FAILURE_CLASS = 'PAYWALL_WALL';
 function hasPaywallMarkers(html: string): boolean {
   const body = String(html || '');
   if (body.length === 0) return false;
-  // isAccessibleForFree:false is an active machine-readable barrier on its own.
-  const structuredBarrier = /isAccessibleForFree\s*:\s*false/i.test(body);
+  // isAccessibleForFree:false is an active machine-readable barrier on its own,
+  // in plain or quoted JSON-LD form ("isAccessibleForFree": false).
+  const structuredBarrier = /["']?isAccessibleForFree["']?\s*:\s*false/i.test(body);
   // Class-based paywall UI must be ACTIVE: incidental/disabled/hidden UI
   // (e.g. class="paywall-disabled") combined with payment text elsewhere must
   // never read as a live wall. A disabled-qualified paywall marker anywhere
