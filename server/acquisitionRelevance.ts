@@ -10,8 +10,9 @@
  *   evidence preserved; audit logged.
  * - DEMOTE: low-value but potentially relevant. Crawled AFTER eligible,
  *   static-only, existing static caps (small bounded budget), no rendering /
- *   scrolling / clicking / interaction, no escalation merely because budget
- *   remains (escalation only on bridge/FOUND evidence per existing policy).
+ *   scrolling / clicking / interaction, no escalation for any reason (even
+ *   static FOUND retains its invite statically; ownership comes from static
+ *   evidence, never via browser for demoted seeds).
  * - ELIGIBLE: default. Normal acquisition path. Fail-open target for errors,
  *   missing data, unexpected state, or low confidence.
  *
@@ -241,7 +242,7 @@ function isSinglePurposeDetail(signals: RelevanceSignals): boolean {
  * generic creator domains, and /community|/join|/members|/register|/about|
  * /contact paths NEVER block here (production FOUND counterexamples).
  *
- * DEMOTE (static-only, order-last, no render unless bridge/FOUND):
+ * DEMOTE (static-only, order-last, no render under any outcome):
  * - D1 news/article path shape + no hint + no context + not creator-canonical
  *   + low-trust source (0 FOUND obs in 7d; 3 FOUND sites need page-level
  *   proof before any block, so demote only).

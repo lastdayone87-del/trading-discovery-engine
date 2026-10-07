@@ -77,4 +77,38 @@ describe('acquisition relevance tiering (fail-open, recall-safe)', () => {
       'BLOCK',
     );
   });
+
+  it('adversarial: subdomain-login, fragment, asset, wrapper, source guards fail open', () => {
+    // login. subdomain is not a path wall.
+    assert.notEqual(
+      classifyUrlRelevance({ url: 'https://login.example.com/register', source: 'VIDEO_1_DESCRIPTION', contextMatches: false }).tier,
+      'BLOCK',
+    );
+    // Fragment-only login never blocks (spotify #login FOUND precedent).
+    assert.notEqual(
+      classifyUrlRelevance({ url: 'https://open.spotify.com/show/abc#login', source: 'VIDEO_1_DESCRIPTION', contextMatches: false }).tier,
+      'BLOCK',
+    );
+    // Wrapper (redirect chain) needs acquisition, never blocked.
+    assert.notEqual(
+      classifyUrlRelevance({ url: 'https://forms.gle/abc', source: 'VIDEO_1_DESCRIPTION', contextMatches: false, wrapperUrl: 'https://youtube.com/redirect?q=x' }).tier,
+      'BLOCK',
+    );
+    // Non-low-trust source never blocks even on utility shape.
+    assert.notEqual(
+      classifyUrlRelevance({ url: 'https://calendly.com/u/book', source: 'CHANNEL_LINKS', contextMatches: false }).tier,
+      'BLOCK',
+    );
+    // Creator-canonical never blocks.
+    assert.notEqual(
+      classifyUrlRelevance({
+        url: 'https://mycreator.com/book', source: 'VIDEO_1_DESCRIPTION', contextMatches: false,
+        creatorCanonicalHosts: new Set(['mycreator.com']),
+      }).tier,
+      'BLOCK',
+    );
+    // Invalid/asset handled by admission boundary, not relevance BLOCK.
+    const invalid = classifyUrlRelevance({ url: 'https://g/', source: 'VIDEO_1_DESCRIPTION', contextMatches: false });
+    assert.equal(invalid.tier, 'ELIGIBLE');
+  });
 });

@@ -210,6 +210,9 @@ const DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES = new Set([
   // bounded policy (uncertain barrier → retryable; conclusive → terminal).
   'LOGIN_WALL',
   'PAYWALL_WALL',
+  // Conclusive permanent block established over bounded identical retries
+  // (see permanentBlockDetection.ts): terminal, never owns retry.
+  'PERMANENT_ACCESS_BLOCK',
 ]);
 
 /**
