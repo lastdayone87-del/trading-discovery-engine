@@ -1454,3 +1454,112 @@ maybe('terminal settlement failure cannot report a clean completed cycle', async
     await retireFixtureActions(database, tag);
   }
 });
+
+maybe('bootstrap materialization never consumes another run allocated actions', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, materializeCycleBatch } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `scopebatch:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const policy = await createPolicy({
+    policyKey: `test-scope-batch:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  async function fixtureAction(suffix: string): Promise<string> {
+    return String(
+      (
+        await database.query(
+          `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+           VALUES($1,$2,'MINE_TRANSCRIPT_KEYPHRASES','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,100,1,0,'persistent-research-controller-v1',now()+interval '14 days') RETURNING id`,
+          [
+            `test-bootstrap-action:${tag}:${suffix}`,
+            programId,
+            `scope probe ${tag} ${suffix}`,
+            JSON.stringify({ country: 'US', language: 'en', intent: 'strategy' }),
+            JSON.stringify({
+              sourceType: 'test-scope',
+              sourceKey: `scope-key:${tag}:${suffix}`,
+              creatorChannelId: 'test-scope-channel',
+              text: `genuine scope fixture content ${tag} ${suffix} with enough words to extract candidate spans`,
+              observedAt: new Date().toISOString(),
+            }),
+            JSON.stringify(['test']),
+            `scope-cluster:${tag}:${suffix}`,
+          ]
+        )
+      ).rows[0].id
+    );
+  }
+  async function fixtureAssignment(actionId: string, suffix: string, snapshot: Record<string, unknown>): Promise<void> {
+    await database.query(
+      `INSERT INTO discovery_action_assignments(assignment_key,action_id,policy_key,policy_version,selected,rank,propensity_basis_points,utility,reason_codes,context_snapshot)
+       VALUES($1,$2,$3,$4,true,1,0,1.0,$5,$6)`,
+      [
+        `test-scope-assignment:${tag}:${suffix}`,
+        actionId,
+        `test-scope-policy:${tag}`,
+        '1',
+        JSON.stringify(['TEST_SCOPE_FIXTURE']),
+        JSON.stringify(snapshot),
+      ]
+    );
+  }
+  const actionA = await fixtureAction('a');
+  const actionB = await fixtureAction('b');
+  const actionC = await fixtureAction('c');
+  for (const id of [actionA, actionB, actionC]) {
+    await database.query(`UPDATE discovery_actions SET lifecycle='ALLOCATED' WHERE id=$1`, [id]);
+  }
+  const runA = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 5, maxProviderCost: 5000, windowHours: 24,
+    reason: 'test scope A', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(runA.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  const prevBudget = (await database.query(`SELECT paused, daily_compute_documents FROM corpus_controls WHERE singleton=true`)).rows[0];
+  await fundControlCaps(database);
+  let runBId: string | null = null;
+  try {
+    await fixtureAssignment(actionA, 'a', { bootstrapRunId: runA.id });
+    // Run A dies with its batch untouched: abort retires no actions.
+    await abortResearchBootstrapRun(runA.id, 'test:research-bootstrap', 'test terminate A');
+    runBId = String((await startResearchBootstrapRun({
+      candidatePolicyId: policy.id, maxAssignments: 5, maxProviderCost: 5000, windowHours: 24,
+      reason: 'test scope B', actor: 'test:research-bootstrap',
+    })).id);
+    await fixtureAssignment(actionB, 'b', { bootstrapRunId: runBId as string });
+    await fixtureAssignment(actionC, 'c', { policyKey: `test-scope-policy:${tag}` });
+    await armRun(configureBootstrapArming, runBId as string);
+    // Corpus persist is budget-gated; provision room for exactly this test.
+    await database.query(`UPDATE corpus_controls SET paused=false, daily_compute_documents=100000 WHERE singleton=true`);
+    const batch = await materializeCycleBatch({
+      bootstrapRunId: runBId as string,
+      cutoff: new Date().toISOString(),
+    });
+    assert.equal(batch.corpusMaterialized, 2, 'only own-run and canonical rows may materialize');
+    const lifecycles = Object.fromEntries(
+      (
+        await database.query(`SELECT action_key, lifecycle FROM discovery_actions WHERE action_key LIKE $1`, [`test-bootstrap-action:${tag}:%`])
+      ).rows.map((r: { action_key: string; lifecycle: string }) => [r.action_key, r.lifecycle])
+    );
+    assert.equal(lifecycles[`test-bootstrap-action:${tag}:a`], 'ALLOCATED', 'run A row must never materialize under run B');
+    assert.equal(lifecycles[`test-bootstrap-action:${tag}:b`], 'COMPLETED', 'run B own row stays materializable');
+    assert.equal(lifecycles[`test-bootstrap-action:${tag}:c`], 'COMPLETED', 'canonical row stays materializable');
+    const fence = (await database.query('SELECT bootstrap_armed, bootstrap_run_id FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fence.bootstrap_armed, true);
+    assert.equal(String(fence.bootstrap_run_id), runBId as string);
+  } finally {
+    if (runBId) await abortResearchBootstrapRun(runBId, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+    await database.query(`UPDATE corpus_controls SET paused=$1, daily_compute_documents=$2 WHERE singleton=true`, [prevBudget.paused, prevBudget.daily_compute_documents]).catch(() => undefined);
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
