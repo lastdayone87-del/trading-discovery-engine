@@ -82,6 +82,68 @@ describe('confirmed login-wall detection (redirect + content, never URL-only)', 
   it('fails open on missing input', () => {
     assert.equal(isConfirmedLoginWall({}), false);
   });
+
+  it('/auth/register + password alone is NOT a confirmed login wall', () => {
+    const registerHtml =
+      '<html><body><form action="/auth/register"><input name="email"><input type="password" name="pw">' +
+      '<button>Create your account</button></form><p>Join free today</p></body></html>';
+    assert.equal(
+      isConfirmedLoginWall({
+        requestedUrl: 'https://example.com/invite',
+        finalUrl: 'https://example.com/auth/register',
+        html: registerHtml,
+        httpStatus: 200,
+      }),
+      false,
+    );
+    // Signup copy with a password field and account wording, but no
+    // login-specific evidence, stays retryable/incomplete — never terminal.
+    const signupHtml =
+      '<html><body><form action="/signup"><input type="password" name="pw">' +
+      '<input type="submit" value="Sign up"></form></body></html>';
+    assert.equal(
+      isConfirmedLoginWall({
+        requestedUrl: 'https://example.com/invite',
+        finalUrl: 'https://example.com/login?next=/invite',
+        html: signupHtml,
+        httpStatus: 200,
+      }),
+      false,
+    );
+  });
+
+  it('genuine login/access-gate evidence still confirms', () => {
+    // Login-posting form.
+    assert.equal(
+      isConfirmedLoginWall({
+        requestedUrl: 'https://example.com/page',
+        finalUrl: 'https://example.com/login?next=/page',
+        html: '<html><body><form action="/session"><input name="u"><input type="password" name="p"></form></body></html>',
+        httpStatus: 200,
+      }),
+      true,
+    );
+    // Gate phrasing without a form action.
+    assert.equal(
+      isConfirmedLoginWall({
+        requestedUrl: 'https://example.com/page',
+        finalUrl: 'https://example.com/auth/login',
+        html: '<html><body><p>Log in to continue</p><input type="password" name="p"></body></html>',
+        httpStatus: 200,
+      }),
+      true,
+    );
+    // Forgot-password affordance.
+    assert.equal(
+      isConfirmedLoginWall({
+        requestedUrl: 'https://example.com/page',
+        finalUrl: 'https://example.com/signin',
+        html: '<html><body><input type="password" name="p"><a>Forgot password?</a></body></html>',
+        httpStatus: 200,
+      }),
+      true,
+    );
+  });
 });
 
 describe('confirmed paywall detection (markers + payment, never status-only)', () => {

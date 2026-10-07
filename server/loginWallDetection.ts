@@ -36,9 +36,23 @@ export function isLoginFinalPath(finalUrl: string): boolean {
 function hasLoginFormMarkers(html: string): boolean {
   const body = String(html || '');
   if (body.length === 0) return false;
-  const hasPassword = /type\s*=\s*["']password["']/i.test(body);
-  if (!hasPassword) return false;
-  return /login|signin|sign-in|auth|account|password/i.test(body);
+  // A password field alone proves nothing about the gate: registration and
+  // signup forms also carry one. Require INDEPENDENT login/access-gate
+  // evidence beyond the password input itself (which trivially contains the
+  // word "password", so it must never satisfy the second check on its own).
+  if (!/type\s*=\s*["']password["']/i.test(body)) return false;
+  return (
+    // Form posting to a login/session endpoint (register/signup/join actions
+    // do not match: only login|signin|sign-in|/session).
+    /<form[^>]*action\s*=\s*["'][^"']*(login|signin|sign-in|\/session)[^"']*["']/i.test(body) ||
+    // Login-labeled submit control or button.
+    /type\s*=\s*["']submit["'][^>]*value\s*=\s*["'][^"']*(log\s?in|sign\s?in)/i.test(body) ||
+    /<button[^>]*>\s*(log\s?in|sign\s?in)\b/i.test(body) ||
+    // Forgot-password affordance exists only on login gates.
+    /forgot\s+(your\s+)?password/i.test(body) ||
+    // Explicit gate phrasing ("Log in to continue", "Sign in below").
+    /(log\s?in|sign\s?in)\s+(to|with|using|via|below|here)/i.test(body)
+  );
 }
 
 /**
