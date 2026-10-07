@@ -7,8 +7,8 @@ import assert from 'node:assert/strict';
  *
  *   bootstrap creation → bounded allocation (2 runs × 30) → real cycle driver
  *   → outcomes → effective samples → policy evaluation (genuine PASS) →
- *   promotion attempt (fail-closed on main) → CANARY gate negative → CANARY
- *   operation with genuine PASS evidence.
+ *   governed promotion DRAFT→APPROVED→CANARY on that PASS → PASS-backed
+ *   CANARY allocation (with pre-evidence CANARY refusal asserted first).
  *
  * Run ONLY with an explicitly provided dedicated test database:
  *
@@ -38,11 +38,12 @@ import assert from 'node:assert/strict';
  *
  * Promotion/CANARY boundary (explicitly preserved): the suite NEVER writes
  * portfolio_policy_evaluations. The persistent-research PASS evaluation is
- * genuine; the canonical CANARY/promotion path's refusal (its required legacy
- * evidence is not supplied by the persistent evaluator) is documented, not
- * bypassed. The CANARY status flip itself is harness-only setup (that flip is
- * what is broken on main); the PASS-evidence gate is genuinely exercised in
- * both directions (rejected before evidence, allocating after).
+ * genuine, and governed promotion consumes exactly that artifact (PASS with
+ * non-null baseline for the promoted candidate). The CANARY status reached in
+ * stage 5 purely to set up the pre-evidence refusal remains harness-only
+ * setup; every status change after the PASS goes through transitionPolicy.
+ * The PASS-evidence gate is genuinely exercised in both directions (rejected
+ * before evidence, allocating after).
  */
 const dedicated = process.env.RESEARCH_E2E_TEST_DATABASE_URL;
 
@@ -164,7 +165,21 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       configuration: { ...BASELINE_CONFIG, programFloors: { [`test:e2e:baseline:${tag}`]: 0 } },
       actor: 'test:research-e2e',
     });
-    const windowStart = new Date().toISOString();
+    // Single-clock harness rule: derive the evaluation window start from the
+  // database timestamps themselves, plus a 1s buffer, so created_at <=
+  // windowStart holds regardless of runner/database clock skew AND
+  // microsecond truncation (the replay compares with millisecond ISO bounds).
+  // The sleeps below guarantee every subsequent action/assignment/outcome
+  // timestamp falls strictly inside the window.
+  const windowStart = String(
+    (
+      await database.query(
+        `SELECT (max(created_at) + interval '1 second')::text AS t FROM portfolio_policies WHERE id = ANY($1::uuid[])`,
+        [[candidate.id, baseline.id]]
+      )
+    ).rows[0].t
+  );
+  await new Promise(resolve => setTimeout(resolve, 1200));
 
     // ---- Stage 2: seed 30 high-yield + 30 low-yield PROPOSED actions. ----
     // Controlled provider-generation boundary (see header): realistic action
@@ -252,6 +267,7 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       [...highSet].sort(),
       'run 0 must allocate exactly the 30 high-yield actions'
     );
+    await new Promise(resolve => setTimeout(resolve, 1200));
     const cutoff = new Date().toISOString();
 
     // ---- Stage 4: lifecycle integrity (cycles attributed to the candidate). ----
@@ -291,74 +307,68 @@ maybe('bootstrap-to-CANARY lifecycle works end to end on isolated infrastructure
       actor: 'test:research-e2e',
     })) as unknown as {
       decision: string;
-      candidate: { effectiveSampleSize: number; unsupportedTargetActions: number };
-      baseline: { effectiveSampleSize: number; unsupportedTargetActions: number };
-      incrementalDifference: number;
-      confidenceInterval: { lower: number; upper: number };
-      segmentGuardrails: Record<string, { pass: boolean }>;
+      metrics: {
+        candidate: { effectiveSampleSize: number; unsupportedTargetActions: number };
+        baseline: { effectiveSampleSize: number; unsupportedTargetActions: number };
+        incrementalDifference: number;
+        confidenceInterval: { lower: number; upper: number };
+        segmentGuardrails: Record<string, { pass: boolean }>;
+      };
     };
+    // evaluatePersistentResearchPolicy returns the evaluation ROW: statistics
+    // live under metrics; decision is top-level.
+    const metrics = evaluation.metrics;
+    assert.ok(metrics && metrics.candidate && metrics.baseline, 'evaluation must carry metrics');
     console.log(
       `E2E evaluation decision=${evaluation.decision} ` +
-        `candidateN=${evaluation.candidate.effectiveSampleSize} baselineN=${evaluation.baseline.effectiveSampleSize} ` +
-        `diff=${evaluation.incrementalDifference} ci=[${evaluation.confidenceInterval.lower},${evaluation.confidenceInterval.upper}]`
+        `candidateN=${metrics.candidate.effectiveSampleSize} baselineN=${metrics.baseline.effectiveSampleSize} ` +
+        `diff=${metrics.incrementalDifference} ci=[${metrics.confidenceInterval.lower},${metrics.confidenceInterval.upper}]`
     );
     assert.equal(evaluation.decision, 'PASS', 'designed data must genuinely PASS');
-    assert.ok(evaluation.candidate.effectiveSampleSize >= 30, 'candidate needs ≥30 effective samples');
-    assert.ok(evaluation.baseline.effectiveSampleSize >= 30, 'baseline needs ≥30 effective samples');
-    assert.equal(evaluation.candidate.unsupportedTargetActions, 0, 'no unsupported candidate actions');
-    assert.equal(evaluation.baseline.unsupportedTargetActions, 0, 'no unsupported baseline actions');
-    assert.ok(evaluation.incrementalDifference > 0, 'candidate must improve on baseline');
+    assert.ok(metrics.candidate.effectiveSampleSize >= 30, 'candidate needs ≥30 effective samples');
+    assert.ok(metrics.baseline.effectiveSampleSize >= 30, 'baseline needs ≥30 effective samples');
+    assert.equal(metrics.candidate.unsupportedTargetActions, 0, 'no unsupported candidate actions');
+    assert.equal(metrics.baseline.unsupportedTargetActions, 0, 'no unsupported baseline actions');
+    assert.ok(metrics.incrementalDifference > 0, 'candidate must improve on baseline');
     assert.ok(
-      evaluation.confidenceInterval.lower > 0,
+      metrics.confidenceInterval.lower > 0,
       'improvement confidence interval must exclude zero'
     );
-    const guardrails = Object.values(evaluation.segmentGuardrails || {});
+    const guardrails = Object.values(metrics.segmentGuardrails || {});
     assert.ok(guardrails.length > 0, 'at least one segment guardrail must be evaluated');
     assert.ok(
       guardrails.every(entry => entry.pass),
       'every segment guardrail must pass'
     );
 
-    // ---- Stage 7: promotion fails closed on main (structural gap, documented). ----
-    // NOTHING writes portfolio_policy_evaluations, and transitionPolicy reads
-    // a nonexistent status column there (pre-#506): promotion must refuse with
-    // the gate/database-path error itself — not with an unrelated validation
-    // or NOT_FOUND error (which would mean the test never reached the gate).
-    // Harness reset (labeled): APPROVE is only a legal transition from DRAFT,
-    // so the status returns to DRAFT first; stage 8 re-establishes CANARY.
+    // ---- Stage 7: governed promotion on the genuine PASS evaluation. ----
+    // The bridge gate reads persistent_research_policy_evaluations for this
+    // candidate (PASS + non-null baseline). Harness reset (labeled): APPROVE
+    // is only a legal transition from DRAFT, so the stage-5 CANARY setup
+    // returns to DRAFT first. No portfolio_policy_evaluations row is written.
     await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [candidate.id]);
-    const promotionError = await transitionPolicy({
+    const approved = await transitionPolicy({
       id: candidate.id,
       action: 'APPROVE',
-      reason: 'test e2e promotion attempt',
+      reason: 'test e2e promotion on genuine PASS',
       idempotencyKey: `test-e2e-approve:${tag}`,
       actor: 'test:research-e2e',
-    }).then(
-      () => null,
-      (error: unknown) => (error instanceof Error ? error : new Error(String(error)))
-    );
-    assert.ok(promotionError, 'promotion must fail closed on current main');
-    assert.match(
-      promotionError.message,
-      /ADAPTIVE_POLICY_EVALUATION_REQUIRED|status/i,
-      'failure must be the promotion-gate/database path, not an unrelated error'
-    );
-    assert.doesNotMatch(
-      promotionError.message,
-      /POLICY_REASON_AND_IDEMPOTENCY|PORTFOLIO_POLICY_NOT_FOUND|INVALID_POLICY_TRANSITION/,
-      'failure must occur AT the gate, after validation passes'
-    );
-    const stillDraft = (
-      await database.query('SELECT status FROM portfolio_policies WHERE id=$1', [candidate.id])
-    ).rows[0];
-    assert.equal(stillDraft.status, 'CANARY', 'failed promotion must not change policy status');
+    });
+    assert.equal(approved.status, 'APPROVED', 'genuine PASS must promote DRAFT to APPROVED');
+    const canaryPolicy = await transitionPolicy({
+      id: candidate.id,
+      action: 'CANARY',
+      reason: 'test e2e canary advance on genuine PASS',
+      idempotencyKey: `test-e2e-canary:${tag}`,
+      actor: 'test:research-e2e',
+    });
+    assert.equal(canaryPolicy.status, 'CANARY', 'APPROVED policy with PASS must advance to CANARY');
 
     // ---- Stage 8: CANARY allocates with the GENUINE PASS evidence. ----
-    // CANARY status is re-established here (same harness-only flip as stage
-    // 5); the only change since the stage-5 refusal is the now-existing PASS
-    // evaluation. No portfolio_policy_evaluations row is ever written: the
-    // persistent-vs-legacy mismatch is preserved, not bypassed.
-    await database.query(`UPDATE portfolio_policies SET status='CANARY' WHERE id=$1`, [candidate.id]);
+    // Status reached through the governed promotion path above (the only
+    // direct status write left is the stage-5 negative setup). The delta
+    // since the stage-5 refusal remains exactly the now-existing PASS
+    // evaluation.
     const extraIds: string[] = [];
     for (let index = 0; index < 5; index++) {
       const row = await database.query(
