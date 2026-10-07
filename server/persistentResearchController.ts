@@ -650,12 +650,14 @@ export async function settleCeilingBootstrap(runId: string | null | undefined, c
   if (completed !== true || !runId) return;
   const db = await getDb();
   // The ceiling batch was allocated under valid bootstrap authority. Anything
-  // the materializers could not consume must re-enter the canonical pool as
-  // PROPOSED instead of staying ALLOCATED behind a disarmed control (orphan).
-  // Only untouched ALLOCATED rows revert; RESERVED/QUEUED rows are left alone.
+  // the materializers could not consume is retired to the terminal EXPIRED
+  // lifecycle instead of staying ALLOCATED behind a disarmed control (orphan:
+  // no serving path would ever consume it again). EXPIRED keeps it out of
+  // future allocation pools, so subsequent runs allocate exactly as designed.
+  // Only untouched ALLOCATED rows retire; RESERVED/QUEUED rows are left alone.
   const ids = await ceilingBatchActionIds(String(runId));
   if (ids.length) {
-    await db.query(`UPDATE discovery_actions SET lifecycle='PROPOSED' WHERE id=ANY($1::uuid[]) AND lifecycle='ALLOCATED'`, [ids]);
+    await db.query(`UPDATE discovery_actions SET lifecycle='EXPIRED' WHERE id=ANY($1::uuid[]) AND lifecycle='ALLOCATED'`, [ids]);
   }
   // Release the fence after materialization. Pristine (no intervening normal
   // CANARY reconfig) resets to dormant; otherwise only fence columns clear,

@@ -1175,6 +1175,7 @@ maybe('ceiling completion defers disarm until the batch materializes, then settl
       await database.query(`SELECT lifecycle, count(*)::int AS n FROM discovery_actions WHERE action_key LIKE $1 GROUP BY 1`, [`test-bootstrap-action:${tag}:%`])
     ).rows as Array<{ lifecycle: string; n: number }>;
     assert.equal(states.filter(row => row.lifecycle === 'ALLOCATED').reduce((n, row) => n + Number(row.n), 0), 0);
+    assert.equal(states.filter(row => row.lifecycle === 'EXPIRED').reduce((n, row) => n + Number(row.n), 0), 2);
     const released = (await database.query('SELECT bootstrap_armed FROM research_control WHERE singleton=true')).rows[0];
     assert.equal(released.bootstrap_armed, false);
   } finally {
