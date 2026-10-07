@@ -80,4 +80,13 @@ describe('terminal permanent barrier channel state (relevant-only unresolved)', 
     assert.equal(isCommunityRetryableObservation(transient as never), true);
     assert.equal(hasRetryableCommunityAcquisitionFailure([transient] as never), true);
   });
+
+  it('DEMOTE tier never owns outcome or retry (evidence still crawled statically)', () => {
+    const demoted = { ...barrier, relevanceTier: 'DEMOTE' };
+    assert.equal(isCommunityRelevantObservation(demoted as never), false);
+    assert.equal(isCommunityRetryableObservation(demoted as never), false);
+    assert.equal(hasRetryableCommunityAcquisitionFailure([demoted] as never), false);
+    // ELIGIBLE (or absent tier) preserves existing ownership.
+    assert.equal(isCommunityRelevantObservation({ ...barrier } as never), true);
+  });
 });

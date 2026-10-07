@@ -257,13 +257,16 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   if (DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES.has(String(item.failureClass || '').toUpperCase())) {
     return false;
   }
-  // Clearly-unrelated URLs classified BLOCKED by the acquisition relevance
-  // layer never own retry. Independent: when the classifier is disabled,
-  // errored, or missing, no observation carries relevanceTier BLOCKED, so
-  // existing PR #504 behavior is byte-identical. This check never makes an
-  // otherwise ineligible observation eligible.
+  // Clearly-unrelated (BLOCKED) and low-value demoted (DEMOTE) tiers never
+  // own retry. Independent: when the classifier is disabled, errored, or
+  // missing, no observation carries either tier, so existing PR #504 behavior
+  // is byte-identical. This check never makes an otherwise ineligible
+  // observation eligible. Demoted static gaps stay non-owning: their bounded
+  // static evidence is retained, but low-value incompleteness must not spend
+  // worker retries unless existing acquisition semantics (FOUND gaps,
+  // rendered required failures) genuinely require it through other rows.
   const relevanceTier = (item as { relevanceTier?: unknown }).relevanceTier;
-  if (relevanceTier === 'BLOCKED') return false;
+  if (relevanceTier === 'BLOCKED' || relevanceTier === 'DEMOTE') return false;
   // Auxiliary/demoted URLs (affiliate, broker, transactional, no-community
   // commerce) never own channel-level retry: their evidence is retained on
   // success and their telemetry stays in the ledger, but a failure there

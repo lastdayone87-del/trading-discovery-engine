@@ -780,11 +780,15 @@ export function isMeaningfulWebsiteObservation(item: { rootUrl?: string; request
  * unaffected — this gates outcome ownership only.
  */
 export function isCommunityRelevantObservation(item: { rootUrl?: string; requestedUrl: string }): boolean {
-  // Clearly-unrelated BLOCKED tier never owns outcome (acquisition-layer
-  // decision, separate from PR #504 auxiliary logic below which is preserved).
-  // Absent tier (legacy/disabled/failed-open) preserves existing behavior.
+  // Clearly-unrelated BLOCKED and low-value DEMOTE tiers never own outcome
+  // (acquisition-layer decision, separate from PR #504 auxiliary logic below
+  // which is preserved). Absent tier (legacy/disabled/failed-open) preserves
+  // existing behavior. Exclusion is outcome-ownership only: demoted seeds are
+  // still crawled static-only and their candidates join websiteCandidates
+  // unfiltered, so a demoted FOUND still retains its invite through the
+  // candidate path exactly like auxiliary successes.
   const tier = (item as { relevanceTier?: unknown }).relevanceTier;
-  if (tier === 'BLOCKED') return false;
+  if (tier === 'BLOCKED' || tier === 'DEMOTE') return false;
   return isMeaningfulWebsiteObservation(item) && !isAuxiliaryForOutcome(acquisitionOwnershipUrl(item));
 }
 

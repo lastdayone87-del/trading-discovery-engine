@@ -21,6 +21,21 @@ describe('retry ownership preserves PR504, excludes BLOCKED/LOGIN_WALL, allows s
     );
   });
 
+  it('DEMOTE tier never owns retry (bounded static evidence retained, no worker spend)', () => {
+    assert.equal(
+      isCommunityRetryableObservation({
+        required: false,
+        surface: 'CREATOR_WEBSITES',
+        outcome: 'PARTIALLY_INSPECTED',
+        retryable: true,
+        failureClass: 'STATIC_BUDGET_GAP',
+        requestedUrl: 'https://amzn.to/3ovQMLW',
+        relevanceTier: 'DEMOTE',
+      } as unknown as Parameters<typeof isCommunityRetryableObservation>[0]),
+      false,
+    );
+  });
+
   it('LOGIN_WALL never owns retry (terminal)', () => {
     assert.equal(
       isCommunityRetryableObservation({

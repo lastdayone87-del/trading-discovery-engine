@@ -48,27 +48,56 @@ describe('acquisition relevance tiering (fail-open, recall-safe)', () => {
     assert.equal(decision.tier, 'DEMOTE');
   });
 
-  it('blocks utility scheduling detail only under strict conjunction', () => {
-    const blocked = classifyUrlRelevance({
-      url: 'https://calendly.com/someuser/book-meeting',
-      source: 'VIDEO_1_DESCRIPTION',
-      contextMatches: false,
-    });
-    assert.equal(blocked.tier, 'BLOCK');
-    // Trusted source never blocks.
+  it('utility/form/single-purpose shapes demote (never block: destination uncertain)', () => {
+    // Scheduling can be creator mentorship workflow; forms can be community
+    // applications; amzn.to destinations are opaque (trading book/resource
+    // possible). Low yield is not determinism → DEMOTE, never BLOCK.
+    for (const url of [
+      'https://calendly.com/someuser/book-meeting',
+      'https://forms.gle/Mt45c2qhAvgaUTyG8',
+      'https://amzn.to/3ovQMLW',
+    ]) {
+      const decision = classifyUrlRelevance({ url, source: 'VIDEO_1_DESCRIPTION', contextMatches: false });
+      assert.equal(decision.tier, 'DEMOTE', url);
+    }
+    // Trusted source never even demotes via these rules (guards fail open).
     const trusted = classifyUrlRelevance({
       url: 'https://calendly.com/someuser/book-meeting',
       source: 'CHANNEL_LINKS',
       contextMatches: false,
     });
     assert.notEqual(trusted.tier, 'BLOCK');
-    // Community hint never blocks.
+    // Community hint never demotes/blocks.
     const hinted = classifyUrlRelevance({
       url: 'https://calendly.com/someuser/book-meeting?x=discord',
       source: 'VIDEO_1_DESCRIPTION',
       contextMatches: false,
     });
-    assert.notEqual(hinted.tier, 'BLOCK');
+    assert.equal(hinted.tier, 'ELIGIBLE');
+  });
+
+  it('BLOCK tier is reserved: no semantic rule emits it on representative corpus', () => {
+    const corpus = [
+      'https://tradeify.co/?ref=RDF',
+      'https://bit.ly/btc-discord',
+      'https://linktr.ee/somehandle',
+      'https://x.com/someprofile',
+      'https://apps.apple.com/in/app/classplus/id1324522260',
+      'https://example.com/news/some-article',
+      'https://calendly.com/someuser/book-meeting',
+      'https://forms.gle/abc123',
+      'https://amzn.to/3ovQMLW',
+      'https://example.com/community',
+      'https://noticetrades.substack.com/',
+      'https://github.com/some/repo',
+    ];
+    for (const url of corpus) {
+      assert.notEqual(
+        classifyUrlRelevance({ url, source: 'VIDEO_1_DESCRIPTION', contextMatches: false }).tier,
+        'BLOCK',
+        url,
+      );
+    }
   });
 
   it('community hint / context / creator-canonical never block', () => {

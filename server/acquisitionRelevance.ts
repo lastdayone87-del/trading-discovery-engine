@@ -229,23 +229,25 @@ function isSinglePurposeDetail(signals: RelevanceSignals): boolean {
  * Pure classifier: BLOCK / DEMOTE / ELIGIBLE from stored signals only.
  * Fail-open: any error, missing data, or non-confident state → ELIGIBLE.
  *
- * BLOCK (narrow, multi-signal conjunctions only; replay must show 0 FOUND):
- * - B1 utility-scheduling detail: UTILITY_SCHEDULING + scheduling path +
- *   no community hint + no context + low-trust VIDEO_DESC source +
- *   not creator-canonical + no wrapper + WEBSITE kind.
- * - B2 form detail: FORM + form detail + same guards.
- * - B3 single-purpose commerce redirector: SHORTENER_SINGLE_PURPOSE detail +
- *   same guards.
- * App Store / Play, news/article, generic services, broker/affiliate/
- * tracking/transaction, social, link-hub, community-platform, Substack,
- * Notion, GitHub, Spotify/creator-commerce, generic shorteners, redirects,
- * generic creator domains, and /community|/join|/members|/register|/about|
- * /contact paths NEVER block here (production FOUND counterexamples).
+ * BLOCK is reserved for deterministic cases where acquiring the URL cannot
+ * provide relevant discovery evidence. No current semantic rule meets that
+ * burden: opaque shorteners hide their destination pre-acquisition (an
+ * amzn.to link can point to a trading book/resource), and form/scheduling
+ * destinations can be community application, registration, course, or
+ * creator workflows. Low yield is not determinism, so B1/B2/B3 below emit
+ * DEMOTE (static-only bounded evidence, never outcome-owning), never BLOCK.
+ * App Store / Play, news/article, broker/affiliate/tracking/transaction,
+ * social, link-hub, community-platform, Substack, Notion, GitHub,
+ * Spotify/creator-commerce, generic shorteners, redirects, generic creator
+ * domains, and /community|/join|/members|/register|/about|/contact paths
+ * NEVER block here (production FOUND counterexamples).
  *
  * DEMOTE (static-only, order-last, no render under any outcome):
- * - D1 news/article path shape + no hint + no context + not creator-canonical
- *   + low-trust source (0 FOUND obs in 7d; 3 FOUND sites need page-level
- *   proof before any block, so demote only).
+ * - B1 utility-scheduling detail + guards (scheduling can be mentorship).
+ * - B2 form detail + guards (forms can be community applications).
+ * - B3 single-purpose commerce redirector + guards (opaque destination;
+ *   product pages can carry companion-community evidence).
+ * - D1 news/article path shape + guards.
  * App Store remains ELIGIBLE (2 FOUND rows prove render may matter).
  */
 export function classifyRelevance(signals: RelevanceSignals | null): RelevanceDecision {
@@ -306,24 +308,24 @@ export function classifyRelevance(signals: RelevanceSignals | null): RelevanceDe
     }
     if (signals.platformFamily === 'UTILITY_SCHEDULING' && isSchedulingDetailPath(signals.path)) {
       return {
-        tier: 'BLOCK',
-        reason: 'utility-scheduling-detail:multi-signal-conjunction',
+        tier: 'DEMOTE',
+        reason: 'utility-scheduling-detail:demote-static-only (scheduling can be creator workflow)',
         signals: decisionSignals(signals),
         policyVersion: RELEVANCE_POLICY_VERSION,
       };
     }
     if (signals.platformFamily === 'FORM' && isFormDetailPath(signals.path, signals.queryKeys)) {
       return {
-        tier: 'BLOCK',
-        reason: 'form-detail:multi-signal-conjunction',
+        tier: 'DEMOTE',
+        reason: 'form-detail:demote-static-only (forms can be community applications)',
         signals: decisionSignals(signals),
         policyVersion: RELEVANCE_POLICY_VERSION,
       };
     }
     if (isSinglePurposeDetail(signals)) {
       return {
-        tier: 'BLOCK',
-        reason: 'single-purpose-commerce-redirector:multi-signal-conjunction',
+        tier: 'DEMOTE',
+        reason: 'single-purpose-commerce-redirector:demote-static-only (opaque destination)',
         signals: decisionSignals(signals),
         policyVersion: RELEVANCE_POLICY_VERSION,
       };
