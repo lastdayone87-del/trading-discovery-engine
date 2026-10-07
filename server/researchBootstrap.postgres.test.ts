@@ -1387,3 +1387,70 @@ maybe('disarm cannot commit while a bootstrap materialization holds authority', 
     await restoreControl(database, prevControl);
   }
 });
+
+maybe('terminal settlement failure cannot report a clean completed cycle', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, configureBootstrapArming, runPersistentResearchCycle } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `settlefail:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const policy = await createPolicy({
+    policyKey: `test-settle-fail:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  await database.query(
+    `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+     VALUES($1,$2,'SEARCH_YOUTUBE','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,100,1,0,'persistent-research-controller-v1',now()+interval '14 days')`,
+    [
+      `test-bootstrap-action:${tag}:0`,
+      programId,
+      `settle fail probe ${tag}`,
+      JSON.stringify({ country: 'US', intent: 'strategy' }),
+      JSON.stringify({}),
+      JSON.stringify(['test']),
+      `settle-fail-cluster:${tag}`,
+    ]
+  );
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id, maxAssignments: 1, maxProviderCost: 5000, windowHours: 24,
+    reason: 'test settle fail', actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  const owner = `test-settle-fail:${tag}`;
+  try {
+    await armRun(configureBootstrapArming, run.id);
+    // Force terminal settlement to fail: settling retires the untouched
+    // ceiling batch to EXPIRED, so a temporary CHECK ban on that transition
+    // makes the settlement transaction abort. Nothing else in the cycle
+    // writes EXPIRED, so only the settlement step can trip this.
+    await database.query(`ALTER TABLE discovery_actions DROP CONSTRAINT IF EXISTS test_settle_fail_ck`);
+    await database.query(`ALTER TABLE discovery_actions ADD CONSTRAINT test_settle_fail_ck CHECK (lifecycle <> 'EXPIRED')`);
+    await assert.rejects(
+      runPersistentResearchCycle(owner, new Date().toISOString()),
+      /check constraint/i
+    );
+    // The cycle must not report clean completion with an uncleared fence.
+    const cycle = (
+      await database.query(`SELECT status FROM persistent_research_cycles WHERE lease_owner=$1 ORDER BY started_at DESC LIMIT 1`, [owner])
+    ).rows[0];
+    assert.equal(cycle.status, 'FAILED', 'settlement failure must fail the cycle, not complete it');
+    const fence = (await database.query('SELECT bootstrap_armed, bootstrap_run_id FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fence.bootstrap_armed, true, 'uncleaned fence must stay visible, not silently dropped');
+    assert.equal(String(fence.bootstrap_run_id), run.id);
+    assert.equal((await database.query('SELECT status FROM research_bootstrap_runs WHERE id=$1', [run.id])).rows[0].status, 'COMPLETED');
+  } finally {
+    await database.query(`ALTER TABLE discovery_actions DROP CONSTRAINT IF EXISTS test_settle_fail_ck`);
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
