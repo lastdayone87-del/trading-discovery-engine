@@ -1434,7 +1434,7 @@ maybe('terminal settlement failure cannot report a clean completed cycle', async
     // makes the settlement transaction abort. Nothing else in the cycle
     // writes EXPIRED, so only the settlement step can trip this.
     await database.query(`ALTER TABLE discovery_actions DROP CONSTRAINT IF EXISTS test_settle_fail_ck`);
-    await database.query(`ALTER TABLE discovery_actions ADD CONSTRAINT test_settle_fail_ck CHECK (lifecycle <> 'EXPIRED')`);
+    await database.query(`ALTER TABLE discovery_actions ADD CONSTRAINT test_settle_fail_ck CHECK (lifecycle <> 'EXPIRED' OR action_key NOT LIKE 'test-bootstrap-action:settlefail:%')`);
     await assert.rejects(
       runPersistentResearchCycle(owner, new Date().toISOString()),
       /check constraint/i
