@@ -1047,3 +1047,138 @@ maybe('materialization stops when the control is not serving', async t => {
     await database.query(`UPDATE discovery_actions SET lifecycle='EXPIRED' WHERE id=$1`, [actionId]);
   }
 });
+
+maybe('CANARY allocation requires latest evaluation PASS with baseline (stale PASS refused)', async t => {
+  const { createPolicy } = await import('./portfolioAllocator');
+  const { allocateCanonical } = await import('./persistentResearchController');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `alloc-latest:${Date.now()}:${process.pid}`;
+  const candidate = await createPolicy({
+    policyKey: `test-alloc-latest:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  const baseline = await createPolicy({
+    policyKey: `test-alloc-latest-base:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(`base:${tag}`),
+    actor: 'test:research-bootstrap',
+  });
+  await database.query(`UPDATE portfolio_policies SET status='CANARY' WHERE id=$1`, [candidate.id]);
+  const prevControl = await saveControl(database);
+  await armCanaryControl(database, candidate.id);
+  try {
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    // Stale PASS superseded by FAIL must refuse allocation even though a PASS exists.
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at) VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'PASS',$5,$6,'test:research-bootstrap',now()-interval '2 hours')`,
+      [`test-alloc-latest:${tag}:pass`, candidate.id, baseline.id, JSON.stringify({}), JSON.stringify([]), `cs-${tag}-pass`]
+    );
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at) VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'FAIL',$5,$6,'test:research-bootstrap',now()-interval '1 hour')`,
+      [`test-alloc-latest:${tag}:fail`, candidate.id, baseline.id, JSON.stringify({}), JSON.stringify([]), `cs-${tag}-fail`]
+    );
+    await assert.rejects(allocateCanonical(control, 'CANARY', new Date().toISOString()), /EVALUATED_CANARY_POLICY_REQUIRED/);
+    // Newer PASS restores allocation eligibility.
+    await database.query(
+      `INSERT INTO persistent_research_policy_evaluations(evaluation_key,policy_id,baseline_policy_id,evaluation_window_start,dataset_cutoff,minimum_assignments,metrics,decision,reason_codes,artifact_checksum,evaluated_by,evaluated_at) VALUES($1,$2,$3,now()-interval '3 hours',now(),30,$4,'PASS',$5,$6,'test:research-bootstrap',now())`,
+      [`test-alloc-latest:${tag}:pass2`, candidate.id, baseline.id, JSON.stringify({}), JSON.stringify([]), `cs-${tag}-pass2`]
+    );
+    const ok = await allocateCanonical(control, 'CANARY', new Date().toISOString());
+    assert.equal(ok.policyId, candidate.id);
+  } finally {
+    await database.query(`UPDATE portfolio_policies SET status='DRAFT' WHERE id=$1`, [candidate.id]);
+    await restoreControl(database, prevControl);
+  }
+});
+
+maybe('control lease is not stealable by a concurrent same-owner cycle', async t => {
+  const { acquireLease, releaseLease } = await import('./persistentResearchController');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const owner = `test-lease-owner:${Date.now()}:${process.pid}`;
+  const first = await acquireLease(owner, 120);
+  assert.ok(first, 'first acquire holds the lease');
+  try {
+    // Same owner re-request while the lease is live must fail closed: the
+    // previous holder keeps its token and overlapping cycles cannot start.
+    assert.equal(await acquireLease(owner, 120), null);
+    assert.equal(await acquireLease(`${owner}:other`, 120), null);
+  } finally {
+    await releaseLease(first as string, { test: 'lease-steal' });
+  }
+  const after = await acquireLease(`${owner}:other`, 120);
+  assert.ok(after, 'lease acquirable after release');
+  await releaseLease(after as string, { test: 'lease-steal' });
+});
+
+maybe('ceiling completion defers disarm until the batch materializes, then settles without orphans', async t => {
+  const { startResearchBootstrapRun, abortResearchBootstrapRun, allocateBootstrapAssignments, configureBootstrapArming, settleCeilingBootstrap } = await import(
+    './persistentResearchController'
+  );
+  const { createPolicy } = await import('./portfolioAllocator');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const tag = `ceiling-settle:${Date.now()}:${process.pid}`;
+  await ensureProvider(database);
+  const programId = await ensureProgram(database, tag);
+  const policy = await createPolicy({
+    policyKey: `test-ceiling-settle:${tag}`,
+    policyType: 'CONTEXTUAL_BANDIT',
+    configuration: policyConfigFor(tag),
+    actor: 'test:research-bootstrap',
+  });
+  for (let index = 0; index < 2; index++) {
+    await database.query(
+      `INSERT INTO discovery_actions(action_key,program_id,action_type,provider_key,normalized_target,context,provenance,source_family_ids,depth,cluster_key,expected_incremental_creators,expected_information_gain,expected_coverage_gain,uncertainty,provider_cost,review_cost,overlap_penalty,policy_version,expires_at)
+       VALUES($1,$2,'SEARCH_YOUTUBE','youtube-search',$3,$4,$5,$6,0,$7,1,1,1,0.5,100,1,0,'persistent-research-controller-v1',now()+interval '14 days')`,
+      [
+        `test-bootstrap-action:${tag}:${index}`,
+        programId,
+        `ceiling settle probe ${tag} ${index}`,
+        JSON.stringify({ country: 'US', intent: 'strategy' }),
+        JSON.stringify({}),
+        JSON.stringify(['test']),
+        `ceiling-settle-cluster:${tag}:${index}`,
+      ]
+    );
+  }
+  const run = await startResearchBootstrapRun({
+    candidatePolicyId: policy.id,
+    maxAssignments: 2,
+    maxProviderCost: 3000,
+    windowHours: 24,
+    reason: 'test ceiling settle',
+    actor: 'test:research-bootstrap',
+  });
+  t.after(async () => {
+    await abortResearchBootstrapRun(run.id, 'test:research-bootstrap', 'test cleanup').catch(() => undefined);
+  });
+  const prevControl = await saveControl(database);
+  await fundControlCaps(database);
+  try {
+    await armRun(configureBootstrapArming, run.id);
+    const control = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
+    const result = await allocateBootstrapAssignments(control, new Date().toISOString(), run.id);
+    assert.equal(result.allocated, 2);
+    assert.equal(result.completed, true);
+    // Disarm is deferred: the fence is still held so materializers stay serving.
+    const fenced = (await database.query('SELECT bootstrap_armed, bootstrap_run_id FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(fenced.bootstrap_armed, true);
+    assert.equal(String(fenced.bootstrap_run_id), run.id);
+    // Settle (as runPersistentResearchCycle does after materialization):
+    // leftovers re-enter the pool, fence releases, newer config untouched.
+    await settleCeilingBootstrap(run.id, true);
+    const states = (
+      await database.query(`SELECT lifecycle, count(*)::int AS n FROM discovery_actions WHERE action_key LIKE $1 GROUP BY 1`, [`test-bootstrap-action:${tag}:%`])
+    ).rows as Array<{ lifecycle: string; n: number }>;
+    assert.equal(states.filter(row => row.lifecycle === 'ALLOCATED').reduce((n, row) => n + Number(row.n), 0), 0);
+    const released = (await database.query('SELECT bootstrap_armed FROM research_control WHERE singleton=true')).rows[0];
+    assert.equal(released.bootstrap_armed, false);
+  } finally {
+    await restoreControl(database, prevControl);
+    await retireFixtureActions(database, tag);
+  }
+});
