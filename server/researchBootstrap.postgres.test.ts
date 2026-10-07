@@ -1485,7 +1485,7 @@ maybe('bootstrap materialization never consumes another run allocated actions', 
             JSON.stringify({
               sourceType: 'test-scope',
               sourceKey: `scope-key:${tag}:${suffix}`,
-              creatorChannelId: 'test-scope-channel',
+              creatorChannelId: null,
               lineage: 'AUTONOMOUS',
               text: `genuine scope fixture content ${tag} ${suffix} with enough words to extract candidate spans`,
               observedAt: new Date().toISOString(),
