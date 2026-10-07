@@ -600,11 +600,12 @@ maybe('allocation from a stale control snapshot cannot authorize CANARY work', a
   await armCanaryControl(database, candidate.id);
   const staleSnapshot = (await database.query('SELECT * FROM research_control WHERE singleton=true')).rows[0];
   try {
-    // Concurrent operator pause lands after the snapshot was taken.
-    await database.query(`UPDATE research_control SET paused=true WHERE singleton=true`);
+    // Concurrent operator pause lands after the snapshot was taken (any governed
+    // mutation bumps configuration_version, so the stale snapshot is detected).
+    await database.query(`UPDATE research_control SET paused=true, configuration_version=configuration_version+1 WHERE singleton=true`);
     await assert.rejects(
       allocateCanonical(staleSnapshot, 'CANARY', new Date().toISOString()),
-      /EVALUATED_CANARY_POLICY_REQUIRED/
+      /RESEARCH_CONTROL_STALE/
     );
     // Configuration drift (any concurrent reconfig) is also fail-closed.
     await database.query(`UPDATE research_control SET paused=false, daily_provider_cost_cap=1, configuration_version=configuration_version+1 WHERE singleton=true`);
