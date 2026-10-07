@@ -84,7 +84,17 @@ async function main() {
     }
   }
   console.log(JSON.stringify({
-    window: '2026-09-30 20:07:07Z → 2026-10-07 20:07:07Z (trail-parsed exact rules)',
+    // Labels describe the actual queries (semantics unchanged): observations
+    // use a rolling 7-day window evaluated at runtime (now() - 7 days), and
+    // trails cover all channels whose persisted inspection_trail contains
+    // per-seed [Crawling] lines (unrestricted by window; only website seeds
+    // with stored Source/Context lines are classifiable).
+    window: 'observations: rolling now()-7d at runtime; trails: all channels with [Crawling] lines (see queries)',
+    queries: {
+      observations: "observed_at >= now() - interval '7 days'",
+      trails: "channels WHERE inspection_trail::text LIKE '%[Crawling]%' (all history, batched by channel_id)",
+    },
+    executedAt: new Date().toISOString(),
     channelsWithTrails: totalN, seeds, blocked, demoted, eligible,
     foundBlocked: foundBlocked.length, foundDemoted, foundEligible,
     blockedDetails, foundBlockedList: foundBlocked,

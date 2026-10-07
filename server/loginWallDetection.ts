@@ -81,12 +81,31 @@ export const PAYWALL_FAILURE_CLASS = 'PAYWALL_WALL';
 function hasPaywallMarkers(html: string): boolean {
   const body = String(html || '');
   if (body.length === 0) return false;
-  const marker =
-    /isAccessibleForFree\s*:\s*false/i.test(body) ||
-    /class\s*=\s*["'][^"']*paywall[^"']*["']/i.test(body) ||
-    /subscribe\s+to\s+continue/i.test(body) ||
-    /subscription\s+required/i.test(body);
-  if (!marker) return false;
+  // isAccessibleForFree:false is an active machine-readable barrier on its own.
+  const structuredBarrier = /isAccessibleForFree\s*:\s*false/i.test(body);
+  // Class-based paywall UI must be ACTIVE: incidental/disabled/hidden UI
+  // (e.g. class="paywall-disabled") combined with payment text elsewhere must
+  // never read as a live wall. A disabled-qualified paywall marker anywhere
+  // makes the evidence ambiguous → fail closed to retryable/incomplete, even
+  // when active phrasing ("subscribe to continue") appears elsewhere on the
+  // page (it may live inside the inactive template).
+  let activeClassBarrier = false;
+  let disabledPaywallPresent = false;
+  try {
+    const classAttrs = body.match(/class\s*=\s*["'][^"']*["']/gi) || [];
+    for (const attr of classAttrs) {
+      if (!/paywall/i.test(attr)) continue;
+      if (/disabled|hidden|inactive|removed|\boff\b/i.test(attr)) {
+        disabledPaywallPresent = true;
+        continue;
+      }
+      activeClassBarrier = true;
+    }
+  } catch { activeClassBarrier = false; }
+  const textualBarrier =
+    /subscribe\s+to\s+continue/i.test(body) || /subscription\s+required/i.test(body);
+  if (!structuredBarrier && disabledPaywallPresent) return false;
+  if (!structuredBarrier && !activeClassBarrier && !textualBarrier) return false;
   return /subscri|subscription|payment|pay\s+to|premium|members?\s+only|billing/i.test(body);
 }
 

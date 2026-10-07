@@ -170,16 +170,19 @@ export function siteInspectionCoversRequest(
   requestedUrl: string,
   options?: { strictFoundCoverage?: boolean },
 ): boolean {
-  // Path-aware FOUND borrowing (R6 follow-up, flag-gated by caller):
+  // Path-aware FOUND borrowing (R6 follow-up, explicit opt-in by caller):
   // legacy borrows FOUND regardless of path (registrable-domain-only),
   // letting unrelated short-link slugs inherit another URL's FOUND merely
   // via shared domain. Strict mode requires a valid coverage-key/binding
   // match for FOUND too; borrowers without a match fall through to their
   // own acquisition. Same-site brand sharing that spans paths recrawls
   // (recall-safe cost); genuine redirect chains resolve via exact bindings.
-  const strictFound = options?.strictFoundCoverage !== false;
+  // Default is legacy (opt-in strict): existing callers omitting options keep
+  // prior behavior byte-identically; the inspector passes strict explicitly
+  // when its flag resolves enabled.
+  const strictFound = options?.strictFoundCoverage === true;
   if (row.outcome === 'FOUND' && !strictFound) return true;
-  // Strict (default): FOUND falls through to coverage-key check below.
+  // Strict: FOUND falls through to coverage-key check below.
   const want = normalizeCoverageKey(requestedUrl);
   if (!want) return false;
   const covered = new Set<string>();
@@ -292,6 +295,33 @@ export function redirectBindingFor(
     }
   }
   return null;
+}
+
+/** Exact-page cover check for terminal-barrier rows (LOGIN_WALL,
+ * PAYWALL_WALL, PERMANENT_ACCESS_BLOCK): the borrower's URL matches the
+ * row's canonical/final URL or a previously requested/root URL on the row
+ * (same page, e.g. after a login redirect) — never another path on the same
+ * host. Pure and fail-closed (any error → false → recrawl). */
+export function isExactBarrierPageCover(
+  row: Pick<CachedSiteInspection, 'canonicalUrl' | 'finalUrl' | 'observations'>,
+  coverageUrl: string,
+): boolean {
+  try {
+    const norm = (u: unknown): string => String(u || '').trim().toLowerCase().replace(/\/+$/, '');
+    const want = norm(coverageUrl);
+    if (!want) return false;
+    const finals = [row.canonicalUrl, row.finalUrl].filter(Boolean).map(norm);
+    if (finals.includes(want)) return true;
+    for (const item of row.observations || []) {
+      const source = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+      for (const field of ['requestedUrl', 'rootUrl'] as const) {
+        if (typeof source[field] === 'string' && norm(source[field] as string) === want) return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /** Every destination referenced by an alias row (bindings plus legacy

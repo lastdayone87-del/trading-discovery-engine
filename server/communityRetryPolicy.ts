@@ -257,7 +257,7 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   if (DETERMINISTICALLY_PERMANENT_FAILURE_CLASSES.has(String(item.failureClass || '').toUpperCase())) {
     return false;
   }
-  // Clearly-unrelated (BLOCKED) and low-value demoted (DEMOTE) tiers never
+  // Clearly-unrelated (BLOCK) and low-value demoted (DEMOTE) tiers never
   // own retry. Independent: when the classifier is disabled, errored, or
   // missing, no observation carries either tier, so existing PR #504 behavior
   // is byte-identical. This check never makes an otherwise ineligible
@@ -266,7 +266,7 @@ export function isCommunityRetryableObservation(item: CommunityRetryObservation)
   // worker retries unless existing acquisition semantics (FOUND gaps,
   // rendered required failures) genuinely require it through other rows.
   const relevanceTier = (item as { relevanceTier?: unknown }).relevanceTier;
-  if (relevanceTier === 'BLOCKED' || relevanceTier === 'DEMOTE') return false;
+  if (relevanceTier === 'BLOCK' || relevanceTier === 'DEMOTE') return false;
   // Auxiliary/demoted URLs (affiliate, broker, transactional, no-community
   // commerce) never own channel-level retry: their evidence is retained on
   // success and their telemetry stays in the ledger, but a failure there
@@ -340,7 +340,10 @@ export function hasRetryableCommunityAcquisitionFailure(
     : new Set(timeoutSuppressedKeys || []);
   return observations.some(
     item =>
-      item.required &&
+      // Eligible static budget gaps own retry despite required=false (see
+      // isCommunityRetryableObservation's STATIC_BUDGET_GAP exception);
+      // DEMOTE/BLOCK tiers stay excluded via the predicate itself.
+      (item.required || String((item as { failureClass?: unknown }).failureClass || '') === STATIC_BUDGET_GAP_FAILURE_CLASS) &&
       isCommunityRetryableObservation(item) &&
       !suppressed.has(timeoutSuppressionKey((item as { requestedUrl?: unknown }).requestedUrl)),
   );

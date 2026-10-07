@@ -111,4 +111,21 @@ describe('confirmed paywall detection (markers + payment, never status-only)', (
       false,
     );
   });
+
+  it('disabled/hidden paywall UI with payment text stays non-terminal', () => {
+    assert.equal(
+      isConfirmedPaywall({
+        finalUrl: 'https://example.com/article/1',
+        html: '<html><body><div class="paywall-disabled">subscribe</div><p>billing info</p></body></html>',
+      }),
+      false,
+    );
+    assert.equal(
+      isConfirmedPaywall({
+        finalUrl: 'https://example.com/article/1',
+        html: '<html><body><div class="paywall paywall-hidden">subscribe to continue, billing</div></body></html>',
+      }),
+      false,
+    );
+  });
 });

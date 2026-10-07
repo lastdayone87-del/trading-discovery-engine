@@ -101,7 +101,14 @@ export function isConclusivePermanentBlock(input: {
     if (!key) return false;
     const finalReg = registrableOf(String(current.finalUrl || ''));
     if (!finalReg) return false;
-    const priors = (Array.isArray(input.history) ? input.history : []).filter(row => {
+    // Latest uninterrupted matching failure streak (current + history, newest
+    // last). Any intervening successful, different-status, different-host, or
+    // otherwise nonmatching observation resets the streak: older matching
+    // rows beyond the break never count toward permanence.
+    const ordered = [...(Array.isArray(input.history) ? input.history : [])].sort(
+      (a, b) => Date.parse(String(a.observedAt || 0)) - Date.parse(String(b.observedAt || 0)),
+    );
+    const matches = (row: PermanentBlockAttempt): boolean => {
       if (normalizeKey(String(row.requestedUrl || '')) !== key) return false;
       if (String(row.failureClass || '') !== 'HTTP_ERROR') return false;
       if (Number(row.httpStatus) !== status) return false;
@@ -111,8 +118,14 @@ export function isConclusivePermanentBlock(input: {
       const rowFinal = registrableOf(String(row.finalUrl || ''));
       if (!rowFinal || rowFinal !== finalReg) return false;
       return true;
-    });
-    return priors.length >= 2;
+    };
+    let streak = 0;
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (!matches(ordered[i])) break;
+      streak++;
+      if (streak >= 2) break;
+    }
+    return streak >= 2;
   } catch {
     return false;
   }
