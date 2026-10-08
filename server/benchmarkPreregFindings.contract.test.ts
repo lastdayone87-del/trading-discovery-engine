@@ -131,6 +131,16 @@ test('plan enforces the full frozen scope and execution waits for terminal attri
   assert.match(script, /assertFullScope\(snapshot, spec\)/);
   assert.match(script, /--execute --spec-version=\$\{spec\.specVersion\} --out/);
   assert.match(script, /requireFreshPlanForStatus\(record\.status, snapshot\.collectedAt\)/);
+  assert.ok(
+    script.indexOf('requireFreshPlanForStatus(record.status, snapshot.collectedAt)') <
+      script.indexOf("record.status = 'IN_PROGRESS'"),
+    'freshness must read the original persisted status before IN_PROGRESS mutation'
+  );
+  assert.match(script, /const requestId = `\$\{spec\.logTag\}:/);
+  assert.match(script, /\$\{spec\.logTag\}\] INCOMPLETE:/);
+  assert.ok(!script.includes('benchmark-prereg-v2:${'), 'no hardcoded v2 request namespace may remain');
+  assert.ok(script.includes('--execute --spec-version=v2 --out'), 'documented execute command must select v2');
+  assert.ok(script.includes('--plan --spec-version=v2 --out'), 'documented plan command must select v2');
   assert.match(script, /isSchedulerStoppedForBenchmark\(/);
   assert.match(script, /waitForTerminalObservation\(pollRunState\(/);
   assert.match(script, /isScopeTerminallyAccounted\(/);

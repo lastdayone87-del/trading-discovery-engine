@@ -19,8 +19,8 @@
  *   review approval.
  *
  * Usage:
- *   npx tsx scripts/runBenchmarkPreregV1.ts --plan --out ./benchmark-prereg-v2
- *   npx tsx scripts/runBenchmarkPreregV1.ts --execute --out ./benchmark-prereg-v2
+ *   npx tsx scripts/runBenchmarkPreregV1.ts --plan --spec-version=v2 --out ./benchmark-prereg-v2
+ *   npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version=v2 --out ./benchmark-prereg-v2
  */
 import dotenv from 'dotenv';
 import { parseBenchmarkArgs } from '../server/benchmarkPreregCli';
@@ -177,6 +177,7 @@ async function main(): Promise<void> {
   }
   verifyPoolSnapshotHash(snapshot);
   verifyExecutionArtifactsBound(record, snapshot);
+  requireFreshPlanForStatus(record.status, snapshot.collectedAt);
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
@@ -186,7 +187,6 @@ async function main(): Promise<void> {
   record.updatedAt = new Date().toISOString();
   writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
 
-  requireFreshPlanForStatus(record.status, snapshot.collectedAt);
   const schedulerRow = (await db.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`).catch(() => ({ rows: [] })) as { rows: Array<{ is_enabled: boolean; is_running: boolean }> }).rows[0];
   if (!isSchedulerStoppedForBenchmark(schedulerRow)) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED: autonomous scheduler must be stopped (enabled=false, running=false) before executing');
@@ -219,7 +219,7 @@ async function main(): Promise<void> {
     record.stopReason = stopReason;
     saveRecord();
     await db.end().catch(() => undefined);
-    throw new Error(`[benchmark-prereg-v2] INCOMPLETE: ${stopReason}`);
+    throw new Error(`[${spec.logTag}] INCOMPLETE: ${stopReason}`);
   };
   const pollRunState = (runId: string) => async () => {
     const runRows = (await db.query('SELECT status, completed_at FROM query_runs WHERE id = $1', [runId])).rows as Array<{ status: string; completed_at: string | null }>;
@@ -306,7 +306,7 @@ async function main(): Promise<void> {
     // guarantees it schedules the designated row or nothing — never
     // unrelated work.
     const attemptStart = new Date();
-    const requestId = `benchmark-prereg-v2:${snapshot.snapshotHash.slice(0, 12)}:${designated.poolRowId}`;
+    const requestId = `${spec.logTag}:${snapshot.snapshotHash.slice(0, 12)}:${designated.poolRowId}`;
     // Kill-switch recheck immediately before scheduling: drift checking ran
     // above, but a pause engaged in the gap must still stop the benchmark.
     // The engine also honors pause for benchmark scope even with a target
