@@ -95,7 +95,7 @@ export interface SelectionExperimentTrialConfig {
 }
 
 /**
- * Frozen benchmark opportunity scope (benchmark-preregistration-v1).
+ * Frozen benchmark opportunity scope (benchmark-preregistration-v2).
  * Designates the pre-existing frozen pool snapshot row this attempt belongs
  * to. Carried on the request (pre-selection) so the benchmark opportunity
  * identity never depends on which query selection serves. Optional and
@@ -166,15 +166,15 @@ function shaBucket(input: string): number {
 }
 
 /**
- * Frozen benchmark identity (benchmark-preregistration-v1 §3A). These
+ * Frozen benchmark identity (benchmark-preregistration-v2 §3A). These
  * constants name the preregistered experiment identities; they change no
  * assignment math and gate only benchmark-scoped derivation paths. All
  * other experiment identities execute the legacy caller-supplied paths
  * byte-identically.
  */
-export const BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v1-selection';
-export const BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v1-ordering';
-/** Frozen P2 recency lookback in days (benchmark-preregistration-v1 §3A). */
+export const BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v2-selection';
+export const BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v2-ordering';
+/** Frozen P2 recency lookback in days (benchmark-preregistration-v2 §3A). */
 export const BENCHMARK_PREREG_ORDERING_WINDOW_DAYS = 90;
 
 const BENCHMARK_PREREG_ORDERING_WINDOW_MS = BENCHMARK_PREREG_ORDERING_WINDOW_DAYS * 24 * 60 * 60 * 1000;
@@ -193,7 +193,7 @@ export function deriveBenchmarkOrderingWindow(scheduledAt: Date): { publishedAft
 
 /**
  * Whether a normalized experiment request exactly matches the frozen
- * benchmark configuration (benchmark-preregistration-v1 §3A). Arm-independent:
+ * benchmark configuration (benchmark-preregistration-v2 §3A). Arm-independent:
  * CONTROL and treatment draws share the same opportunity identity. Any
  * deviation — unrelated identity, different arms/order, different basis,
  * different priors/weights — is not the frozen benchmark, even when a valid
@@ -249,7 +249,7 @@ export function benchmarkOpportunityIdForScope(
   if (!isFrozenBenchmarkConfiguration(experiment)) return undefined;
   if (!scope) return undefined;
   if (servedQueryId !== scope.poolRowId) return undefined;
-  return `benchmark-prereg-v1:pool:${scope.snapshotHash}:${scope.poolRowId}`;
+  return `benchmark-prereg-v2:pool:${scope.snapshotHash}:${scope.poolRowId}`;
 }
 
 /**
@@ -497,7 +497,7 @@ export function evaluateOrderingDimension(args: {
     };
   }
   if (args.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
-    // Frozen benchmark path (benchmark-preregistration-v1 §3A/§6): a
+    // Frozen benchmark path (benchmark-preregistration-v2 §3A/§6): a
     // TREATMENT assignment always carries the scheduled_at-derived 90-day
     // window. Caller-supplied bounds (present, absent, or divergent) never
     // reach the envelope, closing the unwindowed-treatment hole. There is
@@ -660,7 +660,7 @@ export interface SelectionExperimentObservation {
   servedArm: SelectionExperimentArm;
   /**
    * Stable benchmark opportunity identity
-   * (`benchmark-prereg-v1:pool:<snapshotHash>:<poolRowId>`). Present only
+   * (`benchmark-prereg-v2:pool:<snapshotHash>:<poolRowId>`). Present only
    * when the request designated a frozen pool scope AND the served query is
    * that designated row; retries share it while each attempt keeps its own
    * assignment draw under determinism.*. Absent otherwise, so

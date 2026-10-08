@@ -46,17 +46,17 @@ function eligibleRow(id: number, overrides: Record<string, unknown> = {}): Query
 
 test('frozen request builder uses exactly the preregistered configuration', () => {
   const request = buildFrozenBenchmarkRequest('abc123', 42);
-  assert.equal(request.selection?.experimentId, 'benchmark-prereg-v1-selection');
+  assert.equal(request.selection?.experimentId, 'benchmark-prereg-v2-selection');
   assert.deepEqual(request.selection?.enabledArms, ['THOMPSON', 'CONTEXTUAL']);
   assert.equal(request.selection?.treatmentBasisPoints, 5000);
   assert.deepEqual(request.selection?.thompsonPrior, { alpha0: 1, beta0: 1 });
   assert.deepEqual(request.selection?.contextualWeights, { value: 0.5, exploration: 0.35, cost: 0.1 });
-  assert.equal(request.ordering?.experimentId, 'benchmark-prereg-v1-ordering');
+  assert.equal(request.ordering?.experimentId, 'benchmark-prereg-v2-ordering');
   assert.equal(request.ordering?.treatmentBasisPoints, 5000);
   assert.deepEqual(request.benchmark, { snapshotHash: 'abc123', poolRowId: 42 });
   assert.equal(isFrozenBenchmarkConfiguration(request), true);
-  assert.deepEqual(BENCHMARK_PREREG_FROZEN_SELECTION.experimentId, 'benchmark-prereg-v1-selection');
-  assert.deepEqual(BENCHMARK_PREREG_FROZEN_ORDERING.experimentId, 'benchmark-prereg-v1-ordering');
+  assert.deepEqual(BENCHMARK_PREREG_FROZEN_SELECTION.experimentId, 'benchmark-prereg-v2-selection');
+  assert.deepEqual(BENCHMARK_PREREG_FROZEN_ORDERING.experimentId, 'benchmark-prereg-v2-ordering');
 });
 
 test('frozen version verification passes live and fails on drift', () => {
@@ -67,7 +67,7 @@ test('frozen version verification passes live and fails on drift', () => {
   );
 });
 
-test('pool snapshot is deterministic, id-ordered, capped at 300, with counted exclusions', () => {
+test('pool snapshot is deterministic, id-ordered, capped at 120, with counted exclusions', () => {
   const now = new Date('2026-05-01T00:00:00.000Z');
   const rows: QueryRecord[] = [];
   for (let id = 400; id >= 1; id--) {
@@ -114,10 +114,10 @@ test('execution record carries the full frozen provenance', () => {
     providerRegistry: [],
     appSettings: [{ setting_key: 'site_profiler_enabled', setting_value: 'false' }],
   });
-  assert.equal(record.specVersion, 'benchmark-preregistration-v1');
+  assert.equal(record.specVersion, 'benchmark-preregistration-v2');
   assert.equal(record.frozenBaseCommit, '4b49e0c01ac53eebf0080fae29bd6aaabb803cfc');
   assert.equal(record.designatedOpportunities.length, 5);
-  assert.equal(record.designatedOpportunities[0].benchmarkOpportunityId, `benchmark-prereg-v1:pool:${snapshot.snapshotHash}:1`);
+  assert.equal(record.designatedOpportunities[0].benchmarkOpportunityId, `benchmark-prereg-v2:pool:${snapshot.snapshotHash}:1`);
   assert.equal(record.status, 'PLANNED');
   assert.throws(
     () => buildExecutionRecord({
@@ -199,7 +199,7 @@ test('undersized plans fail closed with a deterministic reason', async () => {
     rows: [eligibleRow(1), eligibleRow(2)],
     collectedAt: now, cooldownMinutes: 360, maxPrimaryUses: 2,
   });
-  assert.throws(() => assertFullScope(small), /BENCHMARK_PREREG_INSUFFICIENT_POOL.*eligible=2.*required=300/);
+  assert.throws(() => assertFullScope(small), /BENCHMARK_PREREG_INSUFFICIENT_POOL.*eligible=2.*required=120/);
   const full = buildPoolSnapshot({
     rows: Array.from({ length: 320 }, (_, index) => eligibleRow(index + 1)),
     collectedAt: now, cooldownMinutes: 360, maxPrimaryUses: 2,
@@ -383,7 +383,7 @@ test('execution record is cryptographically bound to the loaded snapshot', async
   tamperedRecord.designatedOpportunities[0] = {
     ...tamperedRecord.designatedOpportunities[0],
     poolRowId: 999999,
-    benchmarkOpportunityId: `benchmark-prereg-v1:pool:${snapshot.snapshotHash}:999999`,
+    benchmarkOpportunityId: `benchmark-prereg-v2:pool:${snapshot.snapshotHash}:999999`,
   };
   assert.throws(() => verifyExecutionArtifactsBound(tamperedRecord, snapshot), /BENCHMARK_PREREG_RECORD_MISMATCH/);
   // A snapshot with different rows fails even when hashes are internally consistent.

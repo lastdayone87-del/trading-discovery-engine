@@ -82,13 +82,13 @@ test('already-terminal failQueryRun still reaches observation capture without mu
 test('benchmark opportunity identity is designated pre-selection, never served-query derived', async () => {
   const { benchmarkOpportunityIdForScope, isFrozenBenchmarkConfiguration, normalizeSelectionExperimentRequest } = await import('./querySelectionExperiments');
   const frozen = normalizeSelectionExperimentRequest({
-    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
-    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    selection: { experimentId: 'benchmark-prereg-v2-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
     benchmark: { snapshotHash: 'abc123', poolRowId: 101 },
   });
   // The designated frozen pool row maps stably regardless of arm, attempt,
   // or which query wins; retries stay attached to the same opportunity.
-  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 101, frozen), 'benchmark-prereg-v1:pool:abc123:101');
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 101, frozen), 'benchmark-prereg-v2:pool:abc123:101');
   // A fallback winner, a newly generated query, or any non-designated row
   // never acquires the frozen identity.
   assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 102, frozen), undefined);

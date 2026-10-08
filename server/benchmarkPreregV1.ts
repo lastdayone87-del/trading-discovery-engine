@@ -1,5 +1,5 @@
 /**
- * Execution plumbing for benchmark-preregistration-v1.
+ * Execution plumbing for benchmark-preregistration-v2.
  *
  * The frozen specification (docs/BENCHMARK_PREREGISTRATION.md) is the sole
  * authority. This module implements ONLY what is genuinely missing to make
@@ -50,23 +50,23 @@ import {
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
 
-// Frozen literals (benchmark-preregistration-v1 §1/§3A/§7/§10). Compared
+// Frozen literals (benchmark-preregistration-v2 §1/§3A/§7/§10). Compared
 // against the live code constants by verifyFrozenBenchmarkVersions().
-export const BENCHMARK_PREREG_SPEC_VERSION = 'benchmark-preregistration-v1';
+export const BENCHMARK_PREREG_SPEC_VERSION = 'benchmark-preregistration-v2';
 export const BENCHMARK_PREREG_FROZEN_BASE_COMMIT = '4b49e0c01ac53eebf0080fae29bd6aaabb803cfc';
-export const BENCHMARK_PREREG_SCOPE_SIZE = 300;
+export const BENCHMARK_PREREG_SCOPE_SIZE = 120;
 export const BENCHMARK_PREREG_WALL_CLOCK_DAYS = 14;
 export const BENCHMARK_PREREG_FROZEN_MIGRATION_COUNT = 137;
-export const BENCHMARK_PREREG_POOL_RULES_VERSION = 'pool-rules-benchmark-prereg-v1';
+export const BENCHMARK_PREREG_POOL_RULES_VERSION = 'pool-rules-benchmark-prereg-v2';
 export const BENCHMARK_PREREG_FROZEN_SELECTION = {
-  experimentId: 'benchmark-prereg-v1-selection',
+  experimentId: 'benchmark-prereg-v2-selection',
   enabledArms: ['THOMPSON', 'CONTEXTUAL'],
   treatmentBasisPoints: 5000,
   thompsonPrior: { alpha0: 1, beta0: 1 },
   contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
 } as const;
 export const BENCHMARK_PREREG_FROZEN_ORDERING = {
-  experimentId: 'benchmark-prereg-v1-ordering',
+  experimentId: 'benchmark-prereg-v2-ordering',
   treatmentBasisPoints: 5000,
 } as const;
 export const BENCHMARK_PREREG_FROZEN_TRIAL_DEFAULTS = { maxQuota: 100, pageDepth: 1 } as const;
@@ -215,7 +215,7 @@ export interface PoolSnapshot {
 }
 
 /**
- * Builds the frozen pool snapshot: the first 300 eligible opportunities in
+ * Builds the frozen pool snapshot: the first 120 eligible opportunities in
  * deterministic snapshot ID ascending order. Eligibility mirrors the
  * production selection pipeline stage by stage (reservable → cooldown →
  * primary-term diversity → intent rotation → authority → retrieval shape),
@@ -359,7 +359,7 @@ export function verifyExecutionArtifactsBound(record: BenchmarkExecutionRecord, 
     const designated = record.designatedOpportunities[index] as
       | { snapshotHash?: string; poolRowId?: number; benchmarkOpportunityId?: string; country?: string }
       | undefined;
-    const expectedId = `benchmark-prereg-v1:pool:${snapshot.snapshotHash}:${row.queryId}`;
+    const expectedId = `benchmark-prereg-v2:pool:${snapshot.snapshotHash}:${row.queryId}`;
     if (
       !designated ||
       designated.snapshotHash !== snapshot.snapshotHash ||
@@ -461,7 +461,7 @@ export function buildExecutionRecord(input: {
     designatedOpportunities: input.poolSnapshot.rows.map(row => ({
       snapshotHash: input.poolSnapshot.snapshotHash,
       poolRowId: row.queryId,
-      benchmarkOpportunityId: `benchmark-prereg-v1:pool:${input.poolSnapshot.snapshotHash}:${row.queryId}`,
+      benchmarkOpportunityId: `benchmark-prereg-v2:pool:${input.poolSnapshot.snapshotHash}:${row.queryId}`,
       country: row.country,
     })),
     status: 'PLANNED',
@@ -483,7 +483,7 @@ export function assertNormalizedRequestUsable(normalized: NormalizedSelectionExp
 
 /**
  * Fail closed unless the snapshot holds the full frozen scope. An
- * undersized plan is not an executable benchmark: the frozen scope is 300,
+ * undersized plan is not an executable benchmark: the frozen scope is 120,
  * never silently fewer. Reports the deterministic reason (candidate volume
  * plus leading exclusion causes) so operators know what to remediate.
  */
