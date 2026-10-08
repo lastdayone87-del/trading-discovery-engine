@@ -9,6 +9,7 @@ import {
   isSameUtcDayPlan,
   isSchedulerStoppedForBenchmark,
   requireFreshPlanForStatus,
+  assertExecutionPreflightReady,
   BENCHMARK_PREREG_SPEC_VERSION,
   BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
   BENCHMARK_PREREG_SCOPE_SIZE,
@@ -528,10 +529,10 @@ test('v2 spec flows end to end without touching v1 behavior', () => {
   assert.throws(() => assertFullScope({ ...snapshot, rows: snapshot.rows.slice(0, 119) }, BENCHMARK_PREREG_V2_SPEC), /required=120/);
   assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-08T23:59:59.000Z')), true);
   assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-09T00:00:01.000Z')), false);
-  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: false }), true);
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }), true);
-  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: true }), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: false }), false);
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: true }), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: true }), false);
   assert.equal(isSchedulerStoppedForBenchmark(null), false);
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }, true), false);
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }, false), true);
@@ -546,4 +547,45 @@ test('freshness gate applies to PLANNED start, never strands IN_PROGRESS recover
   assert.doesNotThrow(() => requireFreshPlanForStatus('IN_PROGRESS', '2026-10-08T12:00:00.000Z', new Date('2026-10-09T00:30:00.000Z')));
   assert.doesNotThrow(() => requireFreshPlanForStatus('IN_PROGRESS', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')));
   assert.throws(() => requireFreshPlanForStatus('COMPLETE', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')), /BENCHMARK_PREREG_PLAN_STALE/);
+});
+
+test('combined preflight rejects non-quiescent schedulers before any IN_PROGRESS transition', () => {
+  const day = '2026-10-08T12:00:00.000Z';
+  const now = new Date('2026-10-08T23:00:00.000Z');
+  assert.doesNotThrow(() => assertExecutionPreflightReady({
+    recordStatus: 'PLANNED', collectedAtIso: day,
+    schedulerRow: { is_enabled: true, is_running: false }, liveRunning: false, now,
+  }));
+  assert.throws(
+    () => assertExecutionPreflightReady({
+      recordStatus: 'PLANNED', collectedAtIso: day,
+      schedulerRow: { is_enabled: true, is_running: true }, liveRunning: false, now,
+    }),
+    /BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED/
+  );
+  assert.throws(
+    () => assertExecutionPreflightReady({
+      recordStatus: 'PLANNED', collectedAtIso: day,
+      schedulerRow: { is_enabled: false, is_running: false }, liveRunning: false, now,
+    }),
+    /BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED/
+  );
+  assert.throws(
+    () => assertExecutionPreflightReady({
+      recordStatus: 'PLANNED', collectedAtIso: day,
+      schedulerRow: { is_enabled: true, is_running: false }, liveRunning: true, now,
+    }),
+    /BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED/
+  );
+  assert.throws(
+    () => assertExecutionPreflightReady({
+      recordStatus: 'PLANNED', collectedAtIso: '2026-10-07T12:00:00.000Z',
+      schedulerRow: { is_enabled: true, is_running: false }, liveRunning: false, now,
+    }),
+    /BENCHMARK_PREREG_PLAN_STALE/
+  );
+  assert.doesNotThrow(() => assertExecutionPreflightReady({
+    recordStatus: 'IN_PROGRESS', collectedAtIso: '2026-10-07T12:00:00.000Z',
+    schedulerRow: { is_enabled: true, is_running: false }, liveRunning: false, now,
+  }));
 });

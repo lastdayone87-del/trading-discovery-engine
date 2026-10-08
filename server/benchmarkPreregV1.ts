@@ -148,21 +148,38 @@ export function requireFreshPlanForStatus(recordStatus: string, collectedAtIso: 
   if (recordStatus === 'PLANNED' && isSameUtcDayPlan(collectedAtIso, now)) return;
   throw new Error('BENCHMARK_PREREG_PLAN_STALE: plan snapshot is not from today (UTC); re-run --plan the same day before executing');
 }
-/** Quiescence check for the execute gate: no cycle running and no live
- * lease, regardless of the enabled flag. The scheduler row MUST stay enabled
- * during benchmark execution because acquireSchedulerLock() only grants the
- * lock WHERE is_enabled=true; requiring enabled=false deadlocks execution
- * against its own gate. Quiescence (nothing able to compete) plus the
- * separate live-lease check is the invariant that actually excludes
- * concurrent producers. Pure. */
+/** Quiescence check for the execute gate: the scheduler row must stay
+ * enabled (acquireSchedulerLock() only grants the lock WHERE
+ * is_enabled=true; a disabled row could never proceed, so allowing it past
+ * the gate would only fail later and opaquely), with no running cycle and no
+ * live lease. Quiescence (nothing able to compete) plus the separate
+ * live-lease check is the invariant that actually excludes concurrent
+ * producers. Pure. */
 export function isSchedulerStoppedForBenchmark(
   row: { is_enabled?: unknown; is_running?: unknown } | null | undefined,
   liveRunning: boolean = false
 ): boolean {
   if (!row) return false;
+  if (row.is_enabled !== true) return false;
   if (row.is_running !== false) return false;
   if (liveRunning) return false;
   return true;
+}
+/** Combined initial-execution preflight decisions: freshness first, then
+ * scheduler quiescence. Throws the exact gate error; the runner must call
+ * this before mutating any record so a failed gate can never convert a
+ * fresh PLANNED plan. Pure. */
+export function assertExecutionPreflightReady(input: {
+  recordStatus: string;
+  collectedAtIso: string;
+  schedulerRow: { is_enabled?: unknown; is_running?: unknown } | null | undefined;
+  liveRunning: boolean;
+  now?: Date;
+}): void {
+  requireFreshPlanForStatus(input.recordStatus, input.collectedAtIso, input.now ?? new Date());
+  if (!isSchedulerStoppedForBenchmark(input.schedulerRow, input.liveRunning)) {
+    throw new Error('BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED: autonomous scheduler must be quiescent (enabled row, no running cycle, no live lease) before executing');
+  }
 }
 
 /** Gates that must be OFF (or absent) for benchmark execution. */
