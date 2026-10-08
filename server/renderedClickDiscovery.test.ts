@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   attemptRenderedControlClick,
   buildClickFailureSample,
+  createRenderedControlClickDeps,
   isSkippableNavigableAnchorClick,
   partitionRenderedClickTargets,
   type BrowserFallbackTelemetry,
@@ -48,34 +49,65 @@ test('same-host community anchor is enqueue-handled, never clicked', () => {
 });
 
 // Fixture 2: a button revealing a hidden discord.gg link only after a
-// successful click — the crawler must click it and post-click inspection
-// must discover the invite. Fake page: no network, no browser.
+// successful click — driven through the production wiring factory so the
+// test proves the call-site callbacks (getHref, click+timeout, 400ms settle,
+// retain, inspect, clicks++) behave exactly as the crawl loop wires them.
 test('click-through button reveals hidden Discord invite via post-click inspection', async () => {
   const telemetry = freshTelemetry();
   const state = { revealed: false };
   const discovered: string[] = [];
+  const calls: string[] = [];
+  let clickCount = 0;
   const control = { index: 1, text: 'Join our Discord', href: null, tag: 'button' as const };
-  const result = await attemptRenderedControlClick({
-    control,
-    pageUrl: 'https://creator.example/',
-    getHref: async () => null,
-    performClick: async () => {
+  const fakeLocator = {
+    getAttribute: async (name: string) => {
+      calls.push(`getAttribute:${name}`);
+      return null;
+    },
+    click: async (options: { timeout: number }) => {
+      calls.push(`click:${options.timeout}`);
       state.revealed = true;
     },
-    settle: async () => {},
-    retain: () => {},
-    inspect: async () => {
-      const dom = state.revealed
-        ? '<a href="https://discord.gg/hiddentrading">join</a>'
-        : '<button>Join our Discord</button>';
-      for (const candidate of extractDiscordCandidates(dom, 'CREATOR_WEBSITES', 'https://creator.example/')) {
-        if (candidate.nativeInviteCode) discovered.push(candidate.nativeInviteCode);
-      }
+  };
+  const fakePage = {
+    url: () => 'https://creator.example/',
+    waitForTimeout: async (ms: number) => {
+      calls.push(`wait:${ms}`);
     },
-    telemetry,
-  });
+  };
+  const retained: string[] = [];
+  let inspections = 0;
+  const result = await attemptRenderedControlClick(
+    createRenderedControlClickDeps({
+      locator: fakeLocator,
+      page: fakePage,
+      control,
+      retain: (text: string, pageUrl: string) => {
+        retained.push(`${text} @${pageUrl}`);
+      },
+      inspect: async () => {
+        inspections++;
+        const dom = state.revealed
+          ? '<a href="https://discord.gg/hiddentrading">join</a>'
+          : '<button>Join our Discord</button>';
+        for (const candidate of extractDiscordCandidates(dom, 'CREATOR_WEBSITES', 'https://creator.example/')) {
+          if (candidate.nativeInviteCode) discovered.push(candidate.nativeInviteCode);
+        }
+      },
+      telemetry,
+      onClicked: () => {
+        clickCount++;
+      },
+    }),
+  );
   assert.equal(result.ok, true);
   assert.deepEqual(discovered, ['hiddentrading']);
+  // Production wiring proof: href read, 2s click timeout, 400ms settle,
+  // single post-click inspection, exactly one clicks++ on success.
+  assert.deepEqual(calls, ['getAttribute:href', 'click:2000', 'wait:400']);
+  assert.equal(inspections, 1);
+  assert.equal(clickCount, 1);
+  assert.equal(retained.length, 1);
   assert.equal(telemetry.clicksStarted, 1);
   assert.equal(telemetry.clicksSucceeded, 1);
   assert.equal(telemetry.clicksFailed, 0);
@@ -87,26 +119,45 @@ test('click-through button reveals hidden Discord invite via post-click inspecti
 test('detached control fails deterministically without corrupting page outcome', async () => {
   const telemetry = freshTelemetry();
   telemetry.requestsStarted = 2;
+  const calls: string[] = [];
+  let clickCount = 0;
   let inspected = false;
   const control = { index: 7, text: 'Join now', href: 'https://creator.example/join', tag: 'anchor' as const };
-  const result = await attemptRenderedControlClick({
-    control,
-    pageUrl: 'https://creator.example/',
-    getHref: async () => 'https://creator.example/join',
-    performClick: async () => {
-      throw new Error('locator.click: Element is not attached to the DOM');
-    },
-    settle: async () => {
-      throw new Error('settle must not run after a failed click');
-    },
-    retain: () => {},
-    inspect: async () => {
-      inspected = true;
-    },
-    telemetry,
-  });
+  const result = await attemptRenderedControlClick(
+    createRenderedControlClickDeps({
+      locator: {
+        getAttribute: async () => {
+          calls.push('getAttribute:href');
+          return 'https://creator.example/join';
+        },
+        click: async (options: { timeout: number }) => {
+          calls.push(`click:${options.timeout}`);
+          throw new Error('locator.click: Element is not attached to the DOM');
+        },
+      },
+      page: {
+        url: () => 'https://creator.example/',
+        waitForTimeout: async () => {
+          calls.push('wait');
+        },
+      },
+      control,
+      retain: () => {},
+      inspect: async () => {
+        inspected = true;
+      },
+      telemetry,
+      onClicked: () => {
+        clickCount++;
+      },
+    }),
+  );
   assert.equal(result.ok, false);
   assert.equal(result.clickFailureKind, 'detached_stale');
+  // Wiring proof on failure: href read and click attempted with production
+  // timeout, but no settle wait, no inspection, and no clicks++.
+  assert.deepEqual(calls, ['getAttribute:href', 'click:2000']);
+  assert.equal(clickCount, 0);
   assert.equal(telemetry.clicksStarted, 1);
   assert.equal(telemetry.clicksSucceeded, 0);
   assert.equal(telemetry.clicksFailed, 1);
@@ -145,7 +196,13 @@ test('click failure classification covers real Playwright error shapes', () => {
     classifyRenderedClickFailure(new Error('Navigation failed because page crashed')),
     'nav_interrupted',
   );
+  assert.equal(
+    classifyRenderedClickFailure(new Error('locator.click: Element is not enabled')),
+    'overlay_intercepted',
+  );
   assert.equal(classifyRenderedClickFailure(new Error('net::ERR_INTERNET_DISCONNECTED')), 'network');
+  assert.equal(classifyRenderedClickFailure(new Error('read ECONNRESET')), 'network');
+  assert.equal(classifyRenderedClickFailure(new Error('connect ECONNREFUSED 127.0.0.1:80')), 'network');
   assert.equal(classifyRenderedClickFailure(new Error('something entirely unexpected')), 'other');
   assert.equal(emptyRenderedClickFailureDetail().timeout, 0);
 });
@@ -164,8 +221,7 @@ test('first-failure sample is sanitized and bounded', () => {
 });
 
 // Ledger persistence keeps the new bounded fields and drops the rest.
-test('sanitizer persists bounded click detail and drops unknown/negative keys', () => {
-  const persisted = safeCrawlerTelemetry({
+test('sanitizer persists bounded click detail and drops unknown/negative keys', () => {  const persisted = safeCrawlerTelemetry({
     mode: 'RENDERED',
     redirectsFollowed: 0,
     pagesInspected: 1,
@@ -189,4 +245,62 @@ test('sanitizer persists bounded click detail and drops unknown/negative keys', 
   assert.deepEqual(persisted?.clickFailedTargetKinds, { anchor: 1, button: 1 });
   assert.equal(persisted?.clickFailedWithHref, 1);
   assert.equal(persisted?.firstClickFailureSample, 'timeout|href|locator.click: Timeout 2000ms exceeded.');
+});
+
+// Bounded counters: normal values survive, invalid rejected, excess clamped.
+test('sanitizer clamps click counters to actual attempts and truncates samples', () => {
+  const base = {
+    mode: 'RENDERED',
+    redirectsFollowed: 0,
+    pagesInspected: 1,
+    budgetExhausted: false,
+    clicksStarted: 3,
+    clicksSucceeded: 1,
+    clicksFailed: 2,
+    requestsStarted: 1,
+    requestsFinished: 1,
+    requestsFailed: 0,
+    navigationTimeouts: 0,
+    blockedRequests: 0,
+    rateLimitedRequests: 0,
+    hostBackoffsApplied: 0,
+  };
+  // Normal values survive unchanged.
+  const normal = safeCrawlerTelemetry({
+    ...base,
+    clickFailureDetail: { timeout: 1, detached_stale: 1 },
+    clickFailedTargetKinds: { anchor: 1, button: 1 },
+    clickFailedWithHref: 2,
+  });
+  assert.deepEqual(normal?.clickFailureDetail, { timeout: 1, detached_stale: 1 });
+  assert.deepEqual(normal?.clickFailedTargetKinds, { anchor: 1, button: 1 });
+  assert.equal(normal?.clickFailedWithHref, 2);
+  // Zero/negative/invalid values are rejected.
+  const invalid = safeCrawlerTelemetry({
+    ...base,
+    clicksStarted: 0,
+    clickFailureDetail: { timeout: 0, network: -5, bogus: 3 },
+    clickFailedTargetKinds: { anchor: 0 },
+    clickFailedWithHref: -2,
+  });
+  assert.equal(invalid?.clickFailureDetail, undefined);
+  assert.equal(invalid?.clickFailedTargetKinds, undefined);
+  assert.equal(invalid?.clickFailedWithHref, undefined);
+  // Excessively large values are clamped to actual attempts, never unbounded.
+  const clamped = safeCrawlerTelemetry({
+    ...base,
+    clickFailureDetail: { timeout: 1_000_000_000, network: 1_000_000_000 },
+    clickFailedTargetKinds: { anchor: 999_999_999 },
+    clickFailedWithHref: 999_999_999,
+  });
+  assert.deepEqual(clamped?.clickFailureDetail, { timeout: 3 });
+  assert.deepEqual(clamped?.clickFailedTargetKinds, { anchor: 3 });
+  assert.equal(clamped?.clickFailedWithHref, 3);
+  // Oversize samples are truncated to 200 chars with URLs stripped.
+  const longSample = safeCrawlerTelemetry({
+    ...base,
+    firstClickFailureSample: `timeout|href|${'x'.repeat(500)} https://example.com/join?token=secret-value`,
+  });
+  assert.ok((longSample?.firstClickFailureSample as string).length <= 200);
+  assert.ok(!(longSample?.firstClickFailureSample as string).includes('http'));
 });

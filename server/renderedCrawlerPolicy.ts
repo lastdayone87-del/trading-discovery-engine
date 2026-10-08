@@ -57,10 +57,14 @@ export function classifyRenderedClickFailure(error: unknown): RenderedClickFailu
   if (/element is not attached to the dom|detached from dom|stale element/i.test(message)) {
     return 'detached_stale';
   }
-  if (/intercepts pointer events|receives pointer events|element is not visible|element is not stable|element is disabled/i.test(message)) {
+  // Actionability gate: visible/stable/enabled/receiving-pointer states share
+  // this bucket (the element could not be acted upon for page-state reasons,
+  // as opposed to timing out or being detached). Both Playwright phrasings
+  // ("element is not enabled" and "element is disabled") read the same.
+  if (/intercepts pointer events|receives pointer events|element is not visible|element is not stable|element is not enabled|element is disabled/i.test(message)) {
     return 'overlay_intercepted';
   }
-  if (/net::ERR_|ERR_INTERNET_DISCONNECTED|ERR_CONNECTION_|ENOTFOUND|EAI_AGAIN/i.test(message)) {
+  if (/net::ERR_|ERR_INTERNET_DISCONNECTED|ERR_CONNECTION_|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN/i.test(message)) {
     return 'network';
   }
   if (/timeout|timed out/i.test(message)) {

@@ -421,6 +421,51 @@ export function sanitizeClickFailureMessage(error: unknown): string {
 }
 
 /**
+ * Production wiring adapter for attemptRenderedControlClick (the exact
+ * call-site callbacks). settle() waits only — the single post-click
+ * inspect() lives in attemptRenderedControlClick, so a successful click is
+ * never double-inspected and a redundant second inspection can never turn a
+ * success into a failure. Timeouts keep production values via defaults.
+ */
+export interface RenderedClickEndpoint {
+  getAttribute(name: string): Promise<string | null>;
+  click(options: { timeout: number }): Promise<void>;
+}
+
+export interface RenderedClickSettler {
+  waitForTimeout(ms: number): Promise<void>;
+  url(): string;
+}
+
+export function createRenderedControlClickDeps(input: {
+  locator: RenderedClickEndpoint;
+  page: RenderedClickSettler;
+  control: RenderedControlTarget;
+  retain: (text: string, pageUrl: string) => void;
+  inspect: () => Promise<void>;
+  telemetry: BrowserFallbackTelemetry;
+  onClicked: () => void;
+  clickTimeoutMs?: number;
+  settleMs?: number;
+}): RenderedClickAttemptDeps {
+  const { locator, page, control, retain, inspect, telemetry, onClicked } = input;
+  const clickTimeoutMs = input.clickTimeoutMs ?? 2_000;
+  const settleMs = input.settleMs ?? 400;
+  return {
+    control,
+    pageUrl: page.url(),
+    getHref: () => locator.getAttribute('href'),
+    performClick: () => locator.click({ timeout: clickTimeoutMs }).then(() => {
+      onClicked();
+    }),
+    settle: () => page.waitForTimeout(settleMs),
+    retain,
+    inspect,
+    telemetry,
+  };
+}
+
+/**
  * Rendered click targeting (acquisition efficiency): controls whose href
  * resolves to a same-host navigable document that also passes the rendered
  * enqueue/admission rule are discovered deterministically through
@@ -1040,16 +1085,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             for (const control of clickPlan.toClick) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
               const locator=page.locator('a,button,[role="button"]').nth(control.index);
-              await attemptRenderedControlClick({
+              await attemptRenderedControlClick(createRenderedControlClickDeps({
+                locator: locator as unknown as RenderedClickEndpoint,
+                page: page as unknown as RenderedClickSettler,
                 control,
-                pageUrl: page.url(),
-                getHref: () => locator.getAttribute('href'),
-                performClick: () => locator.click({timeout:2_000}).then(() => { clicks++; }),
-                settle: async () => { await page.waitForTimeout(400); await inspect(); },
                 retain,
                 inspect,
                 telemetry,
-              });
+                onClicked: () => { clicks++; },
+              }));
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {

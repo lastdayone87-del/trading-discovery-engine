@@ -414,7 +414,10 @@ export function staticCrawlerTelemetry(input: {
 
 /**
  * Bounded click-failure taxonomy sanitizer (closed 7-kind keys, non-negative
- * ints). Unknown keys and non-finite values are dropped rather than stored.
+ * ints, additionally clamped to maxTotal so persisted counters can never
+ * exceed the crawl's actual click attempts). Unknown keys, non-finite, and
+ * non-positive values are dropped rather than stored. Clamping spends a fixed
+ * taxonomy-order budget, so both per-key and total counts stay bounded.
  */
 const CLICK_FAILURE_DETAIL_KEYS = [
   'timeout',
@@ -426,34 +429,46 @@ const CLICK_FAILURE_DETAIL_KEYS = [
   'other',
 ] as const;
 
-export function sanitizeClickFailureDetail(
-  value: unknown,
+function clampCountRecord(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+  maxTotal: number,
 ): Partial<Record<string, number>> | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const record = value as Record<string, unknown>;
+  const budget = Number.isFinite(maxTotal) && maxTotal > 0 ? Math.floor(maxTotal) : 0;
   const out: Partial<Record<string, number>> = {};
-  for (const key of CLICK_FAILURE_DETAIL_KEYS) {
+  let remaining = budget;
+  for (const key of keys) {
+    if (remaining <= 0) break;
     const entry = record[key];
     if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
-      out[key] = Math.floor(entry);
+      const taken = Math.min(Math.floor(entry), remaining);
+      if (taken > 0) {
+        out[key] = taken;
+        remaining -= taken;
+      }
     }
   }
   return Object.keys(out).length ? out : undefined;
 }
 
+export function sanitizeClickFailureDetail(
+  value: unknown,
+  maxTotal: number = Number.POSITIVE_INFINITY,
+): Partial<Record<string, number>> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  return clampCountRecord(value as Record<string, unknown>, CLICK_FAILURE_DETAIL_KEYS, maxTotal);
+}
+
+const CLICK_TARGET_KIND_KEYS = ['anchor', 'button', 'role'] as const;
+
 export function sanitizeClickFailedTargetKinds(
   value: unknown,
+  maxTotal: number = Number.POSITIVE_INFINITY,
 ): { anchor?: number; button?: number; role?: number } | undefined {
   if (!value || typeof value !== 'object') return undefined;
-  const record = value as Record<string, unknown>;
-  const out: { anchor?: number; button?: number; role?: number } = {};
-  for (const key of ['anchor', 'button', 'role'] as const) {
-    const entry = record[key];
-    if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
-      out[key] = Math.floor(entry);
-    }
-  }
-  return Object.keys(out).length ? out : undefined;
+  return clampCountRecord(value as Record<string, unknown>, CLICK_TARGET_KIND_KEYS, maxTotal) as
+    | { anchor?: number; button?: number; role?: number }
+    | undefined;
 }
 
 /**
@@ -531,16 +546,37 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(scrolls > 0 ? { scrollsUsed: scrolls } : {}),
     ...(attribution ? { experimentAttribution: attribution } : {}),
     ...(ceiling ? { ceiling } : {}),
-    ...(sanitizeClickFailureDetail((candidate as { clickFailureDetail?: unknown }).clickFailureDetail)
-      ? { clickFailureDetail: sanitizeClickFailureDetail((candidate as { clickFailureDetail?: unknown }).clickFailureDetail)! }
+    ...(sanitizeClickFailureDetail(
+      (candidate as { clickFailureDetail?: unknown }).clickFailureDetail,
+      number(candidate.clicksStarted),
+    )
+      ? {
+          clickFailureDetail: sanitizeClickFailureDetail(
+            (candidate as { clickFailureDetail?: unknown }).clickFailureDetail,
+            number(candidate.clicksStarted),
+          )!,
+        }
       : {}),
-    ...(sanitizeClickFailedTargetKinds((candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds)
-      ? { clickFailedTargetKinds: sanitizeClickFailedTargetKinds((candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds)! }
+    ...(sanitizeClickFailedTargetKinds(
+      (candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds,
+      number(candidate.clicksStarted),
+    )
+      ? {
+          clickFailedTargetKinds: sanitizeClickFailedTargetKinds(
+            (candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds,
+            number(candidate.clicksStarted),
+          )!,
+        }
       : {}),
     ...(typeof (candidate as { clickFailedWithHref?: unknown }).clickFailedWithHref === 'number' &&
     Number.isFinite((candidate as { clickFailedWithHref?: unknown }).clickFailedWithHref) &&
     (candidate as { clickFailedWithHref?: number }).clickFailedWithHref! > 0
-      ? { clickFailedWithHref: Math.floor((candidate as { clickFailedWithHref?: number }).clickFailedWithHref!) }
+      ? {
+          clickFailedWithHref: Math.min(
+            Math.floor((candidate as { clickFailedWithHref?: number }).clickFailedWithHref!),
+            number(candidate.clicksStarted),
+          ),
+        }
       : {}),
     ...(sanitizeClickFailureSample((candidate as { firstClickFailureSample?: unknown }).firstClickFailureSample)
       ? { firstClickFailureSample: sanitizeClickFailureSample((candidate as { firstClickFailureSample?: unknown }).firstClickFailureSample)! }
