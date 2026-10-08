@@ -552,3 +552,37 @@ test('frozen ordering without a valid scheduledAt fails closed instead of using 
   assert.equal(legacy.windowApplied, true);
   assert.deepEqual(legacy.window, { publishedAfter: '2026-01-01T00:00:00Z' });
 });
+
+test('v2 frozen identities are recognized without disturbing v1 recognition', async () => {
+  const { benchmarkOpportunityIdForScope, isFrozenBenchmarkConfiguration, normalizeSelectionExperimentRequest } = await import('./querySelectionExperiments');
+  const v2Request = {
+    selection: { experimentId: 'benchmark-prereg-v2-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000, thompsonPrior: { alpha0: 1, beta0: 1 }, contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 } },
+    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  };
+  const v2 = normalizeSelectionExperimentRequest(v2Request);
+  assert.equal(isFrozenBenchmarkConfiguration(v2), true);
+  assert.equal(benchmarkOpportunityIdForScope(v2.benchmark, 42, v2), 'benchmark-prereg-v2:pool:abc123:42');
+  const v1Request = {
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000, thompsonPrior: { alpha0: 1, beta0: 1 }, contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 } },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  };
+  const v1 = normalizeSelectionExperimentRequest(v1Request);
+  assert.equal(isFrozenBenchmarkConfiguration(v1), true);
+  assert.equal(benchmarkOpportunityIdForScope(v1.benchmark, 42, v1), 'benchmark-prereg-v1:pool:abc123:42');
+  const mixedA = normalizeSelectionExperimentRequest({
+    selection: v1Request.selection,
+    ordering: v2Request.ordering,
+    benchmark: v1Request.benchmark,
+  });
+  assert.equal(isFrozenBenchmarkConfiguration(mixedA), false);
+  assert.equal(benchmarkOpportunityIdForScope(mixedA.benchmark, 42, mixedA), undefined);
+  const mixedB = normalizeSelectionExperimentRequest({
+    selection: v2Request.selection,
+    ordering: v1Request.ordering,
+    benchmark: v1Request.benchmark,
+  });
+  assert.equal(isFrozenBenchmarkConfiguration(mixedB), false);
+  assert.equal(benchmarkOpportunityIdForScope(mixedB.benchmark, 42, mixedB), undefined);
+});

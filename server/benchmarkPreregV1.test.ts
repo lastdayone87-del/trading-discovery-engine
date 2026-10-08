@@ -3,6 +3,12 @@ import fs from 'node:fs';
 import test from 'node:test';
 import type { QueryRecord } from '../src/types';
 import {
+  BENCHMARK_PREREG_V2_SPEC,
+  BENCHMARK_PREREG_V2_FROZEN_BASE_COMMIT,
+  benchmarkPreregSpecForVersion,
+  isSameUtcDayPlan,
+  isSchedulerStoppedForBenchmark,
+  requireFreshPlanForStatus,
   BENCHMARK_PREREG_SPEC_VERSION,
   BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
   BENCHMARK_PREREG_SCOPE_SIZE,
@@ -14,6 +20,7 @@ import {
   buildPoolSnapshot,
   verifyPoolSnapshotHash,
   verifyExecutionArtifactsBound,
+  assertFullScope,
   computeConfigurationHash,
   buildExecutionRecord,
 } from './benchmarkPreregV1';
@@ -142,9 +149,10 @@ test('runner script cannot substitute an unrelated benchmark', () => {
 
 test('planning cannot reach scheduling without the explicit execute mode', () => {
   const source = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  const cliSource = fs.readFileSync(new URL('./benchmarkPreregCli.ts', import.meta.url), 'utf8');
   // Default mode is plan; only the literal --execute flag selects execute.
-  assert.match(source, /let mode: 'plan' \| 'execute' = 'plan'/);
-  assert.match(source, /if \(arg === '--execute'\) mode = 'execute'/);
+  assert.match(cliSource, /let mode: 'plan' \| 'execute' = 'plan'/);
+  assert.match(cliSource, /if \(arg === '--execute'\) mode = 'execute'/);
   // The plan branch returns before any scheduling site.
   const planGuard = source.indexOf("if (mode === 'plan')");
   const scheduleSite = source.indexOf('runAutonomousDiscoveryCycle(row.country');
@@ -493,4 +501,46 @@ test('benchmark honors the kill switch even with a target country', async () => 
   assert.match(script, /killSwitchEngaged = await haltedByKillSwitch\(\);/);
   assert.match(script, /INFRA_INCIDENT:KILL_SWITCH_UNREADABLE/);
   assert.doesNotMatch(script, /KILL_SWITCH_PAUSED\|INCOMPLETE/);
+});
+
+test('v2 spec flows end to end without touching v1 behavior', () => {
+  const v2 = BENCHMARK_PREREG_V2_SPEC;
+  assert.equal(v2.specVersion, 'benchmark-preregistration-v2');
+  assert.equal(v2.baseCommit, BENCHMARK_PREREG_V2_FROZEN_BASE_COMMIT);
+  assert.equal(v2.scopeSize, 120);
+  assert.equal(v2.poolPrefix, 'benchmark-prereg-v2:pool');
+  assert.equal(v2.selectionExperimentId, 'benchmark-prereg-v2-selection');
+  assert.equal(v2.orderingExperimentId, 'benchmark-prereg-v2-ordering');
+  assert.equal(BENCHMARK_PREREG_V2_SPEC.baseCommit.length, 40);
+  assert.throws(() => benchmarkPreregSpecForVersion('benchmark-preregistration-v99'), /BENCHMARK_PREREG_UNKNOWN_SPEC/);
+  const rows = Array.from({ length: 130 }, (_, i) => eligibleRow(i + 1));
+  const snapshot = buildPoolSnapshot(
+    { rows, collectedAt: new Date('2026-10-08T12:00:00.000Z'), cooldownMinutes: 360, maxPrimaryUses: 2 },
+    BENCHMARK_PREREG_V2_SPEC
+  );
+  assert.equal(snapshot.rows.length, 120);
+  assert.equal(snapshot.specVersion, 'benchmark-preregistration-v2');
+  assert.equal(snapshot.rulesVersion, 'pool-rules-benchmark-prereg-v2');
+  const request = buildFrozenBenchmarkRequest(snapshot.snapshotHash, 7, BENCHMARK_PREREG_V2_SPEC);
+  assert.equal(request.selection?.experimentId, 'benchmark-prereg-v2-selection');
+  assert.equal(request.ordering?.experimentId, 'benchmark-prereg-v2-ordering');
+  assert.equal(isFrozenBenchmarkConfiguration(request), true);
+  assert.throws(() => assertFullScope({ ...snapshot, rows: snapshot.rows.slice(0, 119) }, BENCHMARK_PREREG_V2_SPEC), /required=120/);
+  assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-08T23:59:59.000Z')), true);
+  assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-09T00:00:01.000Z')), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: false }), true);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: true }), false);
+  assert.equal(isSchedulerStoppedForBenchmark(null), false);
+});
+
+test('freshness gate applies to PLANNED start, never strands IN_PROGRESS recovery', () => {
+  assert.doesNotThrow(() => requireFreshPlanForStatus('PLANNED', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')));
+  assert.throws(
+    () => requireFreshPlanForStatus('PLANNED', '2026-10-08T12:00:00.000Z', new Date('2026-10-09T00:30:00.000Z')),
+    /BENCHMARK_PREREG_PLAN_STALE/
+  );
+  assert.doesNotThrow(() => requireFreshPlanForStatus('IN_PROGRESS', '2026-10-08T12:00:00.000Z', new Date('2026-10-09T00:30:00.000Z')));
+  assert.doesNotThrow(() => requireFreshPlanForStatus('IN_PROGRESS', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')));
+  assert.throws(() => requireFreshPlanForStatus('COMPLETE', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')), /BENCHMARK_PREREG_PLAN_STALE/);
 });

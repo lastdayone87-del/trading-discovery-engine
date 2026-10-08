@@ -1,14 +1,15 @@
 /**
- * Minimal execution runner for benchmark-preregistration-v1.
+ * Version-parameterized execution runner (default: benchmark-preregistration-v1).
  *
- * Sole authority: docs/BENCHMARK_PREREGISTRATION.md. This script is NOT a
+ * Sole authority is the active spec document: docs/BENCHMARK_PREREGISTRATION.md
+ * for v1, docs/BENCHMARK_PREREGISTRATION_V2.md for --spec-version=v2. This script is NOT a
  * new benchmark and shares nothing with fastBenchmark, evaluateBenchmark,
  * semantic benchmarks, or any other script: those are different benchmarks
  * and must never be substituted here.
  *
  * Modes (no benchmark observations are created unless --execute is passed):
  * - plan (default): read-only against the database. Verifies frozen
- *   versions and gates, exports the deterministic 300-row pool snapshot +
+ *   versions and gates, exports the deterministic 120-row pool snapshot +
  *   hash, captures configuration/provider/migration provenance, and writes
  *   pool-snapshot.json + execution-record.json (status PLANNED). Schedules
  *   nothing. This is the only mode used during implementation.
@@ -19,10 +20,11 @@
  *   review approval.
  *
  * Usage:
- *   npx tsx scripts/runBenchmarkPreregV1.ts --plan --out ./benchmark-prereg-v1
- *   npx tsx scripts/runBenchmarkPreregV1.ts --execute --out ./benchmark-prereg-v1
+ *   npx tsx scripts/runBenchmarkPreregV1.ts --plan --spec-version=v2 --out ./benchmark-prereg-v2
+ *   npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version=v2 --out ./benchmark-prereg-v2
  */
 import dotenv from 'dotenv';
+import { parseBenchmarkArgs } from '../server/benchmarkPreregCli';
 dotenv.config();
 import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -31,9 +33,12 @@ import { fileURLToPath } from 'node:url';
 import { getDb } from '../server/db';
 import { rowToQuery } from '../server/dbCore';
 import {
-  BENCHMARK_PREREG_SPEC_VERSION,
-  BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
   BENCHMARK_PREREG_FROZEN_MIGRATION_COUNT,
+  BENCHMARK_PREREG_V2_SPEC,
+  benchmarkPreregSpecForVersion,
+  isSameUtcDayPlan,
+  requireFreshPlanForStatus,
+  isSchedulerStoppedForBenchmark,
   verifyFrozenBenchmarkVersions,
   verifyBenchmarkGatesOff,
   buildFrozenBenchmarkRequest,
@@ -57,25 +62,17 @@ import {
 } from '../server/benchmarkPreregV1';
 
 function usageError(message: string): never {
-  console.error(`[benchmark-prereg-v1] ${message}`);
-  console.error('Usage: npx tsx scripts/runBenchmarkPreregV1.ts [--plan|--execute] --out <dir> [--force]');
+  console.error(`[benchmark-prereg] ${message}`);
+  console.error('Usage: npx tsx scripts/runBenchmarkPreregV1.ts [--plan|--execute] --out <dir> [--force] [--spec-version=v1|v2]');
   process.exit(1);
 }
 
-function parseArgs(argv: string[]): { mode: 'plan' | 'execute'; outDir: string; force: boolean } {
-  let mode: 'plan' | 'execute' = 'plan';
-  let outDir = '';
-  let force = false;
-  for (const arg of argv) {
-    if (arg === '--execute') mode = 'execute';
-    else if (arg === '--plan') mode = 'plan';
-    else if (arg === '--force') force = true;
-    else if (arg.startsWith('--out=')) outDir = arg.slice('--out='.length);
-    else if (arg === '--out') outDir = argv[argv.indexOf(arg) + 1] || '';
-    else if (arg.startsWith('--')) usageError(`Unknown flag ${arg}`);
+function parseArgs(argv: string[]): { mode: 'plan' | 'execute'; outDir: string; force: boolean; specVersion: string } {
+  try {
+    return parseBenchmarkArgs(argv);
+  } catch (error) {
+    usageError(error instanceof Error ? error.message.replace(/^BENCHMARK_PREREG_USAGE: /, '') : String(error));
   }
-  if (!outDir) usageError('Missing required --out <dir>');
-  return { mode, outDir: resolve(outDir), force };
 }
 
 function runningCommit(repoRoot: string): string {
@@ -106,10 +103,11 @@ function effectiveNumberedSetting(
 }
 
 async function main(): Promise<void> {
-  const { mode, outDir, force } = parseArgs(process.argv.slice(2));
+  const { mode, outDir, force, specVersion } = parseArgs(process.argv.slice(2));
+  const spec = benchmarkPreregSpecForVersion(specVersion);
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const commit = runningCommit(repoRoot);
-  console.log(`[benchmark-prereg-v1] mode=${mode} spec=${BENCHMARK_PREREG_SPEC_VERSION} frozenBase=${BENCHMARK_PREREG_FROZEN_BASE_COMMIT} running=${commit}`);
+  console.log(`[${spec.logTag}] mode=${mode} spec=${spec.specVersion} frozenBase=${spec.baseCommit} running=${commit}`);
 
   // Fail closed on any frozen drift before touching anything else.
   verifyFrozenBenchmarkVersions();
@@ -141,24 +139,24 @@ async function main(): Promise<void> {
       collectedAt: now,
       cooldownMinutes,
       maxPrimaryUses,
-    });
+    }, spec);
     if (snapshot.rows.length === 0) {
       throw new Error('BENCHMARK_PREREG_EMPTY_POOL: no eligible opportunities; refusing to freeze an empty scope');
     }
-    // Frozen scope is 300: an undersized plan is not executable and must
-    // fail closed here with its deterministic reason, never silently fewer.
-    assertFullScope(snapshot);
+    // Frozen scope (per active spec): an undersized plan is not executable
+    // and must fail closed here with its deterministic reason, never silently fewer.
+    assertFullScope(snapshot, spec);
     const providerRegistry = (await db.query(
       'SELECT provider_key, provider_family, provider_kind, capabilities, quota_domain, mode, daily_cost_cap, configuration_version FROM discovery_provider_registry ORDER BY provider_key'
     )).rows as Array<Record<string, unknown>>;
     const configurationHash = computeConfigurationHash({ appSettings: settingsRows, maxMigrationVersion, providerRegistry });
-    const record = buildExecutionRecord({ runningCommit: commit, poolSnapshot: snapshot, configurationHash, maxMigrationVersion, providerRegistry, appSettings: settingsRows });
+    const record = buildExecutionRecord({ runningCommit: commit, poolSnapshot: snapshot, configurationHash, maxMigrationVersion, providerRegistry, appSettings: settingsRows, spec });
     mkdirSync(outDir, { recursive: true });
     writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
-    console.log(`[benchmark-prereg-v1] PLANNED rows=${snapshot.rows.length}/${snapshot.candidateRows} hash=${snapshot.snapshotHash}`);
-    console.log(`[benchmark-prereg-v1] configHash=${configurationHash} out=${outDir}`);
-    console.log(`[benchmark-prereg-v1] Execute ONLY with explicit approval: npx tsx scripts/runBenchmarkPreregV1.ts --execute --out ${outDir}`);
+    console.log(`[${spec.logTag}] PLANNED rows=${snapshot.rows.length}/${snapshot.candidateRows} hash=${snapshot.snapshotHash}`);
+    console.log(`[${spec.logTag}] configHash=${configurationHash} out=${outDir}`);
+    console.log(`[${spec.logTag}] Execute ONLY with explicit approval: npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version=${spec.specVersion} --out ${outDir}`);
     await db.end().catch(() => undefined);
     return;
   }
@@ -169,30 +167,41 @@ async function main(): Promise<void> {
   }
   const record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
   const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
+  const recordSpec = benchmarkPreregSpecForVersion(record.specVersion);
   if (
-    record.specVersion !== BENCHMARK_PREREG_SPEC_VERSION ||
-    record.frozenBaseCommit !== BENCHMARK_PREREG_FROZEN_BASE_COMMIT ||
+    recordSpec.specVersion !== spec.specVersion ||
+    record.frozenBaseCommit !== recordSpec.baseCommit ||
     record.poolSnapshot.snapshotHash !== snapshot.snapshotHash ||
     (record.status !== 'PLANNED' && record.status !== 'IN_PROGRESS')
   ) {
-    throw new Error('BENCHMARK_PREREG_RECORD_MISMATCH: execution record does not match the frozen plan; refusing to execute');
+    throw new Error('BENCHMARK_PREREG_RECORD_MISMATCH: execution record does not match the frozen plan and requested spec version; refusing to execute');
   }
   verifyPoolSnapshotHash(snapshot);
   verifyExecutionArtifactsBound(record, snapshot);
-  record.status = 'IN_PROGRESS';
-  record.runningCommit = commit;
-  if (record.firstObservedAt === undefined) record.firstObservedAt = null;
-  // Persist IN_PROGRESS before any scheduling so a post-scheduling crash or
-  // ledger-read failure can never leave the file as PLANNED while a run is
-  // active. Every later mutation also saves via saveRecord().
-  record.updatedAt = new Date().toISOString();
-  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
-
+  requireFreshPlanForStatus(record.status, snapshot.collectedAt);
+  // All initial-execution preflight (freshness above; scheduler stopped and
+  // live-lease checks below) must pass BEFORE the record is mutated and
+  // persisted as IN_PROGRESS. Otherwise a failed gate would leave a fresh
+  // PLANNED record converted to IN_PROGRESS, letting a later execution
+  // resume against a stale snapshot and bypass the same-day requirement.
+  const schedulerRow = (await db.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`).catch(() => ({ rows: [] })) as { rows: Array<{ is_enabled: boolean; is_running: boolean }> }).rows[0];
+  if (!isSchedulerStoppedForBenchmark(schedulerRow)) {
+    throw new Error('BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED: autonomous scheduler must be stopped (enabled=false, running=false) before executing');
+  }
   const { runAutonomousDiscoveryCycle, getAutonomousDiscoveryStatus } = await import('../server/autonomousDiscovery');
   const status = await getAutonomousDiscoveryStatus().catch(() => null);
   if (status?.isRunning) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_BUSY: autonomous scheduler already running; stop it before executing');
   }
+  record.status = 'IN_PROGRESS';
+  record.runningCommit = commit;
+  if (record.firstObservedAt === undefined) record.firstObservedAt = null;
+  // Persist IN_PROGRESS only after all preflight passed, and before any
+  // scheduling, so a post-scheduling crash or ledger-read failure can never
+  // leave the file as PLANNED while a run is active. Every later mutation
+  // also saves via saveRecord().
+  record.updatedAt = new Date().toISOString();
+  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
 
   const saveRecord = () => {
@@ -216,7 +225,7 @@ async function main(): Promise<void> {
     record.stopReason = stopReason;
     saveRecord();
     await db.end().catch(() => undefined);
-    throw new Error(`[benchmark-prereg-v1] INCOMPLETE: ${stopReason}`);
+    throw new Error(`[${spec.logTag}] INCOMPLETE: ${stopReason}`);
   };
   const pollRunState = (runId: string) => async () => {
     const runRows = (await db.query('SELECT status, completed_at FROM query_runs WHERE id = $1', [runId])).rows as Array<{ status: string; completed_at: string | null }>;
@@ -294,7 +303,7 @@ async function main(): Promise<void> {
         matchedRunIds: preMatched.map(run => run.id),
       });
       saveRecord();
-      console.log(`[benchmark-prereg-v1] recovered ${designated.benchmarkOpportunityId} ${outcome} run=${latest.id}`);
+      console.log(`[${spec.logTag}] recovered ${designated.benchmarkOpportunityId} ${outcome} run=${latest.id}`);
       continue;
     }
 
@@ -303,7 +312,7 @@ async function main(): Promise<void> {
     // guarantees it schedules the designated row or nothing — never
     // unrelated work.
     const attemptStart = new Date();
-    const requestId = `benchmark-prereg-v1:${snapshot.snapshotHash.slice(0, 12)}:${designated.poolRowId}`;
+    const requestId = `${spec.logTag}:${snapshot.snapshotHash.slice(0, 12)}:${designated.poolRowId}`;
     // Kill-switch recheck immediately before scheduling: drift checking ran
     // above, but a pause engaged in the gap must still stop the benchmark.
     // The engine also honors pause for benchmark scope even with a target
@@ -327,7 +336,7 @@ async function main(): Promise<void> {
     try {
       const row = snapshot.rows.find(candidate => candidate.queryId === designated.poolRowId);
       if (!row) throw new Error(`BENCHMARK_PREREG_DESIGNATED_ROW_MISSING: poolRowId=${designated.poolRowId}`);
-      const frozenRequest = buildFrozenBenchmarkRequest(snapshot.snapshotHash, row.queryId);
+      const frozenRequest = buildFrozenBenchmarkRequest(snapshot.snapshotHash, row.queryId, spec);
       report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest);
       // Engine pause (kill switch engaged mid-cycle) is an abort, never a
       // no-match exclusion: schedule nothing further.
@@ -364,7 +373,7 @@ async function main(): Promise<void> {
           note: `adopted-after-cycle-error:${message.slice(0, 120)}`,
         });
         saveRecord();
-        console.log(`[benchmark-prereg-v1] adopted ${designated.benchmarkOpportunityId} ${outcome} run=${postMatched[postMatched.length - 1].id}`);
+        console.log(`[${spec.logTag}] adopted ${designated.benchmarkOpportunityId} ${outcome} run=${postMatched[postMatched.length - 1].id}`);
         continue;
       }
       record.attempts.push({
@@ -373,7 +382,7 @@ async function main(): Promise<void> {
         exclusionReason: `EXECUTION_FAILURE:${message.slice(0, 200)}`,
       });
       saveRecord();
-      console.log(`[benchmark-prereg-v1] excluded ${designated.benchmarkOpportunityId} EXCLUDED_EXECUTION_FAILURE`);
+      console.log(`[${spec.logTag}] excluded ${designated.benchmarkOpportunityId} EXCLUDED_EXECUTION_FAILURE`);
       continue;
     }
     const attemptEnd = new Date();
@@ -410,7 +419,7 @@ async function main(): Promise<void> {
         remainingAutonomousQuota: report.remainingAutonomousQuota ?? null,
       });
       saveRecord();
-      console.log(`[benchmark-prereg-v1] excluded ${designated.benchmarkOpportunityId} ${classified.state} ${classified.reason}`);
+      console.log(`[${spec.logTag}] excluded ${designated.benchmarkOpportunityId} ${classified.state} ${classified.reason}`);
     } else {
       if (!record.firstObservedAt) {
         record.firstObservedAt = matched.map(run => run.scheduled_at).sort()[0];
@@ -426,14 +435,14 @@ async function main(): Promise<void> {
         remainingAutonomousQuota: report.remainingAutonomousQuota ?? null,
       });
       saveRecord();
-      console.log(`[benchmark-prereg-v1] observed ${designated.benchmarkOpportunityId} ${outcome} run=${matched[matched.length - 1].id}`);
+      console.log(`[${spec.logTag}] observed ${designated.benchmarkOpportunityId} ${outcome} run=${matched[matched.length - 1].id}`);
     }
     const statesNow = record.designatedOpportunities.map(item => rowState(item.benchmarkOpportunityId));
     if (isScopeTerminallyAccounted(statesNow)) {
       record.status = 'COMPLETE';
       record.stopReason = 'SCOPE_COVERED';
       saveRecord();
-      console.log('[benchmark-prereg-v1] COMPLETE: all 300 designated opportunities terminally accounted');
+      console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
       await db.end().catch(() => undefined);
       process.exit(0);
     }
@@ -447,7 +456,7 @@ async function main(): Promise<void> {
     record.status = 'COMPLETE';
     record.stopReason = 'SCOPE_COVERED';
     saveRecord();
-    console.log('[benchmark-prereg-v1] COMPLETE: all 300 designated opportunities terminally accounted');
+    console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
     await db.end().catch(() => undefined);
     process.exit(0);
   }
@@ -455,6 +464,6 @@ async function main(): Promise<void> {
 }
 
 main().catch(error => {
-  console.error(`[benchmark-prereg-v1] FAILED: ${error instanceof Error ? error.message : String(error)}`);
+  console.error(`[benchmark-prereg] FAILED: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });

@@ -95,7 +95,7 @@ export interface SelectionExperimentTrialConfig {
 }
 
 /**
- * Frozen benchmark opportunity scope (benchmark-preregistration-v1).
+ * Frozen benchmark opportunity scope (benchmark-preregistration-v2).
  * Designates the pre-existing frozen pool snapshot row this attempt belongs
  * to. Carried on the request (pre-selection) so the benchmark opportunity
  * identity never depends on which query selection serves. Optional and
@@ -166,7 +166,7 @@ function shaBucket(input: string): number {
 }
 
 /**
- * Frozen benchmark identity (benchmark-preregistration-v1 §3A). These
+ * Frozen benchmark identity (benchmark-preregistration-v2 §3A). These
  * constants name the preregistered experiment identities; they change no
  * assignment math and gate only benchmark-scoped derivation paths. All
  * other experiment identities execute the legacy caller-supplied paths
@@ -174,7 +174,9 @@ function shaBucket(input: string): number {
  */
 export const BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v1-selection';
 export const BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v1-ordering';
-/** Frozen P2 recency lookback in days (benchmark-preregistration-v1 §3A). */
+export const BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v2-selection';
+export const BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v2-ordering';
+/** Frozen P2 recency lookback in days (benchmark-preregistration-v2 §3A). */
 export const BENCHMARK_PREREG_ORDERING_WINDOW_DAYS = 90;
 
 const BENCHMARK_PREREG_ORDERING_WINDOW_MS = BENCHMARK_PREREG_ORDERING_WINDOW_DAYS * 24 * 60 * 60 * 1000;
@@ -193,7 +195,7 @@ export function deriveBenchmarkOrderingWindow(scheduledAt: Date): { publishedAft
 
 /**
  * Whether a normalized experiment request exactly matches the frozen
- * benchmark configuration (benchmark-preregistration-v1 §3A). Arm-independent:
+ * benchmark configuration (benchmark-preregistration-v2 §3A). Arm-independent:
  * CONTROL and treatment draws share the same opportunity identity. Any
  * deviation — unrelated identity, different arms/order, different basis,
  * different priors/weights — is not the frozen benchmark, even when a valid
@@ -204,8 +206,13 @@ export function isFrozenBenchmarkConfiguration(
 ): boolean {
   const selection = experiment?.selection ?? null;
   const ordering = experiment?.ordering ?? null;
-  const selectionFrozen = !!selection &&
-    selection.experimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID &&
+  const selectionVersion: 'v1' | 'v2' | null = !selection ? null :
+    (selection.experimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID ? 'v1' :
+      selection.experimentId === BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID ? 'v2' : null);
+  const orderingVersion: 'v1' | 'v2' | null = !ordering ? null :
+    (ordering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID ? 'v1' :
+      ordering.experimentId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID ? 'v2' : null);
+  const selectionFrozen = selectionVersion !== null &&
     selection.treatmentBasisPoints === 5000 &&
     selection.enabledArms.length === 2 &&
     selection.enabledArms[0] === 'THOMPSON' &&
@@ -215,13 +222,15 @@ export function isFrozenBenchmarkConfiguration(
     selection.contextualWeights.value === 0.5 &&
     selection.contextualWeights.exploration === 0.35 &&
     selection.contextualWeights.cost === 0.1;
-  const orderingFrozen = !!ordering &&
-    ordering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID &&
+  const orderingFrozen = orderingVersion !== null &&
     ordering.treatmentBasisPoints === 5000;
-  // Every present selection/ordering dimension must exactly match; a mixed
-  // request (one frozen dimension, one altered dimension) is not the frozen
-  // benchmark. At least one frozen dimension must be present.
-  return (selectionFrozen || orderingFrozen) &&
+  // Every present dimension must exactly match AND all present dimensions
+  // must belong to the SAME spec version: V1 selection + V1 ordering is
+  // valid V1, V2 + V2 is valid V2, and any mixed V1/V2 request gets no
+  // benchmark attribution. At least one frozen dimension must be present.
+  const versions = [selectionFrozen ? selectionVersion : null, orderingFrozen ? orderingVersion : null]
+    .filter((v): v is 'v1' | 'v2' => v !== null);
+  return versions.length > 0 && versions.every(v => v === versions[0]) &&
     (!selection || selectionFrozen) &&
     (!ordering || orderingFrozen);
 }
@@ -249,6 +258,10 @@ export function benchmarkOpportunityIdForScope(
   if (!isFrozenBenchmarkConfiguration(experiment)) return undefined;
   if (!scope) return undefined;
   if (servedQueryId !== scope.poolRowId) return undefined;
+  const versionId = experiment.selection?.experimentId ?? experiment.ordering?.experimentId;
+  if (versionId === BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID || versionId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID) {
+    return `benchmark-prereg-v2:pool:${scope.snapshotHash}:${scope.poolRowId}`;
+  }
   return `benchmark-prereg-v1:pool:${scope.snapshotHash}:${scope.poolRowId}`;
 }
 
@@ -496,8 +509,8 @@ export function evaluateOrderingDimension(args: {
       experimentId: null,
     };
   }
-  if (args.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
-    // Frozen benchmark path (benchmark-preregistration-v1 §3A/§6): a
+  if (args.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID || args.experimentId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID) {
+    // Frozen benchmark path (benchmark-preregistration-v2 §3A/§6): a
     // TREATMENT assignment always carries the scheduled_at-derived 90-day
     // window. Caller-supplied bounds (present, absent, or divergent) never
     // reach the envelope, closing the unwindowed-treatment hole. There is
@@ -553,14 +566,14 @@ export function resolveFrozenBenchmarkScheduleOrdering(
   ordering: SelectionExperimentObservation['ordering'],
   storedScheduledAt: Date
 ): SelectionExperimentObservation['ordering'] {
-  if (!ordering || ordering.arm !== 'TREATMENT' || ordering.experimentId !== BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
+  if (!ordering || ordering.arm !== 'TREATMENT' || (ordering.experimentId !== BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID && ordering.experimentId !== BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID)) {
     return ordering;
   }
   return {
     ...ordering,
     windowApplied: true,
     window: deriveBenchmarkOrderingWindow(storedScheduledAt),
-    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    experimentId: ordering.experimentId,
   };
 }
 
@@ -660,7 +673,7 @@ export interface SelectionExperimentObservation {
   servedArm: SelectionExperimentArm;
   /**
    * Stable benchmark opportunity identity
-   * (`benchmark-prereg-v1:pool:<snapshotHash>:<poolRowId>`). Present only
+   * (`benchmark-prereg-v2:pool:<snapshotHash>:<poolRowId>`). Present only
    * when the request designated a frozen pool scope AND the served query is
    * that designated row; retries share it while each attempt keeps its own
    * assignment draw under determinism.*. Absent otherwise, so
