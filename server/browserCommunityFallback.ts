@@ -8,6 +8,9 @@ import {
   DEFAULT_RENDERED_MAX_REQUEST_RETRIES,
   DEFAULT_RENDERED_MAX_SESSION_ROTATIONS,
   classifyRenderedCrawlerFailure,
+  classifyRenderedClickFailure,
+  emptyRenderedClickFailureDetail,
+  type RenderedClickFailureKind,
   renderedCrawlerHostBackoffMs,
   renderedCrawlerRetryPolicy,
   isRenderedNavigationTimeout,
@@ -54,6 +57,27 @@ export interface BrowserFallbackTelemetry {
   clicksSucceeded: number;
   clicksFailed: number;
   clickFailureClasses: Record<RenderedCrawlerFailureClass, number>;
+  /**
+   * Additive per-click failure taxonomy (fixed 7 keys; see
+   * classifyRenderedClickFailure). The coarser clickFailureClasses buckets
+   * above are unchanged. Optional for backward compatibility with rows and
+   * test fixtures predating instrumentation; the crawler always initializes
+   * it. Sparse in the ledger: omitted when no click has failed yet.
+   */
+  clickFailureDetail?: Record<RenderedClickFailureKind, number>;
+  /**
+   * Failed-click control kinds (fixed anchor/button/role keys) and href
+   * presence count. Bounded aggregates only: no selectors, texts, or URLs.
+   * Optional/sparse like clickFailureDetail.
+   */
+  clickFailedTargetKinds?: { anchor: number; button: number; role: number };
+  clickFailedWithHref?: number;
+  /**
+   * Single sanitized first-failure sample per crawl
+   * ("kind|href|message", URL-stripped, secrets-redacted, capped at 200
+   * chars). Never a raw exception object or unbounded text. Optional/sparse.
+   */
+  firstClickFailureSample?: string;
   /**
    * Furthest lifecycle stage with affirmative evidence for this crawl
    * (seed accepted → gate acquired → crawler running → handler entered →
@@ -321,6 +345,82 @@ export function discoverRequiredSeedLinks(seedHtml: string, seedUrl: string): st
 }
 
 /**
+ * One rendered control click attempt (extracted verbatim from the crawl loop
+ * so fakes can drive the identical sequence in tests). Sequence is fixed:
+ * read href → retain candidate text → click → settle → post-click inspect on
+ * success; on failure record both the legacy coarse bucket and the additive
+ * fine-grained taxonomy, then return without throwing. Failed clicks never
+ * touch request accounting (see markRenderedRequestSucceeded: click handling
+ * owns no marks) and never affect page completion — the caller decides
+ * completion from page/request evidence only.
+ */
+export interface RenderedClickAttemptDeps {
+  control: RenderedControlTarget;
+  pageUrl: string;
+  getHref(): Promise<string | null>;
+  performClick(): Promise<void>;
+  settle(): Promise<void>;
+  retain(text: string, pageUrl: string): void;
+  inspect(): Promise<void>;
+  telemetry: BrowserFallbackTelemetry;
+}
+
+export async function attemptRenderedControlClick(
+  deps: RenderedClickAttemptDeps,
+): Promise<{ ok: boolean; clickFailureKind?: RenderedClickFailureKind }> {
+  const { control, pageUrl, getHref, performClick, settle, retain, inspect, telemetry } = deps;
+  const href = await getHref().catch(() => null);
+  retain(`${control.text} ${href || ''}`, pageUrl);
+  telemetry.clicksStarted++;
+  try {
+    await performClick();
+    telemetry.clicksSucceeded++;
+    await settle();
+    await inspect();
+    return { ok: true };
+  } catch (error) {
+    telemetry.clicksFailed++;
+    const failureClass = classifyRenderedCrawlerFailure(error);
+    telemetry.clickFailureClasses[failureClass]++;
+    const kind = classifyRenderedClickFailure(error);
+    if (!telemetry.clickFailureDetail) telemetry.clickFailureDetail = emptyRenderedClickFailureDetail();
+    telemetry.clickFailureDetail[kind]++;
+    if (!telemetry.clickFailedTargetKinds) telemetry.clickFailedTargetKinds = { anchor: 0, button: 0, role: 0 };
+    telemetry.clickFailedTargetKinds[control.tag ?? 'role']++;
+    if (typeof href === 'string' && href.length > 0) {
+      telemetry.clickFailedWithHref = (telemetry.clickFailedWithHref || 0) + 1;
+    }
+    if (telemetry.firstClickFailureSample === undefined) {
+      telemetry.firstClickFailureSample = buildClickFailureSample(kind, href, error);
+    }
+    return { ok: false, clickFailureKind: kind };
+  }
+}
+
+/**
+ * Bounded first-failure sample ("kind|href|message", URL-stripped,
+ * secrets-redacted, capped at 200 chars). Never a raw exception object or
+ * unbounded text; the same sanitizer guards the persistence boundary in
+ * crawlerTelemetry.ts.
+ */
+export function buildClickFailureSample(
+  kind: RenderedClickFailureKind,
+  href: string | null,
+  error: unknown,
+): string {
+  const message = sanitizeClickFailureMessage(error);
+  const sample = `${kind}|${typeof href === 'string' && href.length > 0 ? 'href' : 'nohref'}|${message}`;
+  return sample.slice(0, 200);
+}
+
+export function sanitizeClickFailureMessage(error: unknown): string {
+  const raw = String((error as any)?.message || error || '');
+  const stripped = raw.replace(/\bhttps?:\/\/[^\s"'<>]+/gi, '[url]').replace(/[\r\n\t]+/g, ' ').trim();
+  const redacted = redactCauseSnippet(stripped, 180);
+  return (redacted || 'unknown-click-error').slice(0, 180);
+}
+
+/**
  * Rendered click targeting (acquisition efficiency): controls whose href
  * resolves to a same-host navigable document that also passes the rendered
  * enqueue/admission rule are discovered deterministically through
@@ -343,6 +443,13 @@ export interface RenderedControlTarget {
   index: number;
   text: string;
   href: string | null;
+  /**
+   * Control kind for bounded click-failure aggregates (anchor/button/role).
+   * Set at enumeration from the element tag name; optional for backward
+   * compatibility with rows predating instrumentation (counted as 'role').
+   * Never a selector or payload.
+   */
+  tag?: 'anchor' | 'button' | 'role';
 }
 
 export function isSkippableNavigableAnchorClick(
@@ -736,6 +843,9 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     clicksSucceeded: 0,
     clicksFailed: 0,
     clickFailureClasses: { BLOCKED: 0, RATE_LIMITED: 0, TRANSIENT: 0, OTHER: 0 },
+    clickFailureDetail: emptyRenderedClickFailureDetail(),
+    clickFailedTargetKinds: { anchor: 0, button: 0, role: 0 },
+    clickFailedWithHref: 0,
     lastLifecycleStage: 'GATE_QUEUED',
   };
   // Terminal-vs-recovered accounting shared with completion logic below.
@@ -885,7 +995,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               // complete matching set FIRST so skipped navigable anchors can
               // never hide a later click-only control behind the old take-12
               // window. Locator indexes stay positional in the full query.
-              return nodes.map((node, index) => ({index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`,href:(node as HTMLAnchorElement).href || null})).filter(item => re.test(item.text)).slice(0, 64);
+              // The tag feeds bounded click-failure aggregates (anchor/button/
+              // role) and nothing else: selection behavior is unchanged.
+              return nodes.map((node, index) => {
+                const tagName = ((node as HTMLElement).tagName || '').toLowerCase();
+                return {index,text:`${(node as HTMLElement).innerText || ''} ${(node as HTMLAnchorElement).href || ''} ${(node as HTMLElement).getAttribute('aria-label') || ''}`,href:(node as HTMLAnchorElement).href || null,tag:(tagName === 'a' ? 'anchor' : tagName === 'button' ? 'button' : 'role') as 'anchor' | 'button' | 'role'};
+              }).filter(item => re.test(item.text)).slice(0, 64);
             }, COMMUNITY_HINTS.source);
             // Navigable same-host anchors are already discovered through
             // enqueueLinks and Discord-scanned before any click, so the click
@@ -925,20 +1040,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             for (const control of clickPlan.toClick) {
               if (Date.now() - startedAt >= limits.totalTimeoutMs) break;
               const locator=page.locator('a,button,[role="button"]').nth(control.index);
-              const href=await locator.getAttribute('href').catch(()=>null);
-              retain(`${control.text} ${href||''}`,page.url());
-              telemetry.clicksStarted++;
-              try {
-                await locator.click({timeout:2_000});
-                clicks++;
-                telemetry.clicksSucceeded++;
-                await page.waitForTimeout(400);
-            await inspect();
-              } catch (error) {
-                telemetry.clicksFailed++;
-                const failureClass = classifyRenderedCrawlerFailure(error);
-                telemetry.clickFailureClasses[failureClass]++;
-              }
+              await attemptRenderedControlClick({
+                control,
+                pageUrl: page.url(),
+                getHref: () => locator.getAttribute('href'),
+                performClick: () => locator.click({timeout:2_000}).then(() => { clicks++; }),
+                settle: async () => { await page.waitForTimeout(400); await inspect(); },
+                retain,
+                inspect,
+                telemetry,
+              });
             }
 
             if (Date.now() - startedAt < limits.totalTimeoutMs) {

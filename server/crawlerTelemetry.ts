@@ -196,6 +196,26 @@ export interface CrawlerTelemetry {
   clicksSucceeded: number;
   clicksFailed: number;
   requestsStarted: number;
+  /**
+   * Additive per-click failure taxonomy (fixed 7-kind keys; see
+   * classifyRenderedClickFailure in renderedCrawlerPolicy.ts). Sparse:
+   * omitted when no click has failed yet or the row predates instrumentation.
+   * The coarser clickFailureClasses buckets live in detail text only and are
+   * intentionally not part of this persisted interface.
+   */
+  clickFailureDetail?: Partial<Record<string, number>>;
+  /**
+   * Failed-click control kinds (anchor/button/role counts) and href-presence
+   * count. Bounded aggregates only: no selectors, texts, or URLs. Sparse.
+   */
+  clickFailedTargetKinds?: { anchor?: number; button?: number; role?: number };
+  clickFailedWithHref?: number;
+  /**
+   * Single sanitized first-failure sample per crawl ("kind|href|message",
+   * URL-stripped, secrets-redacted, capped at 200 chars). Sparse. Never a
+   * raw exception object or unbounded text.
+   */
+  firstClickFailureSample?: string;
   requestsFinished: number;
   requestsFailed: number;
   navigationTimeouts: number;
@@ -392,6 +412,64 @@ export function staticCrawlerTelemetry(input: {
   };
 }
 
+/**
+ * Bounded click-failure taxonomy sanitizer (closed 7-kind keys, non-negative
+ * ints). Unknown keys and non-finite values are dropped rather than stored.
+ */
+const CLICK_FAILURE_DETAIL_KEYS = [
+  'timeout',
+  'detached_stale',
+  'overlay_intercepted',
+  'nav_interrupted',
+  'target_closed',
+  'network',
+  'other',
+] as const;
+
+export function sanitizeClickFailureDetail(
+  value: unknown,
+): Partial<Record<string, number>> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const out: Partial<Record<string, number>> = {};
+  for (const key of CLICK_FAILURE_DETAIL_KEYS) {
+    const entry = record[key];
+    if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
+      out[key] = Math.floor(entry);
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+export function sanitizeClickFailedTargetKinds(
+  value: unknown,
+): { anchor?: number; button?: number; role?: number } | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const out: { anchor?: number; button?: number; role?: number } = {};
+  for (const key of ['anchor', 'button', 'role'] as const) {
+    const entry = record[key];
+    if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
+      out[key] = Math.floor(entry);
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * First-failure sample sanitizer for the persistence boundary: strips URLs
+ * and query strings, then applies the shared secret redaction, capped at 200
+ * chars. Mirrors buildClickFailureSample's producer-side sanitation so ledger
+ * rows are safe even if a caller passes unsanitized text.
+ */
+export function sanitizeClickFailureSample(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const stripped = value.replace(/\bhttps?:\/\/[^\s"'<>]+/gi, '[url]').replace(/[\r\n\t]+/g, ' ').trim();
+  const redacted = redactCauseSnippet(stripped, 200);
+  if (!redacted) return undefined;
+  return redacted.slice(0, 200) || undefined;
+}
+
 export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefined {
   if (!input || typeof input !== 'object') return undefined;
   const candidate = input as Partial<CrawlerTelemetry>;
@@ -453,6 +531,20 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(scrolls > 0 ? { scrollsUsed: scrolls } : {}),
     ...(attribution ? { experimentAttribution: attribution } : {}),
     ...(ceiling ? { ceiling } : {}),
+    ...(sanitizeClickFailureDetail((candidate as { clickFailureDetail?: unknown }).clickFailureDetail)
+      ? { clickFailureDetail: sanitizeClickFailureDetail((candidate as { clickFailureDetail?: unknown }).clickFailureDetail)! }
+      : {}),
+    ...(sanitizeClickFailedTargetKinds((candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds)
+      ? { clickFailedTargetKinds: sanitizeClickFailedTargetKinds((candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds)! }
+      : {}),
+    ...(typeof (candidate as { clickFailedWithHref?: unknown }).clickFailedWithHref === 'number' &&
+    Number.isFinite((candidate as { clickFailedWithHref?: unknown }).clickFailedWithHref) &&
+    (candidate as { clickFailedWithHref?: number }).clickFailedWithHref! > 0
+      ? { clickFailedWithHref: Math.floor((candidate as { clickFailedWithHref?: number }).clickFailedWithHref!) }
+      : {}),
+    ...(sanitizeClickFailureSample((candidate as { firstClickFailureSample?: unknown }).firstClickFailureSample)
+      ? { firstClickFailureSample: sanitizeClickFailureSample((candidate as { firstClickFailureSample?: unknown }).firstClickFailureSample)! }
+      : {}),
   };
 }
 
