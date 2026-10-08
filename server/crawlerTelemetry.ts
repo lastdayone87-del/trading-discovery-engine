@@ -434,14 +434,20 @@ function clampCountRecord(
   keys: readonly string[],
   maxTotal: number,
 ): Partial<Record<string, number>> | undefined {
-  const budget = Number.isFinite(maxTotal) && maxTotal > 0 ? Math.floor(maxTotal) : 0;
+  // Infinity (the default when callers omit maxTotal) means an unlimited
+  // budget: direct callers retain valid counters unclamped, while
+  // safeCrawlerTelemetry always passes the finite clicksStarted count so
+  // persisted rows stay bounded by actual attempts. Only finite positive
+  // budgets clamp; anything else yields no positive counts.
+  const unlimited = maxTotal === Number.POSITIVE_INFINITY;
+  const budget = unlimited ? Number.POSITIVE_INFINITY : Number.isFinite(maxTotal) && maxTotal > 0 ? Math.floor(maxTotal) : 0;
   const out: Partial<Record<string, number>> = {};
   let remaining = budget;
   for (const key of keys) {
     if (remaining <= 0) break;
     const entry = record[key];
     if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
-      const taken = Math.min(Math.floor(entry), remaining);
+      const taken = unlimited ? Math.floor(entry) : Math.min(Math.floor(entry), remaining);
       if (taken > 0) {
         out[key] = taken;
         remaining -= taken;

@@ -14,6 +14,10 @@ import {
 } from './renderedCrawlerPolicy';
 import { extractDiscordCandidates } from './discordCandidates';
 import { safeCrawlerTelemetry } from './crawlerTelemetry';
+import {
+  sanitizeClickFailureDetail,
+  sanitizeClickFailedTargetKinds,
+} from './crawlerTelemetry';
 
 const freshTelemetry = (): BrowserFallbackTelemetry => ({
   requestsStarted: 0,
@@ -303,4 +307,20 @@ test('sanitizer clamps click counters to actual attempts and truncates samples',
   });
   assert.ok((longSample?.firstClickFailureSample as string).length <= 200);
   assert.ok(!(longSample?.firstClickFailureSample as string).includes('http'));
+});
+
+// Sanitizer budget semantics: omitted maxTotal is unlimited for direct
+// callers; finite budgets clamp; invalid budgets permit nothing.
+test('exported sanitizers default to unlimited and clamp finite budgets', () => {
+  // 1. No maxTotal preserves valid normal counters.
+  assert.deepEqual(sanitizeClickFailureDetail({ timeout: 2, network: 1 }), { timeout: 2, network: 1 });
+  assert.deepEqual(sanitizeClickFailedTargetKinds({ anchor: 3, role: 1 }), { anchor: 3, role: 1 });
+  // 2. Finite maxTotal still clamps per-key and total counts.
+  assert.deepEqual(sanitizeClickFailureDetail({ timeout: 5, network: 5 }, 3), { timeout: 3 });
+  assert.deepEqual(sanitizeClickFailedTargetKinds({ anchor: 4, button: 4 }, 5), { anchor: 4, button: 1 });
+  // 3. Zero/negative/invalid budgets do not permit positive counters.
+  assert.equal(sanitizeClickFailureDetail({ timeout: 2 }, 0), undefined);
+  assert.equal(sanitizeClickFailureDetail({ timeout: 2 }, -4), undefined);
+  assert.equal(sanitizeClickFailureDetail({ timeout: 2 }, Number.NaN), undefined);
+  assert.equal(sanitizeClickFailedTargetKinds({ anchor: 2 }, 0), undefined);
 });
