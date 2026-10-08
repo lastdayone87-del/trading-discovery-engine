@@ -571,11 +571,18 @@ test('v2 frozen identities are recognized without disturbing v1 recognition', as
   const v1 = normalizeSelectionExperimentRequest(v1Request);
   assert.equal(isFrozenBenchmarkConfiguration(v1), true);
   assert.equal(benchmarkOpportunityIdForScope(v1.benchmark, 42, v1), 'benchmark-prereg-v1:pool:abc123:42');
-  const mixed = normalizeSelectionExperimentRequest({
+  const mixedA = normalizeSelectionExperimentRequest({
     selection: v1Request.selection,
     ordering: v2Request.ordering,
     benchmark: v1Request.benchmark,
   });
-  assert.equal(isFrozenBenchmarkConfiguration(mixed), true);
-  assert.equal(benchmarkOpportunityIdForScope(mixed.benchmark, 42, mixed), 'benchmark-prereg-v1:pool:abc123:42');
+  assert.equal(isFrozenBenchmarkConfiguration(mixedA), false);
+  assert.equal(benchmarkOpportunityIdForScope(mixedA.benchmark, 42, mixedA), undefined);
+  const mixedB = normalizeSelectionExperimentRequest({
+    selection: v2Request.selection,
+    ordering: v1Request.ordering,
+    benchmark: v1Request.benchmark,
+  });
+  assert.equal(isFrozenBenchmarkConfiguration(mixedB), false);
+  assert.equal(benchmarkOpportunityIdForScope(mixedB.benchmark, 42, mixedB), undefined);
 });

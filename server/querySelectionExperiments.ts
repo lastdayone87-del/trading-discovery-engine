@@ -206,9 +206,13 @@ export function isFrozenBenchmarkConfiguration(
 ): boolean {
   const selection = experiment?.selection ?? null;
   const ordering = experiment?.ordering ?? null;
-  const selectionFrozen = !!selection &&
-    (selection.experimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID ||
-      selection.experimentId === BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID) &&
+  const selectionVersion: 'v1' | 'v2' | null = !selection ? null :
+    (selection.experimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID ? 'v1' :
+      selection.experimentId === BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID ? 'v2' : null);
+  const orderingVersion: 'v1' | 'v2' | null = !ordering ? null :
+    (ordering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID ? 'v1' :
+      ordering.experimentId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID ? 'v2' : null);
+  const selectionFrozen = selectionVersion !== null &&
     selection.treatmentBasisPoints === 5000 &&
     selection.enabledArms.length === 2 &&
     selection.enabledArms[0] === 'THOMPSON' &&
@@ -218,14 +222,15 @@ export function isFrozenBenchmarkConfiguration(
     selection.contextualWeights.value === 0.5 &&
     selection.contextualWeights.exploration === 0.35 &&
     selection.contextualWeights.cost === 0.1;
-  const orderingFrozen = !!ordering &&
-    (ordering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID ||
-      ordering.experimentId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID) &&
+  const orderingFrozen = orderingVersion !== null &&
     ordering.treatmentBasisPoints === 5000;
-  // Every present selection/ordering dimension must exactly match; a mixed
-  // request (one frozen dimension, one altered dimension) is not the frozen
-  // benchmark. At least one frozen dimension must be present.
-  return (selectionFrozen || orderingFrozen) &&
+  // Every present dimension must exactly match AND all present dimensions
+  // must belong to the SAME spec version: V1 selection + V1 ordering is
+  // valid V1, V2 + V2 is valid V2, and any mixed V1/V2 request gets no
+  // benchmark attribution. At least one frozen dimension must be present.
+  const versions = [selectionFrozen ? selectionVersion : null, orderingFrozen ? orderingVersion : null]
+    .filter((v): v is 'v1' | 'v2' => v !== null);
+  return versions.length > 0 && versions.every(v => v === versions[0]) &&
     (!selection || selectionFrozen) &&
     (!ordering || orderingFrozen);
 }

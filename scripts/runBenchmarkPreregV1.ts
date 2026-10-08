@@ -61,11 +61,11 @@ import {
 
 function usageError(message: string): never {
   console.error(`[benchmark-prereg] ${message}`);
-  console.error('Usage: npx tsx scripts/runBenchmarkPreregV1.ts [--plan|--execute] --out <dir> [--force]');
+  console.error('Usage: npx tsx scripts/runBenchmarkPreregV1.ts [--plan|--execute] --out <dir> [--force] [--spec-version=v1|v2]');
   process.exit(1);
 }
 
-function parseArgs(argv: string[]): { mode: 'plan' | 'execute'; outDir: string; force: boolean; specVersion: string } {
+export function parseArgs(argv: string[]): { mode: 'plan' | 'execute'; outDir: string; force: boolean; specVersion: string } {
   let mode: 'plan' | 'execute' = 'plan';
   let outDir = '';
   let force = false;
@@ -164,7 +164,7 @@ async function main(): Promise<void> {
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
     console.log(`[${spec.logTag}] PLANNED rows=${snapshot.rows.length}/${snapshot.candidateRows} hash=${snapshot.snapshotHash}`);
     console.log(`[${spec.logTag}] configHash=${configurationHash} out=${outDir}`);
-    console.log(`[${spec.logTag}] Execute ONLY with explicit approval: npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version ${spec.specVersion} --out ${outDir}`);
+    console.log(`[${spec.logTag}] Execute ONLY with explicit approval: npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version=${spec.specVersion} --out ${outDir}`);
     await db.end().catch(() => undefined);
     return;
   }
