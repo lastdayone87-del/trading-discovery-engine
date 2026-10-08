@@ -196,6 +196,26 @@ export interface CrawlerTelemetry {
   clicksSucceeded: number;
   clicksFailed: number;
   requestsStarted: number;
+  /**
+   * Additive per-click failure taxonomy (fixed 7-kind keys; see
+   * classifyRenderedClickFailure in renderedCrawlerPolicy.ts). Sparse:
+   * omitted when no click has failed yet or the row predates instrumentation.
+   * The coarser clickFailureClasses buckets live in detail text only and are
+   * intentionally not part of this persisted interface.
+   */
+  clickFailureDetail?: Partial<Record<string, number>>;
+  /**
+   * Failed-click control kinds (anchor/button/role counts) and href-presence
+   * count. Bounded aggregates only: no selectors, texts, or URLs. Sparse.
+   */
+  clickFailedTargetKinds?: { anchor?: number; button?: number; role?: number };
+  clickFailedWithHref?: number;
+  /**
+   * Single sanitized first-failure sample per crawl ("kind|href|message",
+   * URL-stripped, secrets-redacted, capped at 200 chars). Sparse. Never a
+   * raw exception object or unbounded text.
+   */
+  firstClickFailureSample?: string;
   requestsFinished: number;
   requestsFailed: number;
   navigationTimeouts: number;
@@ -392,6 +412,85 @@ export function staticCrawlerTelemetry(input: {
   };
 }
 
+/**
+ * Bounded click-failure taxonomy sanitizer (closed 7-kind keys, non-negative
+ * ints, additionally clamped to maxTotal so persisted counters can never
+ * exceed the crawl's actual click attempts). Unknown keys, non-finite, and
+ * non-positive values are dropped rather than stored. Clamping spends a fixed
+ * taxonomy-order budget, so both per-key and total counts stay bounded.
+ */
+const CLICK_FAILURE_DETAIL_KEYS = [
+  'timeout',
+  'detached_stale',
+  'overlay_intercepted',
+  'nav_interrupted',
+  'target_closed',
+  'network',
+  'other',
+] as const;
+
+function clampCountRecord(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+  maxTotal: number,
+): Partial<Record<string, number>> | undefined {
+  // Infinity (the default when callers omit maxTotal) means an unlimited
+  // budget: direct callers retain valid counters unclamped, while
+  // safeCrawlerTelemetry always passes the finite clicksStarted count so
+  // persisted rows stay bounded by actual attempts. Only finite positive
+  // budgets clamp; anything else yields no positive counts.
+  const unlimited = maxTotal === Number.POSITIVE_INFINITY;
+  const budget = unlimited ? Number.POSITIVE_INFINITY : Number.isFinite(maxTotal) && maxTotal > 0 ? Math.floor(maxTotal) : 0;
+  const out: Partial<Record<string, number>> = {};
+  let remaining = budget;
+  for (const key of keys) {
+    if (remaining <= 0) break;
+    const entry = record[key];
+    if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
+      const taken = unlimited ? Math.floor(entry) : Math.min(Math.floor(entry), remaining);
+      if (taken > 0) {
+        out[key] = taken;
+        remaining -= taken;
+      }
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+export function sanitizeClickFailureDetail(
+  value: unknown,
+  maxTotal: number = Number.POSITIVE_INFINITY,
+): Partial<Record<string, number>> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  return clampCountRecord(value as Record<string, unknown>, CLICK_FAILURE_DETAIL_KEYS, maxTotal);
+}
+
+const CLICK_TARGET_KIND_KEYS = ['anchor', 'button', 'role'] as const;
+
+export function sanitizeClickFailedTargetKinds(
+  value: unknown,
+  maxTotal: number = Number.POSITIVE_INFINITY,
+): { anchor?: number; button?: number; role?: number } | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  return clampCountRecord(value as Record<string, unknown>, CLICK_TARGET_KIND_KEYS, maxTotal) as
+    | { anchor?: number; button?: number; role?: number }
+    | undefined;
+}
+
+/**
+ * First-failure sample sanitizer for the persistence boundary: strips URLs
+ * and query strings, then applies the shared secret redaction, capped at 200
+ * chars. Mirrors buildClickFailureSample's producer-side sanitation so ledger
+ * rows are safe even if a caller passes unsanitized text.
+ */
+export function sanitizeClickFailureSample(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const stripped = value.replace(/\bhttps?:\/\/[^\s"'<>]+/gi, '[url]').replace(/[\r\n\t]+/g, ' ').trim();
+  const redacted = redactCauseSnippet(stripped, 200);
+  if (!redacted) return undefined;
+  return redacted.slice(0, 200) || undefined;
+}
+
 export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefined {
   if (!input || typeof input !== 'object') return undefined;
   const candidate = input as Partial<CrawlerTelemetry>;
@@ -453,6 +552,41 @@ export function safeCrawlerTelemetry(input: unknown): CrawlerTelemetry | undefin
     ...(scrolls > 0 ? { scrollsUsed: scrolls } : {}),
     ...(attribution ? { experimentAttribution: attribution } : {}),
     ...(ceiling ? { ceiling } : {}),
+    ...(sanitizeClickFailureDetail(
+      (candidate as { clickFailureDetail?: unknown }).clickFailureDetail,
+      number(candidate.clicksStarted),
+    )
+      ? {
+          clickFailureDetail: sanitizeClickFailureDetail(
+            (candidate as { clickFailureDetail?: unknown }).clickFailureDetail,
+            number(candidate.clicksStarted),
+          )!,
+        }
+      : {}),
+    ...(sanitizeClickFailedTargetKinds(
+      (candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds,
+      number(candidate.clicksStarted),
+    )
+      ? {
+          clickFailedTargetKinds: sanitizeClickFailedTargetKinds(
+            (candidate as { clickFailedTargetKinds?: unknown }).clickFailedTargetKinds,
+            number(candidate.clicksStarted),
+          )!,
+        }
+      : {}),
+    ...(typeof (candidate as { clickFailedWithHref?: unknown }).clickFailedWithHref === 'number' &&
+    Number.isFinite((candidate as { clickFailedWithHref?: unknown }).clickFailedWithHref) &&
+    (candidate as { clickFailedWithHref?: number }).clickFailedWithHref! > 0
+      ? {
+          clickFailedWithHref: Math.min(
+            Math.floor((candidate as { clickFailedWithHref?: number }).clickFailedWithHref!),
+            number(candidate.clicksStarted),
+          ),
+        }
+      : {}),
+    ...(sanitizeClickFailureSample((candidate as { firstClickFailureSample?: unknown }).firstClickFailureSample)
+      ? { firstClickFailureSample: sanitizeClickFailureSample((candidate as { firstClickFailureSample?: unknown }).firstClickFailureSample)! }
+      : {}),
   };
 }
 
