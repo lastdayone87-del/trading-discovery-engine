@@ -49,7 +49,7 @@ Assignment math (§6-equivalent), all §7 parameters, gates and defaults, exclus
 ## 6. Enforced execution safeguards
 
 - Same-day plan on initial execution: `--execute` refuses a `PLANNED` record unless its snapshot `collectedAt` is today (UTC) — `requireFreshPlanForStatus`. An already `IN_PROGRESS` record resumes across day boundaries under the existing safeguards instead of being stranded — other statuses fail closed.
-- Stopped scheduler: `--execute` refuses unless the `autonomous_discovery` scheduler row reads `is_enabled=false AND is_running=false`, in addition to the pre-existing live-lease check — `isSchedulerStoppedForBenchmark`. Stopping the scheduler is a production configuration change requiring separate explicit authorization (and restoration afterwards).
+- Stopped scheduler: `--execute` refuses unless the scheduler row reads `is_enabled=true` with no running cycle and no live lease — `isSchedulerStoppedForBenchmark` (enabled-required quiescence) plus the pre-existing live-lease refusal. The scheduler row MUST stay enabled during execution because `acquireSchedulerLock()` only grants the lock `WHERE is_enabled=true`; allowing `enabled=false` past the gate deadlocked execution against its own gate (found during V2 validation, corrected here). Quiescence (no producer able to compete, e.g. stopped app process plus clear row/lease) plus the live checks is the invariant that excludes concurrent producers. Pausing activity around execution remains a separately authorized production step (with restoration afterwards).
 
 ## 7. Authorization record
 

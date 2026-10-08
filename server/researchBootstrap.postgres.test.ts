@@ -1564,3 +1564,37 @@ maybe('bootstrap materialization never consumes another run allocated actions', 
     await retireFixtureActions(database, tag);
   }
 });
+
+maybe('benchmark scheduler lock is acquirable under quiescent enabled state and refused while running', async t => {
+  const { acquireSchedulerLock, releaseSchedulerLock } = await import('./dbCore');
+  const { isSchedulerStoppedForBenchmark } = await import('./benchmarkPreregV1');
+  const database = await db();
+  await assertBootstrapDbReady(database);
+  const worker = `test-quiescence:${Date.now()}:${process.pid}`;
+  const prev = (await database.query(`SELECT is_enabled, is_running, locked_by, locked_at, last_run_at, next_run_at, last_report, updated_at FROM scheduler_state WHERE name='autonomous_discovery'`)).rows[0];
+  try {
+    // Approved quiescent state: enabled (lock requires it) but nothing running.
+    await database.query(`UPDATE scheduler_state SET is_enabled=true, is_running=false, locked_by=NULL, locked_at=NULL WHERE name='autonomous_discovery'`);
+    const quiescent = (await database.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`)).rows[0];
+    assert.equal(isSchedulerStoppedForBenchmark(quiescent, false), true);
+    // The deadlock is gone: the benchmark path can actually acquire the lock here.
+    assert.equal(await acquireSchedulerLock('autonomous_discovery', worker), true);
+    const held = (await database.query(`SELECT is_running, locked_by, locked_at FROM scheduler_state WHERE name='autonomous_discovery'`)).rows[0];
+    assert.equal(held.is_running, true, 'acquire persists running state');
+    assert.equal(held.locked_by, worker, 'acquire persists the owner');
+    assert.ok(held.locked_at, 'acquire persists the lock timestamp');
+    // A competing producer cannot take the held lock.
+    assert.equal(await acquireSchedulerLock('autonomous_discovery', `${worker}:rival`), false);
+    await releaseSchedulerLock('autonomous_discovery');
+    // A running scheduler refuses both the gate and the lock.
+    await database.query(`UPDATE scheduler_state SET is_enabled=true, is_running=true, locked_by='test-other', locked_at=now() WHERE name='autonomous_discovery'`);
+    const running = (await database.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`)).rows[0];
+    assert.equal(isSchedulerStoppedForBenchmark(running, false), false);
+    assert.equal(await acquireSchedulerLock('autonomous_discovery', `${worker}:second`), false);
+  } finally {
+    await database.query(
+      `UPDATE scheduler_state SET is_enabled=$1, is_running=$2, locked_by=$3, locked_at=$4, last_run_at=$5, next_run_at=$6, last_report=$7, updated_at=$8 WHERE name='autonomous_discovery'`,
+      [prev.is_enabled, prev.is_running, prev.locked_by, prev.locked_at, prev.last_run_at, prev.next_run_at, prev.last_report, prev.updated_at]
+    );
+  }
+});

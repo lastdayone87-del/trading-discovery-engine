@@ -38,6 +38,7 @@ import {
   benchmarkPreregSpecForVersion,
   isSameUtcDayPlan,
   requireFreshPlanForStatus,
+  assertExecutionPreflightReady,
   isSchedulerStoppedForBenchmark,
   verifyFrozenBenchmarkVersions,
   verifyBenchmarkGatesOff,
@@ -178,18 +179,20 @@ async function main(): Promise<void> {
   }
   verifyPoolSnapshotHash(snapshot);
   verifyExecutionArtifactsBound(record, snapshot);
-  requireFreshPlanForStatus(record.status, snapshot.collectedAt);
-  // All initial-execution preflight (freshness above; scheduler stopped and
-  // live-lease checks below) must pass BEFORE the record is mutated and
-  // persisted as IN_PROGRESS. Otherwise a failed gate would leave a fresh
-  // PLANNED record converted to IN_PROGRESS, letting a later execution
-  // resume against a stale snapshot and bypass the same-day requirement.
-  const schedulerRow = (await db.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`).catch(() => ({ rows: [] })) as { rows: Array<{ is_enabled: boolean; is_running: boolean }> }).rows[0];
-  if (!isSchedulerStoppedForBenchmark(schedulerRow)) {
-    throw new Error('BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED: autonomous scheduler must be stopped (enabled=false, running=false) before executing');
-  }
+  // All initial-execution preflight (freshness + scheduler quiescence)
+  // must pass BEFORE the record is mutated and persisted as IN_PROGRESS.
+  // Otherwise a failed gate would leave a fresh PLANNED record converted to
+  // IN_PROGRESS, letting a later execution resume against a stale snapshot
+  // and bypass the same-day requirement.
   const { runAutonomousDiscoveryCycle, getAutonomousDiscoveryStatus } = await import('../server/autonomousDiscovery');
   const status = await getAutonomousDiscoveryStatus().catch(() => null);
+  const schedulerRow = (await db.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`).catch(() => ({ rows: [] })) as { rows: Array<{ is_enabled: boolean; is_running: boolean }> }).rows[0];
+  assertExecutionPreflightReady({
+    recordStatus: record.status,
+    collectedAtIso: snapshot.collectedAt,
+    schedulerRow,
+    liveRunning: status?.isRunning === true,
+  });
   if (status?.isRunning) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_BUSY: autonomous scheduler already running; stop it before executing');
   }

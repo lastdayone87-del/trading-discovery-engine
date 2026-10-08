@@ -130,28 +130,27 @@ test('plan enforces the full frozen scope and execution waits for terminal attri
   const script = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
   assert.match(script, /assertFullScope\(snapshot, spec\)/);
   assert.match(script, /--execute --spec-version=\$\{spec\.specVersion\} --out/);
-  assert.match(script, /requireFreshPlanForStatus\(record\.status, snapshot\.collectedAt\)/);
+  assert.match(script, /assertExecutionPreflightReady\(\{/);
   const mutateAt = script.indexOf("record.status = 'IN_PROGRESS'");
   assert.ok(mutateAt !== -1);
   for (const gate of [
-    'requireFreshPlanForStatus(record.status, snapshot.collectedAt)',
-    'isSchedulerStoppedForBenchmark(schedulerRow)',
+    'assertExecutionPreflightReady({',
     'BENCHMARK_PREREG_SCHEDULER_BUSY',
   ]) {
     const at = script.indexOf(gate);
     assert.ok(at !== -1 && at < mutateAt, `${gate} must precede the IN_PROGRESS persist so a failed gate cannot convert PLANNED`);
   }
   assert.ok(
-    script.indexOf('requireFreshPlanForStatus(record.status, snapshot.collectedAt)') <
+    script.indexOf('assertExecutionPreflightReady({') <
       script.indexOf("record.status = 'IN_PROGRESS'"),
-    'freshness must read the original persisted status before IN_PROGRESS mutation'
+    'combined preflight (freshness + quiescence) must read the original persisted status before IN_PROGRESS mutation'
   );
   assert.match(script, /const requestId = `\$\{spec\.logTag\}:/);
   assert.match(script, /\$\{spec\.logTag\}\] INCOMPLETE:/);
   assert.ok(!script.includes('benchmark-prereg-v2:${'), 'no hardcoded v2 request namespace may remain');
   assert.ok(script.includes('--execute --spec-version=v2 --out'), 'documented execute command must select v2');
   assert.ok(script.includes('--plan --spec-version=v2 --out'), 'documented plan command must select v2');
-  assert.match(script, /isSchedulerStoppedForBenchmark\(/);
+  assert.match(script, /assertExecutionPreflightReady\(\{/);
   assert.match(script, /waitForTerminalObservation\(pollRunState\(/);
   assert.match(script, /isScopeTerminallyAccounted\(/);
   assert.match(script, /planRowAttempt\(\{/);
