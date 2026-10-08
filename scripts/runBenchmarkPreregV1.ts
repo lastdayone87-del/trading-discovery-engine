@@ -1,7 +1,8 @@
 /**
- * Minimal execution runner for benchmark-preregistration-v2.
+ * Version-parameterized execution runner (default: benchmark-preregistration-v1).
  *
- * Sole authority: docs/BENCHMARK_PREREGISTRATION.md. This script is NOT a
+ * Sole authority is the active spec document: docs/BENCHMARK_PREREGISTRATION.md
+ * for v1, docs/BENCHMARK_PREREGISTRATION_V2.md for --spec-version=v2. This script is NOT a
  * new benchmark and shares nothing with fastBenchmark, evaluateBenchmark,
  * semantic benchmarks, or any other script: those are different benchmarks
  * and must never be substituted here.
