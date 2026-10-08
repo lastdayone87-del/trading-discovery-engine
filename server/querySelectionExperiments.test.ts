@@ -369,13 +369,13 @@ test('frozen benchmark ordering derives the 90-day window from scheduled_at', as
   // Stable benchmark opportunity identity is scoped to designated frozen
   // pool rows under the frozen configuration, never the served query alone.
   const frozenExperiment = normalizeSelectionExperimentRequest({
-    selection: { experimentId: 'benchmark-prereg-v2-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
-    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
     benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
   });
   assert.equal(
     benchmarkOpportunityIdForScope(frozenExperiment.benchmark, 42, frozenExperiment),
-    'benchmark-prereg-v2:pool:abc123:42'
+    'benchmark-prereg-v1:pool:abc123:42'
   );
   // A fallback winner or generated query never acquires the frozen identity.
   assert.equal(benchmarkOpportunityIdForScope(frozenExperiment.benchmark, 7, frozenExperiment), undefined);
@@ -386,14 +386,14 @@ test('frozen benchmark ordering derives the 90-day window from scheduled_at', as
 test('benchmark opportunity identity requires the full frozen configuration', async () => {
   const { benchmarkOpportunityIdForScope, isFrozenBenchmarkConfiguration, normalizeSelectionExperimentRequest } = await import('./querySelectionExperiments');
   const frozenRequest = {
-    selection: { experimentId: 'benchmark-prereg-v2-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
-    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
     benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
   };
   const frozen = normalizeSelectionExperimentRequest(frozenRequest);
   // 1. Valid frozen configuration + matching designated pool row → attached.
   assert.equal(isFrozenBenchmarkConfiguration(frozen), true);
-  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 42, frozen), 'benchmark-prereg-v2:pool:abc123:42');
+  assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 42, frozen), 'benchmark-prereg-v1:pool:abc123:42');
   const variant = (patch: Record<string, unknown>) => normalizeSelectionExperimentRequest({
     selection: { ...(frozenRequest.selection as object), ...(patch.selection as object | undefined) },
     ordering: { ...(frozenRequest.ordering as object), ...(patch.ordering as object | undefined) },
@@ -427,11 +427,11 @@ test('benchmark opportunity identity requires the full frozen configuration', as
   assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 999, frozen), undefined);
   // Ordering-only frozen configuration also qualifies on its own.
   const orderingOnly = normalizeSelectionExperimentRequest({
-    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
     benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
   });
   assert.equal(isFrozenBenchmarkConfiguration(orderingOnly), true);
-  assert.equal(benchmarkOpportunityIdForScope(orderingOnly.benchmark, 42, orderingOnly), 'benchmark-prereg-v2:pool:abc123:42');
+  assert.equal(benchmarkOpportunityIdForScope(orderingOnly.benchmark, 42, orderingOnly), 'benchmark-prereg-v1:pool:abc123:42');
   // 7. CONTROL and treatment share the same frozen opportunity identity: the
   // gate depends on configuration only, never the assigned arm.
   assert.equal(benchmarkOpportunityIdForScope(frozen.benchmark, 42, frozen), benchmarkOpportunityIdForScope(frozen.benchmark, 42, frozen));
@@ -455,8 +455,8 @@ test('observation envelope carries the stable benchmark opportunity only for fro
   };
   const legacy = buildSelectionExperimentObservation(base);
   assert.equal('benchmarkOpportunityId' in legacy, false);
-  const benchmark = buildSelectionExperimentObservation({ ...base, benchmarkOpportunityId: 'benchmark-prereg-v2:q42' });
-  assert.equal(benchmark.benchmarkOpportunityId, 'benchmark-prereg-v2:q42');
+  const benchmark = buildSelectionExperimentObservation({ ...base, benchmarkOpportunityId: 'benchmark-prereg-v1:q42' });
+  assert.equal(benchmark.benchmarkOpportunityId, 'benchmark-prereg-v1:q42');
 });
 
 test('benchmark pool scope normalizes, validates, and gates opportunity identity', () => {
@@ -464,14 +464,14 @@ test('benchmark pool scope normalizes, validates, and gates opportunity identity
   assert.equal(normalizeSelectionExperimentRequest({ selection: { experimentId: 's', enabledArms: ['THOMPSON'], treatmentBasisPoints: 0 } }).benchmark, null);
   // Designated frozen pool row normalizes exactly.
   const scoped = normalizeSelectionExperimentRequest({
-    selection: { experimentId: 'benchmark-prereg-v2-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
-    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
     benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
   });
   assert.deepEqual(scoped.benchmark, { snapshotHash: 'abc123', poolRowId: 42 });
   assert.notEqual(validateSelectionExperimentRequest({
-    selection: { experimentId: 'benchmark-prereg-v2-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
-    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000 },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
     benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
   }), null);
   // Present-but-invalid scope fails closed; scope alone validates nothing.
@@ -551,4 +551,31 @@ test('frozen ordering without a valid scheduledAt fails closed instead of using 
   assert.equal(legacy.arm, 'TREATMENT');
   assert.equal(legacy.windowApplied, true);
   assert.deepEqual(legacy.window, { publishedAfter: '2026-01-01T00:00:00Z' });
+});
+
+test('v2 frozen identities are recognized without disturbing v1 recognition', async () => {
+  const { benchmarkOpportunityIdForScope, isFrozenBenchmarkConfiguration, normalizeSelectionExperimentRequest } = await import('./querySelectionExperiments');
+  const v2Request = {
+    selection: { experimentId: 'benchmark-prereg-v2-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000, thompsonPrior: { alpha0: 1, beta0: 1 }, contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 } },
+    ordering: { experimentId: 'benchmark-prereg-v2-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  };
+  const v2 = normalizeSelectionExperimentRequest(v2Request);
+  assert.equal(isFrozenBenchmarkConfiguration(v2), true);
+  assert.equal(benchmarkOpportunityIdForScope(v2.benchmark, 42, v2), 'benchmark-prereg-v2:pool:abc123:42');
+  const v1Request = {
+    selection: { experimentId: 'benchmark-prereg-v1-selection', enabledArms: ['THOMPSON', 'CONTEXTUAL'], treatmentBasisPoints: 5000, thompsonPrior: { alpha0: 1, beta0: 1 }, contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 } },
+    ordering: { experimentId: 'benchmark-prereg-v1-ordering', treatmentBasisPoints: 5000 },
+    benchmark: { snapshotHash: 'abc123', poolRowId: 42 },
+  };
+  const v1 = normalizeSelectionExperimentRequest(v1Request);
+  assert.equal(isFrozenBenchmarkConfiguration(v1), true);
+  assert.equal(benchmarkOpportunityIdForScope(v1.benchmark, 42, v1), 'benchmark-prereg-v1:pool:abc123:42');
+  const mixed = normalizeSelectionExperimentRequest({
+    selection: v1Request.selection,
+    ordering: v2Request.ordering,
+    benchmark: v1Request.benchmark,
+  });
+  assert.equal(isFrozenBenchmarkConfiguration(mixed), true);
+  assert.equal(benchmarkOpportunityIdForScope(mixed.benchmark, 42, mixed), 'benchmark-prereg-v1:pool:abc123:42');
 });

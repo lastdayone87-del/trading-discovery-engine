@@ -3,6 +3,11 @@ import fs from 'node:fs';
 import test from 'node:test';
 import type { QueryRecord } from '../src/types';
 import {
+  BENCHMARK_PREREG_V2_SPEC,
+  BENCHMARK_PREREG_V2_FROZEN_BASE_COMMIT,
+  benchmarkPreregSpecForVersion,
+  isSameUtcDayPlan,
+  isSchedulerStoppedForBenchmark,
   BENCHMARK_PREREG_SPEC_VERSION,
   BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
   BENCHMARK_PREREG_SCOPE_SIZE,
@@ -14,6 +19,7 @@ import {
   buildPoolSnapshot,
   verifyPoolSnapshotHash,
   verifyExecutionArtifactsBound,
+  assertFullScope,
   computeConfigurationHash,
   buildExecutionRecord,
 } from './benchmarkPreregV1';
@@ -46,17 +52,17 @@ function eligibleRow(id: number, overrides: Record<string, unknown> = {}): Query
 
 test('frozen request builder uses exactly the preregistered configuration', () => {
   const request = buildFrozenBenchmarkRequest('abc123', 42);
-  assert.equal(request.selection?.experimentId, 'benchmark-prereg-v2-selection');
+  assert.equal(request.selection?.experimentId, 'benchmark-prereg-v1-selection');
   assert.deepEqual(request.selection?.enabledArms, ['THOMPSON', 'CONTEXTUAL']);
   assert.equal(request.selection?.treatmentBasisPoints, 5000);
   assert.deepEqual(request.selection?.thompsonPrior, { alpha0: 1, beta0: 1 });
   assert.deepEqual(request.selection?.contextualWeights, { value: 0.5, exploration: 0.35, cost: 0.1 });
-  assert.equal(request.ordering?.experimentId, 'benchmark-prereg-v2-ordering');
+  assert.equal(request.ordering?.experimentId, 'benchmark-prereg-v1-ordering');
   assert.equal(request.ordering?.treatmentBasisPoints, 5000);
   assert.deepEqual(request.benchmark, { snapshotHash: 'abc123', poolRowId: 42 });
   assert.equal(isFrozenBenchmarkConfiguration(request), true);
-  assert.deepEqual(BENCHMARK_PREREG_FROZEN_SELECTION.experimentId, 'benchmark-prereg-v2-selection');
-  assert.deepEqual(BENCHMARK_PREREG_FROZEN_ORDERING.experimentId, 'benchmark-prereg-v2-ordering');
+  assert.deepEqual(BENCHMARK_PREREG_FROZEN_SELECTION.experimentId, 'benchmark-prereg-v1-selection');
+  assert.deepEqual(BENCHMARK_PREREG_FROZEN_ORDERING.experimentId, 'benchmark-prereg-v1-ordering');
 });
 
 test('frozen version verification passes live and fails on drift', () => {
@@ -67,7 +73,7 @@ test('frozen version verification passes live and fails on drift', () => {
   );
 });
 
-test('pool snapshot is deterministic, id-ordered, capped at 120, with counted exclusions', () => {
+test('pool snapshot is deterministic, id-ordered, capped at 300, with counted exclusions', () => {
   const now = new Date('2026-05-01T00:00:00.000Z');
   const rows: QueryRecord[] = [];
   for (let id = 400; id >= 1; id--) {
@@ -114,10 +120,10 @@ test('execution record carries the full frozen provenance', () => {
     providerRegistry: [],
     appSettings: [{ setting_key: 'site_profiler_enabled', setting_value: 'false' }],
   });
-  assert.equal(record.specVersion, 'benchmark-preregistration-v2');
+  assert.equal(record.specVersion, 'benchmark-preregistration-v1');
   assert.equal(record.frozenBaseCommit, '4b49e0c01ac53eebf0080fae29bd6aaabb803cfc');
   assert.equal(record.designatedOpportunities.length, 5);
-  assert.equal(record.designatedOpportunities[0].benchmarkOpportunityId, `benchmark-prereg-v2:pool:${snapshot.snapshotHash}:1`);
+  assert.equal(record.designatedOpportunities[0].benchmarkOpportunityId, `benchmark-prereg-v1:pool:${snapshot.snapshotHash}:1`);
   assert.equal(record.status, 'PLANNED');
   assert.throws(
     () => buildExecutionRecord({
@@ -199,7 +205,7 @@ test('undersized plans fail closed with a deterministic reason', async () => {
     rows: [eligibleRow(1), eligibleRow(2)],
     collectedAt: now, cooldownMinutes: 360, maxPrimaryUses: 2,
   });
-  assert.throws(() => assertFullScope(small), /BENCHMARK_PREREG_INSUFFICIENT_POOL.*eligible=2.*required=120/);
+  assert.throws(() => assertFullScope(small), /BENCHMARK_PREREG_INSUFFICIENT_POOL.*eligible=2.*required=300/);
   const full = buildPoolSnapshot({
     rows: Array.from({ length: 320 }, (_, index) => eligibleRow(index + 1)),
     collectedAt: now, cooldownMinutes: 360, maxPrimaryUses: 2,
@@ -383,7 +389,7 @@ test('execution record is cryptographically bound to the loaded snapshot', async
   tamperedRecord.designatedOpportunities[0] = {
     ...tamperedRecord.designatedOpportunities[0],
     poolRowId: 999999,
-    benchmarkOpportunityId: `benchmark-prereg-v2:pool:${snapshot.snapshotHash}:999999`,
+    benchmarkOpportunityId: `benchmark-prereg-v1:pool:${snapshot.snapshotHash}:999999`,
   };
   assert.throws(() => verifyExecutionArtifactsBound(tamperedRecord, snapshot), /BENCHMARK_PREREG_RECORD_MISMATCH/);
   // A snapshot with different rows fails even when hashes are internally consistent.
@@ -493,4 +499,35 @@ test('benchmark honors the kill switch even with a target country', async () => 
   assert.match(script, /killSwitchEngaged = await haltedByKillSwitch\(\);/);
   assert.match(script, /INFRA_INCIDENT:KILL_SWITCH_UNREADABLE/);
   assert.doesNotMatch(script, /KILL_SWITCH_PAUSED\|INCOMPLETE/);
+});
+
+test('v2 spec flows end to end without touching v1 behavior', () => {
+  const v2 = BENCHMARK_PREREG_V2_SPEC;
+  assert.equal(v2.specVersion, 'benchmark-preregistration-v2');
+  assert.equal(v2.baseCommit, BENCHMARK_PREREG_V2_FROZEN_BASE_COMMIT);
+  assert.equal(v2.scopeSize, 120);
+  assert.equal(v2.poolPrefix, 'benchmark-prereg-v2:pool');
+  assert.equal(v2.selectionExperimentId, 'benchmark-prereg-v2-selection');
+  assert.equal(v2.orderingExperimentId, 'benchmark-prereg-v2-ordering');
+  assert.equal(BENCHMARK_PREREG_V2_SPEC.baseCommit.length, 40);
+  assert.throws(() => benchmarkPreregSpecForVersion('benchmark-preregistration-v99'), /BENCHMARK_PREREG_UNKNOWN_SPEC/);
+  const rows = Array.from({ length: 130 }, (_, i) => eligibleRow(i + 1));
+  const snapshot = buildPoolSnapshot(
+    { rows, collectedAt: new Date('2026-10-08T12:00:00.000Z'), cooldownMinutes: 360, maxPrimaryUses: 2 },
+    BENCHMARK_PREREG_V2_SPEC
+  );
+  assert.equal(snapshot.rows.length, 120);
+  assert.equal(snapshot.specVersion, 'benchmark-preregistration-v2');
+  assert.equal(snapshot.rulesVersion, 'pool-rules-benchmark-prereg-v2');
+  const request = buildFrozenBenchmarkRequest(snapshot.snapshotHash, 7, BENCHMARK_PREREG_V2_SPEC);
+  assert.equal(request.selection?.experimentId, 'benchmark-prereg-v2-selection');
+  assert.equal(request.ordering?.experimentId, 'benchmark-prereg-v2-ordering');
+  assert.equal(isFrozenBenchmarkConfiguration(request), true);
+  assert.throws(() => assertFullScope({ ...snapshot, rows: snapshot.rows.slice(0, 119) }, BENCHMARK_PREREG_V2_SPEC), /required=120/);
+  assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-08T23:59:59.000Z')), true);
+  assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-09T00:00:01.000Z')), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: false }), true);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: true }), false);
+  assert.equal(isSchedulerStoppedForBenchmark(null), false);
 });

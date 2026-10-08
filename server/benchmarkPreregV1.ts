@@ -50,26 +50,100 @@ import {
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
 
-// Frozen literals (benchmark-preregistration-v2 §1/§3A/§7/§10). Compared
+// Frozen literals (benchmark-preregistration-v1 §1/§3A/§7/§10). Compared
 // against the live code constants by verifyFrozenBenchmarkVersions().
-export const BENCHMARK_PREREG_SPEC_VERSION = 'benchmark-preregistration-v2';
+// v1 names/values are frozen: v2 lives alongside under BENCHMARK_PREREG_V2_*
+// and explicit spec objects, never by editing v1 behavior.
+export const BENCHMARK_PREREG_SPEC_VERSION = 'benchmark-preregistration-v1';
 export const BENCHMARK_PREREG_FROZEN_BASE_COMMIT = '4b49e0c01ac53eebf0080fae29bd6aaabb803cfc';
-export const BENCHMARK_PREREG_SCOPE_SIZE = 120;
+export const BENCHMARK_PREREG_SCOPE_SIZE = 300;
 export const BENCHMARK_PREREG_WALL_CLOCK_DAYS = 14;
 export const BENCHMARK_PREREG_FROZEN_MIGRATION_COUNT = 137;
-export const BENCHMARK_PREREG_POOL_RULES_VERSION = 'pool-rules-benchmark-prereg-v2';
+export const BENCHMARK_PREREG_POOL_RULES_VERSION = 'pool-rules-benchmark-prereg-v1';
 export const BENCHMARK_PREREG_FROZEN_SELECTION = {
-  experimentId: 'benchmark-prereg-v2-selection',
+  experimentId: 'benchmark-prereg-v1-selection',
   enabledArms: ['THOMPSON', 'CONTEXTUAL'],
   treatmentBasisPoints: 5000,
   thompsonPrior: { alpha0: 1, beta0: 1 },
   contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
 } as const;
 export const BENCHMARK_PREREG_FROZEN_ORDERING = {
-  experimentId: 'benchmark-prereg-v2-ordering',
+  experimentId: 'benchmark-prereg-v1-ordering',
   treatmentBasisPoints: 5000,
 } as const;
 export const BENCHMARK_PREREG_FROZEN_TRIAL_DEFAULTS = { maxQuota: 100, pageDepth: 1 } as const;
+
+/** Versioned benchmark specification. v1 names above stay frozen; v2 lives here. */
+export interface BenchmarkPreregSpec {
+  specVersion: string;
+  baseCommit: string;
+  scopeSize: number;
+  poolRulesVersion: string;
+  poolPrefix: string;
+  logTag: string;
+  selectionExperimentId: string;
+  orderingExperimentId: string;
+  frozenSelection: {
+    experimentId: string;
+    enabledArms: readonly string[];
+    treatmentBasisPoints: number;
+    thompsonPrior: { alpha0: number; beta0: number };
+    contextualWeights: { value: number; exploration: number; cost: number };
+  };
+  frozenOrdering: { experimentId: string; treatmentBasisPoints: number };
+}
+export const BENCHMARK_PREREG_V1_SPEC: BenchmarkPreregSpec = {
+  specVersion: BENCHMARK_PREREG_SPEC_VERSION,
+  baseCommit: BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
+  scopeSize: BENCHMARK_PREREG_SCOPE_SIZE,
+  poolRulesVersion: BENCHMARK_PREREG_POOL_RULES_VERSION,
+  poolPrefix: 'benchmark-prereg-v1:pool',
+  logTag: 'benchmark-prereg-v1',
+  selectionExperimentId: 'benchmark-prereg-v1-selection',
+  orderingExperimentId: 'benchmark-prereg-v1-ordering',
+  frozenSelection: BENCHMARK_PREREG_FROZEN_SELECTION,
+  frozenOrdering: BENCHMARK_PREREG_FROZEN_ORDERING,
+};
+export const BENCHMARK_PREREG_V2_FROZEN_BASE_COMMIT = 'fed806fc3965b64d9925fbaa0e9b0c6c65e21e41';
+export const BENCHMARK_PREREG_V2_SPEC: BenchmarkPreregSpec = {
+  specVersion: 'benchmark-preregistration-v2',
+  baseCommit: BENCHMARK_PREREG_V2_FROZEN_BASE_COMMIT,
+  scopeSize: 120,
+  poolRulesVersion: 'pool-rules-benchmark-prereg-v2',
+  poolPrefix: 'benchmark-prereg-v2:pool',
+  logTag: 'benchmark-prereg-v2',
+  selectionExperimentId: 'benchmark-prereg-v2-selection',
+  orderingExperimentId: 'benchmark-prereg-v2-ordering',
+  frozenSelection: {
+    experimentId: 'benchmark-prereg-v2-selection',
+    enabledArms: ['THOMPSON', 'CONTEXTUAL'],
+    treatmentBasisPoints: 5000,
+    thompsonPrior: { alpha0: 1, beta0: 1 },
+    contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
+  } as const,
+  frozenOrdering: {
+    experimentId: 'benchmark-prereg-v2-ordering',
+    treatmentBasisPoints: 5000,
+  } as const,
+};
+/** Resolve a spec by version string, fail closed on anything unknown. Pure. */
+export function benchmarkPreregSpecForVersion(specVersion: string): BenchmarkPreregSpec {
+  if (specVersion === BENCHMARK_PREREG_V2_SPEC.specVersion) return BENCHMARK_PREREG_V2_SPEC;
+  if (specVersion === BENCHMARK_PREREG_V1_SPEC.specVersion) return BENCHMARK_PREREG_V1_SPEC;
+  throw new Error(`BENCHMARK_PREREG_UNKNOWN_SPEC: ${specVersion}`);
+}
+/** Same-UTC-day check for the plan/execute freshness gate. Pure. */
+export function isSameUtcDayPlan(collectedAtIso: string, now: Date = new Date()): boolean {
+  const day = (d: Date) => d.toISOString().slice(0, 10);
+  const collected = new Date(collectedAtIso);
+  if (Number.isNaN(collected.getTime())) return false;
+  return day(collected) === day(now);
+}
+/** Stopped-scheduler check for the execute gate: not enabled and not running. Pure. */
+export function isSchedulerStoppedForBenchmark(row: { is_enabled?: unknown; is_running?: unknown } | null | undefined): boolean {
+  if (!row) return false;
+  return row.is_enabled === false && row.is_running === false;
+}
 
 /** Gates that must be OFF (or absent) for benchmark execution. */
 export const BENCHMARK_PREREG_REQUIRED_OFF_KEYS = [
@@ -143,18 +217,18 @@ export function verifyFrozenBenchmarkVersions(
  * Uses only frozen literals; the result must satisfy both the route
  * validator and isFrozenBenchmarkConfiguration, otherwise fail closed.
  */
-export function buildFrozenBenchmarkRequest(snapshotHash: string, poolRowId: number): NormalizedSelectionExperiment {
+export function buildFrozenBenchmarkRequest(snapshotHash: string, poolRowId: number, spec: BenchmarkPreregSpec = BENCHMARK_PREREG_V1_SPEC): NormalizedSelectionExperiment {
   const request: SelectionExperimentRequest = {
     selection: {
-      experimentId: BENCHMARK_PREREG_FROZEN_SELECTION.experimentId,
-      enabledArms: [...BENCHMARK_PREREG_FROZEN_SELECTION.enabledArms] as Array<'THOMPSON' | 'CONTEXTUAL'>,
-      treatmentBasisPoints: BENCHMARK_PREREG_FROZEN_SELECTION.treatmentBasisPoints,
-      thompsonPrior: { ...BENCHMARK_PREREG_FROZEN_SELECTION.thompsonPrior },
-      contextualWeights: { ...BENCHMARK_PREREG_FROZEN_SELECTION.contextualWeights },
+      experimentId: spec.frozenSelection.experimentId,
+      enabledArms: [...spec.frozenSelection.enabledArms] as Array<'THOMPSON' | 'CONTEXTUAL'>,
+      treatmentBasisPoints: spec.frozenSelection.treatmentBasisPoints,
+      thompsonPrior: { ...spec.frozenSelection.thompsonPrior },
+      contextualWeights: { ...spec.frozenSelection.contextualWeights },
     },
     ordering: {
-      experimentId: BENCHMARK_PREREG_FROZEN_ORDERING.experimentId,
-      treatmentBasisPoints: BENCHMARK_PREREG_FROZEN_ORDERING.treatmentBasisPoints,
+      experimentId: spec.frozenOrdering.experimentId,
+      treatmentBasisPoints: spec.frozenOrdering.treatmentBasisPoints,
     },
     benchmark: { snapshotHash, poolRowId },
   };
@@ -222,7 +296,7 @@ export interface PoolSnapshot {
  * so snapshot membership predicts schedulability without changing any gate.
  * Pure and deterministic: identical inputs always yield the identical hash.
  */
-export function buildPoolSnapshot(input: PoolSnapshotInput): PoolSnapshot {
+export function buildPoolSnapshot(input: PoolSnapshotInput, spec: BenchmarkPreregSpec = BENCHMARK_PREREG_V1_SPEC): PoolSnapshot {
   const { rows, collectedAt, cooldownMinutes, maxPrimaryUses } = input;
   const exclusionCounts: Record<string, number> = {};
   const exclude = (reason: string) => {
@@ -271,7 +345,7 @@ export function buildPoolSnapshot(input: PoolSnapshotInput): PoolSnapshot {
     }
     return true;
   });
-  const ordered = [...authorized].sort((a, b) => a.id - b.id).slice(0, BENCHMARK_PREREG_SCOPE_SIZE);
+  const ordered = [...authorized].sort((a, b) => a.id - b.id).slice(0, spec.scopeSize);
   const snapshotRows: PoolSnapshotRow[] = ordered.map((query, poolIndex) => ({
     poolIndex,
     queryId: query.id,
@@ -280,18 +354,17 @@ export function buildPoolSnapshot(input: PoolSnapshotInput): PoolSnapshot {
   }));
   const snapshotHash = createHash('sha256')
     .update(
-      [
-        BENCHMARK_PREREG_SPEC_VERSION,
-        BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
-        BENCHMARK_PREREG_POOL_RULES_VERSION,
+      [spec.specVersion,
+        spec.baseCommit,
+        spec.poolRulesVersion,
         JSON.stringify(snapshotRows),
       ].join('\n')
     )
     .digest('hex');
   return {
-    specVersion: BENCHMARK_PREREG_SPEC_VERSION,
-    baseCommit: BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
-    rulesVersion: BENCHMARK_PREREG_POOL_RULES_VERSION,
+    specVersion: spec.specVersion,
+    baseCommit: spec.baseCommit,
+    rulesVersion: spec.poolRulesVersion,
     collectedAt: collectedAt.toISOString(),
     cooldownMinutes,
     maxPrimaryUses,
@@ -316,9 +389,8 @@ export function verifyPoolSnapshotHash(snapshot: PoolSnapshot): void {
     .digest('hex');
   if (
     recomputed !== snapshot.snapshotHash ||
-    snapshot.specVersion !== BENCHMARK_PREREG_SPEC_VERSION ||
-    snapshot.baseCommit !== BENCHMARK_PREREG_FROZEN_BASE_COMMIT ||
-    snapshot.rows.length > BENCHMARK_PREREG_SCOPE_SIZE
+    snapshot.baseCommit !== benchmarkPreregSpecForVersion(snapshot.specVersion).baseCommit ||
+    snapshot.rows.length > benchmarkPreregSpecForVersion(snapshot.specVersion).scopeSize
   ) {
     throw new Error('BENCHMARK_PREREG_SNAPSHOT_MISMATCH');
   }
@@ -359,7 +431,7 @@ export function verifyExecutionArtifactsBound(record: BenchmarkExecutionRecord, 
     const designated = record.designatedOpportunities[index] as
       | { snapshotHash?: string; poolRowId?: number; benchmarkOpportunityId?: string; country?: string }
       | undefined;
-    const expectedId = `benchmark-prereg-v2:pool:${snapshot.snapshotHash}:${row.queryId}`;
+    const expectedId = `${benchmarkPreregSpecForVersion(record.specVersion).poolPrefix}:${snapshot.snapshotHash}:${row.queryId}`;
     if (
       !designated ||
       designated.snapshotHash !== snapshot.snapshotHash ||
@@ -439,7 +511,9 @@ export function buildExecutionRecord(input: {
   maxMigrationVersion: number;
   providerRegistry: Array<Record<string, unknown>>;
   appSettings: Array<{ setting_key: string; setting_value: string }>;
+  spec?: BenchmarkPreregSpec;
 }): BenchmarkExecutionRecord {
+  const activeSpec = input.spec ?? BENCHMARK_PREREG_V1_SPEC;
   verifyFrozenBenchmarkVersions();
   verifyPoolSnapshotHash(input.poolSnapshot);
   if (input.maxMigrationVersion < BENCHMARK_PREREG_FROZEN_MIGRATION_COUNT) {
@@ -447,8 +521,8 @@ export function buildExecutionRecord(input: {
   }
   const now = new Date().toISOString();
   return {
-    specVersion: BENCHMARK_PREREG_SPEC_VERSION,
-    frozenBaseCommit: BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
+    specVersion: activeSpec.specVersion,
+    frozenBaseCommit: activeSpec.baseCommit,
     runningCommit: input.runningCommit,
     poolSnapshot: input.poolSnapshot,
     configurationHash: input.configurationHash,
@@ -461,7 +535,7 @@ export function buildExecutionRecord(input: {
     designatedOpportunities: input.poolSnapshot.rows.map(row => ({
       snapshotHash: input.poolSnapshot.snapshotHash,
       poolRowId: row.queryId,
-      benchmarkOpportunityId: `benchmark-prereg-v2:pool:${input.poolSnapshot.snapshotHash}:${row.queryId}`,
+      benchmarkOpportunityId: `${activeSpec.poolPrefix}:${input.poolSnapshot.snapshotHash}:${row.queryId}`,
       country: row.country,
     })),
     status: 'PLANNED',
@@ -487,15 +561,15 @@ export function assertNormalizedRequestUsable(normalized: NormalizedSelectionExp
  * never silently fewer. Reports the deterministic reason (candidate volume
  * plus leading exclusion causes) so operators know what to remediate.
  */
-export function assertFullScope(snapshot: PoolSnapshot): void {
-  if (snapshot.rows.length >= BENCHMARK_PREREG_SCOPE_SIZE) return;
+export function assertFullScope(snapshot: PoolSnapshot, spec: BenchmarkPreregSpec = BENCHMARK_PREREG_V1_SPEC): void {
+  if (snapshot.rows.length >= spec.scopeSize) return;
   const reasons = Object.entries(snapshot.exclusionCounts)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5)
     .map(([reason, count]) => `${reason}=${count}`)
     .join(',');
   throw new Error(
-    `BENCHMARK_PREREG_INSUFFICIENT_POOL: eligible=${snapshot.rows.length} required=${BENCHMARK_PREREG_SCOPE_SIZE} candidates=${snapshot.candidateRows} exclusions:${reasons}`
+    `BENCHMARK_PREREG_INSUFFICIENT_POOL: eligible=${snapshot.rows.length} required=${spec.scopeSize} candidates=${snapshot.candidateRows} exclusions:${reasons}`
   );
 }
 

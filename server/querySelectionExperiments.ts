@@ -172,8 +172,10 @@ function shaBucket(input: string): number {
  * other experiment identities execute the legacy caller-supplied paths
  * byte-identically.
  */
-export const BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v2-selection';
-export const BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v2-ordering';
+export const BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v1-selection';
+export const BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v1-ordering';
+export const BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID = 'benchmark-prereg-v2-selection';
+export const BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID = 'benchmark-prereg-v2-ordering';
 /** Frozen P2 recency lookback in days (benchmark-preregistration-v2 §3A). */
 export const BENCHMARK_PREREG_ORDERING_WINDOW_DAYS = 90;
 
@@ -205,7 +207,8 @@ export function isFrozenBenchmarkConfiguration(
   const selection = experiment?.selection ?? null;
   const ordering = experiment?.ordering ?? null;
   const selectionFrozen = !!selection &&
-    selection.experimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID &&
+    (selection.experimentId === BENCHMARK_PREREG_SELECTION_EXPERIMENT_ID ||
+      selection.experimentId === BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID) &&
     selection.treatmentBasisPoints === 5000 &&
     selection.enabledArms.length === 2 &&
     selection.enabledArms[0] === 'THOMPSON' &&
@@ -216,7 +219,8 @@ export function isFrozenBenchmarkConfiguration(
     selection.contextualWeights.exploration === 0.35 &&
     selection.contextualWeights.cost === 0.1;
   const orderingFrozen = !!ordering &&
-    ordering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID &&
+    (ordering.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID ||
+      ordering.experimentId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID) &&
     ordering.treatmentBasisPoints === 5000;
   // Every present selection/ordering dimension must exactly match; a mixed
   // request (one frozen dimension, one altered dimension) is not the frozen
@@ -249,7 +253,11 @@ export function benchmarkOpportunityIdForScope(
   if (!isFrozenBenchmarkConfiguration(experiment)) return undefined;
   if (!scope) return undefined;
   if (servedQueryId !== scope.poolRowId) return undefined;
-  return `benchmark-prereg-v2:pool:${scope.snapshotHash}:${scope.poolRowId}`;
+  const versionId = experiment.selection?.experimentId ?? experiment.ordering?.experimentId;
+  if (versionId === BENCHMARK_PREREG_V2_SELECTION_EXPERIMENT_ID || versionId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID) {
+    return `benchmark-prereg-v2:pool:${scope.snapshotHash}:${scope.poolRowId}`;
+  }
+  return `benchmark-prereg-v1:pool:${scope.snapshotHash}:${scope.poolRowId}`;
 }
 
 /**
@@ -496,7 +504,7 @@ export function evaluateOrderingDimension(args: {
       experimentId: null,
     };
   }
-  if (args.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
+  if (args.experimentId === BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID || args.experimentId === BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID) {
     // Frozen benchmark path (benchmark-preregistration-v2 §3A/§6): a
     // TREATMENT assignment always carries the scheduled_at-derived 90-day
     // window. Caller-supplied bounds (present, absent, or divergent) never
@@ -553,14 +561,14 @@ export function resolveFrozenBenchmarkScheduleOrdering(
   ordering: SelectionExperimentObservation['ordering'],
   storedScheduledAt: Date
 ): SelectionExperimentObservation['ordering'] {
-  if (!ordering || ordering.arm !== 'TREATMENT' || ordering.experimentId !== BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID) {
+  if (!ordering || ordering.arm !== 'TREATMENT' || (ordering.experimentId !== BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID && ordering.experimentId !== BENCHMARK_PREREG_V2_ORDERING_EXPERIMENT_ID)) {
     return ordering;
   }
   return {
     ...ordering,
     windowApplied: true,
     window: deriveBenchmarkOrderingWindow(storedScheduledAt),
-    experimentId: BENCHMARK_PREREG_ORDERING_EXPERIMENT_ID,
+    experimentId: ordering.experimentId,
   };
 }
 
