@@ -178,15 +178,11 @@ async function main(): Promise<void> {
   verifyPoolSnapshotHash(snapshot);
   verifyExecutionArtifactsBound(record, snapshot);
   requireFreshPlanForStatus(record.status, snapshot.collectedAt);
-  record.status = 'IN_PROGRESS';
-  record.runningCommit = commit;
-  if (record.firstObservedAt === undefined) record.firstObservedAt = null;
-  // Persist IN_PROGRESS before any scheduling so a post-scheduling crash or
-  // ledger-read failure can never leave the file as PLANNED while a run is
-  // active. Every later mutation also saves via saveRecord().
-  record.updatedAt = new Date().toISOString();
-  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
-
+  // All initial-execution preflight (freshness above; scheduler stopped and
+  // live-lease checks below) must pass BEFORE the record is mutated and
+  // persisted as IN_PROGRESS. Otherwise a failed gate would leave a fresh
+  // PLANNED record converted to IN_PROGRESS, letting a later execution
+  // resume against a stale snapshot and bypass the same-day requirement.
   const schedulerRow = (await db.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`).catch(() => ({ rows: [] })) as { rows: Array<{ is_enabled: boolean; is_running: boolean }> }).rows[0];
   if (!isSchedulerStoppedForBenchmark(schedulerRow)) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED: autonomous scheduler must be stopped (enabled=false, running=false) before executing');
@@ -196,6 +192,15 @@ async function main(): Promise<void> {
   if (status?.isRunning) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_BUSY: autonomous scheduler already running; stop it before executing');
   }
+  record.status = 'IN_PROGRESS';
+  record.runningCommit = commit;
+  if (record.firstObservedAt === undefined) record.firstObservedAt = null;
+  // Persist IN_PROGRESS only after all preflight passed, and before any
+  // scheduling, so a post-scheduling crash or ledger-read failure can never
+  // leave the file as PLANNED while a run is active. Every later mutation
+  // also saves via saveRecord().
+  record.updatedAt = new Date().toISOString();
+  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
 
   const saveRecord = () => {

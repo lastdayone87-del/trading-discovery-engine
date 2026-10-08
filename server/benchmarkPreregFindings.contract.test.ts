@@ -131,6 +131,16 @@ test('plan enforces the full frozen scope and execution waits for terminal attri
   assert.match(script, /assertFullScope\(snapshot, spec\)/);
   assert.match(script, /--execute --spec-version=\$\{spec\.specVersion\} --out/);
   assert.match(script, /requireFreshPlanForStatus\(record\.status, snapshot\.collectedAt\)/);
+  const mutateAt = script.indexOf("record.status = 'IN_PROGRESS'");
+  assert.ok(mutateAt !== -1);
+  for (const gate of [
+    'requireFreshPlanForStatus(record.status, snapshot.collectedAt)',
+    'isSchedulerStoppedForBenchmark(schedulerRow)',
+    'BENCHMARK_PREREG_SCHEDULER_BUSY',
+  ]) {
+    const at = script.indexOf(gate);
+    assert.ok(at !== -1 && at < mutateAt, `${gate} must precede the IN_PROGRESS persist so a failed gate cannot convert PLANNED`);
+  }
   assert.ok(
     script.indexOf('requireFreshPlanForStatus(record.status, snapshot.collectedAt)') <
       script.indexOf("record.status = 'IN_PROGRESS'"),
