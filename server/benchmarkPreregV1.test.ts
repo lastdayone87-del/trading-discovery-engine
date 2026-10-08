@@ -529,9 +529,12 @@ test('v2 spec flows end to end without touching v1 behavior', () => {
   assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-08T23:59:59.000Z')), true);
   assert.equal(isSameUtcDayPlan(snapshot.collectedAt, new Date('2026-10-09T00:00:01.000Z')), false);
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: false }), true);
-  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }), true);
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: true }), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: true }), false);
   assert.equal(isSchedulerStoppedForBenchmark(null), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }, true), false);
+  assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }, false), true);
 });
 
 test('freshness gate applies to PLANNED start, never strands IN_PROGRESS recovery', () => {

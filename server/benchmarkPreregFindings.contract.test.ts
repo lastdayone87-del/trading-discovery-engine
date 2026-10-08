@@ -135,7 +135,7 @@ test('plan enforces the full frozen scope and execution waits for terminal attri
   assert.ok(mutateAt !== -1);
   for (const gate of [
     'requireFreshPlanForStatus(record.status, snapshot.collectedAt)',
-    'isSchedulerStoppedForBenchmark(schedulerRow)',
+    'isSchedulerStoppedForBenchmark(schedulerRow, status?.isRunning === true)',
     'BENCHMARK_PREREG_SCHEDULER_BUSY',
   ]) {
     const at = script.indexOf(gate);
