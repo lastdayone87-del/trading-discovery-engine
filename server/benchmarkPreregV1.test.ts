@@ -8,6 +8,7 @@ import {
   benchmarkPreregSpecForVersion,
   isSameUtcDayPlan,
   isSchedulerStoppedForBenchmark,
+  requireFreshPlanForStatus,
   BENCHMARK_PREREG_SPEC_VERSION,
   BENCHMARK_PREREG_FROZEN_BASE_COMMIT,
   BENCHMARK_PREREG_SCOPE_SIZE,
@@ -148,9 +149,10 @@ test('runner script cannot substitute an unrelated benchmark', () => {
 
 test('planning cannot reach scheduling without the explicit execute mode', () => {
   const source = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  const cliSource = fs.readFileSync(new URL('./benchmarkPreregCli.ts', import.meta.url), 'utf8');
   // Default mode is plan; only the literal --execute flag selects execute.
-  assert.match(source, /let mode: 'plan' \| 'execute' = 'plan'/);
-  assert.match(source, /if \(arg === '--execute'\) mode = 'execute'/);
+  assert.match(cliSource, /let mode: 'plan' \| 'execute' = 'plan'/);
+  assert.match(cliSource, /if \(arg === '--execute'\) mode = 'execute'/);
   // The plan branch returns before any scheduling site.
   const planGuard = source.indexOf("if (mode === 'plan')");
   const scheduleSite = source.indexOf('runAutonomousDiscoveryCycle(row.country');
@@ -530,4 +532,15 @@ test('v2 spec flows end to end without touching v1 behavior', () => {
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: true, is_running: false }), false);
   assert.equal(isSchedulerStoppedForBenchmark({ is_enabled: false, is_running: true }), false);
   assert.equal(isSchedulerStoppedForBenchmark(null), false);
+});
+
+test('freshness gate applies to PLANNED start, never strands IN_PROGRESS recovery', () => {
+  assert.doesNotThrow(() => requireFreshPlanForStatus('PLANNED', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')));
+  assert.throws(
+    () => requireFreshPlanForStatus('PLANNED', '2026-10-08T12:00:00.000Z', new Date('2026-10-09T00:30:00.000Z')),
+    /BENCHMARK_PREREG_PLAN_STALE/
+  );
+  assert.doesNotThrow(() => requireFreshPlanForStatus('IN_PROGRESS', '2026-10-08T12:00:00.000Z', new Date('2026-10-09T00:30:00.000Z')));
+  assert.doesNotThrow(() => requireFreshPlanForStatus('IN_PROGRESS', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')));
+  assert.throws(() => requireFreshPlanForStatus('COMPLETE', '2026-10-08T12:00:00.000Z', new Date('2026-10-08T23:00:00.000Z')), /BENCHMARK_PREREG_PLAN_STALE/);
 });

@@ -48,7 +48,7 @@ Assignment math (§6-equivalent), all §7 parameters, gates and defaults, exclus
 
 ## 6. Enforced execution safeguards
 
-- Same-day plan: `--execute` refuses unless the plan snapshot's `collectedAt` is today (UTC) — `isSameUtcDayPlan`.
+- Same-day plan on initial execution: `--execute` refuses a `PLANNED` record unless its snapshot `collectedAt` is today (UTC) — `requireFreshPlanForStatus`. An already `IN_PROGRESS` record resumes across day boundaries under the existing safeguards instead of being stranded — other statuses fail closed.
 - Stopped scheduler: `--execute` refuses unless the `autonomous_discovery` scheduler row reads `is_enabled=false AND is_running=false`, in addition to the pre-existing live-lease check — `isSchedulerStoppedForBenchmark`. Stopping the scheduler is a production configuration change requiring separate explicit authorization (and restoration afterwards).
 
 ## 7. Authorization record

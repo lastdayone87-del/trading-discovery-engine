@@ -139,6 +139,15 @@ export function isSameUtcDayPlan(collectedAtIso: string, now: Date = new Date())
   if (Number.isNaN(collected.getTime())) return false;
   return day(collected) === day(now);
 }
+/** Freshness gate for initial execution: a PLANNED record requires a
+ * same-UTC-day plan snapshot; an already IN_PROGRESS record resumes under
+ * the existing safeguards (kill-switch rechecks, scheduler checks, ledger
+ * adoption) instead of being stranded by a day boundary. Pure. */
+export function requireFreshPlanForStatus(recordStatus: string, collectedAtIso: string, now: Date = new Date()): void {
+  if (recordStatus === 'IN_PROGRESS') return;
+  if (recordStatus === 'PLANNED' && isSameUtcDayPlan(collectedAtIso, now)) return;
+  throw new Error('BENCHMARK_PREREG_PLAN_STALE: plan snapshot is not from today (UTC); re-run --plan the same day before executing');
+}
 /** Stopped-scheduler check for the execute gate: not enabled and not running. Pure. */
 export function isSchedulerStoppedForBenchmark(row: { is_enabled?: unknown; is_running?: unknown } | null | undefined): boolean {
   if (!row) return false;

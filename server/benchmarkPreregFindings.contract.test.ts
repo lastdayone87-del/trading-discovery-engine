@@ -130,7 +130,7 @@ test('plan enforces the full frozen scope and execution waits for terminal attri
   const script = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
   assert.match(script, /assertFullScope\(snapshot, spec\)/);
   assert.match(script, /--execute --spec-version=\$\{spec\.specVersion\} --out/);
-  assert.match(script, /isSameUtcDayPlan\(snapshot\.collectedAt/);
+  assert.match(script, /requireFreshPlanForStatus\(record\.status, snapshot\.collectedAt\)/);
   assert.match(script, /isSchedulerStoppedForBenchmark\(/);
   assert.match(script, /waitForTerminalObservation\(pollRunState\(/);
   assert.match(script, /isScopeTerminallyAccounted\(/);

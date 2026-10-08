@@ -23,6 +23,7 @@
  *   npx tsx scripts/runBenchmarkPreregV1.ts --execute --out ./benchmark-prereg-v2
  */
 import dotenv from 'dotenv';
+import { parseBenchmarkArgs } from '../server/benchmarkPreregCli';
 dotenv.config();
 import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -32,10 +33,10 @@ import { getDb } from '../server/db';
 import { rowToQuery } from '../server/dbCore';
 import {
   BENCHMARK_PREREG_FROZEN_MIGRATION_COUNT,
-  BENCHMARK_PREREG_V1_SPEC,
   BENCHMARK_PREREG_V2_SPEC,
   benchmarkPreregSpecForVersion,
   isSameUtcDayPlan,
+  requireFreshPlanForStatus,
   isSchedulerStoppedForBenchmark,
   verifyFrozenBenchmarkVersions,
   verifyBenchmarkGatesOff,
@@ -65,22 +66,12 @@ function usageError(message: string): never {
   process.exit(1);
 }
 
-export function parseArgs(argv: string[]): { mode: 'plan' | 'execute'; outDir: string; force: boolean; specVersion: string } {
-  let mode: 'plan' | 'execute' = 'plan';
-  let outDir = '';
-  let force = false;
-  let specVersion = BENCHMARK_PREREG_V1_SPEC.specVersion;
-  for (const arg of argv) {
-    if (arg === '--execute') mode = 'execute';
-    else if (arg === '--plan') mode = 'plan';
-    else if (arg === '--force') force = true;
-    else if (arg.startsWith('--out=')) outDir = arg.slice('--out='.length);
-    else if (arg === '--out') outDir = argv[argv.indexOf(arg) + 1] || '';
-    else if (arg.startsWith('--spec-version=')) specVersion = arg.slice('--spec-version='.length);
-    else if (arg.startsWith('--')) usageError(`Unknown flag ${arg}`);
+function parseArgs(argv: string[]): { mode: 'plan' | 'execute'; outDir: string; force: boolean; specVersion: string } {
+  try {
+    return parseBenchmarkArgs(argv);
+  } catch (error) {
+    usageError(error instanceof Error ? error.message.replace(/^BENCHMARK_PREREG_USAGE: /, '') : String(error));
   }
-  if (!outDir) usageError('Missing required --out <dir>');
-  return { mode, outDir: resolve(outDir), force, specVersion };
 }
 
 function runningCommit(repoRoot: string): string {
@@ -195,9 +186,7 @@ async function main(): Promise<void> {
   record.updatedAt = new Date().toISOString();
   writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
 
-  if (!isSameUtcDayPlan(snapshot.collectedAt)) {
-    throw new Error('BENCHMARK_PREREG_PLAN_STALE: plan snapshot is not from today (UTC); re-run --plan the same day before executing');
-  }
+  requireFreshPlanForStatus(record.status, snapshot.collectedAt);
   const schedulerRow = (await db.query(`SELECT is_enabled, is_running FROM scheduler_state WHERE name='autonomous_discovery'`).catch(() => ({ rows: [] })) as { rows: Array<{ is_enabled: boolean; is_running: boolean }> }).rows[0];
   if (!isSchedulerStoppedForBenchmark(schedulerRow)) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_NOT_STOPPED: autonomous scheduler must be stopped (enabled=false, running=false) before executing');
