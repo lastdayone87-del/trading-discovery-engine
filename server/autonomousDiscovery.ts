@@ -19,10 +19,79 @@ import { authorizeCountryNativeAllocationQuery, selectNextQueryForCountry } from
 import {
   selectExperimentalQueryForCountry,
   normalizeSelectionExperimentRequest,
+  validateSelectionExperimentRequest,
   type NormalizedSelectionExperiment,
   type SelectionExperimentObservation,
   type SelectionExperimentRequest,
 } from './querySelectionExperiments';
+
+/**
+ * Canonical experiment identity for the live Thompson evaluation.
+ * Operator-written configs must use exactly this ID; anything else is a
+ * different experiment and is never confused with it in attribution.
+ */
+export const LIVE_THOMPSON_EVAL_EXPERIMENT_ID = 'live-thompson-eval-v1';
+
+/** App-settings key carrying the live selection experiment config (JSON). */
+export const LIVE_SELECTION_EXPERIMENT_SETTING_KEY = 'live_selection_experiment';
+
+/**
+ * Parse operator-supplied scheduled-experiment config. Pure: returns the
+ * normalized experiment or null when absent/invalid (legacy behavior).
+ */
+export function parseScheduledSelectionExperiment(
+  raw: string | undefined | null
+): NormalizedSelectionExperiment | null {
+  if (!raw?.trim()) return null;
+  try {
+    const normalized = validateSelectionExperimentRequest(JSON.parse(raw));
+    return normalized && isCanonicalLiveThompsonConfig(normalized) ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the scheduled experiment for autonomous cycles. Absent or invalid
+ * configuration yields null and the scheduler runs legacy UCB1 byte-identically.
+ */
+export async function getScheduledSelectionExperiment(
+  readSetting: () => Promise<string> = () => getAppSetting(LIVE_SELECTION_EXPERIMENT_SETTING_KEY, '')
+): Promise<NormalizedSelectionExperiment | null> {
+  let raw: string;
+  try {
+    raw = await readSetting();
+  } catch (error) {
+    throw new Error(`SCHEDULED_EXPERIMENT_SETTINGS_UNREADABLE: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parseScheduledSelectionExperiment(raw);
+}
+
+/**
+ * Strict gate for the live Thompson evaluation: accepts ONLY the canonical
+ * live design — selection-only, exactly one THOMPSON arm, 5000 basis points,
+ * documented prior/weights, and no ordering/trial/benchmark dimensions.
+ * Anything else (wrong IDs, benchmark IDs, extra dimensions, altered
+ * parameters) is rejected and the scheduler falls back to legacy UCB1.
+ */
+export function isCanonicalLiveThompsonConfig(
+  experiment: NormalizedSelectionExperiment | null | undefined
+): boolean {
+  const selection = experiment?.selection ?? null;
+  if (!selection) return false;
+  if (experiment?.ordering || experiment?.trial || experiment?.benchmark) return false;
+  return (
+    selection.experimentId === LIVE_THOMPSON_EVAL_EXPERIMENT_ID &&
+    selection.enabledArms.length === 1 &&
+    selection.enabledArms[0] === 'THOMPSON' &&
+    selection.treatmentBasisPoints === 5000 &&
+    selection.thompsonPrior.alpha0 === 1 &&
+    selection.thompsonPrior.beta0 === 1 &&
+    selection.contextualWeights.value === 0.5 &&
+    selection.contextualWeights.exploration === 0.35 &&
+    selection.contextualWeights.cost === 0.1
+  );
+}
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
@@ -105,6 +174,40 @@ async function getDiscoveryConfig(): Promise<DiscoveryConfig> {
     dailyQuotaBudget: getDailyYouTubeQuotaBudget(),
     autonomousQuotaPercent: await numericSetting('discovery_autonomous_quota_percent', 'DISCOVERY_AUTONOMOUS_QUOTA_PERCENT', 70, 1, 100)
   };
+}
+
+/** Deterministic per-attempt opportunity key base for the scheduler
+ * cycle. Same inputs always yield the same key (assignment stability);
+ * a new attempt yields a new key and therefore a new arm draw (retries
+ * redraw, matching the frozen benchmark replay convention). Callers append
+ * ':fallback' / ':legacy' role suffixes for the experiment substitution
+ * sites. Extracted so the real generation path is unit-testable. */
+export function buildCycleOpportunityKey(input: {
+  workerId: string;
+  cycleStartedAt: string;
+  country: string;
+  attempt: number;
+  role?: 'fallback' | 'legacy';
+}): string {
+  const base = creatorIntelligenceChecksum({
+    scheduler: 'autonomous_discovery',
+    workerId: input.workerId,
+    cycleStartedAt: input.cycleStartedAt,
+    country: input.country,
+    attempt: input.attempt,
+  });
+  return input.role ? `${base}:${input.role}` : base;
+}
+
+/** Pure pause-gate decision: direct targets bypass the pause gate by
+ * design (operator on-demand), but benchmark-designated attempts never
+ * bypass it. Extracted so the rule is unit-testable without a database. */
+export function shouldPauseDiscoveryCycle(input: {
+  paused: boolean;
+  targetCountry?: string;
+  hasBenchmarkScope: boolean;
+}): boolean {
+  return input.paused && (!input.targetCountry || input.hasBenchmarkScope);
 }
 
 export async function isQueryIntelligencePaused(): Promise<boolean> {
@@ -339,7 +442,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     // after drift checking must still stop scheduling. The raw request is
     // checked here (normalization happens later); any benchmark scope counts.
     const hasBenchmarkScope = Boolean((experiment as { benchmark?: unknown } | null | undefined)?.benchmark);
-    if ((await isQueryIntelligencePaused()) && (!targetCountry || hasBenchmarkScope)) {
+    if (shouldPauseDiscoveryCycle({ paused: await isQueryIntelligencePaused(), targetCountry, hasBenchmarkScope })) {
       return {
         country: 'N/A', query: 'N/A', strategy: 'PAUSED', discoveredCount: 0,
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0,
@@ -436,7 +539,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // dormant behavior because promotion is granted per selected country.
       const scopePromotionBasis = resolveScopePromotionForScope(scope, legacyCountry, targetCountry);
       let candidateDiagnostic: CandidateDiagnosticState = { legacyCountry, attempt: attempts, phase8Result: 'NOT_REACHED', providerRegistryOutcome: 'NOT_REACHED', reservationOutcome: 'NOT_REACHED', schedulingOutcome: 'NOT_REACHED' };
-      const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
+      const opportunityKey = buildCycleOpportunityKey({
+        workerId,
+        cycleStartedAt: now.toISOString(),
+        country: legacyCountry,
+        attempt: attempts,
+      });
 
         // Shadow frontier evaluation (zero scheduling authority)
         await evaluateShadowFrontierAllocation({ opportunityKey, legacyCountry, now })
@@ -589,7 +697,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           let fallbackSelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
           let fallbackExperiment: SelectionExperimentObservation | null = null;
           if (normalizedExperiment) {
-            const experimental = await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: `${opportunityKey}:fallback`, scopePromotionBasis });
+            const experimental = await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: buildCycleOpportunityKey({ workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts, role: 'fallback' }), scopePromotionBasis });
             if (experimental) {
               fallbackSelection = experimental;
               fallbackExperiment = experimental.experiment;
@@ -619,7 +727,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         let legacySelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
         let legacyExperiment: SelectionExperimentObservation | null = null;
         if (normalizedExperiment) {
-          const experimental = await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: `${opportunityKey}:legacy`, scopePromotionBasis });
+          const experimental = await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: buildCycleOpportunityKey({ workerId, cycleStartedAt: now.toISOString(), country, attempt: attempts, role: 'legacy' }), scopePromotionBasis });
           if (experimental) {
             legacySelection = experimental;
             legacyExperiment = experimental.experiment;
@@ -802,7 +910,18 @@ export function startAutonomousDiscoveryScheduler(): void {
     await updateSchedulerState('autonomous_discovery', { next_run_at: nextScheduledTime }).catch(() => undefined);
     schedulerHandle = setTimeout(async () => {
       try {
-        await runAutonomousDiscoveryCycle();
+        await runAutonomousDiscoveryCycle(
+          undefined,
+          undefined,
+          undefined,
+          await getScheduledSelectionExperiment().catch(error => {
+            console.warn(
+              '[Scheduler] Scheduled experiment settings unreadable, running legacy:',
+              error instanceof Error ? error.message : String(error)
+            );
+            return null;
+          })
+        );
       } catch (error) {
         console.error('[Autonomous Producer] Cycle failed:', error);
       } finally {

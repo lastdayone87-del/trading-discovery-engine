@@ -489,7 +489,8 @@ test('benchmark honors the kill switch even with a target country', async () => 
   const fs = await import('node:fs');
   const cycle = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
   assert.match(cycle, /hasBenchmarkScope/);
-  assert.match(cycle, /!\s*targetCountry \|\| hasBenchmarkScope/);
+  assert.match(cycle, /shouldPauseDiscoveryCycle\(\{/);
+  assert.match(cycle, /!input\.targetCountry \|\| input\.hasBenchmarkScope/);
   const script = fs.readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
   assert.match(script, /haltedByKillSwitch\(\)/);
   assert.match(script, /KILL_SWITCH_PAUSED/);
