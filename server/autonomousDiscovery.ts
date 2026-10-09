@@ -187,14 +187,16 @@ export function buildCycleOpportunityKey(input: {
   cycleStartedAt: string;
   country: string;
   attempt: number;
+  role?: 'fallback' | 'legacy';
 }): string {
-  return creatorIntelligenceChecksum({
+  const base = creatorIntelligenceChecksum({
     scheduler: 'autonomous_discovery',
     workerId: input.workerId,
     cycleStartedAt: input.cycleStartedAt,
     country: input.country,
     attempt: input.attempt,
   });
+  return input.role ? `${base}:${input.role}` : base;
 }
 
 /** Pure pause-gate decision: direct targets bypass the pause gate by
@@ -695,7 +697,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           let fallbackSelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
           let fallbackExperiment: SelectionExperimentObservation | null = null;
           if (normalizedExperiment) {
-            const experimental = await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: `${opportunityKey}:fallback`, scopePromotionBasis });
+            const experimental = await selectExperimentalQueryForCountry(legacyCountry, normalizedExperiment, { opportunityKey: buildCycleOpportunityKey({ workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts, role: 'fallback' }), scopePromotionBasis });
             if (experimental) {
               fallbackSelection = experimental;
               fallbackExperiment = experimental.experiment;
@@ -725,7 +727,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         let legacySelection: { queryRecord: any; selectionStrategy: any; reason: string } | null;
         let legacyExperiment: SelectionExperimentObservation | null = null;
         if (normalizedExperiment) {
-          const experimental = await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: `${opportunityKey}:legacy`, scopePromotionBasis });
+          const experimental = await selectExperimentalQueryForCountry(country, normalizedExperiment, { opportunityKey: buildCycleOpportunityKey({ workerId, cycleStartedAt: now.toISOString(), country, attempt: attempts, role: 'legacy' }), scopePromotionBasis });
           if (experimental) {
             legacySelection = experimental;
             legacyExperiment = experimental.experiment;

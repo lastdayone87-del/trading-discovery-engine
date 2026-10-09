@@ -33,6 +33,7 @@ Status: PLAN ONLY. No traffic has run under this plan. Changing anything below a
 - Measured: **308 validated first-owned invites / 14d** (~22/day); lag (first_seen → channel updated_at, upper-bound proxy, n=308): **median 14.3h, p90 4.7d, p95 5.1d, p99 5.5d**. Directly measured: join counts, lag percentiles. Proxy (stated, not proof): channel `updated_at` overstates true validation latency, so the window is conservative.
 - Power at 50/50, 14-day run (~329 runs/arm, ~154 invites/arm at 0.47/run): one-sided 95% Wald on the rate difference at a 20% relative margin gives **≈54% power** — below 80%. Reaching 80% needs a ~28-day run at the same margin, or a 30% margin at 14 days (≈84%). The 30/arm floor itself is comfortably met (~154 expected); the binding constraint is power, not the floor.
 - If this join ever stops reproducing (schema drift, empty result with live traffic present), treat the power basis as void and re-measure before activation — do not fall back to proxy counts.
+- Reproducibility artifacts: `scripts/live-eval-power.sql` (exact read-only join above; re-ran green against production: 309 on 2026-10-09, +1 vs the 10-09 basis as live traffic accrues) and `scripts/live-eval-power.mjs` (pure power arithmetic; `node` it to verify the 54%/84%/154/28-day figures from the stated inputs).
 
 ## Primary metric and decision rule (prespecified)
 

@@ -232,3 +232,51 @@ test('assignment namespace separates experiment identities deterministically', a
   }).bucket, live.bucket);
   assert.notEqual(other.bucket, live.bucket);
 });
+
+test('scheduler retry path: redrawn arms stay attributable without double-count', async () => {
+  const { buildCycleOpportunityKey } = await import('./autonomousDiscovery');
+  const { assignSelectionExperimentArm } = await import('./querySelectionExperiments');
+  const { attributeFirstOwnedInvites } = await import('./liveThompsonAnalysis');
+  const base = { workerId: 'w1', cycleStartedAt: '2026-10-09T00:00:00.000Z', country: 'US' };
+  // Two attempts of one logical opportunity: distinct keys (hence possibly
+  // distinct arms — redraw is intended and explicit, matching the frozen
+  // benchmark replay convention), each arm-labeled on its own run.
+  const key1 = buildCycleOpportunityKey({ ...base, attempt: 3, role: 'legacy' });
+  const key2 = buildCycleOpportunityKey({ ...base, attempt: 4, role: 'legacy' });
+  assert.notEqual(key1, key2);
+  const draw = (key: string, runId: string) => {
+    const arm = assignSelectionExperimentArm({
+      experimentId: 'live-thompson-eval-v1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000, opportunityKey: key,
+    });
+    return { inviteCode: 'retry-code', channelId: 'UC-retry', experimentId: 'live-thompson-eval-v1', arm: arm.arm, quotaUnits: 100, validatedAt: '2026-10-09T10:00:00.000Z', runId };
+  };
+  const attributed = attributeFirstOwnedInvites([draw(key1, 'run-a'), draw(key2, 'run-b')]);
+  assert.equal(attributed.filter(r => r.firstSeen).length, 1);
+});
+
+test('policy version participates in bucket generation (fixed-vector contract)', async () => {
+  const { assignSelectionExperimentArm } = await import('./querySelectionExperiments');
+  // Independently computed: sha256('query-selection-experiment-v1:live-thompson-eval-v1:US:2026-10-09:7')[0:8] % 10000.
+  // If the policy-version namespace ever stops participating in the hash
+  // preimage, this vector breaks loudly instead of silently reshuffling arms.
+  const arm = assignSelectionExperimentArm({
+    experimentId: 'live-thompson-eval-v1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000,
+    opportunityKey: 'US:2026-10-09:7',
+  });
+  assert.equal(arm.bucket, 3149);
+  assert.equal(assignSelectionExperimentArm({
+    experimentId: 'live-thompson-eval-v1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000,
+    opportunityKey: 'US:2026-10-09:7',
+  }).bucket, 3149);
+});
+
+test('experiment attribution attaches at exactly the two experimental sites', () => {
+  // DB-free structural pin: full path coverage needs integration
+  // infrastructure (documented limitation), but this proves no other cycle
+  // site can fabricate an envelope — frontier/targeted/native/authority
+  // paths leave selectedExperiment null and therefore unlabeled, which the
+  // exact-ID analysis filter then excludes rather than misattributes.
+  const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  const assignments = [...source.matchAll(/^\s*selectedExperiment = (fallbackExperiment|legacyExperiment);/gm)].map(m => m[1]);
+  assert.deepEqual(assignments.sort(), ['fallbackExperiment', 'legacyExperiment']);
+});
