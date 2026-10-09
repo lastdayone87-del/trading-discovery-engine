@@ -19,10 +19,48 @@ import { authorizeCountryNativeAllocationQuery, selectNextQueryForCountry } from
 import {
   selectExperimentalQueryForCountry,
   normalizeSelectionExperimentRequest,
+  validateSelectionExperimentRequest,
   type NormalizedSelectionExperiment,
   type SelectionExperimentObservation,
   type SelectionExperimentRequest,
 } from './querySelectionExperiments';
+
+/**
+ * Canonical experiment identity for the live Thompson evaluation.
+ * Operator-written configs must use exactly this ID; anything else is a
+ * different experiment and is never confused with it in attribution.
+ */
+export const LIVE_THOMPSON_EVAL_EXPERIMENT_ID = 'live-thompson-eval-v1';
+
+/** App-settings key carrying the live selection experiment config (JSON). */
+export const LIVE_SELECTION_EXPERIMENT_SETTING_KEY = 'live_selection_experiment';
+
+/**
+ * Parse operator-supplied scheduled-experiment config. Pure: returns the
+ * normalized experiment or null when absent/invalid (legacy behavior).
+ */
+export function parseScheduledSelectionExperiment(
+  raw: string | undefined | null
+): NormalizedSelectionExperiment | null {
+  if (!raw?.trim()) return null;
+  try {
+    return validateSelectionExperimentRequest(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the scheduled experiment for autonomous cycles. Absent or invalid
+ * configuration yields null and the scheduler runs legacy UCB1 byte-identically.
+ */
+export async function getScheduledSelectionExperiment(): Promise<NormalizedSelectionExperiment | null> {
+  try {
+    return parseScheduledSelectionExperiment(await getAppSetting(LIVE_SELECTION_EXPERIMENT_SETTING_KEY, ''));
+  } catch {
+    return null;
+  }
+}
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';
 import { runPersistentResearchCycle } from './persistentResearchController';
@@ -802,7 +840,12 @@ export function startAutonomousDiscoveryScheduler(): void {
     await updateSchedulerState('autonomous_discovery', { next_run_at: nextScheduledTime }).catch(() => undefined);
     schedulerHandle = setTimeout(async () => {
       try {
-        await runAutonomousDiscoveryCycle();
+        await runAutonomousDiscoveryCycle(
+          undefined,
+          undefined,
+          undefined,
+          await getScheduledSelectionExperiment().catch(() => null)
+        );
       } catch (error) {
         console.error('[Autonomous Producer] Cycle failed:', error);
       } finally {
