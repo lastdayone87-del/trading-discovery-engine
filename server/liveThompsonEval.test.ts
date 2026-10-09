@@ -6,7 +6,7 @@ import {
   LIVE_THOMPSON_EVAL_EXPERIMENT_ID,
   parseScheduledSelectionExperiment,
 } from './autonomousDiscovery';
-import { assignSelectionExperimentArm } from './querySelectionExperiments';
+import { assignSelectionExperimentArm, type NormalizedSelectionExperiment } from './querySelectionExperiments';
 
 const LIVE_CONFIG = JSON.stringify({
   selection: {
@@ -71,4 +71,69 @@ test('scheduler pause gate still precedes experiment substitution', () => {
   const pauseAt = source.indexOf('isQueryIntelligencePaused()');
   const substitutionAt = source.indexOf('selectExperimentalQueryForCountry(');
   assert.ok(pauseAt !== -1 && substitutionAt !== -1 && pauseAt < substitutionAt, 'pause gate must precede experiment use');
+});
+
+test('strict gate admits only the canonical live design', async () => {
+  const { isCanonicalLiveThompsonConfig } = await import('./autonomousDiscovery');
+  const canonical = {
+    selection: {
+      experimentId: 'live-thompson-eval-v1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000,
+      thompsonPrior: { alpha0: 1, beta0: 1 }, contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
+    },
+  } as NormalizedSelectionExperiment;
+  assert.equal(isCanonicalLiveThompsonConfig(canonical), true);
+  assert.equal(isCanonicalLiveThompsonConfig(null), false);
+  assert.equal(isCanonicalLiveThompsonConfig(undefined), false);
+  const withId = (id: string): NormalizedSelectionExperiment => ({ selection: { ...canonical.selection, experimentId: id } }) as NormalizedSelectionExperiment;
+  assert.equal(isCanonicalLiveThompsonConfig(withId('other-exp')), false);
+  assert.equal(isCanonicalLiveThompsonConfig(withId('benchmark-prereg-v1-selection')), false);
+  assert.equal(isCanonicalLiveThompsonConfig(withId('benchmark-prereg-v2-selection')), false);
+  const altered = (patch: Record<string, unknown>): NormalizedSelectionExperiment => ({
+    selection: { ...canonical.selection, ...(patch.selection as object | undefined) },
+  }) as NormalizedSelectionExperiment;
+  assert.equal(isCanonicalLiveThompsonConfig(altered({ selection: { treatmentBasisPoints: 2500 } })), false);
+  assert.equal(
+    isCanonicalLiveThompsonConfig(altered({ selection: { thompsonPrior: { alpha0: 2, beta0: 2 } } })),
+    false
+  );
+  assert.equal(isCanonicalLiveThompsonConfig(altered({ selection: { enabledArms: ['THOMPSON', 'CONTEXTUAL'] } })), false);
+  assert.equal(
+    isCanonicalLiveThompsonConfig({ ...canonical, ordering: { experimentId: 'x', treatmentBasisPoints: 1, window: {} } }),
+    false
+  );
+  assert.equal(
+    isCanonicalLiveThompsonConfig({ ...canonical, benchmark: { snapshotHash: 'abc', poolRowId: 1 } } as NormalizedSelectionExperiment),
+    false
+  );
+  assert.ok(parseScheduledSelectionExperiment(JSON.stringify(canonical)));
+  assert.equal(parseScheduledSelectionExperiment(JSON.stringify(withId('other-exp'))), null);
+  assert.equal(
+    parseScheduledSelectionExperiment(
+      JSON.stringify({ selection: canonical.selection, ordering: { experimentId: 'live-thompson-eval-v1', treatmentBasisPoints: 1 } })
+    ),
+    null
+  );
+});
+
+test('served envelope carries complete attribution identity', async () => {
+  const { buildSelectionExperimentObservation } = await import('./querySelectionExperiments');
+  const assignment = assignedArm('US:2026-10-09:7');
+  const envelope = buildSelectionExperimentObservation({
+    experimentId: 'live-thompson-eval-v1',
+    assignment,
+    eligibility: 'SELECTION_EXPERIMENT_ELIGIBLE',
+    reason: 'test',
+    opportunityKey: 'US:2026-10-09:7',
+    poolQueryIds: [11, 22],
+    winner: null,
+    thompsonPrior: { alpha0: 1, beta0: 1 },
+    contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
+    servedArm: assignment.arm,
+  });
+  assert.equal(envelope.experimentId, 'live-thompson-eval-v1');
+  assert.equal(envelope.requestedArm, assignment.arm);
+  assert.equal(envelope.servedArm, assignment.arm);
+  assert.equal(envelope.propensityBasisPoints, assignment.propensityBasisPoints);
+  assert.equal(envelope.determinism.opportunityKey, 'US:2026-10-09:7');
+  assert.deepEqual(envelope.determinism.poolQueryIds, [11, 22]);
 });

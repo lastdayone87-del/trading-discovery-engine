@@ -44,7 +44,8 @@ export function parseScheduledSelectionExperiment(
 ): NormalizedSelectionExperiment | null {
   if (!raw?.trim()) return null;
   try {
-    return validateSelectionExperimentRequest(JSON.parse(raw));
+    const normalized = validateSelectionExperimentRequest(JSON.parse(raw));
+    return normalized && isCanonicalLiveThompsonConfig(normalized) ? normalized : null;
   } catch {
     return null;
   }
@@ -60,6 +61,32 @@ export async function getScheduledSelectionExperiment(): Promise<NormalizedSelec
   } catch {
     return null;
   }
+}
+
+/**
+ * Strict gate for the live Thompson evaluation: accepts ONLY the canonical
+ * live design — selection-only, exactly one THOMPSON arm, 5000 basis points,
+ * documented prior/weights, and no ordering/trial/benchmark dimensions.
+ * Anything else (wrong IDs, benchmark IDs, extra dimensions, altered
+ * parameters) is rejected and the scheduler falls back to legacy UCB1.
+ */
+export function isCanonicalLiveThompsonConfig(
+  experiment: NormalizedSelectionExperiment | null | undefined
+): boolean {
+  const selection = experiment?.selection ?? null;
+  if (!selection) return false;
+  if (experiment?.ordering || experiment?.trial || experiment?.benchmark) return false;
+  return (
+    selection.experimentId === LIVE_THOMPSON_EVAL_EXPERIMENT_ID &&
+    selection.enabledArms.length === 1 &&
+    selection.enabledArms[0] === 'THOMPSON' &&
+    selection.treatmentBasisPoints === 5000 &&
+    selection.thompsonPrior.alpha0 === 1 &&
+    selection.thompsonPrior.beta0 === 1 &&
+    selection.contextualWeights.value === 0.5 &&
+    selection.contextualWeights.exploration === 0.35 &&
+    selection.contextualWeights.cost === 0.1
+  );
 }
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued } from './persistentResearch';

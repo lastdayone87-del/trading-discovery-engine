@@ -6,7 +6,7 @@ Status: PLAN ONLY. No traffic has run under this plan. Changing anything below a
 
 - `experimentId`: `live-thompson-eval-v1` (never a `benchmark-prereg-*` identity; benchmark attribution cannot collide).
 - Arms: CONTROL (legacy UCB1) vs THOMPSON, single-arm treatment.
-- Assignment: `treatmentBasisPoints: 5000` → ~50/50 by deterministic bucket on `opportunityKey = country:date:slotIndex`. Same opportunity always draws the same arm (retries inherit).
+- Assignment: `treatmentBasisPoints: 5000` → ~50/50 by deterministic bucket on the cycle-built opportunity key (checksum of scheduler/country/attempt plus `:fallback`/`:legacy` suffix; see `runAutonomousDiscoveryCycle`). Same key always draws the same arm; retries carry new attempt keys and therefore draw anew (same convention as the frozen benchmark replay path) — recorded per attempt, never double-counted.
 - Priors/weights: Thompson `alpha0=1, beta0=1`; contextual weights unused (no CONTEXTUAL arm).
 - Activation: `app_settings.live_selection_experiment` JSON (exact schema below). Absent/invalid → legacy UCB1, byte-identical behavior.
 
@@ -31,6 +31,7 @@ Status: PLAN ONLY. No traffic has run under this plan. Changing anything below a
 
 - Metric: validated, newly first-owned invites per 1,000 quota units, Thompson vs UCB1. Numerator excludes raw finds, duplicates, and already-owned invites (symmetric ownership registry); denominator is summed `quota_used` per arm.
 - Minimum evidence: ≥30 validated invites per arm with the window closed.
+- Estimator (country-stratified non-inferiority, prespecified): for each country c, arm rates r̂(c) = validated invites / quota units (×1000), with Poisson standard errors se(c) = sqrt(r̂(c)/units(c)) × 1000. Overall arm rate = inverse-variance weighted mean across countries with non-degenerate data; overall SE = 1/sqrt(Σ 1/se(c)²). Non-inferiority holds iff the upper bound of the one-sided 95% Wald interval on (control − Thompson) is below 20% of the pooled control rate. Countries with zero validated invites on both arms contribute no information and are reported, not imputed. Residual cross-arm cooldown interference is disclosed per §Interference, never adjusted away.
 - **Adopt Thompson iff:** one-sided 95% Wald interval on the Thompson-minus-control rate difference excludes differences worse than **−20% of the control rate** (non-inferiority margin: 20% relative), AND no material operational/quality regressions.
 - **Otherwise:** `INCONCLUSIVE`, retain UCB1. Failure to detect a difference is not equivalence.
 - No efficacy peeking: no early stop, no rule changes on interim performance.
