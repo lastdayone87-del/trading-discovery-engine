@@ -56,6 +56,13 @@ export interface ArmOutcomeSummary {
   runs: number;
 }
 
+export interface ScopedRun {
+  runId: string;
+  arm: string;
+  quotaUnits: number;
+  experimentId: string | null;
+}
+
 /**
  * Per-arm outcome totals scoped to ONE exact experiment identity. Rows from
  * any other experiment (benchmark identities, other live experiments, or
@@ -74,25 +81,33 @@ export function summarizeArmOutcomes(
     validatedAt: string;
     runId: string;
   }>,
-  experimentId: string
+  experimentId: string,
+  scopedRuns: ScopedRun[] = []
 ): ArmOutcomeSummary[] {
-  const scoped = rows.filter(row => row.experimentId === experimentId);
+  // Attribute FIRST across every supplied row (including legacy/pre-experiment
+  // rows): filtering by experiment first would hide an earlier owner and let a
+  // rediscovery wrongly count as new. Only first-seen rows of the requested
+  // experiment then contribute invites.
   const attributed = attributeFirstOwnedInvites(
-    scoped.map(row => ({ ...row, experimentId: row.experimentId as string }))
-  ).filter(row => row.firstSeen);
-  const byArm = new Map<string, { invites: number; quota: number; runs: Map<string, number> }>();
+    rows.map(row => ({ ...row, experimentId: row.experimentId as string }))
+  ).filter(row => row.experimentId === experimentId && row.firstSeen);
+  // Denominators come from the scoped run ledger, NOT from invite rows: runs
+  // with zero first-owned invites still spent quota and still count. Quota is
+  // counted once per distinct run, never once per invite.
+  const byArm = new Map<string, { invites: number; quota: number; runs: Set<string> }>();
   for (const row of attributed) {
-    const entry = byArm.get(row.arm) || { invites: 0, quota: 0, runs: new Map<string, number>() };
+    const entry = byArm.get(row.arm) || { invites: 0, quota: 0, runs: new Set<string>() };
     entry.invites += 1;
-    // Quota is counted once per distinct run (first occurrence wins), never
-    // once per invite, so multi-invite runs cannot inflate the denominator.
-    if (!entry.runs.has(row.runId)) {
-      entry.runs.set(row.runId, Number.isFinite(row.quotaUnits) ? row.quotaUnits : 0);
-    }
     byArm.set(row.arm, entry);
   }
-  for (const entry of byArm.values()) {
-    entry.quota = [...entry.runs.values()].reduce((a, b) => a + b, 0);
+  for (const run of scopedRuns) {
+    if (run.experimentId !== experimentId) continue;
+    const entry = byArm.get(run.arm) || { invites: 0, quota: 0, runs: new Set<string>() };
+    if (!entry.runs.has(run.runId)) {
+      entry.runs.add(run.runId);
+      entry.quota += Number.isFinite(run.quotaUnits) ? run.quotaUnits : 0;
+    }
+    byArm.set(run.arm, entry);
   }
   return [...byArm.entries()]
     .map(([arm, entry]) => ({
