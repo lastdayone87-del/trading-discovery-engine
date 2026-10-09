@@ -25,7 +25,14 @@ Status: PLAN ONLY. No traffic has run under this plan. Changing anything below a
 ## Duration and attribution window
 
 - Run: **14 days** minimum (7 days is underpowered — see analysis).
-- Attribution window: validations credited up to **7 days post-run**. Measured lag proxy (channel create→VALIDATED-update, upper bound, n=364): median 16h, p90 4.8d, p99 6.2d — 7 days covers ≥95% with margin. Analysis opens only after the window closes on the final run (14d run + 7d close ≈ 21 days to decision).
+- Attribution window: validations credited up to **7 days post-run**, covering the measured p95 (5.1d) with margin. Analysis opens only after the window closes on the final run (14d run + 7d close ≈ 21 days to decision).
+
+## Reproducible power basis (measured 2026-10-09, read-only)
+
+- Numerator join (re-runnable verbatim): `channels` (`discord_discovery_status='VALIDATED'`, non-null `discord_invite`) → normalize code exactly as migration `138_discord_invite_registry.sql` (lowercase, strip query/fragment and known invite-host prefixes) → `discord_invite_registry` on `(canonical_code, first_channel_id)` for first-ownership → `r.first_seen_at >= now() - interval '14 days'`. Dedupe rule: earliest `first_seen_at` wins per code (registry primary key enforces one row per code by construction). Eligibility filters: VALIDATED status, non-null invite, first-owned match, 14-day window. Denominator: completed `query_runs` in the same window (attributed per run) and summed `quota_used`.
+- Measured: **308 validated first-owned invites / 14d** (~22/day); lag (first_seen → channel updated_at, upper-bound proxy, n=308): **median 14.3h, p90 4.7d, p95 5.1d, p99 5.5d**. Directly measured: join counts, lag percentiles. Proxy (stated, not proof): channel `updated_at` overstates true validation latency, so the window is conservative.
+- Power at 50/50, 14-day run (~329 runs/arm, ~154 invites/arm at 0.47/run): one-sided 95% Wald on the rate difference at a 20% relative margin gives **≈54% power** — below 80%. Reaching 80% needs a ~28-day run at the same margin, or a 30% margin at 14 days (≈84%). The 30/arm floor itself is comfortably met (~154 expected); the binding constraint is power, not the floor.
+- If this join ever stops reproducing (schema drift, empty result with live traffic present), treat the power basis as void and re-measure before activation — do not fall back to proxy counts.
 
 ## Primary metric and decision rule (prespecified)
 

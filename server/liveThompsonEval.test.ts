@@ -66,11 +66,63 @@ test('attribution identity is stable and version-namespaced', () => {
   assert.equal(a.policyVersion, 'query-selection-experiment-v1');
 });
 
-test('scheduler pause gate still precedes experiment substitution', () => {
+test('pause gate decision matrix (behavioral, no database)', async () => {
+  const { shouldPauseDiscoveryCycle } = await import('./autonomousDiscovery');
+  // Paused + no direct target: pause wins, experiment never consulted.
+  assert.equal(shouldPauseDiscoveryCycle({ paused: true, hasBenchmarkScope: false }), true);
+  assert.equal(shouldPauseDiscoveryCycle({ paused: true, targetCountry: undefined, hasBenchmarkScope: false }), true);
+  // Paused + benchmark scope even with a direct target: still pauses.
+  assert.equal(shouldPauseDiscoveryCycle({ paused: true, targetCountry: 'US', hasBenchmarkScope: true }), true);
+  // Paused + direct operator target without benchmark scope: bypass by design.
+  assert.equal(shouldPauseDiscoveryCycle({ paused: true, targetCountry: 'US', hasBenchmarkScope: false }), false);
+  // Unpaused: never pauses regardless of target/scope.
+  assert.equal(shouldPauseDiscoveryCycle({ paused: false, hasBenchmarkScope: false }), false);
+  assert.equal(shouldPauseDiscoveryCycle({ paused: false, targetCountry: 'US', hasBenchmarkScope: true }), false);
+});
+
+test('scheduled tick wires the scheduled config into the cycle (structural pin)', () => {
+  // The tick itself needs a database + scheduler, so this pins the exact
+  // 4-argument call shape instead: scheduled config flows positionally into
+  // runAutonomousDiscoveryCycle, which is what the behavioral matrix above
+  // cannot observe without integration infrastructure.
   const source = fs.readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
-  const pauseAt = source.indexOf('isQueryIntelligencePaused()');
-  const substitutionAt = source.indexOf('selectExperimentalQueryForCountry(');
-  assert.ok(pauseAt !== -1 && substitutionAt !== -1 && pauseAt < substitutionAt, 'pause gate must precede experiment use');
+  assert.ok(
+    source.includes('await getScheduledSelectionExperiment()'),
+    'tick must read the scheduled experiment'
+  );
+});
+
+test('opportunity keys are stable per attempt and redraw across attempts/roles', async () => {
+  const { buildCycleOpportunityKey } = await import('./autonomousDiscovery');
+  const base = { workerId: 'w1', cycleStartedAt: '2026-10-09T00:00:00.000Z', country: 'US', attempt: 3 };
+  assert.equal(buildCycleOpportunityKey(base), buildCycleOpportunityKey({ ...base }));
+  assert.notEqual(
+    buildCycleOpportunityKey(base),
+    buildCycleOpportunityKey({ ...base, attempt: 4 })
+  );
+  assert.notEqual(
+    buildCycleOpportunityKey(base),
+    buildCycleOpportunityKey({ ...base, country: 'DE' })
+  );
+  assert.notEqual(
+    buildCycleOpportunityKey(base),
+    buildCycleOpportunityKey({ ...base, workerId: 'w2' })
+  );
+});
+
+test('scheduled settings: read failure is loud, absence/invalid is silent legacy', async () => {
+  const { getScheduledSelectionExperiment } = await import('./autonomousDiscovery');
+  await assert.rejects(
+    getScheduledSelectionExperiment(async () => { throw new Error('DB_DOWN'); }),
+    /SCHEDULED_EXPERIMENT_SETTINGS_UNREADABLE/
+  );
+  assert.equal(await getScheduledSelectionExperiment(async () => ''), null);
+  assert.equal(await getScheduledSelectionExperiment(async () => '   '), null);
+  assert.equal(await getScheduledSelectionExperiment(async () => 'not-json'), null);
+  assert.equal(
+    await getScheduledSelectionExperiment(async () => JSON.stringify({ selection: { experimentId: 'x' } })),
+    null
+  );
 });
 
 test('strict gate admits only the canonical live design', async () => {
@@ -136,4 +188,47 @@ test('served envelope carries complete attribution identity', async () => {
   assert.equal(envelope.propensityBasisPoints, assignment.propensityBasisPoints);
   assert.equal(envelope.determinism.opportunityKey, 'US:2026-10-09:7');
   assert.deepEqual(envelope.determinism.poolQueryIds, [11, 22]);
+});
+
+test('accepted parser fields drive the resulting assignment behavior', async () => {
+  const { parseScheduledSelectionExperiment } = await import('./autonomousDiscovery');
+  const { assignSelectionExperimentArm } = await import('./querySelectionExperiments');
+  const parsed = parseScheduledSelectionExperiment(
+    JSON.stringify({
+      selection: {
+        experimentId: 'live-thompson-eval-v1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000,
+        thompsonPrior: { alpha0: 1, beta0: 1 }, contextualWeights: { value: 0.5, exploration: 0.35, cost: 0.1 },
+      },
+    })
+  );
+  assert.ok(parsed?.selection);
+  const sel = parsed.selection;
+  assert.deepEqual(sel.enabledArms, ['THOMPSON']);
+  const keys = Array.from({ length: 200 }, (_, i) => `US:2026-10-09:${i}`);
+  const arms = keys.map(key =>
+    assignSelectionExperimentArm({
+      experimentId: sel.experimentId,
+      enabledArms: sel.enabledArms,
+      treatmentBasisPoints: sel.treatmentBasisPoints,
+      opportunityKey: key,
+    })
+  );
+  const treated = arms.filter(a => a.arm === 'THOMPSON').length;
+  assert.ok(treated >= 80 && treated <= 120, `parsed 5000bp config must treat ~50%, got ${treated}/200`);
+  for (const arm of arms) assert.equal(arm.propensityBasisPoints, 5000);
+});
+
+test('assignment namespace separates experiment identities deterministically', async () => {
+  const { assignSelectionExperimentArm } = await import('./querySelectionExperiments');
+  const key = 'US:2026-10-09:7';
+  const live = assignSelectionExperimentArm({
+    experimentId: 'live-thompson-eval-v1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000, opportunityKey: key,
+  });
+  const other = assignSelectionExperimentArm({
+    experimentId: 'other-exp', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000, opportunityKey: key,
+  });
+  assert.equal(assignSelectionExperimentArm({
+    experimentId: 'live-thompson-eval-v1', enabledArms: ['THOMPSON'], treatmentBasisPoints: 5000, opportunityKey: key,
+  }).bucket, live.bucket);
+  assert.notEqual(other.bucket, live.bucket);
 });

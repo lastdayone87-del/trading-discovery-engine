@@ -55,12 +55,16 @@ export function parseScheduledSelectionExperiment(
  * Read the scheduled experiment for autonomous cycles. Absent or invalid
  * configuration yields null and the scheduler runs legacy UCB1 byte-identically.
  */
-export async function getScheduledSelectionExperiment(): Promise<NormalizedSelectionExperiment | null> {
+export async function getScheduledSelectionExperiment(
+  readSetting: () => Promise<string> = () => getAppSetting(LIVE_SELECTION_EXPERIMENT_SETTING_KEY, '')
+): Promise<NormalizedSelectionExperiment | null> {
+  let raw: string;
   try {
-    return parseScheduledSelectionExperiment(await getAppSetting(LIVE_SELECTION_EXPERIMENT_SETTING_KEY, ''));
-  } catch {
-    return null;
+    raw = await readSetting();
+  } catch (error) {
+    throw new Error(`SCHEDULED_EXPERIMENT_SETTINGS_UNREADABLE: ${error instanceof Error ? error.message : String(error)}`);
   }
+  return parseScheduledSelectionExperiment(raw);
 }
 
 /**
@@ -170,6 +174,38 @@ async function getDiscoveryConfig(): Promise<DiscoveryConfig> {
     dailyQuotaBudget: getDailyYouTubeQuotaBudget(),
     autonomousQuotaPercent: await numericSetting('discovery_autonomous_quota_percent', 'DISCOVERY_AUTONOMOUS_QUOTA_PERCENT', 70, 1, 100)
   };
+}
+
+/** Deterministic per-attempt opportunity key base for the scheduler
+ * cycle. Same inputs always yield the same key (assignment stability);
+ * a new attempt yields a new key and therefore a new arm draw (retries
+ * redraw, matching the frozen benchmark replay convention). Callers append
+ * ':fallback' / ':legacy' role suffixes for the experiment substitution
+ * sites. Extracted so the real generation path is unit-testable. */
+export function buildCycleOpportunityKey(input: {
+  workerId: string;
+  cycleStartedAt: string;
+  country: string;
+  attempt: number;
+}): string {
+  return creatorIntelligenceChecksum({
+    scheduler: 'autonomous_discovery',
+    workerId: input.workerId,
+    cycleStartedAt: input.cycleStartedAt,
+    country: input.country,
+    attempt: input.attempt,
+  });
+}
+
+/** Pure pause-gate decision: direct targets bypass the pause gate by
+ * design (operator on-demand), but benchmark-designated attempts never
+ * bypass it. Extracted so the rule is unit-testable without a database. */
+export function shouldPauseDiscoveryCycle(input: {
+  paused: boolean;
+  targetCountry?: string;
+  hasBenchmarkScope: boolean;
+}): boolean {
+  return input.paused && (!input.targetCountry || input.hasBenchmarkScope);
 }
 
 export async function isQueryIntelligencePaused(): Promise<boolean> {
@@ -404,7 +440,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     // after drift checking must still stop scheduling. The raw request is
     // checked here (normalization happens later); any benchmark scope counts.
     const hasBenchmarkScope = Boolean((experiment as { benchmark?: unknown } | null | undefined)?.benchmark);
-    if ((await isQueryIntelligencePaused()) && (!targetCountry || hasBenchmarkScope)) {
+    if (shouldPauseDiscoveryCycle({ paused: await isQueryIntelligencePaused(), targetCountry, hasBenchmarkScope })) {
       return {
         country: 'N/A', query: 'N/A', strategy: 'PAUSED', discoveredCount: 0,
         uniqueCount: 0, qualityCreatorsCount: 0, performanceScore: 0,
@@ -501,7 +537,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // dormant behavior because promotion is granted per selected country.
       const scopePromotionBasis = resolveScopePromotionForScope(scope, legacyCountry, targetCountry);
       let candidateDiagnostic: CandidateDiagnosticState = { legacyCountry, attempt: attempts, phase8Result: 'NOT_REACHED', providerRegistryOutcome: 'NOT_REACHED', reservationOutcome: 'NOT_REACHED', schedulingOutcome: 'NOT_REACHED' };
-      const opportunityKey = creatorIntelligenceChecksum({ scheduler: 'autonomous_discovery', workerId, cycleStartedAt: now.toISOString(), country: legacyCountry, attempt: attempts });
+      const opportunityKey = buildCycleOpportunityKey({
+        workerId,
+        cycleStartedAt: now.toISOString(),
+        country: legacyCountry,
+        attempt: attempts,
+      });
 
         // Shadow frontier evaluation (zero scheduling authority)
         await evaluateShadowFrontierAllocation({ opportunityKey, legacyCountry, now })
@@ -871,7 +912,13 @@ export function startAutonomousDiscoveryScheduler(): void {
           undefined,
           undefined,
           undefined,
-          await getScheduledSelectionExperiment().catch(() => null)
+          await getScheduledSelectionExperiment().catch(error => {
+            console.warn(
+              '[Scheduler] Scheduled experiment settings unreadable, running legacy:',
+              error instanceof Error ? error.message : String(error)
+            );
+            return null;
+          })
         );
       } catch (error) {
         console.error('[Autonomous Producer] Cycle failed:', error);
