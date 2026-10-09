@@ -25,7 +25,7 @@ Status: PLAN ONLY. No traffic has run under this plan. Changing anything below a
 ## Duration and attribution window
 
 - Run: **14 days** minimum (7 days is underpowered — see analysis).
-- Attribution window: validations credited up to **14 days post-run** (covers observed p99 ≈ 6.2d with margin); analysis opens only after the window closes on the final run (≈28 days to decision).
+- Attribution window: validations credited up to **7 days post-run**. Measured lag proxy (channel create→VALIDATED-update, upper bound, n=364): median 16h, p90 4.8d, p99 6.2d — 7 days covers ≥95% with margin. Analysis opens only after the window closes on the final run (14d run + 7d close ≈ 21 days to decision).
 
 ## Primary metric and decision rule (prespecified)
 
