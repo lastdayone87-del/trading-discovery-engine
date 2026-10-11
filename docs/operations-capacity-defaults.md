@@ -75,19 +75,38 @@ only while holding it. A refused contender throws
 `BENCHMARK_EXECUTION_LOCK_HELD` with no scheduling or record mutation. The
 lock releases on completion and handled failures (release verifies the owner
 token, so cleanup can never remove another process's lock); a crashed
-holder's stale lock is taken over only after its pid is confirmed dead —
+holder's stale lock is taken over only after its owner is proven dead —
 never by age — through a phased inspect-then-commit protocol
 (`inspectStaleLock` pins the exact instance by hard-link inode identity plus
 token; `commit` re-verifies path identity, token, and dead owner immediately
 before removing the shared name and refuses on any change), so a recovery
 paused across another process's completed takeover can never delete the new
-live lock. Holders
+live lock. Only `ENOENT` (vanished path) rejoins the retry flow; permission,
+I/O, and unexpected filesystem failures propagate instead of masquerading
+as contention. Owner identity combines pid liveness with the recorded
+command line, so a pid recycled into an unrelated process reads as stale
+rather than blocking recovery forever (pre-marker files and unreadable
+command lines keep the conservative pid-only verdict). Holders
 re-verify ownership before every mutation and schedule, so even a residual
 takeover race resolves with exactly one proceeding executor. After acquiring
 the lock the runner reloads the record and snapshot from disk and
 revalidates them, so a delayed process never overwrites a completed record
-with stale data. An interrupted
+with stale data. Cross-process proof (separate OS processes sequenced over
+IPC, plus an N-way claim barrier) lives in
+`server/benchmarkExecutionLock.process.test.ts`. An interrupted
 `IN_PROGRESS` run stays resumable and is never permanently blocked.
+
+Copies of one plan running from different output directories on the same
+host serialize on a snapshot-keyed global lock
+(`acquirePlanExecutionLock`, same atomic protocol): the second executor
+fails closed instead of racing the ledger read-to-schedule window. A second
+executor that does observe the first executor's ledger runs adopts them
+(`planRowAttempt` → `adopt-recovered`) rather than duplicating work. Copies
+on different hosts are not prevented (same-host lock scope) — their shared
+ledger still converges through adoption, but duplicate provider spend is
+possible there; do not run copies of one plan on multiple hosts concurrently.
+`--plan --force` refuses while a live execution holds the directory lock, so
+planning can never replace artifacts an executor is using.
 
 ## Post-deploy verification (read-only)
 - `docker inspect <app-container> --format '{{json .Config.Env}}'` shows

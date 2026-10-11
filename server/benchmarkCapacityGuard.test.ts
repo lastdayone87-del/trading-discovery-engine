@@ -14,6 +14,7 @@ import {
   buildPoolSnapshot,
   computeConfigurationHash,
   effectiveBenchmarkKnobs,
+  planRowAttempt,
 } from './benchmarkPreregV1';
 import type { QueryRecord } from '../src/types';
 import {
@@ -358,4 +359,15 @@ test('runner reloads and revalidates artifacts under lock before mutating', () =
     (script.match(/assertBenchmarkExecutionArtifactsEligible\(record, snapshot, spec\.specVersion\)/g) || []).length,
     1
   );
+});
+
+test('a copied plan adopts ledger runs instead of duplicating them', () => {
+  // Two executors running copies of one plan share opportunity IDs (derived
+  // from the snapshot hash) and the same ledger. A second executor that
+  // observes the first executor's runs adopts them rather than scheduling
+  // duplicates; only a ledger read that predates all scheduling may still
+  // race, which the same-plan execution lock closes on one host.
+  assert.equal(planRowAttempt({ covered: false, matchedRunIds: ['run-1'] }), 'adopt-recovered');
+  assert.equal(planRowAttempt({ covered: true, matchedRunIds: ['run-1'] }), 'skip-covered');
+  assert.equal(planRowAttempt({ covered: false, matchedRunIds: [] }), 'schedule-attempt');
 });

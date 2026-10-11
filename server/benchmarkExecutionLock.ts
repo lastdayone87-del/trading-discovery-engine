@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, linkSync, openSync, readFileSync, statSync, unlinkSync, writeSync, type Stats } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 /**
  * Cross-process mutual exclusion for benchmark --execute runs sharing one
@@ -31,6 +32,11 @@ export interface BenchmarkExecutionLockInfo {
   pid: number;
   token: string;
   startedAt: string;
+  /**
+   * Basename of the owner's main script, recorded at claim time. Absent on
+   * lock files written before this field existed (pid-only verdict then).
+   */
+  argv?: string;
 }
 
 export interface BenchmarkExecutionLock {
@@ -48,6 +54,51 @@ export interface BenchmarkExecutionLock {
 
 export function lockFilePathForOutputDir(outDir: string): string {
   return join(outDir, 'execution-record.execute.lock');
+}
+
+/**
+ * Only ENOENT means "changed underneath us" (vanished path → retry the
+ * atomic claim). Every other filesystem error is a real failure and must
+ * propagate, never masquerade as contention or staleness.
+ */
+export function isEnoentError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT';
+}
+
+/** Reads /proc/<pid>/cmdline; null when unavailable (non-Linux, unreadable). Never throws. */
+export function readProcCmdline(pid: number): string | null {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+export type ProcCmdlineReader = (pid: number) => string | null;
+
+/**
+ * Owner liveness beyond pid reuse: a live pid counts as the lock owner only
+ * when its command line still runs the recorded script. A recycled pid now
+ * running something else is stale (recoverable); an unreadable command line
+ * or a pre-marker lock file keeps the conservative pid-only verdict
+ * (fail-closed toward refusal). The reader is injectable for deterministic
+ * tests; production uses /proc.
+ */
+export function isLockOwnerLive(
+  info: BenchmarkExecutionLockInfo,
+  readCmdline: ProcCmdlineReader = readProcCmdline
+): boolean {
+  if (!pidAlive(info.pid)) return false;
+  const marker = info.argv ?? '';
+  if (!marker) return true;
+  let cmdline: string | null;
+  try {
+    cmdline = readCmdline(info.pid);
+  } catch {
+    return true;
+  }
+  if (cmdline === null) return true;
+  return cmdline.includes(marker);
 }
 
 export function serializeBenchmarkExecutionLock(info: BenchmarkExecutionLockInfo): string {
@@ -73,7 +124,12 @@ function readLockInfo(lockPath: string): BenchmarkExecutionLockInfo | null {
   try {
     const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as Partial<BenchmarkExecutionLockInfo>;
     if (typeof parsed.pid !== 'number' || typeof parsed.token !== 'string') return null;
-    return { pid: parsed.pid, token: parsed.token, startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : '' };
+    return {
+      pid: parsed.pid,
+      token: parsed.token,
+      startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : '',
+      argv: typeof parsed.argv === 'string' && parsed.argv ? parsed.argv : undefined,
+    };
   } catch {
     return null;
   }
@@ -123,19 +179,26 @@ export type StaleLockInspection =
  * mixes in a random token); reusing a tag only ever fails safe to 'recheck'.
  */
 export function inspectStaleLock(lockPath: string, quarantineTag: string): StaleLockInspection {
-  let pathStat;
+  let pathStat: Stats;
   try {
     pathStat = statSync(lockPath);
-  } catch {
-    return { outcome: 'recheck' }; // Vanished; caller retries the claim.
+  } catch (error) {
+    // Vanished: caller retries the claim. Anything else (permission, I/O)
+    // is a real failure and propagates instead of masquerading as contention.
+    if (!isEnoentError(error)) throw error;
+    return { outcome: 'recheck' };
   }
   const current = readLockInfo(lockPath);
   if (!current) return { outcome: 'unreadable' }; // Fail closed; never remove.
   const quarantinePath = `${lockPath}.quar-${process.pid}-${quarantineTag}`;
   try {
     linkSync(lockPath, quarantinePath);
-  } catch {
-    return { outcome: 'recheck' }; // Vanished (or tag reused); caller retries.
+  } catch (error) {
+    // Vanished, or our tag collided with our own leftover: retry. Anything
+    // else propagates.
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code !== 'ENOENT' && code !== 'EEXIST') throw error;
+    return { outcome: 'recheck' };
   }
   const dropQuarantine = () => {
     try {
@@ -154,7 +217,7 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
     dropQuarantine();
     return { outcome: 'recheck' }; // Replaced mid-inspection; re-evaluate fresh.
   }
-  if (pidAlive(current.pid)) {
+  if (isLockOwnerLive(current)) {
     dropQuarantine();
     return { outcome: 'live', info: current }; // Live owner; shared path untouched.
   }
@@ -192,11 +255,15 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
           ) {
             return 'changed';
           }
-          if (pidAlive(latest.pid)) throw lockHeldError(latest);
+          if (isLockOwnerLive(latest)) throw lockHeldError(latest);
           try {
             unlinkSync(lockPath);
-          } catch {
-            return 'changed'; // A racer removed it first; re-evaluate.
+          } catch (error) {
+            // Only a vanished path means a racer removed it first
+            // (re-evaluate whatever is there now). Permission or I/O
+            // failures propagate instead of masquerading as contention.
+            if (!isEnoentError(error)) throw error;
+            return 'changed';
           }
           return 'removed';
         } finally {
@@ -211,21 +278,23 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
 }
 
 /**
- * Acquire the outDir execution lock exclusively. Throws
- * BENCHMARK_EXECUTION_LOCK_HELD when another live process holds it — before
- * the caller may mutate the record or schedule work. Stale locks (owner pid
- * confirmed dead) are taken over via inode-verified removal plus atomic
- * re-link, so an interrupted IN_PROGRESS run stays resumable and is never
- * permanently blocked.
+ * Acquire a lock file exclusively. Throws BENCHMARK_EXECUTION_LOCK_HELD when
+ * another live process holds it. Stale locks (owner confirmed dead, never
+ * merely old) are taken over via inode-verified removal plus atomic re-link,
+ * so an interrupted run stays resumable and is never permanently blocked.
  */
-export function acquireBenchmarkExecutionLock(outDir: string): BenchmarkExecutionLock {
-  const lockPath = lockFilePathForOutputDir(outDir);
+export function acquireBenchmarkExecutionLock(
+  lockDir: string,
+  lockFileName = 'execution-record.execute.lock'
+): BenchmarkExecutionLock {
+  const lockPath = join(lockDir, lockFileName);
   const token = randomUUID();
   const startedAt = new Date().toISOString();
+  const argv = basename(process.argv[1] ?? '');
   const tmpPath = `${lockPath}.tmp-${process.pid}-${token.slice(0, 8)}`;
   const fd = openSync(tmpPath, 'wx');
   try {
-    writeSync(fd, serializeBenchmarkExecutionLock({ pid: process.pid, token, startedAt }));
+    writeSync(fd, serializeBenchmarkExecutionLock({ pid: process.pid, token, startedAt, argv }));
   } finally {
     try {
       closeSync(fd);
@@ -280,5 +349,41 @@ export function acquireBenchmarkExecutionLock(outDir: string): BenchmarkExecutio
     try {
       unlinkSync(tmpPath);
     } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Same-host serialization across output directories for one benchmark plan:
+ * two executors running copies of the same snapshot must not schedule the
+ * same opportunities concurrently. The second executor fails closed instead.
+ * Same-host scope only (like the outDir lock); cross-host copies are
+ * detected through ledger adoption, not prevented — see the runner docs.
+ */
+export function planExecutionLockPath(snapshotHash: string): string {
+  return join(tmpdir(), `benchmark-plan-execution-${snapshotHash}.lock`);
+}
+
+export function acquirePlanExecutionLock(lockPath: string): BenchmarkExecutionLock {
+  return acquireBenchmarkExecutionLock(dirname(lockPath), basename(lockPath));
+}
+
+/**
+ * Planning guard: refuse to (re)write plan artifacts while a live execution
+ * holds the outDir lock. Absent locks pass; stale or unreadable locks pass
+ * (execution-time guards still gate, and a corrupt lock must not strand
+ * planning — only a proven-live holder blocks). Used by --plan (including
+ * --force); --execute has its own claim path.
+ */
+export function refuseActiveBenchmarkExecution(lockDir: string): void {
+  // readLockInfo never throws (unreadable locks read as null): only a
+  // proven-live holder blocks planning. Stale, absent, and unreadable locks
+  // all pass here; execution-time guards still gate independently.
+  const current = readLockInfo(lockFilePathForOutputDir(lockDir));
+  if (current && isLockOwnerLive(current)) {
+    throw new Error(
+      `BENCHMARK_PLAN_BLOCKED_ACTIVE_EXECUTION: an --execute run holds ${lockFilePathForOutputDir(lockDir)} ` +
+        `(pid=${current.pid}); refusing to replace plan artifacts an executor is using. ` +
+        `Re-run --plan after it finishes.`
+    );
   }
 }

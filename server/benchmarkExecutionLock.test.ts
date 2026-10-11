@@ -5,8 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquireBenchmarkExecutionLock,
+  acquirePlanExecutionLock,
   inspectStaleLock,
+  isEnoentError,
+  isLockOwnerLive,
   lockFilePathForOutputDir,
+  planExecutionLockPath,
+  refuseActiveBenchmarkExecution,
   serializeBenchmarkExecutionLock,
 } from './benchmarkExecutionLock';
 
@@ -352,4 +357,100 @@ test('commit rethrows non-ENOENT filesystem errors', () => {
   assert.equal(readFileSync(lockPath, 'utf8'), serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale-owner', startedAt: '2026-01-01T00:00:00.000Z' }));
   const holder = acquireBenchmarkExecutionLock(outDir);
   assert.equal(holder.release(), true);
+});
+
+test('only ENOENT counts as a vanished path', () => {
+  assert.equal(isEnoentError(Object.assign(new Error('gone'), { code: 'ENOENT' })), true);
+  for (const code of ['EACCES', 'EPERM', 'EIO', 'ENOTDIR', 'EEXIST', undefined]) {
+    assert.equal(isEnoentError(Object.assign(new Error('x'), { code })), false);
+  }
+  assert.equal(isEnoentError(new Error('plain')), false);
+  assert.equal(isEnoentError(null), false);
+});
+
+test('owner liveness combines pid checks with command identity', () => {
+  const calls: number[] = [];
+  const reader = (pid: number) => {
+    calls.push(pid);
+    return 'node scripts/runBenchmarkPreregV1.ts --execute';
+  };
+  // Dead pid short-circuits before any command read.
+  assert.equal(isLockOwnerLive({ pid: 999999999, token: 't', startedAt: '', argv: 'runBenchmarkPreregV1.ts' }, reader), false);
+  assert.deepEqual(calls, []);
+  // Live pid running the recorded script: live.
+  assert.equal(isLockOwnerLive({ pid: process.pid, token: 't', startedAt: '', argv: 'runBenchmarkPreregV1.ts' }, reader), true);
+  // Live pid recycled into an unrelated command: stale (recoverable).
+  assert.equal(
+    isLockOwnerLive({ pid: process.pid, token: 't', startedAt: '', argv: 'runBenchmarkPreregV1.ts' }, () => 'postgres: checkpointer'),
+    false
+  );
+  // Unreadable command line (non-Linux) and pre-marker lock files keep the
+  // conservative pid-only verdict: fail closed toward refusal.
+  assert.equal(isLockOwnerLive({ pid: process.pid, token: 't', startedAt: '', argv: 'runBenchmarkPreregV1.ts' }, () => null), true);
+  assert.equal(isLockOwnerLive({ pid: process.pid, token: 't', startedAt: '' }, () => 'anything'), true);
+  // A throwing reader degrades to pid-only rather than crashing evaluation.
+  assert.equal(
+    isLockOwnerLive({ pid: process.pid, token: 't', startedAt: '', argv: 'runBenchmarkPreregV1.ts' }, () => { throw new Error('boom'); }),
+    true
+  );
+});
+
+test('acquired locks record the owner command for reuse checks', () => {
+  const outDir = freshDir();
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  const parsed = JSON.parse(readFileSync(lockFilePathForOutputDir(outDir), 'utf8')) as { argv?: string };
+  assert.ok(parsed.argv && parsed.argv.length > 0);
+  assert.equal(holder.release(), true);
+});
+
+test('same plan serializes across directories; different plans proceed', () => {
+  const first = acquirePlanExecutionLock(planExecutionLockPath('abc123'));
+  assert.throws(() => acquirePlanExecutionLock(planExecutionLockPath('abc123')), /BENCHMARK_EXECUTION_LOCK_HELD/);
+  const other = acquirePlanExecutionLock(planExecutionLockPath('def456'));
+  assert.equal(first.release(), true);
+  assert.equal(other.release(), true);
+  const after = acquirePlanExecutionLock(planExecutionLockPath('abc123'));
+  assert.equal(after.release(), true);
+});
+
+test('planning is refused only for a proven-live executor', () => {
+  const outDir = freshDir();
+  refuseActiveBenchmarkExecution(outDir);
+  writeFileSync(lockFilePathForOutputDir(outDir), 'not-json{');
+  refuseActiveBenchmarkExecution(outDir);
+  writeFileSync(
+    lockFilePathForOutputDir(outDir),
+    serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale', startedAt: '2026-01-01T00:00:00.000Z' })
+  );
+  refuseActiveBenchmarkExecution(outDir);
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  assert.throws(() => refuseActiveBenchmarkExecution(outDir), /BENCHMARK_PLAN_BLOCKED_ACTIVE_EXECUTION/);
+  assert.equal(holder.release(), true);
+  refuseActiveBenchmarkExecution(outDir);
+});
+
+test('runner checks for active execution before planning and gates the first mutation', () => {
+  const script = readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  assert.match(
+    script,
+    /BENCHMARK_PREREG_RECORD_EXISTS[\s\S]*?refuseActiveBenchmarkExecution\(outDir\)[\s\S]*?query_library/
+  );
+  assert.match(
+    script,
+    /assertBenchmarkExecutionArtifactsEligible\(record, snapshot, spec\.specVersion\)[\s\S]*?executionLock\.assertOwned\(\);[\s\S]*?record\.status = 'IN_PROGRESS'/
+  );
+});
+
+test('runner holds the plan lock across the run and releases both locks on every terminal path', () => {
+  const script = readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  assert.match(
+    script,
+    /activeBenchmarkPlanLock = acquirePlanExecutionLock\(planExecutionLockPath\(snapshot\.snapshotHash\)\)/
+  );
+  const releaseBody = script.slice(
+    script.indexOf('function releaseActiveBenchmarkExecutionLock'),
+    script.indexOf('async function main')
+  );
+  assert.match(releaseBody, /activeBenchmarkExecutionLock\?\.release\(\)/);
+  assert.match(releaseBody, /activeBenchmarkPlanLock\?\.release\(\)/);
 });

@@ -69,6 +69,9 @@ import {
 } from '../server/benchmarkCapacityGuard';
 import {
   acquireBenchmarkExecutionLock,
+  acquirePlanExecutionLock,
+  planExecutionLockPath,
+  refuseActiveBenchmarkExecution,
   type BenchmarkExecutionLock,
 } from '../server/benchmarkExecutionLock';
 
@@ -118,11 +121,22 @@ function effectiveNumberedSetting(
 // the same handle; release is ownership-checked and never throws, so calling
 // it with no lock held is a safe no-op (plan mode included).
 let activeBenchmarkExecutionLock: BenchmarkExecutionLock | null = null;
+let activeBenchmarkPlanLock: BenchmarkExecutionLock | null = null;
 function releaseActiveBenchmarkExecutionLock(): void {
+  // Releases every lock this process holds for the run (ownership-checked,
+  // never throws); kept under one name so abortIncomplete, the COMPLETE
+  // exits, and the top-level catch cannot miss one. Lock acquisition order
+  // is always outDir-then-plan (never the reverse), so two executors cannot
+  // deadlock against each other.
   try {
     activeBenchmarkExecutionLock?.release();
   } finally {
     activeBenchmarkExecutionLock = null;
+  }
+  try {
+    activeBenchmarkPlanLock?.release();
+  } finally {
+    activeBenchmarkPlanLock = null;
   }
 }
 
@@ -162,6 +176,10 @@ async function main(): Promise<void> {
     if (!force && (existsSync(recordPath) || existsSync(snapshotPath))) {
       throw new Error('BENCHMARK_PREREG_RECORD_EXISTS: refusing to overwrite; pass --force to re-plan before any observation');
     }
+    // A --force replan must not replace artifacts a live execution is using.
+    // Absent, stale, and unreadable locks pass; only a proven-live holder
+    // blocks. Execution-time guards still gate independently.
+    refuseActiveBenchmarkExecution(outDir);
     const libraryRows = (await db.query('SELECT * FROM query_library ORDER BY id')).rows as Array<Record<string, unknown>>;
     const now = new Date();
     const cooldownMinutes = effectiveNumberedSetting(settings, 'query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', '360', 1, 10080);
@@ -254,6 +272,11 @@ async function main(): Promise<void> {
   // lock (residual takeover race), the gates abort before the next mutation
   // or schedule instead of corrupting shared state.
   const executionLock: BenchmarkExecutionLock = activeBenchmarkExecutionLock;
+  // Same-plan serialization across output directories: a copied plan running
+  // elsewhere on this host holds the snapshot-keyed global lock. Acquired
+  // strictly after the outDir lock (never the reverse: no deadlock cycle).
+  // Contention fails closed here with no mutation or scheduling.
+  activeBenchmarkPlanLock = acquirePlanExecutionLock(planExecutionLockPath(snapshot.snapshotHash));
   // Reload under lock: the pre-lock validation above may have acted on stale
   // files if this process paused while another execution finished and
   // released the lock. Revalidate the freshly loaded artifacts; a record
@@ -262,6 +285,10 @@ async function main(): Promise<void> {
   record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
   snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
   assertBenchmarkExecutionArtifactsEligible(record, snapshot, spec.specVersion);
+  // Ownership gate before the first mutation and write: a holder that lost
+  // the lock between acquisition and this point must not persist stale
+  // state over the rightful executor's progress.
+  executionLock.assertOwned();
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
