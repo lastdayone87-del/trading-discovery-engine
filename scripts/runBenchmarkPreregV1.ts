@@ -61,21 +61,6 @@ import {
   type BenchmarkRowState,
   type PoolSnapshot,
 } from '../server/benchmarkPreregV1';
-import {
-  assertBenchmarkExecutionArtifactsEligible,
-  assertBenchmarkPlannedQueueDepth,
-  assertBenchmarkQueueDepthEstablished,
-  benchmarkValidatedQueueDepth,
-} from '../server/benchmarkCapacityGuard';
-import {
-  acquireBenchmarkExecutionLock,
-  refuseActiveBenchmarkExecution,
-  type BenchmarkExecutionLock,
-} from '../server/benchmarkExecutionLock';
-import {
-  acquireBenchmarkPlanLock,
-  type BenchmarkPlanLock,
-} from '../server/benchmarkPlanLock';
 
 function usageError(message: string): never {
   console.error(`[benchmark-prereg] ${message}`);
@@ -118,32 +103,6 @@ function effectiveNumberedSetting(
   return Math.min(max, Math.max(min, finite));
 }
 
-// Mutual-exclusion holder for the --execute path. Module-scoped so
-// abortIncomplete, the COMPLETE exits, and the top-level catch all release
-// the same handle; release is ownership-checked and never throws, so calling
-// it with no lock held is a safe no-op (plan mode included).
-let activeBenchmarkExecutionLock: BenchmarkExecutionLock | null = null;
-let activeBenchmarkPlanLock: BenchmarkPlanLock | null = null;
-async function releaseActiveBenchmarkExecutionLock(): Promise<void> {
-  // Releases every lock this process holds for the run. File locks first,
-  // then the plan advisory lock (unlock + client release/destroy, never
-  // throws); kept under one name so abortIncomplete, the COMPLETE exits,
-  // the plan return, and the top-level catch cannot miss one. All call sites
-  // are async and await this. Lock acquisition order is always
-  // outDir-then-plan (and try_advisory_lock never blocks), so executors
-  // cannot deadlock against each other.
-  try {
-    activeBenchmarkExecutionLock?.release();
-  } finally {
-    activeBenchmarkExecutionLock = null;
-  }
-  try {
-    await activeBenchmarkPlanLock?.release();
-  } finally {
-    activeBenchmarkPlanLock = null;
-  }
-}
-
 async function main(): Promise<void> {
   const { mode, outDir, force, specVersion } = parseArgs(process.argv.slice(2));
   const spec = benchmarkPreregSpecForVersion(specVersion);
@@ -159,14 +118,6 @@ async function main(): Promise<void> {
   const settings: Record<string, string> = Object.fromEntries(settingsRows.map(row => [row.setting_key, row.setting_value]));
   verifyBenchmarkGatesOff(settings);
 
-  // Capacity-record guard (non-frozen enforcement for the frozen 15-vs-30
-  // divergence; see docs/operations-capacity-defaults.md). No plan may be
-  // created, and no execution started, unless queue depth 30 is established
-  // via an explicit database/environment value. Fails before any snapshot
-  // query or file. Passes the requested mode so the error names the refused
-  // operation (this preflight runs in both modes).
-  assertBenchmarkQueueDepthEstablished(settings, process.env, mode);
-
   const migrationRows = (await db.query('SELECT max(version) AS max_version FROM schema_migrations')).rows as Array<{ max_version: string | number | null }>;
   const maxMigrationVersion = Number(migrationRows[0]?.max_version || 0);
   if (maxMigrationVersion < BENCHMARK_PREREG_FROZEN_MIGRATION_COUNT) {
@@ -177,28 +128,6 @@ async function main(): Promise<void> {
   const snapshotPath = join(outDir, 'pool-snapshot.json');
 
   if (mode === 'plan') {
-    if (!force && (existsSync(recordPath) || existsSync(snapshotPath))) {
-      throw new Error('BENCHMARK_PREREG_RECORD_EXISTS: refusing to overwrite; pass --force to re-plan before any observation');
-    }
-    // A --force replan must not replace artifacts a live execution is using.
-    // Absent, stale, and unreadable locks pass; only a proven-live holder
-    // blocks. Execution-time guards still gate independently. The lock is
-    // then held across planning (acquired below): the check above can pass
-    // while an executor is still pre-lock, and planning runs slow queries
-    // before writing — holding the lock through both writes closes that
-    // window. Released before the normal return below (and by the top-level
-    // catch on any throw), so no path leaks a held lock.
-    refuseActiveBenchmarkExecution(outDir);
-    // The outDir must exist before the lock's temp file can be created. A
-    // fresh --plan targets a new directory; creating it here is safe because
-    // no plan files exist yet at this point (the RECORD_EXISTS gate above
-    // rejected non-force overwrites, and --force explicitly replaces).
-    mkdirSync(outDir, { recursive: true });
-    activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock(outDir);
-    // A concurrent planner may have created artifacts between our existence
-    // check and lock acquisition: re-check under the held lock, before any
-    // query or write. Without --force, another planner's fresh artifacts
-    // abort us here instead of being overwritten below.
     if (!force && (existsSync(recordPath) || existsSync(snapshotPath))) {
       throw new Error('BENCHMARK_PREREG_RECORD_EXISTS: refusing to overwrite; pass --force to re-plan before any observation');
     }
@@ -223,19 +152,12 @@ async function main(): Promise<void> {
     )).rows as Array<Record<string, unknown>>;
     const configurationHash = computeConfigurationHash({ appSettings: settingsRows, maxMigrationVersion, providerRegistry });
     const record = buildExecutionRecord({ runningCommit: commit, poolSnapshot: snapshot, configurationHash, maxMigrationVersion, providerRegistry, appSettings: settingsRows, spec });
-    // Record-evidencing enforcement: the frozen record builder preserves raw
-    // settings strings, so a stray empty database row (normalized as absent
-    // by the live guard above) would still land in plannedKnobs and fail at
-    // execution. Refuse the plan here — before any file is written — instead
-    // of producing a plan that can never execute. Remediation: delete the
-    // empty row or set an explicit 30, then re-plan.
-    assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'plan');
+    mkdirSync(outDir, { recursive: true });
     writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
     console.log(`[${spec.logTag}] PLANNED rows=${snapshot.rows.length}/${snapshot.candidateRows} hash=${snapshot.snapshotHash}`);
     console.log(`[${spec.logTag}] configHash=${configurationHash} out=${outDir}`);
     console.log(`[${spec.logTag}] Execute ONLY with explicit approval: npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version=${spec.specVersion} --out ${outDir}`);
-    await releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     return;
   }
@@ -244,12 +166,8 @@ async function main(): Promise<void> {
   if (!existsSync(recordPath) || !existsSync(snapshotPath)) {
     throw new Error('BENCHMARK_PREREG_NO_PLAN: run --plan first; refusing to execute without a frozen snapshot + record');
   }
-  let record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
-  let snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
-  // Pre-lock eligibility uses the original inline checks verbatim (kept for
-  // the frozen structural pin on verifyExecutionArtifactsBound); the same
-  // checks run again after lock acquisition via
-  // assertBenchmarkExecutionArtifactsEligible on freshly reloaded files.
+  const record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
+  const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
   const recordSpec = benchmarkPreregSpecForVersion(record.specVersion);
   if (
     recordSpec.specVersion !== spec.specVersion ||
@@ -278,42 +196,6 @@ async function main(): Promise<void> {
   if (status?.isRunning) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_BUSY: autonomous scheduler already running; stop it before executing');
   }
-  // Capacity-record enforcement for execution: the live environment must
-  // evidence 30 AND the plan file itself must record 30 (a pre-guard plan
-  // with a fallback-governed 15 must never execute). Both checks run before
-  // the record mutates to IN_PROGRESS. The validated depth is captured here
-  // and pinned into every discovery cycle below, so a database change after
-  // this point cannot divert the run while the record stays valid.
-  const validatedQueueDepth = benchmarkValidatedQueueDepth(settings, process.env, 'execute');
-  // Mutual exclusion across concurrent --execute processes on this host.
-  // The IN_PROGRESS mutation and every schedule below happen only while
-  // holding the outDir execution lock. Contention throws
-  // BENCHMARK_EXECUTION_LOCK_HELD here with no record mutation or scheduling.
-  activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock(outDir);
-  // Local handle for ownership gates below. If this process ever loses the
-  // lock (residual takeover race), the gates abort before the next mutation
-  // or schedule instead of corrupting shared state.
-  const executionLock: BenchmarkExecutionLock = activeBenchmarkExecutionLock;
-  // Reload under lock: the pre-lock validation above may have acted on stale
-  // files if this process paused while another execution finished and
-  // released the lock. Revalidate the freshly loaded artifacts; a record
-  // that is no longer eligible (completed, mismatched, stale) refuses here
-  // instead of being overwritten. Only then mutate to IN_PROGRESS.
-  record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
-  snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
-  assertBenchmarkExecutionArtifactsEligible(record, snapshot, spec.specVersion);
-  // Same-plan serialization across output directories AND hosts: keyed on
-  // the freshly reloaded snapshot hash (never the pre-lock copy). The lock
-  // lives in the database every copy of a plan necessarily shares, so
-  // copies in different directories, tmpdirs, or containers cannot silently
-  // acquire independent locks. The dedicated client stays checked out until
-  // release; try_advisory_lock never blocks, so no deadlock cycle exists.
-  // Contention fails closed here with no mutation or scheduling.
-  activeBenchmarkPlanLock = await acquireBenchmarkPlanLock(db, snapshot.snapshotHash);
-  // Ownership gate before the first mutation and write: a holder that lost
-  // the lock between acquisition and this point must not persist stale
-  // state over the rightful executor's progress.
-  executionLock.assertOwned();
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
@@ -326,12 +208,6 @@ async function main(): Promise<void> {
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
 
   const saveRecord = () => {
-    // Ownership gate: a holder that lost the lock aborts here instead of
-    // persisting over another execution's newer state. abortIncomplete calls
-    // saveRecord while holding the lock, so its INCOMPLETE persist is
-    // unaffected; a LOCK_LOST throw there correctly leaves the record
-    // resumable for the rightful owner.
-    executionLock.assertOwned();
     record.updatedAt = new Date().toISOString();
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
   };
@@ -351,7 +227,6 @@ async function main(): Promise<void> {
     record.status = 'INCOMPLETE';
     record.stopReason = stopReason;
     saveRecord();
-    await releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     throw new Error(`[${spec.logTag}] INCOMPLETE: ${stopReason}`);
   };
@@ -465,10 +340,7 @@ async function main(): Promise<void> {
       const row = snapshot.rows.find(candidate => candidate.queryId === designated.poolRowId);
       if (!row) throw new Error(`BENCHMARK_PREREG_DESIGNATED_ROW_MISSING: poolRowId=${designated.poolRowId}`);
       const frozenRequest = buildFrozenBenchmarkRequest(snapshot.snapshotHash, row.queryId, spec);
-      // Ownership gate before scheduling: never schedule benchmark work
-      // after losing the lock.
-      executionLock.assertOwned();
-      report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest, { pinnedTargetQueueDepth: validatedQueueDepth });
+      report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest);
       // Engine pause (kill switch engaged mid-cycle) is an abort, never a
       // no-match exclusion: schedule nothing further.
       if (report.isPaused) {
@@ -574,7 +446,6 @@ async function main(): Promise<void> {
       record.stopReason = 'SCOPE_COVERED';
       saveRecord();
       console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
-      await releaseActiveBenchmarkExecutionLock();
       await db.end().catch(() => undefined);
       process.exit(0);
     }
@@ -589,18 +460,13 @@ async function main(): Promise<void> {
     record.stopReason = 'SCOPE_COVERED';
     saveRecord();
     console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
-    await releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     process.exit(0);
   }
   await abortIncomplete('DESIGNATED_ROWS_UNACCOUNTED');
 }
 
-main().catch(async error => {
-  // Covers uncaught mid-execution failures (the record stays IN_PROGRESS and
-  // resumable); ownership-checked release is a safe no-op when this process
-  // holds no lock (plan mode, pre-acquisition failures).
-  await releaseActiveBenchmarkExecutionLock();
+main().catch(error => {
   console.error(`[benchmark-prereg] FAILED: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });

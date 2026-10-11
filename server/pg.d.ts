@@ -4,7 +4,6 @@ declare module 'pg' {
     query(text: string, params?: any[]): Promise<{ rows: any[]; rowCount: number | null }>;
     connect(): Promise<PoolClient>;
     end(): Promise<void>;
-    on(event: string, listener: (...args: any[]) => void): this;
   }
   export interface PoolClient {
     query(text: string, params?: any[]): Promise<{ rows: any[]; rowCount: number | null }>;
