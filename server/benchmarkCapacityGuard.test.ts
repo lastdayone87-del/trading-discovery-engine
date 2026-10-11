@@ -127,6 +127,66 @@ test('empty database value counts as absent (runtime-consistent)', () => {
   );
 });
 
+test('empty database value fails planning before files, never at execution', () => {
+  // Complete plan-to-execute path for DB '' + env '30': the live guard
+  // normalizes the empty row as absent and passes, but the frozen record
+  // builder preserves the raw empty string in plannedKnobs — so the plan
+  // itself must be refused before any file is written, never at execution.
+  const settings = { discovery_target_queue_depth: '' };
+  const env = { DISCOVERY_TARGET_QUEUE_DEPTH: '30' };
+  assertBenchmarkQueueDepthEstablished(settings, env, 'plan');
+  const recorded = effectiveBenchmarkKnobs(settings, env);
+  assert.equal(recorded.discovery_target_queue_depth, '');
+  assert.throws(
+    () => assertBenchmarkPlannedQueueDepth(recorded, 'plan'),
+    /BENCHMARK_QUEUE_DEPTH_UNESTABLISHED/
+  );
+  // After remediation (empty row deleted), the full path plans and executes.
+  const fixed = effectiveBenchmarkKnobs({}, env);
+  assert.equal(fixed.discovery_target_queue_depth, '30');
+  assertBenchmarkPlannedQueueDepth(fixed, 'plan');
+  assertBenchmarkQueueDepthEstablished({}, env, 'execute');
+  assertBenchmarkPlannedQueueDepth(fixed, 'execute');
+});
+
+test('pinned depth is validated against the 1..500 integer bounds', () => {
+  assert.equal(resolveCycleTargetQueueDepth(20, 1), 1);
+  assert.equal(resolveCycleTargetQueueDepth(20, 500), 500);
+  assert.equal(resolveCycleTargetQueueDepth(20, 30), 30);
+  for (const invalid of [Number.NaN, 30.5, 0, -5, 501, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => resolveCycleTargetQueueDepth(20, invalid),
+      /BENCHMARK_PINNED_QUEUE_DEPTH_INVALID/
+    );
+  }
+  // Absent pin preserves existing runtime behavior exactly, including live
+  // values the runtime resolver itself produces (no live validation added).
+  assert.equal(resolveCycleTargetQueueDepth(20, undefined), 20);
+  assert.equal(resolveCycleTargetQueueDepth(30.5, undefined), 30.5);
+});
+
+test('guard errors name the requested operation', () => {
+  assert.throws(
+    () => assertBenchmarkQueueDepthEstablished({}, {}, 'plan'),
+    /refusing to plan/
+  );
+  assert.throws(
+    () => assertBenchmarkQueueDepthEstablished({}, {}, 'execute'),
+    /refusing to execute/
+  );
+  assert.throws(
+    () => benchmarkValidatedQueueDepth({}, {}, 'execute'),
+    /refusing to execute/
+  );
+  assert.throws(
+    () => assertBenchmarkPlannedQueueDepth({}, 'plan'),
+    /refusing to plan/
+  );
+  assert.throws(
+    () => assertBenchmarkPlannedQueueDepth({}, 'execute'),
+    /refusing to execute/
+  );
+});
 test('pinned depth survives a database change after validation', () => {
   // Validate against settings evidencing 30; the returned value is captured
   // once at preflight and threaded into every cycle.
@@ -147,7 +207,13 @@ test('pinned depth survives a database change after validation', () => {
 
 test('runner enforces the guard before plan files and before IN_PROGRESS', () => {
   const script = readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
-  assert.match(script, /assertBenchmarkQueueDepthEstablished\(settings, process\.env, 'plan'\)/);
+  // Shared preflight names the requested operation (it runs in both modes).
+  assert.match(script, /assertBenchmarkQueueDepthEstablished\(settings, process\.env, mode\)/);
+  // Plan path refuses a non-evidencing record before any file is written.
+  assert.match(
+    script,
+    /assertBenchmarkPlannedQueueDepth\(record\.plannedKnobs, 'plan'\)[\s\S]*mkdirSync\(outDir/
+  );
   assert.match(
     script,
     /benchmarkValidatedQueueDepth\(settings, process\.env, 'execute'\)[\s\S]*assertBenchmarkPlannedQueueDepth\(record\.plannedKnobs, 'execute'\)[\s\S]*record\.status = 'IN_PROGRESS'/

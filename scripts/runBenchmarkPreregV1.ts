@@ -125,9 +125,11 @@ async function main(): Promise<void> {
 
   // Capacity-record guard (non-frozen enforcement for the frozen 15-vs-30
   // divergence; see docs/operations-capacity-defaults.md). No plan may be
-  // created unless the record will evidence queue depth 30 via an explicit
-  // database/environment value. Fails before any snapshot query or file.
-  assertBenchmarkQueueDepthEstablished(settings, process.env, 'plan');
+  // created, and no execution started, unless queue depth 30 is established
+  // via an explicit database/environment value. Fails before any snapshot
+  // query or file. Passes the requested mode so the error names the refused
+  // operation (this preflight runs in both modes).
+  assertBenchmarkQueueDepthEstablished(settings, process.env, mode);
 
   const migrationRows = (await db.query('SELECT max(version) AS max_version FROM schema_migrations')).rows as Array<{ max_version: string | number | null }>;
   const maxMigrationVersion = Number(migrationRows[0]?.max_version || 0);
@@ -163,6 +165,13 @@ async function main(): Promise<void> {
     )).rows as Array<Record<string, unknown>>;
     const configurationHash = computeConfigurationHash({ appSettings: settingsRows, maxMigrationVersion, providerRegistry });
     const record = buildExecutionRecord({ runningCommit: commit, poolSnapshot: snapshot, configurationHash, maxMigrationVersion, providerRegistry, appSettings: settingsRows, spec });
+    // Record-evidencing enforcement: the frozen record builder preserves raw
+    // settings strings, so a stray empty database row (normalized as absent
+    // by the live guard above) would still land in plannedKnobs and fail at
+    // execution. Refuse the plan here — before any file is written — instead
+    // of producing a plan that can never execute. Remediation: delete the
+    // empty row or set an explicit 30, then re-plan.
+    assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'plan');
     mkdirSync(outDir, { recursive: true });
     writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);

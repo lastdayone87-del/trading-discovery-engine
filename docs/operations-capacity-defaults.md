@@ -57,10 +57,13 @@ Fallback-derived benchmark records must not be compared against the
 Time-of-check/time-of-use closure: the execute path captures the validated
 numeric depth once (`benchmarkValidatedQueueDepth`) and pins it into every
 discovery cycle (`pinnedTargetQueueDepth`, applied by
-`resolveCycleTargetQueueDepth` inside `runAutonomousDiscoveryCycle`). Cycles
-never re-resolve the database setting, so a database change after validation
-cannot divert the run while the record stays valid. Without a pin (all
-existing production callers), live resolution flows through unchanged.
+`resolveCycleTargetQueueDepth` inside `runAutonomousDiscoveryCycle`). Each
+cycle still reads the live setting via `getDiscoveryConfig()`, but the pinned
+depth overrides the live-resolved value for benchmark capacity calculation
+(the pin itself is validated as an integer in 1..500), so a database change
+after validation cannot divert the run while the record stays valid. Without
+a pin (all existing production callers), live resolution flows through
+unchanged.
 
 ## Post-deploy verification (read-only)
 

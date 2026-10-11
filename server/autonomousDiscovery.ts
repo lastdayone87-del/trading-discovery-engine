@@ -123,13 +123,28 @@ export function resolveDiscoveryTargetQueueDepth(
  * Pure cycle-depth selection (unit-testable without a database). A
  * benchmark-pinned depth wins when present, so a database change after
  * validation cannot divert the run; otherwise the live-resolved value flows
- * through unchanged (every existing caller passes nothing).
+ * through unchanged (every existing caller passes nothing). A supplied pin
+ * is validated against the normal [1, 500] bounds — non-integers,
+ * non-finite values, and out-of-range values throw instead of reaching
+ * capacity calculation. An absent pin leaves live resolution untouched,
+ * including any live value the runtime itself accepts.
  */
 export function resolveCycleTargetQueueDepth(
   liveTargetQueueDepth: number,
   pinnedTargetQueueDepth?: number
 ): number {
-  return pinnedTargetQueueDepth ?? liveTargetQueueDepth;
+  if (pinnedTargetQueueDepth === undefined) return liveTargetQueueDepth;
+  if (
+    typeof pinnedTargetQueueDepth !== 'number' ||
+    !Number.isInteger(pinnedTargetQueueDepth) ||
+    pinnedTargetQueueDepth < 1 ||
+    pinnedTargetQueueDepth > 500
+  ) {
+    throw new Error(
+      `BENCHMARK_PINNED_QUEUE_DEPTH_INVALID: pinnedTargetQueueDepth=${String(pinnedTargetQueueDepth)}; expected an integer in 1..500`
+    );
+  }
+  return pinnedTargetQueueDepth;
 }
 
 async function getDiscoveryConfig(): Promise<DiscoveryConfig> {
