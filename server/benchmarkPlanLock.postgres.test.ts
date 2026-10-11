@@ -40,7 +40,12 @@ test('plan lock database tests require a dedicated database (skipped otherwise)'
 const maybe = dedicated ? test : test.skip;
 
 function testPool(): Pool {
-  return new Pool({ connectionString: dedicated as string, ssl: false });
+  const pool = new Pool({ connectionString: dedicated as string, ssl: false });
+  // pg pools re-emit idle-client errors (e.g. after pg_terminate_backend in
+  // the crash test) as uncaughtExceptions unless observed. Swallow them
+  // here; every test still asserts its own outcomes explicitly.
+  pool.on('error', () => undefined);
+  return pool;
 }
 
 maybe('second executor is refused while the first holds the plan', async () => {
