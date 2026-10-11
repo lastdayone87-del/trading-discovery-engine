@@ -50,14 +50,17 @@ export function assertBenchmarkQueueDepthEstablished(
 /**
  * Record cross-check for the --execute path: a plan file created before this
  * guard (or against a divergent environment) must never execute, even when
- * the live environment now resolves 30.
+ * the live environment now resolves 30. Uses the same numeric comparison as
+ * the live guard, so equivalent valid representations ('30', '30.0') round-
+ * trip from plan to execute under unchanged configuration; invalid,
+ * non-finite, and non-30 values still fail closed.
  */
 export function assertBenchmarkPlannedQueueDepth(
   plannedKnobs: Record<string, string>,
   phase: 'plan' | 'execute'
 ): void {
   const recorded = plannedKnobs['discovery_target_queue_depth'];
-  if (recorded === String(BENCHMARK_REQUIRED_QUEUE_DEPTH)) return;
+  if (Number(recorded) === BENCHMARK_REQUIRED_QUEUE_DEPTH) return;
   throw new Error(
     `BENCHMARK_QUEUE_DEPTH_UNESTABLISHED: refusing to ${phase} — ` +
       `plan records discovery_target_queue_depth='${recorded ?? '<absent>'}', ` +
