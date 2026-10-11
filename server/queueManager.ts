@@ -2411,6 +2411,12 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
   return { session, traceId, message: 'Manual discovery is queued; page 1 and all continuation pages will run in the high-priority durable queue.' };
 }
 
+/** Default search workers when SEARCH_WORKER_CONCURRENCY is unset. */
+export const SEARCH_WORKER_CONCURRENCY_DEFAULT = 4;
+/** Resolve the search worker count from env (pure; explicit env wins, unset resolves to the default). */
+export function resolveSearchWorkerCount(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.max(1, Number(env.SEARCH_WORKER_CONCURRENCY || SEARCH_WORKER_CONCURRENCY_DEFAULT));
+}
 /** Default enrichment workers when ENRICHMENT_WORKER_CONCURRENCY is unset. */
 export const ENRICHMENT_WORKER_CONCURRENCY_DEFAULT = 3;
 /** Resolve the enrichment worker count from env (pure; env override wins). */
@@ -2448,7 +2454,7 @@ export function startSearchWorkers(): void {
   // The canary shares the SEARCH pool tick (same provider profile, same
   // lifecycle, unchanged concurrency): its own settings gate keeps the claim
   // closed unless explicitly enabled, so default pool behavior is identical.
-  startWorkerPool('SEARCH_YOUTUBE', Math.max(1, Number(process.env.SEARCH_WORKER_CONCURRENCY || 1)), ['RELATIONSHIP_CANARY_EXPANSION']);
+  startWorkerPool('SEARCH_YOUTUBE', resolveSearchWorkerCount(), ['RELATIONSHIP_CANARY_EXPANSION']);
   startWorkerPool('MANUAL_SEARCH_PAGE', Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1)));
   // Enrichment defaults to 3 workers: measured service demand is ~334s mean
   // per completion (~10.8/hr per worker), so 3 workers burst ~30/hr against
