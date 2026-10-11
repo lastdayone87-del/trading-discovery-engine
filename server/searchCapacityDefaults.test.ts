@@ -9,6 +9,10 @@ import {
   DISCOVERY_TARGET_QUEUE_DEPTH_DEFAULT,
   resolveDiscoveryTargetQueueDepth,
 } from './autonomousDiscovery';
+import {
+  BENCHMARK_PREREG_DRIFT_KNOBS,
+  effectiveBenchmarkKnobs,
+} from './benchmarkPreregV1';
 
 test('search worker code default is 4 (permanent default)', () => {
   assert.equal(SEARCH_WORKER_CONCURRENCY_DEFAULT, 4);
@@ -63,6 +67,37 @@ test('getDiscoveryConfig resolves depth through the precedence helper', () => {
   assert.doesNotMatch(source, /discovery_target_queue_depth', 'DISCOVERY_TARGET_QUEUE_DEPTH', 15/);
 });
 
+test('frozen benchmark fallback divergence is explicit (15 vs runtime 30)', () => {
+  // server/benchmarkPreregV1.ts is frozen and must not be edited: its drift
+  // table pins fallback '15' as a historical record. The runtime fallback is
+  // now 30, and drift detection resolves plan and execute through the same
+  // frozen table, so it cannot catch this divergence on environments without
+  // an explicit value. Pin both sides here so a future runtime-default change
+  // forces revisiting docs/operations-capacity-defaults.md instead of
+  // silently misrepresenting effective configuration in benchmark records.
+  const frozen = BENCHMARK_PREREG_DRIFT_KNOBS.find(knob => knob.setting === 'discovery_target_queue_depth');
+  assert.ok(frozen, 'frozen drift table must still list discovery_target_queue_depth');
+  assert.equal(frozen?.fallback, '15');
+  assert.equal(String(DISCOVERY_TARGET_QUEUE_DEPTH_DEFAULT), '30');
+  // The safe path works through the frozen table untouched: an explicit
+  // database/environment value of 30 (production holds database 30) records
+  // 30 at both plan and execute time.
+  assert.equal(
+    effectiveBenchmarkKnobs({ discovery_target_queue_depth: '30' }, {}).discovery_target_queue_depth,
+    '30',
+  );
+});
+
+test('historical readiness report keeps its 2026-07-29 values', () => {
+  // docs/production-readiness-report.md is a historical snapshot dated
+  // 2026-07-29: its defaults must stay as they were. Current defaults live
+  // in docs/operations-capacity-defaults.md, Dockerfile, code, and
+  // .env.example (pinned by the consistency test above).
+  const report = readFileSync(new URL('../docs/production-readiness-report.md', import.meta.url), 'utf8');
+  assert.match(report, /Date: 2026-07-29/);
+  assert.match(report, /\| `DISCOVERY_TARGET_QUEUE_DEPTH` \| Optional autonomous queue watermark; default 15\. \|/);
+  assert.match(report, /\| `SEARCH_WORKER_CONCURRENCY` \| Search worker count; default 1\. \|/);
+});
 test('Dockerfile, application, and .env.example defaults agree', () => {
   const dockerfile = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
   const example = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');

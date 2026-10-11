@@ -231,12 +231,12 @@ existing incompatible legacy operation: it returns an error by design.
 | `QUERY_INTELLIGENCE_EXPLORATION_RATIO` | Optional; default 0.4. |
 | `DISCOVERY_INTERVAL_MINUTES` | Optional producer cadence; default 5. |
 | `DISCOVERY_BATCH_SIZE` | Optional maximum jobs per producer wake; default 5. |
-| `DISCOVERY_TARGET_QUEUE_DEPTH` | Optional autonomous queue watermark; default 30. |
+| `DISCOVERY_TARGET_QUEUE_DEPTH` | Optional autonomous queue watermark; default 15. |
 | `DAILY_YOUTUBE_QUOTA_BUDGET` | Application quota budget; default 9000. |
 | `DISCOVERY_AUTONOMOUS_QUOTA_PERCENT` | Autonomous allocation; default 70. |
 | `DISCOVERY_ENRICHMENT_QUOTA_PERCENT` | Enrichment allocation; default 20. |
 | `DISCOVERY_MANUAL_QUOTA_PERCENT` | Manual reserve; default 10. |
-| `SEARCH_WORKER_CONCURRENCY` | Search worker count; default 4. |
+| `SEARCH_WORKER_CONCURRENCY` | Search worker count; default 1. |
 | `MANUAL_SEARCH_WORKER_CONCURRENCY` | Manual continuation worker count; default 1. |
 | `ENRICHMENT_WORKER_CONCURRENCY` | Enrichment worker count; default 3. |
 | `YOUTUBE_DISCOVERY_MAX_RESULTS` | Results requested per search, clamped 10–50; default 25. |
