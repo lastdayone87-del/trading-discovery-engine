@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquireBenchmarkExecutionLock,
+  inspectStaleLock,
   lockFilePathForOutputDir,
   serializeBenchmarkExecutionLock,
 } from './benchmarkExecutionLock';
@@ -218,4 +219,84 @@ test('runner gates every mutation and schedule on live ownership', () => {
     script,
     /executionLock\.assertOwned\(\);[\s\S]*?report = await runAutonomousDiscoveryCycle\(row\.country/
   );
+});
+
+test('paused recovery cannot remove a live lock acquired after inspection', () => {
+  // The exact reported interleaving, forced deterministically (no timing):
+  // 1. A and B both face the same dead-owner lock.
+  // 2. B inspects it and pauses holding a takeover intent.
+  // 3. A completes recovery and acquires a new live lock.
+  // 4. B resumes and attempts recovery.
+  // 5. B must neither delete nor replace A's live lock, A stays sole owner,
+  //    and B cannot proceed to benchmark work.
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  writeFileSync(
+    lockPath,
+    serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale-owner', startedAt: '2026-01-01T00:00:00.000Z' })
+  );
+  const bInspection = inspectStaleLock(lockPath, 'test-B-paused');
+  if (bInspection.outcome !== 'recoverable') assert.fail('B should hold a takeover intent on a dead lock');
+  const a = acquireBenchmarkExecutionLock(outDir);
+  a.assertOwned();
+  const liveBytes = readFileSync(lockPath, 'utf8');
+  assert.equal(bInspection.recovery.commit(), 'changed');
+  assert.equal(readFileSync(lockPath, 'utf8'), liveBytes);
+  // B cannot proceed: a fresh claim sees A's live lock and refuses, with no
+  // mutation or scheduling on B's side.
+  assert.throws(() => acquireBenchmarkExecutionLock(outDir), /BENCHMARK_EXECUTION_LOCK_HELD/);
+  assert.equal(readFileSync(lockPath, 'utf8'), liveBytes);
+  // A remains the sole owner to the end.
+  a.assertOwned();
+  assert.equal(a.release(), true);
+  // And the output directory is reusable afterward.
+  const next = acquireBenchmarkExecutionLock(outDir);
+  assert.equal(next.release(), true);
+});
+
+test('abandoned recovery touches nothing', () => {
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  const staleBytes = serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale-owner', startedAt: '2026-01-01T00:00:00.000Z' });
+  writeFileSync(lockPath, staleBytes);
+  const inspection = inspectStaleLock(lockPath, 'test-abandon');
+  if (inspection.outcome !== 'recoverable') assert.fail('expected a takeover intent');
+  inspection.recovery.abandon();
+  assert.equal(readFileSync(lockPath, 'utf8'), staleBytes);
+  const leftovers = readdirSync(outDir).filter(name => name !== 'execution-record.execute.lock');
+  assert.deepEqual(leftovers, []);
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  assert.equal(holder.release(), true);
+});
+
+test('inspection classifies live, unreadable, and absent locks', () => {
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  assert.equal(inspectStaleLock(lockPath, 'test-absent').outcome, 'recheck');
+  writeFileSync(lockPath, 'not-json{');
+  assert.equal(inspectStaleLock(lockPath, 'test-corrupt').outcome, 'unreadable');
+  writeFileSync(
+    lockPath,
+    serializeBenchmarkExecutionLock({ pid: process.pid, token: 'live-owner', startedAt: new Date().toISOString() })
+  );
+  const live = inspectStaleLock(lockPath, 'test-live');
+  if (live.outcome !== 'live') assert.fail('expected a live verdict');
+  assert.equal(live.info.token, 'live-owner');
+});
+
+test('committed takeover removes only the inspected instance', () => {
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  writeFileSync(
+    lockPath,
+    serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale-owner', startedAt: '2026-01-01T00:00:00.000Z' })
+  );
+  const inspection = inspectStaleLock(lockPath, 'test-commit');
+  if (inspection.outcome !== 'recoverable') assert.fail('expected a takeover intent');
+  assert.equal(inspection.recovery.commit(), 'removed');
+  assert.equal(existsSync(lockPath), false);
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  assert.equal(holder.release(), true);
+  const leftovers = readdirSync(outDir).filter(name => name !== 'execution-record.execute.lock');
+  assert.deepEqual(leftovers, []);
 });

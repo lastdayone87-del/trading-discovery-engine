@@ -76,9 +76,12 @@ only while holding it. A refused contender throws
 lock releases on completion and handled failures (release verifies the owner
 token, so cleanup can never remove another process's lock); a crashed
 holder's stale lock is taken over only after its pid is confirmed dead —
-never by age — and only after proving the shared name still refers to the
-exact inspected instance (hard-link inode identity plus token), so a
-recovery contender can never delete another process's live lock. Holders
+never by age — through a phased inspect-then-commit protocol
+(`inspectStaleLock` pins the exact instance by hard-link inode identity plus
+token; `commit` re-verifies path identity, token, and dead owner immediately
+before removing the shared name and refuses on any change), so a recovery
+paused across another process's completed takeover can never delete the new
+live lock. Holders
 re-verify ownership before every mutation and schedule, so even a residual
 takeover race resolves with exactly one proceeding executor. After acquiring
 the lock the runner reloads the record and snapshot from disk and
