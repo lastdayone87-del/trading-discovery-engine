@@ -18,10 +18,22 @@ export function resolveBenchmarkQueueDepth(
   settings: Record<string, string>,
   env: Record<string, string | undefined> = process.env
 ): { resolved: string; explicit: boolean } {
-  const resolved = effectiveBenchmarkKnobs(settings, env).discovery_target_queue_depth;
+  // Empty strings count as absent, matching resolveDiscoveryTargetQueueDepth:
+  // a stray empty database row must neither shadow an explicit environment
+  // value nor fabricate explicitness. The frozen resolver is fed normalized
+  // copies; it is never modified.
+  const normalizedSettings = { ...settings };
+  if ((normalizedSettings['discovery_target_queue_depth'] ?? '') === '') {
+    delete normalizedSettings['discovery_target_queue_depth'];
+  }
+  const normalizedEnv = { ...env };
+  if ((normalizedEnv['DISCOVERY_TARGET_QUEUE_DEPTH'] ?? '') === '') {
+    delete normalizedEnv['DISCOVERY_TARGET_QUEUE_DEPTH'];
+  }
+  const resolved = effectiveBenchmarkKnobs(normalizedSettings, normalizedEnv).discovery_target_queue_depth;
   const explicit =
-    (settings['discovery_target_queue_depth'] ?? '') !== '' ||
-    (env['DISCOVERY_TARGET_QUEUE_DEPTH'] ?? '') !== '';
+    (normalizedSettings['discovery_target_queue_depth'] ?? '') !== '' ||
+    (normalizedEnv['DISCOVERY_TARGET_QUEUE_DEPTH'] ?? '') !== '';
   return { resolved, explicit };
 }
 
@@ -45,6 +57,21 @@ export function assertBenchmarkQueueDepthEstablished(
       `(explicit value ${explicit ? 'present but not 30' : 'absent; frozen fallback 15 would govern the record'}). ` +
       `Set an explicit database app_settings or DISCOVERY_TARGET_QUEUE_DEPTH=30 matching production before benchmarking.`
   );
+}
+
+/**
+ * Validated depth for the --execute path: asserts establishment, then
+ * returns the exact numeric value that was validated so the runner can pin
+ * every discovery cycle to it (see resolveCycleTargetQueueDepth). The value
+ * is captured once at preflight; later database changes cannot alter it.
+ */
+export function benchmarkValidatedQueueDepth(
+  settings: Record<string, string>,
+  env: Record<string, string | undefined>,
+  phase: 'plan' | 'execute'
+): number {
+  assertBenchmarkQueueDepthEstablished(settings, env, phase);
+  return Number(resolveBenchmarkQueueDepth(settings, env).resolved);
 }
 
 /**

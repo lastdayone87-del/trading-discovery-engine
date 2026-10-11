@@ -119,6 +119,19 @@ export function resolveDiscoveryTargetQueueDepth(
   return Math.min(500, Math.max(1, Number.isFinite(parsed) ? parsed : DISCOVERY_TARGET_QUEUE_DEPTH_DEFAULT));
 }
 
+/**
+ * Pure cycle-depth selection (unit-testable without a database). A
+ * benchmark-pinned depth wins when present, so a database change after
+ * validation cannot divert the run; otherwise the live-resolved value flows
+ * through unchanged (every existing caller passes nothing).
+ */
+export function resolveCycleTargetQueueDepth(
+  liveTargetQueueDepth: number,
+  pinnedTargetQueueDepth?: number
+): number {
+  return pinnedTargetQueueDepth ?? liveTargetQueueDepth;
+}
+
 async function getDiscoveryConfig(): Promise<DiscoveryConfig> {
   return {
     intervalMinutes: await numericSetting('discovery_interval_minutes', 'DISCOVERY_INTERVAL_MINUTES', 5, 1, 60),
@@ -325,7 +338,7 @@ export async function setDiscoveryScope(scope: DiscoveryScopeMode, selectedCount
  * Produces a quota-paced batch of durable work. It deliberately performs no
  * YouTube or channel processing; workers are the only autonomous executors.
  */
-export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean; geographicAllocationIntent?: GeographicAllocationIntent }, requestId?: string, experiment?: SelectionExperimentRequest | NormalizedSelectionExperiment | null): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
+export async function runAutonomousDiscoveryCycle(targetCountry?: string, providerTarget?: { targetProviderKey?: string; requiredCapability?: string; allocationType?: string; maxRuns?: number; allowShadowProvider?: boolean; geographicAllocationIntent?: GeographicAllocationIntent }, requestId?: string, experiment?: SelectionExperimentRequest | NormalizedSelectionExperiment | null, discoveryOptions?: { pinnedTargetQueueDepth?: number }): Promise<DiscoveryProducerReport & { logs: string[]; isPaused?: boolean }> {
   if (targetCountry) await assertCountryAllowed(targetCountry, 'autonomous_cycle');
   if (isCycleRunning) throw new Error('An autonomous discovery producer cycle is already in progress.');
 
@@ -386,7 +399,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
     }
     const calculatedCapacity = calculateDiscoveryCapacity({
       batchSize: config.batchSize,
-      targetQueueDepth: config.targetQueueDepth,
+      targetQueueDepth: resolveCycleTargetQueueDepth(config.targetQueueDepth, discoveryOptions?.pinnedTargetQueueDepth),
       currentQueueDepth: snapshot.queueDepth,
       dailyBudget: config.dailyQuotaBudget,
       allocationPercent: config.autonomousQuotaPercent,

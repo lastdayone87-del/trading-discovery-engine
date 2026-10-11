@@ -54,10 +54,19 @@ Fallback-derived benchmark records must not be compared against the
 (`server/benchmarkCapacityGuard.test.ts`, plus the divergence pin in
 `server/searchCapacityDefaults.test.ts`).
 
+Time-of-check/time-of-use closure: the execute path captures the validated
+numeric depth once (`benchmarkValidatedQueueDepth`) and pins it into every
+discovery cycle (`pinnedTargetQueueDepth`, applied by
+`resolveCycleTargetQueueDepth` inside `runAutonomousDiscoveryCycle`). Cycles
+never re-resolve the database setting, so a database change after validation
+cannot divert the run while the record stays valid. Without a pin (all
+existing production callers), live resolution flows through unchanged.
+
 ## Post-deploy verification (read-only)
 
 - `docker inspect <app-container> --format '{{json .Config.Env}}'` shows
-  `SEARCH_WORKER_CONCURRENCY=4` (absent only if an explicit runtime value
-  overrides it, which still wins by design).
+  `SEARCH_WORKER_CONCURRENCY=4`, unless an explicit runtime override sets a
+  different value — in that case `.Config.Env` shows the overridden value,
+  which wins by design.
 - Read-only database `SELECT setting_value FROM app_settings WHERE
   setting_key='discovery_target_queue_depth'` still returns `30`.

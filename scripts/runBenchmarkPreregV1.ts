@@ -64,6 +64,7 @@ import {
 import {
   assertBenchmarkPlannedQueueDepth,
   assertBenchmarkQueueDepthEstablished,
+  benchmarkValidatedQueueDepth,
 } from '../server/benchmarkCapacityGuard';
 
 function usageError(message: string): never {
@@ -209,8 +210,10 @@ async function main(): Promise<void> {
   // Capacity-record enforcement for execution: the live environment must
   // evidence 30 AND the plan file itself must record 30 (a pre-guard plan
   // with a fallback-governed 15 must never execute). Both checks run before
-  // the record mutates to IN_PROGRESS.
-  assertBenchmarkQueueDepthEstablished(settings, process.env, 'execute');
+  // the record mutates to IN_PROGRESS. The validated depth is captured here
+  // and pinned into every discovery cycle below, so a database change after
+  // this point cannot divert the run while the record stays valid.
+  const validatedQueueDepth = benchmarkValidatedQueueDepth(settings, process.env, 'execute');
   assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'execute');
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
@@ -356,7 +359,7 @@ async function main(): Promise<void> {
       const row = snapshot.rows.find(candidate => candidate.queryId === designated.poolRowId);
       if (!row) throw new Error(`BENCHMARK_PREREG_DESIGNATED_ROW_MISSING: poolRowId=${designated.poolRowId}`);
       const frozenRequest = buildFrozenBenchmarkRequest(snapshot.snapshotHash, row.queryId, spec);
-      report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest);
+      report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest, { pinnedTargetQueueDepth: validatedQueueDepth });
       // Engine pause (kill switch engaged mid-cycle) is an abort, never a
       // no-match exclusion: schedule nothing further.
       if (report.isPaused) {
