@@ -36,14 +36,23 @@ Implications:
   recorded explicitly resolved values, and production carries an explicit
   database `30`, so plan and execute agreed).
 
-Rule: **any benchmark environment must carry an explicit
-`discovery_target_queue_depth` database or environment value of `30`
-(matching production) so the frozen fallback never governs a record.**
+Rule (enforced, not just documented): **no benchmark plan may be created
+and no benchmark may execute unless queue depth 30 is established.**
+`server/benchmarkCapacityGuard.ts` (non-frozen) fails closed with
+`BENCHMARK_QUEUE_DEPTH_UNESTABLISHED`:
+- `--plan`: `assertBenchmarkQueueDepthEstablished(settings, env, 'plan')`
+  runs right after the gate checks, before any snapshot query or file write —
+  the frozen resolution must evidence exactly 30 (which, given the frozen
+  `'15'` fallback, proves an explicit database/environment value).
+- `--execute`: the live environment is re-checked AND the plan file's own
+  `plannedKnobs` must record `'30'`
+  (`assertBenchmarkPlannedQueueDepth`) — a pre-guard plan with a
+  fallback-governed 15 can never execute. Both checks run before the record
+  mutates to `IN_PROGRESS`.
 Fallback-derived benchmark records must not be compared against the
 30-runtime. This invariant is pinned by test
-(`server/searchCapacityDefaults.test.ts`: frozen fallback stays `'15'`,
-runtime default stays `30`, explicit `30` resolves through
-`effectiveBenchmarkKnobs`).
+(`server/benchmarkCapacityGuard.test.ts`, plus the divergence pin in
+`server/searchCapacityDefaults.test.ts`).
 
 ## Post-deploy verification (read-only)
 

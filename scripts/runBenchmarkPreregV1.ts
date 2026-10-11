@@ -61,6 +61,10 @@ import {
   type BenchmarkRowState,
   type PoolSnapshot,
 } from '../server/benchmarkPreregV1';
+import {
+  assertBenchmarkPlannedQueueDepth,
+  assertBenchmarkQueueDepthEstablished,
+} from '../server/benchmarkCapacityGuard';
 
 function usageError(message: string): never {
   console.error(`[benchmark-prereg] ${message}`);
@@ -117,6 +121,12 @@ async function main(): Promise<void> {
   const settingsRows = (await db.query('SELECT setting_key, setting_value FROM app_settings ORDER BY setting_key')).rows as Array<{ setting_key: string; setting_value: string }>;
   const settings: Record<string, string> = Object.fromEntries(settingsRows.map(row => [row.setting_key, row.setting_value]));
   verifyBenchmarkGatesOff(settings);
+
+  // Capacity-record guard (non-frozen enforcement for the frozen 15-vs-30
+  // divergence; see docs/operations-capacity-defaults.md). No plan may be
+  // created unless the record will evidence queue depth 30 via an explicit
+  // database/environment value. Fails before any snapshot query or file.
+  assertBenchmarkQueueDepthEstablished(settings, process.env, 'plan');
 
   const migrationRows = (await db.query('SELECT max(version) AS max_version FROM schema_migrations')).rows as Array<{ max_version: string | number | null }>;
   const maxMigrationVersion = Number(migrationRows[0]?.max_version || 0);
@@ -196,6 +206,12 @@ async function main(): Promise<void> {
   if (status?.isRunning) {
     throw new Error('BENCHMARK_PREREG_SCHEDULER_BUSY: autonomous scheduler already running; stop it before executing');
   }
+  // Capacity-record enforcement for execution: the live environment must
+  // evidence 30 AND the plan file itself must record 30 (a pre-guard plan
+  // with a fallback-governed 15 must never execute). Both checks run before
+  // the record mutates to IN_PROGRESS.
+  assertBenchmarkQueueDepthEstablished(settings, process.env, 'execute');
+  assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'execute');
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
