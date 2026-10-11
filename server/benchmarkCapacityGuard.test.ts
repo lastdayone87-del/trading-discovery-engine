@@ -220,7 +220,7 @@ test('runner enforces the guard before plan files and before IN_PROGRESS', () =>
   // Plan path refuses a non-evidencing record before any file is written.
   assert.match(
     script,
-    /assertBenchmarkPlannedQueueDepth\(record\.plannedKnobs, 'plan'\)[\s\S]*mkdirSync\(outDir/
+    /assertBenchmarkPlannedQueueDepth\(record\.plannedKnobs, 'plan'\)[\s\S]*?writeFileSync\(snapshotPath/
   );
   assert.match(
     script,
@@ -372,10 +372,11 @@ test('plan lock follows the reloaded snapshot; planning holds the lock through w
   );
   // Plan: the execution lock is acquired before the slow planning queries
   // and released before the normal return (throws release via top-level
-  // catch), so a --force replan can never write under a live executor.
+  // catch), so a --force replan can never write under a live executor. The
+  // directory is created before acquisition so fresh --plan targets work.
   assert.match(
     script,
-    /refuseActiveBenchmarkExecution\(outDir\);[\s\S]*?activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock\(outDir\);[\s\S]*?const libraryRows = /
+    /refuseActiveBenchmarkExecution\(outDir\);[\s\S]*?mkdirSync\(outDir, \{ recursive: true \}\);[\s\S]*?activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock\(outDir\);[\s\S]*?const libraryRows = /
   );
   assert.match(
     script,

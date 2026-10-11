@@ -185,6 +185,11 @@ async function main(): Promise<void> {
     // window. Released before the normal return below (and by the top-level
     // catch on any throw), so no path leaks a held lock.
     refuseActiveBenchmarkExecution(outDir);
+    // The outDir must exist before the lock's temp file can be created. A
+    // fresh --plan targets a new directory; creating it here is safe because
+    // no plan files exist yet at this point (the RECORD_EXISTS gate above
+    // rejected non-force overwrites, and --force explicitly replaces).
+    mkdirSync(outDir, { recursive: true });
     activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock(outDir);
     const libraryRows = (await db.query('SELECT * FROM query_library ORDER BY id')).rows as Array<Record<string, unknown>>;
     const now = new Date();
@@ -214,7 +219,6 @@ async function main(): Promise<void> {
     // of producing a plan that can never execute. Remediation: delete the
     // empty row or set an explicit 30, then re-plan.
     assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'plan');
-    mkdirSync(outDir, { recursive: true });
     writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
     console.log(`[${spec.logTag}] PLANNED rows=${snapshot.rows.length}/${snapshot.candidateRows} hash=${snapshot.snapshotHash}`);
