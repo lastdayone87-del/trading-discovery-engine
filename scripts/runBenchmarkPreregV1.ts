@@ -66,6 +66,10 @@ import {
   assertBenchmarkQueueDepthEstablished,
   benchmarkValidatedQueueDepth,
 } from '../server/benchmarkCapacityGuard';
+import {
+  acquireBenchmarkExecutionLock,
+  type BenchmarkExecutionLock,
+} from '../server/benchmarkExecutionLock';
 
 function usageError(message: string): never {
   console.error(`[benchmark-prereg] ${message}`);
@@ -106,6 +110,19 @@ function effectiveNumberedSetting(
   const parsed = Number(raw) || Number(fallback);
   const finite = Number.isFinite(parsed) ? parsed : Number(fallback);
   return Math.min(max, Math.max(min, finite));
+}
+
+// Mutual-exclusion holder for the --execute path. Module-scoped so
+// abortIncomplete, the COMPLETE exits, and the top-level catch all release
+// the same handle; release is ownership-checked and never throws, so calling
+// it with no lock held is a safe no-op (plan mode included).
+let activeBenchmarkExecutionLock: BenchmarkExecutionLock | null = null;
+function releaseActiveBenchmarkExecutionLock(): void {
+  try {
+    activeBenchmarkExecutionLock?.release();
+  } finally {
+    activeBenchmarkExecutionLock = null;
+  }
 }
 
 async function main(): Promise<void> {
@@ -224,6 +241,11 @@ async function main(): Promise<void> {
   // this point cannot divert the run while the record stays valid.
   const validatedQueueDepth = benchmarkValidatedQueueDepth(settings, process.env, 'execute');
   assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'execute');
+  // Mutual exclusion across concurrent --execute processes on this host.
+  // The IN_PROGRESS mutation and every schedule below happen only while
+  // holding the outDir execution lock. Contention throws
+  // BENCHMARK_EXECUTION_LOCK_HELD here with no record mutation or scheduling.
+  activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock(outDir);
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
@@ -255,6 +277,7 @@ async function main(): Promise<void> {
     record.status = 'INCOMPLETE';
     record.stopReason = stopReason;
     saveRecord();
+    releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     throw new Error(`[${spec.logTag}] INCOMPLETE: ${stopReason}`);
   };
@@ -474,6 +497,7 @@ async function main(): Promise<void> {
       record.stopReason = 'SCOPE_COVERED';
       saveRecord();
       console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
+      releaseActiveBenchmarkExecutionLock();
       await db.end().catch(() => undefined);
       process.exit(0);
     }
@@ -488,6 +512,7 @@ async function main(): Promise<void> {
     record.stopReason = 'SCOPE_COVERED';
     saveRecord();
     console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
+    releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     process.exit(0);
   }
@@ -495,6 +520,10 @@ async function main(): Promise<void> {
 }
 
 main().catch(error => {
+  // Covers uncaught mid-execution failures (the record stays IN_PROGRESS and
+  // resumable); ownership-checked release is a safe no-op when this process
+  // holds no lock (plan mode, pre-acquisition failures).
+  releaseActiveBenchmarkExecutionLock();
   console.error(`[benchmark-prereg] FAILED: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });

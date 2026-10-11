@@ -65,8 +65,21 @@ after validation cannot divert the run while the record stays valid. Without
 a pin (all existing production callers), live resolution flows through
 unchanged.
 
-## Post-deploy verification (read-only)
+## Benchmark execution serialization
 
+Concurrent `--execute` runs against one output directory are mutually
+excluded by `server/benchmarkExecutionLock.ts`: the runner claims
+`execution-record.execute.lock` atomically (link(2)) after read-only
+preflight and before the `IN_PROGRESS` mutation, and every schedule happens
+only while holding it. A refused contender throws
+`BENCHMARK_EXECUTION_LOCK_HELD` with no scheduling or record mutation. The
+lock releases on completion and handled failures (release verifies the owner
+token, so cleanup can never remove another process's lock); a crashed
+holder's stale lock is taken over only after its pid is confirmed dead —
+never by age — so an interrupted `IN_PROGRESS` run stays resumable and is
+never permanently blocked.
+
+## Post-deploy verification (read-only)
 - `docker inspect <app-container> --format '{{json .Config.Env}}'` shows
   `SEARCH_WORKER_CONCURRENCY=4`, unless an explicit runtime override sets a
   different value — in that case `.Config.Env` shows the overridden value,
