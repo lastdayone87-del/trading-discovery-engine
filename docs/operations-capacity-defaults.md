@@ -98,15 +98,20 @@ IPC, plus an N-way claim barrier) lives in
 
 Copies of one plan running from different output directories on the same
 host serialize on a snapshot-keyed global lock
-(`acquirePlanExecutionLock`, same atomic protocol): the second executor
-fails closed instead of racing the ledger read-to-schedule window. A second
-executor that does observe the first executor's ledger runs adopts them
-(`planRowAttempt` → `adopt-recovered`) rather than duplicating work. Copies
-on different hosts are not prevented (same-host lock scope) — their shared
-ledger still converges through adoption, but duplicate provider spend is
-possible there; do not run copies of one plan on multiple hosts concurrently.
-`--plan --force` refuses while a live execution holds the directory lock, so
-planning can never replace artifacts an executor is using.
+(`acquirePlanExecutionLock`, same atomic protocol, keyed on the freshly
+reloaded snapshot — never the pre-lock copy a replan may have replaced): the
+second executor fails closed instead of racing the ledger read-to-schedule
+window. A second executor that does observe the first executor's ledger runs
+adopts them (`planRowAttempt` → `adopt-recovered`) rather than duplicating
+work. Copies on different hosts are not prevented (same-host lock scope) —
+their shared ledger still converges through adoption, but duplicate provider
+spend is possible there; do not run copies of one plan on multiple hosts
+concurrently.
+`--plan --force` refuses while a live execution holds the directory lock, and
+planning additionally holds the execution lock from before its slow queries
+through both artifact writes (released on normal return and via the
+top-level catch on any throw), so a replan can never write under a live
+executor.
 
 ## Post-deploy verification (read-only)
 - `docker inspect <app-container> --format '{{json .Config.Env}}'` shows

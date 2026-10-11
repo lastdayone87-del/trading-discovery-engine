@@ -178,8 +178,14 @@ async function main(): Promise<void> {
     }
     // A --force replan must not replace artifacts a live execution is using.
     // Absent, stale, and unreadable locks pass; only a proven-live holder
-    // blocks. Execution-time guards still gate independently.
+    // blocks. Execution-time guards still gate independently. The lock is
+    // then held across planning (acquired below): the check above can pass
+    // while an executor is still pre-lock, and planning runs slow queries
+    // before writing — holding the lock through both writes closes that
+    // window. Released before the normal return below (and by the top-level
+    // catch on any throw), so no path leaks a held lock.
     refuseActiveBenchmarkExecution(outDir);
+    activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock(outDir);
     const libraryRows = (await db.query('SELECT * FROM query_library ORDER BY id')).rows as Array<Record<string, unknown>>;
     const now = new Date();
     const cooldownMinutes = effectiveNumberedSetting(settings, 'query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', '360', 1, 10080);
@@ -214,6 +220,7 @@ async function main(): Promise<void> {
     console.log(`[${spec.logTag}] PLANNED rows=${snapshot.rows.length}/${snapshot.candidateRows} hash=${snapshot.snapshotHash}`);
     console.log(`[${spec.logTag}] configHash=${configurationHash} out=${outDir}`);
     console.log(`[${spec.logTag}] Execute ONLY with explicit approval: npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version=${spec.specVersion} --out ${outDir}`);
+    releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     return;
   }
@@ -272,11 +279,6 @@ async function main(): Promise<void> {
   // lock (residual takeover race), the gates abort before the next mutation
   // or schedule instead of corrupting shared state.
   const executionLock: BenchmarkExecutionLock = activeBenchmarkExecutionLock;
-  // Same-plan serialization across output directories: a copied plan running
-  // elsewhere on this host holds the snapshot-keyed global lock. Acquired
-  // strictly after the outDir lock (never the reverse: no deadlock cycle).
-  // Contention fails closed here with no mutation or scheduling.
-  activeBenchmarkPlanLock = acquirePlanExecutionLock(planExecutionLockPath(snapshot.snapshotHash));
   // Reload under lock: the pre-lock validation above may have acted on stale
   // files if this process paused while another execution finished and
   // released the lock. Revalidate the freshly loaded artifacts; a record
@@ -285,6 +287,13 @@ async function main(): Promise<void> {
   record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
   snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
   assertBenchmarkExecutionArtifactsEligible(record, snapshot, spec.specVersion);
+  // Same-plan serialization across output directories: keyed on the freshly
+  // reloaded snapshot hash (never the pre-lock copy — a --force replan that
+  // landed before our outDir acquisition must not leave us holding the old
+  // plan's lock while running the new plan's opportunities). Acquired
+  // strictly after the outDir lock (never the reverse: no deadlock cycle).
+  // Contention fails closed here with no mutation or scheduling.
+  activeBenchmarkPlanLock = acquirePlanExecutionLock(planExecutionLockPath(snapshot.snapshotHash));
   // Ownership gate before the first mutation and write: a holder that lost
   // the lock between acquisition and this point must not persist stale
   // state over the rightful executor's progress.
