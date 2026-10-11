@@ -5,12 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquireBenchmarkExecutionLock,
-  acquirePlanExecutionLock,
   inspectStaleLock,
   isEnoentError,
   isLockOwnerLive,
   lockFilePathForOutputDir,
-  planExecutionLockPath,
+  readProcCmdline,
   refuseActiveBenchmarkExecution,
   serializeBenchmarkExecutionLock,
 } from './benchmarkExecutionLock';
@@ -133,9 +132,10 @@ test('runner holds the lock across mutation and scheduling, and releases on ever
     /isScopeTerminallyAccounted\(finalStates\)[\s\S]*?releaseActiveBenchmarkExecutionLock\(\);[\s\S]*?process\.exit\(0\)/
   );
   // Released on uncaught mid-execution failures (record stays resumable).
+  // The catch is async so the advisory plan-client release completes.
   assert.match(
     script,
-    /main\(\)\.catch\(error => \{[\s\S]*releaseActiveBenchmarkExecutionLock\(\)[\s\S]*process\.exit\(1\)/
+    /main\(\)\.catch\(async error => \{[\s\S]*await releaseActiveBenchmarkExecutionLock\(\)[\s\S]*process\.exit\(1\)/
   );
 });
 
@@ -403,16 +403,6 @@ test('acquired locks record the owner command for reuse checks', () => {
   assert.equal(holder.release(), true);
 });
 
-test('same plan serializes across directories; different plans proceed', () => {
-  const first = acquirePlanExecutionLock(planExecutionLockPath('abc123'));
-  assert.throws(() => acquirePlanExecutionLock(planExecutionLockPath('abc123')), /BENCHMARK_EXECUTION_LOCK_HELD/);
-  const other = acquirePlanExecutionLock(planExecutionLockPath('def456'));
-  assert.equal(first.release(), true);
-  assert.equal(other.release(), true);
-  const after = acquirePlanExecutionLock(planExecutionLockPath('abc123'));
-  assert.equal(after.release(), true);
-});
-
 test('planning is refused only for a proven-live executor', () => {
   const outDir = freshDir();
   refuseActiveBenchmarkExecution(outDir);
@@ -441,16 +431,57 @@ test('runner checks for active execution before planning and gates the first mut
   );
 });
 
-test('runner holds the plan lock across the run and releases both locks on every terminal path', () => {
+test('runner holds the advisory plan lock across the run and releases both locks on every terminal path', () => {
   const script = readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  // The plan lock lives in the database every copy shares (not tmpdir):
+  // same snapshot hash, any directory, any host on that database.
   assert.match(
     script,
-    /activeBenchmarkPlanLock = acquirePlanExecutionLock\(planExecutionLockPath\(snapshot\.snapshotHash\)\)/
+    /activeBenchmarkPlanLock = await acquireBenchmarkPlanLock\(db, snapshot\.snapshotHash\)/
   );
   const releaseBody = script.slice(
-    script.indexOf('function releaseActiveBenchmarkExecutionLock'),
+    script.indexOf('async function releaseActiveBenchmarkExecutionLock'),
     script.indexOf('async function main')
   );
   assert.match(releaseBody, /activeBenchmarkExecutionLock\?\.release\(\)/);
-  assert.match(releaseBody, /activeBenchmarkPlanLock\?\.release\(\)/);
+  assert.match(releaseBody, /await activeBenchmarkPlanLock\?\.release\(\)/);
+});
+
+test('release never deletes a replacement lock', () => {
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  // Same-inode content swap (truncate-in-place keeps the inode): the
+  // re-verification before removal must refuse instead of deleting.
+  const swapped = serializeBenchmarkExecutionLock({ pid: process.pid, token: 'foreign-live', startedAt: new Date().toISOString() });
+  writeFileSync(lockPath, swapped);
+  assert.equal(holder.release(), false);
+  assert.equal(readFileSync(lockPath, 'utf8'), swapped);
+  // New-inode replacement (delete + rewrite) is likewise preserved.
+  unlinkSync(lockPath);
+  const replaced = serializeBenchmarkExecutionLock({ pid: process.pid, token: 'foreign-live-2', startedAt: new Date().toISOString() });
+  writeFileSync(lockPath, replaced);
+  assert.equal(holder.release(), false);
+  assert.equal(readFileSync(lockPath, 'utf8'), replaced);
+});
+
+test('commit and inspect agree on command-identity verdicts', () => {
+  // A live pid running a foreign command reads as stale at inspect time;
+  // commit must reach the same verdict through the same check (not pid-only)
+  // and remove only that verified instance. Skipped where /proc is
+  // unavailable (the pid-only fallback then governs by design).
+  if (readProcCmdline(process.pid) === null) {
+    console.log('SKIP: /proc unavailable; command-identity coherence needs Linux procfs');
+    return;
+  }
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  writeFileSync(
+    lockPath,
+    serializeBenchmarkExecutionLock({ pid: process.pid, token: 'foreign-cmd', startedAt: new Date().toISOString(), argv: 'something-else-entirely' })
+  );
+  const inspection = inspectStaleLock(lockPath, 'coherence');
+  if (inspection.outcome !== 'recoverable') assert.fail('foreign command on a live pid must read as stale');
+  assert.equal(inspection.recovery.commit(), 'removed');
+  assert.equal(existsSync(lockPath), false);
 });

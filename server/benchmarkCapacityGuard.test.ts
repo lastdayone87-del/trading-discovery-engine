@@ -364,11 +364,12 @@ test('runner reloads and revalidates artifacts under lock before mutating', () =
 test('plan lock follows the reloaded snapshot; planning holds the lock through writes', () => {
   const script = readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
   // Execute: the global plan lock is keyed on the freshly reloaded snapshot
-  // (never the pre-lock copy a --force replan may have replaced), acquired
-  // after revalidation and before any mutation.
+  // via the database advisory lock shared by every copy of the plan
+  // (directories, tmpdirs, and hosts on that database), acquired after
+  // revalidation and before any mutation.
   assert.match(
     script,
-    /assertBenchmarkExecutionArtifactsEligible\(record, snapshot, spec\.specVersion\)[\s\S]*?activeBenchmarkPlanLock = acquirePlanExecutionLock\(planExecutionLockPath\(snapshot\.snapshotHash\)\)[\s\S]*?record\.status = 'IN_PROGRESS'/
+    /assertBenchmarkExecutionArtifactsEligible\(record, snapshot, spec\.specVersion\)[\s\S]*?activeBenchmarkPlanLock = await acquireBenchmarkPlanLock\(db, snapshot\.snapshotHash\)[\s\S]*?record\.status = 'IN_PROGRESS'/
   );
   // Plan: the execution lock is acquired before the slow planning queries
   // and released before the normal return (throws release via top-level

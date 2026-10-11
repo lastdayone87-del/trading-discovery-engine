@@ -5,7 +5,6 @@
 //
 // Protocol (parent -> child { id, cmd, ... }, child -> parent { id, ... }):
 //   acquire { outDir }            -> { ok, token } | { ok:false, error }
-//   acquirePlan { lockPath }      -> { ok, token } | { ok:false, error }
 //   inspect { lockPath, tag }     -> { ok, outcome } (intent kept by id)
 //   commit { id }                 -> { ok, result } | { ok:false, error }
 //   abandon { id }                -> { ok }
@@ -14,7 +13,6 @@
 //   exit {}                       -> child terminates (no reply)
 import {
   acquireBenchmarkExecutionLock,
-  acquirePlanExecutionLock,
   inspectStaleLock,
   type BenchmarkExecutionLock,
   type PendingStaleRecovery,
@@ -41,12 +39,6 @@ process.on('message', (raw) => {
     switch (msg.cmd) {
       case 'acquire': {
         const handle = acquireBenchmarkExecutionLock(msg.outDir as string);
-        held.set(entryKey(msg), { handle });
-        reply(msg.id, { ok: true, token: handle.token });
-        break;
-      }
-      case 'acquirePlan': {
-        const handle = acquirePlanExecutionLock(msg.lockPath as string);
         held.set(entryKey(msg), { handle });
         reply(msg.id, { ok: true, token: handle.token });
         break;

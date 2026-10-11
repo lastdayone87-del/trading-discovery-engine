@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
 import { fork, type ChildProcess } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -96,7 +97,10 @@ class Contender {
   }
 
   static async spawn(): Promise<Contender> {
-    const child = fork(new URL('./benchmarkLockChild.ts', import.meta.url));
+    // fork() takes a filesystem path: convert the module URL explicitly
+    // (passing a URL object is not portable across Node versions) and verify
+    // startup via the child's ready handshake before use.
+    const child = fork(fileURLToPath(new URL('./benchmarkLockChild.ts', import.meta.url)));
     children.push(child);
     const contender = new Contender(child);
     await contender.ready;
@@ -180,52 +184,27 @@ test('stale takeover race across processes yields one holder', async () => {
 });
 
 test('barrier race across processes elects exactly one holder', async () => {
-  // Five contenders race one atomic claim; the assertions (exactly one
-  // winner, every loser refused, file matches the winner) are deterministic
-  // regardless of interleaving. One environmental caveat, documented not
-  // hidden: this host's filesystem (f2fs bind mount under parallel
-  // hard-link churn) sporadically returns EPERM from racing stat/unlink
-  // calls — verified with a logic-free raw-syscall stress (10-28 EPERM per
-  // 1200 ops, zero application code involved). A round that hits EPERM is
-  // discarded and retried (bounded); assertion failures never retry, so a
-  // genuine protocol violation still fails loudly.
-  let winners: Reply[] = [];
-  let refused: Reply[] = [];
-  let elected = '';
-  for (let round = 0; round < 3; round++) {
-    const outDir = freshDir();
-    const contenders = await Promise.all(
-      Array.from({ length: 5 }, () => Contender.spawn())
-    );
-    const pids = new Set(contenders.map(contender => contender.pid));
-    assert.equal(pids.size, 5);
-    try {
-      const results = await Promise.all(
-        contenders.map(contender => contender.call({ cmd: 'acquire', outDir }))
-      );
-      winners = results.filter(result => result.ok === true);
-      refused = results.filter(result => result.ok !== true);
-      assert.equal(winners.length, 1);
-      assert.equal(refused.length, 4);
-      for (const loser of refused) {
-        assert.match(String(loser.error || ''), /BENCHMARK_EXECUTION_LOCK_HELD/);
-      }
-      const current = JSON.parse(readFileSync(lockFilePathForOutputDir(outDir), 'utf8')) as { token: string };
-      assert.equal(current.token, winners[0].token);
-      elected = outDir;
-      for (const contender of contenders) {
-        await contender.stop();
-      }
-      break;
-    } catch (error) {
-      for (const contender of contenders) {
-        await contender.stop();
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes('EPERM') || round === 2) throw error;
-    }
+  const outDir = freshDir();
+  const contenders = await Promise.all(
+    Array.from({ length: 5 }, () => Contender.spawn())
+  );
+  const pids = new Set(contenders.map(contender => contender.pid));
+  assert.equal(pids.size, 5);
+  const results = await Promise.all(
+    contenders.map(contender => contender.call({ cmd: 'acquire', outDir }))
+  );
+  const winners = results.filter(result => result.ok === true);
+  const refused = results.filter(result => result.ok !== true);
+  assert.equal(winners.length, 1);
+  assert.equal(refused.length, 4);
+  for (const loser of refused) {
+    assert.match(String(loser.error || ''), /BENCHMARK_EXECUTION_LOCK_HELD/);
   }
-  assert.ok(elected, 'a clean barrier round must complete within the retry budget');
+  const current = JSON.parse(readFileSync(lockFilePathForOutputDir(outDir), 'utf8')) as { token: string };
+  assert.equal(current.token, winners[0].token);
+  for (const contender of contenders) {
+    await contender.stop();
+  }
 });
 
 test('live holder blocks contender processes; release unblocks them', async () => {

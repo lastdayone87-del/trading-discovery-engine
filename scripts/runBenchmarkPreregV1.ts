@@ -69,11 +69,13 @@ import {
 } from '../server/benchmarkCapacityGuard';
 import {
   acquireBenchmarkExecutionLock,
-  acquirePlanExecutionLock,
-  planExecutionLockPath,
   refuseActiveBenchmarkExecution,
   type BenchmarkExecutionLock,
 } from '../server/benchmarkExecutionLock';
+import {
+  acquireBenchmarkPlanLock,
+  type BenchmarkPlanLock,
+} from '../server/benchmarkPlanLock';
 
 function usageError(message: string): never {
   console.error(`[benchmark-prereg] ${message}`);
@@ -121,20 +123,22 @@ function effectiveNumberedSetting(
 // the same handle; release is ownership-checked and never throws, so calling
 // it with no lock held is a safe no-op (plan mode included).
 let activeBenchmarkExecutionLock: BenchmarkExecutionLock | null = null;
-let activeBenchmarkPlanLock: BenchmarkExecutionLock | null = null;
-function releaseActiveBenchmarkExecutionLock(): void {
-  // Releases every lock this process holds for the run (ownership-checked,
-  // never throws); kept under one name so abortIncomplete, the COMPLETE
-  // exits, and the top-level catch cannot miss one. Lock acquisition order
-  // is always outDir-then-plan (never the reverse), so two executors cannot
-  // deadlock against each other.
+let activeBenchmarkPlanLock: BenchmarkPlanLock | null = null;
+async function releaseActiveBenchmarkExecutionLock(): Promise<void> {
+  // Releases every lock this process holds for the run. File locks first,
+  // then the plan advisory lock (unlock + client release/destroy, never
+  // throws); kept under one name so abortIncomplete, the COMPLETE exits,
+  // the plan return, and the top-level catch cannot miss one. All call sites
+  // are async and await this. Lock acquisition order is always
+  // outDir-then-plan (and try_advisory_lock never blocks), so executors
+  // cannot deadlock against each other.
   try {
     activeBenchmarkExecutionLock?.release();
   } finally {
     activeBenchmarkExecutionLock = null;
   }
   try {
-    activeBenchmarkPlanLock?.release();
+    await activeBenchmarkPlanLock?.release();
   } finally {
     activeBenchmarkPlanLock = null;
   }
@@ -191,6 +195,13 @@ async function main(): Promise<void> {
     // rejected non-force overwrites, and --force explicitly replaces).
     mkdirSync(outDir, { recursive: true });
     activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock(outDir);
+    // A concurrent planner may have created artifacts between our existence
+    // check and lock acquisition: re-check under the held lock, before any
+    // query or write. Without --force, another planner's fresh artifacts
+    // abort us here instead of being overwritten below.
+    if (!force && (existsSync(recordPath) || existsSync(snapshotPath))) {
+      throw new Error('BENCHMARK_PREREG_RECORD_EXISTS: refusing to overwrite; pass --force to re-plan before any observation');
+    }
     const libraryRows = (await db.query('SELECT * FROM query_library ORDER BY id')).rows as Array<Record<string, unknown>>;
     const now = new Date();
     const cooldownMinutes = effectiveNumberedSetting(settings, 'query_intelligence_query_cooldown_minutes', 'QUERY_INTELLIGENCE_COOLDOWN_MINUTES', '360', 1, 10080);
@@ -224,7 +235,7 @@ async function main(): Promise<void> {
     console.log(`[${spec.logTag}] PLANNED rows=${snapshot.rows.length}/${snapshot.candidateRows} hash=${snapshot.snapshotHash}`);
     console.log(`[${spec.logTag}] configHash=${configurationHash} out=${outDir}`);
     console.log(`[${spec.logTag}] Execute ONLY with explicit approval: npx tsx scripts/runBenchmarkPreregV1.ts --execute --spec-version=${spec.specVersion} --out ${outDir}`);
-    releaseActiveBenchmarkExecutionLock();
+    await releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     return;
   }
@@ -291,13 +302,14 @@ async function main(): Promise<void> {
   record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
   snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
   assertBenchmarkExecutionArtifactsEligible(record, snapshot, spec.specVersion);
-  // Same-plan serialization across output directories: keyed on the freshly
-  // reloaded snapshot hash (never the pre-lock copy — a --force replan that
-  // landed before our outDir acquisition must not leave us holding the old
-  // plan's lock while running the new plan's opportunities). Acquired
-  // strictly after the outDir lock (never the reverse: no deadlock cycle).
+  // Same-plan serialization across output directories AND hosts: keyed on
+  // the freshly reloaded snapshot hash (never the pre-lock copy). The lock
+  // lives in the database every copy of a plan necessarily shares, so
+  // copies in different directories, tmpdirs, or containers cannot silently
+  // acquire independent locks. The dedicated client stays checked out until
+  // release; try_advisory_lock never blocks, so no deadlock cycle exists.
   // Contention fails closed here with no mutation or scheduling.
-  activeBenchmarkPlanLock = acquirePlanExecutionLock(planExecutionLockPath(snapshot.snapshotHash));
+  activeBenchmarkPlanLock = await acquireBenchmarkPlanLock(db, snapshot.snapshotHash);
   // Ownership gate before the first mutation and write: a holder that lost
   // the lock between acquisition and this point must not persist stale
   // state over the rightful executor's progress.
@@ -339,7 +351,7 @@ async function main(): Promise<void> {
     record.status = 'INCOMPLETE';
     record.stopReason = stopReason;
     saveRecord();
-    releaseActiveBenchmarkExecutionLock();
+    await releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     throw new Error(`[${spec.logTag}] INCOMPLETE: ${stopReason}`);
   };
@@ -562,7 +574,7 @@ async function main(): Promise<void> {
       record.stopReason = 'SCOPE_COVERED';
       saveRecord();
       console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
-      releaseActiveBenchmarkExecutionLock();
+      await releaseActiveBenchmarkExecutionLock();
       await db.end().catch(() => undefined);
       process.exit(0);
     }
@@ -577,18 +589,18 @@ async function main(): Promise<void> {
     record.stopReason = 'SCOPE_COVERED';
     saveRecord();
     console.log(`[${spec.logTag}] COMPLETE: all ${spec.scopeSize} designated opportunities terminally accounted`);
-    releaseActiveBenchmarkExecutionLock();
+    await releaseActiveBenchmarkExecutionLock();
     await db.end().catch(() => undefined);
     process.exit(0);
   }
   await abortIncomplete('DESIGNATED_ROWS_UNACCOUNTED');
 }
 
-main().catch(error => {
+main().catch(async error => {
   // Covers uncaught mid-execution failures (the record stays IN_PROGRESS and
   // resumable); ownership-checked release is a safe no-op when this process
   // holds no lock (plan mode, pre-acquisition failures).
-  releaseActiveBenchmarkExecutionLock();
+  await releaseActiveBenchmarkExecutionLock();
   console.error(`[benchmark-prereg] FAILED: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });

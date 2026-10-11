@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, linkSync, openSync, readFileSync, statSync, unlinkSync, writeSync, type Stats } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 
 /**
  * Cross-process mutual exclusion for benchmark --execute runs sharing one
@@ -65,6 +64,31 @@ export function isEnoentError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT';
 }
 
+const FS_RETRY_ATTEMPTS = 10;
+
+/**
+ * Run one filesystem operation, retrying transient EPERM only. Rationale:
+ * filesystems under parallel hard-link churn sporadically fail racing
+ * link/stat/unlink calls with EPERM for an operation that did not happen
+ * (verified with a logic-free raw-syscall stress: no application code
+ * involved). Retrying is safe — every call site below either recreates the
+ * same precondition or re-evaluates afterwards — while anything else,
+ * including persistent EPERM, propagates unchanged (never converted into a
+ * contention or staleness verdict).
+ */
+function attemptFs<T>(operation: () => T, attempts = FS_RETRY_ATTEMPTS): T {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return operation();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code !== 'EPERM') throw error;
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
 /** Reads /proc/<pid>/cmdline; null when unavailable (non-Linux, unreadable). Never throws. */
 export function readProcCmdline(pid: number): string | null {
   try {
@@ -122,7 +146,7 @@ function pidAlive(pid: number): boolean {
 
 function readLockInfo(lockPath: string): BenchmarkExecutionLockInfo | null {
   try {
-    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as Partial<BenchmarkExecutionLockInfo>;
+    const parsed = JSON.parse(attemptFs(() => readFileSync(lockPath, 'utf8'))) as Partial<BenchmarkExecutionLockInfo>;
     if (typeof parsed.pid !== 'number' || typeof parsed.token !== 'string') return null;
     return {
       pid: parsed.pid,
@@ -181,7 +205,7 @@ export type StaleLockInspection =
 export function inspectStaleLock(lockPath: string, quarantineTag: string): StaleLockInspection {
   let pathStat: Stats;
   try {
-    pathStat = statSync(lockPath);
+    pathStat = attemptFs(() => statSync(lockPath));
   } catch (error) {
     // Vanished: caller retries the claim. Anything else (permission, I/O)
     // is a real failure and propagates instead of masquerading as contention.
@@ -192,7 +216,7 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
   if (!current) return { outcome: 'unreadable' }; // Fail closed; never remove.
   const quarantinePath = `${lockPath}.quar-${process.pid}-${quarantineTag}`;
   try {
-    linkSync(lockPath, quarantinePath);
+    attemptFs(() => linkSync(lockPath, quarantinePath));
   } catch (error) {
     // Vanished, or our tag collided with our own leftover: retry. Anything
     // else propagates.
@@ -202,10 +226,10 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
   }
   const dropQuarantine = () => {
     try {
-      unlinkSync(quarantinePath);
+      attemptFs(() => unlinkSync(quarantinePath));
     } catch { /* best effort */ }
   };
-  const quarantineStat = statSync(quarantinePath);
+  const quarantineStat = attemptFs(() => statSync(quarantinePath));
   const isolated = readLockInfo(quarantinePath);
   if (
     quarantineStat.ino !== pathStat.ino ||
@@ -228,6 +252,29 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
       lockPath,
       quarantinePath,
       commit(): 'removed' | 'changed' {
+        // Re-verification helper: the path still holds the exact inspected
+        // instance (inode identity plus owner token/pid). ENOENT (vanished)
+        // reads as absent; anything else unexpected propagates.
+        const verifyCurrentInstance = (): BenchmarkExecutionLockInfo | null => {
+          let restat: Stats;
+          try {
+            restat = attemptFs(() => statSync(lockPath));
+          } catch (error) {
+            if (!isEnoentError(error)) throw error;
+            return null;
+          }
+          const instance = readLockInfo(lockPath);
+          if (
+            restat.ino !== inspected.ino ||
+            restat.dev !== inspected.dev ||
+            !instance ||
+            instance.token !== inspected.token ||
+            instance.pid !== inspected.pid
+          ) {
+            return null;
+          }
+          return instance;
+        };
         try {
           // Re-verify at commit time: the path must still hold the exact
           // inspected instance and its owner must still be dead. A pid that
@@ -237,27 +284,18 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
           // against whatever is there now, so removal races converge on a
           // single holder instead of aborting. Only ENOENT takes this path;
           // permission, I/O, and unexpected failures propagate.
-          let restat: Stats;
-          let latest: BenchmarkExecutionLockInfo | null;
-          try {
-            restat = statSync(lockPath);
-            latest = readLockInfo(lockPath);
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return 'changed';
-            throw error;
-          }
-          if (
-            restat.ino !== inspected.ino ||
-            restat.dev !== inspected.dev ||
-            !latest ||
-            latest.token !== inspected.token ||
-            latest.pid !== inspected.pid
-          ) {
-            return 'changed';
-          }
+          const latest = verifyCurrentInstance();
+          if (!latest) return 'changed';
           if (isLockOwnerLive(latest)) throw lockHeldError(latest);
+          // Final re-verification immediately before removal. Verification
+          // and removal are separate syscalls, so a replacement landing
+          // exactly between them cannot be ruled out in theory — but any
+          // replacement that landed before this point (every pause an OS
+          // scheduler or test can deterministically construct) refuses
+          // here instead of deleting.
+          if (!verifyCurrentInstance()) return 'changed';
           try {
-            unlinkSync(lockPath);
+            attemptFs(() => unlinkSync(lockPath));
           } catch (error) {
             // Only a vanished path means a racer removed it first
             // (re-evaluate whatever is there now). Permission or I/O
@@ -292,9 +330,9 @@ export function acquireBenchmarkExecutionLock(
   const startedAt = new Date().toISOString();
   const argv = basename(process.argv[1] ?? '');
   const tmpPath = `${lockPath}.tmp-${process.pid}-${token.slice(0, 8)}`;
-  const fd = openSync(tmpPath, 'wx');
+  const fd = attemptFs(() => openSync(tmpPath, 'wx'));
   try {
-    writeSync(fd, serializeBenchmarkExecutionLock({ pid: process.pid, token, startedAt, argv }));
+    attemptFs(() => writeSync(fd, serializeBenchmarkExecutionLock({ pid: process.pid, token, startedAt, argv })));
   } finally {
     try {
       closeSync(fd);
@@ -303,15 +341,22 @@ export function acquireBenchmarkExecutionLock(
   try {
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
-        linkSync(tmpPath, lockPath);
+        attemptFs(() => linkSync(tmpPath, lockPath));
         const held: BenchmarkExecutionLock = {
           lockPath,
           token,
           release(): boolean {
+            // Re-verify immediately before removal: a replacement lock that
+            // landed after the first read must not be deleted (same TOCTOU
+            // class as stale recovery). Any failure — including a change
+            // under us — reports unreleased rather than throwing, so cleanup
+            // stays safe to call on every exit path.
             try {
               const current = readLockInfo(lockPath);
               if (!current || current.token !== token) return false;
-              unlinkSync(lockPath);
+              const confirm = readLockInfo(lockPath);
+              if (!confirm || confirm.token !== token) return false;
+              attemptFs(() => unlinkSync(lockPath));
               return true;
             } catch {
               return false;
@@ -347,24 +392,9 @@ export function acquireBenchmarkExecutionLock(
     // The claim tmp is uniquely ours; remove it on every path (the live lock,
     // once linked, lives at lockPath).
     try {
-      unlinkSync(tmpPath);
+      attemptFs(() => unlinkSync(tmpPath));
     } catch { /* best effort */ }
   }
-}
-
-/**
- * Same-host serialization across output directories for one benchmark plan:
- * two executors running copies of the same snapshot must not schedule the
- * same opportunities concurrently. The second executor fails closed instead.
- * Same-host scope only (like the outDir lock); cross-host copies are
- * detected through ledger adoption, not prevented — see the runner docs.
- */
-export function planExecutionLockPath(snapshotHash: string): string {
-  return join(tmpdir(), `benchmark-plan-execution-${snapshotHash}.lock`);
-}
-
-export function acquirePlanExecutionLock(lockPath: string): BenchmarkExecutionLock {
-  return acquireBenchmarkExecutionLock(dirname(lockPath), basename(lockPath));
 }
 
 /**
