@@ -97,11 +97,36 @@ async function numericSetting(key: string, envKey: string, fallback: number, min
   return Math.min(max, Math.max(min, Number.isFinite(value) ? value : fallback));
 }
 
+/** Code fallback for the autonomous queue watermark when neither the
+ * database nor the environment supplies a value. Production holds an
+ * explicit database value of 30, which keeps winning over this fallback. */
+export const DISCOVERY_TARGET_QUEUE_DEPTH_DEFAULT = 30;
+/**
+ * Pure queue-depth resolution with the same precedence as numericSetting:
+ * database value first, environment value second, code fallback last,
+ * clamped to [1, 500]. Non-numeric input falls back to the default.
+ * Unit-testable without a database; the async setting reads stay at the
+ * call site in getDiscoveryConfig.
+ */
+export function resolveDiscoveryTargetQueueDepth(
+  dbValue: string | undefined,
+  envValue: string | undefined,
+): number {
+  const raw = (dbValue ?? '') !== '' ? dbValue as string
+    : (envValue ?? '') !== '' ? envValue as string
+    : String(DISCOVERY_TARGET_QUEUE_DEPTH_DEFAULT);
+  const parsed = Number(raw);
+  return Math.min(500, Math.max(1, Number.isFinite(parsed) ? parsed : DISCOVERY_TARGET_QUEUE_DEPTH_DEFAULT));
+}
+
 async function getDiscoveryConfig(): Promise<DiscoveryConfig> {
   return {
     intervalMinutes: await numericSetting('discovery_interval_minutes', 'DISCOVERY_INTERVAL_MINUTES', 5, 1, 60),
     batchSize: await numericSetting('discovery_batch_size', 'DISCOVERY_BATCH_SIZE', 5, 1, 50),
-    targetQueueDepth: await numericSetting('discovery_target_queue_depth', 'DISCOVERY_TARGET_QUEUE_DEPTH', 15, 1, 500),
+    targetQueueDepth: resolveDiscoveryTargetQueueDepth(
+      await getAppSetting('discovery_target_queue_depth', ''),
+      process.env.DISCOVERY_TARGET_QUEUE_DEPTH,
+    ),
     dailyQuotaBudget: getDailyYouTubeQuotaBudget(),
     autonomousQuotaPercent: await numericSetting('discovery_autonomous_quota_percent', 'DISCOVERY_AUTONOMOUS_QUOTA_PERCENT', 70, 1, 100)
   };
