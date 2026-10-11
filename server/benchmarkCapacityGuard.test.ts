@@ -3,12 +3,19 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import {
   BENCHMARK_REQUIRED_QUEUE_DEPTH,
+  assertBenchmarkExecutionArtifactsEligible,
   assertBenchmarkPlannedQueueDepth,
   assertBenchmarkQueueDepthEstablished,
   benchmarkValidatedQueueDepth,
   resolveBenchmarkQueueDepth,
 } from './benchmarkCapacityGuard';
-import { effectiveBenchmarkKnobs } from './benchmarkPreregV1';
+import {
+  buildExecutionRecord,
+  buildPoolSnapshot,
+  computeConfigurationHash,
+  effectiveBenchmarkKnobs,
+} from './benchmarkPreregV1';
+import type { QueryRecord } from '../src/types';
 import {
   resolveCycleTargetQueueDepth,
   resolveDiscoveryTargetQueueDepth,
@@ -216,7 +223,7 @@ test('runner enforces the guard before plan files and before IN_PROGRESS', () =>
   );
   assert.match(
     script,
-    /benchmarkValidatedQueueDepth\(settings, process\.env, 'execute'\)[\s\S]*assertBenchmarkPlannedQueueDepth\(record\.plannedKnobs, 'execute'\)[\s\S]*record\.status = 'IN_PROGRESS'/
+    /benchmarkValidatedQueueDepth\(settings, process\.env, 'execute'\)[\s\S]*?activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock\(outDir\)[\s\S]*?record\.status = 'IN_PROGRESS'/
   );
   // Every benchmark cycle runs at the validated depth, never re-resolved.
   assert.match(
@@ -230,5 +237,125 @@ test('cycle applies the pinned depth over live configuration', () => {
   assert.match(
     source,
     /targetQueueDepth: resolveCycleTargetQueueDepth\(config\.targetQueueDepth, discoveryOptions\?\.pinnedTargetQueueDepth\)/
+  );
+});
+
+function guardEligibleRow(id: number): QueryRecord {
+  return {
+    id,
+    query: `trading strategy ${id}`,
+    country: 'US',
+    collection: 'EXPERIMENTAL',
+    intent: 'strategy',
+    times_executed: 0,
+    last_executed: null,
+    total_channels_found: 0,
+    unique_channels_found: 0,
+    quality_channels_found: 0,
+    community_channels_found: 0,
+    avg_quality_score: 0,
+    performance_score: 0,
+    created_at: '2026-01-01T00:00:00.000Z',
+    status: 'ACTIVE',
+    generation_metadata: {
+      retrievalSpecificity: { policyVersion: 'retrieval-specificity-v2', eligibility: 'STANDALONE' },
+      queryTemplate: 'SINGLE_ATOM',
+    },
+  } as QueryRecord;
+}
+
+function guardArtifacts(
+  appSettings: Array<{ setting_key: string; setting_value: string }> = [
+    { setting_key: 'discovery_target_queue_depth', setting_value: '30' },
+  ],
+  collectedAt = new Date()
+) {
+  const snapshot = buildPoolSnapshot({
+    rows: [guardEligibleRow(1), guardEligibleRow(2)],
+    collectedAt,
+    cooldownMinutes: 360,
+    maxPrimaryUses: 2,
+  });
+  const record = buildExecutionRecord({
+    runningCommit: 'test-commit',
+    poolSnapshot: snapshot,
+    configurationHash: computeConfigurationHash({ appSettings: [], maxMigrationVersion: 137, providerRegistry: [] }),
+    maxMigrationVersion: 137,
+    providerRegistry: [],
+    appSettings,
+  });
+  return { record, snapshot };
+}
+
+test('eligible artifacts pass for planned and resumable records', () => {
+  const { record, snapshot } = guardArtifacts();
+  assert.equal(record.status, 'PLANNED');
+  assertBenchmarkExecutionArtifactsEligible(record, snapshot, record.specVersion);
+  const resumed = { ...record, status: 'IN_PROGRESS' as const };
+  assertBenchmarkExecutionArtifactsEligible(resumed, snapshot, record.specVersion);
+});
+
+test('a completed record is rejected and can never be overwritten', () => {
+  // Delayed-executor scenario: a stale PLANNED copy validates pre-lock, but
+  // the freshly reloaded COMPLETE copy refuses post-lock — no mutation or
+  // scheduling follows.
+  const { record, snapshot } = guardArtifacts();
+  assertBenchmarkExecutionArtifactsEligible(record, snapshot, record.specVersion);
+  const completed = { ...record, status: 'COMPLETE' as const, stopReason: 'SCOPE_COVERED' };
+  assert.throws(
+    () => assertBenchmarkExecutionArtifactsEligible(completed, snapshot, record.specVersion),
+    /BENCHMARK_PREREG_RECORD_MISMATCH/
+  );
+});
+
+test('mismatched spec, snapshot, and freshness are rejected', () => {
+  const { record, snapshot } = guardArtifacts();
+  assert.throws(
+    () => assertBenchmarkExecutionArtifactsEligible(record, snapshot, 'definitely-not-a-spec'),
+    /BENCHMARK_PREREG_RECORD_MISMATCH/
+  );
+  const other = buildPoolSnapshot({
+    rows: [guardEligibleRow(9)],
+    collectedAt: new Date(),
+    cooldownMinutes: 360,
+    maxPrimaryUses: 2,
+  });
+  assert.throws(
+    () => assertBenchmarkExecutionArtifactsEligible(record, other, record.specVersion),
+    /BENCHMARK_PREREG_RECORD_MISMATCH/
+  );
+  const stale = guardArtifacts(
+    [{ setting_key: 'discovery_target_queue_depth', setting_value: '30' }],
+    new Date('2020-01-01T00:00:00.000Z')
+  );
+  assert.throws(
+    () => assertBenchmarkExecutionArtifactsEligible(stale.record, stale.snapshot, stale.record.specVersion),
+    /BENCHMARK_PREREG_PLAN_STALE/
+  );
+});
+
+test('record evidencing non-30 depth is rejected with depth error', () => {
+  const { record, snapshot } = guardArtifacts([
+    { setting_key: 'discovery_target_queue_depth', setting_value: '' },
+  ]);
+  assert.equal(record.plannedKnobs.discovery_target_queue_depth, '');
+  assert.throws(
+    () => assertBenchmarkExecutionArtifactsEligible(record, snapshot, record.specVersion),
+    /BENCHMARK_QUEUE_DEPTH_UNESTABLISHED/
+  );
+});
+
+test('runner reloads and revalidates artifacts under lock before mutating', () => {
+  const script = readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  assert.match(
+    script,
+    /activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock\(outDir\)[\s\S]*?record = JSON\.parse\(readFileSync\(recordPath[\s\S]*?snapshot = JSON\.parse\(readFileSync\(snapshotPath[\s\S]*?assertBenchmarkExecutionArtifactsEligible\(record, snapshot, spec\.specVersion\)[\s\S]*?record\.status = 'IN_PROGRESS'/
+  );
+  // The post-lock revalidation uses the shared helper (the pre-lock fast
+  // fail keeps the original inline checks verbatim for the frozen structural
+  // pin, so the helper appears exactly once in the runner).
+  assert.equal(
+    (script.match(/assertBenchmarkExecutionArtifactsEligible\(record, snapshot, spec\.specVersion\)/g) || []).length,
+    1
   );
 });

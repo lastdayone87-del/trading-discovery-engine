@@ -76,8 +76,15 @@ only while holding it. A refused contender throws
 lock releases on completion and handled failures (release verifies the owner
 token, so cleanup can never remove another process's lock); a crashed
 holder's stale lock is taken over only after its pid is confirmed dead —
-never by age — so an interrupted `IN_PROGRESS` run stays resumable and is
-never permanently blocked.
+never by age — and only after proving the shared name still refers to the
+exact inspected instance (hard-link inode identity plus token), so a
+recovery contender can never delete another process's live lock. Holders
+re-verify ownership before every mutation and schedule, so even a residual
+takeover race resolves with exactly one proceeding executor. After acquiring
+the lock the runner reloads the record and snapshot from disk and
+revalidates them, so a delayed process never overwrites a completed record
+with stale data. An interrupted
+`IN_PROGRESS` run stays resumable and is never permanently blocked.
 
 ## Post-deploy verification (read-only)
 - `docker inspect <app-container> --format '{{json .Config.Env}}'` shows

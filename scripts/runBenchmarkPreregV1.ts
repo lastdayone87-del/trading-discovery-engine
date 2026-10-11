@@ -62,6 +62,7 @@ import {
   type PoolSnapshot,
 } from '../server/benchmarkPreregV1';
 import {
+  assertBenchmarkExecutionArtifactsEligible,
   assertBenchmarkPlannedQueueDepth,
   assertBenchmarkQueueDepthEstablished,
   benchmarkValidatedQueueDepth,
@@ -203,8 +204,12 @@ async function main(): Promise<void> {
   if (!existsSync(recordPath) || !existsSync(snapshotPath)) {
     throw new Error('BENCHMARK_PREREG_NO_PLAN: run --plan first; refusing to execute without a frozen snapshot + record');
   }
-  const record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
-  const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
+  let record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
+  let snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
+  // Pre-lock eligibility uses the original inline checks verbatim (kept for
+  // the frozen structural pin on verifyExecutionArtifactsBound); the same
+  // checks run again after lock acquisition via
+  // assertBenchmarkExecutionArtifactsEligible on freshly reloaded files.
   const recordSpec = benchmarkPreregSpecForVersion(record.specVersion);
   if (
     recordSpec.specVersion !== spec.specVersion ||
@@ -240,12 +245,23 @@ async function main(): Promise<void> {
   // and pinned into every discovery cycle below, so a database change after
   // this point cannot divert the run while the record stays valid.
   const validatedQueueDepth = benchmarkValidatedQueueDepth(settings, process.env, 'execute');
-  assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'execute');
   // Mutual exclusion across concurrent --execute processes on this host.
   // The IN_PROGRESS mutation and every schedule below happen only while
   // holding the outDir execution lock. Contention throws
   // BENCHMARK_EXECUTION_LOCK_HELD here with no record mutation or scheduling.
   activeBenchmarkExecutionLock = acquireBenchmarkExecutionLock(outDir);
+  // Local handle for ownership gates below. If this process ever loses the
+  // lock (residual takeover race), the gates abort before the next mutation
+  // or schedule instead of corrupting shared state.
+  const executionLock: BenchmarkExecutionLock = activeBenchmarkExecutionLock;
+  // Reload under lock: the pre-lock validation above may have acted on stale
+  // files if this process paused while another execution finished and
+  // released the lock. Revalidate the freshly loaded artifacts; a record
+  // that is no longer eligible (completed, mismatched, stale) refuses here
+  // instead of being overwritten. Only then mutate to IN_PROGRESS.
+  record = JSON.parse(readFileSync(recordPath, 'utf8')) as BenchmarkExecutionRecord;
+  snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as PoolSnapshot;
+  assertBenchmarkExecutionArtifactsEligible(record, snapshot, spec.specVersion);
   record.status = 'IN_PROGRESS';
   record.runningCommit = commit;
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
@@ -258,6 +274,12 @@ async function main(): Promise<void> {
   if (record.firstObservedAt === undefined) record.firstObservedAt = null;
 
   const saveRecord = () => {
+    // Ownership gate: a holder that lost the lock aborts here instead of
+    // persisting over another execution's newer state. abortIncomplete calls
+    // saveRecord while holding the lock, so its INCOMPLETE persist is
+    // unaffected; a LOCK_LOST throw there correctly leaves the record
+    // resumable for the rightful owner.
+    executionLock.assertOwned();
     record.updatedAt = new Date().toISOString();
     writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
   };
@@ -391,6 +413,9 @@ async function main(): Promise<void> {
       const row = snapshot.rows.find(candidate => candidate.queryId === designated.poolRowId);
       if (!row) throw new Error(`BENCHMARK_PREREG_DESIGNATED_ROW_MISSING: poolRowId=${designated.poolRowId}`);
       const frozenRequest = buildFrozenBenchmarkRequest(snapshot.snapshotHash, row.queryId, spec);
+      // Ownership gate before scheduling: never schedule benchmark work
+      // after losing the lock.
+      executionLock.assertOwned();
       report = await runAutonomousDiscoveryCycle(row.country, undefined, requestId, frozenRequest, { pinnedTargetQueueDepth: validatedQueueDepth });
       // Engine pause (kill switch engaged mid-cycle) is an abort, never a
       // no-match exclusion: schedule nothing further.

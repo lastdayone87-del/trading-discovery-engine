@@ -1,4 +1,12 @@
-import { effectiveBenchmarkKnobs } from './benchmarkPreregV1';
+import {
+  benchmarkPreregSpecForVersion,
+  effectiveBenchmarkKnobs,
+  requireFreshPlanForStatus,
+  verifyExecutionArtifactsBound,
+  verifyPoolSnapshotHash,
+  type BenchmarkExecutionRecord,
+  type PoolSnapshot,
+} from './benchmarkPreregV1';
 
 /**
  * Non-frozen benchmark capacity guard (see
@@ -57,6 +65,34 @@ export function assertBenchmarkQueueDepthEstablished(
       `(explicit value ${explicit ? 'present but not 30' : 'absent; frozen fallback 15 would govern the record'}). ` +
       `Set an explicit database app_settings or DISCOVERY_TARGET_QUEUE_DEPTH=30 matching production before benchmarking.`
   );
+}
+
+/**
+ * Artifact eligibility for --execute, checked before lock acquisition (fail
+ * fast on stale reads) and again after acquiring it against freshly reloaded
+ * files (fail safe). A delayed process that paused while another execution
+ * finished will see the terminal record here and refuse instead of
+ * overwriting it with stale attempts, extras, or status. Pure; needs no
+ * database. Mirrors the frozen record checks verbatim (same errors).
+ */
+export function assertBenchmarkExecutionArtifactsEligible(
+  record: BenchmarkExecutionRecord,
+  snapshot: PoolSnapshot,
+  expectedSpecVersion: string
+): void {
+  const recordSpec = benchmarkPreregSpecForVersion(record.specVersion);
+  if (
+    recordSpec.specVersion !== expectedSpecVersion ||
+    record.frozenBaseCommit !== recordSpec.baseCommit ||
+    record.poolSnapshot.snapshotHash !== snapshot.snapshotHash ||
+    (record.status !== 'PLANNED' && record.status !== 'IN_PROGRESS')
+  ) {
+    throw new Error('BENCHMARK_PREREG_RECORD_MISMATCH: execution record does not match the frozen plan and requested spec version; refusing to execute');
+  }
+  verifyPoolSnapshotHash(snapshot);
+  verifyExecutionArtifactsBound(record, snapshot);
+  requireFreshPlanForStatus(record.status, snapshot.collectedAt);
+  assertBenchmarkPlannedQueueDepth(record.plannedKnobs, 'execute');
 }
 
 /**

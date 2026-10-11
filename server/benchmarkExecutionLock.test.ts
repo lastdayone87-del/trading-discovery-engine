@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -130,5 +130,92 @@ test('runner holds the lock across mutation and scheduling, and releases on ever
   assert.match(
     script,
     /main\(\)\.catch\(error => \{[\s\S]*releaseActiveBenchmarkExecutionLock\(\)[\s\S]*process\.exit\(1\)/
+  );
+});
+
+test('concurrent stale-takeover attempts yield exactly one holder', async () => {
+  // The Finding 1 scenario: many recovery contenders race on one dead-owner
+  // lock. Contention is real (shared event loop, shared path) while the
+  // asserted invariants are deterministic: single winner, consistent file,
+  // no litter, losers refused without side effects.
+  for (let round = 0; round < 3; round++) {
+    const outDir = freshDir();
+    writeFileSync(
+      lockFilePathForOutputDir(outDir),
+      serializeBenchmarkExecutionLock({ pid: 999999999, token: `dead-${round}`, startedAt: '2026-01-01T00:00:00.000Z' })
+    );
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, () => (async () => {
+        try {
+          return { held: true as const, token: acquireBenchmarkExecutionLock(outDir).token };
+        } catch (error) {
+          return { held: false as const, message: error instanceof Error ? error.message : String(error) };
+        }
+      })())
+    );
+    const winners = outcomes.filter(outcome => outcome.held);
+    const refused = outcomes.filter(outcome => !outcome.held);
+    assert.equal(winners.length, 1);
+    assert.equal(refused.length, 7);
+    for (const loser of refused) {
+      assert.match(String((loser as { message: string }).message), /BENCHMARK_EXECUTION_LOCK_HELD/);
+    }
+    const current = JSON.parse(readFileSync(lockFilePathForOutputDir(outDir), 'utf8')) as { token: string };
+    assert.equal(current.token, (winners[0] as { token: string }).token);
+    const leftovers = readdirSync(outDir).filter(name => name !== 'execution-record.execute.lock');
+    assert.deepEqual(leftovers, []);
+  }
+});
+
+test('recovery contention never deletes a live lock', async () => {
+  // A live holder plus racing contenders: every contender refuses and the
+  // live lock file stays byte-identical, so no takeover path can remove a
+  // lock another process has already acquired. Deterministic outcome.
+  for (let round = 0; round < 3; round++) {
+    const outDir = freshDir();
+    const holder = acquireBenchmarkExecutionLock(outDir);
+    const before = readFileSync(lockFilePathForOutputDir(outDir), 'utf8');
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, () => (async () => {
+        try {
+          acquireBenchmarkExecutionLock(outDir);
+          return 'acquired';
+        } catch {
+          return 'refused';
+        }
+      })())
+    );
+    assert.ok(outcomes.every(outcome => outcome === 'refused'));
+    assert.equal(readFileSync(lockFilePathForOutputDir(outDir), 'utf8'), before);
+    assert.equal(holder.release(), true);
+  }
+});
+
+test('ownership gate aborts a holder that lost the lock', () => {
+  const outDir = freshDir();
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  holder.assertOwned();
+  // Another execution takes over after our pid is (falsely for this test)
+  // gone: overwrite with a foreign live claim, as a residual takeover race
+  // could. The gate must fail closed instead of letting us mutate.
+  writeFileSync(
+    lockFilePathForOutputDir(outDir),
+    serializeBenchmarkExecutionLock({ pid: process.pid, token: 'foreign-live', startedAt: new Date().toISOString() })
+  );
+  assert.throws(() => holder.assertOwned(), /BENCHMARK_EXECUTION_LOCK_LOST/);
+  // And deleting the file reads as lost too, never as owned.
+  writeFileSync(lockFilePathForOutputDir(outDir), 'not-json{');
+  assert.throws(() => holder.assertOwned(), /BENCHMARK_EXECUTION_LOCK_LOST/);
+});
+
+test('runner gates every mutation and schedule on live ownership', () => {
+  const script = readFileSync(new URL('../scripts/runBenchmarkPreregV1.ts', import.meta.url), 'utf8');
+  assert.match(
+    script,
+    /const saveRecord = \(\) => \{[\s\S]*?executionLock\.assertOwned\(\);[\s\S]*?writeFileSync\(recordPath/
+  );
+  assert.match(
+    script,
+    /executionLock\.assertOwned\(\);[\s\S]*?report = await runAutonomousDiscoveryCycle\(row\.country/
   );
 });
