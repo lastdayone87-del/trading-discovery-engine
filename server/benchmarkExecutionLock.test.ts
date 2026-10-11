@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -299,4 +299,57 @@ test('committed takeover removes only the inspected instance', () => {
   assert.equal(holder.release(), true);
   const leftovers = readdirSync(outDir).filter(name => name !== 'execution-record.execute.lock');
   assert.deepEqual(leftovers, []);
+});
+
+test('commit on a concurrently removed lock returns changed, not ENOENT', () => {
+  // Forced sequence, no timing: B inspects a stale lock and pauses; another
+  // contender removes the shared lock before B's re-stat. commit() must
+  // return 'changed' (rejoining the retry/claim flow), never leak the raw
+  // ENOENT, and leave no quarantine artifact behind.
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  writeFileSync(
+    lockPath,
+    serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale-owner', startedAt: '2026-01-01T00:00:00.000Z' })
+  );
+  const inspection = inspectStaleLock(lockPath, 'test-removed');
+  if (inspection.outcome !== 'recoverable') assert.fail('expected a takeover intent');
+  unlinkSync(lockPath);
+  assert.equal(inspection.recovery.commit(), 'changed');
+  assert.equal(existsSync(lockPath), false);
+  const leftovers = readdirSync(outDir).filter(name => !name.startsWith('execution-record.execute.lock'));
+  assert.deepEqual(leftovers, []);
+  // The acquisition path handles the changed state by claiming fresh.
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  holder.assertOwned();
+  assert.equal(holder.release(), true);
+});
+
+test('commit rethrows non-ENOENT filesystem errors', () => {
+  // Deterministic ENOTDIR (works even as root, unlike permission bits):
+  // the parent directory is replaced by a file after inspection.
+  const outDir = freshDir();
+  const lockPath = lockFilePathForOutputDir(outDir);
+  writeFileSync(
+    lockPath,
+    serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale-owner', startedAt: '2026-01-01T00:00:00.000Z' })
+  );
+  const inspection = inspectStaleLock(lockPath, 'test-enotdir');
+  if (inspection.outcome !== 'recoverable') assert.fail('expected a takeover intent');
+  const moved = `${outDir}.moved`;
+  renameSync(outDir, moved);
+  writeFileSync(outDir, 'not-a-directory');
+  try {
+    assert.throws(() => inspection.recovery.commit(), (error: unknown) => {
+      assert.equal((error as NodeJS.ErrnoException).code, 'ENOTDIR');
+      return true;
+    });
+  } finally {
+    unlinkSync(outDir);
+    renameSync(moved, outDir);
+  }
+  // The original stale lock is untouched and still recoverable afterwards.
+  assert.equal(readFileSync(lockPath, 'utf8'), serializeBenchmarkExecutionLock({ pid: 999999999, token: 'stale-owner', startedAt: '2026-01-01T00:00:00.000Z' }));
+  const holder = acquireBenchmarkExecutionLock(outDir);
+  assert.equal(holder.release(), true);
 });

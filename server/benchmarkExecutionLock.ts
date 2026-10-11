@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, linkSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, linkSync, openSync, readFileSync, statSync, unlinkSync, writeSync, type Stats } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -169,8 +169,20 @@ export function inspectStaleLock(lockPath: string, quarantineTag: string): Stale
           // Re-verify at commit time: the path must still hold the exact
           // inspected instance and its owner must still be dead. A pid that
           // came alive again (recycled) fails closed here, path untouched.
-          const restat = statSync(lockPath);
-          const latest = readLockInfo(lockPath);
+          // A vanished path (a concurrent contender removed it first) is
+          // 'changed', not an error: the caller retries its atomic claim
+          // against whatever is there now, so removal races converge on a
+          // single holder instead of aborting. Only ENOENT takes this path;
+          // permission, I/O, and unexpected failures propagate.
+          let restat: Stats;
+          let latest: BenchmarkExecutionLockInfo | null;
+          try {
+            restat = statSync(lockPath);
+            latest = readLockInfo(lockPath);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return 'changed';
+            throw error;
+          }
           if (
             restat.ino !== inspected.ino ||
             restat.dev !== inspected.dev ||
