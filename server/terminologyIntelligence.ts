@@ -520,22 +520,27 @@ export function rollupNativeQualityEvidence(
  * rules.
  *
  * The predicates mirror rollupNativeQualityEvidence exactly (kept as the
- * unit-tested reference implementation): top-level qualityVersion marker,
- * canonical spamConfirmed boolean with the persisted spamSignals-array
- * fallback, top-level novel boolean. jsonb_typeof guards keep a single
- * malformed out-of-band row from failing the cast and the whole refresh —
- * non-boolean flags read as false on both paths.
+ * unit-tested reference implementation): a single evidence set restricted to
+ * native-v1 rows, top-level qualityVersion marker, canonical spamConfirmed
+ * boolean with the persisted spamSignals-array fallback, top-level novel
+ * boolean. Legacy-only terms therefore aggregate to v1=0/false/false and
+ * keep legacy rules on both paths; legacy or out-of-band rows carrying novel
+ * or spam flags can neither admit a non-novel term nor block trial entry.
+ * jsonb_typeof CASE guards keep a single malformed out-of-band row from
+ * failing a cast or array-length call and aborting the whole refresh —
+ * non-boolean flags read as false on both paths. (CASE, not AND, guards the
+ * array-length call: PostgreSQL does not guarantee AND evaluation order.)
  */
 export const NATIVE_QUALITY_ROLLUP_SQL =
-  `SELECT count(*) FILTER (WHERE evidence->>'qualityVersion'='native-v1')::int AS v1,
+  `SELECT count(*)::int AS v1,
     COALESCE(bool_or(
       CASE WHEN jsonb_typeof(evidence->'spamConfirmed') = 'boolean' THEN (evidence->>'spamConfirmed')::boolean ELSE false END
-      OR COALESCE(jsonb_typeof(evidence->'spamSignals') = 'array' AND jsonb_array_length(evidence->'spamSignals') > 0, false)
+      OR CASE WHEN jsonb_typeof(evidence->'spamSignals') = 'array' THEN COALESCE(jsonb_array_length(evidence->'spamSignals') > 0, false) ELSE false END
     ), false) AS spam,
     COALESCE(bool_or(
       CASE WHEN jsonb_typeof(evidence->'novel') = 'boolean' THEN (evidence->>'novel')::boolean ELSE false END
     ), false) AS novel
-   FROM terminology_observations WHERE canonical_term_id=$1`;
+   FROM terminology_observations WHERE canonical_term_id=$1 AND evidence->>'qualityVersion'='native-v1'`;
 
 export async function readNativeQualityEvidence(
   termId: number,

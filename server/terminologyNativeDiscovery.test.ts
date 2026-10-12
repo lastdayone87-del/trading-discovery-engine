@@ -391,6 +391,39 @@ test('quality rollup reads the evidence shape writers persist', () => {
   );
 });
 
+test('non-native rows cannot flip the quality rollup either path', () => {
+  // Legacy rows carrying novel/spam flags (the exact out-of-band case the
+  // guards withstand) must not admit a non-novel term or block trial entry.
+  const mixed = [
+    { extractor: 'LEGACY', novel: true, spamConfirmed: true, spamSignals: ['signal-group-solicitation'] },
+    { qualityVersion: 'other-pipeline', novel: true, spamSignals: ['promotional'] },
+    writerEvidence({ novel: false }),
+  ];
+  assert.deepEqual(rollupNativeQualityEvidence(mixed), { v1Observations: 1, spamConfirmed: false, novel: false });
+  assert.deepEqual(
+    rollupNativeQualityEvidence([
+      { extractor: 'LEGACY', novel: true, spamConfirmed: true, spamSignals: ['x'] },
+      { extractor: 'KNOWN_INSTRUMENT_V1' },
+    ]),
+    { v1Observations: 0, spamConfirmed: false, novel: false }
+  );
+});
+
+test('malformed spamSignals degrade to false instead of failing', () => {
+  const shapes: Array<Record<string, unknown>> = [
+    writerEvidence({ spamSignals: { unexpected: 'object' } }),
+    writerEvidence({ spamSignals: 'promotional' }),
+    writerEvidence({ spamSignals: 42 }),
+    writerEvidence({ spamSignals: null }),
+    writerEvidence({}),
+    writerEvidence({ spamSignals: [] }),
+  ];
+  for (const evidence of shapes) {
+    assert.equal(rollupNativeQualityEvidence([evidence]).spamConfirmed, false, JSON.stringify(evidence.spamSignals));
+  }
+  assert.equal(rollupNativeQualityEvidence([writerEvidence({ spamSignals: ['promotional'] })]).spamConfirmed, true);
+});
+
 // --- Fake-Queryable behavioral integration (no database) ---
 
 interface RecordedCall {
@@ -408,7 +441,7 @@ function fakeRunner(scenarios: {
     calls,
     query: async (text: string, params: unknown[] = []) => {
       calls.push({ text, params });
-      if (text.startsWith('SELECT count(*) FILTER')) {
+      if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) {
         return { rows: [{ v1: scenarios.quality.v1, spam: scenarios.quality.spam, novel: scenarios.quality.novel }] };
       }
       if (text.startsWith('SELECT event_type, reason FROM')) {
@@ -726,6 +759,14 @@ test('quality aggregation runs in SQL over the corrected evidence schema', () =>
   assert.match(NATIVE_QUALITY_ROLLUP_SQL, /evidence->'spamConfirmed'/);
   assert.match(NATIVE_QUALITY_ROLLUP_SQL, /bool_or/);
   assert.doesNotMatch(NATIVE_QUALITY_ROLLUP_SQL, /evidence->'quality'/);
+  // Single evidence set: every aggregate is restricted to native-v1 rows, so
+  // legacy/out-of-band flags can neither admit nor block (finding: bool_or
+  // previously scanned unfiltered rows while the count was filtered).
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /WHERE canonical_term_id=\$1 AND evidence->>'qualityVersion'='native-v1'/);
+  // Safe array-length guard: CASE, not AND — PostgreSQL does not guarantee
+  // AND evaluation order, so a non-array value could abort the query.
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /CASE WHEN jsonb_typeof\(evidence->'spamSignals'\) = 'array' THEN/);
+  assert.doesNotMatch(NATIVE_QUALITY_ROLLUP_SQL, /AND jsonb_array_length/);
   // Malformed out-of-band rows degrade to false instead of failing the cast:
   // the guards mirror the pure rollup's strict checks (parity validated
   // against a live replica: SQL {4,t,t} == rollup {4,true,true} on the same
