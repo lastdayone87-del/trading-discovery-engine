@@ -786,6 +786,10 @@ test('observation path acquires the advisory lock before any term-row write', as
   assert.ok(canonicalAt >= 0 && lockAt > canonicalAt, 'lock follows the exempt canonical upsert');
   assert.ok(obsAt > lockAt, 'observation insert follows the lock');
   assert.ok(recencyAt > lockAt, 'recency update follows the lock');
+  const rowLockAt = statements.findIndex(
+    text => text.includes('FROM canonical_trading_terms WHERE id=$1') && text.includes('FOR UPDATE')
+  );
+  assert.ok(rowLockAt > lockAt && obsAt > rowLockAt, 'row lock precedes any KEY SHARE so concurrent observers cannot deadlock on upgrade');
 });
 
 test('attribution path acquires the advisory lock before its performance insert', async () => {
@@ -939,6 +943,7 @@ test('recorded production sequences compete without deadlock (S9)', async () => 
       return 'keyshare';
     }
     if (text.startsWith('UPDATE canonical_trading_terms')) return 'rowexcl';
+    if (text.includes('FOR UPDATE')) return 'rowexcl';
     if (text.startsWith('SELECT')) return 'read';
     if (/^(INSERT|UPDATE|DELETE)\s/i.test(text)) return null;
     return 'read';
@@ -1193,6 +1198,14 @@ test('saveExtractedTerm shares the normalized-identity lock and reuses variant r
   // Normalized reuse: variant spelling updated the existing row, no new row.
   assert.ok(!ordered.some(text => text.startsWith('INSERT INTO extracted_trading_vocabulary')));
   assert.deepEqual(released, [0]);
+});
+
+test('vocabulary fold matches observation-term canonicalization', async () => {
+  const { normalizeTerm } = await import('./terminologyIntelligence');
+  const fold = (value: string) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
+  for (const tricky of ['BTC', 'btc', 'Btc', 'order  flow', 'order\u00a0flow', 'ＥＳ', 'ﬁb', 'KİLİT', 'Straße']) {
+    assert.equal(fold(tricky), normalizeTerm(tricky), `fold drift on ${JSON.stringify(tricky)}`);
+  }
 });
 
 test('yield failure still demotes through the shared path', async () => {

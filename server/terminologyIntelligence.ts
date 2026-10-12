@@ -684,12 +684,18 @@ export async function observeTerminologyDetailed(args: {
     termId = Number(existing.rows[0].id);
   }
 
-  // Lock order: advisory BEFORE the observation insert, recency update, and
-  // refresh below (see acquireTerminologyLifecycleLock). The canonical upsert
-  // above is exempt: for existing terms it writes nothing, and for new terms
-  // the row is uncontended (concurrent creators block on speculative insert
-  // holding nothing). Re-entrant: refresh re-acquires harmlessly below.
+  // Lock order: advisory, then FOR UPDATE, BEFORE the observation insert,
+  // recency update, and refresh below (see acquireTerminologyLifecycleLock).
+  // The canonical upsert above is exempt: for existing terms it writes nothing,
+  // and for new terms the row is uncontended (concurrent creators block on
+  // speculative insert holding nothing). Taking FOR UPDATE before any KEY
+  // SHARE (observation/performance FK checks) is load-bearing: two concurrent
+  // observers each holding KEY SHARE while requesting FOR UPDATE (e.g. inside
+  // projection recomputation) deadlock, and either order with the upgrade
+  // reversed reintroduces it. Re-entrant below: refresh re-acquires the
+  // advisory harmlessly, and recomputation re-locks the already-held row.
   await acquireTerminologyLifecycleLock(termId, runner);
+  await runner.query(`SELECT id FROM canonical_trading_terms WHERE id=$1 FOR UPDATE`, [termId]);
 
   // 2. Resolve native creator/locale evidence status
   let resolvedCreatorCountry: string | null = args.sourceCreatorCountry ? canonicalCountry(args.sourceCreatorCountry) : null;

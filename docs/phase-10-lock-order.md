@@ -16,7 +16,17 @@ Phase 10 mutations use one lock order for a canonical native term:
    treatment/quota. Phase 9 never recomputes Phase 10 evidence.
 
 Creator refresh obtains canonical-term locks in ascending order. Observation
-insertion already owns only its canonical term before recomputation. Consequently
+insertion already owns only its canonical term before recomputation.
+
+Addendum (terminology lifecycle): observation transactions take the per-term
+advisory lock and then `SELECT ... FOR UPDATE` on the canonical term row BEFORE
+inserting observation rows (whose foreign keys take KEY SHARE). Taking FOR UPDATE
+first is load-bearing: two concurrent observers each holding KEY SHARE while
+requesting FOR UPDATE deadlock. Attribution takes the same advisory lock before
+its performance insert and refreshes inside that transaction. No path holds a
+row lock while requesting the advisory lock, and no path requests a row lock
+while holding a conflicting one — waiters only ever wait on holders that are
+not waiting back, so no cycle can form. Consequently
 no path takes a creator lock after a canonical-term/projection/proposal lock, and
 no path reverses proposal/projection ordering. The canonical-term lock is held
 from before the authoritative aggregate read through projection and proposal
