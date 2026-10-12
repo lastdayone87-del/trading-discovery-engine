@@ -14,7 +14,7 @@ import {
   getQuota,
   getAppSetting
 } from './db';
-import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
+import { alignVideoIdsToTitles, calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
@@ -766,7 +766,10 @@ export async function processChannelThroughPipeline(
   // discoveries are persisted, but must not train autonomous terminology until
   // an explicit human approval supplies independent provenance.
   if (qualityResult.score >= 55 && source !== 'manual_search') {
-    await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate));
+    // Provenance: align YouTube video IDs to titles (null where unknown)
+    // so title-backed terminology observations trace to their source video.
+    const extractionVideoIds = alignVideoIdsToTitles(candidate.videoTitles, candidate.videos);
+    await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate), extractionVideoIds);
     await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
   }
 

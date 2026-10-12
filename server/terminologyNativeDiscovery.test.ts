@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
+import type { ChannelRecord } from '../src/types';
 import {
   KNOWN_INSTRUMENT_TERMS,
   NATIVE_PROMOTION_MIN_CREATORS,
   NATIVE_PROMOTION_MIN_EXECUTIONS,
   NATIVE_PROMOTION_MIN_YIELD_PER_1000_QUOTA,
+  buildNoveltyBaseline,
+  classifyNativeCandidate,
   detectSpamSignals,
   evaluateNativeTermPromotion,
   evaluateTermNovelty,
@@ -13,23 +16,67 @@ import {
   evaluateTrialEntry,
   findLiteralSpan,
   getPlannerTerminology,
+  observeTerminology,
   refreshTerminologyLifecycle,
+  rollupNativeQualityEvidence,
+  type LiteralSourceText,
+  type NoveltyBaseline,
 } from './terminologyIntelligence';
+import {
+  admitNativeCandidates,
+  alignVideoIdsToTitles,
+  findRuleInstrumentHits,
+} from './queryIntelligence';
 import { planDiverseQueries } from './queryPlanner';
 
-const SOURCES = [
-  { kind: 'CHANNEL_NAME' as const, index: 0, text: 'Börsenanalyse LuxX' },
-  { kind: 'VIDEO_TITLE' as const, index: 0, text: 'Flux Ordres Nasdaq - Order Flow NQ' },
-  { kind: 'VIDEO_TITLE' as const, index: 1, text: 'Day trading update' },
-  { kind: 'DESCRIPTION' as const, index: 0, text: 'Rejoignez mon canal Telegram signaux gratuits' },
+const SOURCES: LiteralSourceText[] = [
+  { kind: 'CHANNEL_NAME', index: 0, text: 'Börsenanalyse LuxX' },
+  { kind: 'VIDEO_TITLE', index: 0, text: 'Flux Ordres Nasdaq - Order Flow NQ' },
+  { kind: 'VIDEO_TITLE', index: 1, text: 'Day trading update' },
+  { kind: 'DESCRIPTION', index: 0, text: 'Rejoignez mon canal Telegram signaux gratuits' },
 ];
 
-test('instrument list is pinned against drift', () => {
+function okBaseline(overrides: Partial<NoveltyBaseline> = {}): NoveltyBaseline {
+  return {
+    ok: true,
+    country: 'Germany',
+    curatedTerms: ['Börsenanalyse', 'DAX Analyse'],
+    existingTerms: ['Scalping Strategie'],
+    failed: [],
+    ...overrides,
+  };
+}
+
+/** Evidence in the exact shape the observation writers persist. */
+function writerEvidence(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    extractor: 'GEMINI',
+    qualityVersion: 'native-v1',
+    literal: true,
+    sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1' },
+    novel: true,
+    knownAs: null,
+    generic: false,
+    spamConfirmed: false,
+    spamSignals: [],
+    translationRisk: null,
+    ...overrides,
+  };
+}
+
+// --- Finding 13: one canonical instrument list ---
+
+test('instrument list is pinned and shared (no parallel source of truth)', () => {
   assert.deepEqual([...KNOWN_INSTRUMENT_TERMS].sort(), [
     'AEX', 'BTC', 'CAC 40', 'DAX', 'ES', 'ETH', 'EURUSD', 'FDAX', 'FTSE 100',
     'GBPUSD', 'Gold', 'IBEX 35', 'NQ', 'Nasdaq', 'S&P 500', 'WTI Crude',
   ].sort());
+  const extractorSource = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.match(extractorSource, /KNOWN_INSTRUMENT_TERMS/);
+  assert.doesNotMatch(extractorSource, /const potentialInstruments/);
 });
+
+// --- Findings 6+7: exact original spans, length-safe case folding, significant whitespace ---
 
 test('literal spans trace to exact source text', () => {
   assert.deepEqual(findLiteralSpan('Börsenanalyse', SOURCES), {
@@ -47,7 +94,40 @@ test('literal spans trace to exact source text', () => {
   assert.equal(findLiteralSpan('X', SOURCES), null);
   assert.equal(findLiteralSpan('', SOURCES), null);
   // Non-Latin scripts match by substring (no word boundaries in CJK).
-  assert.notEqual(findLiteralSpan('原油', [{ kind: 'VIDEO_TITLE', index: 0, text: '原油期货交易' }]), null);
+  const cjk = findLiteralSpan('原油', [{ kind: 'VIDEO_TITLE', index: 0, text: '原油期货交易' }]);
+  assert.equal(cjk?.span, '原油');
+});
+
+test('NFKC compatibility characters map back to the exact original span', () => {
+  // Full-width 'ＥＳ' normalizes to 'ES' — the span must be the original text.
+  const hit = findLiteralSpan('ES', [{ kind: 'VIDEO_TITLE', index: 0, text: 'ＥＳ先物デイトレ' }]);
+  assert.equal(hit?.span, 'ＥＳ');
+  // Ligature 'ﬁ' normalizes to 'fi'.
+  const ligature = findLiteralSpan('fib', [{ kind: 'DESCRIPTION', index: 0, text: 'ﬁb levels' }]);
+  assert.equal(ligature?.span, 'ﬁb');
+});
+
+test('length-changing case folds keep correct original spans', () => {
+  // Turkish dotted capital İ lowercases to i̇ (1 char → 2): slicing the
+  // original source with an index taken from lowercased text (' İ P2P-Algo'
+  // → 'i̇ p2p-algo') shifts every later offset by one and corrupts the span.
+  // Engine case folding keeps indices valid: the span is exact.
+  const hit = findLiteralSpan('p2p-algo', [{ kind: 'VIDEO_TITLE', index: 0, text: 'İ P2P-Algo backtest' }]);
+  assert.equal(hit?.span, 'P2P-Algo');
+  assert.equal(findLiteralSpan('KİLİT', [{ kind: 'VIDEO_TITLE', index: 0, text: 'KİLİT seviye analizi' }])?.span, 'KİLİT');
+  // Combined CJK + preceding length-changing fold: lowercased-index slicing
+  // returns '油 ' here; engine matching with an index map returns '原油'.
+  const cjkShifted = findLiteralSpan('原油', [{ kind: 'VIDEO_TITLE', index: 0, text: 'İ原油 futures' }]);
+  assert.equal(cjkShifted?.span, '原油');
+});
+
+test('internal whitespace is significant; surrounding whitespace is not', () => {
+  const doubleSpace: LiteralSourceText[] = [{ kind: 'DESCRIPTION', index: 0, text: 'live order  flow session' }];
+  assert.equal(findLiteralSpan('order  flow', doubleSpace)?.span, 'order  flow');
+  // A single-space candidate does not match a double-space source: the phrase
+  // as written never appears there.
+  assert.equal(findLiteralSpan('order flow', doubleSpace), null);
+  assert.equal(findLiteralSpan('  Börsenanalyse  ', SOURCES)?.span, 'Börsenanalyse');
 });
 
 test('novelty distinguishes new terms from known ones', () => {
@@ -71,6 +151,8 @@ test('novelty distinguishes new terms from known ones', () => {
   );
 });
 
+// --- Finding 9: English + localized spam screening ---
+
 test('spam patterns reject solicitation, preserve legitimate terms', () => {
   assert.deepEqual(detectSpamSignals('join my free WhatsApp signals'), ['signal-group-solicitation', 'messenger-solicitation']);
   assert.deepEqual(detectSpamSignals('Gold promo code FREE100'), ['promotional']);
@@ -80,6 +162,16 @@ test('spam patterns reject solicitation, preserve legitimate terms', () => {
   // instrument names — must never match.
   for (const legit of ['Börsenanalyse', 'Flux Ordres', 'SMC', 'price action', 'Order Flow NQ', 'ICT killzones', 'Gold', 'DAX', '原油期货']) {
     assert.deepEqual(detectSpamSignals(legit), [], `legit term flagged: ${legit}`);
+  }
+});
+
+test('localized solicitation is screened without touching legitimate local language', () => {
+  assert.ok(detectSpamSignals('Rejoignez mon canal Telegram signaux gratuits').some(code => code.endsWith('-fr')));
+  assert.ok(detectSpamSignals('signaux gratuits vip').some(code => code.endsWith('-fr')));
+  assert.ok(detectSpamSignals('Kostenlose Signale, tritt bei der VIP Gruppe').some(code => code.endsWith('-de')));
+  assert.ok(detectSpamSignals('Únete a mi canal gratis señales vip').some(code => code.endsWith('-es')));
+  for (const legit of ['Analyse Technique', 'Börsenanalyse', 'Futures Handel', 'Acción del Precio', 'Flux Ordres', 'Séance de trading']) {
+    assert.deepEqual(detectSpamSignals(legit), [], `legit local term flagged: ${legit}`);
   }
 });
 
@@ -109,14 +201,56 @@ test('trial entry admits only novel, non-spam terms', () => {
   assert.deepEqual(evaluateTrialEntry({ novel: false, spamConfirmed: false }), { allowed: false, reasons: ['not-novel'] });
 });
 
+// --- Finding 3: fail-closed novelty baseline + pure classifier ---
+
+test('novelty baseline fails closed on either lookup failure', () => {
+  const vocab = { country: 'Germany', languages: ['de'], native_trading_terminology: ['Börsenanalyse'], popular_instruments: [], local_market_phrases: [], common_content_format_names: [] };
+  assert.deepEqual(buildNoveltyBaseline({ country: 'Germany', vocab, vocabOk: true, existingTerms: [], existingOk: true }).failed, []);
+  const vocabFailed = buildNoveltyBaseline({ country: 'Germany', vocab: undefined, vocabOk: false, existingTerms: ['X'], existingOk: true });
+  assert.equal(vocabFailed.ok, false);
+  assert.deepEqual(vocabFailed.failed, ['curated']);
+  assert.deepEqual(vocabFailed.curatedTerms, []);
+  const existingFailed = buildNoveltyBaseline({ country: 'Germany', vocab, vocabOk: true, existingTerms: [], existingOk: false });
+  assert.equal(existingFailed.ok, false);
+  assert.deepEqual(existingFailed.failed, ['existing']);
+  assert.deepEqual(existingFailed.existingTerms, []);
+});
+
+test('classifier rejects in order: shape, length, literal, spam, novelty-unknown', () => {
+  assert.equal(classifyNativeCandidate(42, SOURCES, okBaseline(), {}).admit, false);
+  const short = classifyNativeCandidate('X', SOURCES, okBaseline(), {});
+  assert.equal(short.admit, false);
+  if (short.admit === false) assert.equal(short.reason, 'too-short');
+  const invented = classifyNativeCandidate('Scalping Strategie', SOURCES, okBaseline(), {});
+  assert.equal(invented.admit, false);
+  if (invented.admit === false) assert.equal(invented.reason, 'non-literal');
+  const spam = classifyNativeCandidate('join free signals vip group', [{ kind: 'DESCRIPTION', index: 0, text: 'join free signals vip group now' }], okBaseline(), {});
+  assert.equal(spam.admit, false);
+  if (spam.admit === false) {
+    assert.equal(spam.reason, 'spam');
+    assert.ok(spam.spamSignals.length > 0);
+  }
+  // A genuinely new, literal, clean term is still rejected when novelty is unknown.
+  const unknown = classifyNativeCandidate('P2P-Algo', [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest' }], okBaseline({ ok: false, failed: ['curated', 'existing'] }), {});
+  assert.equal(unknown.admit, false);
+  if (unknown.admit === false) assert.equal(unknown.reason, 'novelty-unknown');
+  const admitted = classifyNativeCandidate('P2P-Algo', [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest' }], okBaseline(), { language: 'de' });
+  assert.equal(admitted.admit, true);
+  if (admitted.admit === true) {
+    assert.equal(admitted.located.span, 'P2P-Algo');
+    assert.equal(admitted.novelty.novel, true);
+  }
+});
+
+// --- Findings 1+2: disjoint attribution, verified-trader yield, mandatory verified evidence ---
+
 function strongPromotionBase() {
   return {
     novel: true,
     spamConfirmed: false,
     executions: 5,
     quotaConsumed: 2000,
-    newCreators: 12,
-    confirmedTradingCreators: 9,
+    confirmedTradingCreators: 12,
     nonTradingCreators: 1,
     wrongCountryCreators: 0,
     needsReviewCreators: 1,
@@ -126,7 +260,7 @@ function strongPromotionBase() {
   };
 }
 
-test('promotion policy promotes strong evidence, holds or rejects the rest', () => {
+test('promotion policy promotes verified evidence, holds or rejects the rest', () => {
   const promote = evaluateNativeTermPromotion(strongPromotionBase());
   assert.equal(promote.decision, 'PROMOTE');
   assert.ok(promote.metrics.yieldPer1000Quota >= NATIVE_PROMOTION_MIN_YIELD_PER_1000_QUOTA);
@@ -141,25 +275,100 @@ test('promotion policy promotes strong evidence, holds or rejects the rest', () 
   const generic = evaluateNativeTermPromotion({ ...strongPromotionBase(), novel: false });
   assert.equal(generic.decision, 'REJECT');
 
-  const mistargeted = evaluateNativeTermPromotion({ ...strongPromotionBase(), wrongCountryCreators: 12, newCreators: 2, confirmedTradingCreators: 1 });
+  const mistargeted = evaluateNativeTermPromotion({ ...strongPromotionBase(), confirmedTradingCreators: 2, nonTradingCreators: 0, wrongCountryCreators: 7, needsReviewCreators: 1 });
   assert.equal(mistargeted.decision, 'REJECT');
+  assert.ok(mistargeted.reasons.some(reason => reason.startsWith('wrong-country-share')));
 
-  const unproven = evaluateNativeTermPromotion({ ...strongPromotionBase(), confirmedTradingCreators: 0, nonTradingCreators: 6, newCreators: 0 });
-  assert.equal(unproven.decision, 'REJECT');
-
-  const burdened = evaluateNativeTermPromotion({ ...strongPromotionBase(), needsReviewCreators: 12, newCreators: 4, confirmedTradingCreators: 2 });
+  const burdened = evaluateNativeTermPromotion({ ...strongPromotionBase(), confirmedTradingCreators: 2, nonTradingCreators: 0, needsReviewCreators: 12 });
   assert.equal(burdened.decision, 'HOLD');
 
   const burst = evaluateNativeTermPromotion({ ...strongPromotionBase(), coordinatedBurst: true, distinctCommunities: 1 });
   assert.equal(burst.decision, 'HOLD');
 
-  const weakYield = evaluateNativeTermPromotion({ ...strongPromotionBase(), newCreators: 1, quotaConsumed: 5000 });
+  const weakYield = evaluateNativeTermPromotion({ ...strongPromotionBase(), confirmedTradingCreators: 1, quotaConsumed: 5000 });
   assert.equal(weakYield.decision, 'HOLD');
+});
+
+test('attribution shares use a disjoint denominator (no double counting)', () => {
+  // 2 confirmed + 7 wrong-country + 1 review = 10 attributed; the 0.70
+  // wrong-country share must reject (old code computed 7/12 and passed).
+  const result = evaluateNativeTermPromotion({
+    ...strongPromotionBase(),
+    confirmedTradingCreators: 2,
+    nonTradingCreators: 0,
+    wrongCountryCreators: 7,
+    needsReviewCreators: 1,
+  });
+  assert.equal(result.decision, 'REJECT');
+  assert.equal(result.metrics.wrongCountryShare, 0.7);
+  // Review share over the hold threshold holds.
+  const reviewHeavy = evaluateNativeTermPromotion({
+    ...strongPromotionBase(),
+    confirmedTradingCreators: 2,
+    nonTradingCreators: 0,
+    wrongCountryCreators: 0,
+    needsReviewCreators: 6,
+  });
+  assert.equal(reviewHeavy.decision, 'HOLD');
+  assert.equal(reviewHeavy.metrics.reviewShare, 0.75);
+});
+
+test('promotion requires verified trading creators, never unverified yield', () => {
+  // Zero confirmed + zero non-trading: nothing contradicts, but nothing
+  // verifies either — HOLD, never PROMOTE.
+  const empty = evaluateNativeTermPromotion({
+    ...strongPromotionBase(),
+    confirmedTradingCreators: 0,
+    nonTradingCreators: 0,
+    wrongCountryCreators: 0,
+    needsReviewCreators: 0,
+  });
+  assert.equal(empty.decision, 'HOLD');
+  assert.deepEqual(empty.reasons, ['no-verified-traders']);
+  // Review-only results hold for verification.
+  const reviewOnly = evaluateNativeTermPromotion({
+    ...strongPromotionBase(),
+    confirmedTradingCreators: 0,
+    nonTradingCreators: 0,
+    wrongCountryCreators: 0,
+    needsReviewCreators: 5,
+  });
+  assert.equal(reviewOnly.decision, 'HOLD');
+  // Non-trading results alone hold (and can never promote via unverified yield).
+  const nonTradingOnly = evaluateNativeTermPromotion({
+    ...strongPromotionBase(),
+    confirmedTradingCreators: 0,
+    nonTradingCreators: 6,
+    wrongCountryCreators: 0,
+    needsReviewCreators: 0,
+  });
+  assert.equal(nonTradingOnly.decision, 'HOLD');
 });
 
 test('promotion floors mirror the lifecycle minimums', () => {
   assert.equal(NATIVE_PROMOTION_MIN_EXECUTIONS, 3);
   assert.equal(NATIVE_PROMOTION_MIN_CREATORS, 3);
+});
+
+// --- Finding 10: rollup over the real writer evidence shape ---
+
+test('quality rollup reads the evidence shape writers persist', () => {
+  assert.deepEqual(rollupNativeQualityEvidence([writerEvidence()]), { v1Observations: 1, spamConfirmed: false, novel: true });
+  assert.deepEqual(rollupNativeQualityEvidence([writerEvidence({ novel: false, knownAs: 'curated:Germany:X', generic: true })]), {
+    v1Observations: 1, spamConfirmed: false, novel: false,
+  });
+  // Out-of-band spam-flagged rows (array or canonical flag) gate trial entry.
+  assert.equal(rollupNativeQualityEvidence([writerEvidence({ spamSignals: ['signal-group-solicitation'] })]).spamConfirmed, true);
+  assert.equal(rollupNativeQualityEvidence([writerEvidence({ spamConfirmed: true })]).spamConfirmed, true);
+  // Legacy observations without the pipeline marker keep legacy rules.
+  assert.deepEqual(rollupNativeQualityEvidence([{ extractor: 'KNOWN_INSTRUMENT_V1' }, null, undefined, [] as unknown as Record<string, unknown>]), {
+    v1Observations: 0, spamConfirmed: false, novel: false,
+  });
+  // Mixed rows: any spam flag or novel marker wins across the term.
+  assert.deepEqual(
+    rollupNativeQualityEvidence([writerEvidence({ novel: false }), writerEvidence({ novel: true, spamSignals: ['promotional'] })]),
+    { v1Observations: 2, spamConfirmed: true, novel: true }
+  );
 });
 
 // --- Fake-Queryable behavioral integration (no database) ---
@@ -171,15 +380,19 @@ interface RecordedCall {
 
 function fakeRunner(scenarios: {
   aggregates: Record<string, unknown>;
-  quality: { v1: number; spam: boolean; novel: boolean };
+  evidenceRows: Array<Record<string, unknown>>;
+  latestEvent?: Record<string, unknown> | null;
 }): { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>; calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
   return {
     calls,
     query: async (text: string, params: unknown[] = []) => {
       calls.push({ text, params });
-      if (text.includes('qualityVersion')) {
-        return { rows: [{ v1: scenarios.quality.v1, spam: scenarios.quality.spam, novel: scenarios.quality.novel }] };
+      if (text.startsWith('SELECT evidence FROM')) {
+        return { rows: scenarios.evidenceRows.map(evidence => ({ evidence })) };
+      }
+      if (text.startsWith('SELECT event_type, reason FROM')) {
+        return { rows: scenarios.latestEvent ? [scenarios.latestEvent] : [] };
       }
       if (text.startsWith('SELECT t.*')) {
         return { rows: [scenarios.aggregates] };
@@ -204,51 +417,61 @@ function legacyAggregates(overrides: Record<string, unknown> = {}): Record<strin
   };
 }
 
+function eventInserts(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter(call => call.text.startsWith('INSERT INTO terminology_lifecycle_events'));
+}
+
+function snapshotInserts(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter(call => call.text.startsWith('INSERT INTO terminology_score_snapshots'));
+}
+
 test('legacy terms without new evidence transition exactly as before', async () => {
-  const runner = fakeRunner({
-    aggregates: legacyAggregates(),
-    quality: { v1: 0, spam: false, novel: false },
-  });
+  const runner = fakeRunner({ aggregates: legacyAggregates(), evidenceRows: [] });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.equal(updates.length, 1);
   assert.deepEqual(updates[0].params.slice(1, 4), ['SEARCH_TRIAL', true, 2]);
-  const events = runner.calls.filter(call => call.text.startsWith('INSERT INTO terminology_lifecycle_events'));
+  const events = eventInserts(runner.calls);
   assert.equal(events.length, 1);
-  assert.match(String(events[0].params[3]), /PROMOTION/);
-  assert.ok(runner.calls.some(call => call.text.startsWith('INSERT INTO terminology_score_snapshots')));
+  assert.equal(events[0].params[3], 'PROMOTION');
+  const snapshots = snapshotInserts(runner.calls);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].params[6], 'SEARCH_TRIAL');
 });
 
 test('spam-flagged new terms are held with a recorded reason', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates(),
-    quality: { v1: 2, spam: true, novel: false },
+    evidenceRows: [writerEvidence({ novel: false, spamSignals: ['signal-group-solicitation'] })],
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   assert.equal(runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms')).length, 0);
-  const events = runner.calls.filter(call => call.text.startsWith('INSERT INTO terminology_lifecycle_events'));
+  const events = eventInserts(runner.calls);
   assert.equal(events.length, 1);
   assert.match(events[0].text, /'ELIGIBILITY_CHANGE'/);
   assert.match(String(events[0].params[2]), /spam-confirmed/);
-  assert.ok(runner.calls.some(call => call.text.startsWith('INSERT INTO terminology_score_snapshots')));
+  // Finding 12: the snapshot records the persisted state, not the blocked decision.
+  const snapshots = snapshotInserts(runner.calls);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].params[6], 'OBSERVED');
 });
 
 test('non-novel new terms are held on trial entry', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates(),
-    quality: { v1: 1, spam: false, novel: false },
+    evidenceRows: [writerEvidence({ novel: false, knownAs: 'curated:Germany:X', generic: true })],
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   assert.equal(runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms')).length, 0);
-  const events = runner.calls.filter(call => call.text.startsWith('INSERT INTO terminology_lifecycle_events'));
-  assert.match(events[0].text, /'ELIGIBILITY_CHANGE'/);
+  const events = eventInserts(runner.calls);
+  assert.equal(events.length, 1);
   assert.match(String(events[0].params[2]), /not-novel/);
 });
 
 test('novel new terms pass through to the legacy decision', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates(),
-    quality: { v1: 1, spam: false, novel: true },
+    evidenceRows: [writerEvidence({ novel: true })],
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
@@ -256,15 +479,205 @@ test('novel new terms pass through to the legacy decision', async () => {
   assert.deepEqual(updates[0].params.slice(1, 4), ['SEARCH_TRIAL', true, 2]);
 });
 
+test('blocked lifecycle events are idempotent for an unchanged reason', async () => {
+  const blocked = {
+    aggregates: legacyAggregates(),
+    evidenceRows: [writerEvidence({ novel: false, knownAs: 'curated:Germany:X', generic: true })],
+  };
+  const first = fakeRunner({ ...blocked });
+  await refreshTerminologyLifecycle(42, undefined, first as never);
+  assert.equal(eventInserts(first.calls).length, 1);
+  const blockReason = String(eventInserts(first.calls)[0].params[2]);
+  // Same block reason on the next refresh: no duplicate event.
+  const second = fakeRunner({ ...blocked, latestEvent: { event_type: 'ELIGIBILITY_CHANGE', reason: blockReason } });
+  await refreshTerminologyLifecycle(42, undefined, second as never);
+  assert.equal(eventInserts(second.calls).length, 0);
+  assert.equal(snapshotInserts(second.calls).length, 1);
+  // Changed reason (e.g. term later flagged spam): a new event is recorded.
+  const third = fakeRunner({
+    aggregates: legacyAggregates(),
+    evidenceRows: [writerEvidence({ novel: false, spamSignals: ['promotional'] })],
+    latestEvent: { event_type: 'ELIGIBILITY_CHANGE', reason: blockReason },
+  });
+  await refreshTerminologyLifecycle(42, undefined, third as never);
+  assert.equal(eventInserts(third.calls).length, 1);
+  assert.match(String(eventInserts(third.calls)[0].params[2]), /spam-confirmed/);
+});
+
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
-    quality: { v1: 0, spam: false, novel: false },
+    evidenceRows: [],
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.equal(updates.length, 1);
   assert.equal(updates[0].params[1], 'DEMOTED');
+});
+
+// --- Findings 4+5+8+14: admission ordering, rule boundaries, video IDs, observability ---
+
+function testChannel(): ChannelRecord {
+  return {
+    channel_id: 'ch-1',
+    channel_name: 'Börsenanalyse LuxX',
+    country: 'Germany',
+    discord_invite: null,
+  } as unknown as ChannelRecord;
+}
+
+function fakeDeps(scenarios: {
+  observe?: (args: Record<string, unknown>) => Promise<number | null>;
+  save?: (country: string, term: string) => Promise<unknown>;
+  log?: (message: string) => void;
+  observed: Array<Record<string, unknown>>;
+  saved: Array<{ country: string; term: string }>;
+}) {
+  return {
+    observeTerm: async (args: Record<string, unknown>): Promise<number | null> => {
+      scenarios.observed.push(args);
+      return scenarios.observe ? scenarios.observe(args) : 7;
+    },
+    saveTerm: async (country: string, term: string): Promise<unknown> => {
+      scenarios.saved.push({ country, term });
+      if (scenarios.save) return scenarios.save(country, term);
+    },
+    log: scenarios.log ?? (() => undefined),
+  };
+}
+
+test('observation failure never persists the extracted term (retryable)', async () => {
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-9' }];
+  // Observation throws: nothing persisted, error propagates for a later retry.
+  const throwing = fakeDeps({ observed, saved, observe: async () => { throw new Error('db down'); } });
+  await assert.rejects(
+    admitNativeCandidates({
+      channel: testChannel(), sources,
+      parsed: { terminology: ['P2P-Algo'] },
+      baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps: throwing,
+    }),
+    /db down/
+  );
+  assert.equal(saved.length, 0);
+  // Observation returns null (invalid/over-length): skipped, retryable.
+  observed.length = 0;
+  const nulling = fakeDeps({ observed, saved, observe: async () => null });
+  const nullReport = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['P2P-Algo'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps: nulling,
+  });
+  assert.equal(nullReport.admitted, 0);
+  assert.equal(nullReport.rejected['observation-failed'], 1);
+  assert.equal(saved.length, 0);
+  // Retry after the failure succeeds end to end, in observe-then-save order.
+  observed.length = 0;
+  const order: string[] = [];
+  const working = fakeDeps({
+    observed,
+    saved,
+    observe: async (args) => { order.push(`observe:${String((args.evidence as Record<string, unknown>).novel)}`); return 7; },
+    save: async () => { order.push('save'); },
+  });
+  const report = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['P2P-Algo'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps: working,
+  });
+  assert.equal(report.admitted, 1);
+  assert.deepEqual(order, ['observe:true', 'save']);
+  assert.deepEqual(saved, [{ country: 'Germany', term: 'P2P-Algo' }]);
+});
+
+test('real observation validation rejects over-length candidates before persistence', async () => {
+  // No database needed: the length guard runs before any runner is acquired.
+  const tooLong = `P2P-Algo-${'x'.repeat(80)}`;
+  assert.ok(tooLong.length > 80);
+  assert.equal(await observeTerminology({ term: tooLong, country: 'Germany', termType: 'TERMINOLOGY', observationType: 'ENRICHMENT' }), null);
+});
+
+test('rule-based instrument matching respects token boundaries', () => {
+  assert.deepEqual(findRuleInstrumentHits('heroes and best trades', [], ''), []);
+  const hits = findRuleInstrumentHits('trade ES Futures today', [], '');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].instrument, 'ES');
+  assert.equal(hits[0].located.span, 'ES');
+  // Full-width instrument mention traces to the exact original span.
+  const wide = findRuleInstrumentHits('ＥＳ先物', [], '');
+  assert.equal(wide.length, 1);
+  assert.equal(wide[0].located.span, 'ＥＳ');
+});
+
+test('video IDs align to titles and persist on the observation', async () => {
+  assert.deepEqual(alignVideoIdsToTitles(['a', 'b'], [{ id: 'v-a', title: 'a' }, { id: 'v-b', title: 'b' }]), ['v-a', 'v-b']);
+  assert.deepEqual(alignVideoIdsToTitles(['b', 'a'], [{ id: 'v-a', title: 'a' }, { id: 'v-b', title: 'b' }]), ['v-b', 'v-a']);
+  assert.deepEqual(alignVideoIdsToTitles(['a', 'missing'], [{ id: 'v-a', title: 'a' }]), ['v-a', null]);
+  assert.deepEqual(alignVideoIdsToTitles(['a']), [null]);
+
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const sources: LiteralSourceText[] = [
+    { kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-1' },
+    { kind: 'VIDEO_TITLE', index: 1, text: 'SMC entry model', videoId: 'vid-2' },
+  ];
+  const deps = fakeDeps({ observed, saved });
+  const report = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['P2P-Algo', 'SMC'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps,
+  });
+  assert.equal(report.admitted, 2);
+  assert.equal(observed[0].videoId, 'vid-1');
+  assert.equal(observed[1].videoId, 'vid-2');
+  assert.deepEqual(
+    (observed[0].evidence as Record<string, unknown>).sourceRef,
+    { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1' }
+  );
+});
+
+test('rejected candidates are observable by reason, without source content', async () => {
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const logs: string[] = [];
+  const sentinel = 'SENTINEL-UNIQUE-PHRASE-ORDER-FLOW';
+  const sources: LiteralSourceText[] = [{ kind: 'DESCRIPTION', index: 0, text: `about ${sentinel} join free signals vip` }];
+  const deps = fakeDeps({ observed, saved, log: (message) => logs.push(message) });
+  const report = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['Invented Term', 'join free signals vip', 42, sentinel] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps,
+  });
+  assert.equal(report.admitted, 1);
+  assert.equal(report.rejected['non-literal'], 1);
+  assert.equal(report.rejected.spam, 1);
+  assert.equal(report.rejected['non-string'], 1);
+  assert.deepEqual(saved, [{ country: 'Germany', term: sentinel }]);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /admitted=1/);
+  assert.match(logs[0], /"non-literal":1/);
+  assert.doesNotMatch(logs[0], new RegExp(sentinel));
+});
+
+test('unknown novelty baseline rejects everything and is logged', async () => {
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const logs: string[] = [];
+  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest' }];
+  const deps = fakeDeps({ observed, saved, log: (message) => logs.push(message) });
+  const report = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['P2P-Algo'] },
+    baseline: okBaseline({ ok: false, curatedTerms: [], existingTerms: [], failed: ['curated', 'existing'] }),
+    humanApproved: false, humanObservation: 'ENRICHMENT', deps,
+  });
+  assert.equal(report.admitted, 0);
+  assert.equal(report.rejected['novelty-unknown'], 1);
+  assert.equal(observed.length, 0);
+  assert.equal(saved.length, 0);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /noveltyBaseline=unknown:curated,existing/);
 });
 
 test('planner serves trial terms to live cycles', () => {
@@ -278,11 +691,12 @@ test('planner serves trial terms to live cycles', () => {
   assert.ok(JSON.stringify(candidates).includes('P2P-Algo'));
 });
 
-test('extraction admits only literal, non-spam candidates', () => {
+test('extraction admits only literal, non-spam candidates with observe-first ordering', () => {
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
-  assert.match(source, /findLiteralSpan\(raw, literalSources\)/);
-  assert.match(source, /detectSpamSignals\(raw\)/);
-  assert.match(source, /evaluateTermNovelty\(raw,/);
+  assert.match(source, /classifyNativeCandidate\(raw, args\.sources, args\.baseline/);
+  assert.match(source, /if \(termId == null\)/);
+  assert.match(source, /buildNoveltyBaseline\(/);
+  assert.doesNotMatch(source, /\(\) => \[\] as string\[\]/);
 });
 
 test('lifecycle refresh consults the trial-entry gate', () => {
