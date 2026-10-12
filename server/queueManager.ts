@@ -700,8 +700,10 @@ export async function processNextSearchJob(
         // Retry repair: a retried ENRICH job replays vocabulary extraction so a
         // save that failed after its observation committed cannot strand rows
         // behind this early completion (same bars as the ingestion helper).
+        // Repair failures propagate to failJob (bounded retry) rather than
+        // completing with rows still missing.
         if (channel && job.attempts > 1) {
-          await replayVocabularyForRetry(channel, candidate, source, true).catch(error => console.warn(`[Vocabulary Repair] channel ${channelId}:`, error instanceof Error ? error.message : error));
+          await replayVocabularyForRetry(channel, candidate, source, true);
         }
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel?.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'CASE_NO_LONGER_ELIGIBLE'}).catch(()=>undefined);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel?.trading_status||'POLICY_REJECTED',output:{reason:channel?'CASE_NO_LONGER_ELIGIBLE':'CHANNEL_MISSING'}});
