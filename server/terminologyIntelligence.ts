@@ -210,7 +210,7 @@ const SPAM_SIGNAL_PATTERNS: Array<{ pattern: RegExp; code: string }> = [
   // 'únete al grupo' would evade screening. The `u` flag is still required
   // for \p{} and lookbehind.
   { pattern: /(?<![\p{L}\p{N}_])(\u00fanete|unete|gratis|gratuito|gratuita)(?![\p{L}\p{N}_]).{0,20}(?<![\p{L}\p{N}_])(se\u00f1ales|se\u00f1al|grupo|canal|vip)(?![\p{L}\p{N}_])/iu, code: 'signal-group-solicitation-es' },
-  { pattern: /(?<![\\p{L}\\p{N}_])(se\u00f1ales|se\u00f1al|grupo|canal)(?![\\p{L}\\p{N}_]).{0,20}(?<![\\p{L}\\p{N}_])(\u00fanete|unete|gratis|gratuito|gratuita|vip)(?![\\p{L}\\p{N}_])/iu, code: 'signal-group-solicitation-es' },
+  { pattern: /(?<![\p{L}\p{N}_])(se\u00f1ales|se\u00f1al|grupo|canal)(?![\p{L}\p{N}_]).{0,20}(?<![\p{L}\p{N}_])(\u00fanete|unete|gratis|gratuito|gratuita|vip)(?![\p{L}\p{N}_])/iu, code: 'signal-group-solicitation-es' },
   { pattern: /\b(promo( code)?|discount|giveaway|bonus|airdrop)\b/i, code: 'promotional' },
   { pattern: /\b(guaranteed|risk.?free|double your|1000?x gains?)\b/i, code: 'guaranteed-returns' },
   { pattern: /[$€£¥₹]\s*\d|💰|🚀|🔥|💸|🤑|💵/i, code: 'money-bait' },

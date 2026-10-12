@@ -197,6 +197,13 @@ test('localized solicitation is screened without touching legitimate local langu
   }
   // Glued words are not boundaries: fragments inside longer tokens stay clean.
   assert.deepEqual(detectSpamSignals('xúnete al grupox'), []);
+  // Double-escape regression: the reverse pattern must use real Unicode
+  // property classes, so 'grupo' inside 'subgrupo' is not a boundary.
+  assert.deepEqual(detectSpamSignals('subgrupo gratuito'), []);
+  assert.deepEqual(detectSpamSignals('el subgrupo见 gratis'), []);
+  for (const variant of ['grupo gratis vip', 'canal únete gratis', 'señales únete']) {
+    assert.ok(detectSpamSignals(variant).some(code => code.endsWith('-es')), `missed reverse ES solicitation: ${variant}`);
+  }
   for (const legit of ['Analyse Technique', 'Börsenanalyse', 'Futures Handel', 'Acción del Precio', 'Flux Ordres', 'Séance de trading', 'Señales de Trading', 'Canal de Telegram', 'Grupo de Trading', 'Análisis Técnico', 'Gestión del Riesgo', 'Velas Japonesas']) {
     assert.deepEqual(detectSpamSignals(legit), [], `legit local term flagged: ${legit}`);
   }
