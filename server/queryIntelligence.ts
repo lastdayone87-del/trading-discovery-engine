@@ -264,6 +264,18 @@ export function hasNativeExtractionText(channelName: string, titles: string[], d
   return channelName.trim() !== '' || titles.length > 0 || description.length > 20;
 }
 
+/**
+ * Parse Gemini vocabulary output. Returns undefined when no JSON object is
+ * present; THROWS on malformed JSON (provider-side garbage — the caller
+ * treats that as a provider failure with warn-and-skip, distinct from
+ * persistence failures in admission, which propagate for retry).
+ */
+export function parseNativeVocabularyResponse(resText: string): { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined {
+  const jsonMatch = (resText || '').match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return undefined;
+  return JSON.parse(jsonMatch[0]);
+}
+
 export interface ExtractionSourceOrigins {
   /** False when videoTitles are not YouTube metadata (fallbacks/prose). */
   videoTitlesAreMetadata?: boolean;
@@ -441,6 +453,11 @@ export async function extractVocabularyFromCreator(
   const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
   const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
   if (ai && hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
+    // Provider failures (quota/busy/malformed model output) warn and skip AI
+    // extraction. Persistence failures from admission below are NOT caught
+    // here: they propagate to the caller for retry instead of being
+    // misreported as Gemini errors or silently swallowed.
+    let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined;
     try {
       const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
@@ -463,9 +480,20 @@ Return ONLY a valid JSON object with format:
       })}));
 
       const resText = response.text || '';
-      const jsonMatch = resText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
+      parsed = parseNativeVocabularyResponse(resText);
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+      const is503 = msg.includes('503') || msg.includes('high demand');
+      if (isQuota) {
+        console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
+      } else if (is503) {
+        console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
+      } else {
+        console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
+      }
+    }
+    if (parsed) {
         // Literal, traceable admission (native-v1 pipeline) via the shared
         // admitNativeCandidates helper: classification (literal → spam →
         // fail-closed novelty), observe-first persistence, rejection stats.
@@ -505,18 +533,6 @@ Return ONLY a valid JSON object with format:
           humanApproved,
           humanObservation,
         });
-      }
-    } catch (e: any) {
-      const msg = e?.message || String(e);
-      const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-      const is503 = msg.includes('503') || msg.includes('high demand');
-      if (isQuota) {
-        console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
-      } else if (is503) {
-        console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
-      } else {
-        console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
-      }
     }
   }
 

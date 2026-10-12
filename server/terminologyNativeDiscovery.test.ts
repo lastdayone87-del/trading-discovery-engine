@@ -31,6 +31,7 @@ import {
   buildLiteralSources,
   findRuleInstrumentHits,
   hasNativeExtractionText,
+  parseNativeVocabularyResponse,
 } from './queryIntelligence';
 import { computeObservationKey } from './countryNativeIntelligence';
 import { extractDiscoveredChannels } from './youtube';
@@ -1170,6 +1171,22 @@ test('extraction text gate preserves the channel-name-only path', () => {
   assert.equal(hasNativeExtractionText('', [], 'a description long enough to analyze'), true);
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
   assert.match(source, /hasNativeExtractionText\(channel\.channel_name, effTitles, effDesc\)/);
+});
+
+test('provider parse failures are distinct from persistence failures', () => {
+  // Malformed model output throws at the parse boundary (caller: warn-and-skip).
+  assert.throws(() => parseNativeVocabularyResponse('{broken json} trailing'));
+  // No JSON object present: clean undefined, no throw.
+  assert.equal(parseNativeVocabularyResponse('plain prose, no object'), undefined);
+  // Valid payload parses for admission.
+  assert.deepEqual(parseNativeVocabularyResponse('{"terminology": ["SMC"]}'), { terminology: ['SMC'] });
+  // Persistence/admission errors must NOT be caught as provider errors: the
+  // admission call sits outside the provider try/catch (after `if (parsed)`),
+  // so observe/save failures propagate to the caller for retry.
+  const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  const catchEnd = source.indexOf('if (parsed) {');
+  assert.ok(catchEnd > 0);
+  assert.ok(source.indexOf('await admitNativeCandidates({') > catchEnd);
 });
 
 test('extraction forwards language and locale into the admission helper', () => {
