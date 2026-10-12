@@ -1826,8 +1826,7 @@ test('retry forces extraction replay on the preserved-channel path', () => {
   // and the ENRICH caller must set it only on genuine retries (attempts are
   // claimed pre-run, so first executions see attempts=1 and keep the fast path).
   const ingestion = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
-  assert.match(ingestion, /forceExtraction && existing\.trading_status === 'TRADING_CONFIRMED'/);
-  assert.match(ingestion, /await extractVocabularyFromCreator\(existing, candidate\.videoTitles/);
+  assert.match(ingestion, /if \(options\?\.forceExtraction && existing\.trading_status === 'TRADING_CONFIRMED' && source !== 'manual_search' && existing\.quality_score != null && existing\.quality_score >= 55\) \{\s*await extractVocabularyFromCreator\(existing, candidate\.videoTitles/);
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(queue, /forceExtraction:job\.attempts>1/);
 });

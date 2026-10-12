@@ -187,8 +187,10 @@ export async function processChannelThroughPipeline(
       // behind this early return. Idempotent (observation keys, insert-gated
       // saves, reconcile repair); skipped for first attempts to preserve the
       // cheap-preservation fast path. Low-audience early returns stay skipped
-      // (budget gate deliberately starves them of compute).
-      if (options?.forceExtraction && existing.trading_status === 'TRADING_CONFIRMED') {
+      // (budget gate deliberately starves them of compute). The replay honors
+      // the normal extraction bars (quality threshold, no manual-search
+      // training) exactly like the main path below.
+      if (options?.forceExtraction && existing.trading_status === 'TRADING_CONFIRMED' && source !== 'manual_search' && existing.quality_score != null && existing.quality_score >= 55) {
         await extractVocabularyFromCreator(existing, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate), resolveExtractionVideoIds(candidate));
       }
       // Update basic existing metadata if changed
