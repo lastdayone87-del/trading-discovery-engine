@@ -16,7 +16,7 @@ import {
 import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
-import { attributeTerminologyPerformance, getPlannerTerminology, observeTerminology } from './terminologyIntelligence';
+import { attributeTerminologyPerformance, detectSpamSignals, evaluateTermNovelty, evaluateTermQualityFlags, findLiteralSpan, getPlannerTerminology, observeTerminology, type LiteralSourceText } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -195,7 +195,8 @@ export async function extractVocabularyFromCreator(
   videoTitles: string[] = [],
   description: string = '',
   humanApproved = false,
-  languageContext?: ExplicitTerminologyLanguageContext
+  languageContext?: ExplicitTerminologyLanguageContext,
+  videoIds?: Array<string | null>
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
   const ai = getAIClient();
@@ -217,7 +218,8 @@ export async function extractVocabularyFromCreator(
         { value: description, type: 'DESCRIPTION' }
       ];
       for (const source of sources.filter(item => item.value.toLocaleLowerCase('en').includes(inst.toLocaleLowerCase('en')))) {
-        await observeTerminology({ term: inst, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : source.type, channelId: channel.channel_id, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: source.type } });
+        const at = source.value.toLocaleLowerCase('en').indexOf(inst.toLocaleLowerCase('en'));
+        await observeTerminology({ term: inst, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : source.type, channelId: channel.channel_id, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: source.type, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: source.type, span: source.value.slice(at, at + inst.length) }, novel: false, knownAs: `instrument:${inst}`, generic: true, spamSignals: [] as string[], translationRisk: null } });
       }
     }
   }
@@ -231,7 +233,7 @@ Description: "${description}"
 Recent Titles:
 ${videoTitles.map(t => `- ${t}`).join('\n')}
 
-Identify any localized, native trading terminology, popular financial instruments, market phrases, or content formats specific to traders in ${channel.country}.
+Identify any localized, native trading terminology, popular financial instruments, market phrases, or content formats specific to traders in ${channel.country}. Quote every term EXACTLY as it appears in the texts above: do not paraphrase, translate, or invent terms.
 Return ONLY a valid JSON object with format:
 {
   "terminology": ["term1", "term2"],
@@ -249,29 +251,71 @@ Return ONLY a valid JSON object with format:
       const jsonMatch = resText.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
+        // Literal, traceable admission (native-v1 pipeline): every AI
+        // candidate must occur verbatim in the cited sources and must not
+        // match signal-selling patterns. Survivors carry novelty/quality
+        // evidence for trial/promotion review; invented or promotional terms
+        // never reach persistence. Observation types per category preserve
+        // legacy behavior exactly.
+        const literalSources: LiteralSourceText[] = [
+          { kind: 'CHANNEL_NAME', index: 0, text: channel.channel_name },
+          ...videoTitles.map((value, index) => ({ kind: 'VIDEO_TITLE' as const, index, text: value, videoId: videoIds?.[index] ?? null })),
+          { kind: 'DESCRIPTION' as const, index: 0, text: description },
+        ];
+        const vocab = await getCountryVocabularies().then(
+          all => all.find(entry => entry.country.toLowerCase() === channel.country.toLowerCase()),
+          () => undefined
+        );
+        const curatedTerms = [
+          ...(vocab?.native_trading_terminology || []),
+          ...(vocab?.popular_instruments || []),
+          ...(vocab?.local_market_phrases || []),
+          ...(vocab?.common_content_format_names || []),
+        ];
+        const existingTerms = await getExtractedVocabulary(channel.country).then(
+          rows => rows.map(row => row.term),
+          () => [] as string[]
+        );
+        const admitNativeCandidate = async (
+          raw: unknown,
+          category: 'terminology' | 'instrument' | 'phrase' | 'format',
+          termType: 'TERMINOLOGY' | 'INSTRUMENT' | 'PHRASE' | 'FORMAT',
+          observationType: 'HUMAN_APPROVED_CHANNEL' | 'ENRICHMENT',
+          approved: boolean | undefined
+        ): Promise<void> => {
+          if (typeof raw !== 'string') return;
+          const located = findLiteralSpan(raw, literalSources);
+          if (!located) return;
+          const spamSignals = detectSpamSignals(raw);
+          if (spamSignals.length > 0) return;
+          const novelty = evaluateTermNovelty(raw, { country: channel.country, curatedTerms, existingTerms });
+          const flags = evaluateTermQualityFlags(raw, { language: languageContext?.language, curatedTerms });
+          await saveExtractedTerm(channel.country, raw, category, channel.channel_id);
+          await observeTerminology({
+            term: String(raw), country: channel.country, termType, observationType,
+            channelId: channel.channel_id, humanApproved: approved,
+            language: languageContext?.language, locale: languageContext?.locale,
+            communityFingerprint: channel.discord_invite || undefined,
+            evidence: {
+              extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
+              sourceRef: { kind: located.sourceKind, index: located.sourceIndex, span: located.span, videoId: located.videoId ?? null },
+              novel: novelty.novel, knownAs: novelty.knownAs,
+              generic: flags.generic, spamSignals, translationRisk: flags.translationRisk,
+            },
+          });
+        };
+        const humanObservation = humanApproved ? 'HUMAN_APPROVED_CHANNEL' as const : 'ENRICHMENT' as const;
         if (Array.isArray(parsed.terminology)) {
-          for (const t of parsed.terminology) {
-            await saveExtractedTerm(channel.country, t, 'terminology', channel.channel_id);
-            await observeTerminology({ term: String(t), country: channel.country, termType: 'TERMINOLOGY', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
-          }
+          for (const t of parsed.terminology) await admitNativeCandidate(t, 'terminology', 'TERMINOLOGY', humanObservation, humanApproved);
         }
         if (Array.isArray(parsed.instruments)) {
-          for (const i of parsed.instruments) {
-            await saveExtractedTerm(channel.country, i, 'instrument', channel.channel_id);
-            await observeTerminology({ term: String(i), country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : 'ENRICHMENT', channelId: channel.channel_id, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
-          }
+          for (const i of parsed.instruments) await admitNativeCandidate(i, 'instrument', 'INSTRUMENT', humanObservation, humanApproved);
         }
         if (Array.isArray(parsed.phrases)) {
-          for (const p of parsed.phrases) {
-            await saveExtractedTerm(channel.country, p, 'phrase', channel.channel_id);
-            await observeTerminology({ term: String(p), country: channel.country, termType: 'PHRASE', observationType: 'ENRICHMENT', channelId: channel.channel_id, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
-          }
+          for (const pp of parsed.phrases) await admitNativeCandidate(pp, 'phrase', 'PHRASE', 'ENRICHMENT', undefined);
         }
         if (Array.isArray(parsed.formats)) {
-          for (const f of parsed.formats) {
-            await saveExtractedTerm(channel.country, f, 'format', channel.channel_id);
-            await observeTerminology({ term: String(f), country: channel.country, termType: 'FORMAT', observationType: 'ENRICHMENT', channelId: channel.channel_id, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'GEMINI' } });
-          }
+          for (const f of parsed.formats) await admitNativeCandidate(f, 'format', 'FORMAT', 'ENRICHMENT', undefined);
         }
       }
     } catch (e: any) {

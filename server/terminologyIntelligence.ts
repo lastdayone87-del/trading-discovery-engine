@@ -61,6 +61,294 @@ export function decideLifecycle(input: { current: TerminologyLifecycle; decayedE
   return { status: 'CANDIDATE', searchEligible: false, reason: 'Evidence remains below the observation threshold.' };
 }
 
+/**
+ * Native-discovery quality helpers (literal spans, novelty, spam, translation
+ * risk, trial-entry gate, promotion policy). All pure except where noted.
+ * Evidence they produce is recorded on terminology_observations evidence
+ * JSONB — no schema change. decideLifecycle() below is intentionally
+ * untouched: legacy transitions stay byte-identical, and the entry gate in
+ * refreshTerminologyLifecycle applies only to terms carrying new
+ * qualityVersion evidence.
+ */
+
+/** Canonical instrument list mirrored from the rule-based extractor in
+ * queryIntelligence.ts (historical spelling preserved). A term matching this
+ * list is generic by construction: useful, but never a novel discovery. */
+export const KNOWN_INSTRUMENT_TERMS = [
+  'NQ', 'ES', 'DAX', 'FDAX', 'CAC 40', 'IBEX 35', 'FTSE 100', 'AEX',
+  'BTC', 'ETH', 'EURUSD', 'GBPUSD', 'Gold', 'WTI Crude', 'S&P 500', 'Nasdaq',
+];
+
+export interface LiteralSourceText {
+  kind: 'CHANNEL_NAME' | 'VIDEO_TITLE' | 'DESCRIPTION';
+  index: number;
+  text: string;
+  videoId?: string | null;
+}
+
+export interface LiteralSpanMatch {
+  sourceKind: LiteralSourceText['kind'];
+  sourceIndex: number;
+  span: string;
+  videoId?: string | null;
+}
+
+/**
+ * Prove a candidate term occurs literally in cited source metadata. Both
+ * sides are NFKC-normalized and compared case-insensitively; the returned
+ * span is sliced from the normalized source so offsets are always valid.
+ * Word-boundary aware for Latin-script terms (so 'ES' never matches inside
+ * 'heroes'); plain substring for terms containing non-Latin characters
+ * (CJK and similar scripts have no word boundaries). Returns null when the
+ * term cannot be traced to any cited source — model-invented or paraphrased
+ * candidates must never enter the evidence ledger.
+ */
+export function findLiteralSpan(term: string, sources: LiteralSourceText[]): LiteralSpanMatch | null {
+  const needle = term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
+  if (needle.length < 2) return null;
+  const hasNonLatin = /[^\u0000-\u024F\u1E00-\u1EFF]/u.test(needle);
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = hasNonLatin ? null : new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, 'iu');
+  for (const source of sources) {
+    if (!source.text) continue;
+    const haystack = source.text.normalize('NFKC');
+    if (pattern) {
+      const match = haystack.match(pattern);
+      if (match && match.index !== undefined) {
+        return { sourceKind: source.kind, sourceIndex: source.index, span: match[0], videoId: source.videoId ?? null };
+      }
+      continue;
+    }
+    const at = haystack.toLocaleLowerCase('en').indexOf(needle.toLocaleLowerCase('en'));
+    if (at >= 0) {
+      return { sourceKind: source.kind, sourceIndex: source.index, span: haystack.slice(at, at + needle.length), videoId: source.videoId ?? null };
+    }
+  }
+  return null;
+}
+
+export interface TermNovelty {
+  novel: boolean;
+  /** Where the term was already known, if anywhere. Null when novel. */
+  knownAs: string | null;
+}
+
+/**
+ * Novelty against everything the engine already serves or tracks. Curated
+ * country vocabulary, the known-instrument list, and already-extracted terms
+ * are supplied by the caller (one cheap read each at the extraction site);
+ * comparison is normalized-case. A term unknown everywhere is novel and may
+ * enter trial consideration; known terms keep flowing through their existing
+ * curated/legacy paths.
+ */
+export function evaluateTermNovelty(
+  term: string,
+  context: { country: string; curatedTerms: string[]; knownInstruments?: string[]; existingTerms?: string[] }
+): TermNovelty {
+  const normalized = normalizeTerm(term);
+  const instruments = context.knownInstruments ?? KNOWN_INSTRUMENT_TERMS;
+  const hitInstrument = instruments.find(candidate => normalizeTerm(candidate) === normalized);
+  if (hitInstrument) return { novel: false, knownAs: `instrument:${hitInstrument}` };
+  const hitCurated = context.curatedTerms.find(candidate => normalizeTerm(candidate) === normalized);
+  if (hitCurated) return { novel: false, knownAs: `curated:${context.country}:${hitCurated}` };
+  const hitExtracted = (context.existingTerms ?? []).find(candidate => normalizeTerm(candidate) === normalized);
+  if (hitExtracted) return { novel: false, knownAs: `extracted:${hitExtracted}` };
+  return { novel: true, knownAs: null };
+}
+
+/** Strong signal-selling / promotional patterns. A trading term matching any
+ * of these is junk by construction — never a legitimate local methodology
+ * name (which never contains join/WhatsApp/promo/giveaway language). Kept
+ * deliberately narrow to avoid false positives on real terms. */
+const SPAM_SIGNAL_PATTERNS: Array<{ pattern: RegExp; code: string }> = [
+  { pattern: /\b(join|free|vip|premium)\b.{0,20}\b(signals?|group|channel|vip)\b/i, code: 'signal-group-solicitation' },
+  { pattern: /\b(whatsapp|telegram)\b.{0,20}\b(join|free|signals?|vip|group)\b/i, code: 'messenger-solicitation' },
+  { pattern: /\b(promo( code)?|discount|giveaway|bonus|airdrop)\b/i, code: 'promotional' },
+  { pattern: /\b(guaranteed|risk.?free|double your|1000?x gains?)\b/i, code: 'guaranteed-returns' },
+  { pattern: /[$€£¥₹]\s*\d|💰|🚀|🔥|💸|🤑|💵/i, code: 'money-bait' },
+  { pattern: /\b(click (here|link|below)|link in (bio|description))\b/i, code: 'engagement-bait' },
+];
+
+/** Returns matched spam reason codes, or [] for clean terms. */
+export function detectSpamSignals(term: string): string[] {
+  const hits: string[] = [];
+  for (const { pattern, code } of SPAM_SIGNAL_PATTERNS) {
+    if (pattern.test(term)) hits.push(code);
+  }
+  return [...new Set(hits)];
+}
+
+export interface TermQualityFlags {
+  generic: boolean;
+  translationRisk: string | null;
+}
+
+/**
+ * Evidence-only quality flags (never block extraction by themselves):
+ * generic marks terms the engine already serves (curated/instruments);
+ * translationRisk marks ASCII-only terms observed under a non-Latin-script
+ * language context as possibly translated rather than native. Both are
+ * heuristic and documented as such; they inform trial/promotion review.
+ */
+const NON_LATIN_SCRIPT_LANGUAGES = new Set([
+  'ja', 'zh', 'ko', 'th', 'ar', 'he', 'fa', 'ur', 'ru', 'uk', 'bg', 'el',
+  'hi', 'bn', 'ta', 'te', 'mr', 'tr', 'ka', 'hy', 'az', 'kk',
+]);
+
+export function evaluateTermQualityFlags(
+  term: string,
+  context: { language?: string; curatedTerms: string[]; knownInstruments?: string[] }
+): TermQualityFlags {
+  const normalized = normalizeTerm(term);
+  const inLists = (list: string[]) => list.some(candidate => normalizeTerm(candidate) === normalized);
+  const generic =
+    inLists(context.knownInstruments ?? KNOWN_INSTRUMENT_TERMS) || inLists(context.curatedTerms);
+  let translationRisk: string | null = null;
+  const language = (context.language || '').toLowerCase().split('-')[0];
+  if (
+    language &&
+    language !== 'und' &&
+    language !== 'en' &&
+    NON_LATIN_SCRIPT_LANGUAGES.has(language) &&
+    /^[\x00-\x7F]*$/.test(term)
+  ) {
+    translationRisk = 'ascii-in-non-latin-context';
+  }
+  return { generic, translationRisk };
+}
+
+/**
+ * Trial-entry gate for terms carrying new quality evidence. Spam-confirmed
+ * terms never enter; non-novel terms never (re)enter trial or proven states
+ * through new evidence (generics stay served via curated/legacy paths).
+ * Only governs entry into search-eligible states — never forces exit, so
+ * demotion stays exclusively yield-driven and existing terms are untouched
+ * until they accumulate new evidence.
+ */
+export function evaluateTrialEntry(input: { novel: boolean; spamConfirmed: boolean }): {
+  allowed: boolean;
+  reasons: string[];
+} {
+  if (input.spamConfirmed) return { allowed: false, reasons: ['spam-confirmed'] };
+  if (!input.novel) return { allowed: false, reasons: ['not-novel'] };
+  return { allowed: true, reasons: ['novel-eligible'] };
+}
+
+export interface NativePromotionMetrics {
+  yieldPer1000Quota: number;
+  confirmedShare: number;
+  wrongCountryShare: number;
+  reviewShare: number;
+}
+
+/** Initial promotion policy thresholds. Reviewable operator policy: raise
+ * the yield bar or tighten shares as evidence accumulates. */
+export const NATIVE_PROMOTION_MIN_YIELD_PER_1000_QUOTA = 1.0;
+export const NATIVE_PROMOTION_MAX_WRONG_COUNTRY_SHARE = 0.5;
+export const NATIVE_PROMOTION_MAX_NON_TRADING_WITHOUT_CONFIRMED = 0;
+export const NATIVE_PROMOTION_REVIEW_HOLD_SHARE = 0.5;
+export const NATIVE_PROMOTION_MIN_EXECUTIONS = 3;
+export const NATIVE_PROMOTION_MIN_CREATORS = 3;
+
+/**
+ * Promotion policy for native term trials (pure; operator/trial decisions,
+ * never auto-applied). Dimensions per mandate: verified new trading
+ * creators per quota unit, country/language precision (wrong-country
+ * share), duplicates (deduped upstream: distinct creators/communities
+ * inputs), non-trading results, source independence (distinct communities +
+ * burst flag), review burden (needs-review share holds, never auto-promotes),
+ * and uncertainty (minimum-evidence floors hold instead of deciding).
+ * Novelty is required: generic terms are served via curated paths already.
+ */
+export function evaluateNativeTermPromotion(input: {
+  novel: boolean;
+  spamConfirmed: boolean;
+  executions: number;
+  quotaConsumed: number;
+  newCreators: number;
+  confirmedTradingCreators: number;
+  nonTradingCreators: number;
+  wrongCountryCreators: number;
+  needsReviewCreators: number;
+  distinctCreators: number;
+  distinctCommunities: number;
+  coordinatedBurst: boolean;
+}): { decision: 'PROMOTE' | 'HOLD' | 'REJECT'; reasons: string[]; metrics: NativePromotionMetrics } {
+  const reasons: string[] = [];
+  if (input.spamConfirmed) {
+    return { decision: 'REJECT', reasons: ['spam-confirmed'], metrics: emptyPromotionMetrics() };
+  }
+  if (!input.novel) {
+    return { decision: 'REJECT', reasons: ['not-novel: generics served via curated paths'], metrics: emptyPromotionMetrics() };
+  }
+  if (input.executions < NATIVE_PROMOTION_MIN_EXECUTIONS) {
+    reasons.push(`insufficient-executions:${input.executions}<${NATIVE_PROMOTION_MIN_EXECUTIONS}`);
+  }
+  if (input.distinctCreators < NATIVE_PROMOTION_MIN_CREATORS) {
+    reasons.push(`insufficient-creators:${input.distinctCreators}<${NATIVE_PROMOTION_MIN_CREATORS}`);
+  }
+  if (input.quotaConsumed <= 0) {
+    reasons.push('no-quota-basis');
+  }
+  const totalAttributed =
+    input.newCreators + input.confirmedTradingCreators + input.nonTradingCreators +
+    input.wrongCountryCreators + input.needsReviewCreators;
+  const metrics: NativePromotionMetrics = {
+    yieldPer1000Quota: input.quotaConsumed > 0 ? (1000 * input.newCreators) / input.quotaConsumed : 0,
+    confirmedShare: totalAttributed > 0 ? input.confirmedTradingCreators / totalAttributed : 0,
+    wrongCountryShare: totalAttributed > 0 ? input.wrongCountryCreators / totalAttributed : 0,
+    reviewShare: totalAttributed > 0 ? input.needsReviewCreators / totalAttributed : 0,
+  };
+  if (reasons.length > 0) return { decision: 'HOLD', reasons, metrics };
+  if (input.coordinatedBurst && input.distinctCommunities < 2) {
+    return { decision: 'HOLD', reasons: ['coordinated-burst: single-community concentration needs review'], metrics };
+  }
+  if (metrics.wrongCountryShare > NATIVE_PROMOTION_MAX_WRONG_COUNTRY_SHARE) {
+    return { decision: 'REJECT', reasons: [`wrong-country-share:${metrics.wrongCountryShare.toFixed(2)}`], metrics };
+  }
+  if (input.confirmedTradingCreators <= NATIVE_PROMOTION_MAX_NON_TRADING_WITHOUT_CONFIRMED && input.nonTradingCreators > 0) {
+    return { decision: 'REJECT', reasons: ['no-verified-traders-with-non-trading-evidence'], metrics };
+  }
+  if (metrics.reviewShare > NATIVE_PROMOTION_REVIEW_HOLD_SHARE) {
+    return { decision: 'HOLD', reasons: [`review-burden:${metrics.reviewShare.toFixed(2)}`], metrics };
+  }
+  if (metrics.yieldPer1000Quota < NATIVE_PROMOTION_MIN_YIELD_PER_1000_QUOTA) {
+    return { decision: 'HOLD', reasons: [`yield-below-bar:${metrics.yieldPer1000Quota.toFixed(2)}`], metrics };
+  }
+  return { decision: 'PROMOTE', reasons: ['meets-native-promotion-bar'], metrics };
+}
+
+function emptyPromotionMetrics(): NativePromotionMetrics {
+  return { yieldPer1000Quota: 0, confirmedShare: 0, wrongCountryShare: 0, reviewShare: 0 };
+}
+
+export interface NativeQualityRollup {
+  v1Observations: number;
+  spamConfirmed: boolean;
+  novel: boolean;
+}
+
+/** Quality rollup over new-pipeline observations for one term. Terms with
+ * only legacy observations return v1Observations 0 and keep legacy rules. */
+export async function readNativeQualityEvidence(
+  termId: number,
+  runner: Queryable
+): Promise<NativeQualityRollup> {
+  const result = await runner.query(
+    `SELECT count(*) FILTER (WHERE evidence->>'qualityVersion'='native-v1')::int AS v1,
+      COALESCE(bool_or((evidence->'quality'->>'spamConfirmed')::boolean), false) AS spam,
+      COALESCE(bool_or((evidence->>'novel')::boolean), false) AS novel
+     FROM terminology_observations WHERE canonical_term_id=$1`,
+    [termId]
+  );
+  const row = (result.rows[0] || {}) as Record<string, unknown>;
+  return {
+    v1Observations: Number(row.v1 || 0),
+    spamConfirmed: row.spam === true,
+    novel: row.novel === true,
+  };
+}
+
 export async function observeTerminology(args: {
   term: string;
   country: string;
@@ -249,7 +537,31 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   if (!result.rows[0]) return;
   const row = result.rows[0];
   const decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type }, policy);
-  if (decision.status !== row.lifecycle_status || decision.searchEligible !== row.search_eligible) {
+  // Native quality gate: applies ONLY when entering a search-eligible state
+  // AND the term carries new-pipeline (qualityVersion) evidence. Legacy-only
+  // terms take the legacy path below byte-identically; spam or non-novel
+  // new terms are held at their current status with a recorded reason
+  // instead of entering trial/proven states. Demotion stays yield-driven.
+  // The quality rollup is read once; a second read would race concurrent
+  // writers and is unnecessary.
+  let qualityBlocked = false;
+  const enteringEligibility = !row.search_eligible && decision.searchEligible;
+  if (enteringEligibility) {
+    const quality = await readNativeQualityEvidence(termId, runner);
+    if (quality.v1Observations > 0) {
+      const entry = evaluateTrialEntry({ novel: quality.novel, spamConfirmed: quality.spamConfirmed });
+      if (!entry.allowed) {
+        qualityBlocked = true;
+        // event_type is CHECK-constrained to PROMOTION/DEMOTION/ELIGIBILITY_CHANGE:
+        // same-status ELIGIBILITY_CHANGE with an explicit block reason.
+        await runner.query(
+          `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$2,'ELIGIBILITY_CHANGE',$3,$4)`,
+          [termId, row.lifecycle_status, `quality-gate blocked trial entry: ${entry.reasons.join('; ')}`, JSON.stringify({ v1Observations: quality.v1Observations, novel: quality.novel, spamConfirmed: quality.spamConfirmed })]
+        );
+      }
+    }
+  }
+  if (!qualityBlocked && (decision.status !== row.lifecycle_status || decision.searchEligible !== row.search_eligible)) {
     await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, decision.status, decision.searchEligible, decision.status === 'PROVEN_SEARCH_TERM' ? 1 : decision.searchEligible ? 2 : 3]);
     await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, decision.status, decision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', decision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield })]);
   }
