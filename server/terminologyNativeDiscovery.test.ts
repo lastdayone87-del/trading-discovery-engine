@@ -1285,6 +1285,28 @@ test('concurrent repairs from two channels keep one row with both links', async 
 });
 
 // S3: casing variants reuse the earliest normalized row instead of duplicating.
+test('whitespace and NFKC variants reconcile to one vocabulary row', async () => {
+  // lower() prefiltering would miss these; the country-wide normalized scan
+  // must not split links across equivalent rows.
+  const store = createFakeVocabStore();
+  const deps = fakeDeps({
+    reconciled: [], observed: [], saved: [], store,
+    observe: async () => ({ termId: 9, observationInserted: false }),
+    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
+  });
+  const admissionFor = (candidate: string) => ({
+    channel: testChannel(),
+    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: `${candidate} session`, videoId: 'vid-4' }] as LiteralSourceText[],
+    parsed: { terminology: [candidate] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
+  });
+  await admitNativeCandidates(admissionFor('order  flow'));
+  await admitNativeCandidates(admissionFor('order flow'));
+  assert.equal(store.rows.size, 1);
+  const productionSql = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(productionSql, /lower\(term\)=lower/);
+});
+
 test('casing variants reconcile to one vocabulary row', async () => {
   const sharedStore = createFakeVocabStore();
   const deps = fakeDeps({

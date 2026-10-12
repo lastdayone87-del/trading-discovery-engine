@@ -362,9 +362,14 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
   try {
     if (client) await runner.query('BEGIN');
     await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`extracted-vocab:${country}:${normalized}`]);
+    // Country-wide scan with in-code normalized comparison: SQL lower()
+    // cannot express NFKC/whitespace canonicalization, so a lower() prefilter
+    // would miss equivalent rows ('order  flow' vs 'order flow') and split
+    // links across duplicate rows. Per-country vocabularies are small; repair
+    // is rare, so the scan cost is bounded and correctness comes first.
     const existing = await runner.query(
-      `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 AND lower(term)=lower($2) ORDER BY id ASC`,
-      [country, clean]
+      `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY id ASC`,
+      [country]
     );
     let rowId: number | null = null;
     let rowInserted = false;
@@ -384,8 +389,8 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
         rowInserted = true;
       } else {
         const reread = await runner.query(
-          `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 AND lower(term)=lower($2) ORDER BY id ASC`,
-          [country, clean]
+          `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY id ASC`,
+          [country]
         );
         for (const row of reread.rows || []) {
           if (normalizeTermForReconcile(String(row.term)) === normalized) {

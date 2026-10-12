@@ -626,7 +626,7 @@ export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, san
       // Keep each result's video ID alongside its title: matchedDocument only
       // retains the first result, so without this later titles lose their IDs.
       if (videoId && videoTitle && !(existing.videos || []).some(video => video.id === videoId)) {
-        existing.videos = [...(existing.videos || []), { id: videoId, title: videoTitle }];
+        existing.videos = [...(existing.videos || []), { id: videoId, title: videoTitle, description: videoDescription }];
       }
       continue;
     }
@@ -643,7 +643,7 @@ export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, san
       // is preserved separately on matchedDocument.
       videoTitles: videoTitle ? [videoTitle] : [],
       videoDescriptions: videoDescription ? [videoDescription] : [],
-      videos: videoId && videoTitle ? [{ id: videoId, title: videoTitle }] : [],
+      videos: videoId && videoTitle ? [{ id: videoId, title: videoTitle, description: videoDescription }] : [],
       // VIDEO-search snippets are retrieval-selected, not a recent-channel
       // sample: they must never vote in the aggregated-language country path.
       videoDescriptionsAuthoritative: false,
