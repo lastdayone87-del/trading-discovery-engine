@@ -902,17 +902,27 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
     const perf = await runner.query(
       `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
         COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,
-        COALESCE(SUM(wrong_country_creators),0)::int wrong, COALESCE(SUM(needs_review_creators),0)::int review
+        COALESCE(SUM(wrong_country_creators),0)::int wrong, COALESCE(SUM(needs_review_creators),0)::int review,
+        COALESCE(SUM(new_creators),0)::int fresh
        FROM terminology_performance WHERE canonical_term_id=$1`,
       [termId]
     );
     const agg = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
+    // Verified-trader bar counts FRESH discoveries only: confirmed_trading_creators
+    // tallies every TRADING_CONFIRMED funnel result including repeat sightings
+    // of already-known traders, so repeat-only runs could clear the bar with
+    // zero newly verified traders. Bounding by persisted new creators (a sound
+    // upper bound — every newly verified trader is a new channel) closes that
+    // without a schema change. No fresh-new breakdown exists per bucket, so
+    // the other buckets keep their stored totals (conservative direction kept:
+    // under-counting fresh confirmations can only HOLD, never wrongly promote).
+    const freshConfirmed = Math.min(Number(agg.confirmed || 0), Number(agg.fresh || 0));
     const verdict = evaluateNativeTermPromotion({
       novel: quality.novel,
       spamConfirmed: quality.spamConfirmed,
       executions: Number(agg.executions || 0),
       quotaConsumed: Number(agg.quota || 0),
-      confirmedTradingCreators: Number(agg.confirmed || 0),
+      confirmedTradingCreators: freshConfirmed,
       nonTradingCreators: Number(agg.nontrading || 0),
       wrongCountryCreators: Number(agg.wrong || 0),
       needsReviewCreators: Number(agg.review || 0),

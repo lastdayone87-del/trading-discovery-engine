@@ -544,7 +544,7 @@ function fakeRunner(scenarios: {
   aggregates: Record<string, unknown>;
   quality: { v1: number; spam: boolean; novel: boolean };
   latestEvent?: Record<string, unknown> | null;
-  performance?: { executions: number; quota: number; confirmed: number; nontrading: number; wrong: number; review: number };
+  performance?: { executions: number; quota: number; confirmed: number; nontrading: number; wrong: number; review: number; fresh?: number };
 }): { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>; calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
   return {
@@ -555,8 +555,8 @@ function fakeRunner(scenarios: {
         return { rows: [{ v1: scenarios.quality.v1, spam: scenarios.quality.spam, novel: scenarios.quality.novel }] };
       }
       if (text.includes('FROM terminology_performance WHERE canonical_term_id=$1')) {
-        const perf = scenarios.performance ?? { executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0 };
-        return { rows: [{ executions: perf.executions, quota: perf.quota, confirmed: perf.confirmed, nontrading: perf.nontrading, wrong: perf.wrong, review: perf.review }] };
+        const perf = scenarios.performance ?? { executions: 0, quota: 0, confirmed: 0, nontrading: 0, wrong: 0, review: 0, fresh: 0 };
+        return { rows: [{ executions: perf.executions, quota: perf.quota, confirmed: perf.confirmed, nontrading: perf.nontrading, wrong: perf.wrong, review: perf.review, fresh: perf.fresh }] };
       }
       if (text.startsWith('SELECT event_type, reason FROM')) {
         return { rows: scenarios.latestEvent ? [scenarios.latestEvent] : [] };
@@ -1099,7 +1099,7 @@ test('native term without verified traders is capped at trial, never proven', as
     // Row below trial: the legacy decision would promote straight to PROVEN.
     aggregates: { ...provenAggregates(), lifecycle_status: 'OBSERVED', search_eligible: false },
     quality: { v1: 1, spam: false, novel: true },
-    performance: { executions: 5, quota: 2000, confirmed: 0, nontrading: 1, wrong: 0, review: 1 },
+    performance: { executions: 5, quota: 2000, confirmed: 0, nontrading: 1, wrong: 0, review: 1, fresh: 4 },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
@@ -1126,11 +1126,28 @@ test('already-PROVEN rows are never capped down by the native gate', async () =>
   assert.equal(snapshots[0].params[6], 'PROVEN_SEARCH_TERM');
 });
 
+test('repeat-only confirmations cannot clear the verified-trader bar', async () => {
+  // The reported scenario: confirmed tallies repeat sightings while no new
+  // traders were verified — the fresh bound holds the term at trial.
+  const runner = fakeRunner({
+    aggregates: { ...provenAggregates(), lifecycle_status: 'OBSERVED', search_eligible: false },
+    quality: { v1: 1, spam: false, novel: true },
+    performance: { executions: 5, quota: 2000, confirmed: 12, nontrading: 0, wrong: 0, review: 0, fresh: 0 },
+  });
+  await refreshTerminologyLifecycle(42, undefined, runner as never);
+  const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].params[1], 'SEARCH_TRIAL');
+  const events = eventInserts(runner.calls);
+  assert.equal(events.length, 1);
+  assert.match(String(events[0].params[4]), /native promotion bar not met/);
+});
+
 test('native term with verified traders still reaches proven', async () => {
   const runner = fakeRunner({
     aggregates: provenAggregates(),
     quality: { v1: 1, spam: false, novel: true },
-    performance: { executions: 5, quota: 2000, confirmed: 12, nontrading: 0, wrong: 0, review: 0 },
+    performance: { executions: 5, quota: 2000, confirmed: 12, nontrading: 0, wrong: 0, review: 0, fresh: 12 },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
