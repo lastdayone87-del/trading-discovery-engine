@@ -139,7 +139,13 @@ export function findLiteralSpan(term: string, sources: LiteralSourceText[]): Lit
   // trimmed, so 'order  flow' matches 'order  flow' but never 'order flow'.
   const needle = term.normalize('NFKC').trim();
   if (needle.length < 2) return null;
-  const hasNonLatin = /[^\u0000-\u024F\u1E00-\u1EFF]/u.test(needle);
+  // Script detection runs on letters only: punctuation such as the en dash
+  // in 'order–flow' must not flip the term to the non-Latin path and
+  // disable word-boundary guards (which would admit 'order–flow' inside
+  // 'disorder–flow'). CJK and other non-Latin letters still take the
+  // boundary-free substring path.
+  const lettersOnly = needle.replace(/[^\p{L}]/gu, '');
+  const hasNonLatin = /[^\u0000-\u024F\u1E00-\u1EFF]/u.test(lettersOnly);
   const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Boundaries guard against Latin-script letters only: 'ES' inside 'heroes'
   // is a fragment, but CJK and similar scripts have no word boundaries, so an

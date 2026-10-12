@@ -99,6 +99,19 @@ test('literal spans trace to exact source text', () => {
   assert.equal(cjk?.span, '原油');
 });
 
+test('punctuated Latin terms keep word-boundary guards', () => {
+  // Script detection is letter-based: the en dash must not flip 'order–flow'
+  // to the boundary-free path (which admitted it inside 'disorder–flow').
+  const endash = [{ kind: 'DESCRIPTION', index: 0, text: 'live order–flow session' }];
+  assert.equal(findLiteralSpan('order–flow', endash)?.span, 'order–flow');
+  assert.equal(findLiteralSpan('order–flow', [{ kind: 'DESCRIPTION', index: 0, text: 'disorder–flow analysis' }]), null);
+  // Equivalent punctuation: em dash behaves the same.
+  assert.equal(findLiteralSpan('order—flow', [{ kind: 'DESCRIPTION', index: 0, text: 'live order—flow session' }])?.span, 'order—flow');
+  assert.equal(findLiteralSpan('order—flow', [{ kind: 'DESCRIPTION', index: 0, text: 'disorder—flow analysis' }]), null);
+  // CJK terms with punctuation stay on the boundary-free substring path.
+  assert.equal(findLiteralSpan('原油、期货', [{ kind: 'VIDEO_TITLE', index: 0, text: '今日原油、期货分析' }])?.span, '原油、期货');
+});
+
 test('NFKC compatibility characters map back to the exact original span', () => {
   // Full-width 'ＥＳ' normalizes to 'ES' — the span must be the original text.
   const hit = findLiteralSpan('ES', [{ kind: 'VIDEO_TITLE', index: 0, text: 'ＥＳ先物デイトレ' }]);
