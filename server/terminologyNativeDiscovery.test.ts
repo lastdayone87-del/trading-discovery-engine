@@ -1014,6 +1014,47 @@ test('recorded production sequences compete without deadlock (S9)', async () => 
   assert.equal(attrFirst.deadlocked, false);
 });
 
+test('attribution on Pool shares one transaction across lock, write, and refresh', async () => {
+  // S6: with a Pool runner the advisory lock, performance insert, and
+  // lifecycle refresh must share one transaction-bound client — otherwise the
+  // lock releases before the protected writes.
+  const statements: string[] = [];
+  let released = false;
+  const client = {
+    query: async (text: string, params: unknown[] = []) => {
+      statements.push(text);
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+      if (text.startsWith('SELECT id FROM canonical_trading_terms')) return { rows: [{ id: 9 }] };
+      if (text.startsWith('SELECT t.*')) {
+        return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
+      }
+      if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) {
+        return { rows: [{ v1: 0, spam: false, novel: false }] };
+      }
+      return { rows: [] };
+    },
+    release: () => { released = true; },
+  };
+  const pool = { connect: async () => client };
+  await attributeTerminologyPerformance(
+    { generation_metadata: { learnedTerm: 'P2P-Algo' }, country: 'Germany' } as never,
+    { distinctResults: 10, newChannels: 3 } as never,
+    100,
+    undefined,
+    undefined,
+    pool as never
+  );
+  assert.equal(statements[0], 'BEGIN');
+  assert.equal(statements[statements.length - 1], 'COMMIT');
+  assert.equal(statements.filter(text => text === 'BEGIN').length, 1);
+  const lockAt = statements.findIndex(text => text.includes('pg_advisory_xact_lock'));
+  const perfAt = statements.findIndex(text => text.startsWith('INSERT INTO terminology_performance'));
+  const refreshAt = statements.findIndex(text => text.startsWith('SELECT t.*'));
+  assert.ok(lockAt > 0 && perfAt > lockAt && refreshAt > perfAt);
+  assert.equal(released, true);
+});
+
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
