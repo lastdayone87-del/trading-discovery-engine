@@ -348,7 +348,9 @@ export interface ReconcileOutcome {
  * the derived counters from the links. All inside one transaction under an
  * advisory lock on the normalized term identity, so concurrent repairs for
  * any spelling or channel collapse to one row with every valid link and
- * uninflated counts.
+ * uninflated counts. Repaired rows start at occurrences 0: only genuine new
+ * observations increment (via saveTerm), so a repair racing an in-flight
+ * save can never inflate frequency — the saver always brings it to exactly 1.
  */
 export async function defaultReconcileExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string): Promise<ReconcileOutcome> {
   const { normalizeTerm: normalizeTermForReconcile } = await import('./terminologyIntelligence');
@@ -381,7 +383,7 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
     }
     if (rowId === null) {
       const inserted = await runner.query(
-        `INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,1,now(),now(),3,0) ON CONFLICT(country,term) DO NOTHING RETURNING id`,
+        `INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,0,now(),now(),3,0) ON CONFLICT(country,term) DO NOTHING RETURNING id`,
         [country, clean, category, sourceChannelId || null]
       );
       if (inserted.rows?.[0]?.id !== undefined && inserted.rows?.[0]?.id !== null) {

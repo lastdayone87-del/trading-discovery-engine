@@ -880,18 +880,59 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   const enteringEligibility = !row.search_eligible && decision.searchEligible;
   // The gate below acts only when legacy keeps/grants eligibility or the row
   // already has it; otherwise the outcome is the legacy path regardless, so
-  // the aggregate read is skipped (identical outcome, no wasted query).
+  // the aggregate read is skipped (identical outcome, no wasted query). A
+  // PROVEN legacy decision always sets searchEligible, so the PROVEN cap
+  // below never faces a skipped read.
   const quality = (enteringEligibility || row.search_eligible)
     ? await readNativeQualityEvidence(termId, runner)
     : { v1Observations: 0, spamConfirmed: false, novel: false };
+  // Native PROVEN gate: the legacy lifecycle must not automatically mark a
+  // native-v1 term PROVEN on executions/yield alone (scopeWeightedYield counts
+  // in-scope channels regardless of trading outcome). Promotion to PROVEN
+  // requires the native policy's verified-trader bar, evaluated here from the
+  // persisted performance ledger; otherwise the term is capped at SEARCH_TRIAL
+  // (still search-eligible, still trialed). Already-PROVEN rows are left
+  // untouched — only new promotions are gated. coordinatedBurst has no stored
+  // signal, so burst review stays operator-side (conservative: absent).
+  let effectiveDecision = decision;
+  if (decision.status === 'PROVEN_SEARCH_TERM' && quality.v1Observations > 0) {
+    const perf = await runner.query(
+      `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
+        COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,
+        COALESCE(SUM(wrong_country_creators),0)::int wrong, COALESCE(SUM(needs_review_creators),0)::int review
+       FROM terminology_performance WHERE canonical_term_id=$1`,
+      [termId]
+    );
+    const agg = ((perf.rows || [])[0] || {}) as Record<string, unknown>;
+    const verdict = evaluateNativeTermPromotion({
+      novel: quality.novel,
+      spamConfirmed: quality.spamConfirmed,
+      executions: Number(agg.executions || 0),
+      quotaConsumed: Number(agg.quota || 0),
+      confirmedTradingCreators: Number(agg.confirmed || 0),
+      nonTradingCreators: Number(agg.nontrading || 0),
+      wrongCountryCreators: Number(agg.wrong || 0),
+      needsReviewCreators: Number(agg.review || 0),
+      distinctCreators: row.distinct_creators,
+      distinctCommunities: row.distinct_communities,
+      coordinatedBurst: false,
+    });
+    if (verdict.decision !== 'PROMOTE') {
+      effectiveDecision = {
+        status: 'SEARCH_TRIAL',
+        searchEligible: true,
+        reason: `native promotion bar not met (${verdict.decision}): ${verdict.reasons.join('; ')}`,
+      };
+    }
+  }
   if (quality.v1Observations > 0) {
     const entry = evaluateTrialEntry({ novel: quality.novel, spamConfirmed: quality.spamConfirmed });
     if (!entry.allowed) {
-      if (decision.searchEligible || row.search_eligible) {
+      if (effectiveDecision.searchEligible || row.search_eligible) {
         qualityBlocked = true;
-        const demoteFollows = row.search_eligible && decision.status === 'DEMOTED';
+        const demoteFollows = row.search_eligible && effectiveDecision.status === 'DEMOTED';
         // event_type is CHECK-constrained to PROMOTION/DEMOTION/ELIGIBILITY_CHANGE.
-        const blockReason = row.search_eligible && decision.searchEligible && !demoteFollows
+        const blockReason = row.search_eligible && effectiveDecision.searchEligible && !demoteFollows
           ? `quality-gate revoked eligibility: ${entry.reasons.join('; ')}`
           : `quality-gate blocked trial entry: ${entry.reasons.join('; ')}`;
         const eventType = demoteFollows ? 'DEMOTION' : 'ELIGIBILITY_CHANGE';
@@ -903,7 +944,7 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
           blockedStatus = eventTo;
           await runner.query(
             'UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=false,trust_tier=$3 WHERE id=$1',
-            [termId, eventTo, demoteFollows ? (decision.searchEligible ? 2 : 3) : row.trust_tier]
+            [termId, eventTo, demoteFollows ? (effectiveDecision.searchEligible ? 2 : 3) : row.trust_tier]
           );
         } else {
           blockedStatus = row.lifecycle_status;
@@ -925,13 +966,13 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       }
     }
   }
-  if (!qualityBlocked && (decision.status !== row.lifecycle_status || decision.searchEligible !== row.search_eligible)) {
-    await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, decision.status, decision.searchEligible, decision.status === 'PROVEN_SEARCH_TERM' ? 1 : decision.searchEligible ? 2 : 3]);
-    await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, decision.status, decision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', decision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield })]);
+  if (!qualityBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
+    await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, effectiveDecision.status, effectiveDecision.searchEligible, effectiveDecision.status === 'PROVEN_SEARCH_TERM' ? 1 : effectiveDecision.searchEligible ? 2 : 3]);
+    await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield })]);
   }
   // The snapshot records the persisted lifecycle state: when the quality
   // gate blocks a transition, decision.status was never applied.
-  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, qualityBlocked ? (blockedStatus ?? row.lifecycle_status) : decision.status, JSON.stringify(policy)]);
+  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, qualityBlocked ? (blockedStatus ?? row.lifecycle_status) : effectiveDecision.status, JSON.stringify(policy)]);
 }
 
 /**
