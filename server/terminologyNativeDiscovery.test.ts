@@ -190,7 +190,14 @@ test('localized solicitation is screened without touching legitimate local langu
   assert.ok(detectSpamSignals('signaux gratuits vip').some(code => code.endsWith('-fr')));
   assert.ok(detectSpamSignals('Kostenlose Signale, tritt bei der VIP Gruppe').some(code => code.endsWith('-de')));
   assert.ok(detectSpamSignals('Únete a mi canal gratis señales vip').some(code => code.endsWith('-es')));
-  for (const legit of ['Analyse Technique', 'Börsenanalyse', 'Futures Handel', 'Acción del Precio', 'Flux Ordres', 'Séance de trading']) {
+  // Unicode-letter-aware boundaries: per ECMAScript \b is ASCII-only even
+  // with the `u` flag, so accented variants need explicit lookarounds.
+  for (const variant of ['únete al grupo', 'unete al grupo', 'ÚNETE AL GRUPO', 'grupo de señales gratis', 'señales gratuitas vip']) {
+    assert.ok(detectSpamSignals(variant).some(code => code.endsWith('-es')), `missed ES solicitation: ${variant}`);
+  }
+  // Glued words are not boundaries: fragments inside longer tokens stay clean.
+  assert.deepEqual(detectSpamSignals('xúnete al grupox'), []);
+  for (const legit of ['Analyse Technique', 'Börsenanalyse', 'Futures Handel', 'Acción del Precio', 'Flux Ordres', 'Séance de trading', 'Señales de Trading', 'Canal de Telegram', 'Grupo de Trading', 'Análisis Técnico', 'Gestión del Riesgo', 'Velas Japonesas']) {
     assert.deepEqual(detectSpamSignals(legit), [], `legit local term flagged: ${legit}`);
   }
 });

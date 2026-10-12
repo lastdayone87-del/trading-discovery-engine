@@ -205,7 +205,12 @@ const SPAM_SIGNAL_PATTERNS: Array<{ pattern: RegExp; code: string }> = [
   { pattern: /\b(rejoignez|rejoindre|gratuit|gratuite|gratuits)\b.{0,20}\b(signaux|signal|groupe|canal|vip)\b/i, code: 'signal-group-solicitation-fr' },
   { pattern: /\b(signaux|groupe|canal)\b.{0,20}\b(gratuit|gratuite|gratuits|rejoignez|vip)\b/i, code: 'signal-group-solicitation-fr' },
   { pattern: /\b(beitreten|tritt bei|kostenlose?|gratis)\b.{0,20}\b(signale|gruppe|kanal|vip)\b/i, code: 'signal-group-solicitation-de' },
-  { pattern: /\b(\u00fanete|unete|gratis|gratuito|gratuita)\b.{0,20}\b(se\u00f1ales|se\u00f1al|grupo|canal|vip)\b/i, code: 'signal-group-solicitation-es' },
+  // Unicode-letter-aware boundaries (not \b): per ECMAScript, \b is
+  // ASCII-only even with the `u` flag, so no boundary exists before 'ú' and
+  // 'únete al grupo' would evade screening. The `u` flag is still required
+  // for \p{} and lookbehind.
+  { pattern: /(?<![\p{L}\p{N}_])(\u00fanete|unete|gratis|gratuito|gratuita)(?![\p{L}\p{N}_]).{0,20}(?<![\p{L}\p{N}_])(se\u00f1ales|se\u00f1al|grupo|canal|vip)(?![\p{L}\p{N}_])/iu, code: 'signal-group-solicitation-es' },
+  { pattern: /(?<![\\p{L}\\p{N}_])(se\u00f1ales|se\u00f1al|grupo|canal)(?![\\p{L}\\p{N}_]).{0,20}(?<![\\p{L}\\p{N}_])(\u00fanete|unete|gratis|gratuito|gratuita|vip)(?![\\p{L}\\p{N}_])/iu, code: 'signal-group-solicitation-es' },
   { pattern: /\b(promo( code)?|discount|giveaway|bonus|airdrop)\b/i, code: 'promotional' },
   { pattern: /\b(guaranteed|risk.?free|double your|1000?x gains?)\b/i, code: 'guaranteed-returns' },
   { pattern: /[$€£¥₹]\s*\d|💰|🚀|🔥|💸|🤑|💵/i, code: 'money-bait' },
