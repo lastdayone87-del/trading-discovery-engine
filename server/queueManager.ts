@@ -53,7 +53,7 @@ import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
 import './youtubeInnertubeProvider';
-import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
+import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting } from './ingestionPipeline';
@@ -697,6 +697,12 @@ export async function processNextSearchJob(
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
       const channel = await getChannelById(channelId);
       if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+        // Retry repair: a retried ENRICH job replays vocabulary extraction so a
+        // save that failed after its observation committed cannot strand rows
+        // behind this early completion (same bars as the ingestion helper).
+        if (channel && job.attempts > 1) {
+          await replayVocabularyForRetry(channel, candidate, source, true).catch(error => console.warn(`[Vocabulary Repair] channel ${channelId}:`, error instanceof Error ? error.message : error));
+        }
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel?.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'CASE_NO_LONGER_ELIGIBLE'}).catch(()=>undefined);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel?.trading_status||'POLICY_REJECTED',output:{reason:channel?'CASE_NO_LONGER_ELIGIBLE':'CHANNEL_MISSING'}});
         await completeJob(job.id);
@@ -1069,7 +1075,7 @@ export async function processNextSearchJob(
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
-      const outcome = await processDiscoveredChannel(raw, country, source);
+      const outcome = await processDiscoveredChannel(raw, country, source, { forceExtraction: job.attempts > 1 });
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
@@ -1401,9 +1407,10 @@ export function projectLiveCountryAttribution(
 export async function processDiscoveredChannel(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
-  source: DiscoverySource
+  source: DiscoverySource,
+  options?: { forceExtraction?: boolean }
 ): Promise<ProcessDiscoveredChannelOutcome> {
-  return processChannelThroughPipeline(raw, targetCountry, source, false);
+  return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);
 }
 
 /**

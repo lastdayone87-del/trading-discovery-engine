@@ -14,7 +14,7 @@ import {
   getQuota,
   getAppSetting
 } from './db';
-import { calculateCreatorQualityScore, extractVocabularyFromCreator, resolveExtractionVideoIds } from './queryIntelligence';
+import { calculateCreatorQualityScore, extractVocabularyFromCreator, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
@@ -182,17 +182,10 @@ export async function processChannelThroughPipeline(
       console.log(
         `[Unified Ingestion Pipeline] Channel '${candidate.channelName}' (${candidate.channelId}) is already in database (Country: ${existing.country_status}, Trading: ${existing.trading_status}, Scan: ${existing.scan_status}). Preserving existing record.`
       );
-      // Retry repair: a retried job replays vocabulary extraction so a save
-      // that failed after its observation committed cannot strand missing rows
-      // behind this early return. Idempotent (observation keys, insert-gated
-      // saves, reconcile repair); skipped for first attempts to preserve the
-      // cheap-preservation fast path. Low-audience early returns stay skipped
-      // (budget gate deliberately starves them of compute). The replay honors
-      // the normal extraction bars (quality threshold, no manual-search
-      // training) exactly like the main path below.
-      if (options?.forceExtraction && existing.trading_status === 'TRADING_CONFIRMED' && source !== 'manual_search' && existing.quality_score != null && existing.quality_score >= 55) {
-        await extractVocabularyFromCreator(existing, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate), resolveExtractionVideoIds(candidate));
-      }
+      // Retry repair (see replayVocabularyForRetry): a retried job replays
+      // vocabulary extraction so a save that failed after its observation
+      // committed cannot strand missing rows behind this early return.
+      await replayVocabularyForRetry(existing, candidate, source, options?.forceExtraction ?? false);
       // Update basic existing metadata if changed
       let updated = false;
       if (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count) {

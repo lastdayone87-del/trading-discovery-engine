@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import { ChannelRecord, CountryVocabulary, QualityScoreBreakdown, QueryRecord, QueryCollection, ExtractedTermRecord } from '../src/types';
+import { ChannelRecord, CountryVocabulary, DiscoverySource, QualityScoreBreakdown, QueryRecord, QueryCollection, ExtractedTermRecord } from '../src/types';
 import {
   getDb,
   getCountryVocabularies,
@@ -18,6 +18,7 @@ import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQ
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
+import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { appendProviderCallEvent } from './db';
@@ -442,8 +443,40 @@ const EMPTY_ADMISSION_REJECTIONS = (): Record<NativeAdmissionRejectReason, numbe
 
 export interface ExtractionVideoSource {
   videoTitles: string[];
-  videos?: Array<{ id?: string; title: string }>;
+  videos?: Array<{ id?: string; title: string; language?: string }>;
   matchedDocument?: { type?: string; providerNativeId?: string; title?: string };
+  description?: string;
+  detectedLanguages?: Array<{ language: string; confidence?: number }>;
+}
+
+/**
+ * Retry repair for preserved/confirmed channels: replays vocabulary extraction
+ * so a save that failed after its observation committed cannot strand missing
+ * rows behind early-return paths. Honors the normal extraction bars (confirmed
+ * trading status, quality threshold, no manual-search training) exactly like
+ * the main path. Idempotent; returns true when extraction ran.
+ */
+export async function replayVocabularyForRetry(
+  channel: ChannelRecord,
+  candidate: ExtractionVideoSource,
+  source: DiscoverySource,
+  isRetry: boolean,
+  deps?: { extractVocabulary?: typeof extractVocabularyFromCreator }
+): Promise<boolean> {
+  if (!isRetry) return false;
+  if (source === 'manual_search') return false;
+  if (channel.trading_status !== 'TRADING_CONFIRMED') return false;
+  if (channel.quality_score == null || channel.quality_score < 55) return false;
+  const extract = deps?.extractVocabulary ?? extractVocabularyFromCreator;
+  await extract(
+    channel,
+    candidate.videoTitles,
+    candidate.description ?? '',
+    false,
+    selectExplicitTerminologyLanguageContext(candidate),
+    resolveExtractionVideoIds(candidate)
+  );
+  return true;
 }
 
 /**

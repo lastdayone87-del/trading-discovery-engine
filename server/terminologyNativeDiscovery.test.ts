@@ -26,6 +26,7 @@ import {
   type NoveltyBaseline,
 } from './terminologyIntelligence';
 import {
+  replayVocabularyForRetry,
   admitNativeCandidates,
   alignVideoIdsToTitles,
   buildLiteralSources,
@@ -1820,15 +1821,48 @@ test('search-query fallback titles never become video titles', () => {
   assert.deepEqual(withTitle[0].videoTitles, ['Real Title']);
 });
 
+test('retry replay helper gates on retry, provenance, quality, and lane', async () => {
+  const calls: Array<{ channel: string; titles: string[]; approved: boolean; locale?: string; videoIds?: Array<string | null> }> = [];
+  const stubExtract = async (
+    channel: ChannelRecord, titles: string[], description: string, approved: boolean,
+    languageContext: { language?: string; locale?: string } | undefined, videoIds?: Array<string | null>
+  ) => {
+    calls.push({ channel: channel.channel_id, titles, approved, locale: languageContext?.locale, videoIds });
+    return [];
+  };
+  const deps = { extractVocabulary: stubExtract };
+  const channel = (): ChannelRecord => ({ channel_id: 'ch-1', channel_name: 'Kanal', country: 'Germany', trading_status: 'TRADING_CONFIRMED', quality_score: 80 } as unknown as ChannelRecord);
+  const candidate = {
+    videoTitles: ['SMC backtest'], description: 'About',
+    videos: [{ id: 'v-1', title: 'SMC backtest' }],
+    detectedLanguages: [{ language: 'de-DE', confidence: 90 }],
+  };
+  // Retry + confirmed + quality + autonomous: replays with honest provenance.
+  assert.equal(await replayVocabularyForRetry(channel(), candidate, 'automated_query', true, deps), true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].titles, ['SMC backtest']);
+  assert.equal(calls[0].approved, false);
+  assert.equal(calls[0].locale, 'de-DE');
+  assert.deepEqual(calls[0].videoIds, ['v-1']);
+  // First attempt, manual lane, unconfirmed, and low quality: all skip.
+  assert.equal(await replayVocabularyForRetry(channel(), candidate, 'automated_query', false, deps), false);
+  assert.equal(await replayVocabularyForRetry(channel(), candidate, 'manual_search', true, deps), false);
+  assert.equal(await replayVocabularyForRetry({ ...channel(), trading_status: 'UNCERTAIN' } as ChannelRecord, candidate, 'automated_query', true, deps), false);
+  assert.equal(await replayVocabularyForRetry({ ...channel(), quality_score: 10 } as ChannelRecord, candidate, 'automated_query', true, deps), false);
+  assert.equal(calls.length, 1);
+});
+
 test('retry forces extraction replay on the preserved-channel path', () => {
   // Structural pin: the preserved early return must replay vocabulary
   // extraction when forceExtraction is set (failed saves strand otherwise),
   // and the ENRICH caller must set it only on genuine retries (attempts are
   // claimed pre-run, so first executions see attempts=1 and keep the fast path).
   const ingestion = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
-  assert.match(ingestion, /if \(options\?\.forceExtraction && existing\.trading_status === 'TRADING_CONFIRMED' && source !== 'manual_search' && existing\.quality_score != null && existing\.quality_score >= 55\) \{\s*await extractVocabularyFromCreator\(existing, candidate\.videoTitles/);
+  assert.match(ingestion, /await replayVocabularyForRetry\(existing, candidate, source, options\?\.forceExtraction \?\? false\)/);
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(queue, /forceExtraction:job\.attempts>1/);
+  assert.match(queue, /await replayVocabularyForRetry\(channel, candidate, source, true\)/);
+  assert.match(queue, /processDiscoveredChannel\(raw, country, source, \{ forceExtraction: job\.attempts > 1 \}\)/);
 });
 
 test('extraction caller marks non-metadata origins honestly', () => {
