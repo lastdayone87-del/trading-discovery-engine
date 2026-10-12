@@ -1200,11 +1200,25 @@ test('saveExtractedTerm shares the normalized-identity lock and reuses variant r
   assert.deepEqual(released, [0]);
 });
 
-test('vocabulary fold matches observation-term canonicalization', async () => {
+test('saveExtractedTerm lock key matches observation-term canonicalization', async () => {
+  // The production fold is captured from the advisory lock statement itself —
+  // a test-local copy would pass while production drifts.
   const { normalizeTerm } = await import('./terminologyIntelligence');
-  const fold = (value: string) => value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
-  for (const tricky of ['BTC', 'btc', 'Btc', 'order  flow', 'order\u00a0flow', 'ＥＳ', 'ﬁb', 'KİLİT', 'Straße']) {
-    assert.equal(fold(tricky), normalizeTerm(tricky), `fold drift on ${JSON.stringify(tricky)}`);
+  const { saveExtractedTerm } = await import('./dbCore');
+  for (const tricky of ['BTC', 'order  flow', 'order\u00a0flow', 'ＥＳ', 'KİLİT', 'Straße']) {
+    let lockKey = '';
+    const pool = {
+      connect: async () => ({
+        query: async (text: string, params: unknown[] = []) => {
+          if (text.includes('pg_advisory_xact_lock')) lockKey = String(params[0]);
+          if (text.startsWith('INSERT INTO extracted_trading_vocabulary')) return { rows: [{ id: 11 }] };
+          return { rows: [] };
+        },
+        release: () => undefined,
+      }),
+    };
+    await saveExtractedTerm('Germany', tricky, 'instrument', undefined, pool as never);
+    assert.equal(lockKey, `extracted-vocab:Germany:${normalizeTerm(tricky)}`, `lock-key drift on ${JSON.stringify(tricky)}`);
   }
 });
 
