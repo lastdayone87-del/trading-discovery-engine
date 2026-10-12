@@ -21,12 +21,19 @@ function uniqueLanguages(values: string[]): string[] {
 }
 
 /**
- * Canonical full tag (BCP 47 shape: language lower, region upper when present).
+ * Canonical full tag via Intl.Locale: language, script, and region subtags
+ * normalized per BCP 47 (script title-case, region upper-case). Script-only
+ * tags ('zh-Hans') and bare languages collapse to the primary language —
+ * they carry no region and must never read as regional locales. Invalid tags
+ * yield '' so malformed input can never fabricate a locale.
  */
 function canonicalTag(value: string): string {
-  const parts = value.trim().split(/[-_]/);
-  if (parts.length < 2 || !parts[0] || !parts[1]) return (parts[0] || '').toLowerCase();
-  return `${parts[0].toLowerCase()}-${parts[1].toUpperCase()}`;
+  try {
+    const locale = new Intl.Locale(value.trim().replace(/_/g, '-'));
+    return locale.region ? locale.toString() : locale.language;
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -66,6 +73,9 @@ export function selectExplicitTerminologyLanguageContext(
   ];
   const documentLanguages = uniqueLanguages(documents);
   if (documentLanguages.length !== 1) return undefined;
-  const locale = explicitLocale(documents);
+  // Consensus runs over signals agreeing with the selected language only:
+  // 'und'/unknown entries carry no information and must not veto an explicit
+  // regional tag (nor smuggle one in).
+  const locale = explicitLocale(documents.filter(value => normalized(value) === documentLanguages[0]));
   return locale ? { language: documentLanguages[0], locale } : { language: documentLanguages[0] };
 }

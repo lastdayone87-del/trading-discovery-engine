@@ -345,6 +345,8 @@ export interface NativeCandidateAdmission {
   novelty: TermNovelty;
   flags: TermQualityFlags;
   spamSignals: string[];
+  /** Solicitation signals in the matched source text (evidence-only). */
+  sourceSpamSignals: string[];
 }
 
 export interface NativeCandidateRejection {
@@ -385,7 +387,11 @@ export function classifyNativeCandidate(
     existingTerms: baseline.existingTerms,
   });
   const flags = evaluateTermQualityFlags(raw, { language: opts.language, curatedTerms: baseline.curatedTerms });
-  return { admit: true, located, novelty, flags, spamSignals };
+  const matchedSource = sources.find(
+    source => source.kind === located.sourceKind && source.index === located.sourceIndex
+  );
+  const sourceSpamSignals = matchedSource ? detectSpamSignals(matchedSource.text) : [];
+  return { admit: true, located, novelty, flags, spamSignals, sourceSpamSignals };
 }
 
 /**
@@ -872,7 +878,12 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // row status; revoke preserves it too unless legacy rules demote).
   let blockedStatus: string | null = null;
   const enteringEligibility = !row.search_eligible && decision.searchEligible;
-  const quality = await readNativeQualityEvidence(termId, runner);
+  // The gate below acts only when legacy keeps/grants eligibility or the row
+  // already has it; otherwise the outcome is the legacy path regardless, so
+  // the aggregate read is skipped (identical outcome, no wasted query).
+  const quality = (enteringEligibility || row.search_eligible)
+    ? await readNativeQualityEvidence(termId, runner)
+    : { v1Observations: 0, spamConfirmed: false, novel: false };
   if (quality.v1Observations > 0) {
     const entry = evaluateTrialEntry({ novel: quality.novel, spamConfirmed: quality.spamConfirmed });
     if (!entry.allowed) {

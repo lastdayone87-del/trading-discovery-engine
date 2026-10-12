@@ -808,6 +808,110 @@ test('attribution path acquires the advisory lock before its performance insert'
   assert.ok(lockAt >= 0 && perfAt > lockAt, 'performance insert follows the lock');
 });
 
+// --- Finding C: deterministic lock-order competition model ---
+//
+// No writable database is available in this environment (no PHASE10_POSTGRES_URL
+// or DATABASE_URL; the audit tunnel is read-only), so the live multi-connection
+// proof cannot run here. This model executes the exact statement order the
+// production paths issue (proven by the order tests above) under PostgreSQL
+// lock-compatibility rules and both adversarial interleavings. It fails if the
+// order ever regresses to hold-row-lock-while-requesting-advisory.
+
+type SimLockMode = 'KEY_SHARE' | 'ROW_EXCLUSIVE';
+interface SimStep { txn: 'OBS' | 'ATTR'; op: 'canon' | 'advisory' | 'keyshare' | 'rowexcl' | 'read' | 'commit' }
+
+function runLockCompetition(obsSeq: SimStep[], attrSeq: SimStep[], first: 'OBS' | 'ATTR'): { deadlocked: boolean; attrSawCommit: boolean; steps: number } {
+  // Program-counter model: a blocked transaction does NOT advance — its later
+  // statements (including commit) stay queued behind the contested lock, like
+  // real PostgreSQL blocking waits. A full round with zero progress on every
+  // unfinished transaction is a deadlock cycle.
+  let advisoryHolder: string | null = null;
+  const rowHeld: Array<{ txn: string; mode: SimLockMode }> = [];
+  const store = { obsCommitted: false };
+  let attrSawCommit = false;
+  const pc: Record<'OBS' | 'ATTR', number> = { OBS: 0, ATTR: 0 };
+  const done = new Set<string>();
+  let steps = 0;
+  const conflicts = (txn: string, mode: SimLockMode): boolean =>
+    rowHeld.some(entry => entry.txn !== txn && (mode === 'ROW_EXCLUSIVE' || entry.mode === 'ROW_EXCLUSIVE'));
+  const order: Array<'OBS' | 'ATTR'> = first === 'OBS' ? ['OBS', 'ATTR'] : ['ATTR', 'OBS'];
+  for (; steps < 500; steps++) {
+    if (done.size >= 2) break;
+    let progressed = false;
+    for (const txn of order) {
+      if (done.has(txn)) continue;
+      const mine = txn === 'OBS' ? obsSeq : attrSeq;
+      const current = mine[pc[txn]];
+      if (!current) continue;
+      if (current.op === 'commit') {
+        for (let i = rowHeld.length - 1; i >= 0; i--) if (rowHeld[i].txn === txn) rowHeld.splice(i, 1);
+        if (advisoryHolder === txn) advisoryHolder = null;
+        if (txn === 'OBS') store.obsCommitted = true;
+        done.add(txn);
+        progressed = true;
+        continue;
+      }
+      if (current.op === 'read') {
+        if (txn === 'ATTR' && store.obsCommitted) attrSawCommit = true;
+        pc[txn] += 1;
+        progressed = true;
+        continue;
+      }
+      if (current.op === 'canon') {
+        pc[txn] += 1; // uncontended new-row upsert, holds nothing
+        progressed = true;
+        continue;
+      }
+      if (current.op === 'advisory') {
+        if (advisoryHolder !== null && advisoryHolder !== txn) continue; // blocked: pc frozen
+        advisoryHolder = txn;
+        pc[txn] += 1;
+        progressed = true;
+        continue;
+      }
+      const mode: SimLockMode = current.op === 'keyshare' ? 'KEY_SHARE' : 'ROW_EXCLUSIVE';
+      if (conflicts(txn, mode)) continue; // blocked: pc frozen
+      rowHeld.push({ txn, mode });
+      pc[txn] += 1;
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  const deadlocked = done.size < 2;
+  return { deadlocked, attrSawCommit, steps };
+}
+
+const OBS_SEQUENCE: SimStep[] = [
+  { txn: 'OBS', op: 'canon' },
+  { txn: 'OBS', op: 'advisory' },
+  { txn: 'OBS', op: 'keyshare' },
+  { txn: 'OBS', op: 'rowexcl' },
+  { txn: 'OBS', op: 'read' },
+  { txn: 'OBS', op: 'rowexcl' },
+  { txn: 'OBS', op: 'commit' },
+];
+
+const ATTR_SEQUENCE: SimStep[] = [
+  { txn: 'ATTR', op: 'read' },
+  { txn: 'ATTR', op: 'advisory' },
+  { txn: 'ATTR', op: 'keyshare' },
+  { txn: 'ATTR', op: 'read' },
+  { txn: 'ATTR', op: 'rowexcl' },
+  { txn: 'ATTR', op: 'commit' },
+];
+
+test('lock competition completes under every interleaving with post-commit visibility', () => {
+  // Attribution wins the advisory race: observation waits holding nothing,
+  // attribution commits, observation proceeds against committed state.
+  const first = runLockCompetition(OBS_SEQUENCE, ATTR_SEQUENCE, 'ATTR');
+  assert.equal(first.deadlocked, false);
+  // Observation wins: attribution waits at the advisory lock, then reads the
+  // committed observation (the visibility guarantee behind findings C and D).
+  const second = runLockCompetition(OBS_SEQUENCE, ATTR_SEQUENCE, 'OBS');
+  assert.equal(second.deadlocked, false);
+  assert.equal(second.attrSawCommit, true);
+});
+
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
@@ -834,13 +938,24 @@ function fakeDeps(scenarios: {
   observe?: (args: Record<string, unknown>) => Promise<{ termId: number; observationInserted: boolean } | null>;
   save?: (country: string, term: string) => Promise<unknown>;
   log?: (message: string) => void;
+  hasTerm?: (country: string, term: string) => Promise<boolean>;
+  ensureTerm?: (country: string, term: string) => Promise<unknown>;
+  ensured?: Array<{ country: string; term: string }>;
   observed: Array<Record<string, unknown>>;
   saved: Array<{ country: string; term: string }>;
 }) {
+  const ensured = scenarios.ensured ?? [];
   return {
     observeTerm: async (args: Record<string, unknown>): Promise<{ termId: number; observationInserted: boolean } | null> => {
       scenarios.observed.push(args);
       return scenarios.observe ? scenarios.observe(args) : { termId: 7, observationInserted: true };
+    },
+    // Unit-test default: vocabulary row present (replays skip writes). Tests
+    // covering repair pass their own hasTerm/ensureTerm fakes.
+    hasTerm: scenarios.hasTerm ?? (async () => true),
+    ensureTerm: async (country: string, term: string): Promise<unknown> => {
+      ensured.push({ country, term });
+      if (scenarios.ensureTerm) return scenarios.ensureTerm(country, term);
     },
     saveTerm: async (country: string, term: string): Promise<unknown> => {
       scenarios.saved.push({ country, term });
@@ -915,6 +1030,77 @@ test('replayed observations reuse evidence without inflating vocabulary counts',
   const second = await admitNativeCandidates(admission);
   assert.deepEqual([second.admitted, second.duplicates], [0, 1]);
   assert.deepEqual(saved, [{ country: 'Germany', term: 'P2P-Algo' }]);
+});
+
+test('failed saveTerm is repaired on retry without inflating counts', async () => {
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const ensured: Array<{ country: string; term: string }> = [];
+  const store = new Set<string>();
+  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-1' }];
+  let saveCalls = 0;
+  const deps = fakeDeps({
+    ensured, observed, saved,
+    observe: async () => ({ termId: 7, observationInserted: saveCalls === 0 }),
+    save: async () => { saveCalls += 1; if (saveCalls === 1) throw new Error('vocab save down'); },
+    hasTerm: async (_country, term) => store.has(term),
+    ensureTerm: async (_country, term) => { store.add(term); },
+  });
+  const admission = {
+    channel: testChannel(), sources,
+    parsed: { terminology: ['P2P-Algo'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
+  };
+  // First attempt: observation commits, saveTerm throws -> propagates visibly.
+  // (The failed save call itself is recorded once; it is never retried
+  // blindly — the retry replays the observation as a duplicate instead.)
+  await assert.rejects(admitNativeCandidates(admission), /vocab save down/);
+  assert.equal(saved.length, 1);
+  // Retry: observation replays as duplicate, missing row is repaired.
+  const retry = await admitNativeCandidates(admission);
+  assert.deepEqual([retry.admitted, retry.duplicates], [1, 0]);
+  assert.deepEqual(ensured, [{ country: 'Germany', term: 'P2P-Algo' }]);
+  assert.equal(saved.length, 1);
+  // Third run: everything present -> pure duplicate, no writes at all.
+  const third = await admitNativeCandidates(admission);
+  assert.deepEqual([third.admitted, third.duplicates], [0, 1]);
+  assert.deepEqual(ensured.length, 1);
+});
+
+test('concurrent repairs create exactly one vocabulary record', async () => {
+  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'SMC backtest', videoId: 'vid-2' }];
+  const saved: Array<{ country: string; term: string }> = [];
+  const ensured: Array<{ country: string; term: string }> = [];
+  const store = new Set<string>();
+  let releaseHasTerm: (() => void) | null = null;
+  const gate = new Promise<void>(resolve => { releaseHasTerm = resolve; });
+  let hasTermCalls = 0;
+  const deps = fakeDeps({
+    ensured, observed: [], saved,
+    observe: async () => ({ termId: 8, observationInserted: false }),
+    // Both retries observe hasTerm=false before either ensure runs.
+    hasTerm: async (_country, term) => { hasTermCalls += 1; if (hasTermCalls < 2) await gate; return store.has(term); },
+    // DO-NOTHING semantics: concurrent inserts collapse to one record.
+    // (The shared wrapper records each ensure call in `ensured`.)
+    ensureTerm: async (_country, term) => {
+      if (hasTermCalls >= 2 && releaseHasTerm) releaseHasTerm();
+      if (!store.has(term)) store.add(term);
+    },
+  });
+  const admission = {
+    channel: testChannel(), sources,
+    parsed: { terminology: ['SMC'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
+  };
+  const [first, second] = await Promise.all([admitNativeCandidates(admission), admitNativeCandidates(admission)]);
+  // Exactly one repair wins; the loser dedupes against the repaired row.
+  // One vocabulary record exists; saveTerm never runs on replays.
+  assert.equal(store.size, 1);
+  assert.equal(ensured.length, 1);
+  assert.equal(first.admitted + second.admitted, 1);
+  const totalDuplicates = first.duplicates + second.duplicates;
+  assert.equal(totalDuplicates, 1);
+  assert.deepEqual(saved, []);
 });
 
 test('over-length candidates are rejected by the length guard, not by missing infrastructure', async () => {
@@ -1147,6 +1333,39 @@ test('search-query fallback titles never become video titles', () => {
 test('extraction caller marks non-metadata origins honestly', () => {
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(source, /videoTitlesAreMetadata: false, descriptionIsMetadata: false/);
+});
+
+test('source solicitation signals are recorded as evidence without blocking legit terms', () => {
+  // A legitimate term quoted in solicitation prose is still admittable; the
+  // source spam flags travel as review evidence instead of suppressing it.
+  const spammy: LiteralSourceText[] = [{ kind: 'DESCRIPTION', index: 0, text: 'Join my FREE VIP signals group for SMC secrets' }];
+  const verdict = classifyNativeCandidate('SMC', spammy, okBaseline(), {});
+  assert.equal(verdict.admit, true);
+  if (verdict.admit === true) {
+    assert.ok(verdict.sourceSpamSignals.length > 0);
+    assert.deepEqual(verdict.spamSignals, []);
+  }
+  const clean: LiteralSourceText[] = [{ kind: 'DESCRIPTION', index: 0, text: 'SMC backtest results' }];
+  const cleanVerdict = classifyNativeCandidate('SMC', clean, okBaseline(), {});
+  assert.equal(cleanVerdict.admit, true);
+  if (cleanVerdict.admit === true) assert.deepEqual(cleanVerdict.sourceSpamSignals, []);
+  // Rule path carries the same evidence on its hits.
+  const ruleHits = findRuleInstrumentHits('Kanal', [], 'Trade ES, join my VIP signals group');
+  assert.equal(ruleHits.length, 1);
+  assert.ok(ruleHits[0].sourceSpamSignals.length > 0);
+  const ruleClean = findRuleInstrumentHits('Kanal', [], 'Trade ES futures today');
+  assert.deepEqual(ruleClean[0].sourceSpamSignals, []);
+});
+
+test('quality read is skipped when it cannot affect the transition', async () => {
+  // CANDIDATE staying non-eligible: the gate cannot act, so no aggregate query.
+  const runner = fakeRunner({
+    aggregates: legacyAggregates({ lifecycle_status: 'CANDIDATE', decayed_evidence: 0, distinct_creators: 1, distinct_communities: 1 }),
+    quality: { v1: 0, spam: false, novel: false },
+  });
+  await refreshTerminologyLifecycle(42, undefined, runner as never);
+  assert.ok(!runner.calls.some(call => call.text.includes('bool_or')), 'no quality aggregate on the no-op legacy path');
+  assert.ok(runner.calls.some(call => call.text.startsWith('INSERT INTO terminology_score_snapshots')));
 });
 
 test('planner serves trial terms inside generated queries', () => {

@@ -11,6 +11,38 @@ test('final integration: highest-confidence explicit detected language is select
   }), { language: 'de' });
 });
 
+test('final integration: regional locale consensus follows BCP 47 without truncation', () => {
+  assert.deepEqual(selectExplicitTerminologyLanguageContext({
+    detectedLanguages: [{ language: 'zh-Hant-TW', confidence: 90 }]
+  }), { language: 'zh', locale: 'zh-Hant-TW' });
+  assert.deepEqual(selectExplicitTerminologyLanguageContext({
+    detectedLanguages: [{ language: 'zh-Hans-CN', confidence: 90 }]
+  }), { language: 'zh', locale: 'zh-Hans-CN' });
+  // Script-only tags carry no region and must not read as regional locales.
+  assert.deepEqual(selectExplicitTerminologyLanguageContext({
+    detectedLanguages: [{ language: 'zh-Hans', confidence: 90 }]
+  }), { language: 'zh' });
+  // Conflicting regions never agree, even under the same script.
+  assert.deepEqual(selectExplicitTerminologyLanguageContext({
+    detectedLanguages: [
+      { language: 'zh-Hant-TW', confidence: 90 },
+      { language: 'zh-Hant-HK', confidence: 90 }
+    ]
+  }), { language: 'zh' });
+  // Unknown signals do not veto an explicit regional tag...
+  assert.deepEqual(selectExplicitTerminologyLanguageContext({
+    videos: [{ language: 'fr-FR' }, { language: 'und' }]
+  }), { language: 'fr', locale: 'fr-FR' });
+  // ...but unknown locale with no usable signal stays unknown.
+  assert.equal(selectExplicitTerminologyLanguageContext({ videos: [{ language: 'und' }] }), undefined);
+  assert.equal(selectExplicitTerminologyLanguageContext({
+    detectedLanguages: [
+      { language: 'de-DE', confidence: 90 },
+      { language: 'fr-FR', confidence: 90 }
+    ]
+  }), undefined);
+});
+
 test('final integration: conflicting equally strong language evidence remains unknown', () => {
   assert.equal(selectExplicitTerminologyLanguageContext({
     detectedLanguages: [

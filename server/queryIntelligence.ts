@@ -16,7 +16,7 @@ import {
 import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
-import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, findLiteralSpan, getPlannerTerminology, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
+import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -193,6 +193,8 @@ export function calculateCreatorQualityScore(
 export interface RuleInstrumentHit {
   instrument: string;
   located: LiteralSpanMatch;
+  /** Solicitation signals in the matched source text (evidence-only). */
+  sourceSpamSignals: string[];
 }
 
 /**
@@ -212,7 +214,11 @@ export function findRuleInstrumentHits(
   const hits: RuleInstrumentHit[] = [];
   for (const instrument of KNOWN_INSTRUMENT_TERMS) {
     const located = findLiteralSpan(instrument, sources);
-    if (located) hits.push({ instrument, located });
+    if (!located) continue;
+    const matchedSource = sources.find(
+      source => source.kind === located.sourceKind && source.index === located.sourceIndex
+    );
+    hits.push({ instrument, located, sourceSpamSignals: matchedSource ? detectSpamSignals(matchedSource.text) : [] });
   }
   return hits;
 }
@@ -311,6 +317,42 @@ export interface NativeAdmissionDeps {
   saveTerm: (country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', channelId?: string) => Promise<unknown>;
   observeTerm: (args: Parameters<typeof observeTerminologyDetailed>[0]) => Promise<TerminologyObservationResult | null>;
   log?: (message: string) => void;
+  /** Existence check for repair-on-replay. Defaults to a DB lookup. */
+  hasTerm?: (country: string, term: string) => Promise<boolean>;
+  /** Idempotent repair insert (ON CONFLICT DO NOTHING — never inflates counts). */
+  ensureTerm?: (country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', channelId?: string) => Promise<unknown>;
+}
+
+/**
+ * Repair insert mirroring saveExtractedTerm's row shape, but ON CONFLICT DO
+ * NOTHING instead of incrementing occurrences. Observation and
+ * extracted-vocabulary persistence intentionally share no transaction (separate
+ * lanes); when a save fails after its observation committed, a later replay
+ * hits ON CONFLICT (observationInserted=false) and this repair recreates the
+ * missing vocabulary row without double-counting — concurrent repairs are
+ * naturally idempotent.
+ */
+export async function defaultEnsureExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string): Promise<void> {
+  const db = await getDb();
+  const clean = term.trim();
+  if (!clean) return;
+  const saved = await db.query(
+    `INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,1,now(),now(),3,0) ON CONFLICT(country,term) DO NOTHING RETURNING id`,
+    [country, clean, category, sourceChannelId || null]
+  );
+  const termId = saved.rows?.[0]?.id;
+  if (termId && sourceChannelId) {
+    await db.query(
+      `INSERT INTO extracted_vocabulary_sources(term_id,channel_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM channels WHERE channel_id=$2 AND trading_status='TRADING_CONFIRMED') ON CONFLICT DO NOTHING`,
+      [termId, sourceChannelId]
+    );
+  }
+}
+
+export async function defaultHasExtractedTerm(country: string, term: string): Promise<boolean> {
+  const db = await getDb();
+  const found = await db.query(`SELECT 1 FROM extracted_trading_vocabulary WHERE country=$1 AND term=$2 LIMIT 1`, [country, term.trim()]);
+  return (found.rows?.length ?? 0) > 0;
 }
 
 export interface NativeAdmissionReport {
@@ -354,6 +396,8 @@ export async function admitNativeCandidates(args: {
 }): Promise<NativeAdmissionReport> {
   const saveTerm = args.deps?.saveTerm ?? ((country, term, category, channelId) => saveExtractedTerm(country, term, category, channelId));
   const observeTerm = args.deps?.observeTerm ?? ((observeArgs) => observeTerminologyDetailed(observeArgs));
+  const hasTerm = args.deps?.hasTerm ?? defaultHasExtractedTerm;
+  const ensureTerm = args.deps?.ensureTerm ?? defaultEnsureExtractedTerm;
   const log = args.deps?.log ?? ((message) => console.warn(message));
   const rejected = EMPTY_ADMISSION_REJECTIONS();
   let admitted = 0;
@@ -379,7 +423,7 @@ export async function admitNativeCandidates(args: {
         extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
         sourceRef: { kind: verdict.located.sourceKind, index: verdict.located.sourceIndex, span: verdict.located.span, videoId: verdict.located.videoId ?? null },
         novel: verdict.novelty.novel, knownAs: verdict.novelty.knownAs,
-        generic: verdict.flags.generic, spamConfirmed: false, spamSignals: verdict.spamSignals,
+        generic: verdict.flags.generic, spamConfirmed: false, spamSignals: verdict.spamSignals, sourceSpamSignals: verdict.sourceSpamSignals,
         translationRisk: verdict.flags.translationRisk,
       },
     });
@@ -387,9 +431,18 @@ export async function admitNativeCandidates(args: {
       rejected['observation-failed'] += 1;
       return;
     }
-    // Occurrence counts advance only on newly persisted evidence: replaying
-    // an already-recorded observation reuses it idempotently (no saveTerm).
+    // Occurrence counts advance only on newly persisted evidence. A replayed
+    // (already-recorded) observation normally needs no write — unless its
+    // vocabulary row is missing because an earlier saveTerm failed after the
+    // observation committed. In that case repair it idempotently; concurrent
+    // repairs collapse on ON CONFLICT DO NOTHING without inflating counts.
+    // Thrown errors propagate (never swallowed): the caller retries.
     if (!observation.observationInserted) {
+      if (!(await hasTerm(args.channel.country, String(raw)))) {
+        await ensureTerm(args.channel.country, String(raw), category, args.channel.channel_id);
+        admitted += 1;
+        return;
+      }
       duplicates += 1;
       return;
     }
@@ -439,10 +492,12 @@ export async function extractVocabularyFromCreator(
   for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
-    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], translationRisk: null } });
+    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
     if (ruleObservation == null) continue;
     if (ruleObservation.observationInserted) {
       await saveExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
+    } else if (!(await defaultHasExtractedTerm(channel.country, hit.instrument))) {
+      await defaultEnsureExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
     }
   }
 
