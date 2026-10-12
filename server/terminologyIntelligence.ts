@@ -155,12 +155,15 @@ export function findLiteralSpan(term: string, sources: LiteralSourceText[]): Lit
   // Case-insensitive matching is left to the regex engine ('iu'), which folds
   // case per character without changing string lengths — lowercasing both
   // sides first (e.g. Turkish İ → i̇) would shift offsets and corrupt spans.
-  const pattern = new RegExp(body, 'iu');
+  const pattern = new RegExp(body, 'giu');
   for (const source of sources) {
     if (!source.text) continue;
     const { normalized, indexMap } = normalizeWithIndexMap(source.text);
-    const match = normalized.match(pattern);
-    if (match && match.index !== undefined) {
+    // Every match in the source is tried in order: a first hit that fails
+    // round-trip validation (e.g. cutting through a compatibility-character
+    // expansion) must not hide a later exact occurrence in the same source.
+    for (const match of normalized.matchAll(pattern)) {
+      if (match.index === undefined) continue;
       const span = sliceOriginalSource(source.text, indexMap, match.index, match.index + match[0].length);
       if (!span) continue;
       // Round-trip validation: the slice must NFKC-equal the normalized
@@ -782,14 +785,23 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
     }
     return;
   }
-  // Per-term serialization: lock the canonical row BEFORE reading aggregates
-  // and quality evidence. A concurrent refresh (or an in-flight observation
+  // Per-term serialization WITHOUT row-lock upgrade hazards: an advisory
+  // transaction lock on the term, taken BEFORE reading aggregates and quality
+  // evidence. A concurrent refresh (or an in-flight observation/attribution
   // transaction, which refreshes inside its own transaction) then waits for
   // this transaction's committed state instead of deciding on pre-commit
   // reads — every transition evaluates committed evidence under the same
-  // lock, and block-event check-and-insert becomes atomic with the refresh.
-  // Single-row lock only, so no lock-ordering hazard exists.
-  await runner.query(`SELECT id FROM canonical_trading_terms WHERE id=$1 FOR UPDATE`, [termId]);
+  // serialization, and block-event check-and-insert becomes atomic with the
+  // refresh. A row lock (FOR UPDATE) is deliberately NOT used here: both
+  // observation and performance inserts hold FOR KEY SHARE on the term row
+  // via their canonical_term_id foreign keys until commit, and two
+  // transactions upgrading KEY SHARE -> FOR UPDATE on the same term deadlock.
+  // FOR NO KEY UPDATE would avoid the deadlock but is compatible with KEY
+  // SHARE, so it would not wait for uncommitted observations and would
+  // reintroduce the pre-commit-read race. The advisory lock (separate lock
+  // namespace, one lock per refresh, always acquired first) serializes with
+  // neither hazard. Namespace follows the codebase hashtext($1) convention.
+  await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`terminology-lifecycle:${termId}`]);
   const result = await runner.query(`SELECT t.*, COALESCE(o.distinct_creators,0)::int distinct_creators, COALESCE(o.distinct_communities,0)::int distinct_communities,
     COALESCE(o.human_approved,0)::int human_approved, COALESCE(o.decayed_evidence,0)::float decayed_evidence,
     COALESCE(p.executions,0)::int executions, COALESCE(p.decayed_yield,0)::float decayed_yield

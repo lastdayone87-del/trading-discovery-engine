@@ -242,6 +242,17 @@ export function alignVideoIdsToTitles(
   });
 }
 
+/**
+ * Whether Gemini extraction has any text worth analyzing. The channel name
+ * always counts: post-approval enrichment passes no metadata titles or
+ * descriptions, but valid literal terminology in the channel name alone must
+ * still reach native admission (with CHANNEL_NAME provenance). Exported for
+ * unit testing.
+ */
+export function hasNativeExtractionText(channelName: string, titles: string[], description: string): boolean {
+  return channelName.trim() !== '' || titles.length > 0 || description.length > 20;
+}
+
 export interface ExtractionSourceOrigins {
   /** False when videoTitles are not YouTube metadata (fallbacks/prose). */
   videoTitlesAreMetadata?: boolean;
@@ -407,7 +418,7 @@ export async function extractVocabularyFromCreator(
   // sources, rule spans, or quoted prompt context.
   const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
   const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
-  if (ai && (effTitles.length > 0 || effDesc.length > 20)) {
+  if (ai && hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
     try {
       const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"

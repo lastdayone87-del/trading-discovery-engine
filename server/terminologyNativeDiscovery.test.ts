@@ -28,6 +28,7 @@ import {
   alignVideoIdsToTitles,
   buildLiteralSources,
   findRuleInstrumentHits,
+  hasNativeExtractionText,
 } from './queryIntelligence';
 import { computeObservationKey } from './countryNativeIntelligence';
 import { extractDiscoveredChannels } from './youtube';
@@ -112,6 +113,15 @@ test('NFKC expansions cannot fabricate literal provenance', () => {
   // Valid NFKC equivalences still trace with exact original spans.
   assert.equal(findLiteralSpan('ES', [{ kind: 'VIDEO_TITLE', index: 0, text: 'ＥＳ先物' }])?.span, 'ＥＳ');
   assert.equal(findLiteralSpan('fib', [{ kind: 'DESCRIPTION', index: 0, text: 'ﬁb levels' }])?.span, 'ﬁb');
+});
+
+test('round-trip failure scans later matches in the same source', () => {
+  // First hit cuts through the U+3300 expansion (rejected); the later exact
+  // occurrence must still be found with its literal span.
+  const hit = findLiteralSpan('アパ', [{ kind: 'DESCRIPTION', index: 0, text: '㌀ text アパ' }]);
+  assert.deepEqual(hit, { sourceKind: 'DESCRIPTION', sourceIndex: 0, span: 'アパ', videoId: null });
+  // Single false-span source still rejects (no valid later occurrence).
+  assert.equal(findLiteralSpan('不動産アパ', [{ kind: 'DESCRIPTION', index: 0, text: '不動産㌀' }]), null);
 });
 
 test('punctuated Latin terms keep word-boundary guards', () => {
@@ -672,11 +682,20 @@ test('refresh serializes per term: lock before reads, transaction around writes'
   const pool = { connect: async () => client };
   await refreshTerminologyLifecycle(42, undefined, pool as never);
   assert.equal(statements[0], 'BEGIN');
-  const lockAt = statements.findIndex(text => text.includes('FOR UPDATE'));
+  // Advisory transaction lock (never FOR UPDATE: row-lock upgrades against
+  // FK KEY SHARE locks deadlock; FOR NO KEY UPDATE would not wait for
+  // uncommitted observations and would reintroduce the pre-commit race).
+  const lockAt = statements.findIndex(text => text.includes('pg_advisory_xact_lock'));
+  assert.ok(lockAt >= 0, 'serialization lock acquired');
+  assert.deepEqual(
+    statements[lockAt],
+    'SELECT pg_advisory_xact_lock(hashtext($1))'
+  );
+  assert.ok(!statements.some(text => text.includes('FOR UPDATE')), 'no row-lock upgrade');
   const aggregatesAt = statements.findIndex(text => text.startsWith('SELECT t.*'));
   const qualityAt = statements.findIndex(text => text.includes('bool_or'));
   const updateAt = statements.findIndex(text => text.startsWith('UPDATE canonical_trading_terms'));
-  assert.ok(lockAt >= 0 && aggregatesAt > lockAt, 'aggregates read after lock acquisition');
+  assert.ok(aggregatesAt > lockAt, 'aggregates read after lock acquisition');
   assert.ok(qualityAt > lockAt, 'quality evidence read under the same lock');
   assert.ok(updateAt > qualityAt, 'transition applied after evidence reads');
   assert.equal(statements[statements.length - 1], 'COMMIT');
@@ -981,6 +1000,18 @@ test('planner serves trial terms to live cycles', () => {
     provenTerminology: [{ id: 1, term: 'P2P-Algo', score: 0.9, lifecycle: 'SEARCH_TRIAL' }],
   });
   assert.ok(JSON.stringify(candidates).includes('P2P-Algo'));
+});
+
+test('extraction text gate preserves the channel-name-only path', () => {
+  // Post-approval enrichment passes no metadata titles/descriptions, but a
+  // channel name alone must still reach native admission.
+  assert.equal(hasNativeExtractionText('Börsenanalyse LuxX', [], ''), true);
+  assert.equal(hasNativeExtractionText('', [], ''), false);
+  assert.equal(hasNativeExtractionText('', ['T'], ''), true);
+  assert.equal(hasNativeExtractionText('', [], 'short'), false);
+  assert.equal(hasNativeExtractionText('', [], 'a description long enough to analyze'), true);
+  const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.match(source, /hasNativeExtractionText\(channel\.channel_name, effTitles, effDesc\)/);
 });
 
 test('extraction forwards language and locale into the admission helper', () => {
