@@ -108,7 +108,8 @@ export async function processChannelThroughPipeline(
   targetCountry: string,
   source: DiscoverySource,
   isManualScan: boolean = false,
-  isEnrichmentPass: boolean = false
+  isEnrichmentPass: boolean = false,
+  options?: { forceExtraction?: boolean }
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
   if (await getAppSetting('decision_evaluation_sampling_enabled', 'false') === 'true') {
@@ -181,6 +182,15 @@ export async function processChannelThroughPipeline(
       console.log(
         `[Unified Ingestion Pipeline] Channel '${candidate.channelName}' (${candidate.channelId}) is already in database (Country: ${existing.country_status}, Trading: ${existing.trading_status}, Scan: ${existing.scan_status}). Preserving existing record.`
       );
+      // Retry repair: a retried job replays vocabulary extraction so a save
+      // that failed after its observation committed cannot strand missing rows
+      // behind this early return. Idempotent (observation keys, insert-gated
+      // saves, reconcile repair); skipped for first attempts to preserve the
+      // cheap-preservation fast path. Low-audience early returns stay skipped
+      // (budget gate deliberately starves them of compute).
+      if (options?.forceExtraction && existing.trading_status === 'TRADING_CONFIRMED') {
+        await extractVocabularyFromCreator(existing, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate), resolveExtractionVideoIds(candidate));
+      }
       // Update basic existing metadata if changed
       let updated = false;
       if (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count) {

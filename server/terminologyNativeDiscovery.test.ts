@@ -1820,6 +1820,18 @@ test('search-query fallback titles never become video titles', () => {
   assert.deepEqual(withTitle[0].videoTitles, ['Real Title']);
 });
 
+test('retry forces extraction replay on the preserved-channel path', () => {
+  // Structural pin: the preserved early return must replay vocabulary
+  // extraction when forceExtraction is set (failed saves strand otherwise),
+  // and the ENRICH caller must set it only on genuine retries (attempts are
+  // claimed pre-run, so first executions see attempts=1 and keep the fast path).
+  const ingestion = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  assert.match(ingestion, /forceExtraction && existing\.trading_status === 'TRADING_CONFIRMED'/);
+  assert.match(ingestion, /await extractVocabularyFromCreator\(existing, candidate\.videoTitles/);
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /forceExtraction:job\.attempts>1/);
+});
+
 test('extraction caller marks non-metadata origins honestly', () => {
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(source, /videoTitlesAreMetadata: false, descriptionIsMetadata: false/);
