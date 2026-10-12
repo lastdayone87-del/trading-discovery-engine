@@ -1018,25 +1018,33 @@ test('attribution on Pool shares one transaction across lock, write, and refresh
   // S6: with a Pool runner the advisory lock, performance insert, and
   // lifecycle refresh must share one transaction-bound client — otherwise the
   // lock releases before the protected writes.
-  const statements: string[] = [];
-  let released = false;
-  const client = {
-    query: async (text: string, params: unknown[] = []) => {
-      statements.push(text);
-      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
-      if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
-      if (text.startsWith('SELECT id FROM canonical_trading_terms')) return { rows: [{ id: 9 }] };
-      if (text.startsWith('SELECT t.*')) {
-        return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
-      }
-      if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) {
-        return { rows: [{ v1: 0, spam: false, novel: false }] };
-      }
-      return { rows: [] };
+  // Distinct clients per connect(): a regression splitting the lock, the
+  // performance insert, or the refresh across connections fails below.
+  const byClient = new Map<number, string[]>();
+  const released: number[] = [];
+  let nextClient = 0;
+  const pool = {
+    connect: async () => {
+      const id = nextClient++;
+      byClient.set(id, []);
+      return {
+        query: async (text: string, params: unknown[] = []) => {
+          byClient.get(id)!.push(text);
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+          if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+          if (text.startsWith('SELECT id FROM canonical_trading_terms')) return { rows: [{ id: 9 }] };
+          if (text.startsWith('SELECT t.*')) {
+            return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
+          }
+          if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) {
+            return { rows: [{ v1: 0, spam: false, novel: false }] };
+          }
+          return { rows: [] };
+        },
+        release: () => { released.push(id); },
+      };
     },
-    release: () => { released = true; },
   };
-  const pool = { connect: async () => client };
   await attributeTerminologyPerformance(
     { generation_metadata: { learnedTerm: 'P2P-Algo' }, country: 'Germany' } as never,
     { distinctResults: 10, newChannels: 3 } as never,
@@ -1045,6 +1053,9 @@ test('attribution on Pool shares one transaction across lock, write, and refresh
     undefined,
     pool as never
   );
+  assert.equal(byClient.size, 1, 'single connection serves the whole critical section');
+  const statements = [...byClient.values()][0];
+  const owner = [...byClient.keys()][0];
   assert.equal(statements[0], 'BEGIN');
   assert.equal(statements[statements.length - 1], 'COMMIT');
   assert.equal(statements.filter(text => text === 'BEGIN').length, 1);
@@ -1052,7 +1063,7 @@ test('attribution on Pool shares one transaction across lock, write, and refresh
   const perfAt = statements.findIndex(text => text.startsWith('INSERT INTO terminology_performance'));
   const refreshAt = statements.findIndex(text => text.startsWith('SELECT t.*'));
   assert.ok(lockAt > 0 && perfAt > lockAt && refreshAt > perfAt);
-  assert.equal(released, true);
+  assert.deepEqual(released, [owner]);
 });
 
 test('yield failure still demotes through the shared path', async () => {
