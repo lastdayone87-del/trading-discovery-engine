@@ -32,6 +32,7 @@ import {
   findRuleInstrumentHits,
   hasNativeExtractionText,
   parseNativeVocabularyResponse,
+  resolveExtractionVideoIds,
 } from './queryIntelligence';
 import { computeObservationKey } from './countryNativeIntelligence';
 import { extractDiscoveredChannels } from './youtube';
@@ -912,6 +913,107 @@ test('lock competition completes under every interleaving with post-commit visib
   assert.equal(second.attrSawCommit, true);
 });
 
+test('recorded production sequences compete without deadlock (S9)', async () => {
+  // The hand-written OBS/ATTR sequences above document the intended order;
+  // THIS test derives sequences from the real production functions through
+  // recording fakes, so a production reorder changes the model input. Any
+  // unmapped write fails loudly instead of passing silently.
+  type RecordedOp = 'canon' | 'advisory' | 'keyshare' | 'rowexcl' | 'read' | 'commit';
+  const toOp = (text: string): RecordedOp | 'txn' | null => {
+    if (text === 'BEGIN' || text === 'ROLLBACK') return 'txn';
+    if (text === 'COMMIT') return 'commit';
+    if (text.includes('pg_advisory_xact_lock')) return 'advisory';
+    if (text.startsWith('INSERT INTO canonical_trading_terms')) return 'canon';
+    if (
+      text.startsWith('INSERT INTO terminology_observations') ||
+      text.startsWith('INSERT INTO terminology_performance') ||
+      text.startsWith('INSERT INTO terminology_lifecycle_events') ||
+      text.startsWith('INSERT INTO terminology_score_snapshots') ||
+      text.startsWith('INSERT INTO country_native_evidence_projections')
+    ) {
+      return 'keyshare';
+    }
+    if (text.startsWith('UPDATE canonical_trading_terms')) return 'rowexcl';
+    if (text.startsWith('SELECT')) return 'read';
+    if (/^(INSERT|UPDATE|DELETE)\s/i.test(text)) return null;
+    return 'read';
+  };
+  const record = async (run: (client: never) => Promise<unknown>): Promise<{ ops: SimStep[]; raw: string[]; begins: number; commits: number }> => {
+    const raw: string[] = [];
+    const client = {
+      query: async (text: string, params: unknown[] = []) => {
+        raw.push(text);
+        if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+        if (text.startsWith('INSERT INTO canonical_trading_terms')) return { rows: [{ id: 7 }] };
+        if (text.startsWith('INSERT INTO terminology_observations')) {
+          return { rows: [{ id: 1, observed_at: new Date().toISOString() }] };
+        }
+        if (text.startsWith('SELECT id FROM canonical_trading_terms')) return { rows: [{ id: 7 }] };
+        if (text.startsWith('SELECT t.*')) {
+          return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
+        }
+        if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) {
+          return { rows: [{ v1: 0, spam: false, novel: false }] };
+        }
+        return { rows: [] };
+      },
+      release: () => undefined,
+    };
+    const pool = { connect: async () => client };
+    await run(pool as never);
+    const ops: SimStep[] = [];
+    let begins = 0;
+    let commits = 0;
+    for (const text of raw) {
+      const op = toOp(text);
+      assert.ok(op !== null, `unmapped write escapes the model: ${text.slice(0, 80)}`);
+      if (op === 'txn') {
+        begins += 1;
+        continue;
+      }
+      if (op === 'commit') {
+        commits += 1;
+        ops.push({ txn: 'OBS', op: 'commit' });
+        continue;
+      }
+      ops.push({ txn: 'OBS', op });
+    }
+    return { ops, raw, begins, commits };
+  };
+  const observed = await record(client =>
+    observeTerminologyDetailed({
+      term: 'Competition Model Term', country: 'Germany', termType: 'TERMINOLOGY',
+      observationType: 'VIDEO_TITLE', channelId: 'ch-1', videoId: 'vid-1',
+      evidence: { qualityVersion: 'native-v1' },
+    }, client)
+  );
+  // One transaction covers the whole observation critical section (S6).
+  assert.equal(observed.begins, 1);
+  assert.equal(observed.commits, 1);
+  assert.ok(observed.ops.some(step => step.op === 'advisory'));
+  assert.ok(observed.ops.some(step => step.op === 'keyshare'));
+  const attributed = await record(client =>
+    attributeTerminologyPerformance(
+      { generation_metadata: { learnedTerm: 'Competition Model Term' }, country: 'Germany' } as never,
+      { distinctResults: 10, newChannels: 3 } as never,
+      100,
+      undefined,
+      undefined,
+      client
+    )
+  );
+  assert.equal(attributed.begins, 1);
+  assert.equal(attributed.commits, 1);
+  // Replay the RECORDED production order under competition, both schedulers.
+  const forTxn = (ops: SimStep[], txn: 'OBS' | 'ATTR'): SimStep[] =>
+    ops.map(step => ({ txn, op: step.op }));
+  const obsFirst = runLockCompetition(forTxn(observed.ops, 'OBS'), forTxn(attributed.ops, 'ATTR'), 'OBS');
+  assert.equal(obsFirst.deadlocked, false);
+  assert.equal(obsFirst.attrSawCommit, true);
+  const attrFirst = runLockCompetition(forTxn(observed.ops, 'OBS'), forTxn(attributed.ops, 'ATTR'), 'ATTR');
+  assert.equal(attrFirst.deadlocked, false);
+});
+
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
@@ -934,28 +1036,39 @@ function testChannel(): ChannelRecord {
   } as unknown as ChannelRecord;
 }
 
+export interface FakeVocabStore {
+  rows: Map<string, { id: number; term: string; occurrences: number; validation_count: number; trust_tier: number }>;
+  links: Set<string>;
+  nextId: number;
+}
+
+export function createFakeVocabStore(): FakeVocabStore {
+  return { rows: new Map(), links: new Set(), nextId: 1 };
+}
+
 function fakeDeps(scenarios: {
   observe?: (args: Record<string, unknown>) => Promise<{ termId: number; observationInserted: boolean } | null>;
   save?: (country: string, term: string) => Promise<unknown>;
   log?: (message: string) => void;
-  hasTerm?: (country: string, term: string) => Promise<boolean>;
-  ensureTerm?: (country: string, term: string) => Promise<unknown>;
-  ensured?: Array<{ country: string; term: string }>;
+  reconcile?: (country: string, term: string, store: FakeVocabStore, channelId?: string) => Promise<{ rowInserted: boolean; linkInserted: boolean }>;
+  store?: FakeVocabStore;
+  reconciled?: Array<{ country: string; term: string }>;
   observed: Array<Record<string, unknown>>;
   saved: Array<{ country: string; term: string }>;
 }) {
-  const ensured = scenarios.ensured ?? [];
+  const reconciled = scenarios.reconciled ?? [];
+  const store = scenarios.store ?? createFakeVocabStore();
   return {
     observeTerm: async (args: Record<string, unknown>): Promise<{ termId: number; observationInserted: boolean } | null> => {
       scenarios.observed.push(args);
       return scenarios.observe ? scenarios.observe(args) : { termId: 7, observationInserted: true };
     },
-    // Unit-test default: vocabulary row present (replays skip writes). Tests
-    // covering repair pass their own hasTerm/ensureTerm fakes.
-    hasTerm: scenarios.hasTerm ?? (async () => true),
-    ensureTerm: async (country: string, term: string): Promise<unknown> => {
-      ensured.push({ country, term });
-      if (scenarios.ensureTerm) return scenarios.ensureTerm(country, term);
+    // Unit-test default: vocabulary already complete (replays are pure
+    // duplicates). Tests covering repair pass a shared store instead.
+    reconcileTerm: async (country: string, term: string, _category: string, channelId?: string): Promise<{ rowInserted: boolean; linkInserted: boolean }> => {
+      reconciled.push({ country, term });
+      if (scenarios.reconcile) return scenarios.reconcile(country, term, store, channelId);
+      return { rowInserted: false, linkInserted: false };
     },
     saveTerm: async (country: string, term: string): Promise<unknown> => {
       scenarios.saved.push({ country, term });
@@ -963,6 +1076,41 @@ function fakeDeps(scenarios: {
     },
     log: scenarios.log ?? (() => undefined),
   };
+}
+
+/**
+ * Production-faithful store emulation: raw (country,term) conflict target,
+ * normalized-equivalence reuse, idempotent links, counters recomputed from
+ * links — mirroring defaultReconcileExtractedTerm without a database.
+ */
+export function emulatedReconcile(country: string, term: string, store: FakeVocabStore, channelId = 'ch-1'): { rowInserted: boolean; linkInserted: boolean } {
+  const clean = term.trim();
+  const normalized = clean.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
+  const key = `${country}|${clean}`;
+  let row = store.rows.get(key);
+  let rowInserted = false;
+  if (!row) {
+    const reuse = [...store.rows.values()].find(
+      candidate => candidate.term.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en') === normalized
+    );
+    if (reuse) {
+      row = reuse;
+    } else {
+      row = { id: store.nextId++, term: clean, occurrences: 1, validation_count: 0, trust_tier: 3 };
+      store.rows.set(key, row);
+      rowInserted = true;
+    }
+  }
+  const linkKey = `${row.id}|${channelId}`;
+  let linkInserted = false;
+  if (!store.links.has(linkKey)) {
+    store.links.add(linkKey);
+    linkInserted = true;
+  }
+  const confirmed = [...store.links].filter(link => link.startsWith(`${row!.id}|`)).length;
+  row.validation_count = confirmed;
+  row.trust_tier = confirmed >= 2 ? 2 : 3;
+  return { rowInserted, linkInserted };
 }
 
 test('observation failure never persists the extracted term (retryable)', async () => {
@@ -1035,16 +1183,15 @@ test('replayed observations reuse evidence without inflating vocabulary counts',
 test('failed saveTerm is repaired on retry without inflating counts', async () => {
   const observed: Array<Record<string, unknown>> = [];
   const saved: Array<{ country: string; term: string }> = [];
-  const ensured: Array<{ country: string; term: string }> = [];
-  const store = new Set<string>();
+  const reconciled: Array<{ country: string; term: string }> = [];
+  const store = createFakeVocabStore();
   const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-1' }];
   let saveCalls = 0;
   const deps = fakeDeps({
-    ensured, observed, saved,
+    reconciled, observed, saved, store,
     observe: async () => ({ termId: 7, observationInserted: saveCalls === 0 }),
     save: async () => { saveCalls += 1; if (saveCalls === 1) throw new Error('vocab save down'); },
-    hasTerm: async (_country, term) => store.has(term),
-    ensureTerm: async (_country, term) => { store.add(term); },
+    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
   });
   const admission = {
     channel: testChannel(), sources,
@@ -1056,51 +1203,147 @@ test('failed saveTerm is repaired on retry without inflating counts', async () =
   // blindly — the retry replays the observation as a duplicate instead.)
   await assert.rejects(admitNativeCandidates(admission), /vocab save down/);
   assert.equal(saved.length, 1);
-  // Retry: observation replays as duplicate, missing row is repaired.
+  // Retry: observation replays as duplicate, missing row is repaired with
+  // consistent counters (occurrences 1, validation derived from links).
   const retry = await admitNativeCandidates(admission);
   assert.deepEqual([retry.admitted, retry.duplicates], [1, 0]);
-  assert.deepEqual(ensured, [{ country: 'Germany', term: 'P2P-Algo' }]);
+  assert.deepEqual(reconciled, [{ country: 'Germany', term: 'P2P-Algo' }]);
   assert.equal(saved.length, 1);
+  const row = store.rows.get('Germany|P2P-Algo');
+  assert.ok(row);
+  assert.equal(row.occurrences, 1);
+  assert.equal(row.validation_count, 1);
+  assert.equal(row.trust_tier, 3);
   // Third run: everything present -> pure duplicate, no writes at all.
   const third = await admitNativeCandidates(admission);
   assert.deepEqual([third.admitted, third.duplicates], [0, 1]);
-  assert.deepEqual(ensured.length, 1);
+  assert.deepEqual(reconciled.length, 2);
 });
 
-test('concurrent repairs create exactly one vocabulary record', async () => {
+// C2/S2: row existence alone never proves completeness — the link and the
+// derived counters are reconciled on every replay, even when the row exists.
+test('replay reconciles missing links and counters on existing rows', async () => {
+  const store = createFakeVocabStore();
+  store.rows.set('Germany|SMC', { id: 1, term: 'SMC', occurrences: 5, validation_count: 0, trust_tier: 3 });
+  store.nextId = 2;
   const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'SMC backtest', videoId: 'vid-2' }];
-  const saved: Array<{ country: string; term: string }> = [];
-  const ensured: Array<{ country: string; term: string }> = [];
-  const store = new Set<string>();
-  let releaseHasTerm: (() => void) | null = null;
-  const gate = new Promise<void>(resolve => { releaseHasTerm = resolve; });
-  let hasTermCalls = 0;
   const deps = fakeDeps({
-    ensured, observed: [], saved,
+    reconciled: [], observed: [], saved: [], store,
     observe: async () => ({ termId: 8, observationInserted: false }),
-    // Both retries observe hasTerm=false before either ensure runs.
-    hasTerm: async (_country, term) => { hasTermCalls += 1; if (hasTermCalls < 2) await gate; return store.has(term); },
-    // DO-NOTHING semantics: concurrent inserts collapse to one record.
-    // (The shared wrapper records each ensure call in `ensured`.)
-    ensureTerm: async (_country, term) => {
-      if (hasTermCalls >= 2 && releaseHasTerm) releaseHasTerm();
-      if (!store.has(term)) store.add(term);
-    },
+    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab, 'ch-2'),
   });
-  const admission = {
-    channel: testChannel(), sources,
+  const report = await admitNativeCandidates({
+    channel: { ...testChannel(), channel_id: 'ch-2' }, sources,
+    parsed: { terminology: ['SMC'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps,
+  });
+  assert.deepEqual([report.admitted, report.duplicates], [1, 0]);
+  const row = store.rows.get('Germany|SMC');
+  assert.ok(row);
+  assert.equal(row.occurrences, 5);
+  assert.equal(row.validation_count, 1);
+  assert.ok(store.links.has('1|ch-2'));
+});
+
+// C3: both lookups observe absence before either repair proceeds — both
+// repair attempts run, one row is stored, every link survives.
+test('concurrent repairs from two channels keep one row with both links', async () => {
+  const shared = createFakeVocabStore();
+  let releaseReads: (() => void) | null = null;
+  const gate = new Promise<void>(resolve => { releaseReads = resolve; });
+  let reads = 0;
+  const reconcileCalls: string[] = [];
+  const blockingReconcile = async (country: string, term: string, vocab: FakeVocabStore, channelId?: string) => {
+    reconcileCalls.push(`${country}|${term}`);
+    reads += 1;
+    if (reads < 2) await gate;
+    else if (releaseReads) releaseReads();
+    return emulatedReconcile(country, term, vocab, channelId ?? 'ch-unknown');
+  };
+  const admissionFor = (channelId: string, deps: ReturnType<typeof fakeDeps>) => ({
+    channel: { ...testChannel(), channel_id: channelId },
+    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: 'SMC backtest', videoId: 'vid-2' }] as LiteralSourceText[],
     parsed: { terminology: ['SMC'] },
     baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
+  });
+  const depsA = fakeDeps({ reconciled: [], observed: [], saved: [], store: shared, observe: async () => ({ termId: 8, observationInserted: false }), reconcile: blockingReconcile });
+  const depsB = fakeDeps({ reconciled: [], observed: [], saved: [], store: shared, observe: async () => ({ termId: 8, observationInserted: false }), reconcile: blockingReconcile });
+  const [first, second] = await Promise.all([
+    admitNativeCandidates(admissionFor('ch-A', depsA)),
+    admitNativeCandidates(admissionFor('ch-B', depsB)),
+  ]);
+  assert.equal(reconcileCalls.length, 2);
+  assert.equal(shared.rows.size, 1);
+  const row = shared.rows.get('Germany|SMC');
+  assert.ok(row);
+  assert.equal(row.occurrences, 1);
+  assert.equal(row.validation_count, 2);
+  assert.equal(row.trust_tier, 2);
+  assert.ok(shared.links.has(`${row.id}|ch-A`));
+  assert.ok(shared.links.has(`${row.id}|ch-B`));
+  assert.equal(first.admitted + second.admitted, 2);
+});
+
+// S3: casing variants reuse the earliest normalized row instead of duplicating.
+test('casing variants reconcile to one vocabulary row', async () => {
+  const sharedStore = createFakeVocabStore();
+  const deps = fakeDeps({
+    reconciled: [], observed: [], saved: [], store: sharedStore,
+    observe: async () => ({ termId: 9, observationInserted: false }),
+    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
+  });
+  const admissionFor = (candidate: string) => ({
+    channel: testChannel(),
+    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: `${candidate} outlook`, videoId: 'vid-3' }] as LiteralSourceText[],
+    parsed: { terminology: [candidate] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
+  });
+  await admitNativeCandidates(admissionFor('BTC'));
+  await admitNativeCandidates(admissionFor('btc'));
+  await admitNativeCandidates(admissionFor('Btc'));
+  assert.equal(sharedStore.rows.size, 1);
+  assert.ok(sharedStore.rows.get('Germany|BTC'));
+});
+
+test('one literal in two categories saves once without inflating counts', async () => {
+  // The vocabulary row is keyed (country, term): the first category wins and
+  // the replay reconciles idempotently. Planner consumption uses term text,
+  // trust tier, and validation counts — never the category column.
+  const store = createFakeVocabStore();
+  let observations = 0;
+  const deps = fakeDeps({
+    reconciled: [], observed: [], saved: [], store,
+    observe: async () => { observations += 1; return { termId: 7, observationInserted: observations === 1 }; },
+    // Faithful save emulation: creates the row and channel link, like production.
+    save: async (country, term) => { emulatedReconcile(country, term, store); },
+    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
+  });
+  const admission = {
+    channel: testChannel(),
+    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: 'SMC backtest', videoId: 'vid-1' }] as LiteralSourceText[],
+    parsed: { terminology: ['SMC'], phrases: ['SMC'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
   };
-  const [first, second] = await Promise.all([admitNativeCandidates(admission), admitNativeCandidates(admission)]);
-  // Exactly one repair wins; the loser dedupes against the repaired row.
-  // One vocabulary record exists; saveTerm never runs on replays.
-  assert.equal(store.size, 1);
-  assert.equal(ensured.length, 1);
-  assert.equal(first.admitted + second.admitted, 1);
-  const totalDuplicates = first.duplicates + second.duplicates;
-  assert.equal(totalDuplicates, 1);
-  assert.deepEqual(saved, []);
+  const report = await admitNativeCandidates(admission);
+  assert.deepEqual([report.admitted, report.duplicates], [1, 1]);
+  assert.equal(store.rows.size, 1);
+  assert.equal(store.rows.get('Germany|SMC')?.occurrences, 1);
+});
+
+test('concurrent novel observations converge to the serial first-seen decision', () => {
+  // Two overlapping extractions both record novel:true for a genuinely new
+  // term. The trial-entry gate consumes novel via OR-aggregation, so the
+  // concurrent outcome equals the serial first-seen outcome by construction:
+  // revalidating under a lock would merely elect the other serial order.
+  const single = rollupNativeQualityEvidence([writerEvidence({ novel: true })]);
+  const doubled = rollupNativeQualityEvidence([writerEvidence({ novel: true }), writerEvidence({ novel: true })]);
+  assert.deepEqual(
+    evaluateTrialEntry({ novel: single.novel, spamConfirmed: single.spamConfirmed }),
+    evaluateTrialEntry({ novel: doubled.novel, spamConfirmed: doubled.spamConfirmed })
+  );
+  assert.deepEqual(evaluateTrialEntry({ novel: doubled.novel, spamConfirmed: doubled.spamConfirmed }), {
+    allowed: true, reasons: ['novel-eligible'],
+  });
 });
 
 test('over-length candidates are rejected by the length guard, not by missing infrastructure', async () => {
@@ -1182,8 +1425,25 @@ test('video IDs align to titles and persist on the observation', async () => {
   assert.deepEqual(alignVideoIdsToTitles(['Real Title'], [], { id: 'v1', title: 'Real Title' }), ['v1']);
   assert.deepEqual(alignVideoIdsToTitles(['Other'], [], { id: 'v1', title: 'Real Title' }), [null]);
   assert.deepEqual(alignVideoIdsToTitles(['T'], [{ id: 'A', title: 'T' }], { id: 'v1', title: 'T' }), ['A']);
+  // resolveExtractionVideoIds is the production handoff: the ingestion call
+  // must forward its result to extraction (fails if the argument is removed).
   const ingestionSource = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
-  assert.match(ingestionSource, /candidate\.matchedDocument\?\.type === 'VIDEO'/);
+  assert.match(ingestionSource, /resolveExtractionVideoIds\(candidate\)/);
+  assert.match(ingestionSource, /extractVocabularyFromCreator\(([\s\S]{0,400}?)extractionVideoIds/);
+  // Handoff behavior through the real helper: matched-document fallback,
+  // mismatch honesty, and hydrated-videos precedence.
+  assert.deepEqual(
+    resolveExtractionVideoIds({ videoTitles: ['Real Title'], matchedDocument: { type: 'VIDEO', providerNativeId: 'v1', title: 'Real Title' } }),
+    ['v1']
+  );
+  assert.deepEqual(
+    resolveExtractionVideoIds({ videoTitles: ['Other'], matchedDocument: { type: 'VIDEO', providerNativeId: 'v1', title: 'Real Title' } }),
+    [null]
+  );
+  assert.deepEqual(
+    resolveExtractionVideoIds({ videoTitles: ['T'], videos: [{ id: 'A', title: 'T' }], matchedDocument: { type: 'VIDEO', providerNativeId: 'v1', title: 'T' } }),
+    ['A']
+  );
 
   const observed: Array<Record<string, unknown>> = [];
   const saved: Array<{ country: string; term: string }> = [];

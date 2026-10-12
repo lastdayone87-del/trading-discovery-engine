@@ -954,6 +954,23 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
   if (!learned) return;
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return;
+  // Same Pool discipline as observe/refresh: the advisory lock, the
+  // performance insert, and the lifecycle refresh must share one transaction-
+  // bound client, or the lock releases before the protected writes.
+  if ('connect' in runner && typeof (runner as Pool).connect === 'function' && !('release' in runner)) {
+    const client = await (runner as Pool).connect();
+    try {
+      await client.query('BEGIN');
+      await attributeTerminologyPerformance(query, metrics, quotaConsumed, retrievalLane, searchOrdering, client);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return;
+  }
   const terms = await runner.query('SELECT id FROM canonical_trading_terms WHERE country=$1 AND normalized_term=$2', [canonicalCountry(query.country), learned]);
   for (const row of terms.rows) {
     // Lock order: advisory BEFORE the performance insert below (its FK takes

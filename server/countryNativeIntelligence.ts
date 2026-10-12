@@ -126,6 +126,15 @@ export function computeObservationKey(params: {
   // instead of inserting a duplicate observation that inflates evidence.
   const { novel: _novel, knownAs: _knownAs, generic: _generic, ...stableEvidence } =
     (params.evidence || {}) as Record<string, unknown>;
+  // Positional source index is not source identity when a stable video ID is
+  // present: the same video at another list position must reuse its key
+  // instead of inserting a duplicate observation. (One-time effect: rows
+  // recorded with the old index-bearing key re-observe once after deploy,
+  // then stay stable.)
+  const sourceRef = (stableEvidence.sourceRef || {}) as Record<string, unknown>;
+  if (sourceRef.videoId !== undefined && sourceRef.videoId !== null) {
+    stableEvidence.sourceRef = { ...sourceRef, index: undefined };
+  }
   const checksum = computeEvidenceChecksum(stableEvidence);
   const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();
 

@@ -317,10 +317,11 @@ export interface NativeAdmissionDeps {
   saveTerm: (country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', channelId?: string) => Promise<unknown>;
   observeTerm: (args: Parameters<typeof observeTerminologyDetailed>[0]) => Promise<TerminologyObservationResult | null>;
   log?: (message: string) => void;
-  /** Existence check for repair-on-replay. Defaults to a DB lookup. */
-  hasTerm?: (country: string, term: string) => Promise<boolean>;
-  /** Idempotent repair insert (ON CONFLICT DO NOTHING — never inflates counts). */
-  ensureTerm?: (country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', channelId?: string) => Promise<unknown>;
+  /**
+   * Idempotent vocabulary repair (row + link + counters as one unit).
+   * Defaults to defaultReconcileExtractedTerm.
+   */
+  reconcileTerm?: (country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', channelId?: string) => Promise<ReconcileOutcome>;
 }
 
 /**
@@ -332,27 +333,88 @@ export interface NativeAdmissionDeps {
  * missing vocabulary row without double-counting — concurrent repairs are
  * naturally idempotent.
  */
-export async function defaultEnsureExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string): Promise<void> {
-  const db = await getDb();
-  const clean = term.trim();
-  if (!clean) return;
-  const saved = await db.query(
-    `INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,1,now(),now(),3,0) ON CONFLICT(country,term) DO NOTHING RETURNING id`,
-    [country, clean, category, sourceChannelId || null]
-  );
-  const termId = saved.rows?.[0]?.id;
-  if (termId && sourceChannelId) {
-    await db.query(
-      `INSERT INTO extracted_vocabulary_sources(term_id,channel_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM channels WHERE channel_id=$2 AND trading_status='TRADING_CONFIRMED') ON CONFLICT DO NOTHING`,
-      [termId, sourceChannelId]
-    );
-  }
+export interface ReconcileOutcome {
+  rowInserted: boolean;
+  linkInserted: boolean;
 }
 
-export async function defaultHasExtractedTerm(country: string, term: string): Promise<boolean> {
+/**
+ * Idempotent vocabulary repair: reconciles the vocabulary row, its
+ * channel source link, and the derived validation_count/trust_tier as one
+ * unit. Row existence alone proves nothing (a save can fail after the row
+ * upsert but before linkage/counters), so every repair re-resolves the row
+ * id (normalized term equivalence — earliest spelling wins, no case-variant
+ * duplicates), links the channel (ON CONFLICT DO NOTHING), and recomputes
+ * the derived counters from the links. All inside one transaction under an
+ * advisory lock on the normalized term identity, so concurrent repairs for
+ * any spelling or channel collapse to one row with every valid link and
+ * uninflated counts.
+ */
+export async function defaultReconcileExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string): Promise<ReconcileOutcome> {
+  const { normalizeTerm: normalizeTermForReconcile } = await import('./terminologyIntelligence');
   const db = await getDb();
-  const found = await db.query(`SELECT 1 FROM extracted_trading_vocabulary WHERE country=$1 AND term=$2 LIMIT 1`, [country, term.trim()]);
-  return (found.rows?.length ?? 0) > 0;
+  const clean = term.trim();
+  if (!clean) return { rowInserted: false, linkInserted: false };
+  const normalized = normalizeTermForReconcile(clean);
+  const poolLike = 'connect' in (db as object) && typeof (db as { connect?: unknown }).connect === 'function' ? (db as unknown as import('pg').Pool) : null;
+  const client = poolLike ? await poolLike.connect() : null;
+  const runner = (client ?? db) as unknown as { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }> };
+  try {
+    if (client) await runner.query('BEGIN');
+    await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`extracted-vocab:${country}:${normalized}`]);
+    const existing = await runner.query(
+      `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 AND lower(term)=lower($2) ORDER BY id ASC`,
+      [country, clean]
+    );
+    let rowId: number | null = null;
+    let rowInserted = false;
+    for (const row of existing.rows || []) {
+      if (normalizeTermForReconcile(String(row.term)) === normalized) {
+        rowId = Number(row.id);
+        break;
+      }
+    }
+    if (rowId === null) {
+      const inserted = await runner.query(
+        `INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,1,now(),now(),3,0) ON CONFLICT(country,term) DO NOTHING RETURNING id`,
+        [country, clean, category, sourceChannelId || null]
+      );
+      if (inserted.rows?.[0]?.id !== undefined && inserted.rows?.[0]?.id !== null) {
+        rowId = Number(inserted.rows[0].id);
+        rowInserted = true;
+      } else {
+        const reread = await runner.query(
+          `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 AND lower(term)=lower($2) ORDER BY id ASC`,
+          [country, clean]
+        );
+        for (const row of reread.rows || []) {
+          if (normalizeTermForReconcile(String(row.term)) === normalized) {
+            rowId = Number(row.id);
+            break;
+          }
+        }
+      }
+    }
+    let linkInserted = false;
+    if (rowId !== null && sourceChannelId) {
+      const linked = await runner.query(
+        `INSERT INTO extracted_vocabulary_sources(term_id,channel_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM channels WHERE channel_id=$2 AND trading_status='TRADING_CONFIRMED') ON CONFLICT DO NOTHING RETURNING term_id`,
+        [rowId, sourceChannelId]
+      );
+      linkInserted = (linked.rows?.length ?? 0) > 0;
+      await runner.query(
+        `UPDATE extracted_trading_vocabulary v SET validation_count=s.confirmed_sources,trust_tier=CASE WHEN s.confirmed_sources>=2 THEN 2 ELSE 3 END FROM (SELECT COUNT(DISTINCT evs.channel_id)::int confirmed_sources FROM extracted_vocabulary_sources evs JOIN channels c ON c.channel_id=evs.channel_id AND c.trading_status='TRADING_CONFIRMED' WHERE evs.term_id=$1) s WHERE v.id=$1`,
+        [rowId]
+      );
+    }
+    if (client) await runner.query('COMMIT');
+    return { rowInserted, linkInserted };
+  } catch (error) {
+    if (client) await runner.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    if (client) client.release();
+  }
 }
 
 export interface NativeAdmissionReport {
@@ -370,6 +432,28 @@ const EMPTY_ADMISSION_REJECTIONS = (): Record<NativeAdmissionRejectReason, numbe
   'novelty-unknown': 0,
   'observation-failed': 0,
 });
+
+export interface ExtractionVideoSource {
+  videoTitles: string[];
+  videos?: Array<{ id?: string; title: string }>;
+  matchedDocument?: { type?: string; providerNativeId?: string; title?: string };
+}
+
+/**
+ * Production ingestion handoff: align YouTube video IDs to titles. When no
+ * hydrated video records exist, the matched retrieval document's
+ * provider-native ID is preserved through title equality (never inferred).
+ * Exported so the handoff composition itself is unit-testable.
+ */
+export function resolveExtractionVideoIds(candidate: ExtractionVideoSource): Array<string | null> {
+  return alignVideoIdsToTitles(
+    candidate.videoTitles,
+    candidate.videos,
+    candidate.matchedDocument?.type === 'VIDEO'
+      ? { id: candidate.matchedDocument.providerNativeId, title: candidate.matchedDocument.title }
+      : undefined
+  );
+}
 
 /**
  * Admit parsed AI candidates into the native-v1 evidence ledger.
@@ -396,8 +480,7 @@ export async function admitNativeCandidates(args: {
 }): Promise<NativeAdmissionReport> {
   const saveTerm = args.deps?.saveTerm ?? ((country, term, category, channelId) => saveExtractedTerm(country, term, category, channelId));
   const observeTerm = args.deps?.observeTerm ?? ((observeArgs) => observeTerminologyDetailed(observeArgs));
-  const hasTerm = args.deps?.hasTerm ?? defaultHasExtractedTerm;
-  const ensureTerm = args.deps?.ensureTerm ?? defaultEnsureExtractedTerm;
+  const reconcileTerm = args.deps?.reconcileTerm ?? defaultReconcileExtractedTerm;
   const log = args.deps?.log ?? ((message) => console.warn(message));
   const rejected = EMPTY_ADMISSION_REJECTIONS();
   let admitted = 0;
@@ -432,18 +515,13 @@ export async function admitNativeCandidates(args: {
       return;
     }
     // Occurrence counts advance only on newly persisted evidence. A replayed
-    // (already-recorded) observation normally needs no write — unless its
-    // vocabulary row is missing because an earlier saveTerm failed after the
-    // observation committed. In that case repair it idempotently; concurrent
-    // repairs collapse on ON CONFLICT DO NOTHING without inflating counts.
-    // Thrown errors propagate (never swallowed): the caller retries.
+    // (already-recorded) observation is reconciled as a unit — row, channel
+    // link, and derived counters — because row existence alone never proves a
+    // past save completed. Thrown errors propagate (never swallowed).
     if (!observation.observationInserted) {
-      if (!(await hasTerm(args.channel.country, String(raw)))) {
-        await ensureTerm(args.channel.country, String(raw), category, args.channel.channel_id);
-        admitted += 1;
-        return;
-      }
-      duplicates += 1;
+      const repair = await reconcileTerm(args.channel.country, String(raw), category, args.channel.channel_id);
+      if (repair.rowInserted || repair.linkInserted) admitted += 1;
+      else duplicates += 1;
       return;
     }
     await saveTerm(args.channel.country, String(raw), category, args.channel.channel_id);
@@ -496,8 +574,8 @@ export async function extractVocabularyFromCreator(
     if (ruleObservation == null) continue;
     if (ruleObservation.observationInserted) {
       await saveExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
-    } else if (!(await defaultHasExtractedTerm(channel.country, hit.instrument))) {
-      await defaultEnsureExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
+    } else {
+      await defaultReconcileExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
     }
   }
 
