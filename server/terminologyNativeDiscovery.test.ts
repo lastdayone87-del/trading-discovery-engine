@@ -1844,6 +1844,30 @@ test('quality read is skipped when it cannot affect the transition', async () =>
   assert.ok(runner.calls.some(call => call.text.startsWith('INSERT INTO terminology_score_snapshots')));
 });
 
+test('rollup consumes admission-captured evidence, not hand-built fixtures', async () => {
+  // If the admission writer stops emitting a quality field, this fails at the
+  // capture assertion before the rollup ever runs.
+  const observed: Array<Record<string, unknown>> = [];
+  const deps = fakeDeps({
+    reconciled: [], observed, saved: [],
+    observe: async () => ({ termId: 7, observationInserted: true }),
+  });
+  const report = await admitNativeCandidates({
+    channel: testChannel(),
+    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-1' }],
+    parsed: { terminology: ['P2P-Algo'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps,
+  });
+  assert.equal(report.admitted, 1);
+  assert.equal(observed.length, 1);
+  const evidence = observed[0].evidence as Record<string, unknown>;
+  assert.equal(evidence.qualityVersion, 'native-v1');
+  assert.equal(evidence.novel, true);
+  assert.deepEqual(evidence.spamSignals, []);
+  const rollup = rollupNativeQualityEvidence([evidence]);
+  assert.deepEqual(rollup, { v1Observations: 1, spamConfirmed: false, novel: true });
+});
+
 test('planner serves trial terms inside generated queries', () => {
   const candidates = planDiverseQueries({
     country: 'Germany',
