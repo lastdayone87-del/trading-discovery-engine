@@ -21,6 +21,26 @@ function uniqueLanguages(values: string[]): string[] {
 }
 
 /**
+ * Canonical full tag (BCP 47 shape: language lower, region upper when present).
+ */
+function canonicalTag(value: string): string {
+  const parts = value.trim().split(/[-_]/);
+  if (parts.length < 2 || !parts[0] || !parts[1]) return (parts[0] || '').toLowerCase();
+  return `${parts[0].toLowerCase()}-${parts[1].toUpperCase()}`;
+}
+
+/**
+ * Preserves an explicit regional locale only when EVERY agreeing signal
+ * carries the SAME full regional tag. A bare language tag alongside a
+ * regional one (fr + fr-FR) is ambiguity, not agreement — no locale is
+ * inferred. Never inferred from country, never guessed across conflicts.
+ */
+function explicitLocale(tags: string[]): string | undefined {
+  const full = [...new Set(tags.map(canonicalTag).filter(Boolean))];
+  return full.length === 1 && full[0].includes('-') ? full[0] : undefined;
+}
+
+/**
  * Selects an explicit language signal without inferring one from creator country.
  * Conflicting signals are deliberately left unknown rather than guessed.
  */
@@ -28,18 +48,24 @@ export function selectExplicitTerminologyLanguageContext(
   evidence: LanguageBearingCreatorEvidence
 ): ExplicitTerminologyLanguageContext | undefined {
   const detected = (evidence.detectedLanguages || [])
-    .map(item => ({ language: normalized(item.language), confidence: Number.isFinite(item.confidence) ? Number(item.confidence) : 0 }))
+    .map(item => ({ tag: (item.language || '').trim(), language: normalized(item.language), confidence: Number.isFinite(item.confidence) ? Number(item.confidence) : 0 }))
     .filter(item => item.language && item.language !== 'und');
 
   if (detected.length > 0) {
     const highestConfidence = Math.max(...detected.map(item => item.confidence));
-    const winners = uniqueLanguages(detected.filter(item => item.confidence === highestConfidence).map(item => item.language));
-    return winners.length === 1 ? { language: winners[0] } : undefined;
+    const top = detected.filter(item => item.confidence === highestConfidence);
+    const winners = uniqueLanguages(top.map(item => item.language));
+    if (winners.length !== 1) return undefined;
+    const locale = explicitLocale(top.filter(item => item.language === winners[0]).map(item => item.tag));
+    return locale ? { language: winners[0], locale } : { language: winners[0] };
   }
 
-  const documentLanguages = uniqueLanguages([
+  const documents = [
     ...(evidence.videos || []).map(video => video.language || ''),
     ...(evidence.transcriptExcerpts || []).map(excerpt => excerpt.language || '')
-  ]);
-  return documentLanguages.length === 1 ? { language: documentLanguages[0] } : undefined;
+  ];
+  const documentLanguages = uniqueLanguages(documents);
+  if (documentLanguages.length !== 1) return undefined;
+  const locale = explicitLocale(documents);
+  return locale ? { language: documentLanguages[0], locale } : { language: documentLanguages[0] };
 }

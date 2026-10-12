@@ -768,7 +768,15 @@ export async function processChannelThroughPipeline(
   if (qualityResult.score >= 55 && source !== 'manual_search') {
     // Provenance: align YouTube video IDs to titles (null where unknown)
     // so title-backed terminology observations trace to their source video.
-    const extractionVideoIds = alignVideoIdsToTitles(candidate.videoTitles, candidate.videos);
+    // When no hydrated video records exist, the matched retrieval document's
+    // provider-native ID is preserved through title equality (never inferred).
+    const extractionVideoIds = alignVideoIdsToTitles(
+      candidate.videoTitles,
+      candidate.videos,
+      candidate.matchedDocument?.type === 'VIDEO'
+        ? { id: candidate.matchedDocument.providerNativeId, title: candidate.matchedDocument.title }
+        : undefined
+    );
     await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate), extractionVideoIds);
     await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
   }

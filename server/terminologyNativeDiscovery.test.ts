@@ -16,7 +16,9 @@ import {
   evaluateTrialEntry,
   findLiteralSpan,
   getPlannerTerminology,
+  attributeTerminologyPerformance,
   observeTerminology,
+  observeTerminologyDetailed,
   refreshTerminologyLifecycle,
   rollupNativeQualityEvidence,
   NATIVE_QUALITY_ROLLUP_SQL,
@@ -289,9 +291,12 @@ test('novelty baseline fails closed on either lookup failure', () => {
 });
 
 test('missing country vocabulary is an unknown baseline, not an empty one', () => {
-  // Successful lookup, no row for the country: fail closed.
-  const missing = buildNoveltyBaseline({ country: 'Germany', vocab: undefined, vocabOk: false, existingTerms: [], existingOk: true });
+  // Successful lookup, no row for the country: fail closed. (vocabOk:true +
+  // vocab:undefined is the exact scenario — a lookup failure takes a
+  // different flag and is covered separately.)
+  const missing = buildNoveltyBaseline({ country: 'Germany', vocab: undefined, vocabOk: true, existingTerms: [], existingOk: true });
   assert.equal(missing.ok, false);
+  assert.deepEqual(missing.failed, ['curated']);
   const rejected = classifyNativeCandidate('P2P-Algo', [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest' }], missing, {});
   assert.equal(rejected.admit, false);
   if (rejected.admit === false) assert.equal(rejected.reason, 'novelty-unknown');
@@ -306,9 +311,12 @@ test('missing country vocabulary is an unknown baseline, not an empty one', () =
   assert.equal(admitted.admit, true);
 });
 
-test('extraction treats a missing country row as an unknown baseline', () => {
+test('extraction relies on the shared constructor for missing rows', () => {
+  // The caller passes the lookup outcome through; buildNoveltyBaseline owns
+  // the missing-row rule (single choke point, unit-tested above).
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
-  assert.match(source, /vocabOutcome\.ok && vocabOutcome\.vocab !== undefined/);
+  assert.match(source, /vocab: vocabOutcome\.vocab,/);
+  assert.match(source, /vocabOk: vocabOutcome\.ok,/);
 });
 
 test('classifier rejects in order: shape, length, literal, spam, novelty-unknown', () => {
@@ -600,8 +608,8 @@ test('spam-flagged new terms are held with a recorded reason', async () => {
   assert.equal(runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms')).length, 0);
   const events = eventInserts(runner.calls);
   assert.equal(events.length, 1);
-  assert.match(events[0].text, /'ELIGIBILITY_CHANGE'/);
-  assert.match(String(events[0].params[2]), /spam-confirmed/);
+  assert.equal(events[0].params[3], 'ELIGIBILITY_CHANGE');
+  assert.match(String(events[0].params[4]), /spam-confirmed/);
   // Finding 12: the snapshot records the persisted state, not the blocked decision.
   const snapshots = snapshotInserts(runner.calls);
   assert.equal(snapshots.length, 1);
@@ -617,7 +625,8 @@ test('non-novel new terms are held on trial entry', async () => {
   assert.equal(runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms')).length, 0);
   const events = eventInserts(runner.calls);
   assert.equal(events.length, 1);
-  assert.match(String(events[0].params[2]), /not-novel/);
+  assert.equal(events[0].params[3], 'ELIGIBILITY_CHANGE');
+  assert.match(String(events[0].params[4]), /not-novel/);
 });
 
 test('novel new terms pass through to the legacy decision', async () => {
@@ -639,7 +648,7 @@ test('blocked lifecycle events are idempotent for an unchanged reason', async ()
   const first = fakeRunner({ ...blocked });
   await refreshTerminologyLifecycle(42, undefined, first as never);
   assert.equal(eventInserts(first.calls).length, 1);
-  const blockReason = String(eventInserts(first.calls)[0].params[2]);
+  const blockReason = String(eventInserts(first.calls)[0].params[4]);
   // Same block reason on the next refresh: no duplicate event.
   const second = fakeRunner({ ...blocked, latestEvent: { event_type: 'ELIGIBILITY_CHANGE', reason: blockReason } });
   await refreshTerminologyLifecycle(42, undefined, second as never);
@@ -653,7 +662,7 @@ test('blocked lifecycle events are idempotent for an unchanged reason', async ()
   });
   await refreshTerminologyLifecycle(42, undefined, third as never);
   assert.equal(eventInserts(third.calls).length, 1);
-  assert.match(String(eventInserts(third.calls)[0].params[2]), /spam-confirmed/);
+  assert.match(String(eventInserts(third.calls)[0].params[4]), /spam-confirmed/);
 });
 
 test('refresh serializes per term: lock before reads, transaction around writes', async () => {
@@ -702,6 +711,102 @@ test('refresh serializes per term: lock before reads, transaction around writes'
   assert.equal(released, true);
 });
 
+test('already-eligible terms with blocking native evidence are revoked', async () => {
+  // The race: an attribution refresh marks the term eligible while a native
+  // observation is uncommitted; the observation refresh must then revoke,
+  // not skip the gate because search_eligible is already true.
+  const runner = fakeRunner({
+    aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, decayed_evidence: 9 }),
+    quality: { v1: 1, spam: false, novel: false },
+  });
+  await refreshTerminologyLifecycle(42, undefined, runner as never);
+  const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].params[1], 'SEARCH_TRIAL');
+  assert.match(updates[0].text, /search_eligible=false/);
+  const events = eventInserts(runner.calls);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].params[3], 'ELIGIBILITY_CHANGE');
+  assert.match(String(events[0].params[4]), /revoked eligibility/);
+  assert.match(String(events[0].params[4]), /not-novel/);
+  const snapshots = snapshotInserts(runner.calls);
+  assert.equal(snapshots[0].params[6], 'SEARCH_TRIAL');
+});
+
+test('revoke follows legacy demotion when the legacy decision demotes', async () => {
+  const runner = fakeRunner({
+    aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
+    quality: { v1: 1, spam: true, novel: false },
+  });
+  await refreshTerminologyLifecycle(42, undefined, runner as never);
+  const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].params[1], 'DEMOTED');
+  assert.match(updates[0].text, /search_eligible=false/);
+  const events = eventInserts(runner.calls);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].params[3], 'DEMOTION');
+});
+
+test('observation path acquires the advisory lock before any term-row write', async () => {
+  // Deterministic lock-order regression: canonical upsert (exempt,
+  // uncontended) may precede the lock, but the observation insert, recency
+  // update, and refresh must all follow it — no row lock is ever held while
+  // requesting the advisory lock.
+  const statements: string[] = [];
+  const runner = {
+    query: async (text: string, params: unknown[] = []) => {
+      statements.push(text);
+      if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+      if (text.startsWith('INSERT INTO canonical_trading_terms')) return { rows: [{ id: 7 }] };
+      if (text.startsWith('INSERT INTO terminology_observations')) return { rows: [{ id: 1, observed_at: new Date().toISOString() }] };
+      if (text.startsWith('SELECT t.*')) return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
+      if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) return { rows: [{ v1: 0, spam: false, novel: false }] };
+      return { rows: [] };
+    },
+  };
+  const result = await observeTerminologyDetailed({
+    term: 'P2P-Algo Lock-Order', country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId: 'ch-1', videoId: 'vid-1',
+    evidence: { qualityVersion: 'native-v1' },
+  }, runner as never);
+  assert.deepEqual(result, { termId: 7, observationInserted: true });
+  const at = (fragment: string) => statements.findIndex(text => text.includes(fragment));
+  const canonicalAt = at('INSERT INTO canonical_trading_terms');
+  const lockAt = at('pg_advisory_xact_lock');
+  const obsAt = at('INSERT INTO terminology_observations');
+  const recencyAt = at('SET last_observed_at');
+  assert.ok(canonicalAt >= 0 && lockAt > canonicalAt, 'lock follows the exempt canonical upsert');
+  assert.ok(obsAt > lockAt, 'observation insert follows the lock');
+  assert.ok(recencyAt > lockAt, 'recency update follows the lock');
+});
+
+test('attribution path acquires the advisory lock before its performance insert', async () => {
+  const statements: string[] = [];
+  const runner = {
+    query: async (text: string, params: unknown[] = []) => {
+      statements.push(text);
+      if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+      if (text.startsWith('SELECT id FROM canonical_trading_terms')) return { rows: [{ id: 9 }] };
+      if (text.startsWith('SELECT t.*')) return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
+      if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) return { rows: [{ v1: 0, spam: false, novel: false }] };
+      return { rows: [] };
+    },
+  };
+  await attributeTerminologyPerformance(
+    { generation_metadata: { learnedTerm: 'P2P-Algo' }, country: 'Germany' } as never,
+    { distinctResults: 10, newChannels: 3 } as never,
+    100,
+    undefined,
+    undefined,
+    runner as never
+  );
+  const at = (fragment: string) => statements.findIndex(text => text.includes(fragment));
+  const lockAt = at('pg_advisory_xact_lock');
+  const perfAt = at('INSERT INTO terminology_performance');
+  assert.ok(lockAt >= 0 && perfAt > lockAt, 'performance insert follows the lock');
+});
+
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
@@ -725,16 +830,16 @@ function testChannel(): ChannelRecord {
 }
 
 function fakeDeps(scenarios: {
-  observe?: (args: Record<string, unknown>) => Promise<number | null>;
+  observe?: (args: Record<string, unknown>) => Promise<{ termId: number; observationInserted: boolean } | null>;
   save?: (country: string, term: string) => Promise<unknown>;
   log?: (message: string) => void;
   observed: Array<Record<string, unknown>>;
   saved: Array<{ country: string; term: string }>;
 }) {
   return {
-    observeTerm: async (args: Record<string, unknown>): Promise<number | null> => {
+    observeTerm: async (args: Record<string, unknown>): Promise<{ termId: number; observationInserted: boolean } | null> => {
       scenarios.observed.push(args);
-      return scenarios.observe ? scenarios.observe(args) : 7;
+      return scenarios.observe ? scenarios.observe(args) : { termId: 7, observationInserted: true };
     },
     saveTerm: async (country: string, term: string): Promise<unknown> => {
       scenarios.saved.push({ country, term });
@@ -776,7 +881,7 @@ test('observation failure never persists the extracted term (retryable)', async 
   const working = fakeDeps({
     observed,
     saved,
-    observe: async (args) => { order.push(`observe:${String((args.evidence as Record<string, unknown>).novel)}`); return 7; },
+    observe: async (args) => { order.push(`observe:${String((args.evidence as Record<string, unknown>).novel)}`); return { termId: 7, observationInserted: true }; },
     save: async () => { order.push('save'); },
   });
   const report = await admitNativeCandidates({
@@ -786,6 +891,28 @@ test('observation failure never persists the extracted term (retryable)', async 
   });
   assert.equal(report.admitted, 1);
   assert.deepEqual(order, ['observe:true', 'save']);
+  assert.deepEqual(saved, [{ country: 'Germany', term: 'P2P-Algo' }]);
+});
+
+test('replayed observations reuse evidence without inflating vocabulary counts', async () => {
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-1' }];
+  // First extraction inserts; replay hits ON CONFLICT (same key, no new row).
+  let calls = 0;
+  const deps = fakeDeps({
+    observed, saved,
+    observe: async () => { calls += 1; return { termId: 7, observationInserted: calls === 1 }; },
+  });
+  const admission = {
+    channel: testChannel(), sources,
+    parsed: { terminology: ['P2P-Algo'] },
+    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
+  };
+  const first = await admitNativeCandidates(admission);
+  assert.deepEqual([first.admitted, first.duplicates], [1, 0]);
+  const second = await admitNativeCandidates(admission);
+  assert.deepEqual([second.admitted, second.duplicates], [0, 1]);
   assert.deepEqual(saved, [{ country: 'Germany', term: 'P2P-Algo' }]);
 });
 
@@ -863,6 +990,13 @@ test('video IDs align to titles and persist on the observation', async () => {
   assert.deepEqual(alignVideoIdsToTitles(['T', 'T', 'T'], [{ id: 'A', title: 'T' }, { id: 'B', title: 'T' }]), ['A', 'B', null]);
   // Single video, duplicate titles: first takes it, second is honestly null.
   assert.deepEqual(alignVideoIdsToTitles(['T', 'T'], [{ id: 'A', title: 'T' }]), ['A', null]);
+  // Matched-document fallback: provider-native ID preserved through title
+  // equality when no hydrated videos exist; never inferred on mismatch.
+  assert.deepEqual(alignVideoIdsToTitles(['Real Title'], [], { id: 'v1', title: 'Real Title' }), ['v1']);
+  assert.deepEqual(alignVideoIdsToTitles(['Other'], [], { id: 'v1', title: 'Real Title' }), [null]);
+  assert.deepEqual(alignVideoIdsToTitles(['T'], [{ id: 'A', title: 'T' }], { id: 'v1', title: 'T' }), ['A']);
+  const ingestionSource = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  assert.match(ingestionSource, /candidate\.matchedDocument\?\.type === 'VIDEO'/);
 
   const observed: Array<Record<string, unknown>> = [];
   const saved: Array<{ country: string; term: string }> = [];
@@ -972,6 +1106,29 @@ test('non-metadata inputs are excluded from provenance evidence', () => {
   assert.equal(hits[0].located.videoId, 'vid-7');
 });
 
+test('admission with non-metadata origins records no title/description evidence', async () => {
+  // End-to-end through the production source builder + admission: inspection
+  // prose and fallback titles must not surface as VIDEO_TITLE/DESCRIPTION in
+  // persisted observation evidence.
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const sources = buildLiteralSources(
+    'Börsenanalyse LuxX', ['SMC Kompakt'], 'Inspection prose mentioning SMC Group',
+    ['vid-x'], { videoTitlesAreMetadata: false, descriptionIsMetadata: false }
+  );
+  const deps = fakeDeps({ observed, saved });
+  const report = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['Börsenanalyse'] },
+    baseline: okBaseline(), humanApproved: true, humanObservation: 'HUMAN_APPROVED_CHANNEL', deps,
+  });
+  assert.equal(report.admitted, 1);
+  for (const entry of observed) {
+    const ref = (entry.evidence as Record<string, unknown>).sourceRef as Record<string, unknown>;
+    assert.ok(ref.kind === 'CHANNEL_NAME', `non-metadata kind leaked: ${String(ref.kind)}`);
+  }
+});
+
 test('search-query fallback titles never become video titles', () => {
   const channels = extractDiscoveredChannels(
     [{ id: { channelId: 'ch-1' }, snippet: { channelTitle: 'Kanal' } }],
@@ -991,15 +1148,16 @@ test('extraction caller marks non-metadata origins honestly', () => {
   assert.match(source, /videoTitlesAreMetadata: false, descriptionIsMetadata: false/);
 });
 
-test('planner serves trial terms to live cycles', () => {
+test('planner serves trial terms inside generated queries', () => {
   const candidates = planDiverseQueries({
     country: 'Germany',
     count: 5,
     learnedVocabulary: [],
     existingQueries: [],
     provenTerminology: [{ id: 1, term: 'P2P-Algo', score: 0.9, lifecycle: 'SEARCH_TRIAL' }],
-  });
-  assert.ok(JSON.stringify(candidates).includes('P2P-Algo'));
+  }) as Array<{ query: string }>;
+  const serving = candidates.filter(candidate => candidate.query.includes('P2P-Algo'));
+  assert.ok(serving.length >= 1, 'a planned retrieval query must contain the trial term');
 });
 
 test('extraction text gate preserves the channel-name-only path', () => {
@@ -1023,7 +1181,8 @@ test('extraction forwards language and locale into the admission helper', () => 
 test('extraction admits only literal, non-spam candidates with observe-first ordering', () => {
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
   assert.match(source, /classifyNativeCandidate\(raw, args\.sources, args\.baseline/);
-  assert.match(source, /if \(termId == null\)/);
+  assert.match(source, /if \(observation == null\)/);
+  assert.match(source, /if \(!observation\.observationInserted\)/);
   assert.match(source, /buildNoveltyBaseline\(/);
   assert.doesNotMatch(source, /\(\) => \[\] as string\[\]/);
 });

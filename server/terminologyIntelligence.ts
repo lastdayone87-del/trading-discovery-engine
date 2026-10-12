@@ -310,7 +310,10 @@ export function buildNoveltyBaseline(args: {
   existingOk: boolean;
 }): NoveltyBaseline {
   const failed: Array<'curated' | 'existing'> = [];
-  if (!args.vocabOk) failed.push('curated');
+  // A missing country row is an unknown baseline even when the lookup itself
+  // succeeded: without the country-specific curated vocabulary, known terms
+  // would falsely classify as novel.
+  if (!args.vocabOk || args.vocab === undefined) failed.push('curated');
   if (!args.existingOk) failed.push('existing');
   return {
     ok: failed.length === 0,
@@ -577,7 +580,26 @@ export async function readNativeQualityEvidence(
   };
 }
 
-export async function observeTerminology(args: {
+export interface TerminologyObservationResult {
+  termId: number;
+  /** True only when INSERT ... ON CONFLICT actually inserted a new observation row. */
+  observationInserted: boolean;
+}
+
+/**
+ * Per-term lifecycle serialization lock. Acquires a transaction-scoped
+ * advisory lock BEFORE the transaction writes any terminology row for the
+ * term. Universal lock order across observation, attribution, and refresh:
+ * advisory first, row writes after — no transaction ever holds term-row
+ * locks (ROW EXCLUSIVE updates, FK KEY SHARE checks) while requesting this
+ * lock, so the KEY SHARE -> row-lock upgrade deadlock cannot form.
+ * Re-entrant within a session (repeat acquisition is a no-op until commit).
+ */
+export async function acquireTerminologyLifecycleLock(termId: number, runner: Queryable): Promise<void> {
+  await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`terminology-lifecycle:${termId}`]);
+}
+
+export async function observeTerminologyDetailed(args: {
   term: string;
   country: string;
   language?: string;
@@ -595,7 +617,7 @@ export async function observeTerminology(args: {
   nativeEvidenceStatus?: NativeEvidenceStatus | null;
   sourceProvenanceFamily?: SourceProvenanceFamily | null;
   sourceEvidenceId?: string;
-}, clientOverride?: Queryable): Promise<number | null> {
+}, clientOverride?: Queryable): Promise<TerminologyObservationResult | null> {
   const canonical = args.term.normalize('NFKC').trim().replace(/\s+/gu, ' ');
   const normalized = normalizeTerm(canonical);
   const country = canonicalCountry(args.country);
@@ -620,7 +642,7 @@ export async function observeTerminology(args: {
     const client = await (runner as Pool).connect();
     try {
       await client.query('BEGIN');
-      const result = await observeTerminology(args, client);
+      const result = await observeTerminologyDetailed(args, client);
       await client.query('COMMIT');
       return result;
     } catch (error) {
@@ -655,6 +677,13 @@ export async function observeTerminology(args: {
     if (!existing.rows || !existing.rows[0]) return null;
     termId = Number(existing.rows[0].id);
   }
+
+  // Lock order: advisory BEFORE the observation insert, recency update, and
+  // refresh below (see acquireTerminologyLifecycleLock). The canonical upsert
+  // above is exempt: for existing terms it writes nothing, and for new terms
+  // the row is uncontended (concurrent creators block on speculative insert
+  // holding nothing). Re-entrant: refresh re-acquires harmlessly below.
+  await acquireTerminologyLifecycleLock(termId, runner);
 
   // 2. Resolve native creator/locale evidence status
   let resolvedCreatorCountry: string | null = args.sourceCreatorCountry ? canonicalCountry(args.sourceCreatorCountry) : null;
@@ -729,7 +758,8 @@ export async function observeTerminology(args: {
   );
 
   // 5. Invoke authoritative terminology lifecycle refresh & projection recompute ONLY if a new observation row was actually inserted!
-  if (obsInsert.rows && obsInsert.rows.length > 0) {
+  const observationInserted = Boolean(obsInsert.rows && obsInsert.rows.length > 0);
+  if (observationInserted) {
     const obsAt = obsInsert.rows[0].observed_at || new Date().toISOString();
     await runner.query(
       `UPDATE canonical_trading_terms
@@ -741,7 +771,20 @@ export async function observeTerminology(args: {
     await recomputeNativeEvidenceProjection(termId, runner);
   }
 
-  return termId;
+  return { termId, observationInserted };
+}
+
+/**
+ * Stable public contract: canonical term id or null. Callers that need to
+ * know whether the observation row was newly inserted (e.g. to gate
+ * extracted-vocabulary occurrence increments) use observeTerminologyDetailed.
+ */
+export async function observeTerminology(
+  args: Parameters<typeof observeTerminologyDetailed>[0],
+  clientOverride?: Queryable
+): Promise<number | null> {
+  const result = await observeTerminologyDetailed(args, clientOverride);
+  return result ? result.termId : null;
 }
 
 export async function addTerminologyAlias(canonicalTermId: number, alias: string, aliasType: 'ABBREVIATION' | 'SPELLING' | 'TRANSLITERATION' | 'SHORTHAND' | 'REGIONAL' | 'SPELLING_VARIANT', language = 'und', clientOverride?: Queryable): Promise<void> {
@@ -812,36 +855,60 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   if (!result.rows[0]) return;
   const row = result.rows[0];
   const decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type }, policy);
-  // Native quality gate: applies ONLY when entering a search-eligible state
-  // AND the term carries new-pipeline (qualityVersion) evidence. Legacy-only
-  // terms take the legacy path below byte-identically; spam or non-novel
-  // new terms are held at their current status with a recorded reason
-  // instead of entering trial/proven states. Demotion stays yield-driven.
-  // The quality rollup is read once; a second read would race concurrent
-  // writers and is unnecessary.
+  // Native quality gate: applies whenever the term carries new-pipeline
+  // (qualityVersion) evidence, whether entering eligibility or already
+  // eligible. Legacy-only terms take the legacy path below byte-identically.
+  // Spam or non-novel terms are held with a recorded reason instead of
+  // entering trial/proven states — and an already-eligible term whose native
+  // evidence denies entry is revoked (search_eligible=false, status
+  // otherwise untouched unless legacy rules demote). Without revocation, an
+  // attribution refresh could mark a term eligible while a native
+  // observation is uncommitted, and the later observation refresh would skip
+  // the gate (already eligible) and leave the ineligible term eligible.
+  // Demotion stays yield-driven. The quality rollup is read once; per-term
+  // serialization makes re-reads unnecessary.
   let qualityBlocked = false;
+  // Actual persisted lifecycle_status when blocked (entry block preserves the
+  // row status; revoke preserves it too unless legacy rules demote).
+  let blockedStatus: string | null = null;
   const enteringEligibility = !row.search_eligible && decision.searchEligible;
-  if (enteringEligibility) {
-    const quality = await readNativeQualityEvidence(termId, runner);
-    if (quality.v1Observations > 0) {
-      const entry = evaluateTrialEntry({ novel: quality.novel, spamConfirmed: quality.spamConfirmed });
-      if (!entry.allowed) {
+  const quality = await readNativeQualityEvidence(termId, runner);
+  if (quality.v1Observations > 0) {
+    const entry = evaluateTrialEntry({ novel: quality.novel, spamConfirmed: quality.spamConfirmed });
+    if (!entry.allowed) {
+      if (decision.searchEligible || row.search_eligible) {
         qualityBlocked = true;
-        // event_type is CHECK-constrained to PROMOTION/DEMOTION/ELIGIBILITY_CHANGE:
-        // same-status ELIGIBILITY_CHANGE with an explicit block reason.
-        const blockReason = `quality-gate blocked trial entry: ${entry.reasons.join('; ')}`;
+        const demoteFollows = row.search_eligible && decision.status === 'DEMOTED';
+        // event_type is CHECK-constrained to PROMOTION/DEMOTION/ELIGIBILITY_CHANGE.
+        const blockReason = row.search_eligible && decision.searchEligible && !demoteFollows
+          ? `quality-gate revoked eligibility: ${entry.reasons.join('; ')}`
+          : `quality-gate blocked trial entry: ${entry.reasons.join('; ')}`;
+        const eventType = demoteFollows ? 'DEMOTION' : 'ELIGIBILITY_CHANGE';
+        const eventTo = demoteFollows ? decision.status : row.lifecycle_status;
+        if (row.search_eligible) {
+          // Revoke: strip eligibility the legacy decision would keep. Status
+          // follows legacy demotion when the legacy decision demotes (still
+          // yield-driven); otherwise the status is preserved untouched.
+          blockedStatus = eventTo;
+          await runner.query(
+            'UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=false,trust_tier=$3 WHERE id=$1',
+            [termId, eventTo, demoteFollows ? (decision.searchEligible ? 2 : 3) : row.trust_tier]
+          );
+        } else {
+          blockedStatus = row.lifecycle_status;
+        }
         // Idempotency: a term that stays blocked for the same reason must not
         // append a duplicate event on every refresh — record only when the
-        // block reason changed since the latest event.
+        // (type, reason) changed since the latest event.
         const latest = await runner.query(
           `SELECT event_type, reason FROM terminology_lifecycle_events WHERE canonical_term_id=$1 ORDER BY id DESC LIMIT 1`,
           [termId]
         );
         const lastEvent = ((latest.rows || [])[0] || {}) as Record<string, unknown>;
-        if (!(lastEvent.event_type === 'ELIGIBILITY_CHANGE' && lastEvent.reason === blockReason)) {
+        if (!(lastEvent.event_type === eventType && lastEvent.reason === blockReason)) {
           await runner.query(
-            `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$2,'ELIGIBILITY_CHANGE',$3,$4)`,
-            [termId, row.lifecycle_status, blockReason, JSON.stringify({ v1Observations: quality.v1Observations, novel: quality.novel, spamConfirmed: quality.spamConfirmed })]
+            `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`,
+            [termId, row.lifecycle_status, eventTo, eventType, blockReason, JSON.stringify({ v1Observations: quality.v1Observations, novel: quality.novel, spamConfirmed: quality.spamConfirmed })]
           );
         }
       }
@@ -853,7 +920,7 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   }
   // The snapshot records the persisted lifecycle state: when the quality
   // gate blocks a transition, decision.status was never applied.
-  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, qualityBlocked ? row.lifecycle_status : decision.status, JSON.stringify(policy)]);
+  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, qualityBlocked ? (blockedStatus ?? row.lifecycle_status) : decision.status, JSON.stringify(policy)]);
 }
 
 /**
@@ -878,6 +945,9 @@ export async function attributeTerminologyPerformance(query: QueryRecord, metric
   if (!runner) return;
   const terms = await runner.query('SELECT id FROM canonical_trading_terms WHERE country=$1 AND normalized_term=$2', [canonicalCountry(query.country), learned]);
   for (const row of terms.rows) {
+    // Lock order: advisory BEFORE the performance insert below (its FK takes
+    // KEY SHARE on the term row). Matches observe/refresh ordering.
+    await acquireTerminologyLifecycleLock(Number(row.id), runner);
     const yieldScore = scopeWeightedYield(metrics.distinctResults, metrics.newChannels, metrics.inScopeNewChannels);
     await runner.query(`INSERT INTO terminology_performance(canonical_term_id,query_id,retrieval_lane,search_ordering,raw_results,unique_creators,new_creators,confirmed_trading_creators,needs_review_creators,non_trading_creators,wrong_country_creators,communities_discovered,quota_consumed,decayed_yield_score) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [row.id, query.id, String(retrievalLane || metadata.retrievalLane || 'UNKNOWN'), String(searchOrdering || metadata.searchOrdering || 'RELEVANCE'), metrics.rawResults, metrics.distinctResults, metrics.newChannels, metrics.tradingConfirmed, metrics.needsReview, metrics.nonTrading, metrics.countryRejected, metrics.communitiesDiscovered, quotaConsumed, yieldScore]);
     await refreshTerminologyLifecycle(Number(row.id), DEFAULT_TERMINOLOGY_POLICY, runner);

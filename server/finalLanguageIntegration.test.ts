@@ -77,9 +77,10 @@ test('final integration: newly covered supported countries use stable region and
 });
 
 test('final integration: every normal extraction family receives explicit language fields', async () => {
-  // Rule path: single direct observation call site forwards both fields.
+  // Rule path: single direct observation call site forwards both fields
+  // (the helper's default dependency delegates to the same detailed writer).
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
-  const directCalls = source.split('await observeTerminology({').slice(1);
+  const directCalls = source.split('observeTerminologyDetailed({').slice(1);
   assert.equal(directCalls.length, 1, 'only the rule path observes directly; Gemini families share the admission helper');
   assert.match(directCalls[0], /language: languageContext\?\.language/);
   assert.match(directCalls[0], /locale: languageContext\?\.locale/);
@@ -101,13 +102,13 @@ test('final integration: every normal extraction family receives explicit langua
       phrases: ['P2P-Algo live session'],
       formats: ['Gold Analyse Wochenausblick'],
     },
-    baseline: buildNoveltyBaseline({ country: 'Germany', vocab: undefined, vocabOk: true, existingTerms: [], existingOk: true }),
+    baseline: buildNoveltyBaseline({ country: 'Germany', vocab: { country: 'Germany', languages: ['de'], native_trading_terminology: [], popular_instruments: [], local_market_phrases: [], common_content_format_names: [] }, vocabOk: true, existingTerms: [], existingOk: true }),
     language: 'de',
     locale: 'de-DE',
     humanApproved: false,
     humanObservation: 'ENRICHMENT',
     deps: {
-      observeTerm: async (args) => { observed.push(args as unknown as Record<string, unknown>); return 1; },
+      observeTerm: async (args) => { observed.push(args as unknown as Record<string, unknown>); return { termId: 1, observationInserted: true }; },
       saveTerm: async () => undefined,
     },
   });

@@ -16,7 +16,7 @@ import {
 import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
-import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, findLiteralSpan, getPlannerTerminology, observeTerminology, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline } from './terminologyIntelligence';
+import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, findLiteralSpan, getPlannerTerminology, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -224,10 +224,21 @@ export function findRuleInstrumentHits(
  */
 export function alignVideoIdsToTitles(
   titles: string[],
-  videos?: Array<{ id?: string; title: string }>
+  videos?: Array<{ id?: string; title: string }>,
+  matchedVideo?: { id?: string | null; title?: string | null }
 ): Array<string | null> {
-  if (videos && videos.length === titles.length && videos.every((video, index) => video.title === titles[index])) {
-    return videos.map(video => video.id ?? null);
+  // Production fallback: when no hydrated video records exist but the matched
+  // retrieval document carries the provider-native video ID, it forms a
+  // single-video pool — never inferred or fabricated, only preserved through
+  // title equality. Mismatched titles honestly yield null.
+  const pool =
+    videos && videos.length > 0
+      ? videos
+      : matchedVideo?.id && matchedVideo?.title
+        ? [{ id: matchedVideo.id, title: matchedVideo.title }]
+        : undefined;
+  if (pool && pool.length === titles.length && pool.every((video, index) => video.title === titles[index])) {
+    return pool.map(video => video.id ?? null);
   }
   // Title-match fallback consumes each video once: duplicate titles take the
   // next unmatched same-title video in encounter order, and positions with no
@@ -235,10 +246,10 @@ export function alignVideoIdsToTitles(
   // provenance instead of repeating one video's ID across positions.
   const used = new Set<number>();
   return titles.map(title => {
-    const hit = (videos ?? []).findIndex((video, index) => !used.has(index) && video.title === title);
+    const hit = (pool ?? []).findIndex((video, index) => !used.has(index) && video.title === title);
     if (hit < 0) return null;
     used.add(hit);
-    return videos?.[hit]?.id ?? null;
+    return pool?.[hit]?.id ?? null;
   });
 }
 
@@ -286,12 +297,14 @@ export function buildLiteralSources(
 
 export interface NativeAdmissionDeps {
   saveTerm: (country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', channelId?: string) => Promise<unknown>;
-  observeTerm: (args: Parameters<typeof observeTerminology>[0]) => Promise<number | null>;
+  observeTerm: (args: Parameters<typeof observeTerminologyDetailed>[0]) => Promise<TerminologyObservationResult | null>;
   log?: (message: string) => void;
 }
 
 export interface NativeAdmissionReport {
   admitted: number;
+  /** Already-recorded observations reused idempotently (no new writes). */
+  duplicates: number;
   rejected: Record<NativeAdmissionRejectReason, number>;
 }
 
@@ -328,10 +341,11 @@ export async function admitNativeCandidates(args: {
   deps?: NativeAdmissionDeps;
 }): Promise<NativeAdmissionReport> {
   const saveTerm = args.deps?.saveTerm ?? ((country, term, category, channelId) => saveExtractedTerm(country, term, category, channelId));
-  const observeTerm = args.deps?.observeTerm ?? ((observeArgs) => observeTerminology(observeArgs));
+  const observeTerm = args.deps?.observeTerm ?? ((observeArgs) => observeTerminologyDetailed(observeArgs));
   const log = args.deps?.log ?? ((message) => console.warn(message));
   const rejected = EMPTY_ADMISSION_REJECTIONS();
   let admitted = 0;
+  let duplicates = 0;
   const admit = async (
     raw: unknown,
     category: 'terminology' | 'instrument' | 'phrase' | 'format',
@@ -344,7 +358,7 @@ export async function admitNativeCandidates(args: {
       rejected[verdict.reason] += 1;
       return;
     }
-    const termId = await observeTerm({
+    const observation = await observeTerm({
       term: String(raw), country: args.channel.country, termType, observationType,
       channelId: args.channel.channel_id, videoId: verdict.located.videoId ?? undefined, humanApproved: approved,
       language: args.language, locale: args.locale,
@@ -357,8 +371,14 @@ export async function admitNativeCandidates(args: {
         translationRisk: verdict.flags.translationRisk,
       },
     });
-    if (termId == null) {
+    if (observation == null) {
       rejected['observation-failed'] += 1;
+      return;
+    }
+    // Occurrence counts advance only on newly persisted evidence: replaying
+    // an already-recorded observation reuses it idempotently (no saveTerm).
+    if (!observation.observationInserted) {
+      duplicates += 1;
       return;
     }
     await saveTerm(args.channel.country, String(raw), category, args.channel.channel_id);
@@ -379,11 +399,11 @@ export async function admitNativeCandidates(args: {
   const dropped = (Object.values(rejected) as number[]).reduce((sum, count) => sum + count, 0);
   if (dropped > 0 || !args.baseline.ok) {
     log(
-      `[Vocabulary Extraction] channel ${args.channel.channel_id} native admission: admitted=${admitted} ` +
+      `[Vocabulary Extraction] channel ${args.channel.channel_id} native admission: admitted=${admitted} duplicates=${duplicates} ` +
       `rejected=${JSON.stringify(rejected)} noveltyBaseline=${args.baseline.ok ? 'ok' : `unknown:${args.baseline.failed.join(',')}`}`
     );
   }
-  return { admitted, rejected };
+  return { admitted, duplicates, rejected };
 }
 
 export async function extractVocabularyFromCreator(
@@ -407,9 +427,11 @@ export async function extractVocabularyFromCreator(
   for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
-    const termId = await observeTerminology({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], translationRisk: null } });
-    if (termId == null) continue;
-    await saveExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
+    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], translationRisk: null } });
+    if (ruleObservation == null) continue;
+    if (ruleObservation.observationInserted) {
+      await saveExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
+    }
   }
 
   // 2. Deep Gemini Extraction if API Key is configured
@@ -462,10 +484,8 @@ Return ONLY a valid JSON object with format:
         const baseline = buildNoveltyBaseline({
           country: channel.country,
           vocab: vocabOutcome.vocab,
-          // A successful lookup with no row for this country is an unknown
-          // baseline, not an empty one: without the country-specific curated
-          // vocabulary, known terms would falsely classify as novel.
-          vocabOk: vocabOutcome.ok && vocabOutcome.vocab !== undefined,
+          // Missing-row handling lives in buildNoveltyBaseline (unknown, not empty).
+          vocabOk: vocabOutcome.ok,
           existingTerms: existingOutcome.terms,
           existingOk: existingOutcome.ok,
         });
