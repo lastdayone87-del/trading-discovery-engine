@@ -147,10 +147,11 @@ export function findLiteralSpan(term: string, sources: LiteralSourceText[]): Lit
   const lettersOnly = needle.replace(/[^\p{L}]/gu, '');
   const hasNonLatin = /[^\u0000-\u024F\u1E00-\u1EFF]/u.test(lettersOnly);
   const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Boundaries guard against Latin-script letters only: 'ES' inside 'heroes'
-  // is a fragment, but CJK and similar scripts have no word boundaries, so an
-  // instrument adjacent to Han/Hangul/etc. characters still matches.
-  const body = hasNonLatin ? escaped : `(?<!\\p{Script=Latin})${escaped}(?!\\p{Script=Latin})`;
+  // Boundaries guard against Latin-script letters, numbers, and underscores:
+  // 'ES' inside 'heroes', 'ES1', or 'ES_Futures' is a fragment, never a term.
+  // CJK and similar scripts have no word boundaries, so an instrument
+  // adjacent to Han/Hangul/etc. characters still matches.
+  const body = hasNonLatin ? escaped : `(?<![\\p{Script=Latin}\\p{N}_])${escaped}(?![\\p{Script=Latin}\\p{N}_])`;
   // Case-insensitive matching is left to the regex engine ('iu'), which folds
   // case per character without changing string lengths — lowercasing both
   // sides first (e.g. Turkish İ → i̇) would shift offsets and corrupt spans.
@@ -162,6 +163,13 @@ export function findLiteralSpan(term: string, sources: LiteralSourceText[]): Lit
     if (match && match.index !== undefined) {
       const span = sliceOriginalSource(source.text, indexMap, match.index, match.index + match[0].length);
       if (!span) continue;
+      // Round-trip validation: the slice must NFKC-equal the normalized
+      // match. Many-to-one expansions (e.g. U+3300 -> katakana sequence) map
+      // several normalized units to one source offset, so the slice can end
+      // mid-expansion ('不动産' for candidate '不动産アパ') and
+      // record provenance that does not contain the candidate. Reject such
+      // mappings rather than persisting false provenance.
+      if (span.normalize('NFKC') !== match[0]) continue;
       return { sourceKind: source.kind, sourceIndex: source.index, span, videoId: source.videoId ?? null };
     }
   }
@@ -741,9 +749,47 @@ export async function addTerminologyAlias(canonicalTermId: number, alias: string
   await runner.query(`INSERT INTO trading_term_aliases(canonical_term_id,alias,normalized_alias,language,script,alias_type) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(canonical_term_id,normalized_alias) DO NOTHING`, [canonicalTermId, alias.normalize('NFKC').trim(), normalized, language, inferScript(alias), aliasType]);
 }
 
+/**
+ * Version-skew limitation (documented, not fixable in application code): the
+ * native-v1 trial-entry gate below binds only workers running this code. An
+ * older worker sharing the database applies decideLifecycle without the gate
+ * and can mark a term search-eligible while a native observation is in flight.
+ * No application-level mechanism constrains another binary; a
+ * version-independent database enforcement would require a DDL migration,
+ * which is out of scope for this change. Operational mitigation: the fleet
+ * deploys a single version at a time, no native-v1 observations exist until
+ * this code ships, and terminology-driven selection stays inactive until the
+ * E2E staging proof passes — so the gate and the first native-v1 writes
+ * always land on a single-version fleet.
+ */
 export async function refreshTerminologyLifecycle(termId: number, policy = DEFAULT_TERMINOLOGY_POLICY, clientOverride?: Queryable): Promise<void> {
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return;
+  // A Pool does not bind sequential queries to one connection: own a
+  // transaction exactly like observeTerminology does, so the row lock below
+  // actually serializes concurrent refreshes instead of releasing instantly.
+  if ('connect' in runner && typeof (runner as Pool).connect === 'function' && !('release' in runner)) {
+    const client = await (runner as Pool).connect();
+    try {
+      await client.query('BEGIN');
+      await refreshTerminologyLifecycle(termId, policy, client);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return;
+  }
+  // Per-term serialization: lock the canonical row BEFORE reading aggregates
+  // and quality evidence. A concurrent refresh (or an in-flight observation
+  // transaction, which refreshes inside its own transaction) then waits for
+  // this transaction's committed state instead of deciding on pre-commit
+  // reads — every transition evaluates committed evidence under the same
+  // lock, and block-event check-and-insert becomes atomic with the refresh.
+  // Single-row lock only, so no lock-ordering hazard exists.
+  await runner.query(`SELECT id FROM canonical_trading_terms WHERE id=$1 FOR UPDATE`, [termId]);
   const result = await runner.query(`SELECT t.*, COALESCE(o.distinct_creators,0)::int distinct_creators, COALESCE(o.distinct_communities,0)::int distinct_communities,
     COALESCE(o.human_approved,0)::int human_approved, COALESCE(o.decayed_evidence,0)::float decayed_evidence,
     COALESCE(p.executions,0)::int executions, COALESCE(p.decayed_yield,0)::float decayed_yield

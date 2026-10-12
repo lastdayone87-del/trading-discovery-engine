@@ -205,13 +205,10 @@ export function findRuleInstrumentHits(
   channelName: string,
   videoTitles: string[],
   description: string,
-  videoIds?: Array<string | null>
+  videoIds?: Array<string | null>,
+  origins?: ExtractionSourceOrigins
 ): RuleInstrumentHit[] {
-  const sources: LiteralSourceText[] = [
-    { kind: 'CHANNEL_NAME', index: 0, text: channelName },
-    ...videoTitles.map((value, index) => ({ kind: 'VIDEO_TITLE' as const, index, text: value, videoId: videoIds?.[index] ?? null })),
-    { kind: 'DESCRIPTION' as const, index: 0, text: description },
-  ];
+  const sources = buildLiteralSources(channelName, videoTitles, description, videoIds, origins);
   const hits: RuleInstrumentHit[] = [];
   for (const instrument of KNOWN_INSTRUMENT_TERMS) {
     const located = findLiteralSpan(instrument, sources);
@@ -232,7 +229,48 @@ export function alignVideoIdsToTitles(
   if (videos && videos.length === titles.length && videos.every((video, index) => video.title === titles[index])) {
     return videos.map(video => video.id ?? null);
   }
-  return titles.map(title => videos?.find(video => video.title === title)?.id ?? null);
+  // Title-match fallback consumes each video once: duplicate titles take the
+  // next unmatched same-title video in encounter order, and positions with no
+  // remaining match get null. Ambiguous duplicates therefore degrade to null
+  // provenance instead of repeating one video's ID across positions.
+  const used = new Set<number>();
+  return titles.map(title => {
+    const hit = (videos ?? []).findIndex((video, index) => !used.has(index) && video.title === title);
+    if (hit < 0) return null;
+    used.add(hit);
+    return videos?.[hit]?.id ?? null;
+  });
+}
+
+export interface ExtractionSourceOrigins {
+  /** False when videoTitles are not YouTube metadata (fallbacks/prose). */
+  videoTitlesAreMetadata?: boolean;
+  /** False when description is not YouTube metadata (inspection prose). */
+  descriptionIsMetadata?: boolean;
+}
+
+/**
+ * Build literal-traceability sources with honest provenance kinds.
+ * Non-metadata inputs (search-query fallback titles, inspection prose,
+ * channel-name duplicates) are excluded from provenance evidence rather than
+ * mislabeled as VIDEO_TITLE/DESCRIPTION. Exported for unit testing.
+ */
+export function buildLiteralSources(
+  channelName: string,
+  videoTitles: string[],
+  description: string,
+  videoIds?: Array<string | null>,
+  origins?: ExtractionSourceOrigins
+): LiteralSourceText[] {
+  return [
+    { kind: 'CHANNEL_NAME', index: 0, text: channelName },
+    ...(origins?.videoTitlesAreMetadata === false
+      ? []
+      : videoTitles.map((value, index) => ({ kind: 'VIDEO_TITLE' as const, index, text: value, videoId: videoIds?.[index] ?? null }))),
+    ...(origins?.descriptionIsMetadata === false
+      ? []
+      : [{ kind: 'DESCRIPTION' as const, index: 0, text: description }]),
+  ];
 }
 
 export interface NativeAdmissionDeps {
@@ -343,7 +381,8 @@ export async function extractVocabularyFromCreator(
   description: string = '',
   humanApproved = false,
   languageContext?: ExplicitTerminologyLanguageContext,
-  videoIds?: Array<string | null>
+  videoIds?: Array<string | null>,
+  origins?: ExtractionSourceOrigins
 ): Promise<ExtractedTermRecord[]> {
   const extracted: ExtractedTermRecord[] = [];
   const ai = getAIClient();
@@ -354,7 +393,7 @@ export async function extractVocabularyFromCreator(
   // (KNOWN_INSTRUMENT_TERMS — shared with novelty classification, never
   // duplicated). Boundary-aware literal matching: 'ES' inside 'heroes' or
   // 'trades' is a word fragment, never instrument evidence.
-  for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds)) {
+  for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
     const termId = await observeTerminology({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], translationRisk: null } });
@@ -363,13 +402,18 @@ export async function extractVocabularyFromCreator(
   }
 
   // 2. Deep Gemini Extraction if API Key is configured
-  if (ai && (videoTitles.length > 0 || description.length > 20)) {
+  // Non-metadata inputs (origins) are invisible to vocabulary provenance:
+  // titles/descriptions that are not YouTube metadata never become literal
+  // sources, rule spans, or quoted prompt context.
+  const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
+  const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
+  if (ai && (effTitles.length > 0 || effDesc.length > 20)) {
     try {
       const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
-Description: "${description}"
+Description: "${effDesc}"
 Recent Titles:
-${videoTitles.map(t => `- ${t}`).join('\n')}
+${effTitles.map(t => `- ${t}`).join('\n')}
 
 Identify any localized, native trading terminology, popular financial instruments, market phrases, or content formats specific to traders in ${channel.country}. Quote every term EXACTLY as it appears in the texts above: do not paraphrase, translate, or invent terms.
 Return ONLY a valid JSON object with format:
@@ -392,11 +436,7 @@ Return ONLY a valid JSON object with format:
         // Literal, traceable admission (native-v1 pipeline) via the shared
         // admitNativeCandidates helper: classification (literal → spam →
         // fail-closed novelty), observe-first persistence, rejection stats.
-        const literalSources: LiteralSourceText[] = [
-          { kind: 'CHANNEL_NAME', index: 0, text: channel.channel_name },
-          ...videoTitles.map((value, index) => ({ kind: 'VIDEO_TITLE' as const, index, text: value, videoId: videoIds?.[index] ?? null })),
-          { kind: 'DESCRIPTION' as const, index: 0, text: description },
-        ];
+        const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
         // Fail closed: when either novelty lookup errors, the baseline is
         // marked unknown and every candidate is rejected as novelty-unknown —
         // a transient read error must never make a known term look novel.
@@ -411,7 +451,10 @@ Return ONLY a valid JSON object with format:
         const baseline = buildNoveltyBaseline({
           country: channel.country,
           vocab: vocabOutcome.vocab,
-          vocabOk: vocabOutcome.ok,
+          // A successful lookup with no row for this country is an unknown
+          // baseline, not an empty one: without the country-specific curated
+          // vocabulary, known terms would falsely classify as novel.
+          vocabOk: vocabOutcome.ok && vocabOutcome.vocab !== undefined,
           existingTerms: existingOutcome.terms,
           existingOk: existingOutcome.ok,
         });

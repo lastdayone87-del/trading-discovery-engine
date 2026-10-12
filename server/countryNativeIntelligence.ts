@@ -120,7 +120,13 @@ export function computeObservationKey(params: {
   const normStatus = (params.nativeEvidenceStatus || 'none').trim().toUpperCase();
   const normFamily = (params.sourceProvenanceFamily || 'none').trim().toUpperCase();
 
-  const checksum = computeEvidenceChecksum(params.evidence);
+  // Novelty-derived fields (novel/knownAs/generic) describe the classification
+  // at observation time, not the source: re-extraction after the term is saved
+  // flips them (novel true->false) and must reuse the original observation key
+  // instead of inserting a duplicate observation that inflates evidence.
+  const { novel: _novel, knownAs: _knownAs, generic: _generic, ...stableEvidence } =
+    (params.evidence || {}) as Record<string, unknown>;
+  const checksum = computeEvidenceChecksum(stableEvidence);
   const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();
 
   const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}|${evidenceId}`;

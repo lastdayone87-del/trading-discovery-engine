@@ -632,7 +632,10 @@ export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, san
       // Preserve it as retrieval provenance and leave About unknown until the
       // authoritative channels resource is hydrated.
       description: lane === 'VIDEO' ? '' : (item.snippet?.description || ''),
-      videoTitles: videoTitle ? [videoTitle] : [sanitizedQuery],
+      // Query-text fallback removed: the search query is not a video title and
+      // must never carry VIDEO_TITLE provenance downstream. Retrieval context
+      // is preserved separately on matchedDocument.
+      videoTitles: videoTitle ? [videoTitle] : [],
       videoDescriptions: videoDescription ? [videoDescription] : [],
       // VIDEO-search snippets are retrieval-selected, not a recent-channel
       // sample: they must never vote in the aggregated-language country path.

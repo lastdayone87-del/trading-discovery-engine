@@ -26,8 +26,11 @@ import {
 import {
   admitNativeCandidates,
   alignVideoIdsToTitles,
+  buildLiteralSources,
   findRuleInstrumentHits,
 } from './queryIntelligence';
+import { computeObservationKey } from './countryNativeIntelligence';
+import { extractDiscoveredChannels } from './youtube';
 import { planDiverseQueries } from './queryPlanner';
 
 const SOURCES: LiteralSourceText[] = [
@@ -99,10 +102,22 @@ test('literal spans trace to exact source text', () => {
   assert.equal(cjk?.span, '原油');
 });
 
+test('NFKC expansions cannot fabricate literal provenance', () => {
+  // U+3300 expands to a katakana sequence sharing one source offset: the
+  // mapped slice ('不動産') does not contain the candidate ('不動産アパ').
+  assert.equal(
+    findLiteralSpan('不動産アパ', [{ kind: 'DESCRIPTION', index: 0, text: '不動産㌀' }]),
+    null
+  );
+  // Valid NFKC equivalences still trace with exact original spans.
+  assert.equal(findLiteralSpan('ES', [{ kind: 'VIDEO_TITLE', index: 0, text: 'ＥＳ先物' }])?.span, 'ＥＳ');
+  assert.equal(findLiteralSpan('fib', [{ kind: 'DESCRIPTION', index: 0, text: 'ﬁb levels' }])?.span, 'ﬁb');
+});
+
 test('punctuated Latin terms keep word-boundary guards', () => {
   // Script detection is letter-based: the en dash must not flip 'order–flow'
   // to the boundary-free path (which admitted it inside 'disorder–flow').
-  const endash = [{ kind: 'DESCRIPTION', index: 0, text: 'live order–flow session' }];
+  const endash: LiteralSourceText[] = [{ kind: 'DESCRIPTION', index: 0, text: 'live order–flow session' }];
   assert.equal(findLiteralSpan('order–flow', endash)?.span, 'order–flow');
   assert.equal(findLiteralSpan('order–flow', [{ kind: 'DESCRIPTION', index: 0, text: 'disorder–flow analysis' }]), null);
   // Equivalent punctuation: em dash behaves the same.
@@ -263,6 +278,29 @@ test('novelty baseline fails closed on either lookup failure', () => {
   assert.deepEqual(existingFailed.existingTerms, []);
 });
 
+test('missing country vocabulary is an unknown baseline, not an empty one', () => {
+  // Successful lookup, no row for the country: fail closed.
+  const missing = buildNoveltyBaseline({ country: 'Germany', vocab: undefined, vocabOk: false, existingTerms: [], existingOk: true });
+  assert.equal(missing.ok, false);
+  const rejected = classifyNativeCandidate('P2P-Algo', [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest' }], missing, {});
+  assert.equal(rejected.admit, false);
+  if (rejected.admit === false) assert.equal(rejected.reason, 'novelty-unknown');
+  // Valid country row: baseline usable, genuinely new term admittable.
+  const present = buildNoveltyBaseline({
+    country: 'Germany',
+    vocab: { country: 'Germany', languages: ['de'], native_trading_terminology: [], popular_instruments: [], local_market_phrases: [], common_content_format_names: [] },
+    vocabOk: true, existingTerms: [], existingOk: true,
+  });
+  assert.equal(present.ok, true);
+  const admitted = classifyNativeCandidate('P2P-Algo', [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest' }], present, {});
+  assert.equal(admitted.admit, true);
+});
+
+test('extraction treats a missing country row as an unknown baseline', () => {
+  const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.match(source, /vocabOutcome\.ok && vocabOutcome\.vocab !== undefined/);
+});
+
 test('classifier rejects in order: shape, length, literal, spam, novelty-unknown', () => {
   assert.equal(classifyNativeCandidate(42, SOURCES, okBaseline(), {}).admit, false);
   const short = classifyNativeCandidate('X', SOURCES, okBaseline(), {});
@@ -390,6 +428,30 @@ test('promotion requires verified trading creators, never unverified yield', () 
     needsReviewCreators: 0,
   });
   assert.equal(nonTradingOnly.decision, 'HOLD');
+});
+
+test('observation identity is stable across novelty reclassification', () => {
+  const sourceEvidence = {
+    extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
+    sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1' },
+    spamSignals: [], translationRisk: null,
+  };
+  const first = computeObservationKey({
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    evidence: { ...sourceEvidence, novel: true, knownAs: null, generic: false },
+  });
+  // After the term is saved, re-extraction flips novelty fields — same key.
+  const second = computeObservationKey({
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    evidence: { ...sourceEvidence, novel: false, knownAs: 'extracted:P2P-Algo', generic: true },
+  });
+  assert.equal(first, second);
+  // Genuinely different source evidence still keys differently.
+  const other = computeObservationKey({
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-2', observationType: 'ENRICHMENT',
+    evidence: { ...sourceEvidence, novel: true, knownAs: null, generic: false },
+  });
+  assert.notEqual(first, other);
 });
 
 test('promotion floors mirror the lifecycle minimums', () => {
@@ -584,6 +646,43 @@ test('blocked lifecycle events are idempotent for an unchanged reason', async ()
   assert.match(String(eventInserts(third.calls)[0].params[2]), /spam-confirmed/);
 });
 
+test('refresh serializes per term: lock before reads, transaction around writes', async () => {
+  // Fake Pool (connect, no release): refresh must BEGIN, lock the term row,
+  // then read aggregates/quality, and COMMIT last — so concurrent refreshes
+  // evaluate committed evidence under the same lock instead of racing.
+  const statements: string[] = [];
+  let released = false;
+  const client = {
+    query: async (text: string, params: unknown[] = []) => {
+      statements.push(text);
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes('FOR UPDATE')) {
+        assert.deepEqual(params, [42]);
+        return { rows: [{ id: 42 }] };
+      }
+      if (text.startsWith('SELECT t.*')) return { rows: [legacyAggregates()] };
+      if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) {
+        return { rows: [{ v1: 1, spam: false, novel: true }] };
+      }
+      if (text.startsWith('SELECT event_type, reason FROM')) return { rows: [] };
+      return { rows: [] };
+    },
+    release: () => { released = true; },
+  };
+  const pool = { connect: async () => client };
+  await refreshTerminologyLifecycle(42, undefined, pool as never);
+  assert.equal(statements[0], 'BEGIN');
+  const lockAt = statements.findIndex(text => text.includes('FOR UPDATE'));
+  const aggregatesAt = statements.findIndex(text => text.startsWith('SELECT t.*'));
+  const qualityAt = statements.findIndex(text => text.includes('bool_or'));
+  const updateAt = statements.findIndex(text => text.startsWith('UPDATE canonical_trading_terms'));
+  assert.ok(lockAt >= 0 && aggregatesAt > lockAt, 'aggregates read after lock acquisition');
+  assert.ok(qualityAt > lockAt, 'quality evidence read under the same lock');
+  assert.ok(updateAt > qualityAt, 'transition applied after evidence reads');
+  assert.equal(statements[statements.length - 1], 'COMMIT');
+  assert.equal(released, true);
+});
+
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
@@ -671,11 +770,25 @@ test('observation failure never persists the extracted term (retryable)', async 
   assert.deepEqual(saved, [{ country: 'Germany', term: 'P2P-Algo' }]);
 });
 
-test('real observation validation rejects over-length candidates before persistence', async () => {
-  // No database needed: the length guard runs before any runner is acquired.
+test('over-length candidates are rejected by the length guard, not by missing infrastructure', async () => {
   const tooLong = `P2P-Algo-${'x'.repeat(80)}`;
   assert.ok(tooLong.length > 80);
-  assert.equal(await observeTerminology({ term: tooLong, country: 'Germany', termType: 'TERMINOLOGY', observationType: 'ENRICHMENT' }), null);
+  // Injected fake runner: the guard must reject before any database query.
+  // (With no runner at all, observeTerminology also returns null — which is
+  // why the fake and its zero-query assertion are load-bearing. Removing the
+  // length guard makes this test fail: the fake would receive queries.)
+  const calls: string[] = [];
+  const fake = {
+    query: async (text: string) => { calls.push(text); return { rows: [] }; },
+  };
+  // Evidence is supplied so the earlier ENRICHMENT fail-closed check passes
+  // and only the length guard can reject: without it, the fake would receive
+  // INSERT/SELECT queries and the zero-query assertion would fail.
+  assert.equal(
+    await observeTerminology({ term: tooLong, country: 'Germany', termType: 'TERMINOLOGY', observationType: 'ENRICHMENT', evidence: { qualityVersion: 'native-v1' } }, fake as never),
+    null
+  );
+  assert.equal(calls.length, 0);
 });
 
 test('rule-based instrument matching respects token boundaries', () => {
@@ -688,6 +801,20 @@ test('rule-based instrument matching respects token boundaries', () => {
   const wide = findRuleInstrumentHits('ＥＳ先物', [], '');
   assert.equal(wide.length, 1);
   assert.equal(wide[0].located.span, 'ＥＳ');
+});
+
+test('instrument boundaries exclude adjacent digits and underscores', () => {
+  const src = (text: string): LiteralSourceText[] => [{ kind: 'DESCRIPTION', index: 0, text }];
+  assert.equal(findLiteralSpan('ES', src('trade ES1 futures')), null);
+  assert.equal(findLiteralSpan('ES', src('trade ES_Futures')), null);
+  assert.equal(findLiteralSpan('CAC 40', src('CAC 400 rally')), null);
+  assert.equal(findLiteralSpan('ES', src('trade ES Futures today'))?.span, 'ES');
+  assert.equal(findLiteralSpan('CAC 40', src('CAC 40 Analyse'))?.span, 'CAC 40');
+  // Accented Latin still guards; CJK adjacency still matches; punctuation kept.
+  assert.equal(findLiteralSpan('ES', src('dÉES trade')), null);
+  assert.equal(findLiteralSpan('ES', [{ kind: 'VIDEO_TITLE', index: 0, text: 'ＥＳ先物' }])?.span, 'ＥＳ');
+  assert.equal(findLiteralSpan('order–flow', src('live order–flow'))?.span, 'order–flow');
+  assert.equal(findLiteralSpan('order–flow', src('disorder–flow')), null);
 });
 
 test('locale survives the shared admission helper into observations', async () => {
@@ -711,6 +838,12 @@ test('video IDs align to titles and persist on the observation', async () => {
   assert.deepEqual(alignVideoIdsToTitles(['b', 'a'], [{ id: 'v-a', title: 'a' }, { id: 'v-b', title: 'b' }]), ['v-b', 'v-a']);
   assert.deepEqual(alignVideoIdsToTitles(['a', 'missing'], [{ id: 'v-a', title: 'a' }]), ['v-a', null]);
   assert.deepEqual(alignVideoIdsToTitles(['a']), [null]);
+  // Duplicate titles consume videos uniquely: no ID repeats across positions.
+  assert.deepEqual(alignVideoIdsToTitles(['T', 'T', 'X'], [{ id: 'A', title: 'T' }, { id: 'B', title: 'T' }]), ['A', 'B', null]);
+  // Exhausted duplicates degrade to null instead of repeating an ID.
+  assert.deepEqual(alignVideoIdsToTitles(['T', 'T', 'T'], [{ id: 'A', title: 'T' }, { id: 'B', title: 'T' }]), ['A', 'B', null]);
+  // Single video, duplicate titles: first takes it, second is honestly null.
+  assert.deepEqual(alignVideoIdsToTitles(['T', 'T'], [{ id: 'A', title: 'T' }]), ['A', null]);
 
   const observed: Array<Record<string, unknown>> = [];
   const saved: Array<{ country: string; term: string }> = [];
@@ -802,6 +935,41 @@ test('quality aggregation runs in SQL over the corrected evidence schema', () =>
     rollupNativeQualityEvidence([{ qualityVersion: 'native-v1', novel: 'yes', spamConfirmed: 'true', spamSignals: 'x' }]),
     { v1Observations: 1, spamConfirmed: false, novel: false }
   );
+});
+
+test('non-metadata inputs are excluded from provenance evidence', () => {
+  // Inspection prose / fallback titles must never be labeled VIDEO_TITLE/DESCRIPTION.
+  const excluded = buildLiteralSources('Kanal', ['Prose title'], 'Inspection prose here', ['vid-9'], { videoTitlesAreMetadata: false, descriptionIsMetadata: false });
+  assert.deepEqual(excluded, [{ kind: 'CHANNEL_NAME', index: 0, text: 'Kanal' }]);
+  // Default (real metadata): all kinds present with aligned video IDs.
+  const full = buildLiteralSources('Kanal', ['T1', 'T2'], 'About text', ['v-1', 'v-2']);
+  assert.deepEqual(full.map(entry => entry.kind), ['CHANNEL_NAME', 'VIDEO_TITLE', 'VIDEO_TITLE', 'DESCRIPTION']);
+  assert.equal(full[1].videoId, 'v-1');
+  assert.equal(full[2].videoId, 'v-2');
+  // Rule path honors origins too: matching text, no instrument evidence.
+  assert.deepEqual(findRuleInstrumentHits('Kanal', ['ES trade'], 'ES deals', undefined, { videoTitlesAreMetadata: false, descriptionIsMetadata: false }), []);
+  // Rule hits propagate video IDs to provenance.
+  const hits = findRuleInstrumentHits('Kanal', ['ES trade'], '', ['vid-7']);
+  assert.equal(hits[0].located.videoId, 'vid-7');
+});
+
+test('search-query fallback titles never become video titles', () => {
+  const channels = extractDiscoveredChannels(
+    [{ id: { channelId: 'ch-1' }, snippet: { channelTitle: 'Kanal' } }],
+    'CHANNEL', 'dax trading strategie'
+  );
+  assert.equal(channels.length, 1);
+  assert.deepEqual(channels[0].videoTitles, []);
+  const withTitle = extractDiscoveredChannels(
+    [{ snippet: { channelId: 'ch-2', channelTitle: 'K2', title: 'Real Title' } }],
+    'VIDEO', 'dax trading strategie'
+  );
+  assert.deepEqual(withTitle[0].videoTitles, ['Real Title']);
+});
+
+test('extraction caller marks non-metadata origins honestly', () => {
+  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(source, /videoTitlesAreMetadata: false, descriptionIsMetadata: false/);
 });
 
 test('planner serves trial terms to live cycles', () => {

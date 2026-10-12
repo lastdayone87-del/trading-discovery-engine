@@ -658,7 +658,10 @@ export async function processNextSearchJob(
         refreshed.quality_score=quality.score; refreshed.quality_breakdown=quality.breakdown;
         await upsertChannel(refreshed);
         if(quality.score>=55) {
-          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true,result.languageContext);
+          // Provenance: titles here are the channel name (already a CHANNEL_NAME
+          // source) and the description is inspection-trail prose — neither is
+          // YouTube metadata, so both are excluded from provenance evidence.
+          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true,result.languageContext,undefined,{ videoTitlesAreMetadata: false, descriptionIsMetadata: false });
           const db=await getDb();
           await db.query(`UPDATE extracted_vocabulary_sources SET provenance='HUMAN_APPROVED',eligible_after_enrichment=true WHERE channel_id=$1`,[channelId]);
           await enqueueTermHarvest({channelId,text,lineage:'HUMAN_APPROVED',approved:true});
