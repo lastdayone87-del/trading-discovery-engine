@@ -214,9 +214,14 @@ const SPAM_SIGNAL_PATTERNS: Array<{ pattern: RegExp; code: string }> = [
 
 /** Returns matched spam reason codes, or [] for clean terms. */
 export function detectSpamSignals(term: string): string[] {
+  // Screen the NFKC-normalized candidate so Unicode compatibility characters
+  // (e.g. 'Ⓓiscount' for 'discount') cannot bypass the patterns. Screening
+  // never alters the candidate itself: persistence and source spans always
+  // use the original text (see classifyNativeCandidate / findLiteralSpan).
+  const screened = term.normalize('NFKC');
   const hits: string[] = [];
   for (const { pattern, code } of SPAM_SIGNAL_PATTERNS) {
-    if (pattern.test(term)) hits.push(code);
+    if (pattern.test(screened)) hits.push(code);
   }
   return [...new Set(hits)];
 }
@@ -507,18 +512,42 @@ export function rollupNativeQualityEvidence(
   return { v1Observations, spamConfirmed, novel };
 }
 
-/** Quality rollup over new-pipeline observations for one term. Terms with
- * only legacy observations return v1Observations 0 and keep legacy rules. */
+/**
+ * Quality rollup over new-pipeline observations for one term, aggregated in
+ * SQL: refresh runs on every new observation and every attribution, so the
+ * result stays fixed-size no matter how large a term's history grows. Terms
+ * with only legacy observations return v1Observations 0 and keep legacy
+ * rules.
+ *
+ * The predicates mirror rollupNativeQualityEvidence exactly (kept as the
+ * unit-tested reference implementation): top-level qualityVersion marker,
+ * canonical spamConfirmed boolean with the persisted spamSignals-array
+ * fallback, top-level novel boolean. jsonb_typeof guards keep a single
+ * malformed out-of-band row from failing the cast and the whole refresh —
+ * non-boolean flags read as false on both paths.
+ */
+export const NATIVE_QUALITY_ROLLUP_SQL =
+  `SELECT count(*) FILTER (WHERE evidence->>'qualityVersion'='native-v1')::int AS v1,
+    COALESCE(bool_or(
+      CASE WHEN jsonb_typeof(evidence->'spamConfirmed') = 'boolean' THEN (evidence->>'spamConfirmed')::boolean ELSE false END
+      OR COALESCE(jsonb_typeof(evidence->'spamSignals') = 'array' AND jsonb_array_length(evidence->'spamSignals') > 0, false)
+    ), false) AS spam,
+    COALESCE(bool_or(
+      CASE WHEN jsonb_typeof(evidence->'novel') = 'boolean' THEN (evidence->>'novel')::boolean ELSE false END
+    ), false) AS novel
+   FROM terminology_observations WHERE canonical_term_id=$1`;
+
 export async function readNativeQualityEvidence(
   termId: number,
   runner: Queryable
 ): Promise<NativeQualityRollup> {
-  const result = await runner.query(
-    `SELECT evidence FROM terminology_observations WHERE canonical_term_id=$1`,
-    [termId]
-  );
-  const rows = (result.rows || []) as Array<Record<string, unknown>>;
-  return rollupNativeQualityEvidence(rows.map(row => row.evidence as Record<string, unknown>));
+  const result = await runner.query(NATIVE_QUALITY_ROLLUP_SQL, [termId]);
+  const row = ((result.rows || [])[0] || {}) as Record<string, unknown>;
+  return {
+    v1Observations: Number(row.v1 || 0),
+    spamConfirmed: row.spam === true,
+    novel: row.novel === true,
+  };
 }
 
 export async function observeTerminology(args: {

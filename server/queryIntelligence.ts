@@ -273,6 +273,7 @@ export async function admitNativeCandidates(args: {
   parsed: { terminology?: unknown[]; instruments?: unknown[]; phrases?: unknown[]; formats?: unknown[] };
   baseline: NoveltyBaseline;
   language?: string;
+  locale?: string;
   humanApproved: boolean;
   humanObservation: 'HUMAN_APPROVED_CHANNEL' | 'ENRICHMENT';
   deps?: NativeAdmissionDeps;
@@ -297,7 +298,7 @@ export async function admitNativeCandidates(args: {
     const termId = await observeTerm({
       term: String(raw), country: args.channel.country, termType, observationType,
       channelId: args.channel.channel_id, videoId: verdict.located.videoId ?? undefined, humanApproved: approved,
-      language: args.language, locale: undefined,
+      language: args.language, locale: args.locale,
       communityFingerprint: args.channel.discord_invite || undefined,
       evidence: {
         extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
@@ -426,6 +427,7 @@ Return ONLY a valid JSON object with format:
           },
           baseline,
           language: languageContext?.language,
+          locale: languageContext?.locale,
           humanApproved,
           humanObservation,
         });

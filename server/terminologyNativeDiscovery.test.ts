@@ -19,6 +19,7 @@ import {
   observeTerminology,
   refreshTerminologyLifecycle,
   rollupNativeQualityEvidence,
+  NATIVE_QUALITY_ROLLUP_SQL,
   type LiteralSourceText,
   type NoveltyBaseline,
 } from './terminologyIntelligence';
@@ -163,6 +164,25 @@ test('spam patterns reject solicitation, preserve legitimate terms', () => {
   for (const legit of ['Börsenanalyse', 'Flux Ordres', 'SMC', 'price action', 'Order Flow NQ', 'ICT killzones', 'Gold', 'DAX', '原油期货']) {
     assert.deepEqual(detectSpamSignals(legit), [], `legit term flagged: ${legit}`);
   }
+});
+
+test('compatibility characters cannot bypass spam screening', () => {
+  // 'Ⓓ' (U+24B9) NFKC-normalizes to 'D': the raw candidate evades /discount/.
+  assert.deepEqual(detectSpamSignals('Ⓓiscount code FREE'), ['promotional']);
+  assert.deepEqual(detectSpamSignals('Ⓡejoignez signaux gratuits').some(code => code.endsWith('-fr')), true);
+  // Screening normalizes only for detection: legitimate terminology with
+  // compatibility characters stays clean and keeps its original text.
+  for (const legit of ['ﬁb levels', 'ＢＴＣanalyse', 'Börsenanalyse']) {
+    assert.deepEqual(detectSpamSignals(legit), [], `legit term flagged: ${legit}`);
+  }
+  const verdict = classifyNativeCandidate(
+    'Ⓓiscount code FREE',
+    [{ kind: 'DESCRIPTION', index: 0, text: 'grab the Ⓓiscount code FREE today' }],
+    okBaseline(),
+    {}
+  );
+  assert.equal(verdict.admit, false);
+  if (verdict.admit === false) assert.equal(verdict.reason, 'spam');
 });
 
 test('localized solicitation is screened without touching legitimate local language', () => {
@@ -380,7 +400,7 @@ interface RecordedCall {
 
 function fakeRunner(scenarios: {
   aggregates: Record<string, unknown>;
-  evidenceRows: Array<Record<string, unknown>>;
+  quality: { v1: number; spam: boolean; novel: boolean };
   latestEvent?: Record<string, unknown> | null;
 }): { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>; calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
@@ -388,8 +408,8 @@ function fakeRunner(scenarios: {
     calls,
     query: async (text: string, params: unknown[] = []) => {
       calls.push({ text, params });
-      if (text.startsWith('SELECT evidence FROM')) {
-        return { rows: scenarios.evidenceRows.map(evidence => ({ evidence })) };
+      if (text.startsWith('SELECT count(*) FILTER')) {
+        return { rows: [{ v1: scenarios.quality.v1, spam: scenarios.quality.spam, novel: scenarios.quality.novel }] };
       }
       if (text.startsWith('SELECT event_type, reason FROM')) {
         return { rows: scenarios.latestEvent ? [scenarios.latestEvent] : [] };
@@ -426,7 +446,7 @@ function snapshotInserts(calls: RecordedCall[]): RecordedCall[] {
 }
 
 test('legacy terms without new evidence transition exactly as before', async () => {
-  const runner = fakeRunner({ aggregates: legacyAggregates(), evidenceRows: [] });
+  const runner = fakeRunner({ aggregates: legacyAggregates(), quality: { v1: 0, spam: false, novel: false } });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.equal(updates.length, 1);
@@ -442,7 +462,7 @@ test('legacy terms without new evidence transition exactly as before', async () 
 test('spam-flagged new terms are held with a recorded reason', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates(),
-    evidenceRows: [writerEvidence({ novel: false, spamSignals: ['signal-group-solicitation'] })],
+    quality: { v1: 1, spam: true, novel: false },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   assert.equal(runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms')).length, 0);
@@ -459,7 +479,7 @@ test('spam-flagged new terms are held with a recorded reason', async () => {
 test('non-novel new terms are held on trial entry', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates(),
-    evidenceRows: [writerEvidence({ novel: false, knownAs: 'curated:Germany:X', generic: true })],
+    quality: { v1: 1, spam: false, novel: false },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   assert.equal(runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms')).length, 0);
@@ -471,7 +491,7 @@ test('non-novel new terms are held on trial entry', async () => {
 test('novel new terms pass through to the legacy decision', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates(),
-    evidenceRows: [writerEvidence({ novel: true })],
+    quality: { v1: 1, spam: false, novel: true },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
@@ -482,7 +502,7 @@ test('novel new terms pass through to the legacy decision', async () => {
 test('blocked lifecycle events are idempotent for an unchanged reason', async () => {
   const blocked = {
     aggregates: legacyAggregates(),
-    evidenceRows: [writerEvidence({ novel: false, knownAs: 'curated:Germany:X', generic: true })],
+    quality: { v1: 1, spam: false, novel: false },
   };
   const first = fakeRunner({ ...blocked });
   await refreshTerminologyLifecycle(42, undefined, first as never);
@@ -496,7 +516,7 @@ test('blocked lifecycle events are idempotent for an unchanged reason', async ()
   // Changed reason (e.g. term later flagged spam): a new event is recorded.
   const third = fakeRunner({
     aggregates: legacyAggregates(),
-    evidenceRows: [writerEvidence({ novel: false, spamSignals: ['promotional'] })],
+    quality: { v1: 1, spam: true, novel: false },
     latestEvent: { event_type: 'ELIGIBILITY_CHANGE', reason: blockReason },
   });
   await refreshTerminologyLifecycle(42, undefined, third as never);
@@ -507,7 +527,7 @@ test('blocked lifecycle events are idempotent for an unchanged reason', async ()
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
-    evidenceRows: [],
+    quality: { v1: 0, spam: false, novel: false },
   });
   await refreshTerminologyLifecycle(42, undefined, runner as never);
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
@@ -610,6 +630,22 @@ test('rule-based instrument matching respects token boundaries', () => {
   assert.equal(wide[0].located.span, 'ＥＳ');
 });
 
+test('locale survives the shared admission helper into observations', async () => {
+  const observed: Array<Record<string, unknown>> = [];
+  const saved: Array<{ country: string; term: string }> = [];
+  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-1' }];
+  const deps = fakeDeps({ observed, saved });
+  const report = await admitNativeCandidates({
+    channel: testChannel(), sources,
+    parsed: { terminology: ['P2P-Algo'] },
+    baseline: okBaseline(), language: 'de', locale: 'de-DE',
+    humanApproved: false, humanObservation: 'ENRICHMENT', deps,
+  });
+  assert.equal(report.admitted, 1);
+  assert.equal(observed[0].language, 'de');
+  assert.equal(observed[0].locale, 'de-DE');
+});
+
 test('video IDs align to titles and persist on the observation', async () => {
   assert.deepEqual(alignVideoIdsToTitles(['a', 'b'], [{ id: 'v-a', title: 'a' }, { id: 'v-b', title: 'b' }]), ['v-a', 'v-b']);
   assert.deepEqual(alignVideoIdsToTitles(['b', 'a'], [{ id: 'v-a', title: 'a' }, { id: 'v-b', title: 'b' }]), ['v-b', 'v-a']);
@@ -680,6 +716,26 @@ test('unknown novelty baseline rejects everything and is logged', async () => {
   assert.match(logs[0], /noveltyBaseline=unknown:curated,existing/);
 });
 
+test('quality aggregation runs in SQL over the corrected evidence schema', () => {
+  // Structural pin: the production aggregate must read the keys writers
+  // persist (top-level qualityVersion/novel/spamSignals/spamConfirmed) and
+  // must not reference the evidence.quality object no writer produces.
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /evidence->>'qualityVersion'/);
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /evidence->>'novel'/);
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /evidence->'spamSignals'/);
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /evidence->'spamConfirmed'/);
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /bool_or/);
+  assert.doesNotMatch(NATIVE_QUALITY_ROLLUP_SQL, /evidence->'quality'/);
+  // Malformed out-of-band rows degrade to false instead of failing the cast:
+  // the guards mirror the pure rollup's strict checks (parity validated
+  // against a live replica: SQL {4,t,t} == rollup {4,true,true} on the same
+  // battery, legacy term → {0,false,false}).
+  assert.deepEqual(
+    rollupNativeQualityEvidence([{ qualityVersion: 'native-v1', novel: 'yes', spamConfirmed: 'true', spamSignals: 'x' }]),
+    { v1Observations: 1, spamConfirmed: false, novel: false }
+  );
+});
+
 test('planner serves trial terms to live cycles', () => {
   const candidates = planDiverseQueries({
     country: 'Germany',
@@ -689,6 +745,12 @@ test('planner serves trial terms to live cycles', () => {
     provenTerminology: [{ id: 1, term: 'P2P-Algo', score: 0.9, lifecycle: 'SEARCH_TRIAL' }],
   });
   assert.ok(JSON.stringify(candidates).includes('P2P-Algo'));
+});
+
+test('extraction forwards language and locale into the admission helper', () => {
+  const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.match(source, /locale: languageContext\?\.locale,\n(\s*)humanApproved,/);
+  assert.match(source, /language: languageContext\?\.language,\n(\s*)locale: languageContext\?\.locale,/);
 });
 
 test('extraction admits only literal, non-spam candidates with observe-first ordering', () => {
