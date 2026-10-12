@@ -895,7 +895,10 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // untouched — only new promotions are gated. coordinatedBurst has no stored
   // signal, so burst review stays operator-side (conservative: absent).
   let effectiveDecision = decision;
-  if (decision.status === 'PROVEN_SEARCH_TERM' && quality.v1Observations > 0) {
+  // New promotions only: an already-PROVEN row keeps its status (and trust
+  // tier) even when current performance would not clear the bar fresh —
+  // downgrades stay exclusively yield-driven via DEMOTED.
+  if (decision.status === 'PROVEN_SEARCH_TERM' && row.lifecycle_status !== 'PROVEN_SEARCH_TERM' && quality.v1Observations > 0) {
     const perf = await runner.query(
       `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
         COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,

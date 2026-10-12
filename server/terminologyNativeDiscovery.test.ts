@@ -1113,6 +1113,19 @@ test('native term without verified traders is capped at trial, never proven', as
   assert.match(String(events[0].params[4]), /native promotion bar not met/);
 });
 
+test('already-PROVEN rows are never capped down by the native gate', async () => {
+  const runner = fakeRunner({
+    aggregates: { ...provenAggregates(), lifecycle_status: 'PROVEN_SEARCH_TERM' },
+    quality: { v1: 1, spam: false, novel: true },
+    performance: { executions: 5, quota: 2000, confirmed: 0, nontrading: 1, wrong: 0, review: 1 },
+  });
+  await refreshTerminologyLifecycle(42, undefined, runner as never);
+  assert.equal(runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms')).length, 0);
+  const snapshots = snapshotInserts(runner.calls);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].params[6], 'PROVEN_SEARCH_TERM');
+});
+
 test('native term with verified traders still reaches proven', async () => {
   const runner = fakeRunner({
     aggregates: provenAggregates(),
@@ -1123,6 +1136,46 @@ test('native term with verified traders still reaches proven', async () => {
   const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
   assert.equal(updates.length, 1);
   assert.equal(updates[0].params[1], 'PROVEN_SEARCH_TERM');
+});
+
+test('saveExtractedTerm shares the normalized-identity lock and reuses variant rows', async () => {
+  const byClient = new Map<number, string[]>();
+  const released: number[] = [];
+  let nextClient = 0;
+  const pool = {
+    connect: async () => {
+      const id = nextClient++;
+      byClient.set(id, []);
+      return {
+        query: async (text: string, params: unknown[] = []) => {
+          byClient.get(id)!.push(text);
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+          if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+          if (text.startsWith('SELECT id, term FROM extracted_trading_vocabulary')) {
+            return { rows: [{ id: 5, term: 'BTC' }] };
+          }
+          if (text.startsWith('UPDATE extracted_trading_vocabulary SET occurrences')) {
+            return { rows: [{ id: 5 }] };
+          }
+          return { rows: [] };
+        },
+        release: () => { released.push(id); },
+      };
+    },
+  };
+  const { saveExtractedTerm } = await import('./dbCore');
+  await saveExtractedTerm('Germany', 'btc', 'instrument', 'ch-1', pool as never);
+  assert.equal(byClient.size, 1, 'single connection serves lookup, write, and linkage');
+  const ordered = [...byClient.values()][0];
+  assert.equal(ordered[0], 'BEGIN');
+  assert.equal(ordered[ordered.length - 1], 'COMMIT');
+  const lockAt = ordered.findIndex(text => text.includes('pg_advisory_xact_lock'));
+  const lookupAt = ordered.findIndex(text => text.startsWith('SELECT id, term FROM'));
+  const writeAt = ordered.findIndex(text => text.startsWith('UPDATE extracted_trading_vocabulary SET occurrences') || text.startsWith('INSERT INTO extracted_trading_vocabulary'));
+  assert.ok(lockAt > 0 && lookupAt > lockAt && writeAt > lookupAt);
+  // Normalized reuse: variant spelling updated the existing row, no new row.
+  assert.ok(!ordered.some(text => text.startsWith('INSERT INTO extracted_trading_vocabulary')));
+  assert.deepEqual(released, [0]);
 });
 
 test('yield failure still demotes through the shared path', async () => {
