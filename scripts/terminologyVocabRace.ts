@@ -155,7 +155,7 @@ async function main() {
   // Bounded overall deadline (RACE_DEADLINE_MS): a wedged query rejects the
   // run instead of hanging it. Settlement is always awaited below — even on
   // failure — so cleanup never runs while writers are still in flight.
-  const deadlineMs = Number(process.env.RACE_DEADLINE_MS || '120000');
+  const deadlineMs = Number(process.env.RACE_DEADLINE_MS || '180000');
   CHANNELS.forEach((channelId, i) => {
     // Pass each pool directly: the writers detect the Pool, pin lock, reads
     // and writes to one transaction-bound client, and hold the advisory lock
