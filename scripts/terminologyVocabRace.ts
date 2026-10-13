@@ -10,6 +10,16 @@
  * (npx tsx scripts/runMigrations.ts).
  *
  * Run: STAGING_OK=true DATABASE_URL=<staging> npx tsx scripts/terminologyVocabRace.ts
+ *
+ * Provisioning (once per staging database, before first run): same marker as
+ * the E2E proof (see scripts/terminologyStagingProof.ts header); run with
+ * STAGING_PROOF_TOKEN=<same-token>. The pre-init check compares the token
+ * before any initializing connection, so a copied marker row alone never
+ * authorizes.
+ *
+ * Race pools intentionally carry no query timeout: advisory-lock blocking
+ * waits are the behavior under test, and a timeout would abort legitimate
+ * contention. Connection establishment alone is bounded (15s).
  */
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
@@ -33,20 +43,32 @@ function targetConnectionString(): string {
 }
 
 // Target verification BEFORE any initializing connection: getDb() runs
-// migrations and seedDefaults() (both write), so the staging marker is
-// checked here through a one-shot non-initializing pool. Fail closed.
+// migrations and seedDefaults() (both write), so staging identity is proven
+// here through a one-shot non-initializing pool. Three independent refusals,
+// all fail-closed: (1) no pairing token; (2) non-loopback target without TLS
+// (the provisioned topology is a localhost tunnel); (3) marker row absent or
+// token mismatch. Timeouts bound the probe so a black-holed endpoint fails.
 async function verifyStagingTarget(connectionString: string): Promise<void> {
-  const probe = new pg.Pool({ connectionString, ssl: stagingSsl() });
+  const expectedToken = process.env.STAGING_PROOF_TOKEN;
+  if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
+  let host = '';
+  try { host = new URL(connectionString).hostname.toLowerCase(); } catch { host = ''; }
+  const loopback = host === '' || host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  const wantsTls = /[?&]sslmode=(require|verify-ca|verify-full)(&|$)/.test(connectionString);
+  if (!loopback && !wantsTls) {
+    throw new Error(`Refusing to run: non-loopback target '${host}' without sslmode=require — refusing plaintext credentials.`);
+  }
+  const probe = new pg.Pool({ connectionString, ssl: stagingSsl(), connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let ok = false;
   try {
-    const marker = await probe.query(`SELECT note FROM staging_proof_marker LIMIT 1`);
-    ok = (marker.rows[0] as Record<string, unknown> | undefined)?.note === 'terminology-e2e-staging';
+    const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
+    ok = (marker.rows[0] as Record<string, unknown> | undefined)?.token === expectedToken;
   } catch {
     ok = false;
   } finally {
     await probe.end().catch(() => undefined);
   }
-  if (!ok) throw new Error('Refusing to run: target is not the provisioned staging database (marker check failed) — never production.');
+  if (!ok) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
 }
 
 const COUNTRY_ALIAS = 'US';
@@ -74,7 +96,10 @@ async function main() {
   process.env.DATABASE_URL = connectionString!;
   const dbPool = await getDb();
   const db = dbPool;
-  const pools = [new pg.Pool({ connectionString, ssl: stagingSsl() }), new pg.Pool({ connectionString, ssl: stagingSsl() })];
+  const pools = [
+    new pg.Pool({ connectionString, ssl: stagingSsl(), connectionTimeoutMillis: 15_000 }),
+    new pg.Pool({ connectionString, ssl: stagingSsl(), connectionTimeoutMillis: 15_000 }),
+  ];
   try {
   for (const channelId of CHANNELS) {
     await db.query(
@@ -133,6 +158,22 @@ async function main() {
 
   console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
   } finally {
+    try {
+      const termIds = (await db.query(`SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1`, [`%${RUN.toLowerCase()}%`]).catch(() => ({ rows: [] as unknown[] }))).rows;
+      const ids = (termIds as Array<Record<string, unknown>>).map(row => Number(row.id));
+      if (ids.length > 0) {
+        await db.query(`DELETE FROM terminology_observations WHERE canonical_term_id = ANY($1)`, [ids]);
+        await db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [ids]);
+        await db.query(`DELETE FROM terminology_performance WHERE canonical_term_id = ANY($1)`, [ids]);
+        await db.query(`DELETE FROM terminology_lifecycle_events WHERE canonical_term_id = ANY($1)`, [ids]);
+      }
+      await db.query(`DELETE FROM extracted_trading_vocabulary WHERE term ILIKE $1`, [`%${RUN}%`]);
+      if (ids.length > 0) await db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [ids]);
+      await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [CHANNELS]);
+      console.log('cleanup: removed run fixtures');
+    } catch (error) {
+      console.warn('cleanup: fixture removal incomplete (ids are run-unique; later runs unaffected)', error);
+    }
     await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
     await dbPool.end().catch(() => undefined);
   }
