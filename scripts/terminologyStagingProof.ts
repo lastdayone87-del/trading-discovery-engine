@@ -93,6 +93,10 @@ async function cleanupRunFixtures(
       await db.query(`DELETE FROM terminology_observations WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
       await db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [fixtures.termIds]);
       await db.query(`DELETE FROM terminology_performance WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
+      await db.query(`DELETE FROM terminology_score_snapshots WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
+      await db.query(`DELETE FROM trading_term_aliases WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
+      await db.query(`DELETE FROM country_native_evidence_projections WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
+      await db.query(`DELETE FROM country_native_performance_attribution WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
       await db.query(`DELETE FROM terminology_lifecycle_events WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
     }
     if (fixtures.phrases.length > 0) {
