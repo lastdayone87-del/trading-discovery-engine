@@ -126,14 +126,16 @@ export function computeObservationKey(params: {
   // instead of inserting a duplicate observation that inflates evidence.
   const { novel: _novel, knownAs: _knownAs, generic: _generic, ...stableEvidence } =
     (params.evidence || {}) as Record<string, unknown>;
-  // Positional source index is not source identity when a stable video ID is
-  // present: the same video at another list position must reuse its key
-  // instead of inserting a duplicate observation. (One-time effect: rows
-  // recorded with the old index-bearing key re-observe once after deploy,
-  // then stay stable.)
+  // Positional source index is not source identity: the same video (or the
+  // same title text) at another list position must reuse its key instead of
+  // inserting a duplicate observation. Genuine distinctions are preserved via
+  // source kind, exact span text, and video ID, all of which remain in the
+  // checksum. (One-time effect: rows recorded with index-bearing keys
+  // re-observe once after deploy, then stay stable.)
   const sourceRef = (stableEvidence.sourceRef || {}) as Record<string, unknown>;
-  if (sourceRef.videoId !== undefined && sourceRef.videoId !== null) {
-    stableEvidence.sourceRef = { ...sourceRef, index: undefined };
+  if (sourceRef.index !== undefined) {
+    const { index: _droppedIndex, ...stableRef } = sourceRef;
+    stableEvidence.sourceRef = stableRef;
   }
   const checksum = computeEvidenceChecksum(stableEvidence);
   const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();

@@ -16,7 +16,7 @@ import {
 import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
-import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
+import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
@@ -353,9 +353,9 @@ export interface ReconcileOutcome {
  * observations increment (via saveTerm), so a repair racing an in-flight
  * save can never inflate frequency — the saver always brings it to exactly 1.
  */
-export async function defaultReconcileExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string): Promise<ReconcileOutcome> {
+export async function defaultReconcileExtractedTerm(country: string, term: string, category: 'terminology' | 'instrument' | 'phrase' | 'format', sourceChannelId?: string, clientOverride?: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }): Promise<ReconcileOutcome> {
   const { normalizeTerm: normalizeTermForReconcile } = await import('./terminologyIntelligence');
-  const db = await getDb();
+  const db = clientOverride ?? await getDb();
   const clean = term.trim();
   if (!clean) return { rowInserted: false, linkInserted: false };
   const normalized = normalizeTermForReconcile(clean);
@@ -413,6 +413,13 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
       await runner.query(
         `UPDATE extracted_trading_vocabulary v SET validation_count=s.confirmed_sources,trust_tier=CASE WHEN s.confirmed_sources>=2 THEN 2 ELSE 3 END FROM (SELECT COUNT(DISTINCT evs.channel_id)::int confirmed_sources FROM extracted_vocabulary_sources evs JOIN channels c ON c.channel_id=evs.channel_id AND c.trading_status='TRADING_CONFIRMED' WHERE evs.term_id=$1) s WHERE v.id=$1`,
         [rowId]
+      );
+      // Frequency is derived from committed observations, never incremented
+      // here: a repaired row converges to exactly the persisted evidence
+      // count no matter how many repairs race or retry.
+      await runner.query(
+        `UPDATE extracted_trading_vocabulary v SET occurrences=s.n FROM (SELECT COUNT(*)::int n FROM terminology_observations o JOIN canonical_trading_terms t ON t.id=o.canonical_term_id WHERE t.country=$2 AND t.normalized_term=$3) s WHERE v.id=$1 AND EXISTS(SELECT 1 FROM canonical_trading_terms t WHERE t.country=$2 AND t.normalized_term=$3)`,
+        [rowId, country, normalized]
       );
     }
     if (client) await runner.query('COMMIT');
@@ -493,6 +500,80 @@ export function resolveExtractionVideoIds(candidate: ExtractionVideoSource): Arr
       ? { id: candidate.matchedDocument.providerNativeId, title: candidate.matchedDocument.title }
       : undefined
   );
+}
+
+export interface NoveltyBaselineDeps {
+  getVocabularies?: () => Promise<CountryVocabulary[]>;
+  getExtracted?: (country: string) => Promise<ExtractedTermRecord[]>;
+}
+
+/**
+ * Loads the novelty baseline for one extraction. Lookup INFRASTRUCTURE
+ * failures throw (caller retries via the job system); a successful lookup
+ * with no country row resolves to an unknown baseline that rejects
+ * candidates without throwing. Fail-closed classification and retryable
+ * infrastructure errors are therefore distinct outcomes, never conflated.
+ */
+export async function loadNoveltyBaseline(
+  country: string,
+  deps?: NoveltyBaselineDeps
+): Promise<NoveltyBaseline> {
+  const getVocabularies = deps?.getVocabularies ?? getCountryVocabularies;
+  const getExtracted = deps?.getExtracted ?? getExtractedVocabulary;
+  let vocab: CountryVocabulary | undefined;
+  let vocabOk = true;
+  try {
+    const all = await getVocabularies();
+    vocab = all.find(entry => entry.country.toLowerCase() === country.toLowerCase());
+  } catch (error) {
+    vocabOk = false;
+  }
+  let existingTerms: string[] = [];
+  let existingOk = true;
+  try {
+    existingTerms = (await getExtracted(country)).map(row => row.term);
+  } catch (error) {
+    existingOk = false;
+  }
+  if (!vocabOk || !existingOk) {
+    throw new Error(`[Vocabulary Extraction] novelty baseline lookups failed for country ${country} (vocabOk=${vocabOk}, existingOk=${existingOk}); failing the extraction for retry instead of discarding candidates.`);
+  }
+  return buildNoveltyBaseline({ country, vocab, vocabOk, existingTerms, existingOk });
+}
+
+/**
+ * Removes AI candidates already admitted by the rule path in the same
+ * extraction run (normalized comparison). Rule and AI observations carry
+ * different observation types, so without this filter one source mention
+ * would persist twice and inflate evidence and occurrences.
+ */
+export function excludeRuleAdmittedInstruments(values: unknown[] | undefined, ruleObserved: Set<string>): unknown[] | undefined {
+  if (!values) return undefined;
+  return values.filter(raw => typeof raw !== 'string' || !ruleObserved.has(normalizeTerm(raw)));
+}
+
+/**
+ * Ingestion-to-extraction handoff for vocabulary learning: resolves aligned
+ * video IDs and invokes extraction with them. The extraction dependency is
+ * injectable so tests can spy on exactly what the production path forwards.
+ */
+export async function invokeChannelVocabularyExtraction(
+  channel: ChannelRecord,
+  candidate: ExtractionVideoSource & { description?: string; detectedLanguages?: Array<{ language: string; confidence?: number }> },
+  languageContext: ExplicitTerminologyLanguageContext | undefined,
+  deps?: { extractVocabulary?: typeof extractVocabularyFromCreator }
+): Promise<Array<string | null>> {
+  const extractionVideoIds = resolveExtractionVideoIds(candidate);
+  const extract = deps?.extractVocabulary ?? extractVocabularyFromCreator;
+  await extract(
+    channel,
+    candidate.videoTitles,
+    candidate.description ?? '',
+    false,
+    languageContext,
+    extractionVideoIds
+  );
+  return extractionVideoIds;
 }
 
 /**
@@ -607,11 +688,16 @@ export async function extractVocabularyFromCreator(
   // (KNOWN_INSTRUMENT_TERMS — shared with novelty classification, never
   // duplicated). Boundary-aware literal matching: 'ES' inside 'heroes' or
   // 'trades' is a word fragment, never instrument evidence.
+  // Within-run dedupe: instruments validly observed here suppress their AI
+  // twins below (different observation types would otherwise record the same
+  // source mention twice and inflate evidence and occurrences).
+  const ruleObserved = new Set<string>();
   for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
     const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
     if (ruleObservation == null) continue;
+    ruleObserved.add(normalizeTerm(hit.instrument));
     if (ruleObservation.observationInserted) {
       await saveExtractedTerm(channel.country, hit.instrument, 'instrument', channel.channel_id);
     } else {
@@ -671,34 +757,23 @@ Return ONLY a valid JSON object with format:
         // admitNativeCandidates helper: classification (literal → spam →
         // fail-closed novelty), observe-first persistence, rejection stats.
         const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
-        // Fail closed: when either novelty lookup errors, the baseline is
-        // marked unknown and every candidate is rejected as novelty-unknown —
-        // a transient read error must never make a known term look novel.
-        const vocabOutcome = await getCountryVocabularies().then(
-          all => ({ ok: true as const, vocab: all.find(entry => entry.country.toLowerCase() === channel.country.toLowerCase()) }),
-          () => ({ ok: false as const, vocab: undefined })
-        );
-        const existingOutcome = await getExtractedVocabulary(channel.country).then(
-          rows => ({ ok: true as const, terms: rows.map(row => row.term) }),
-          () => ({ ok: false as const, terms: [] as string[] })
-        );
-        const baseline = buildNoveltyBaseline({
-          country: channel.country,
-          vocab: vocabOutcome.vocab,
-          // Missing-row handling lives in buildNoveltyBaseline (unknown, not empty).
-          vocabOk: vocabOutcome.ok,
-          existingTerms: existingOutcome.terms,
-          existingOk: existingOutcome.ok,
-        });
+        // Fail closed: a missing country row marks the baseline unknown and
+        // every candidate is rejected as novelty-unknown — a transient read
+        // error must never make a known term look novel. Lookup
+        // infrastructure failures throw (via loadNoveltyBaseline) so the job
+        // retries instead of silently discarding candidates.
+        const baseline = await loadNoveltyBaseline(channel.country);
         const humanObservation = humanApproved ? 'HUMAN_APPROVED_CHANNEL' as const : 'ENRICHMENT' as const;
+        // Within-run dedupe against rule-admitted instruments (see above).
+        const deduped = (values: unknown[] | undefined) => excludeRuleAdmittedInstruments(values, ruleObserved);
         await admitNativeCandidates({
           channel,
           sources: literalSources,
           parsed: {
-            terminology: Array.isArray(parsed.terminology) ? parsed.terminology : undefined,
-            instruments: Array.isArray(parsed.instruments) ? parsed.instruments : undefined,
-            phrases: Array.isArray(parsed.phrases) ? parsed.phrases : undefined,
-            formats: Array.isArray(parsed.formats) ? parsed.formats : undefined,
+            terminology: deduped(Array.isArray(parsed.terminology) ? parsed.terminology : undefined),
+            instruments: deduped(Array.isArray(parsed.instruments) ? parsed.instruments : undefined),
+            phrases: deduped(Array.isArray(parsed.phrases) ? parsed.phrases : undefined),
+            formats: deduped(Array.isArray(parsed.formats) ? parsed.formats : undefined),
           },
           baseline,
           language: languageContext?.language,

@@ -14,7 +14,7 @@ import {
   getQuota,
   getAppSetting
 } from './db';
-import { calculateCreatorQualityScore, extractVocabularyFromCreator, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
+import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
@@ -773,8 +773,7 @@ export async function processChannelThroughPipeline(
   if (qualityResult.score >= 55 && source !== 'manual_search') {
     // Provenance: align YouTube video IDs to titles (null where unknown)
     // so title-backed terminology observations trace to their source video.
-    const extractionVideoIds = resolveExtractionVideoIds(candidate);
-    await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate), extractionVideoIds);
+    await invokeChannelVocabularyExtraction(finalChannel, candidate, selectExplicitTerminologyLanguageContext(candidate));
     await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
   }
 

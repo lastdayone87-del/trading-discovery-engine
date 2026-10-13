@@ -26,15 +26,20 @@ import {
   type NoveltyBaseline,
 } from './terminologyIntelligence';
 import {
+  excludeRuleAdmittedInstruments,
+  invokeChannelVocabularyExtraction,
+  loadNoveltyBaseline,
   replayVocabularyForRetry,
   admitNativeCandidates,
   alignVideoIdsToTitles,
   buildLiteralSources,
+  defaultReconcileExtractedTerm,
   findRuleInstrumentHits,
   hasNativeExtractionText,
   parseNativeVocabularyResponse,
   resolveExtractionVideoIds,
 } from './queryIntelligence';
+import { saveExtractedTerm } from './dbCore';
 import { computeObservationKey } from './countryNativeIntelligence';
 import { extractDiscoveredChannels } from './youtube';
 import { planDiverseQueries } from './queryPlanner';
@@ -84,6 +89,12 @@ test('instrument list is pinned and shared (no parallel source of truth)', () =>
   const extractorSource = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
   assert.match(extractorSource, /KNOWN_INSTRUMENT_TERMS/);
   assert.doesNotMatch(extractorSource, /const potentialInstruments/);
+  // Behavioral: representative canonical instruments produce rule hits, so a
+  // hard-coded subset cannot silently replace the shared list.
+  for (const instrument of ['NQ', 'CAC 40', 'Gold', 'BTC', 'ES']) {
+    const hits = findRuleInstrumentHits(`trade ${instrument} today`, [], '');
+    assert.ok(hits.some(hit => hit.instrument === instrument), `no rule hit for ${instrument}`);
+  }
 });
 
 // --- Findings 6+7: exact original spans, length-safe case folding, significant whitespace ---
@@ -127,6 +138,24 @@ test('round-trip failure scans later matches in the same source', () => {
   assert.deepEqual(hit, { sourceKind: 'DESCRIPTION', sourceIndex: 0, span: 'アパ', videoId: null });
   // Single false-span source still rejects (no valid later occurrence).
   assert.equal(findLiteralSpan('不動産アパ', [{ kind: 'DESCRIPTION', index: 0, text: '不動産㌀' }]), null);
+});
+
+test('reordered title lists reuse observation identity without video IDs', () => {
+  const keyFor = (index: number, videoId?: string | null) => computeObservationKey({
+    canonicalTermId: 7, channelId: 'ch-1', videoId: videoId ?? null, observationType: 'VIDEO_TITLE',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', sourceRef: { kind: 'VIDEO_TITLE', index, span: 'SMC backtest', videoId: videoId ?? null } },
+  });
+  // Same span moved to another position, no video ID: same key.
+  assert.equal(keyFor(0), keyFor(2));
+  // Different spans stay distinct even without video IDs.
+  const other = computeObservationKey({
+    canonicalTermId: 7, channelId: 'ch-1', videoId: null, observationType: 'VIDEO_TITLE',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: 'SMC live session', videoId: null } },
+  });
+  assert.notEqual(keyFor(0), other);
+  // Video-backed identity is unchanged by the generalization.
+  assert.equal(keyFor(0, 'vid-9'), keyFor(3, 'vid-9'));
+  assert.notEqual(keyFor(0, 'vid-9'), keyFor(0, 'vid-8'));
 });
 
 test('punctuated Latin terms keep word-boundary guards', () => {
@@ -314,12 +343,44 @@ test('missing country vocabulary is an unknown baseline, not an empty one', () =
   assert.equal(admitted.admit, true);
 });
 
-test('extraction relies on the shared constructor for missing rows', () => {
-  // The caller passes the lookup outcome through; buildNoveltyBaseline owns
-  // the missing-row rule (single choke point, unit-tested above).
+test('extraction resolves novelty through the retryable baseline loader', () => {
+  // The caller delegates to loadNoveltyBaseline (lookup errors throw for
+  // retry; missing rows resolve unknown via the shared constructor).
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
-  assert.match(source, /vocab: vocabOutcome\.vocab,/);
-  assert.match(source, /vocabOk: vocabOutcome\.ok,/);
+  assert.match(source, /await loadNoveltyBaseline\(channel\.country\)/);
+});
+
+test('baseline loader throws on lookup failure but resolves unknown rows', async () => {
+  // Transient infrastructure failure: throws so the job retries instead of
+  // silently discarding candidates (fail-closed classification preserved —
+  // nothing is recorded as novel).
+  await assert.rejects(
+    loadNoveltyBaseline('Germany', {
+      getVocabularies: async () => { throw new Error('db down'); },
+      getExtracted: async () => [],
+    }),
+    /novelty baseline lookups failed/
+  );
+  await assert.rejects(
+    loadNoveltyBaseline('Germany', {
+      getVocabularies: async () => [],
+      getExtracted: async () => { throw new Error('db down'); },
+    }),
+    /existingOk=false/
+  );
+  // Successful lookup with no country row: unknown baseline, no throw.
+  const missing = await loadNoveltyBaseline('Germany', {
+    getVocabularies: async () => [],
+    getExtracted: async () => [],
+  });
+  assert.equal(missing.ok, false);
+  // Healthy lookups resolve a usable baseline.
+  const healthy = await loadNoveltyBaseline('Germany', {
+    getVocabularies: async () => [{ country: 'Germany', languages: ['de'], native_trading_terminology: [], popular_instruments: [], local_market_phrases: [], common_content_format_names: [] }],
+    getExtracted: async () => [{ term: 'SMC' }] as never,
+  });
+  assert.equal(healthy.ok, true);
+  assert.deepEqual(healthy.existingTerms, ['SMC']);
 });
 
 test('classifier rejects in order: shape, length, literal, spam, novelty-unknown', () => {
@@ -473,6 +534,23 @@ test('observation identity is stable across novelty reclassification', () => {
     evidence: { ...sourceEvidence, novel: true, knownAs: null, generic: false },
   });
   assert.notEqual(first, other);
+});
+
+test('promotion holds below three executions regardless of creators', () => {
+  const thin = {
+    novel: true, spamConfirmed: false, executions: 2, quotaConsumed: 2000,
+    confirmedTradingCreators: 12, nonTradingCreators: 0, wrongCountryCreators: 0,
+    needsReviewCreators: 0, distinctCreators: 5, distinctCommunities: 3, coordinatedBurst: false,
+  };
+  const result = evaluateNativeTermPromotion(thin);
+  assert.equal(result.decision, 'HOLD');
+  assert.ok(result.reasons.some(reason => reason.startsWith('insufficient-executions:')));
+  // Removing the execution floor while keeping the creator floor must fail:
+  // creators alone never satisfy the execution requirement.
+  const creatorHeavy = { ...thin, executions: 1, distinctCreators: 9 };
+  const held = evaluateNativeTermPromotion(creatorHeavy);
+  assert.equal(held.decision, 'HOLD');
+  assert.ok(held.reasons.some(reason => reason.startsWith('insufficient-executions:')));
 });
 
 test('promotion floors mirror the lifecycle minimums', () => {
@@ -1223,6 +1301,18 @@ test('saveExtractedTerm lock key matches observation-term canonicalization', asy
   }
 });
 
+test('refresh on a bare client completes correctly without serialization', async () => {
+  // Contract pin: a supplied client without an active transaction degrades
+  // gracefully (statements execute in order, transition applies) — it simply
+  // provides no cross-statement serialization. Every production caller either
+  // passes a Pool (self-wrapped) or a transaction-bound client.
+  const runner = fakeRunner({ aggregates: legacyAggregates(), quality: { v1: 0, spam: false, novel: false } });
+  await refreshTerminologyLifecycle(42, undefined, runner as never);
+  const updates = runner.calls.filter(call => call.text.startsWith('UPDATE canonical_trading_terms'));
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].params.slice(1, 4), ['SEARCH_TRIAL', true, 2]);
+});
+
 test('yield failure still demotes through the shared path', async () => {
   const runner = fakeRunner({
     aggregates: legacyAggregates({ lifecycle_status: 'SEARCH_TRIAL', search_eligible: true, executions: 5, decayed_yield: 0.01 }),
@@ -1245,28 +1335,16 @@ function testChannel(): ChannelRecord {
   } as unknown as ChannelRecord;
 }
 
-export interface FakeVocabStore {
-  rows: Map<string, { id: number; term: string; occurrences: number; validation_count: number; trust_tier: number }>;
-  links: Set<string>;
-  nextId: number;
-}
-
-export function createFakeVocabStore(): FakeVocabStore {
-  return { rows: new Map(), links: new Set(), nextId: 1 };
-}
-
 function fakeDeps(scenarios: {
   observe?: (args: Record<string, unknown>) => Promise<{ termId: number; observationInserted: boolean } | null>;
   save?: (country: string, term: string) => Promise<unknown>;
   log?: (message: string) => void;
-  reconcile?: (country: string, term: string, store: FakeVocabStore, channelId?: string) => Promise<{ rowInserted: boolean; linkInserted: boolean }>;
-  store?: FakeVocabStore;
+  reconcile?: (country: string, term: string, channelId?: string) => Promise<{ rowInserted: boolean; linkInserted: boolean }>;
   reconciled?: Array<{ country: string; term: string }>;
   observed: Array<Record<string, unknown>>;
   saved: Array<{ country: string; term: string }>;
 }) {
   const reconciled = scenarios.reconciled ?? [];
-  const store = scenarios.store ?? createFakeVocabStore();
   return {
     observeTerm: async (args: Record<string, unknown>): Promise<{ termId: number; observationInserted: boolean } | null> => {
       scenarios.observed.push(args);
@@ -1276,7 +1354,7 @@ function fakeDeps(scenarios: {
     // duplicates). Tests covering repair pass a shared store instead.
     reconcileTerm: async (country: string, term: string, _category: string, channelId?: string): Promise<{ rowInserted: boolean; linkInserted: boolean }> => {
       reconciled.push({ country, term });
-      if (scenarios.reconcile) return scenarios.reconcile(country, term, store, channelId);
+      if (scenarios.reconcile) return scenarios.reconcile(country, term, channelId);
       return { rowInserted: false, linkInserted: false };
     },
     saveTerm: async (country: string, term: string): Promise<unknown> => {
@@ -1292,35 +1370,6 @@ function fakeDeps(scenarios: {
  * normalized-equivalence reuse, idempotent links, counters recomputed from
  * links — mirroring defaultReconcileExtractedTerm without a database.
  */
-export function emulatedReconcile(country: string, term: string, store: FakeVocabStore, channelId = 'ch-1'): { rowInserted: boolean; linkInserted: boolean } {
-  const clean = term.trim();
-  const normalized = clean.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
-  const key = `${country}|${clean}`;
-  let row = store.rows.get(key);
-  let rowInserted = false;
-  if (!row) {
-    const reuse = [...store.rows.values()].find(
-      candidate => candidate.term.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en') === normalized
-    );
-    if (reuse) {
-      row = reuse;
-    } else {
-      row = { id: store.nextId++, term: clean, occurrences: 1, validation_count: 0, trust_tier: 3 };
-      store.rows.set(key, row);
-      rowInserted = true;
-    }
-  }
-  const linkKey = `${row.id}|${channelId}`;
-  let linkInserted = false;
-  if (!store.links.has(linkKey)) {
-    store.links.add(linkKey);
-    linkInserted = true;
-  }
-  const confirmed = [...store.links].filter(link => link.startsWith(`${row!.id}|`)).length;
-  row.validation_count = confirmed;
-  row.trust_tier = confirmed >= 2 ? 2 : 3;
-  return { rowInserted, linkInserted };
-}
 
 test('observation failure never persists the extracted term (retryable)', async () => {
   const observed: Array<Record<string, unknown>> = [];
@@ -1389,165 +1438,253 @@ test('replayed observations reuse evidence without inflating vocabulary counts',
   assert.deepEqual(saved, [{ country: 'Germany', term: 'P2P-Algo' }]);
 });
 
-test('failed saveTerm is repaired on retry without inflating counts', async () => {
-  const observed: Array<Record<string, unknown>> = [];
-  const saved: Array<{ country: string; term: string }> = [];
-  const reconciled: Array<{ country: string; term: string }> = [];
-  const store = createFakeVocabStore();
-  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'P2P-Algo backtest', videoId: 'vid-1' }];
-  let saveCalls = 0;
-  const deps = fakeDeps({
-    reconciled, observed, saved, store,
-    observe: async () => ({ termId: 7, observationInserted: saveCalls === 0 }),
-    save: async () => { saveCalls += 1; if (saveCalls === 1) throw new Error('vocab save down'); },
-    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
-  });
-  const admission = {
-    channel: testChannel(), sources,
-    parsed: { terminology: ['P2P-Algo'] },
-    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
-  };
-  // First attempt: observation commits, saveTerm throws -> propagates visibly.
-  // (The failed save call itself is recorded once; it is never retried
-  // blindly — the retry replays the observation as a duplicate instead.)
-  await assert.rejects(admitNativeCandidates(admission), /vocab save down/);
-  assert.equal(saved.length, 1);
-  // Retry: observation replays as duplicate, missing row is repaired with
-  // consistent counters (occurrences 1, validation derived from links).
-  const retry = await admitNativeCandidates(admission);
-  assert.deepEqual([retry.admitted, retry.duplicates], [1, 0]);
-  assert.deepEqual(reconciled, [{ country: 'Germany', term: 'P2P-Algo' }]);
-  assert.equal(saved.length, 1);
-  const row = store.rows.get('Germany|P2P-Algo');
-  assert.ok(row);
+// --- Production-SQL fake database for vocabulary persistence ---
+//
+// Interprets the exact statements issued by saveExtractedTerm and
+// defaultReconcileExtractedTerm (conflict targets, RETURNING shapes, link and
+// counter recomputation) against an in-memory store. Unlike the removed
+// emulatedReconcile, these tests execute the production SQL text, so a
+// regression in row creation, linkage, or counters fails here.
+
+interface FakeVocabRow {
+  id: number;
+  country: string;
+  term: string;
+  category: string;
+  occurrences: number;
+  validation_count: number;
+  trust_tier: number;
+}
+
+interface FakeVocabDb {
+  vocab: FakeVocabRow[];
+  links: Array<{ termId: number; channelId: string }>;
+  channels: Set<string>;
+  canonical: Map<string, number>;
+  observations: number[];
+  nextId: number;
+  statements: string[];
+  failOnIncludes: string | null;
+  onStatement?: (text: string, params: unknown[]) => Promise<void> | void;
+}
+
+function createFakeVocabDb(): FakeVocabDb {
+  return { vocab: [], links: [], channels: new Set(), canonical: new Map(), observations: [], nextId: 1, statements: [], failOnIncludes: null };
+}
+
+type FakeDbRow = Record<string, unknown>;
+
+async function fakeVocabQuery(
+  state: FakeVocabDb,
+  text: string,
+  params: unknown[] = []
+): Promise<{ rows: FakeDbRow[] }> {
+  state.statements.push(text);
+  if (state.failOnIncludes && text.includes(state.failOnIncludes)) {
+    state.failOnIncludes = null;
+    throw new Error(`injected failure at: ${text.slice(0, 60)}`);
+  }
+  if (state.onStatement) await state.onStatement(text, params);
+  if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+  if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+  if (text.startsWith('SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1')) {
+    const [country] = params as [string];
+    return { rows: state.vocab.filter(row => row.country === country).map(row => ({ id: row.id, term: row.term })) };
+  }
+  if (text.startsWith('INSERT INTO extracted_trading_vocabulary')) {
+    const [country, term, category] = params as [string, string, string];
+    const existing = state.vocab.find(row => row.country === country && row.term === term);
+    if (text.includes('DO NOTHING RETURNING')) {
+      if (existing) return { rows: [] };
+      const row: FakeVocabRow = { id: state.nextId++, country, term, category, occurrences: 0, validation_count: 0, trust_tier: 3 };
+      state.vocab.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+    // saveExtractedTerm upsert: raw conflict target, increments on conflict.
+    if (existing) {
+      existing.occurrences += 1;
+      return { rows: [{ id: existing.id }] };
+    }
+    const row: FakeVocabRow = { id: state.nextId++, country, term, category, occurrences: 1, validation_count: 0, trust_tier: 3 };
+    state.vocab.push(row);
+    return { rows: [{ id: row.id }] };
+  }
+  if (text.startsWith('UPDATE extracted_trading_vocabulary SET occurrences=occurrences+1')) {
+    const [id] = params as [number];
+    const row = state.vocab.find(entry => entry.id === Number(id));
+    if (row) row.occurrences += 1;
+    return { rows: row ? [{ id: row.id }] : [] };
+  }
+  if (text.startsWith('INSERT INTO extracted_vocabulary_sources')) {
+    const [termId, channelId] = params as [number, string];
+    if (!state.channels.has(channelId)) return { rows: [] };
+    if (!state.links.some(link => link.termId === Number(termId) && link.channelId === channelId)) {
+      state.links.push({ termId: Number(termId), channelId });
+      return { rows: [{ term_id: termId }] };
+    }
+    return { rows: [] };
+  }
+  if (text.includes('SET validation_count=s.confirmed_sources')) {
+    const [termId] = params as [number];
+    const row = state.vocab.find(entry => entry.id === Number(termId));
+    if (row) {
+      const confirmed = new Set(
+        state.links.filter(link => link.termId === Number(termId) && state.channels.has(link.channelId)).map(link => link.channelId)
+      ).size;
+      row.validation_count = confirmed;
+      row.trust_tier = confirmed >= 2 ? 2 : 3;
+    }
+    return { rows: [] };
+  }
+  if (text.includes('SET occurrences=s.n')) {
+    const [termId, country, normalized] = params as [number, string, string];
+    const canonicalId = state.canonical.get(`${country}|${normalized}`);
+    const row = state.vocab.find(entry => entry.id === Number(termId));
+    if (row && canonicalId !== undefined) {
+      row.occurrences = state.observations.filter(id => id === canonicalId).length;
+    }
+    return { rows: [] };
+  }
+  throw new Error(`FakeVocabDb cannot interpret statement: ${text.slice(0, 100)}`);
+}
+
+function fakeVocabRunner(state: FakeVocabDb): { query: (text: string, params?: unknown[]) => Promise<{ rows: FakeDbRow[] }> } {
+  return { query: (text: string, params?: unknown[]) => fakeVocabQuery(state, text, params) };
+}
+
+function vocabRow(state: FakeVocabDb, country: string, term: string): FakeVocabRow | undefined {
+  return state.vocab.find(row => (row as unknown as { country?: string }).country === country && row.term === term) as (FakeVocabRow & { country?: string }) | undefined;
+}
+
+test('failed saveTerm is repaired on retry with the exact observation count', async () => {
+  // Production path end to end: the save fails after its observation
+  // committed; the retry replays a duplicate observation and the production
+  // reconciler restores the row from committed evidence — exactly once.
+  const state = createFakeVocabDb();
+  state.channels.add('ch-1');
+  state.canonical.set('Germany|p2p-algo', 100);
+  state.observations.push(100);
+  const runner = fakeVocabRunner(state);
+  state.failOnIncludes = 'INSERT INTO extracted_trading_vocabulary';
+  await assert.rejects(
+    saveExtractedTerm('Germany', 'P2P-Algo', 'terminology', 'ch-1', runner),
+    /injected failure/
+  );
+  assert.equal(state.vocab.length, 0);
+  const outcome = await defaultReconcileExtractedTerm('Germany', 'P2P-Algo', 'terminology', 'ch-1', runner);
+  assert.deepEqual([outcome.rowInserted, outcome.linkInserted], [true, true]);
+  assert.equal(state.vocab.length, 1);
+  const row = state.vocab[0];
   assert.equal(row.occurrences, 1);
   assert.equal(row.validation_count, 1);
   assert.equal(row.trust_tier, 3);
-  // Third run: everything present -> pure duplicate, no writes at all.
-  const third = await admitNativeCandidates(admission);
-  assert.deepEqual([third.admitted, third.duplicates], [0, 1]);
-  assert.deepEqual(reconciled.length, 2);
+  // Further replays are pure no-ops with stable counts.
+  const again = await defaultReconcileExtractedTerm('Germany', 'P2P-Algo', 'terminology', 'ch-1', runner);
+  assert.deepEqual([again.rowInserted, again.linkInserted], [false, false]);
+  assert.equal(state.vocab[0].occurrences, 1);
 });
 
 // C2/S2: row existence alone never proves completeness — the link and the
 // derived counters are reconciled on every replay, even when the row exists.
 test('replay reconciles missing links and counters on existing rows', async () => {
-  const store = createFakeVocabStore();
-  store.rows.set('Germany|SMC', { id: 1, term: 'SMC', occurrences: 5, validation_count: 0, trust_tier: 3 });
-  store.nextId = 2;
-  const sources: LiteralSourceText[] = [{ kind: 'VIDEO_TITLE', index: 0, text: 'SMC backtest', videoId: 'vid-2' }];
-  const deps = fakeDeps({
-    reconciled: [], observed: [], saved: [], store,
-    observe: async () => ({ termId: 8, observationInserted: false }),
-    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab, 'ch-2'),
-  });
-  const report = await admitNativeCandidates({
-    channel: { ...testChannel(), channel_id: 'ch-2' }, sources,
-    parsed: { terminology: ['SMC'] },
-    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT', deps,
-  });
-  assert.deepEqual([report.admitted, report.duplicates], [1, 0]);
-  const row = store.rows.get('Germany|SMC');
-  assert.ok(row);
-  assert.equal(row.occurrences, 5);
+  const state = createFakeVocabDb();
+  state.channels.add('ch-2');
+  // Pre-existing row WITHOUT link/counters (save failed after the upsert),
+  // with three committed observations behind it.
+  state.vocab.push({ id: 1, country: 'Germany', term: 'SMC', category: 'terminology', occurrences: 5, validation_count: 0, trust_tier: 3 });
+  state.nextId = 2;
+  state.canonical.set('Germany|smc', 100);
+  state.observations.push(100, 100, 100);
+  const outcome = await defaultReconcileExtractedTerm('Germany', 'SMC', 'terminology', 'ch-2', fakeVocabRunner(state));
+  assert.deepEqual([outcome.rowInserted, outcome.linkInserted], [false, true]);
+  const row = state.vocab[0];
+  assert.equal(row.occurrences, 3);
   assert.equal(row.validation_count, 1);
-  assert.ok(store.links.has('1|ch-2'));
+  assert.ok(state.links.some(link => link.termId === 1 && link.channelId === 'ch-2'));
 });
 
-// C3: both lookups observe absence before either repair proceeds — both
-// repair attempts run, one row is stored, every link survives.
+// C3: both reconciles genuinely overlap — gate both country scans before
+// either insert proceeds — and still collapse to one row with both links.
 test('concurrent repairs from two channels keep one row with both links', async () => {
-  const shared = createFakeVocabStore();
+  const state = createFakeVocabDb();
+  state.channels.add('ch-A');
+  state.channels.add('ch-B');
+  state.canonical.set('Germany|smc', 100);
+  state.observations.push(100);
   let releaseReads: (() => void) | null = null;
   const gate = new Promise<void>(resolve => { releaseReads = resolve; });
-  let reads = 0;
-  const reconcileCalls: string[] = [];
-  const blockingReconcile = async (country: string, term: string, vocab: FakeVocabStore, channelId?: string) => {
-    reconcileCalls.push(`${country}|${term}`);
-    reads += 1;
-    if (reads < 2) await gate;
-    else if (releaseReads) releaseReads();
-    return emulatedReconcile(country, term, vocab, channelId ?? 'ch-unknown');
+  let scans = 0;
+  state.onStatement = async (text: string) => {
+    if (text.startsWith('SELECT id, term FROM extracted_trading_vocabulary')) {
+      scans += 1;
+      if (scans < 2) await gate;
+      else if (releaseReads) releaseReads();
+    }
   };
-  const admissionFor = (channelId: string, deps: ReturnType<typeof fakeDeps>) => ({
-    channel: { ...testChannel(), channel_id: channelId },
-    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: 'SMC backtest', videoId: 'vid-2' }] as LiteralSourceText[],
-    parsed: { terminology: ['SMC'] },
-    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
-  });
-  const depsA = fakeDeps({ reconciled: [], observed: [], saved: [], store: shared, observe: async () => ({ termId: 8, observationInserted: false }), reconcile: blockingReconcile });
-  const depsB = fakeDeps({ reconciled: [], observed: [], saved: [], store: shared, observe: async () => ({ termId: 8, observationInserted: false }), reconcile: blockingReconcile });
+  const runner = fakeVocabRunner(state);
   const [first, second] = await Promise.all([
-    admitNativeCandidates(admissionFor('ch-A', depsA)),
-    admitNativeCandidates(admissionFor('ch-B', depsB)),
+    defaultReconcileExtractedTerm('Germany', 'SMC', 'terminology', 'ch-A', runner),
+    defaultReconcileExtractedTerm('Germany', 'SMC', 'terminology', 'ch-B', runner),
   ]);
-  assert.equal(reconcileCalls.length, 2);
-  assert.equal(shared.rows.size, 1);
-  const row = shared.rows.get('Germany|SMC');
-  assert.ok(row);
+  assert.equal(state.vocab.length, 1);
+  const row = state.vocab[0];
   assert.equal(row.occurrences, 1);
   assert.equal(row.validation_count, 2);
   assert.equal(row.trust_tier, 2);
-  assert.ok(shared.links.has(`${row.id}|ch-A`));
-  assert.ok(shared.links.has(`${row.id}|ch-B`));
-  assert.equal(first.admitted + second.admitted, 2);
+  assert.ok(state.links.some(link => link.termId === row.id && link.channelId === 'ch-A'));
+  assert.ok(state.links.some(link => link.termId === row.id && link.channelId === 'ch-B'));
+  assert.ok(first.linkInserted && second.linkInserted);
 });
 
 // S3: casing variants reuse the earliest normalized row instead of duplicating.
 test('whitespace and NFKC variants reconcile to one vocabulary row', async () => {
   // lower() prefiltering would miss these; the country-wide normalized scan
   // must not split links across equivalent rows.
-  const store = createFakeVocabStore();
-  const deps = fakeDeps({
-    reconciled: [], observed: [], saved: [], store,
-    observe: async () => ({ termId: 9, observationInserted: false }),
-    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
-  });
-  const admissionFor = (candidate: string) => ({
-    channel: testChannel(),
-    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: `${candidate} session`, videoId: 'vid-4' }] as LiteralSourceText[],
-    parsed: { terminology: [candidate] },
-    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
-  });
-  await admitNativeCandidates(admissionFor('order  flow'));
-  await admitNativeCandidates(admissionFor('order flow'));
-  assert.equal(store.rows.size, 1);
+  const state = createFakeVocabDb();
+  state.channels.add('ch-1');
+  state.canonical.set('Germany|order flow', 300);
+  state.observations.push(300, 300);
+  const runner = fakeVocabRunner(state);
+  await saveExtractedTerm('Germany', 'order  flow', 'phrase', 'ch-1', runner);
+  await saveExtractedTerm('Germany', 'order flow', 'phrase', 'ch-1', runner);
+  await defaultReconcileExtractedTerm('Germany', 'order\u00a0flow', 'phrase', 'ch-1', runner);
+  assert.equal(state.vocab.length, 1);
+  assert.equal(state.vocab[0].term, 'order  flow');
+  assert.equal(state.vocab[0].occurrences, 2);
   const productionSql = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(productionSql, /lower\(term\)=lower/);
 });
 
 test('casing variants reconcile to one vocabulary row', async () => {
-  const sharedStore = createFakeVocabStore();
-  const deps = fakeDeps({
-    reconciled: [], observed: [], saved: [], store: sharedStore,
-    observe: async () => ({ termId: 9, observationInserted: false }),
-    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
-  });
-  const admissionFor = (candidate: string) => ({
-    channel: testChannel(),
-    sources: [{ kind: 'VIDEO_TITLE', index: 0, text: `${candidate} outlook`, videoId: 'vid-3' }] as LiteralSourceText[],
-    parsed: { terminology: [candidate] },
-    baseline: okBaseline(), humanApproved: false, humanObservation: 'ENRICHMENT' as const, deps,
-  });
-  await admitNativeCandidates(admissionFor('BTC'));
-  await admitNativeCandidates(admissionFor('btc'));
-  await admitNativeCandidates(admissionFor('Btc'));
-  assert.equal(sharedStore.rows.size, 1);
-  assert.ok(sharedStore.rows.get('Germany|BTC'));
+  const state = createFakeVocabDb();
+  state.channels.add('ch-1');
+  state.canonical.set('Germany|btc', 200);
+  state.observations.push(200, 200);
+  const runner = fakeVocabRunner(state);
+  await saveExtractedTerm('Germany', 'BTC', 'instrument', 'ch-1', runner);
+  await saveExtractedTerm('Germany', 'btc', 'instrument', 'ch-1', runner);
+  await defaultReconcileExtractedTerm('Germany', 'Btc', 'instrument', 'ch-1', runner);
+  assert.equal(state.vocab.length, 1);
+  assert.equal(state.vocab[0].term, 'BTC');
+  assert.equal(state.vocab[0].occurrences, 2);
 });
 
 test('one literal in two categories saves once without inflating counts', async () => {
   // The vocabulary row is keyed (country, term): the first category wins and
   // the replay reconciles idempotently. Planner consumption uses term text,
   // trust tier, and validation counts — never the category column.
-  const store = createFakeVocabStore();
+  const state = createFakeVocabDb();
+  state.channels.add('ch-1');
+  state.canonical.set('Germany|smc', 100);
+  state.observations.push(100);
+  const runner = fakeVocabRunner(state);
   let observations = 0;
   const deps = fakeDeps({
-    reconciled: [], observed: [], saved: [], store,
+    reconciled: [], observed: [], saved: [],
     observe: async () => { observations += 1; return { termId: 7, observationInserted: observations === 1 }; },
-    // Faithful save emulation: creates the row and channel link, like production.
-    save: async (country, term) => { emulatedReconcile(country, term, store); },
-    reconcile: async (country, term, vocab) => emulatedReconcile(country, term, vocab),
+    // Production save path (insert-gated by the observation result above).
+    save: async (country, term) => { await saveExtractedTerm(country, term, 'terminology', 'ch-1', runner); },
+    reconcile: async () => ({ rowInserted: false, linkInserted: false }),
   });
   const admission = {
     channel: testChannel(),
@@ -1557,8 +1694,8 @@ test('one literal in two categories saves once without inflating counts', async 
   };
   const report = await admitNativeCandidates(admission);
   assert.deepEqual([report.admitted, report.duplicates], [1, 1]);
-  assert.equal(store.rows.size, 1);
-  assert.equal(store.rows.get('Germany|SMC')?.occurrences, 1);
+  assert.equal(state.vocab.length, 1);
+  assert.equal(state.vocab[0].occurrences, 1);
 });
 
 test('concurrent novel observations converge to the serial first-seen decision', () => {
@@ -1656,11 +1793,10 @@ test('video IDs align to titles and persist on the observation', async () => {
   assert.deepEqual(alignVideoIdsToTitles(['Real Title'], [], { id: 'v1', title: 'Real Title' }), ['v1']);
   assert.deepEqual(alignVideoIdsToTitles(['Other'], [], { id: 'v1', title: 'Real Title' }), [null]);
   assert.deepEqual(alignVideoIdsToTitles(['T'], [{ id: 'A', title: 'T' }], { id: 'v1', title: 'T' }), ['A']);
-  // resolveExtractionVideoIds is the production handoff: the ingestion call
-  // must forward its result to extraction (fails if the argument is removed).
+  // invokeChannelVocabularyExtraction owns the production handoff: ingestion
+  // must route through it (fails if the call is removed or bypassed).
   const ingestionSource = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
-  assert.match(ingestionSource, /resolveExtractionVideoIds\(candidate\)/);
-  assert.match(ingestionSource, /extractVocabularyFromCreator\(([\s\S]{0,400}?)extractionVideoIds/);
+  assert.match(ingestionSource, /await invokeChannelVocabularyExtraction\(finalChannel, candidate,/);
   // Handoff behavior through the real helper: matched-document fallback,
   // mismatch honesty, and hydrated-videos precedence.
   assert.deepEqual(
@@ -1927,6 +2063,46 @@ test('rollup consumes admission-captured evidence, not hand-built fixtures', asy
   assert.deepEqual(rollup, { v1Observations: 1, spamConfirmed: false, novel: true });
 });
 
+test('quality rollup SQL executes correctly over mixed evidence', async () => {
+  // SQL-aware fixture: recognizes NATIVE_QUALITY_ROLLUP_SQL and evaluates its
+  // documented predicates (v1 marker, novel boolean, spam flag-or-array) over
+  // supplied evidence rows, instead of regex-matching the statement text.
+  const { readNativeQualityEvidence, NATIVE_QUALITY_ROLLUP_SQL } = await import('./terminologyIntelligence');
+  assert.match(NATIVE_QUALITY_ROLLUP_SQL, /evidence->>'qualityVersion'/);
+  const evaluateRollupSql = (evidenceRows: Array<Record<string, unknown> | null>) => {
+    let v1 = 0;
+    let spam = false;
+    let novel = false;
+    for (const evidence of evidenceRows) {
+      if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) continue;
+      if (evidence.qualityVersion !== 'native-v1') continue;
+      v1 += 1;
+      const spamFlag = evidence.spamConfirmed === true ||
+        (Array.isArray(evidence.spamSignals) && evidence.spamSignals.length > 0);
+      if (spamFlag) spam = true;
+      if (evidence.novel === true) novel = true;
+    }
+    return { rows: [{ v1, spam, novel }] };
+  };
+  const sqlFake = (evidenceRows: Array<Record<string, unknown> | null>) => ({
+    query: async (text: string) => {
+      assert.match(text, /bool_or/);
+      return evaluateRollupSql(evidenceRows);
+    },
+  });
+  const native = await readNativeQualityEvidence(7, sqlFake([writerEvidence({ novel: true })]) as never);
+  assert.deepEqual(native, { v1Observations: 1, spamConfirmed: false, novel: true });
+  const legacy = await readNativeQualityEvidence(7, sqlFake([{ extractor: 'KNOWN_INSTRUMENT_V1' }]) as never);
+  assert.deepEqual(legacy, { v1Observations: 0, spamConfirmed: false, novel: false });
+  const mixed = await readNativeQualityEvidence(7, sqlFake([
+    writerEvidence({ novel: false }),
+    { extractor: 'LEGACY', novel: true } as Record<string, unknown>,
+    writerEvidence({ novel: true, spamSignals: ['promotional'] }),
+    null,
+  ]) as never);
+  assert.deepEqual(mixed, { v1Observations: 2, spamConfirmed: true, novel: true });
+});
+
 test('planner serves trial terms inside generated queries', () => {
   const candidates = planDiverseQueries({
     country: 'Germany',
@@ -1967,10 +2143,67 @@ test('provider parse failures are distinct from persistence failures', () => {
   assert.ok(source.indexOf('await admitNativeCandidates({') > catchEnd);
 });
 
+test('ingestion handoff forwards aligned IDs to extraction', async () => {
+  const seen: Array<{ titles: string[]; videoIds?: Array<string | null> }> = [];
+  const candidate = {
+    videoTitles: ['Real Title', 'Other'],
+    videos: [{ id: 'v-1', title: 'Real Title' }],
+    matchedDocument: { type: 'VIDEO', providerNativeId: 'v-9', title: 'Other' },
+  };
+  const ids = await invokeChannelVocabularyExtraction(
+    testChannel(),
+    candidate,
+    undefined,
+    {
+      extractVocabulary: (async (_channel: unknown, titles: string[], _description: string, _approved: boolean, _ctx: unknown, videoIds?: Array<string | null>) => {
+        seen.push({ titles, videoIds });
+        return [];
+      }) as never,
+    }
+  );
+  // Hydrated videos take precedence; the singleton matched document never
+  // overrides them (using it per-title would fabricate provenance).
+  assert.deepEqual(ids, ['v-1', null]);
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0].titles, ['Real Title', 'Other']);
+  assert.deepEqual(seen[0].videoIds, ['v-1', null]);
+  // Without hydrated videos, the matched document fills the gap by title.
+  const fallbackIds = await invokeChannelVocabularyExtraction(
+    testChannel(),
+    { videoTitles: ['Other'], matchedDocument: { type: 'VIDEO', providerNativeId: 'v-9', title: 'Other' } },
+    undefined,
+    {
+      extractVocabulary: (async (_channel: unknown, titles: string[], _description: string, _approved: boolean, _ctx: unknown, videoIds?: Array<string | null>) => {
+        seen.push({ titles, videoIds });
+        return [];
+      }) as never,
+    }
+  );
+  assert.deepEqual(fallbackIds, ['v-9']);
+  const ingestion = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  assert.match(ingestion, /await invokeChannelVocabularyExtraction\(finalChannel, candidate,/);
+});
+
 test('extraction forwards language and locale into the admission helper', () => {
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
-  assert.match(source, /locale: languageContext\?\.locale,\n(\s*)humanApproved,/);
-  assert.match(source, /language: languageContext\?\.language,\n(\s*)locale: languageContext\?\.locale,/);
+  // Rule path forwards both fields at its observation call.
+  assert.match(source, /locale: languageContext\?\.locale,/);
+  // Gemini path threads both fields into the admission call specifically
+  // (not merely somewhere in the file): the admit block carries them.
+  const admitBlock = source.slice(source.indexOf('await admitNativeCandidates({'));
+  assert.match(admitBlock, /language: languageContext\?\.language,/);
+  assert.match(admitBlock, /locale: languageContext\?\.locale,/);
+});
+
+test('rule-admitted instruments are filtered from AI candidates', () => {
+  const ruleObserved = new Set(['es', 'btc']);
+  assert.deepEqual(
+    excludeRuleAdmittedInstruments(['ES', 'SMC', 42, 'btc', 'Gold'], ruleObserved),
+    ['SMC', 42, 'Gold']
+  );
+  assert.equal(excludeRuleAdmittedInstruments(undefined, ruleObserved), undefined);
+  const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.match(source, /excludeRuleAdmittedInstruments\(values, ruleObserved\)/);
 });
 
 test('extraction admits only literal, non-spam candidates with observe-first ordering', () => {
