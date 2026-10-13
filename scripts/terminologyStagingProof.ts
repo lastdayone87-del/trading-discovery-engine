@@ -28,19 +28,18 @@ import { getDb } from '../server/db';
 import {
   attributeTerminologyPerformance,
   getPlannerTerminology,
+  normalizeTerm,
   observeTerminologyDetailed,
   refreshTerminologyLifecycle,
 } from '../server/terminologyIntelligence';
+import { verifyStagingTarget } from './stagingTargetGuard';
 import { saveExtractedTerm, getExtractedVocabulary } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
 import type { QueryRecord } from '../src/types';
 
-function stagingSsl() {
-  // Identical to the application pool (server/dbCore.ts getDb): PGSSL=disable
-  // forces plaintext for tunnel-local staging; production negotiates TLS.
-  return process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined;
-}
-
+// TLS configuration comes from the verified guard verdict (see
+// scripts/stagingTargetGuard.ts): PGSSL=disable applies to loopback only;
+// every non-loopback target uses fully verified TLS regardless of PGSSL.
 function targetConnectionString(): string {
   if (process.env.STAGING_OK !== 'true' || !process.env.DATABASE_URL) {
     throw new Error('Refusing to run: set STAGING_OK=true and DATABASE_URL=<staging postgres> (never production).');
@@ -56,17 +55,12 @@ function targetConnectionString(): string {
 // topology is a localhost tunnel); (3) marker row absent or token mismatch
 // (a copied marker row alone never authorizes). Timeouts bound the probe so
 // a black-holed endpoint fails instead of hanging.
-async function verifyStagingTarget(connectionString: string): Promise<void> {
+async function verifyStagingTargetOrThrow(connectionString: string): Promise<false | { rejectUnauthorized: boolean } | undefined> {
   const expectedToken = process.env.STAGING_PROOF_TOKEN;
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
-  let host = '';
-  try { host = new URL(connectionString).hostname.toLowerCase(); } catch { host = ''; }
-  const loopback = host === '' || host === 'localhost' || host === '127.0.0.1' || host === '::1';
-  const wantsTls = /[?&]sslmode=(require|verify-ca|verify-full)(&|$)/.test(connectionString);
-  if (!loopback && !wantsTls) {
-    throw new Error(`Refusing to run: non-loopback target '${host}' without sslmode=require — refusing plaintext credentials.`);
-  }
-  const probe = new pg.Pool({ connectionString, ssl: stagingSsl(), connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  const verdict = verifyStagingTarget(connectionString);
+  if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
+  const probe = new pg.Pool({ connectionString, ssl: verdict.ssl, connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let ok = false;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
@@ -77,40 +71,59 @@ async function verifyStagingTarget(connectionString: string): Promise<void> {
     await probe.end().catch(() => undefined);
   }
   if (!ok) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
+  return verdict.ssl;
 }
 
-interface RunFixtures { channels: string[]; termIds: number[]; phrases: string[]; }
+interface RunScope {
+  createdChannels: string[];
+  rawPhrases: string[];
+  normPhrases: string[];
+  countries: string[];
+}
 
-// Best-effort removal of this run's fixtures (run-unique ids, so residue can
-// never pollute later runs; warn-only so cleanup trouble never masks a leg
-// result). Order respects foreign keys: observations/links/performance first.
+// Best-effort removal of this run's fixtures, resolved by run-unique phrase
+// identity plus intended country — never by bare id lists or unscoped text
+// matching, so unrelated rows sharing a numeric id or a substring survive.
+// Vocabulary-row ids are resolved first because source links reference them,
+// not canonical-term ids. Only channels whose insert actually created a row
+// are removed. Warn-only so cleanup trouble never masks a leg result.
 async function cleanupRunFixtures(
-  db: { query: (text: string, params?: unknown[]) => Promise<unknown> },
-  fixtures: RunFixtures
+  db: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> },
+  scope: RunScope
 ): Promise<void> {
   try {
-    if (fixtures.termIds.length > 0) {
-      await db.query(`DELETE FROM terminology_observations WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
-      await db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [fixtures.termIds]);
-      await db.query(`DELETE FROM terminology_performance WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
-      await db.query(`DELETE FROM terminology_score_snapshots WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
-      await db.query(`DELETE FROM trading_term_aliases WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
-      await db.query(`DELETE FROM country_native_evidence_projections WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
-      await db.query(`DELETE FROM country_native_performance_attribution WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
-      await db.query(`DELETE FROM terminology_lifecycle_events WHERE canonical_term_id = ANY($1)`, [fixtures.termIds]);
+    const termRows = await db.query(
+      `SELECT id FROM canonical_trading_terms WHERE normalized_term = ANY($1) AND country = ANY($2)`,
+      [scope.normPhrases, scope.countries]
+    );
+    const termIds = termRows.rows.map(row => Number(row.id));
+    const vocabRows = await db.query(
+      `SELECT id FROM extracted_trading_vocabulary WHERE term = ANY($1) AND country = ANY($2)`,
+      [scope.rawPhrases, scope.countries]
+    );
+    const vocabIds = vocabRows.rows.map(row => Number(row.id));
+    if (termIds.length > 0) {
+      await db.query(`DELETE FROM terminology_observations WHERE canonical_term_id = ANY($1)`, [termIds]);
+      await db.query(`DELETE FROM terminology_performance WHERE canonical_term_id = ANY($1)`, [termIds]);
+      await db.query(`DELETE FROM terminology_lifecycle_events WHERE canonical_term_id = ANY($1)`, [termIds]);
+      await db.query(`DELETE FROM terminology_score_snapshots WHERE canonical_term_id = ANY($1)`, [termIds]);
+      await db.query(`DELETE FROM trading_term_aliases WHERE canonical_term_id = ANY($1)`, [termIds]);
+      await db.query(`DELETE FROM country_native_evidence_projections WHERE canonical_term_id = ANY($1)`, [termIds]);
+      await db.query(`DELETE FROM country_native_performance_attribution WHERE canonical_term_id = ANY($1)`, [termIds]);
     }
-    if (fixtures.phrases.length > 0) {
-      await db.query(`DELETE FROM extracted_trading_vocabulary WHERE term = ANY($1)`, [fixtures.phrases]);
+    if (vocabIds.length > 0) {
+      await db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [vocabIds]);
+      await db.query(`DELETE FROM extracted_trading_vocabulary WHERE id = ANY($1)`, [vocabIds]);
     }
-    if (fixtures.termIds.length > 0) {
-      await db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [fixtures.termIds]);
+    if (termIds.length > 0) {
+      await db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [termIds]);
     }
-    if (fixtures.channels.length > 0) {
-      await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [fixtures.channels]);
+    if (scope.createdChannels.length > 0) {
+      await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [scope.createdChannels]);
     }
     console.log('cleanup: removed run fixtures');
   } catch (error) {
-    console.warn('cleanup: fixture removal incomplete (ids are run-unique; later runs unaffected)', error);
+    console.warn('cleanup: fixture removal incomplete (identity is run-unique; later runs unaffected)', error);
   }
 }
 
@@ -119,6 +132,7 @@ const ALIAS_COUNTRY = 'US';
 const PHRASE = `e2e probe ${randomUUID().slice(0, 8)}`;
 const DEMOTE_PHRASE = `e2e demote probe ${randomUUID().slice(0, 8)}`;
 const ALIAS_PHRASE = `e2e alias probe ${randomUUID().slice(0, 8)}`;
+const SCOPE_PHRASE = `e2e scope probe ${randomUUID().slice(0, 8)}`;
 const RUN = randomUUID().slice(0, 8);
 // Unique fixture IDs per run: no existing record is ever modified, and reruns
 // never collide with prior fixtures on a reused staging database.
@@ -153,22 +167,30 @@ function evidenceFor(channelId: string, videoId: string, phrase: string) {
 
 async function main() {
   targetConnectionString();
-  await verifyStagingTarget(process.env.DATABASE_URL!);
+  await verifyStagingTargetOrThrow(process.env.DATABASE_URL!);
   const pool = await getDb();
   const db = pool;
-  const fixtures: RunFixtures = { channels: CHANNELS, termIds: [], phrases: [PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE] };
+  const scope: RunScope = {
+    createdChannels: [],
+    rawPhrases: [PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE, SCOPE_PHRASE],
+    normPhrases: [normalizeTerm(PHRASE), normalizeTerm(DEMOTE_PHRASE), normalizeTerm(ALIAS_PHRASE), normalizeTerm(SCOPE_PHRASE)],
+    countries: [COUNTRY, 'United States'],
+  };
   try {
   // Fixture creators: confirmed traders eligible for links, retry and trial.
+  // Only ids whose insert actually creates a row are registered for cleanup,
+  // so a pre-existing channel is never removed.
   for (const channelId of CHANNELS) {
-    await db.query(
+    const inserted = await db.query(
       `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
        VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','e2e-proof',now(),90,'TRADING_CONFIRMED')
-       ON CONFLICT(channel_id) DO NOTHING`,
+       ON CONFLICT(channel_id) DO NOTHING RETURNING channel_id`,
       [channelId, `https://youtube.com/channel/${channelId}`, COUNTRY]
     );
+    if (inserted.rows.length > 0) scope.createdChannels.push(channelId);
   }
-  // Phrase must be genuinely novel on this database.
-  const pre = await db.query(`SELECT id FROM canonical_trading_terms WHERE normalized_term=$1`, [PHRASE.toLowerCase()]);
+  // Phrase must be genuinely novel for the intended country on this database.
+  const pre = await db.query(`SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(PHRASE), COUNTRY]);
   check('phrase novel', pre.rows.length === 0, { phrase: PHRASE });
 
   // Leg 1: observation + save.
@@ -178,7 +200,6 @@ async function main() {
   });
   check('first observation inserted', first !== null && first.observationInserted === true, first);
   const termId = Number(first!.termId);
-  fixtures.termIds.push(termId);
   await saveExtractedTerm(COUNTRY, PHRASE, 'terminology', CHANNELS[0]);
   let vocab = await db.query(`SELECT country,occurrences FROM extracted_trading_vocabulary WHERE term=$1`, [PHRASE]);
   check('vocab row under canonical country with count 1', vocab.rows[0]?.country === COUNTRY && Number(vocab.rows[0]?.occurrences) === 1, vocab.rows[0]);
@@ -217,10 +238,31 @@ async function main() {
 
   // Leg 4: attribution + promotion + planner surfacing.
   const query = { generation_metadata: { learnedTerm: PHRASE }, country: COUNTRY } as unknown as QueryRecord;
-  const goodRun = funnel({ rawResults: 20, distinctResults: 12, knownChannels: 2, newChannels: 10, tradingConfirmed: 10, qualityChannels: 8, communitiesDiscovered: 2, averageQualityScore: 80, noveltyRatio: 0.8, countryPrecision: 1, tradingPrecision: 0.9, performanceScore: 85 });
+  // inScopeNewChannels (6) below newChannels (10): expected credit is 6/12.
+  // Quota 300/run keeps the promotion bar margin identical to the unscoped
+  // fixture (1.5/900*1000 = 1.667 against MIN_YIELD_PER_1000_QUOTA=1.0).
+  const goodRun = funnel({ rawResults: 20, distinctResults: 12, knownChannels: 2, newChannels: 10, inScopeNewChannels: 6, tradingConfirmed: 10, qualityChannels: 8, communitiesDiscovered: 2, averageQualityScore: 80, noveltyRatio: 0.8, countryPrecision: 1, tradingPrecision: 0.9, performanceScore: 85 });
   for (let i = 0; i < 3; i++) {
-    await attributeTerminologyPerformance(query, goodRun as never, 500);
+    await attributeTerminologyPerformance(query, goodRun as never, 300);
   }
+  // Scoped-yield probe on an isolated term: a fully out-of-scope run
+  // (inScope 0 of 10 new) must earn exactly zero credit, and the good runs
+  // above must carry scoped credit (0.5) rather than the newChannels
+  // fallback (0.833) — a scope-weighting regression fails these checks.
+  await observeTerminologyDetailed({
+    term: SCOPE_PHRASE, country: COUNTRY, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    channelId: CHANNELS[0], videoId: 'e2e-scope-v1', evidence: evidenceFor(CHANNELS[0], 'e2e-scope-v1', SCOPE_PHRASE),
+  });
+  const scopeQuery = { generation_metadata: { learnedTerm: SCOPE_PHRASE }, country: COUNTRY } as unknown as QueryRecord;
+  await attributeTerminologyPerformance(scopeQuery, funnel({ rawResults: 10, distinctResults: 10, newChannels: 10, inScopeNewChannels: 0 }) as never, 100);
+  const scopePerf = await db.query(
+    `SELECT decayed_yield_score FROM terminology_performance WHERE canonical_term_id=(SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2)`,
+    [normalizeTerm(SCOPE_PHRASE), COUNTRY]
+  );
+  check('out-of-scope discoveries earn zero yield', Number(scopePerf.rows[0]?.decayed_yield_score) === 0, scopePerf.rows[0]);
+  const goodPerf = await db.query(`SELECT decayed_yield_score FROM terminology_performance WHERE canonical_term_id=$1 ORDER BY id`, [termId]);
+  const goodYields = goodPerf.rows.map(row => Number((row as Record<string, unknown>).decayed_yield_score));
+  check('good runs carry scoped credit', goodYields.length === 3 && goodYields.every(y => Math.abs(y - 0.5) < 1e-4), goodYields);
   const promoted = await db.query(`SELECT lifecycle_status FROM canonical_trading_terms WHERE id=$1`, [termId]);
   check('term promotes to PROVEN_SEARCH_TERM', promoted.rows[0]?.lifecycle_status === 'PROVEN_SEARCH_TERM', promoted.rows[0]);
   const plannerTerms = await getPlannerTerminology(COUNTRY);
@@ -240,7 +282,6 @@ async function main() {
   }
   const demoteTermRow = await db.query(`SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [DEMOTE_PHRASE.toLowerCase(), COUNTRY]);
   const demoteTermId = Number(demoteTermRow.rows[0]?.id);
-  fixtures.termIds.push(demoteTermId);
   const demoteQuery = { generation_metadata: { learnedTerm: DEMOTE_PHRASE }, country: COUNTRY } as unknown as QueryRecord;
   const zeroRun = funnel({ averageQualityScore: 5, performanceScore: 2 });
   for (let i = 0; i < 6; i++) {
@@ -274,7 +315,6 @@ async function main() {
     channelId: CHANNELS[0], videoId: 'e2e-alias-v1', evidence: evidenceFor(CHANNELS[0], 'e2e-alias-v1', ALIAS_PHRASE),
   });
   check('alias observation inserted', aliasObs !== null && aliasObs.observationInserted === true, aliasObs);
-  fixtures.termIds.push(Number(aliasObs!.termId));
   await saveExtractedTerm(ALIAS_COUNTRY, ALIAS_PHRASE, 'terminology', CHANNELS[0]);
   const viaAlias = await getExtractedVocabulary(ALIAS_COUNTRY);
   const aliasEntry = viaAlias.find(entry => entry.term === ALIAS_PHRASE);
@@ -282,7 +322,7 @@ async function main() {
 
   console.log(`E2E PROOF COMPLETE (${passed} legs)`);
   } finally {
-    await cleanupRunFixtures(db, fixtures);
+    await cleanupRunFixtures(db, scope);
     await pool.end().catch(() => undefined);
   }
 }

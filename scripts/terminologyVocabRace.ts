@@ -24,16 +24,14 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { getDb } from '../server/db';
-import { observeTerminologyDetailed } from '../server/terminologyIntelligence';
+import { normalizeTerm, observeTerminologyDetailed } from '../server/terminologyIntelligence';
+import { verifyStagingTarget } from './stagingTargetGuard';
 import { saveExtractedTerm } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
 
-function stagingSsl() {
-  // Identical to the application pool (server/dbCore.ts getDb): PGSSL=disable
-  // forces plaintext for tunnel-local staging; production negotiates TLS.
-  return process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined;
-}
-
+// TLS configuration comes from the verified guard verdict (see
+// scripts/stagingTargetGuard.ts): PGSSL=disable applies to loopback only;
+// every non-loopback target uses fully verified TLS regardless of PGSSL.
 function targetConnectionString(): string {
   const connectionString = process.env.PHASE10_POSTGRES_URL || process.env.DATABASE_URL;
   if (process.env.STAGING_OK !== 'true' || !connectionString) {
@@ -44,21 +42,15 @@ function targetConnectionString(): string {
 
 // Target verification BEFORE any initializing connection: getDb() runs
 // migrations and seedDefaults() (both write), so staging identity is proven
-// here through a one-shot non-initializing pool. Three independent refusals,
-// all fail-closed: (1) no pairing token; (2) non-loopback target without TLS
-// (the provisioned topology is a localhost tunnel); (3) marker row absent or
-// token mismatch. Timeouts bound the probe so a black-holed endpoint fails.
-async function verifyStagingTarget(connectionString: string): Promise<void> {
+// here through a one-shot non-initializing pool (guard verdict + pairing
+// token, both fail-closed). Returns the verified TLS configuration for the
+// pools below.
+async function verifyStagingTargetOrThrow(connectionString: string): Promise<false | { rejectUnauthorized: boolean } | undefined> {
   const expectedToken = process.env.STAGING_PROOF_TOKEN;
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
-  let host = '';
-  try { host = new URL(connectionString).hostname.toLowerCase(); } catch { host = ''; }
-  const loopback = host === '' || host === 'localhost' || host === '127.0.0.1' || host === '::1';
-  const wantsTls = /[?&]sslmode=(require|verify-ca|verify-full)(&|$)/.test(connectionString);
-  if (!loopback && !wantsTls) {
-    throw new Error(`Refusing to run: non-loopback target '${host}' without sslmode=require — refusing plaintext credentials.`);
-  }
-  const probe = new pg.Pool({ connectionString, ssl: stagingSsl(), connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  const verdict = verifyStagingTarget(connectionString);
+  if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
+  const probe = new pg.Pool({ connectionString, ssl: verdict.ssl, connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let ok = false;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
@@ -69,6 +61,7 @@ async function verifyStagingTarget(connectionString: string): Promise<void> {
     await probe.end().catch(() => undefined);
   }
   if (!ok) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
+  return verdict.ssl;
 }
 
 const COUNTRY_ALIAS = 'US';
@@ -92,22 +85,25 @@ function check(name: string, cond: boolean, evidence: unknown) {
 
 async function main() {
   const connectionString = targetConnectionString();
-  await verifyStagingTarget(connectionString);
+  const targetSsl = await verifyStagingTargetOrThrow(connectionString);
   process.env.DATABASE_URL = connectionString!;
   const dbPool = await getDb();
   const db = dbPool;
+  const createdChannels: string[] = [];
+  const racers: Array<Promise<unknown>> = [];
   const pools = [
-    new pg.Pool({ connectionString, ssl: stagingSsl(), connectionTimeoutMillis: 15_000 }),
-    new pg.Pool({ connectionString, ssl: stagingSsl(), connectionTimeoutMillis: 15_000 }),
+    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 }),
+    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 }),
   ];
   try {
   for (const channelId of CHANNELS) {
-    await db.query(
+    const inserted = await db.query(
       `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
        VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','vocab-race',now(),90,'TRADING_CONFIRMED')
-       ON CONFLICT(channel_id) DO NOTHING`,
+       ON CONFLICT(channel_id) DO NOTHING RETURNING channel_id`,
       [channelId, `https://youtube.com/channel/${channelId}`, COUNTRY_CANON]
     );
+    if (inserted.rows.length > 0) createdChannels.push(channelId);
   }
   // Committed observation evidence all racers must converge to.
   for (const channelId of CHANNELS) {
@@ -132,7 +128,10 @@ async function main() {
   check('race preconditions committed', expectedCount === CHANNELS.length * OBS_PER_CHANNEL, { expectedCount });
 
   // Genuine overlap: separate pools so advisory-lock blocking is real.
-  const racers: Array<Promise<unknown>> = [];
+  // Bounded overall deadline (RACE_DEADLINE_MS): a wedged query rejects the
+  // run instead of hanging it. Settlement is always awaited below — even on
+  // failure — so cleanup never runs while writers are still in flight.
+  const deadlineMs = Number(process.env.RACE_DEADLINE_MS || '120000');
   CHANNELS.forEach((channelId, i) => {
     // Pass each pool directly: the writers detect the Pool, pin lock, reads
     // and writes to one transaction-bound client, and hold the advisory lock
@@ -144,13 +143,25 @@ async function main() {
     racers.push(saveExtractedTerm(COUNTRY_ALIAS, SPELLINGS[(i + 1) % SPELLINGS.length], 'terminology', channelId, runner as never));
     racers.push(defaultReconcileExtractedTerm(COUNTRY_ALIAS, SPELLINGS[(i + 2) % SPELLINGS.length], 'terminology', channelId, runner as never));
   });
-  await Promise.all(racers);
+  const settlement = racers.map((racer, index) => racer.then(
+    () => ({ index, ok: true as const, error: null as unknown }),
+    (error: unknown) => ({ index, ok: false as const, error })
+  ));
+  const deadline = new Promise<never>((_, reject) => {
+    const timer = setTimeout(() => reject(new Error(`race deadline exceeded after ${deadlineMs}ms with writers pending`)), deadlineMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  const outcomes = await Promise.race([Promise.all(settlement), deadline]);
+  const failed = outcomes.filter(outcome => !outcome.ok);
+  check('all racers settled successfully', failed.length === 0, failed.map(entry => ({ index: entry.index, error: String(entry.error) })));
 
-  // RUN-bound ILIKE: only this run's spellings match (prior runs used other
-  // ids), case-insensitively — the winning surface form may be the uppercased
-  // spelling while RUN hex contains a-f (case-sensitive LIKE would miss it).
+  // Exact fixture identity: intended country plus the SQL-normalized surface
+  // form (lower/collapse/trim — exact for this ASCII spelling set). No
+  // substring matching, so unrelated rows containing the run token can
+  // neither hide a split nor fail the check.
   const rows = await db.query(
-    `SELECT country,term,occurrences FROM extracted_trading_vocabulary WHERE term ILIKE $1`, [`%${RUN}%`]
+    `SELECT country,term,occurrences FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
+    [COUNTRY_CANON, normalizeTerm(TERM)]
   );
   check('exactly one vocabulary row across equivalent spellings', rows.rows.length === 1, rows.rows);
   check('row under canonical country', rows.rows[0]?.country === COUNTRY_CANON, rows.rows[0]);
@@ -158,28 +169,51 @@ async function main() {
 
   console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
   } finally {
+    // Stragglers from a deadline breach settle here (bounded) before cleanup
+    // touches fixtures, so late writers cannot resurrect rows afterwards.
+    await Promise.race([
+      Promise.allSettled(racers),
+      new Promise(resolve => setTimeout(() => { console.warn('cleanup: straggler settlement timed out; proceeding best-effort'); resolve(undefined); }, 30_000)),
+    ]);
     try {
-      const termIds = (await db.query(`SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1`, [`%${RUN.toLowerCase()}%`]).catch(() => ({ rows: [] as unknown[] }))).rows;
-      const ids = (termIds as Array<Record<string, unknown>>).map(row => Number(row.id));
+      const normTerm = normalizeTerm(TERM);
+      const termRows = await db.query(
+        `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normTerm, COUNTRY_CANON]
+      );
+      const ids = (termRows.rows as Array<Record<string, unknown>>).map(row => Number(row.id));
+      const vocabRows = await db.query(
+        `SELECT id FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
+        [COUNTRY_CANON, normTerm]
+      );
+      const vocabIds = (vocabRows.rows as Array<Record<string, unknown>>).map(row => Number(row.id));
       if (ids.length > 0) {
         await db.query(`DELETE FROM terminology_observations WHERE canonical_term_id = ANY($1)`, [ids]);
-        await db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [ids]);
         await db.query(`DELETE FROM terminology_performance WHERE canonical_term_id = ANY($1)`, [ids]);
-      await db.query(`DELETE FROM terminology_score_snapshots WHERE canonical_term_id = ANY($1)`, [ids]);
-      await db.query(`DELETE FROM trading_term_aliases WHERE canonical_term_id = ANY($1)`, [ids]);
-      await db.query(`DELETE FROM country_native_evidence_projections WHERE canonical_term_id = ANY($1)`, [ids]);
-      await db.query(`DELETE FROM country_native_performance_attribution WHERE canonical_term_id = ANY($1)`, [ids]);
         await db.query(`DELETE FROM terminology_lifecycle_events WHERE canonical_term_id = ANY($1)`, [ids]);
+        await db.query(`DELETE FROM terminology_score_snapshots WHERE canonical_term_id = ANY($1)`, [ids]);
+        await db.query(`DELETE FROM trading_term_aliases WHERE canonical_term_id = ANY($1)`, [ids]);
+        await db.query(`DELETE FROM country_native_evidence_projections WHERE canonical_term_id = ANY($1)`, [ids]);
+        await db.query(`DELETE FROM country_native_performance_attribution WHERE canonical_term_id = ANY($1)`, [ids]);
       }
-      await db.query(`DELETE FROM extracted_trading_vocabulary WHERE term ILIKE $1`, [`%${RUN}%`]);
+      if (vocabIds.length > 0) {
+        await db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [vocabIds]);
+        await db.query(`DELETE FROM extracted_trading_vocabulary WHERE id = ANY($1)`, [vocabIds]);
+      }
       if (ids.length > 0) await db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [ids]);
-      await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [CHANNELS]);
+      if (createdChannels.length > 0) await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [createdChannels]);
       console.log('cleanup: removed run fixtures');
     } catch (error) {
-      console.warn('cleanup: fixture removal incomplete (ids are run-unique; later runs unaffected)', error);
+      console.warn('cleanup: fixture removal incomplete (identity is run-unique; later runs unaffected)', error);
     }
-    await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
-    await dbPool.end().catch(() => undefined);
+    // Bounded close: run the outer command under `timeout` as the final
+    // backstop against a wedged server; diagnostics above are already printed.
+    await Promise.race([
+      (async () => {
+        await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
+        await dbPool.end().catch(() => undefined);
+      })(),
+      new Promise(resolve => setTimeout(() => { console.warn('cleanup: pool close timed out; proceeding to exit code'); resolve(undefined); }, 20_000)),
+    ]);
   }
 }
 
