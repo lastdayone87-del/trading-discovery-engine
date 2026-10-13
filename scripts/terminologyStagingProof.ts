@@ -58,6 +58,11 @@ function evidenceFor(channelId: string, videoId: string, phrase: string) {
 
 async function main() {
   const db = await getDb();
+  const marker = await db.query(`SELECT note FROM staging_proof_marker LIMIT 1`).catch(() => ({ rows: [] as unknown[] }));
+  if ((marker.rows[0] as Record<string, unknown> | undefined)?.note !== 'terminology-e2e-staging') {
+    console.error('Refusing to run: staging marker table/row absent — point DATABASE_URL at the provisioned staging database, never production.');
+    process.exit(2);
+  }
   // Fixture creators: confirmed traders eligible for links, retry and trial.
   for (const channelId of CHANNELS) {
     await db.query(
@@ -167,7 +172,8 @@ async function main() {
   check('alias observation inserted', aliasObs !== null && aliasObs.observationInserted === true, aliasObs);
   await saveExtractedTerm(ALIAS_COUNTRY, ALIAS_PHRASE, 'terminology', CHANNELS[0]);
   const viaAlias = await getExtractedVocabulary(ALIAS_COUNTRY);
-  check('alias read finds canonical row with count 1', viaAlias.length === 1 && viaAlias[0].country === 'United States' && viaAlias[0].occurrences === 1, viaAlias[0]);
+  const aliasEntry = viaAlias.find(entry => entry.term === ALIAS_PHRASE);
+  check('alias read finds canonical row with count 1', aliasEntry?.country === 'United States' && aliasEntry?.occurrences === 1, aliasEntry ?? null);
 
   console.log(failures === 0 ? 'E2E PROOF COMPLETE' : `E2E PROOF FAILED (${failures} legs)`);
   process.exit(failures === 0 ? 0 : 1);

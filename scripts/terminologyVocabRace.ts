@@ -39,6 +39,11 @@ function check(name: string, cond: boolean, evidence: unknown) {
 async function main() {
   process.env.DATABASE_URL = connectionString!;
   const db = await getDb();
+  const marker = await db.query(`SELECT note FROM staging_proof_marker LIMIT 1`).catch(() => ({ rows: [] as unknown[] }));
+  if ((marker.rows[0] as Record<string, unknown> | undefined)?.note !== 'terminology-e2e-staging') {
+    console.error('Refusing to run: staging marker table/row absent — point DATABASE_URL at the provisioned staging database, never production.');
+    process.exit(2);
+  }
   for (const channelId of CHANNELS) {
     await db.query(
       `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
@@ -73,7 +78,10 @@ async function main() {
   const pools = [new pg.Pool({ connectionString }), new pg.Pool({ connectionString })];
   const racers: Array<Promise<unknown>> = [];
   CHANNELS.forEach((channelId, i) => {
-    const runner = { query: (text: string, params?: unknown[]) => pools[i % pools.length].query(text, params as unknown[]) };
+    // Pass each pool directly: the writers detect the Pool, pin lock, reads
+    // and writes to one transaction-bound client, and hold the advisory lock
+    // across the critical section — the serialization under test.
+    const runner = pools[i % pools.length];
     racers.push(saveExtractedTerm(COUNTRY_ALIAS, TERM, 'terminology', channelId, runner as never));
     racers.push(saveExtractedTerm(COUNTRY_ALIAS, TERM, 'terminology', channelId, runner as never));
     racers.push(defaultReconcileExtractedTerm(COUNTRY_ALIAS, TERM, 'terminology', channelId, runner as never));
