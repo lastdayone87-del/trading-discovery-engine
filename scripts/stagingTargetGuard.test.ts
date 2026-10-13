@@ -9,10 +9,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  decodedQuery,
   hasHostOverrideParam,
   isLoopbackHost,
   parseTargetHost,
   sslModeParam,
+  sslModeParams,
   verifyStagingTarget,
 } from './stagingTargetGuard';
 
@@ -47,6 +49,35 @@ test('loopback classification covers localhost, IPv4 and normalized IPv6', () =>
   assert.equal(isLoopbackHost('[::1]'), false);
   assert.equal(isLoopbackHost('10.0.1.8'), false);
   assert.equal(isLoopbackHost(''), false);
+});
+
+test('percent-encoded host parameters are decoded and rejected', () => {
+  // pg-connection-string decodes parameter names: ?%68ost= is honored as
+  // ?host= (verified empirically), so the guard must decode before checking.
+  assert.equal(hasHostOverrideParam('postgresql:///db?%68ost=evil.example'), true);
+  assert.equal(verifyStagingTarget('postgresql:///db?%68ost=evil.example').ok, false);
+});
+
+test('percent-encoded TLS downgrades are decoded and rejected', () => {
+  // ?%73slmode=disable parses to ssl=false (verified empirically).
+  assert.deepEqual(sslModeParams('postgresql://10.0.1.8/db?%73slmode=disable'), ['disable']);
+  assert.equal(verifyStagingTarget('postgresql://10.0.1.8/db?%73slmode=disable').ok, false);
+});
+
+test('malformed percent-encoding fails closed', () => {
+  assert.equal(decodedQuery('postgresql://h/db?%zz'), null);
+  assert.equal(verifyStagingTarget('postgresql://h/db?%zz').ok, false);
+});
+
+test('duplicate parameters resolve safely: host refused, conflicting sslmode refused', () => {
+  // pg applies the LAST duplicate; conflicting values are refused instead of
+  // guessing. Identical repeats are harmless.
+  assert.equal(verifyStagingTarget('postgresql://h/db?host=a.example&host=b.example').ok, false);
+  assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=require&sslmode=disable').ok, false);
+  assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=disable&sslmode=require').ok, false);
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined }, () => {
+    assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=require&sslmode=require').ok, true);
+  });
 });
 
 test('host override parameters are detected case-insensitively', () => {

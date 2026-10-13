@@ -23,7 +23,6 @@
  */
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { getDb } from '../server/db';
 import { normalizeTerm, observeTerminologyDetailed } from '../server/terminologyIntelligence';
 import { verifyStagingTarget } from './stagingTargetGuard';
 import { saveExtractedTerm } from '../server/dbCore';
@@ -111,13 +110,17 @@ async function main() {
   const connectionString = targetConnectionString();
   const targetSsl = await verifyStagingTargetOrThrow(connectionString);
   process.env.DATABASE_URL = connectionString!;
-  const dbPool = await getDb();
+  // Script-owned pools (verified TLS): race writers each get a pool directly
+  // (transaction-bound advisory locks), the main pool serves seeds/asserts,
+  // and getDb() is never touched. application_name tags race backends so a
+  // straggler timeout can terminate exactly those connections.
+  const dbPool = new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 });
   const db = dbPool;
   const createdChannels: string[] = [];
   const racers: Array<Promise<unknown>> = [];
   const pools = [
-    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 }),
-    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 }),
+    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000, application_name: 'terminology-vocab-race' }),
+    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000, application_name: 'terminology-vocab-race' }),
   ];
   try {
   for (const channelId of CHANNELS) {
@@ -141,7 +144,7 @@ async function main() {
           sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: TERM, videoId, sourceHash: `race-${videoId}` },
           novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [], translationRisk: null,
         },
-      });
+      }, dbPool);
     }
   }
   const expected = await db.query(
@@ -194,8 +197,28 @@ async function main() {
   console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
   } finally {
     // Stragglers from a deadline breach settle here (bounded) before cleanup
-    // touches fixtures, so late writers cannot resurrect rows afterwards.
-    await bounded(Promise.allSettled(racers), 30_000, () => console.warn('cleanup: straggler settlement timed out; proceeding best-effort')).catch(() => undefined);
+    // touches fixtures. On timeout the race backends are terminated by
+    // application_name: the server rolls back their transactions, so late
+    // commits are impossible and cleanup cannot be followed by resurrected
+    // rows. Any path through here after a failure stays exit-nonzero.
+    let stragglers = false;
+    await bounded(Promise.allSettled(racers), 30_000, () => { stragglers = true; }).catch(() => { stragglers = true; });
+    if (stragglers) {
+      const killed = await db.query(
+        `SELECT count(*)::int n FROM (SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name='terminology-vocab-race' AND pid<>pg_backend_pid()) s WHERE killed`
+      ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+      console.warn(`cleanup: terminated ${Number((killed.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} straggler backends; in-flight transactions rolled back`);
+      await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after termination; proceeding best-effort')).catch(() => undefined);
+    }
+    const failures: string[] = [];
+    const cleanupStep = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+      try {
+        if (process.env.INJECT_CLEANUP_FAILURE === name) throw new Error(`injected cleanup failure at step ${name}`);
+        await fn();
+      } catch (error) {
+        failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
     try {
       const normTerm = normalizeTerm(TERM);
       const termRows = await db.query(
@@ -207,24 +230,37 @@ async function main() {
         [COUNTRY_CANON, normTerm]
       );
       const vocabIds = (vocabRows.rows as Array<Record<string, unknown>>).map(row => Number(row.id));
+      const byTerm = (table: string) => `DELETE FROM ${table} WHERE canonical_term_id = ANY($1)`;
       if (ids.length > 0) {
-        await db.query(`DELETE FROM terminology_observations WHERE canonical_term_id = ANY($1)`, [ids]);
-        await db.query(`DELETE FROM terminology_performance WHERE canonical_term_id = ANY($1)`, [ids]);
-        await db.query(`DELETE FROM terminology_lifecycle_events WHERE canonical_term_id = ANY($1)`, [ids]);
-        await db.query(`DELETE FROM terminology_score_snapshots WHERE canonical_term_id = ANY($1)`, [ids]);
-        await db.query(`DELETE FROM trading_term_aliases WHERE canonical_term_id = ANY($1)`, [ids]);
-        await db.query(`DELETE FROM country_native_evidence_projections WHERE canonical_term_id = ANY($1)`, [ids]);
-        await db.query(`DELETE FROM country_native_performance_attribution WHERE canonical_term_id = ANY($1)`, [ids]);
+        await cleanupStep('observations', () => db.query(byTerm('terminology_observations'), [ids]));
+        await cleanupStep('performance', () => db.query(byTerm('terminology_performance'), [ids]));
+        await cleanupStep('lifecycle', () => db.query(byTerm('terminology_lifecycle_events'), [ids]));
+        await cleanupStep('snapshots', () => db.query(byTerm('terminology_score_snapshots'), [ids]));
+        await cleanupStep('aliases', () => db.query(byTerm('trading_term_aliases'), [ids]));
+        await cleanupStep('projections', () => db.query(byTerm('country_native_evidence_projections'), [ids]));
+        await cleanupStep('attribution', () => db.query(byTerm('country_native_performance_attribution'), [ids]));
       }
       if (vocabIds.length > 0) {
-        await db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [vocabIds]);
-        await db.query(`DELETE FROM extracted_trading_vocabulary WHERE id = ANY($1)`, [vocabIds]);
+        await cleanupStep('links', () => db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [vocabIds]));
+        await cleanupStep('vocab', () => db.query(`DELETE FROM extracted_trading_vocabulary WHERE id = ANY($1)`, [vocabIds]));
       }
-      if (ids.length > 0) await db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [ids]);
-      if (createdChannels.length > 0) await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [createdChannels]);
-      console.log('cleanup: removed run fixtures');
+      if (ids.length > 0) await cleanupStep('canonical', () => db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [ids]));
+      if (createdChannels.length > 0) await cleanupStep('channels', () => db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [createdChannels]));
+      const residue = await db.query(
+        `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2) AS vocab,
+                (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term=$2 AND country=$1) AS terms,
+                (SELECT COUNT(*) FROM channels WHERE channel_id = ANY($3)) AS channels`,
+        [COUNTRY_CANON, normTerm, createdChannels.length > 0 ? createdChannels : ['']]
+      ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+      const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
+      const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
+      if (failures.length > 0 || remaining !== 0) {
+        throw new Error(`cleanup incomplete (failures=[${failures.join('; ')}] remaining=${remaining})`);
+      }
+      console.log('cleanup: removed run fixtures, residue verified 0');
     } catch (error) {
       console.warn('cleanup: fixture removal incomplete (identity is run-unique; later runs unaffected)', error);
+      throw error;
     }
     // Bounded close: run the outer command under `timeout` as the final
     // backstop against a wedged server; diagnostics above are already printed.

@@ -28,15 +28,46 @@ export function parseTargetHost(connectionString: string): string {
   return host;
 }
 
-export function hasHostOverrideParam(connectionString: string): boolean {
+/**
+ * The query string percent-decoded before inspection. pg-connection-string
+ * decodes parameter NAMES (`?%68ost=` selects the host), so checking the raw
+ * string would miss encoded overrides. Malformed encodings fail closed.
+ */
+export function decodedQuery(connectionString: string): string | null {
   const queryIndex = connectionString.indexOf('?');
-  if (queryIndex < 0) return false;
-  return /(?:^|[?&])host=/i.test(connectionString.slice(queryIndex));
+  if (queryIndex < 0) return '';
+  try {
+    return decodeURIComponent(connectionString.slice(queryIndex));
+  } catch {
+    return null;
+  }
+}
+
+export function hasHostOverrideParam(connectionString: string): boolean {
+  const query = decodedQuery(connectionString);
+  if (query === null) return true;
+  return /(?:^|[?&])host=/i.test(query);
+}
+
+/** Every sslmode value present (decoded); pg applies the LAST one. */
+export function sslModeParams(connectionString: string): string[] | null {
+  const query = decodedQuery(connectionString);
+  if (query === null) return null;
+  const modes: string[] = [];
+  const pattern = /[?&]sslmode=([^&#]*)/gi;
+  let match: RegExpExecArray | null;
+  try {
+    while ((match = pattern.exec(query)) !== null) modes.push(decodeURIComponent(match[1]).toLowerCase());
+  } catch {
+    return null;
+  }
+  return modes;
 }
 
 export function sslModeParam(connectionString: string): string | null {
-  const match = /[?&]sslmode=([^&#]*)/i.exec(connectionString);
-  return match ? decodeURIComponent(match[1]).toLowerCase() : null;
+  const modes = sslModeParams(connectionString);
+  if (modes === null || modes.length === 0) return null;
+  return modes[modes.length - 1];
 }
 
 export function isLoopbackHost(host: string): boolean {
@@ -62,10 +93,23 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
   }
   const loopback = isLoopbackHost(host);
   if (!loopback) {
-    const mode = sslModeParam(connectionString);
+    // Conflicting duplicates are refused instead of guessing which value the
+    // driver applies — ambiguity must never resolve toward weaker transport.
+    const modes = sslModeParams(connectionString);
+    if (modes === null) {
+      return { ok: false, loopback, host, ssl: undefined, reason: 'undecodable query string' };
+    }
+    if (new Set(modes).size > 1) {
+      return { ok: false, loopback, host, ssl: undefined, reason: `conflicting sslmode parameters (${modes.join(',')})` };
+    }
+    const mode = modes.length > 0 ? modes[modes.length - 1] : null;
     if (mode !== null && mode !== 'require' && mode !== 'verify-ca' && mode !== 'verify-full') {
       return { ok: false, loopback, host, ssl: undefined, reason: `sslmode=${mode} permits downgraded or plaintext transport` };
     }
+    // Explicit verified TLS. Callers pass this object to every pool they open
+    // (verified: an explicit `ssl` object overrides any URL-parsed downgrade,
+    // including encoded or duplicated parameters), so the opened connection
+    // cannot differ from what was validated here.
     return { ok: true, loopback, host, ssl: { rejectUnauthorized: true } };
   }
   const ssl =
