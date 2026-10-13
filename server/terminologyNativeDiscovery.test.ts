@@ -2111,9 +2111,9 @@ test('retry forces extraction replay on the preserved-channel path', () => {
   const ingestion = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   assert.match(ingestion, /await replayVocabularyForRetry\(existing, candidate, source, options\?\.forceExtraction \?\? false\)/);
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(queue, /forceExtraction:job\.attempts>1/);
+  assert.match(queue, /forceExtraction:isRepairEligibleRetry\(job\)/);
   assert.match(queue, /await replayVocabularyForRetry\(channel, candidate, source, true\)/);
-  assert.match(queue, /processDiscoveredChannel\(raw, country, source, \{ forceExtraction: job\.attempts > 1 \}\)/);
+  assert.match(queue, /processDiscoveredChannel\(raw, country, source, \{ forceExtraction: isRepairEligibleRetry\(job\) \}\)/);
 });
 
 test('extraction caller marks non-metadata origins honestly', () => {
@@ -2234,6 +2234,17 @@ test('saver and repair converge occurrences to the committed count', async () =>
   await defaultReconcileExtractedTerm('Germany', 'SMC', 'terminology', 'ch-1', runner);
   assert.equal(state.vocab[0].occurrences, 2);
   assert.equal(state.vocab[0].validation_count, 1);
+});
+
+test('retry eligibility survives attempt decrements via last_error', async () => {
+  const { isRepairEligibleRetry } = await import('./queueManager');
+  assert.equal(isRepairEligibleRetry({ attempts: 1 }), false);
+  assert.equal(isRepairEligibleRetry({ attempts: 1, last_error: null }), false);
+  assert.equal(isRepairEligibleRetry({ attempts: 2 }), true);
+  // RETRYING_WITHOUT_ATTEMPT decrements back to 1, but last_error persists.
+  assert.equal(isRepairEligibleRetry({ attempts: 1, last_error: 'ETIMEDOUT' }), true);
+  // Crash-reclaim marker likewise qualifies.
+  assert.equal(isRepairEligibleRetry({ attempts: 1, last_error: 'Recovered stale processing lock' }), true);
 });
 
 test('planner serves trial terms inside generated queries', () => {

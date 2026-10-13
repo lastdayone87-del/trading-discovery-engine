@@ -702,7 +702,7 @@ export async function processNextSearchJob(
         // behind this early completion (same bars as the ingestion helper).
         // Repair failures propagate to failJob (bounded retry) rather than
         // completing with rows still missing.
-        if (channel && job.attempts > 1) {
+        if (channel && isRepairEligibleRetry(job)) {
           await replayVocabularyForRetry(channel, candidate, source, true);
         }
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel?.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'CASE_NO_LONGER_ELIGIBLE'}).catch(()=>undefined);
@@ -899,7 +899,7 @@ export async function processNextSearchJob(
           // crashed after persisting the paid enrichment payload.
           await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         }
-        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true,{forceExtraction:job.attempts>1});
+        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true,{forceExtraction:isRepairEligibleRetry(job)});
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
@@ -1077,7 +1077,7 @@ export async function processNextSearchJob(
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
-      const outcome = await processDiscoveredChannel(raw, country, source, { forceExtraction: job.attempts > 1 });
+      const outcome = await processDiscoveredChannel(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
@@ -1406,6 +1406,19 @@ export function projectLiveCountryAttribution(
 /**
  * Handles newly discovered YouTube channel via the unified ingestion pipeline.
  */
+/**
+ * Whether a claimed job may be retrying a previously failed attempt, for
+ * vocabulary-repair purposes. attempts increments at claim time (first
+ * execution already sees 1), but RETRYING_WITHOUT_ATTEMPT decrements on
+ * infrastructure failures and stale-lock reclaim stamps last_error — so a
+ * genuine retry can arrive with attempts===1. last_error is set on every
+ * failure path, cleared on re-enqueue, and present after crash recovery;
+ * either signal therefore marks a retry without false-flagging first runs.
+ */
+export function isRepairEligibleRetry(job: { attempts: number; last_error?: string | null }): boolean {
+  return job.attempts > 1 || job.last_error != null;
+}
+
 export async function processDiscoveredChannel(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
