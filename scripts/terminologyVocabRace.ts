@@ -75,6 +75,23 @@ const SPELLINGS = [TERM, TERM.toUpperCase(), TERM.replace(/ /g, '  '), ` ${TERM}
 const CHANNELS = [1, 2, 3, 4].map(i => `race-${RUN}-ch-${i}`);
 const OBS_PER_CHANNEL = 1;
 
+// Bounded wait: the loser timer is always cleared, so a fast operation never
+// trips a stale timeout later (and never holds the event loop open).
+async function bounded<T>(promise: Promise<T>, ms: number, onTimeout: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => { onTimeout(); reject(new Error(`bounded wait expired after ${ms}ms`)); }, ms);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 let passed = 0;
 // Fail fast: a failed check throws, so no further writes follow a break.
 function check(name: string, cond: boolean, evidence: unknown) {
@@ -171,10 +188,7 @@ async function main() {
   } finally {
     // Stragglers from a deadline breach settle here (bounded) before cleanup
     // touches fixtures, so late writers cannot resurrect rows afterwards.
-    await Promise.race([
-      Promise.allSettled(racers),
-      new Promise(resolve => setTimeout(() => { console.warn('cleanup: straggler settlement timed out; proceeding best-effort'); resolve(undefined); }, 30_000)),
-    ]);
+    await bounded(Promise.allSettled(racers), 30_000, () => console.warn('cleanup: straggler settlement timed out; proceeding best-effort')).catch(() => undefined);
     try {
       const normTerm = normalizeTerm(TERM);
       const termRows = await db.query(
@@ -207,13 +221,10 @@ async function main() {
     }
     // Bounded close: run the outer command under `timeout` as the final
     // backstop against a wedged server; diagnostics above are already printed.
-    await Promise.race([
-      (async () => {
-        await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
-        await dbPool.end().catch(() => undefined);
-      })(),
-      new Promise(resolve => setTimeout(() => { console.warn('cleanup: pool close timed out; proceeding to exit code'); resolve(undefined); }, 20_000)),
-    ]);
+    await bounded((async () => {
+      await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
+      await dbPool.end().catch(() => undefined);
+    })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
   }
 }
 
