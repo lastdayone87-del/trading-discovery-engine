@@ -1404,9 +1404,6 @@ export function projectLiveCountryAttribution(
 }
 
 /**
- * Handles newly discovered YouTube channel via the unified ingestion pipeline.
- */
-/**
  * Whether a claimed job may be retrying a previously failed attempt, for
  * vocabulary-repair purposes. attempts increments at claim time (first
  * execution already sees 1), but RETRYING_WITHOUT_ATTEMPT decrements on
@@ -1419,6 +1416,9 @@ export function isRepairEligibleRetry(job: { attempts: number; last_error?: stri
   return job.attempts > 1 || job.last_error != null;
 }
 
+/**
+ * Handles newly discovered YouTube channel via the unified ingestion pipeline.
+ */
 export async function processDiscoveredChannel(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
