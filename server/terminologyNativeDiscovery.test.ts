@@ -40,7 +40,7 @@ import {
   parseNativeVocabularyResponse,
   resolveExtractionVideoIds,
 } from './queryIntelligence';
-import { saveExtractedTerm } from './dbCore';
+import { getExtractedVocabulary, saveExtractedTerm } from './dbCore';
 import { isRetryableInfrastructureFailure } from './dbCore';
 import { computeObservationKey } from './countryNativeIntelligence';
 import { extractDiscoveredChannels } from './youtube';
@@ -1523,6 +1523,10 @@ async function fakeVocabQuery(
     const [country] = params as [string];
     return { rows: state.vocab.filter(row => row.country === country).map(row => ({ id: row.id, term: row.term })) };
   }
+  if (text.startsWith('SELECT * FROM extracted_trading_vocabulary WHERE country=$1')) {
+    const [country] = params as [string];
+    return { rows: state.vocab.filter(row => row.country === country).map(row => ({ ...row })) };
+  }
   if (text.startsWith('INSERT INTO extracted_trading_vocabulary')) {
     const [country, term, category] = params as [string, string, string];
     const existing = state.vocab.find(row => row.country === country && row.term === term);
@@ -1645,6 +1649,24 @@ test('alias country repairs reconcile against canonical observations', async () 
   const row = vocabRow(state, 'United States', 'Alias Probe');
   assert.ok(row, 'alias repair lands under the canonical country');
   assert.equal(row.occurrences, 2);
+});
+
+test('alias country reads retrieve vocabulary saved through the alias', async () => {
+  // Read/write symmetry: once alias saves land under the canonical country,
+  // the getter must apply the same identity or extraction/query generation
+  // silently miss alias-saved terms.
+  const state = createFakeVocabDb();
+  state.channels.add('ch-alias');
+  state.canonical.set('United States|alias probe', 100);
+  state.observations.push(100, 100);
+  await saveExtractedTerm('US', 'Alias Probe', 'terminology', 'ch-alias', fakeVocabRunner(state));
+  const runner = fakeVocabRunner(state);
+  const viaAlias = await getExtractedVocabulary('US', runner);
+  assert.equal(viaAlias.length, 1);
+  assert.equal(viaAlias[0].country, 'United States');
+  assert.equal(viaAlias[0].occurrences, 2);
+  const viaCanonical = await getExtractedVocabulary('United States', runner);
+  assert.deepEqual(viaCanonical.map(entry => entry.id), viaAlias.map(entry => entry.id));
 });
 
 // C2/S2: row existence alone never proves completeness — the link and the
