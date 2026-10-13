@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
+import { createHash } from 'node:crypto';
 import type { CountryVocabulary, QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
@@ -91,6 +92,12 @@ export interface LiteralSpanMatch {
   sourceIndex: number;
   span: string;
   videoId?: string | null;
+  /**
+   * SHA-256 of the NFKC full source text. Observation identity consumes it,
+   * so reordered copies deduplicate while different titles mentioning the
+   * same term stay distinct — positional index alone cannot do both.
+   */
+  sourceHash: string;
 }
 
 /**
@@ -173,7 +180,13 @@ export function findLiteralSpan(term: string, sources: LiteralSourceText[]): Lit
       // record provenance that does not contain the candidate. Reject such
       // mappings rather than persisting false provenance.
       if (span.normalize('NFKC') !== match[0]) continue;
-      return { sourceKind: source.kind, sourceIndex: source.index, span, videoId: source.videoId ?? null };
+      return {
+        sourceKind: source.kind,
+        sourceIndex: source.index,
+        span,
+        videoId: source.videoId ?? null,
+        sourceHash: createHash('sha256').update(source.text.normalize('NFKC')).digest('hex'),
+      };
     }
   }
   return null;

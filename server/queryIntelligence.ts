@@ -473,6 +473,9 @@ export async function replayVocabularyForRetry(
   if (!isRetry) return false;
   if (source === 'manual_search') return false;
   if (channel.trading_status !== 'TRADING_CONFIRMED') return false;
+  // Gate-1 halt-before-learning: rejected countries never train vocabulary,
+  // including on the retry path.
+  if (channel.country_status === 'REJECTED') return false;
   if (channel.quality_score == null || channel.quality_score < 55) return false;
   const extract = deps?.extractVocabulary ?? extractVocabularyFromCreator;
   await extract(
@@ -522,11 +525,13 @@ export async function loadNoveltyBaseline(
   const getExtracted = deps?.getExtracted ?? getExtractedVocabulary;
   let vocab: CountryVocabulary | undefined;
   let vocabOk = true;
+  const failures: Array<{ lookup: string; error: unknown }> = [];
   try {
     const all = await getVocabularies();
     vocab = all.find(entry => entry.country.toLowerCase() === country.toLowerCase());
   } catch (error) {
     vocabOk = false;
+    failures.push({ lookup: 'curated-vocabulary', error });
   }
   let existingTerms: string[] = [];
   let existingOk = true;
@@ -534,9 +539,24 @@ export async function loadNoveltyBaseline(
     existingTerms = (await getExtracted(country)).map(row => row.term);
   } catch (error) {
     existingOk = false;
+    failures.push({ lookup: 'extracted-vocabulary', error });
   }
   if (!vocabOk || !existingOk) {
-    throw new Error(`[Vocabulary Extraction] novelty baseline lookups failed for country ${country} (vocabOk=${vocabOk}, existingOk=${existingOk}); failing the extraction for retry instead of discarding candidates.`);
+    // Preserve the original failure causes and retryable codes so
+    // isRetryableInfrastructureFailure classifies this as infrastructure
+    // (retry-policy path) rather than an ordinary failure that burns
+    // max_attempts, and logs identify which lookup failed and why.
+    const first = (failures[0]?.error ?? {}) as Record<string, unknown>;
+    const thrown = new Error(
+      `[Vocabulary Extraction] novelty baseline lookups failed for country ${country} ` +
+      `(${failures.map(failure => `${failure.lookup}: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`).join('; ')})`
+    ) as Error & Record<string, unknown>;
+    thrown.cause = failures[0]?.error;
+    if (typeof first.name === 'string' && first.name) thrown.name = first.name;
+    for (const key of ['code', 'status', 'statusCode', 'retryable', 'errorClass', 'retryAt', 'retryAfterMs', 'providerReasons']) {
+      if (thrown[key] === undefined && first[key] !== undefined) thrown[key] = first[key];
+    }
+    throw thrown;
   }
   return buildNoveltyBaseline({ country, vocab, vocabOk, existingTerms, existingOk });
 }
@@ -625,7 +645,7 @@ export async function admitNativeCandidates(args: {
       communityFingerprint: args.channel.discord_invite || undefined,
       evidence: {
         extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
-        sourceRef: { kind: verdict.located.sourceKind, index: verdict.located.sourceIndex, span: verdict.located.span, videoId: verdict.located.videoId ?? null },
+        sourceRef: { kind: verdict.located.sourceKind, index: verdict.located.sourceIndex, span: verdict.located.span, videoId: verdict.located.videoId ?? null, sourceHash: verdict.located.sourceHash },
         novel: verdict.novelty.novel, knownAs: verdict.novelty.knownAs,
         generic: verdict.flags.generic, spamConfirmed: false, spamSignals: verdict.spamSignals, sourceSpamSignals: verdict.sourceSpamSignals,
         translationRisk: verdict.flags.translationRisk,
@@ -695,7 +715,7 @@ export async function extractVocabularyFromCreator(
   for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
-    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
+    const ruleObservation = await observeTerminologyDetailed({ term: hit.instrument, country: channel.country, termType: 'INSTRUMENT', observationType: humanApproved ? 'HUMAN_APPROVED_CHANNEL' : hit.located.sourceKind, channelId: channel.channel_id, videoId: hit.located.videoId ?? undefined, humanApproved, language: languageContext?.language, locale: languageContext?.locale, communityFingerprint: channel.discord_invite || undefined, evidence: { extractor: 'KNOWN_INSTRUMENT_V1', sourceType: hit.located.sourceKind, qualityVersion: 'native-v1', literal: true, sourceRef: { kind: hit.located.sourceKind, index: hit.located.sourceIndex, span: hit.located.span, videoId: hit.located.videoId ?? null, sourceHash: hit.located.sourceHash }, novel: false, knownAs: `instrument:${hit.instrument}`, generic: true, spamConfirmed: false, spamSignals: [] as string[], sourceSpamSignals: hit.sourceSpamSignals, translationRisk: null } });
     if (ruleObservation == null) continue;
     ruleObserved.add(normalizeTerm(hit.instrument));
     if (ruleObservation.observationInserted) {

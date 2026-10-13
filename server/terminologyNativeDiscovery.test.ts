@@ -41,6 +41,7 @@ import {
   resolveExtractionVideoIds,
 } from './queryIntelligence';
 import { saveExtractedTerm } from './dbCore';
+import { isRetryableInfrastructureFailure } from './dbCore';
 import { computeObservationKey } from './countryNativeIntelligence';
 import { extractDiscoveredChannels } from './youtube';
 import { planDiverseQueries } from './queryPlanner';
@@ -371,8 +372,21 @@ test('baseline loader throws on lookup failure but resolves unknown rows', async
       getVocabularies: async () => [],
       getExtracted: async () => { throw new Error('db down'); },
     }),
-    /existingOk=false/
+    /extracted-vocabulary: db down/
   );
+  // Failure causes and retryable codes survive for the retry classifier.
+  const timeout = Object.assign(new Error('connection timeout'), { name: 'TimeoutError', code: 'ETIMEDOUT' });
+  const caught = await loadNoveltyBaseline('Germany', {
+    getVocabularies: async () => { throw timeout; },
+    getExtracted: async () => [],
+  }).then(
+    () => { throw new Error('should have thrown'); },
+    (error: unknown) => error
+  );
+  assert.match(String((caught as Error).message), /curated-vocabulary: connection timeout/);
+  assert.equal((caught as { cause?: unknown }).cause, timeout);
+  assert.equal((caught as { code?: unknown }).code, 'ETIMEDOUT');
+  assert.equal(isRetryableInfrastructureFailure(caught), true);
   // Successful lookup with no country row: unknown baseline, no throw.
   const missing = await loadNoveltyBaseline('Germany', {
     getVocabularies: async () => [],
@@ -1610,6 +1624,89 @@ test('replay reconciles missing links and counters on existing rows', async () =
 
 // C3: both reconciles genuinely overlap — gate both country scans before
 // either insert proceeds — and still collapse to one row with both links.
+test('concurrent variant repairs serialize on the shared lock with one row', async () => {
+  // Blocking-lock fake: advisory locks are held per key with a waiter queue,
+  // released at COMMIT — mirroring PostgreSQL transaction-scoped semantics.
+  // Distinct raw spellings ('BTC' vs 'btc') share one normalized lock key, so
+  // the second repair genuinely blocks until the first commits, then observes
+  // its row instead of inserting a variant duplicate.
+  interface LockClient { id: number; statements: string[]; release: () => void }
+  const holders = new Map<string, number>();
+  const waiters = new Map<string, Array<() => void>>();
+  const clients: LockClient[] = [];
+  let nextClient = 0;
+  let releaseFirstScan: (() => void) | null = null;
+  const bothRequestedGate = new Promise<void>(resolve => { releaseFirstScan = resolve; });
+  let advisoryRequests = 0;
+  const state = createFakeVocabDb();
+  state.channels.add('ch-A');
+  state.channels.add('ch-B');
+  state.canonical.set('Germany|btc', 200);
+  state.observations.push(200);
+  const pool = {
+    connect: async () => {
+      const id = nextClient++;
+      const statements: string[] = [];
+      const client = {
+        query: async (text: string, params: unknown[] = []) => {
+          statements.push(`c${id}:${text.slice(0, 52)}`);
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+            if (text === 'COMMIT') {
+              for (const [key, holder] of [...holders]) {
+                if (holder === id) {
+                  holders.delete(key);
+                  const queued = waiters.get(key) || [];
+                  waiters.delete(key);
+                  for (const wake of queued) wake();
+                }
+              }
+            }
+            return { rows: [] };
+          }
+          if (text.includes('pg_advisory_xact_lock')) {
+            const key = String(params[0]);
+            advisoryRequests += 1;
+            // Let the first repairer scan only after both lock requests have
+            // arrived, forcing genuine overlap (not sequential execution).
+            if (advisoryRequests < 2 && releaseFirstScan) await bothRequestedGate;
+            else if (releaseFirstScan) releaseFirstScan();
+            if (holders.has(key) && holders.get(key) !== id) {
+              await new Promise<void>(resolve => {
+                const queued = waiters.get(key) || [];
+                queued.push(resolve);
+                waiters.set(key, queued);
+              });
+            }
+            holders.set(key, id);
+            return { rows: [{ locked: true }] };
+          }
+          return fakeVocabQuery(state, text, params);
+        },
+        release: () => undefined,
+      };
+      clients.push({ id, statements, release: () => undefined });
+      return client;
+    },
+  };
+  const [first, second] = await Promise.all([
+    defaultReconcileExtractedTerm('Germany', 'BTC', 'instrument', 'ch-A', pool as never),
+    defaultReconcileExtractedTerm('Germany', 'btc', 'instrument', 'ch-B', pool as never),
+  ]);
+  assert.equal(state.vocab.length, 1);
+  assert.ok(['BTC', 'btc'].includes(state.vocab[0].term));
+  const row = state.vocab[0];
+  assert.equal(row.occurrences, 1);
+  assert.equal(row.validation_count, 2);
+  assert.ok(state.links.some(link => link.termId === row.id && link.channelId === 'ch-A'));
+  assert.ok(state.links.some(link => link.termId === row.id && link.channelId === 'ch-B'));
+  assert.ok(first.linkInserted && second.linkInserted);
+  // Both repairs serialized on the SAME normalized lock key.
+  const lockKeys = clients.flatMap(client =>
+    client.statements.filter(text => text.includes('pg_advisory_xact_lock'))
+  );
+  assert.equal(lockKeys.length, 2);
+});
+
 test('concurrent repairs from two channels keep one row with both links', async () => {
   const state = createFakeVocabDb();
   state.channels.add('ch-A');
