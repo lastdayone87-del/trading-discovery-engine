@@ -19,6 +19,7 @@ import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQ
 import { selectQueryCollection, isSeverelyContaminatedQuery, type QueryFunnelMetrics } from './queryPerformance';
 import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCandidate, detectSpamSignals, findLiteralSpan, getPlannerTerminology, normalizeTerm, observeTerminology, observeTerminologyDetailed, KNOWN_INSTRUMENT_TERMS, type LiteralSourceText, type LiteralSpanMatch, type NativeAdmissionRejectReason, type NoveltyBaseline, type TerminologyObservationResult } from './terminologyIntelligence';
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
+import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -360,12 +361,16 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
   const clean = term.trim();
   if (!clean) return { rowInserted: false, linkInserted: false };
   const normalized = normalizeTermForReconcile(clean);
+  // Same write-boundary identity as saveExtractedTerm and the observation
+  // layer: country aliases collapse to canonical so rows, locks, links, and
+  // occurrence reconciliation never split by spelling.
+  const countryCanon = canonicalCountry(country);
   const poolLike = 'connect' in (db as object) && typeof (db as { connect?: unknown }).connect === 'function' ? (db as unknown as import('pg').Pool) : null;
   const client = poolLike ? await poolLike.connect() : null;
   const runner = (client ?? db) as unknown as { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }> };
   try {
     if (client) await runner.query('BEGIN');
-    await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`extracted-vocab:${country}:${normalized}`]);
+    await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`extracted-vocab:${countryCanon}:${normalized}`]);
     // Country-wide scan with in-code normalized comparison: SQL lower()
     // cannot express NFKC/whitespace canonicalization, so a lower() prefilter
     // would miss equivalent rows ('order  flow' vs 'order flow') and split
@@ -373,7 +378,7 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
     // is rare, so the scan cost is bounded and correctness comes first.
     const existing = await runner.query(
       `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY id ASC`,
-      [country]
+      [countryCanon]
     );
     let rowId: number | null = null;
     let rowInserted = false;
@@ -386,7 +391,7 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
     if (rowId === null) {
       const inserted = await runner.query(
         `INSERT INTO extracted_trading_vocabulary(country,term,category,source_channel_id,occurrences,first_extracted,last_extracted,trust_tier,validation_count) VALUES($1,$2,$3,$4,0,now(),now(),3,0) ON CONFLICT(country,term) DO NOTHING RETURNING id`,
-        [country, clean, category, sourceChannelId || null]
+        [countryCanon, clean, category, sourceChannelId || null]
       );
       if (inserted.rows?.[0]?.id !== undefined && inserted.rows?.[0]?.id !== null) {
         rowId = Number(inserted.rows[0].id);
@@ -394,7 +399,7 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
       } else {
         const reread = await runner.query(
           `SELECT id, term FROM extracted_trading_vocabulary WHERE country=$1 ORDER BY id ASC`,
-          [country]
+          [countryCanon]
         );
         for (const row of reread.rows || []) {
           if (normalizeTermForReconcile(String(row.term)) === normalized) {
@@ -420,7 +425,7 @@ export async function defaultReconcileExtractedTerm(country: string, term: strin
       // count no matter how many repairs race or retry.
       await runner.query(
         `UPDATE extracted_trading_vocabulary v SET occurrences=s.n FROM (SELECT COUNT(*)::int n FROM terminology_observations o JOIN canonical_trading_terms t ON t.id=o.canonical_term_id WHERE t.country=$2 AND t.normalized_term=$3) s WHERE v.id=$1 AND EXISTS(SELECT 1 FROM canonical_trading_terms t WHERE t.country=$2 AND t.normalized_term=$3)`,
-        [rowId, country, normalized]
+        [rowId, countryCanon, normalized]
       );
     }
     if (client) await runner.query('COMMIT');

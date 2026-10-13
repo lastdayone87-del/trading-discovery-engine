@@ -1616,6 +1616,37 @@ test('failed saveTerm is repaired on retry with the exact observation count', as
   assert.equal(state.vocab[0].occurrences, 1);
 });
 
+// Country-alias write-boundary identity: the observation layer stores alias
+// countries under canonical identity (canonicalCountry('US') ===
+// 'United States'), so the vocabulary writers must use the same identity.
+// Otherwise the save lands under the raw alias, the occurrence recompute
+// EXISTS misses the canonical term rows, and the count freezes at the
+// insert/increment value instead of converging to committed evidence.
+test('alias country saves reconcile against canonical observations', async () => {
+  const state = createFakeVocabDb();
+  state.channels.add('ch-alias');
+  // Durable observation-side state for a channel carrying country 'US'.
+  state.canonical.set('United States|alias probe', 100);
+  state.observations.push(100, 100);
+  await saveExtractedTerm('US', 'Alias Probe', 'terminology', 'ch-alias', fakeVocabRunner(state));
+  const row = vocabRow(state, 'United States', 'Alias Probe');
+  assert.ok(row, 'alias save lands under the canonical country');
+  assert.equal(row.occurrences, 2);
+  assert.ok(!state.vocab.some(entry => (entry as unknown as { country?: string }).country === 'US'), 'no alias-split row');
+});
+
+test('alias country repairs reconcile against canonical observations', async () => {
+  const state = createFakeVocabDb();
+  state.channels.add('ch-alias');
+  state.canonical.set('United States|alias probe', 100);
+  state.observations.push(100, 100);
+  const outcome = await defaultReconcileExtractedTerm('US', 'Alias Probe', 'terminology', 'ch-alias', fakeVocabRunner(state));
+  assert.deepEqual([outcome.rowInserted, outcome.linkInserted], [true, true]);
+  const row = vocabRow(state, 'United States', 'Alias Probe');
+  assert.ok(row, 'alias repair lands under the canonical country');
+  assert.equal(row.occurrences, 2);
+});
+
 // C2/S2: row existence alone never proves completeness — the link and the
 // derived counters are reconciled on every replay, even when the row exists.
 test('replay reconciles missing links and counters on existing rows', async () => {
