@@ -121,9 +121,11 @@ async function main() {
   });
   await Promise.all(racers);
 
-  // RUN-bound LIKE: only this run's spellings match (prior runs used other ids).
+  // RUN-bound ILIKE: only this run's spellings match (prior runs used other
+  // ids), case-insensitively — the winning surface form may be the uppercased
+  // spelling while RUN hex contains a-f (case-sensitive LIKE would miss it).
   const rows = await db.query(
-    `SELECT country,term,occurrences FROM extracted_trading_vocabulary WHERE term LIKE $1`, [`%${RUN}%`]
+    `SELECT country,term,occurrences FROM extracted_trading_vocabulary WHERE term ILIKE $1`, [`%${RUN}%`]
   );
   check('exactly one vocabulary row across equivalent spellings', rows.rows.length === 1, rows.rows);
   check('row under canonical country', rows.rows[0]?.country === COUNTRY_CANON, rows.rows[0]);
