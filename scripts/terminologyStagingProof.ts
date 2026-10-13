@@ -61,16 +61,23 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
   const probe = new pg.Pool({ connectionString, ssl: verdict.ssl, connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
-  let ok = false;
+  let tokenMatches = false;
+  let probeError: unknown = null;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
-    ok = (marker.rows[0] as Record<string, unknown> | undefined)?.token === expectedToken;
-  } catch {
-    ok = false;
+    tokenMatches = (marker.rows[0] as Record<string, unknown> | undefined)?.token === expectedToken;
+  } catch (error) {
+    probeError = error;
   } finally {
     await probe.end().catch(() => undefined);
   }
-  if (!ok) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
+  // Distinguish a failed probe (connectivity — fail closed) from a wrong
+  // identity so a dead tunnel is never misreported as a token mismatch.
+  if (probeError !== null) {
+    const detail = probeError instanceof Error ? `${probeError.name}: ${probeError.message}` : String(probeError);
+    throw new Error(`Refusing to run: staging probe failed (${detail}) — verify the tunnel and staging database instead of retrying blindly.`);
+  }
+  if (!tokenMatches) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
   return verdict.ssl;
 }
 
