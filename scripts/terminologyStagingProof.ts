@@ -7,8 +7,20 @@
  * functions against live PostgreSQL and asserts persisted evidence.
  *
  * Run: STAGING_OK=true DATABASE_URL=<staging> npx tsx scripts/terminologyStagingProof.ts
+ *
+ * Provisioning (once per staging database, before first run):
+ *   npx tsx scripts/runMigrations.ts   (DATABASE_URL pointed at staging)
+ *   CREATE TABLE staging_proof_marker(note text PRIMARY KEY);
+ *   INSERT INTO staging_proof_marker(note) VALUES('terminology-e2e-staging');
+ *
+ * Non-coverage note: this proof exercises duplicate-observation suppression
+ * (Leg 2), not removal of rule-admitted instruments from overlapping AI
+ * candidates. That extraction-to-admission handoff has no automated coverage
+ * (the extractor offers no AI seam), so it is tracked as a separate
+ * unverified requirement and is not proven here.
  */
 import { randomUUID } from 'node:crypto';
+import pg from 'pg';
 import { getDb } from '../server/db';
 import {
   attributeTerminologyPerformance,
@@ -20,9 +32,35 @@ import { saveExtractedTerm, getExtractedVocabulary } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
 import type { QueryRecord } from '../src/types';
 
-if (process.env.STAGING_OK !== 'true' || !process.env.DATABASE_URL) {
-  console.error('Refusing to run: set STAGING_OK=true and DATABASE_URL=<staging postgres> (never production).');
-  process.exit(2);
+function stagingSsl() {
+  // Identical to the application pool (server/dbCore.ts getDb): PGSSL=disable
+  // forces plaintext for tunnel-local staging; production negotiates TLS.
+  return process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined;
+}
+
+function targetConnectionString(): string {
+  if (process.env.STAGING_OK !== 'true' || !process.env.DATABASE_URL) {
+    throw new Error('Refusing to run: set STAGING_OK=true and DATABASE_URL=<staging postgres> (never production).');
+  }
+  return process.env.DATABASE_URL;
+}
+
+// Target verification BEFORE any initializing connection: getDb() runs
+// migrations and seedDefaults() (both write), so the staging marker is
+// checked here through a one-shot non-initializing pool. Any failure
+// (including a missing marker table) refuses to run — fail closed.
+async function verifyStagingTarget(connectionString: string): Promise<void> {
+  const probe = new pg.Pool({ connectionString, ssl: stagingSsl() });
+  let ok = false;
+  try {
+    const marker = await probe.query(`SELECT note FROM staging_proof_marker LIMIT 1`);
+    ok = (marker.rows[0] as Record<string, unknown> | undefined)?.note === 'terminology-e2e-staging';
+  } catch {
+    ok = false;
+  } finally {
+    await probe.end().catch(() => undefined);
+  }
+  if (!ok) throw new Error('Refusing to run: target is not the provisioned staging database (marker check failed) — never production.');
 }
 
 const COUNTRY = 'Germany';
@@ -30,7 +68,10 @@ const ALIAS_COUNTRY = 'US';
 const PHRASE = `e2e probe ${randomUUID().slice(0, 8)}`;
 const DEMOTE_PHRASE = `e2e demote probe ${randomUUID().slice(0, 8)}`;
 const ALIAS_PHRASE = `e2e alias probe ${randomUUID().slice(0, 8)}`;
-const CHANNELS = ['e2e-ch-1', 'e2e-ch-2', 'e2e-ch-3'];
+const RUN = randomUUID().slice(0, 8);
+// Unique fixture IDs per run: no existing record is ever modified, and reruns
+// never collide with prior fixtures on a reused staging database.
+const CHANNELS = [1, 2, 3].map(i => `e2e-${RUN}-ch-${i}`);
 
 function funnel(overrides: Record<string, number>): Record<string, number> {
   return {
@@ -41,10 +82,13 @@ function funnel(overrides: Record<string, number>): Record<string, number> {
   };
 }
 
-let failures = 0;
+let passed = 0;
+// Fail fast: a failed leg throws, so dependent legs never run and no
+// cascading writes follow a broken prerequisite.
 function check(name: string, cond: boolean, evidence: unknown) {
-  console.log(`${cond ? 'PASS' : 'FAIL'} ${name} ${JSON.stringify(evidence)}`);
-  if (!cond) failures += 1;
+  if (!cond) throw new Error(`LEG FAILED: ${name} ${JSON.stringify(evidence)}`);
+  passed += 1;
+  console.log(`PASS ${name} ${JSON.stringify(evidence)}`);
 }
 
 function evidenceFor(channelId: string, videoId: string, phrase: string) {
@@ -57,18 +101,17 @@ function evidenceFor(channelId: string, videoId: string, phrase: string) {
 }
 
 async function main() {
-  const db = await getDb();
-  const marker = await db.query(`SELECT note FROM staging_proof_marker LIMIT 1`).catch(() => ({ rows: [] as unknown[] }));
-  if ((marker.rows[0] as Record<string, unknown> | undefined)?.note !== 'terminology-e2e-staging') {
-    console.error('Refusing to run: staging marker table/row absent — point DATABASE_URL at the provisioned staging database, never production.');
-    process.exit(2);
-  }
+  targetConnectionString();
+  await verifyStagingTarget(process.env.DATABASE_URL!);
+  const pool = await getDb();
+  const db = pool;
+  try {
   // Fixture creators: confirmed traders eligible for links, retry and trial.
   for (const channelId of CHANNELS) {
     await db.query(
       `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
        VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','e2e-proof',now(),90,'TRADING_CONFIRMED')
-       ON CONFLICT(channel_id) DO UPDATE SET trading_status='TRADING_CONFIRMED',quality_score=90,country_status='CONFIRMED'`,
+       ON CONFLICT(channel_id) DO NOTHING`,
       [channelId, `https://youtube.com/channel/${channelId}`, COUNTRY]
     );
   }
@@ -175,8 +218,13 @@ async function main() {
   const aliasEntry = viaAlias.find(entry => entry.term === ALIAS_PHRASE);
   check('alias read finds canonical row with count 1', aliasEntry?.country === 'United States' && aliasEntry?.occurrences === 1, aliasEntry ?? null);
 
-  console.log(failures === 0 ? 'E2E PROOF COMPLETE' : `E2E PROOF FAILED (${failures} legs)`);
-  process.exit(failures === 0 ? 0 : 1);
+  console.log(`E2E PROOF COMPLETE (${passed} legs)`);
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
 }
 
-main().catch(error => { console.error('E2E PROOF ERROR', error); process.exit(1); });
+main().then(
+  () => { process.exitCode = 0; },
+  error => { console.error('E2E PROOF ERROR', error); process.exitCode = 1; }
+);

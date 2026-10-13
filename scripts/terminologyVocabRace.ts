@@ -18,37 +18,69 @@ import { observeTerminologyDetailed } from '../server/terminologyIntelligence';
 import { saveExtractedTerm } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
 
-const connectionString = process.env.PHASE10_POSTGRES_URL || process.env.DATABASE_URL;
-if (process.env.STAGING_OK !== 'true' || !connectionString) {
-  console.error('Refusing to run: set STAGING_OK=true and PHASE10_POSTGRES_URL (or DATABASE_URL) to a writable staging database.');
-  process.exit(2);
+function stagingSsl() {
+  // Identical to the application pool (server/dbCore.ts getDb): PGSSL=disable
+  // forces plaintext for tunnel-local staging; production negotiates TLS.
+  return process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined;
+}
+
+function targetConnectionString(): string {
+  const connectionString = process.env.PHASE10_POSTGRES_URL || process.env.DATABASE_URL;
+  if (process.env.STAGING_OK !== 'true' || !connectionString) {
+    throw new Error('Refusing to run: set STAGING_OK=true and PHASE10_POSTGRES_URL (or DATABASE_URL) to a writable staging database (never production).');
+  }
+  return connectionString;
+}
+
+// Target verification BEFORE any initializing connection: getDb() runs
+// migrations and seedDefaults() (both write), so the staging marker is
+// checked here through a one-shot non-initializing pool. Fail closed.
+async function verifyStagingTarget(connectionString: string): Promise<void> {
+  const probe = new pg.Pool({ connectionString, ssl: stagingSsl() });
+  let ok = false;
+  try {
+    const marker = await probe.query(`SELECT note FROM staging_proof_marker LIMIT 1`);
+    ok = (marker.rows[0] as Record<string, unknown> | undefined)?.note === 'terminology-e2e-staging';
+  } catch {
+    ok = false;
+  } finally {
+    await probe.end().catch(() => undefined);
+  }
+  if (!ok) throw new Error('Refusing to run: target is not the provisioned staging database (marker check failed) — never production.');
 }
 
 const COUNTRY_ALIAS = 'US';
 const COUNTRY_CANON = 'United States';
-const TERM = `race probe ${randomUUID().slice(0, 8)}`;
-const CHANNELS = ['race-ch-1', 'race-ch-2', 'race-ch-3', 'race-ch-4'];
+const RUN = randomUUID().slice(0, 8);
+const TERM = `race probe ${RUN}`;
+// Equivalent spellings, one canonical identity: racers must collapse to a
+// single vocabulary row no matter which surface form wins the insert race.
+// Unique fixture IDs per run: no existing record is ever modified.
+const SPELLINGS = [TERM, TERM.toUpperCase(), TERM.replace(/ /g, '  '), ` ${TERM} `];
+const CHANNELS = [1, 2, 3, 4].map(i => `race-${RUN}-ch-${i}`);
 const OBS_PER_CHANNEL = 1;
 
-let failures = 0;
+let passed = 0;
+// Fail fast: a failed check throws, so no further writes follow a break.
 function check(name: string, cond: boolean, evidence: unknown) {
-  console.log(`${cond ? 'PASS' : 'FAIL'} ${name} ${JSON.stringify(evidence)}`);
-  if (!cond) failures += 1;
+  if (!cond) throw new Error(`CHECK FAILED: ${name} ${JSON.stringify(evidence)}`);
+  passed += 1;
+  console.log(`PASS ${name} ${JSON.stringify(evidence)}`);
 }
 
 async function main() {
+  const connectionString = targetConnectionString();
+  await verifyStagingTarget(connectionString);
   process.env.DATABASE_URL = connectionString!;
-  const db = await getDb();
-  const marker = await db.query(`SELECT note FROM staging_proof_marker LIMIT 1`).catch(() => ({ rows: [] as unknown[] }));
-  if ((marker.rows[0] as Record<string, unknown> | undefined)?.note !== 'terminology-e2e-staging') {
-    console.error('Refusing to run: staging marker table/row absent — point DATABASE_URL at the provisioned staging database, never production.');
-    process.exit(2);
-  }
+  const dbPool = await getDb();
+  const db = dbPool;
+  const pools = [new pg.Pool({ connectionString, ssl: stagingSsl() }), new pg.Pool({ connectionString, ssl: stagingSsl() })];
+  try {
   for (const channelId of CHANNELS) {
     await db.query(
       `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
        VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','vocab-race',now(),90,'TRADING_CONFIRMED')
-       ON CONFLICT(channel_id) DO UPDATE SET trading_status='TRADING_CONFIRMED',quality_score=90`,
+       ON CONFLICT(channel_id) DO NOTHING`,
       [channelId, `https://youtube.com/channel/${channelId}`, COUNTRY_CANON]
     );
   }
@@ -75,29 +107,36 @@ async function main() {
   check('race preconditions committed', expectedCount === CHANNELS.length * OBS_PER_CHANNEL, { expectedCount });
 
   // Genuine overlap: separate pools so advisory-lock blocking is real.
-  const pools = [new pg.Pool({ connectionString }), new pg.Pool({ connectionString })];
   const racers: Array<Promise<unknown>> = [];
   CHANNELS.forEach((channelId, i) => {
     // Pass each pool directly: the writers detect the Pool, pin lock, reads
     // and writes to one transaction-bound client, and hold the advisory lock
-    // across the critical section — the serialization under test.
+    // across the critical section — the serialization under test. Spellings
+    // rotate so concurrently arriving surface forms must still converge.
     const runner = pools[i % pools.length];
-    racers.push(saveExtractedTerm(COUNTRY_ALIAS, TERM, 'terminology', channelId, runner as never));
-    racers.push(saveExtractedTerm(COUNTRY_ALIAS, TERM, 'terminology', channelId, runner as never));
-    racers.push(defaultReconcileExtractedTerm(COUNTRY_ALIAS, TERM, 'terminology', channelId, runner as never));
+    const spelling = SPELLINGS[i % SPELLINGS.length];
+    racers.push(saveExtractedTerm(COUNTRY_ALIAS, spelling, 'terminology', channelId, runner as never));
+    racers.push(saveExtractedTerm(COUNTRY_ALIAS, SPELLINGS[(i + 1) % SPELLINGS.length], 'terminology', channelId, runner as never));
+    racers.push(defaultReconcileExtractedTerm(COUNTRY_ALIAS, SPELLINGS[(i + 2) % SPELLINGS.length], 'terminology', channelId, runner as never));
   });
   await Promise.all(racers);
-  await Promise.all(pools.map(pool => pool.end()));
 
+  // RUN-bound LIKE: only this run's spellings match (prior runs used other ids).
   const rows = await db.query(
-    `SELECT country,term,occurrences FROM extracted_trading_vocabulary WHERE term=$1`, [TERM]
+    `SELECT country,term,occurrences FROM extracted_trading_vocabulary WHERE term LIKE $1`, [`%${RUN}%`]
   );
-  check('exactly one vocabulary row', rows.rows.length === 1, rows.rows);
+  check('exactly one vocabulary row across equivalent spellings', rows.rows.length === 1, rows.rows);
   check('row under canonical country', rows.rows[0]?.country === COUNTRY_CANON, rows.rows[0]);
   check('occurrences converged to committed evidence', Number(rows.rows[0]?.occurrences) === expectedCount, { got: rows.rows[0]?.occurrences, expectedCount });
 
-  console.log(failures === 0 ? 'VOCAB RACE COMPLETE' : `VOCAB RACE FAILED (${failures} checks)`);
-  process.exit(failures === 0 ? 0 : 1);
+  console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
+  } finally {
+    await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
+    await dbPool.end().catch(() => undefined);
+  }
 }
 
-main().catch(error => { console.error('VOCAB RACE ERROR', error); process.exit(1); });
+main().then(
+  () => { process.exitCode = 0; },
+  error => { console.error('VOCAB RACE ERROR', error); process.exitCode = 1; }
+);
