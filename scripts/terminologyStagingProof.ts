@@ -31,6 +31,15 @@ const PHRASE = `e2e probe ${randomUUID().slice(0, 8)}`;
 const ALIAS_PHRASE = `e2e alias probe ${randomUUID().slice(0, 8)}`;
 const CHANNELS = ['e2e-ch-1', 'e2e-ch-2', 'e2e-ch-3'];
 
+function funnel(overrides: Record<string, number>): Record<string, number> {
+  return {
+    rawResults: 0, distinctResults: 0, duplicateResults: 0, knownChannels: 0, newChannels: 0,
+    countryRejected: 0, nonTrading: 0, uncertain: 0, needsReview: 0, tradingConfirmed: 0,
+    qualityChannels: 0, communitiesDiscovered: 0, averageQualityScore: 0, noveltyRatio: 0,
+    countryPrecision: 0, tradingPrecision: 0, performanceScore: 0, ...overrides,
+  };
+}
+
 let failures = 0;
 function check(name: string, cond: boolean, evidence: unknown) {
   console.log(`${cond ? 'PASS' : 'FAIL'} ${name} ${JSON.stringify(evidence)}`);
@@ -103,8 +112,9 @@ async function main() {
 
   // Leg 4: attribution + promotion + planner surfacing.
   const query = { generation_metadata: { learnedTerm: PHRASE }, country: COUNTRY } as unknown as QueryRecord;
+  const goodRun = funnel({ rawResults: 20, distinctResults: 12, knownChannels: 2, newChannels: 10, tradingConfirmed: 10, qualityChannels: 8, communitiesDiscovered: 2, averageQualityScore: 80, noveltyRatio: 0.8, countryPrecision: 1, tradingPrecision: 0.9, performanceScore: 85 });
   for (let i = 0; i < 3; i++) {
-    await attributeTerminologyPerformance(query, { rawResults: 20, distinctResults: 12, duplicateResults: 0, knownChannels: 2, newChannels: 10 }, 500);
+    await attributeTerminologyPerformance(query, goodRun as never, 500);
   }
   const promoted = await db.query(`SELECT lifecycle_status FROM canonical_trading_terms WHERE id=$1`, [termId]);
   check('term promotes to PROVEN_SEARCH_TERM', promoted.rows[0]?.lifecycle_status === 'PROVEN_SEARCH_TERM', promoted.rows[0]);
@@ -112,8 +122,9 @@ async function main() {
   check('planner surfaces the proven term', plannerTerms.some(entry => entry.id === termId), { count: plannerTerms.length });
 
   // Leg 5: demotion on sustained poor yield (history retained).
+  const poorRun = funnel({ rawResults: 10, distinctResults: 10, knownChannels: 10, nonTrading: 8, uncertain: 2, averageQualityScore: 20, countryPrecision: 0.5, performanceScore: 5 });
   for (let i = 0; i < 6; i++) {
-    await attributeTerminologyPerformance(query, { rawResults: 10, distinctResults: 10, duplicateResults: 0, knownChannels: 10, newChannels: 0 }, 1000);
+    await attributeTerminologyPerformance(query, poorRun as never, 1000);
   }
   const demoted = await db.query(`SELECT lifecycle_status,search_eligible FROM canonical_trading_terms WHERE id=$1`, [termId]);
   check('term demotes and loses eligibility', demoted.rows[0]?.lifecycle_status === 'DEMOTED' && demoted.rows[0]?.search_eligible === false, demoted.rows[0]);
