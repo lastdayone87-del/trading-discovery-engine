@@ -387,6 +387,19 @@ test('baseline loader throws on lookup failure but resolves unknown rows', async
   assert.equal((caught as { cause?: unknown }).cause, timeout);
   assert.equal((caught as { code?: unknown }).code, 'ETIMEDOUT');
   assert.equal(isRetryableInfrastructureFailure(caught), true);
+  // A later transient failure is not hidden by an earlier non-retryable one.
+  const fatal = Object.assign(new Error('forbidden'), { code: 'FORBIDDEN' });
+  const transient = Object.assign(new Error('reset'), { code: 'ECONNRESET' });
+  const mixed = await loadNoveltyBaseline('Germany', {
+    getVocabularies: async () => { throw fatal; },
+    getExtracted: async () => { throw transient; },
+  }).then(
+    () => { throw new Error('should have thrown'); },
+    (error: unknown) => error
+  );
+  assert.match(String((mixed as Error).message), /curated-vocabulary: forbidden; extracted-vocabulary: reset/);
+  assert.equal((mixed as { code?: unknown }).code, 'ECONNRESET');
+  assert.equal(isRetryableInfrastructureFailure(mixed), true);
   // Successful lookup with no country row: unknown baseline, no throw.
   const missing = await loadNoveltyBaseline('Germany', {
     getVocabularies: async () => [],

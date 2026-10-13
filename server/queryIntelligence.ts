@@ -11,7 +11,8 @@ import {
   getExtractedVocabulary,
   getChannelById,
   upsertChannel,
-  getAppSetting
+  getAppSetting,
+  isRetryableInfrastructureFailure
 } from './db';
 import { assertCountryAllowed } from './countryExclusion';
 import { limitRepeatedPrimaryTerms, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, queriesOutsideCooldown, rotateAwayFromMostRecentIntent, reformulatePollutedQuery } from './queryPlanner';
@@ -546,16 +547,31 @@ export async function loadNoveltyBaseline(
     // isRetryableInfrastructureFailure classifies this as infrastructure
     // (retry-policy path) rather than an ordinary failure that burns
     // max_attempts, and logs identify which lookup failed and why.
-    const first = (failures[0]?.error ?? {}) as Record<string, unknown>;
+    // Retryability comes from ANY failure, judged by the same classifier the
+    // job system uses: a later ETIMEDOUT must not hide behind an earlier
+    // non-retryable error (or vice versa) — when any lookup failed
+    // transiently, the job should use the retry policy rather than burning
+    // max_attempts or silently dropping candidates.
+    const retryableFirst = failures.find(failure => isRetryableInfrastructureFailure(failure.error));
+    const primary = ((retryableFirst ?? failures[0])?.error ?? {}) as Record<string, unknown>;
     const thrown = new Error(
       `[Vocabulary Extraction] novelty baseline lookups failed for country ${country} ` +
       `(${failures.map(failure => `${failure.lookup}: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`).join('; ')})`
     ) as Error & Record<string, unknown>;
-    thrown.cause = failures[0]?.error;
-    if (typeof first.name === 'string' && first.name) thrown.name = first.name;
-    for (const key of ['code', 'status', 'statusCode', 'retryable', 'errorClass', 'retryAt', 'retryAfterMs', 'providerReasons']) {
-      if (thrown[key] === undefined && first[key] !== undefined) thrown[key] = first[key];
+    thrown.cause = (retryableFirst ?? failures[0])?.error;
+    if (typeof primary.name === 'string' && primary.name) thrown.name = primary.name;
+    for (const key of ['code', 'status', 'statusCode', 'retryable', 'errorClass', 'retryAt', 'retryAfterMs']) {
+      if (thrown[key] === undefined && primary[key] !== undefined) thrown[key] = primary[key];
     }
+    thrown.providerReasons = [
+      ...new Set(
+        failures.flatMap(failure =>
+          Array.isArray((failure.error as Record<string, unknown> | null)?.providerReasons)
+            ? ((failure.error as Record<string, unknown>).providerReasons as unknown[])
+            : []
+        ).map(String)
+      ),
+    ];
     throw thrown;
   }
   return buildNoveltyBaseline({ country, vocab, vocabOk, existingTerms, existingOk });
