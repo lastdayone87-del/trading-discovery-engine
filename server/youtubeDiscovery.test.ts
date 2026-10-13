@@ -16,11 +16,26 @@ test('video lane extracts unique channels and retains matching video evidence', 
   assert.deepEqual(results[0].matchedDocument, {type:'VIDEO',providerNativeId:'v1',title:'DAX setup',description:'first',publishedAt:undefined,locator:'youtube:video:v1'});
 });
 
+test('video lane keeps per-title IDs with descriptions', () => {
+  const results = extractDiscoveredChannels([
+    { id: { videoId: 'v1' }, snippet: { channelId: 'creator-1', channelTitle: 'Trader', title: 'DAX setup', description: 'first' } },
+    { id: { videoId: 'v2' }, snippet: { channelId: 'creator-1', channelTitle: 'Trader', title: 'DAX analysis', description: 'second' } }
+  ], 'VIDEO', 'dax analyse');
+  assert.equal(results.length, 1);
+  assert.deepEqual(results[0].videos, [
+    { id: 'v1', title: 'DAX setup', description: 'first' },
+    { id: 'v2', title: 'DAX analysis', description: 'second' },
+  ]);
+});
+
 test('channel lane preserves direct channel discovery behavior', () => {
   const results = extractDiscoveredChannels([
     { id: { channelId: 'creator-1' }, snippet: { title: 'Direct Trader', description: 'education' } }
   ], 'CHANNEL', 'trading education');
   assert.equal(results[0].channelId, 'creator-1');
-  assert.deepEqual(results[0].videoTitles, ['trading education']);
+  // The search query is not a video title and must never carry VIDEO_TITLE
+  // provenance downstream; retrieval context lives on matchedDocument.
+  assert.deepEqual(results[0].videoTitles, []);
   assert.equal(results[0].description, 'education');
+  assert.deepEqual(results[0].matchedDocument, {type:'CHANNEL',providerNativeId:'creator-1',title:'Direct Trader',description:'education',locator:'youtube:channel:creator-1'});
 });

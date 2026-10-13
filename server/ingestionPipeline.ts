@@ -14,7 +14,7 @@ import {
   getQuota,
   getAppSetting
 } from './db';
-import { calculateCreatorQualityScore, extractVocabularyFromCreator } from './queryIntelligence';
+import { calculateCreatorQualityScore, extractVocabularyFromCreator, invokeChannelVocabularyExtraction, replayVocabularyForRetry, resolveExtractionVideoIds } from './queryIntelligence';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { enqueueTermHarvest } from './candidateCorpus';
 import { resolveUncertainLifecycle } from './enrichmentLifecycle';
@@ -108,7 +108,8 @@ export async function processChannelThroughPipeline(
   targetCountry: string,
   source: DiscoverySource,
   isManualScan: boolean = false,
-  isEnrichmentPass: boolean = false
+  isEnrichmentPass: boolean = false,
+  options?: { forceExtraction?: boolean }
 ): Promise<IngestionPipelineOutcome> {
   const now = new Date().toISOString();
   if (await getAppSetting('decision_evaluation_sampling_enabled', 'false') === 'true') {
@@ -181,6 +182,10 @@ export async function processChannelThroughPipeline(
       console.log(
         `[Unified Ingestion Pipeline] Channel '${candidate.channelName}' (${candidate.channelId}) is already in database (Country: ${existing.country_status}, Trading: ${existing.trading_status}, Scan: ${existing.scan_status}). Preserving existing record.`
       );
+      // Retry repair (see replayVocabularyForRetry): a retried job replays
+      // vocabulary extraction so a save that failed after its observation
+      // committed cannot strand missing rows behind this early return.
+      await replayVocabularyForRetry(existing, candidate, source, options?.forceExtraction ?? false);
       // Update basic existing metadata if changed
       let updated = false;
       if (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count) {
@@ -766,7 +771,9 @@ export async function processChannelThroughPipeline(
   // discoveries are persisted, but must not train autonomous terminology until
   // an explicit human approval supplies independent provenance.
   if (qualityResult.score >= 55 && source !== 'manual_search') {
-    await extractVocabularyFromCreator(finalChannel, candidate.videoTitles, candidate.description, false, selectExplicitTerminologyLanguageContext(candidate));
+    // Provenance: align YouTube video IDs to titles (null where unknown)
+    // so title-backed terminology observations trace to their source video.
+    await invokeChannelVocabularyExtraction(finalChannel, candidate, selectExplicitTerminologyLanguageContext(candidate));
     await enqueueTermHarvest({channelId:finalChannel.channel_id,text:[candidate.description,...candidate.videoTitles].filter(Boolean).join('\n'),lineage:'AUTONOMOUS'});
   }
 

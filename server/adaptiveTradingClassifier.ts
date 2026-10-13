@@ -38,7 +38,10 @@ export function classifyAdaptiveShadow(input:RawChannelInput,production:Verifica
   const governedFields=corroborated.flatMap(term=>[
     ...(textMatchesTerm(input.channel_name,term.literal)?[{field:'channel_title' as const}]:[]),
     ...(textMatchesTerm(input.description||'',term.literal)?[{field:'channel_bio' as const}]:[]),
-    ...(input.videos||[]).flatMap((video,index)=>textMatchesTerm(`${video.title} ${video.description||''}`,term.literal)?[{field:'video_title' as const,index,sourceId:video.id,publishedAt:video.published_at}]:[])
+    ...(input.videos||[]).flatMap((video,index)=>[
+      ...(textMatchesTerm(video.title||'',term.literal)?[{field:'video_title' as const,index,sourceId:video.id,publishedAt:video.published_at}]:[]),
+      ...(video.description&&textMatchesTerm(video.description,term.literal)?[{field:'video_description' as const,index,sourceId:video.id,publishedAt:video.published_at}]:[]),
+    ])
   ]);
   if(corroborated.length)evidence.push({id:`adaptive:${sum(corroborated.map(t=>t.surfaceId)).slice(0,16)}`,source:'adaptive_catalog',polarity:'POSITIVE',category:'METHODOLOGY_CONCEPT',fact:`Governed adaptive catalog matched ${corroborated.length} corroborated concepts.`,rawMatches:corroborated.map(t=>t.literal),confidence:80,reliability:'MEDIUM',reliabilityMultiplier:.65,rawWeight:Math.min(12,corroborated.length*4),finalWeight:Math.min(12,corroborated.length*4)*.65*.8,provenance:{provider:'adaptive_catalog',type:'GOVERNED_CONCEPT',matchedTerm:corroborated.map(t=>t.literal).join(', '),sourceRef:'Approved terminology/concept snapshot',fields:governedFields},timestamp:now});
   const graphMatches=corroborated.filter(t=>graphConceptIds.has(t.conceptId));

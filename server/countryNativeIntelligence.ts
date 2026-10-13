@@ -120,7 +120,24 @@ export function computeObservationKey(params: {
   const normStatus = (params.nativeEvidenceStatus || 'none').trim().toUpperCase();
   const normFamily = (params.sourceProvenanceFamily || 'none').trim().toUpperCase();
 
-  const checksum = computeEvidenceChecksum(params.evidence);
+  // Novelty-derived fields (novel/knownAs/generic) describe the classification
+  // at observation time, not the source: re-extraction after the term is saved
+  // flips them (novel true->false) and must reuse the original observation key
+  // instead of inserting a duplicate observation that inflates evidence.
+  const { novel: _novel, knownAs: _knownAs, generic: _generic, ...stableEvidence } =
+    (params.evidence || {}) as Record<string, unknown>;
+  // Positional source index is not source identity: the same video (or the
+  // same title text) at another list position must reuse its key instead of
+  // inserting a duplicate observation. Genuine distinctions are preserved via
+  // source kind, exact span text, and video ID, all of which remain in the
+  // checksum. (One-time effect: rows recorded with index-bearing keys
+  // re-observe once after deploy, then stay stable.)
+  const sourceRef = (stableEvidence.sourceRef || {}) as Record<string, unknown>;
+  if (sourceRef.index !== undefined) {
+    const { index: _droppedIndex, ...stableRef } = sourceRef;
+    stableEvidence.sourceRef = stableRef;
+  }
+  const checksum = computeEvidenceChecksum(stableEvidence);
   const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();
 
   const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}|${evidenceId}`;

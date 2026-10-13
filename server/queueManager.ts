@@ -53,7 +53,7 @@ import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
 import './youtubeInnertubeProvider';
-import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator } from './queryIntelligence';
+import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, replayVocabularyForRetry } from './queryIntelligence';
 import { calculateQueryFunnel, type FunnelOutcome, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting } from './ingestionPipeline';
@@ -658,7 +658,10 @@ export async function processNextSearchJob(
         refreshed.quality_score=quality.score; refreshed.quality_breakdown=quality.breakdown;
         await upsertChannel(refreshed);
         if(quality.score>=55) {
-          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true,result.languageContext);
+          // Provenance: titles here are the channel name (already a CHANNEL_NAME
+          // source) and the description is inspection-trail prose — neither is
+          // YouTube metadata, so both are excluded from provenance evidence.
+          await extractVocabularyFromCreator(refreshed,[refreshed.channel_name],text,true,result.languageContext,undefined,{ videoTitlesAreMetadata: false, descriptionIsMetadata: false });
           const db=await getDb();
           await db.query(`UPDATE extracted_vocabulary_sources SET provenance='HUMAN_APPROVED',eligible_after_enrichment=true WHERE channel_id=$1`,[channelId]);
           await enqueueTermHarvest({channelId,text,lineage:'HUMAN_APPROVED',approved:true});
@@ -694,6 +697,14 @@ export async function processNextSearchJob(
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
       const channel = await getChannelById(channelId);
       if (!channel || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+        // Retry repair: a retried ENRICH job replays vocabulary extraction so a
+        // save that failed after its observation committed cannot strand rows
+        // behind this early completion (same bars as the ingestion helper).
+        // Repair failures propagate to failJob (bounded retry) rather than
+        // completing with rows still missing.
+        if (channel && isRepairEligibleRetry(job)) {
+          await replayVocabularyForRetry(channel, candidate, source, true);
+        }
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SKIPPED',resultingStatus:channel?.trading_status,providerCost:0,latencyMs:Date.now()-evidenceStartedAt,reasonCode:'CASE_NO_LONGER_ELIGIBLE'}).catch(()=>undefined);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:channel?.trading_status||'POLICY_REJECTED',output:{reason:channel?'CASE_NO_LONGER_ELIGIBLE':'CHANNEL_MISSING'}});
         await completeJob(job.id);
@@ -888,7 +899,7 @@ export async function processNextSearchJob(
           // crashed after persisting the paid enrichment payload.
           await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         }
-        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true);
+        const pipelineOutcome=await processChannelThroughPipeline(enriched,targetCountry,source,false,true,{forceExtraction:isRepairEligibleRetry(job)});
         if(evidenceDecisionId)await recordEvidenceActionOutcome({decisionId:evidenceDecisionId,jobId:job.id,attempt:job.attempts,status:'SUCCEEDED',resultingStatus:pipelineOutcome.tradingStatus,providerCost:enrichmentQuotaUnits,latencyMs:Date.now()-evidenceStartedAt,reasonCode:pipelineOutcome.tradingStatus==='UNCERTAIN'||pipelineOutcome.tradingStatus==='NEEDS_REVIEW'?'EVIDENCE_DID_NOT_RESOLVE':'DECISION_RESOLVED'}).catch(()=>undefined);
         if(quotaReserved)await finishQuotaReservation('ENRICH_CHANNEL',job.id,true);
         if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:pipelineOutcome.tradingStatus,output:{channelId:pipelineOutcome.channelId,tradingStatus:pipelineOutcome.tradingStatus,countryStatus:pipelineOutcome.countryStatus}});else await completeJob(job.id);
@@ -1066,7 +1077,7 @@ export async function processNextSearchJob(
         country,declaredLanguage:raw.detectedLanguages?.[0]?.language,retrievalLane,searchOrdering,pageNumber,resultRank:index+1,
         matchedDocument:raw.matchedDocument||{type:'UNKNOWN'},rawObservation:{channelName:raw.channelName,youtubeUrl:raw.youtubeUrl,locationTag:raw.locationTag||null}},'INVESTIGATION_QUEUED');
       raw.nominationId=nomination.id||undefined;raw.queryRunId=queryRunId;raw.discoveryJobId=job.id;
-      const outcome = await processDiscoveredChannel(raw, country, source);
+      const outcome = await processDiscoveredChannel(raw, country, source, { forceExtraction: isRepairEligibleRetry(job) });
       const funnelOutcome: FunnelOutcome = outcome.countryStatus === 'REJECTED'
         ? 'COUNTRY_REJECTED'
         : outcome.tradingStatus === 'HUMAN_REJECTED' ? 'NON_TRADING' : outcome.tradingStatus;
@@ -1393,14 +1404,28 @@ export function projectLiveCountryAttribution(
 }
 
 /**
+ * Whether a claimed job may be retrying a previously failed attempt, for
+ * vocabulary-repair purposes. attempts increments at claim time (first
+ * execution already sees 1), but RETRYING_WITHOUT_ATTEMPT decrements on
+ * infrastructure failures and stale-lock reclaim stamps last_error — so a
+ * genuine retry can arrive with attempts===1. last_error is set on every
+ * failure path, cleared on re-enqueue, and present after crash recovery;
+ * either signal therefore marks a retry without false-flagging first runs.
+ */
+export function isRepairEligibleRetry(job: { attempts: number; last_error?: string | null }): boolean {
+  return job.attempts > 1 || job.last_error != null;
+}
+
+/**
  * Handles newly discovered YouTube channel via the unified ingestion pipeline.
  */
 export async function processDiscoveredChannel(
   raw: DiscoveredChannelRaw,
   targetCountry: string,
-  source: DiscoverySource
+  source: DiscoverySource,
+  options?: { forceExtraction?: boolean }
 ): Promise<ProcessDiscoveredChannelOutcome> {
-  return processChannelThroughPipeline(raw, targetCountry, source, false);
+  return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);
 }
 
 /**

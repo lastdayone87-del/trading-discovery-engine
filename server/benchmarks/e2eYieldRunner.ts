@@ -58,9 +58,11 @@ export function runE2EYield(cases: FrozenYieldCase[]): YieldBenchResult {
     );
     const found = extracted.find(c => c.channelId === item.channelId);
     const hasDescription = Boolean(found?.description);
-    // Channel-lane extraction echoes the search query into videoTitles when
-    // no source video exists, so title coverage there requires a title that
-    // is not the query itself. Video-lane titles are always observed.
+    // Channel-lane results carry no video titles when no source video exists
+    // (the old search-query echo was removed: a query is not a video title
+    // and must never carry VIDEO_TITLE provenance). Title coverage there is
+    // therefore only expected when real titles were observed. Video-lane
+    // titles are always observed.
     const hasVideoTitles =
       item.payload.lane === 'VIDEO'
         ? Boolean(found?.videoTitles?.length)

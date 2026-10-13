@@ -38,3 +38,22 @@ test('adaptive term DISTINCT query orders by the projected concept id expression
   assert.match(source, /ORDER BY s\.normalized,c\.id::text/);
   assert.doesNotMatch(source, /ORDER BY s\.normalized,c\.id`/);
 });
+
+test('video description-only matches carry video_description provenance', () => {
+  const fieldsOf = (r: { evidence: Array<{ provenance?: { fields?: Array<{ field?: string }> } }> }) =>
+    r.evidence.flatMap(item => item.provenance?.fields || []).map(field => field.field);
+  // Term only in the video description: must not be labeled video_title.
+  const descOnly = classifyAdaptiveShadow(
+    { channel_name: 'Quiet Channel', description: '', country: 'US', video_titles: ['Market vlog'], video_descriptions: ['deep footprint chart tutorial'], videos: [{ title: 'Market vlog', description: 'deep footprint chart tutorial' }] },
+    production('UNCERTAIN'), [term('1', 'footprint chart'), term('2', 'order flow')]
+  );
+  assert.ok(fieldsOf(descOnly).includes('video_description'));
+  assert.ok(!fieldsOf(descOnly).includes('video_title'));
+  // Term only in the video title: symmetric behavior preserved.
+  const titleOnly = classifyAdaptiveShadow(
+    { channel_name: 'Quiet Channel', description: '', country: 'US', video_titles: ['footprint chart live'], video_descriptions: ['market vlog'], videos: [{ title: 'footprint chart live', description: 'market vlog' }] },
+    production('UNCERTAIN'), [term('1', 'footprint chart'), term('2', 'order flow')]
+  );
+  assert.ok(fieldsOf(titleOnly).includes('video_title'));
+  assert.ok(!fieldsOf(titleOnly).includes('video_description'));
+});

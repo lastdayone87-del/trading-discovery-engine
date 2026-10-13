@@ -619,9 +619,15 @@ export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, san
     const existing = results.get(channelId);
     const videoTitle = lane === 'VIDEO' ? item.snippet?.title : undefined;
     const videoDescription = lane === 'VIDEO' ? item.snippet?.description : undefined;
+    const videoId = lane === 'VIDEO' ? item.id?.videoId : undefined;
     if (existing) {
       if (videoTitle && !existing.videoTitles.includes(videoTitle)) existing.videoTitles.push(videoTitle);
       if (videoDescription && !existing.videoDescriptions?.includes(videoDescription)) existing.videoDescriptions?.push(videoDescription);
+      // Keep each result's video ID alongside its title: matchedDocument only
+      // retains the first result, so without this later titles lose their IDs.
+      if (videoId && videoTitle && !(existing.videos || []).some(video => video.id === videoId)) {
+        existing.videos = [...(existing.videos || []), { id: videoId, title: videoTitle, description: videoDescription }];
+      }
       continue;
     }
     results.set(channelId, {
@@ -632,8 +638,12 @@ export function extractDiscoveredChannels(items: any[], lane: RetrievalLane, san
       // Preserve it as retrieval provenance and leave About unknown until the
       // authoritative channels resource is hydrated.
       description: lane === 'VIDEO' ? '' : (item.snippet?.description || ''),
-      videoTitles: videoTitle ? [videoTitle] : [sanitizedQuery],
+      // Query-text fallback removed: the search query is not a video title and
+      // must never carry VIDEO_TITLE provenance downstream. Retrieval context
+      // is preserved separately on matchedDocument.
+      videoTitles: videoTitle ? [videoTitle] : [],
       videoDescriptions: videoDescription ? [videoDescription] : [],
+      videos: videoId && videoTitle ? [{ id: videoId, title: videoTitle, description: videoDescription }] : [],
       // VIDEO-search snippets are retrieval-selected, not a recent-channel
       // sample: they must never vote in the aggregated-language country path.
       videoDescriptionsAuthoritative: false,
