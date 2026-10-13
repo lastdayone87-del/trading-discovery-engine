@@ -600,6 +600,16 @@ export interface TerminologyObservationResult {
  * locks (ROW EXCLUSIVE updates, FK KEY SHARE checks) while requesting this
  * lock, so the KEY SHARE -> row-lock upgrade deadlock cannot form.
  * Re-entrant within a session (repeat acquisition is a no-op until commit).
+ *
+ * Transaction contract: the lock is transaction-scoped, so it only protects
+ * statements that share the acquirer's transaction. Pool runners are wrapped
+ * in an owned transaction by observe/refresh/attribute before acquisition;
+ * a caller-supplied client MUST already be inside a transaction (as in
+ * completeQueryRun, which BEGINs before attribution). A bare autocommit
+ * client degrades gracefully — statements still execute correctly in order,
+ * but without cross-statement serialization. All production callers comply:
+ * observe/attribute/refresh self-wrap Pools, and the sole external client
+ * supplier (completeQueryRun) is transaction-bound.
  */
 export async function acquireTerminologyLifecycleLock(termId: number, runner: Queryable): Promise<void> {
   await runner.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`terminology-lifecycle:${termId}`]);
