@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { ChannelRecord } from '../src/types';
 import {
@@ -102,6 +103,7 @@ test('instrument list is pinned and shared (no parallel source of truth)', () =>
 test('literal spans trace to exact source text', () => {
   assert.deepEqual(findLiteralSpan('Börsenanalyse', SOURCES), {
     sourceKind: 'CHANNEL_NAME', sourceIndex: 0, span: 'Börsenanalyse', videoId: null,
+    sourceHash: sourceHashOf('Börsenanalyse LuxX'),
   });
   assert.deepEqual(findLiteralSpan('flux ordres', SOURCES)?.sourceKind, 'VIDEO_TITLE');
   assert.equal(findLiteralSpan('flux ordres', SOURCES)?.sourceIndex, 0);
@@ -135,7 +137,7 @@ test('round-trip failure scans later matches in the same source', () => {
   // First hit cuts through the U+3300 expansion (rejected); the later exact
   // occurrence must still be found with its literal span.
   const hit = findLiteralSpan('アパ', [{ kind: 'DESCRIPTION', index: 0, text: '㌀ text アパ' }]);
-  assert.deepEqual(hit, { sourceKind: 'DESCRIPTION', sourceIndex: 0, span: 'アパ', videoId: null });
+  assert.deepEqual(hit, { sourceKind: 'DESCRIPTION', sourceIndex: 0, span: 'アパ', videoId: null, sourceHash: sourceHashOf('㌀ text アパ') });
   // Single false-span source still rejects (no valid later occurrence).
   assert.equal(findLiteralSpan('不動産アパ', [{ kind: 'DESCRIPTION', index: 0, text: '不動産㌀' }]), null);
 });
@@ -223,6 +225,9 @@ test('novelty distinguishes new terms from known ones', () => {
     { novel: true, knownAs: null }
   );
 });
+
+const sourceHashOf = (text: string): string =>
+  createHash('sha256').update(text.normalize('NFKC')).digest('hex');
 
 // --- Finding 9: English + localized spam screening ---
 
@@ -1829,7 +1834,7 @@ test('video IDs align to titles and persist on the observation', async () => {
   assert.equal(observed[1].videoId, 'vid-2');
   assert.deepEqual(
     (observed[0].evidence as Record<string, unknown>).sourceRef,
-    { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1' }
+    { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1', sourceHash: sourceHashOf('P2P-Algo backtest') }
   );
 });
 
@@ -2101,6 +2106,24 @@ test('quality rollup SQL executes correctly over mixed evidence', async () => {
     null,
   ]) as never);
   assert.deepEqual(mixed, { v1Observations: 2, spamConfirmed: true, novel: true });
+});
+
+test('saver and repair converge occurrences to the committed count', async () => {
+  // The reported race: reconcile derives the exact count, then an in-flight
+  // save increments it again. Both writers recompute from committed
+  // observations last, so every interleaving converges instead of inflating.
+  const state = createFakeVocabDb();
+  state.channels.add('ch-1');
+  state.canonical.set('Germany|smc', 100);
+  state.observations.push(100, 100);
+  state.vocab.push({ id: 1, country: 'Germany', term: 'SMC', category: 'terminology', occurrences: 5, validation_count: 0, trust_tier: 3 });
+  state.nextId = 2;
+  const runner = fakeVocabRunner(state);
+  await saveExtractedTerm('Germany', 'SMC', 'terminology', 'ch-1', runner);
+  assert.equal(state.vocab[0].occurrences, 2);
+  await defaultReconcileExtractedTerm('Germany', 'SMC', 'terminology', 'ch-1', runner);
+  assert.equal(state.vocab[0].occurrences, 2);
+  assert.equal(state.vocab[0].validation_count, 1);
 });
 
 test('planner serves trial terms inside generated queries', () => {
