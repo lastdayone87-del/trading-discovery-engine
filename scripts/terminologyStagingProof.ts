@@ -28,6 +28,7 @@ if (process.env.STAGING_OK !== 'true' || !process.env.DATABASE_URL) {
 const COUNTRY = 'Germany';
 const ALIAS_COUNTRY = 'US';
 const PHRASE = `e2e probe ${randomUUID().slice(0, 8)}`;
+const DEMOTE_PHRASE = `e2e demote probe ${randomUUID().slice(0, 8)}`;
 const ALIAS_PHRASE = `e2e alias probe ${randomUUID().slice(0, 8)}`;
 const CHANNELS = ['e2e-ch-1', 'e2e-ch-2', 'e2e-ch-3'];
 
@@ -99,10 +100,13 @@ async function main() {
     [CHANNELS[2], 'e2e-v6', 'e2e-fp-B'],
   ];
   for (const [ch, vid, fp] of extra) {
-    await observeTerminologyDetailed({
+    const obs = await observeTerminologyDetailed({
       term: PHRASE, country: COUNTRY, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
       channelId: ch, videoId: vid, communityFingerprint: fp, evidence: evidenceFor(ch, vid, PHRASE),
     });
+    // Production admit() persists the extracted row after every newly
+    // inserted observation; the derived occurrence count converges there.
+    if (obs !== null && obs.observationInserted) await saveExtractedTerm(COUNTRY, PHRASE, 'terminology', ch);
   }
   await refreshTerminologyLifecycle(termId);
   const term = await db.query(`SELECT lifecycle_status,search_eligible FROM canonical_trading_terms WHERE id=$1`, [termId]);
@@ -121,24 +125,39 @@ async function main() {
   const plannerTerms = await getPlannerTerminology(COUNTRY);
   check('planner surfaces the proven term', plannerTerms.some(entry => entry.id === termId), { count: plannerTerms.length });
 
-  // Leg 5: demotion on sustained poor yield (history retained).
-  const poorRun = funnel({ rawResults: 10, distinctResults: 10, knownChannels: 10, nonTrading: 8, uncertain: 2, averageQualityScore: 20, countryPrecision: 0.5, performanceScore: 5 });
-  for (let i = 0; i < 6; i++) {
-    await attributeTerminologyPerformance(query, poorRun as never, 1000);
+  // Leg 5: demotion on sustained poor yield (history retained). A fresh
+  // term isolates demotion from the promotion ledger above: zero-result
+  // attributions carry yield 0, so six executions must demote per policy.
+  const demoteVids = ['e2e-d1', 'e2e-d2', 'e2e-d3', 'e2e-d4', 'e2e-d5', 'e2e-d6'];
+  for (let i = 0; i < demoteVids.length; i++) {
+    const ch = CHANNELS[i % CHANNELS.length];
+    await observeTerminologyDetailed({
+      term: DEMOTE_PHRASE, country: COUNTRY, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+      channelId: ch, videoId: demoteVids[i], communityFingerprint: i % 2 === 0 ? 'e2e-fp-A' : 'e2e-fp-B',
+      evidence: evidenceFor(ch, demoteVids[i], DEMOTE_PHRASE),
+    });
   }
-  const demoted = await db.query(`SELECT lifecycle_status,search_eligible FROM canonical_trading_terms WHERE id=$1`, [termId]);
+  const demoteTermRow = await db.query(`SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [DEMOTE_PHRASE.toLowerCase(), COUNTRY]);
+  const demoteTermId = Number(demoteTermRow.rows[0]?.id);
+  const demoteQuery = { generation_metadata: { learnedTerm: DEMOTE_PHRASE }, country: COUNTRY } as unknown as QueryRecord;
+  const zeroRun = funnel({ averageQualityScore: 5, performanceScore: 2 });
+  for (let i = 0; i < 6; i++) {
+    await attributeTerminologyPerformance(demoteQuery, zeroRun as never, 1000);
+  }
+  const demoted = await db.query(`SELECT lifecycle_status,search_eligible FROM canonical_trading_terms WHERE id=$1`, [demoteTermId]);
   check('term demotes and loses eligibility', demoted.rows[0]?.lifecycle_status === 'DEMOTED' && demoted.rows[0]?.search_eligible === false, demoted.rows[0]);
-  const obsCount = await db.query(`SELECT COUNT(*)::int n FROM terminology_observations WHERE canonical_term_id=$1`, [termId]);
+  const obsCount = await db.query(`SELECT COUNT(*)::int n FROM terminology_observations WHERE canonical_term_id=$1`, [demoteTermId]);
   check('observations retained after demotion', Number(obsCount.rows[0]?.n) >= 6, obsCount.rows[0]);
 
   // Leg 6: retry recovery — observation committed, save lost (crash window
   // simulated by removing the vocab row); the production retry repair must
   // restore the exact derived count. No mocks in the repair itself.
+  const mainObs = await db.query(`SELECT COUNT(*)::int n FROM terminology_observations WHERE canonical_term_id=$1`, [termId]);
   await db.query(`DELETE FROM extracted_trading_vocabulary WHERE term=$1`, [PHRASE]);
   const recovered = await defaultReconcileExtractedTerm(COUNTRY, PHRASE, 'terminology', CHANNELS[0]);
   check('retry repair restores row and link', recovered.rowInserted === true && recovered.linkInserted === true, recovered);
   vocab = await db.query(`SELECT COUNT(*)::int rows, MAX(occurrences)::int occurrences FROM extracted_trading_vocabulary WHERE term=$1`, [PHRASE]);
-  check('recovered occurrences exact and singular', Number(vocab.rows[0]?.rows) === 1 && Number(vocab.rows[0]?.occurrences) === Number(obsCount.rows[0]?.n), vocab.rows[0]);
+  check('recovered occurrences exact and singular', Number(vocab.rows[0]?.rows) === 1 && Number(vocab.rows[0]?.occurrences) === Number(mainObs.rows[0]?.n), vocab.rows[0]);
 
   // Leg 7: country-alias write/read identity on live PostgreSQL.
   const aliasObs = await observeTerminologyDetailed({
