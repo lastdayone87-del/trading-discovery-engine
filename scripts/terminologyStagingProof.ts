@@ -425,6 +425,24 @@ async function main() {
   };
   let legError: unknown = null;
   try {
+  // Fixture identities must be novel for their intended countries: abort
+  // when any pre-exists rather than reusing (and later deleting) another
+  // run's rows. Checked BEFORE any fixture insert so no unregistered row can
+  // exist if this aborts — registration immediately follows, so every later
+  // write belongs to a registered run. Covers canonical terms AND vocabulary
+  // rows: an orphan vocab row (no canonical term) would otherwise be claimed
+  // by the recovery leg and deleted by cleanup.
+  const pre = await db.query(
+    `SELECT normalized_term, country FROM canonical_trading_terms WHERE (normalized_term = ANY($1) AND country = ANY($2))`,
+    [scope.normPhrases, scope.countries]
+  );
+  const preVocab = await db.query(
+    `SELECT term, country FROM extracted_trading_vocabulary WHERE term = ANY($1) AND country = ANY($2)`,
+    [scope.rawPhrases, scope.countries]
+  );
+  check('fixture identities novel', pre.rows.length === 0 && preVocab.rows.length === 0, { clashes: pre.rows, vocabClashes: preVocab.rows });
+  scope.preflightPassed = true;
+  await registerRun(db, RUN, 'proof');
   // Fixture creators: confirmed traders eligible for links, retry and trial.
   // Only ids whose insert actually creates a row are registered for cleanup,
   // so a pre-existing channel is never removed.
@@ -437,15 +455,6 @@ async function main() {
     );
     if (inserted.rows.length > 0) scope.createdChannels.push(channelId);
   }
-  // Fixture identities must be novel for their intended countries: abort
-  // when any pre-exists rather than reusing (and later deleting) another run's rows.
-  const pre = await db.query(
-    `SELECT normalized_term, country FROM canonical_trading_terms WHERE (normalized_term = ANY($1) AND country = ANY($2))`,
-    [scope.normPhrases, scope.countries]
-  );
-  check('fixture identities novel', pre.rows.length === 0, { clashes: pre.rows });
-  scope.preflightPassed = true;
-  await registerRun(db, RUN, 'proof');
 
   // Leg 1: observation + save.
   const first = await observeTerminologyDetailed({
@@ -604,25 +613,30 @@ async function main() {
   check('staging stayed worker-free', Number(endJobs.rows[0]?.n) === 0, endJobs.rows[0]);
 
   console.log(`E2E PROOF COMPLETE (${passed} legs)`);
-  await finishRun(db, RUN, 'complete');
   } catch (error) {
     // A leg/check failure is captured, not lost: cleanup still runs below,
     // and the original error propagates after pool shutdown instead of being
     // replaced by a cleanup failure (both are reported).
     legError = error;
   }
+  let cleanupError: unknown = null;
   try {
     await cleanupRunFixtures(db, scope);
   } catch (error) {
     console.error('cleanup failed', error);
-    if (legError === null) throw error;
-  } finally {
-    await pool.end().catch(() => undefined);
+    cleanupError = error;
   }
-  if (legError !== null) {
+  // Registry marking happens while the pool is still open (finishRun would
+  // silently fail after pool.end), and 'complete' is recorded only when both
+  // legs and cleanup succeeded — otherwise the run stays recoverable.
+  if (legError === null && cleanupError === null) {
+    await finishRun(db, RUN, 'complete');
+  } else {
     await finishRun(db, RUN, 'failed');
-    throw legError;
   }
+  await pool.end().catch(() => undefined);
+  if (legError !== null) throw legError;
+  if (cleanupError !== null) throw cleanupError;
 }
 
 main().then(

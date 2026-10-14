@@ -307,6 +307,10 @@ async function recoverRaceRunByPattern(db: RaceRunDb, runId: string, norm: strin
   const normLike = `%${norm}%`;
   await step('observations', () => db.query(
     `DELETE FROM terminology_observations WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1 AND country=$2)`, [normLike, COUNTRY_CANON]));
+  for (const table of ['terminology_performance', 'terminology_lifecycle_events', 'terminology_score_snapshots', 'trading_term_aliases', 'country_native_evidence_projections', 'country_native_performance_attribution']) {
+    await step(table, () => db.query(
+      `DELETE FROM ${table} WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1 AND country=$2)`, [normLike, COUNTRY_CANON]));
+  }
   await step('links', () => db.query(
     `DELETE FROM extracted_vocabulary_sources WHERE term_id IN (SELECT id FROM extracted_trading_vocabulary WHERE term ILIKE $1 AND country=$2)`, [like, COUNTRY_CANON]));
   await step('vocab', () => db.query(
@@ -314,22 +318,22 @@ async function recoverRaceRunByPattern(db: RaceRunDb, runId: string, norm: strin
   await step('canonical', () => db.query(
     `DELETE FROM canonical_trading_terms WHERE normalized_term LIKE $1 AND country=$2`, [normLike, COUNTRY_CANON]));
   await step('channels', () => db.query(`DELETE FROM channels WHERE channel_id LIKE $1`, [like]));
-  for (const table of ['terminology_performance', 'terminology_lifecycle_events', 'terminology_score_snapshots', 'trading_term_aliases', 'country_native_evidence_projections', 'country_native_performance_attribution']) {
-    await step(table, () => db.query(
-      `DELETE FROM ${table} WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1 AND country=$2)`, [normLike, COUNTRY_CANON]));
-  }
   const residue = await db.query(
-    `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE term ILIKE $1 AND country=$2) AS vocab,
-            (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term LIKE $2 AND country=$1) AS terms,
+    `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE term ILIKE $1 AND country=$3) AS vocab,
+            (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term LIKE $2 AND country=$3) AS terms,
             (SELECT COUNT(*) FROM channels WHERE channel_id LIKE $1) AS channels`,
     [like, normLike, COUNTRY_CANON]
   ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
   const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
   const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
-  await finishRaceRun(db, runId, failures.length > 0 || remaining !== 0 ? 'recovery-failed' : 'recovered');
   if (failures.length > 0 || remaining !== 0) {
+    // Failed recoveries stay eligible: finished_at is left NULL so a later
+    // --recover retries them instead of skipping them forever.
+    await db.query(`UPDATE staging_proof_runs SET status='recovery-failed' WHERE run_id=$1`, [runId])
+      .catch(error => console.warn('run registry update failed (non-fatal)', error instanceof Error ? error.message : String(error)));
     throw new Error(`recovery incomplete for run ${runId} (failures=[${failures.join('; ')}] remaining=${remaining})`);
   }
+  await finishRaceRun(db, runId, 'recovered');
   console.log(`recovery: removed fixtures of abandoned run ${runId}, residue verified 0`);
   return remaining;
 }
@@ -343,7 +347,10 @@ async function main() {
   // the main pool serves seeds/asserts, and getDb() is never touched.
   // application_name tags race backends so a straggler timeout can terminate
   // exactly those connections.
-  const dbPool = stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
+  // Per-run application names (main pool included): close-timeout
+  // termination below can only target backends this invocation owns.
+  const mainAppName = `terminology-race-main-${RUN}`;
+  const dbPool = stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000, application_name: mainAppName });
   onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   // Endpoint re-verification before any write.
   await assertStagingIdentity(dbPool, target.identity);
@@ -398,10 +405,31 @@ async function main() {
   // Shared shutdown, used by the preflight guard (which runs before the main
   // try/finally), the recovery branch, and by the main finally alike.
   // Declared before any use: --recover and preflight paths call it directly.
-  const closePools = () => bounded((async () => {
-    await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
-    await dbPool.end().catch(() => undefined);
-  })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
+  // Returns false when the bound expires with pools still open (caller then
+  // terminates run backends explicitly — see below).
+  const closePools = async (): Promise<boolean> => {
+    let closed = true;
+    await bounded((async () => {
+      await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
+      await dbPool.end().catch(() => undefined);
+    })(), 20_000, () => { closed = false; }).catch(() => { closed = false; });
+    if (!closed) console.warn('cleanup: pool close timed out; terminating run backends');
+    return closed;
+  };
+  // Last-resort backend termination by application name. Used only when pool
+  // shutdown itself times out (checked-out clients wedged server-side):
+  // killing the backends unblocks pool.end() so the process can exit.
+  const terminateOwnBackends = async (): Promise<void> => {
+    const killer = stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, query_timeout: 15_000 });
+    try {
+      await killer.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = ANY($1) AND pid<>pg_backend_pid()`,
+        [[appName, mainAppName]]
+      ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+    } finally {
+      await killer.end().catch(() => undefined);
+    }
+  };
   if (process.argv.includes('--recover')) {
     // Recovery mode: clean abandoned race runs only, then exit. Full target
     // verification above still applies — recovery deletes data.
@@ -515,69 +543,89 @@ async function main() {
   check('staging stayed worker-free', Number(endJobs.rows[0]?.n) === 0, endJobs.rows[0]);
 
   console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
-  await finishRaceRun(db, RUN, 'complete');
   } catch (error) {
     // A failed check is captured, not lost: teardown still runs below, and
     // the original error propagates after pool shutdown instead of being
     // replaced by a teardown failure (both are reported).
     legError = error;
   } finally {
-    // Stragglers from a deadline breach settle here (bounded) before cleanup
-    // touches fixtures. On timeout the race backends are terminated by
-    // application_name: the server rolls back their transactions, so late
-    // commits are impossible and cleanup cannot be followed by resurrected
-    // rows. Any path through here after a failure stays exit-nonzero.
-    let stragglers = false;
-    await bounded(Promise.allSettled(racers), 30_000, () => { stragglers = true; }).catch(() => { stragglers = true; });
-    if (stragglers) {
-      // Cancel first: aborting the in-flight query rolls back that writer's
-      // transaction while keeping its connection alive, so settlement errors
-      // flow through promises instead of crashing the process on dead-client
-      // 'error' events. Termination below is the last resort for backends
-      // that ignore cancel (their connections die; pool error handlers above
-      // absorb the fallout).
-      const cancelled = await db.query(
-        `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()) s WHERE cancelled`,
-        [appName]
-      ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-      console.warn(`cleanup: cancelled ${Number((cancelled.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} straggler backends; their transactions abort`);
-      let stillStuck = false;
-      await bounded(Promise.allSettled(racers), 15_000, () => { stillStuck = true; }).catch(() => { stillStuck = true; });
-      if (stillStuck) {
-        const killed = await db.query(
-          `SELECT count(*)::int n FROM (SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()) s WHERE killed`,
-        [appName]
+    // Teardown runs inside its own try so pool shutdown below executes even
+    // when straggler verification or cleanup throws. Error precedence at the
+    // end: the original leg error wins (teardown failures are logged), and
+    // every path exits nonzero on any failure.
+    let stragglerError: unknown = null;
+    let cleanupError: unknown = null;
+    try {
+      // Stragglers from a deadline breach settle here (bounded) before cleanup
+      // touches fixtures. On timeout the race backends are terminated by
+      // application_name: the server rolls back their transactions, so late
+      // commits are impossible and cleanup cannot be followed by resurrected
+      // rows. Any path through here after a failure stays exit-nonzero.
+      let stragglers = false;
+      await bounded(Promise.allSettled(racers), 30_000, () => { stragglers = true; }).catch(() => { stragglers = true; });
+      if (stragglers) {
+        // Cancel first: aborting the in-flight query rolls back that writer's
+        // transaction while keeping its connection alive, so settlement errors
+        // flow through promises instead of crashing the process on dead-client
+        // 'error' events. Termination below is the last resort for backends
+        // that ignore cancel (their connections die; pool error handlers above
+        // absorb the fallout).
+        const cancelled = await db.query(
+          `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()) s WHERE cancelled`,
+          [appName]
         ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-        console.warn(`cleanup: terminated ${Number((killed.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} unresponsive backends; their transactions rolled back server-side`);
-        await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after termination')).catch(() => undefined);
-        const remaining = await db.query(
-          `SELECT count(*)::int n FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()`, [appName]
-        ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-        if (Number((remaining.rows[0] as Record<string, unknown> | undefined)?.n ?? 1) > 0) {
-          throw new Error('cleanup unverified: race backends still alive after termination — fixtures left in place, inspect staging before rerunning');
+        console.warn(`cleanup: cancelled ${Number((cancelled.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} straggler backends; their transactions abort`);
+        let stillStuck = false;
+        await bounded(Promise.allSettled(racers), 15_000, () => { stillStuck = true; }).catch(() => { stillStuck = true; });
+        if (stillStuck) {
+          const killed = await db.query(
+            `SELECT count(*)::int n FROM (SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()) s WHERE killed`,
+            [appName]
+          ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+          console.warn(`cleanup: terminated ${Number((killed.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} unresponsive backends; their transactions rolled back server-side`);
+          await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after termination')).catch(() => undefined);
+          const remaining = await db.query(
+            `SELECT count(*)::int n FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()`, [appName]
+          ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+          if (Number((remaining.rows[0] as Record<string, unknown> | undefined)?.n ?? 1) > 0) {
+            throw new Error('cleanup unverified: race backends still alive after termination — fixtures left in place, inspect staging before rerunning');
+          }
+        }
+      }
+      if (!preflightPassed) {
+        console.warn('cleanup: skipped — preflight aborted before this run created any fixture');
+      } else {
+        try {
+          await cleanupRaceFixtures(db, { normTerm: normalizeTerm(TERM), createdChannels });
+          if (legError === null) await finishRaceRun(db, RUN, 'complete');
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
+    } catch (error) {
+      stragglerError = error;
+    } finally {
+      // Pool shutdown runs on every path, including straggler-verification
+      // failure. When it times out, terminate this run's backends explicitly
+      // and retry once; if the process still cannot drain, force termination
+      // AFTER reporting (documented last resort — diagnostics above print
+      // before any exit call).
+      if (!(await closePools())) {
+        await terminateOwnBackends();
+        if (!(await closePools())) {
+          console.error('pools wedged after backend termination; forcing process exit');
+          process.exit(process.exitCode ?? 1);
         }
       }
     }
-    let cleanupError: unknown = null;
-    if (!preflightPassed) {
-      console.warn('cleanup: skipped — preflight aborted before this run created any fixture');
-    } else {
-      try {
-        await cleanupRaceFixtures(db, { normTerm: normalizeTerm(TERM), createdChannels });
-      } catch (error) {
-        cleanupError = error;
-      }
-    }
-    // Bounded close (shared with the preflight guard above): runs even when
-    // cleanup throws. Outer `timeout` remains the final backstop.
-    await closePools();
     // Both errors are reported and the run exits nonzero either way, but a
-    // failed check is never hidden behind a cleanup failure.
+    // failed check is never hidden behind a teardown failure. Failed runs
+    // deliberately keep status started/finished_at NULL (no finish call), so
+    // --recover stays eligible for their fixtures.
     if (cleanupError !== null) console.error('cleanup failed', cleanupError);
-    if (legError !== null) {
-      await finishRaceRun(db, RUN, 'failed');
-      throw legError;
-    }
+    if (stragglerError !== null) console.error('straggler handling failed', stragglerError);
+    if (legError !== null) throw legError;
+    if (stragglerError !== null) throw stragglerError;
     if (cleanupError !== null) throw cleanupError;
   }
 }
