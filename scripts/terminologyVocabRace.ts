@@ -153,15 +153,24 @@ async function cleanupRaceFixtures(
     }
   };
   const normTerm = scope.normTerm;
-  const termRows = await db.query(
-    `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normTerm, COUNTRY_CANON]
-  );
-  const ids = termRows.rows.map(row => Number(row.id));
-  const vocabRows = await db.query(
-    `SELECT id FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
-    [COUNTRY_CANON, normTerm]
-  );
-  const vocabIds = vocabRows.rows.map(row => Number(row.id));
+  // Resolution fallback: a lookup failure must not strand every later step.
+  // Predicate deletes below still scope to this run's identity, and the
+  // recorded failure keeps the exit nonzero.
+  let ids: number[] = [];
+  let vocabIds: number[] = [];
+  try {
+    const termRows = await db.query(
+      `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normTerm, COUNTRY_CANON]
+    );
+    ids = termRows.rows.map(row => Number(row.id));
+    const vocabRows = await db.query(
+      `SELECT id FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
+      [COUNTRY_CANON, normTerm]
+    );
+    vocabIds = vocabRows.rows.map(row => Number(row.id));
+  } catch (error) {
+    failures.push(`resolve: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const byTerm = (table: string) => `DELETE FROM ${table} WHERE canonical_term_id = ANY($1)`;
   if (ids.length > 0) {
     await cleanupStep('observations', () => db.query(byTerm('terminology_observations'), [ids]));
@@ -217,17 +226,30 @@ async function main() {
     // surface through the writers' rejected promises below.
     onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
   }
+  // Shared shutdown, used by the preflight guard (which runs before the main
+  // try/finally) and by the main finally alike.
+  const closePools = () => bounded((async () => {
+    await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
+    await dbPool.end().catch(() => undefined);
+  })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
   // Fixture-identity preflight FIRST: abort when this run's normalized term
   // already exists for the intended country, before any observation can
   // commit a row the run would then mistake for its own. Cleanup below is
   // skipped on preflight failure — the matching row belongs to another run
   // (or prior residue), never to this one, so deleting it would be wrong.
   let preflightPassed = false;
-  const clash = await db.query(
-    `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(TERM), COUNTRY_CANON]
-  );
-  check('fixture identity novel', clash.rows.length === 0, { term: TERM });
-  preflightPassed = true;
+  try {
+    const clash = await db.query(
+      `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(TERM), COUNTRY_CANON]
+    );
+    check('fixture identity novel', clash.rows.length === 0, { term: TERM });
+    preflightPassed = true;
+  } catch (error) {
+    // Preflight runs before the main try/finally: close pools here so a
+    // failed preflight exits with its error instead of hanging.
+    await closePools();
+    throw error;
+  }
   try {
   for (const channelId of CHANNELS) {
     const inserted = await db.query(
@@ -348,13 +370,9 @@ async function main() {
         throw error;
       }
     }
-    // Pool shutdown is unconditional within this finally: a failed cleanup
-    // still releases connections so the run exits with its error instead of
-    // hanging. Outer `timeout` remains the final backstop.
-      await bounded((async () => {
-        await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
-        await dbPool.end().catch(() => undefined);
-      })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
+    // Bounded close (shared with the preflight guard above): runs even when
+    // cleanup throws. Outer `timeout` remains the final backstop.
+    await closePools();
   }
 }
 

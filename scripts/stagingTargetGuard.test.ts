@@ -55,7 +55,10 @@ test('percent-encoded host parameters are decoded and rejected', () => {
   // pg-connection-string decodes parameter names: ?%68ost= is honored as
   // ?host= (verified empirically), so the guard must decode before checking.
   assert.equal(hasHostOverrideParam('postgresql:///db?%68ost=evil.example'), true);
-  assert.equal(verifyStagingTarget('postgresql:///db?%68ost=evil.example').ok, false);
+  // Empty-authority rejection alone would also pass here, so assert the
+  // valid-authority case: the verdict must refuse on the decoded parameter.
+  assert.equal(verifyStagingTarget('postgresql://dbhost/db?%68ost=evil.example').ok, false);
+  assert.equal(verifyStagingTarget('postgresql://dbhost/db?host=evil.example').ok, false);
 });
 
 test('percent-encoded TLS downgrades are decoded and rejected', () => {
