@@ -57,7 +57,9 @@ function targetConnectionString(): string {
 // here through a one-shot non-initializing pool (guard verdict + pairing
 // token, both fail-closed). Returns the verified TLS configuration for the
 // pools below.
-async function verifyStagingTargetOrThrow(connectionString: string): Promise<false | { rejectUnauthorized: boolean } | undefined> {
+async function verifyStagingTargetOrThrow(
+  connectionString: string
+): Promise<{ ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string }> {
   const expectedToken = process.env.STAGING_PROOF_TOKEN;
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
@@ -80,7 +82,14 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
     throw new Error(`Refusing to run: staging probe failed (${detail}) — verify the tunnel and staging database instead of retrying blindly.`);
   }
   if (!tokenMatches) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
-  return verdict.ssl;
+  // Staging quiescence: this script requires a worker-free database (fixture
+  // channels must never be claimed by queue workers mid-run). The provisioned
+  // staging database satisfies this; any jobs table activity refuses the run.
+  const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  if (Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? 1) > 0) {
+    throw new Error('Refusing to run: jobs table is non-empty — staging database must have no workers pointed at it.');
+  }
+  return { ssl: verdict.ssl, caFile: verdict.caFile };
 }
 
 const COUNTRY_ALIAS = 'US';
@@ -121,8 +130,12 @@ async function bounded<T>(promise: Promise<T>, ms: number, onTimeout: () => void
 }
 
 let passed = 0;
+// Set by the SIGINT/SIGTERM handler below: checks abort at the next gate so
+// an interrupted run stops writing before scoped cleanup runs.
+let signalAborting = false;
 // Fail fast: a failed check throws, so no further writes follow a break.
 function check(name: string, cond: boolean, evidence: unknown) {
+  if (signalAborting) throw new Error('aborting: process signal received');
   if (!cond) throw new Error(`CHECK FAILED: ${name} ${JSON.stringify(evidence)}`);
   passed += 1;
   console.log(`PASS ${name} ${JSON.stringify(evidence)}`);
@@ -210,7 +223,7 @@ async function main() {
   // (transaction-bound advisory locks), the main pool serves seeds/asserts,
   // and getDb() is never touched. application_name tags race backends so a
   // straggler timeout can terminate exactly those connections.
-  const dbPool = stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000 });
+  const dbPool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000 });
   onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   const db = dbPool;
   const createdChannels: string[] = [];
@@ -219,14 +232,35 @@ async function main() {
   // never kill another concurrent run's writers sharing this database.
   const appName = `terminology-vocab-race-${RUN}`;
   const pools = [
-    stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000, application_name: appName }),
-    stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000, application_name: appName }),
+    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
+    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
   ];
   for (const pool of pools) {
     // Idle-client deaths must never crash the run; checked-out failures
     // surface through the writers' rejected promises below.
     onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
   }
+  let shuttingDown = false;
+  const onSignal = (signal: 'SIGINT' | 'SIGTERM') => {
+    if (shuttingDown) {
+      console.error(`second ${signal}; forcing immediate exit`);
+      process.exit(1);
+    }
+    shuttingDown = true;
+    signalAborting = true;
+    void (async () => {
+      console.warn(`${signal} received; running scoped cleanup then exiting`);
+      try {
+        await cleanupRaceFixtures(db, { normTerm: normalizeTerm(TERM), createdChannels });
+      } catch (error) {
+        console.error('signal cleanup failed', error);
+      }
+      await closePools();
+      process.exit(1);
+    })();
+  };
+  process.once('SIGINT', () => onSignal('SIGINT'));
+  process.once('SIGTERM', () => onSignal('SIGTERM'));
   // Shared shutdown, used by the preflight guard (which runs before the main
   // try/finally) and by the main finally alike.
   const closePools = () => bounded((async () => {

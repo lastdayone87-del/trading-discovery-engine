@@ -66,7 +66,9 @@ function targetConnectionString(): string {
 // topology is a localhost tunnel); (3) marker row absent or token mismatch
 // (a copied marker row alone never authorizes). Timeouts bound the probe so
 // a black-holed endpoint fails instead of hanging.
-async function verifyStagingTargetOrThrow(connectionString: string): Promise<false | { rejectUnauthorized: boolean } | undefined> {
+async function verifyStagingTargetOrThrow(
+  connectionString: string
+): Promise<{ ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string }> {
   const expectedToken = process.env.STAGING_PROOF_TOKEN;
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
@@ -89,7 +91,14 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
     throw new Error(`Refusing to run: staging probe failed (${detail}) — verify the tunnel and staging database instead of retrying blindly.`);
   }
   if (!tokenMatches) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
-  return verdict.ssl;
+  // Staging quiescence: these scripts require a worker-free database (fixture
+  // channels must never be claimed by queue workers mid-run). The provisioned
+  // staging database satisfies this; any jobs table activity refuses the run.
+  const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  if (Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? 1) > 0) {
+    throw new Error('Refusing to run: jobs table is non-empty — staging database must have no workers pointed at it.');
+  }
+  return { ssl: verdict.ssl, caFile: verdict.caFile };
 }
 
 interface RunScope {
@@ -217,9 +226,13 @@ function funnel(overrides: Record<string, number>): Record<string, number> {
 }
 
 let passed = 0;
+// Set by the SIGINT/SIGTERM handler below: legs abort at the next check so
+// an interrupted run stops writing before scoped cleanup runs.
+let signalAborting = false;
 // Fail fast: a failed leg throws, so dependent legs never run and no
 // cascading writes follow a broken prerequisite.
 function check(name: string, cond: boolean, evidence: unknown) {
+  if (signalAborting) throw new Error('aborting: process signal received');
   if (!cond) throw new Error(`LEG FAILED: ${name} ${JSON.stringify(evidence)}`);
   passed += 1;
   console.log(`PASS ${name} ${JSON.stringify(evidence)}`);
@@ -240,8 +253,29 @@ async function main() {
   // Script-owned pool: every connection this run opens carries the verified
   // TLS configuration, and getDb() (with its own SSL semantics plus
   // migrations/seeds) is never touched.
-  const pool = stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
+  const pool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
   const db = pool;
+  let shuttingDown = false;
+  const onSignal = (signal: 'SIGINT' | 'SIGTERM') => {
+    if (shuttingDown) {
+      console.error(`second ${signal}; forcing immediate exit`);
+      process.exit(1);
+    }
+    shuttingDown = true;
+    signalAborting = true;
+    void (async () => {
+      console.warn(`${signal} received; running scoped cleanup then exiting`);
+      try {
+        await cleanupRunFixtures(db, scope);
+      } catch (error) {
+        console.error('signal cleanup failed', error);
+      }
+      await pool.end().catch(() => undefined);
+      process.exit(1);
+    })();
+  };
+  process.once('SIGINT', () => onSignal('SIGINT'));
+  process.once('SIGTERM', () => onSignal('SIGTERM'));
   const scope: RunScope = {
     createdChannels: [],
     rawPhrases: [PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE, SCOPE_PHRASE],
