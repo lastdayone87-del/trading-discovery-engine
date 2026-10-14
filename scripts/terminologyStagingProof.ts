@@ -94,9 +94,16 @@ async function verifyStagingTargetOrThrow(
   // Staging quiescence: these scripts require a worker-free database (fixture
   // channels must never be claimed by queue workers mid-run). The provisioned
   // staging database satisfies this; any jobs table activity refuses the run.
-  const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-  if (Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? 1) > 0) {
-    throw new Error('Refusing to run: jobs table is non-empty — staging database must have no workers pointed at it.');
+  let jobCount = -1;
+  try {
+    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`);
+    jobCount = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
+  } catch (error) {
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    throw new Error(`Refusing to run: staging probe failed on jobs check (${detail}) — verify the tunnel and staging database instead of retrying blindly.`);
+  }
+  if (jobCount !== 0) {
+    throw new Error(`Refusing to run: jobs table has ${jobCount} rows — staging database must have no workers pointed at it.`);
   }
   return { ssl: verdict.ssl, caFile: verdict.caFile };
 }
