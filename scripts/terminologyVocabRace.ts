@@ -24,7 +24,19 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { normalizeTerm, observeTerminologyDetailed } from '../server/terminologyIntelligence';
-import { verifyStagingTarget } from './stagingTargetGuard';
+import { sanitizedConnectionString, verifyStagingTarget } from './stagingTargetGuard';
+
+// Single pool constructor for this script: the connection string is stripped
+// of every TLS parameter first (proven: node-postgres lets URL parameters
+// override an explicit `ssl` object), then paired with the verdict's explicit
+// TLS configuration — no other TLS input can reach the opened connection.
+function stagingPool(
+  connectionString: string,
+  ssl: false | { rejectUnauthorized: boolean } | undefined,
+  extra?: Record<string, unknown>
+) {
+  return new pg.Pool({ connectionString: sanitizedConnectionString(connectionString), ssl, ...extra });
+}
 import { saveExtractedTerm } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
 
@@ -49,7 +61,7 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
-  const probe = new pg.Pool({ connectionString, ssl: verdict.ssl, connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  const probe = stagingPool(connectionString, verdict.ssl, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
   let probeError: unknown = null;
   try {
@@ -72,7 +84,10 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
 
 const COUNTRY_ALIAS = 'US';
 const COUNTRY_CANON = 'United States';
-const RUN = randomUUID().slice(0, 8);
+// Full-uuid run identity (32 hex): 8-hex suffixes collide across runs
+// sharing one staging database with probability 2^-32 per pair; full uuids
+// make fixture identity unique in practice as well as by construction.
+const RUN = randomUUID().replace(/-/g, '');
 const TERM = `race probe ${RUN}`;
 // Equivalent spellings, one canonical identity: racers must collapse to a
 // single vocabulary row no matter which surface form wins the insert race.
@@ -120,14 +135,17 @@ async function main() {
   // (transaction-bound advisory locks), the main pool serves seeds/asserts,
   // and getDb() is never touched. application_name tags race backends so a
   // straggler timeout can terminate exactly those connections.
-  const dbPool = new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 });
+  const dbPool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000 });
   onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   const db = dbPool;
   const createdChannels: string[] = [];
   const racers: Array<Promise<unknown>> = [];
+  // Per-run application name: a straggler termination in one invocation can
+  // never kill another concurrent run's writers sharing this database.
+  const appName = `terminology-vocab-race-${RUN}`;
   const pools = [
-    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000, application_name: 'terminology-vocab-race' }),
-    new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000, application_name: 'terminology-vocab-race' }),
+    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
+    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
   ];
   for (const pool of pools) {
     // Idle-client deaths must never crash the run; checked-out failures
@@ -159,9 +177,13 @@ async function main() {
       }, dbPool);
     }
   }
+  const clash = await db.query(
+    `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(TERM), COUNTRY_CANON]
+  );
+  check('fixture identity novel', clash.rows.length === 0, { term: TERM });
   const expected = await db.query(
     `SELECT COUNT(*)::int n FROM terminology_observations o JOIN canonical_trading_terms t ON t.id=o.canonical_term_id
-     WHERE t.country=$1 AND t.normalized_term=$2`, [COUNTRY_CANON, TERM.toLowerCase()]
+     WHERE t.country=$1 AND t.normalized_term=$2`, [COUNTRY_CANON, normalizeTerm(TERM)]
   );
   const expectedCount = Number(expected.rows[0]?.n);
   check('race preconditions committed', expectedCount === CHANNELS.length * OBS_PER_CHANNEL, { expectedCount });
@@ -223,17 +245,25 @@ async function main() {
       // that ignore cancel (their connections die; pool error handlers above
       // absorb the fallout).
       const cancelled = await db.query(
-        `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE application_name='terminology-vocab-race' AND pid<>pg_backend_pid()) s WHERE cancelled`
+        `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()) s WHERE cancelled`,
+        [appName]
       ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
       console.warn(`cleanup: cancelled ${Number((cancelled.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} straggler backends; their transactions abort`);
       let stillStuck = false;
       await bounded(Promise.allSettled(racers), 15_000, () => { stillStuck = true; }).catch(() => { stillStuck = true; });
       if (stillStuck) {
         const killed = await db.query(
-          `SELECT count(*)::int n FROM (SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name='terminology-vocab-race' AND pid<>pg_backend_pid()) s WHERE killed`
+          `SELECT count(*)::int n FROM (SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()) s WHERE killed`,
+        [appName]
         ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
         console.warn(`cleanup: terminated ${Number((killed.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} unresponsive backends; their transactions rolled back server-side`);
-        await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after termination; proceeding best-effort')).catch(() => undefined);
+        await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after termination')).catch(() => undefined);
+        const remaining = await db.query(
+          `SELECT count(*)::int n FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()`, [appName]
+        ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+        if (Number((remaining.rows[0] as Record<string, unknown> | undefined)?.n ?? 1) > 0) {
+          throw new Error('cleanup unverified: race backends still alive after termination — fixtures left in place, inspect staging before rerunning');
+        }
       }
     }
     const failures: string[] = [];
@@ -287,13 +317,15 @@ async function main() {
     } catch (error) {
       console.warn('cleanup: fixture removal incomplete (identity is run-unique; later runs unaffected)', error);
       throw error;
+    } finally {
+      // Pool shutdown runs even when cleanup throws: a failed cleanup must
+      // still release connections so the run exits with its error instead of
+      // hanging. Outer `timeout` remains the final backstop.
+      await bounded((async () => {
+        await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
+        await dbPool.end().catch(() => undefined);
+      })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
     }
-    // Bounded close: run the outer command under `timeout` as the final
-    // backstop against a wedged server; diagnostics above are already printed.
-    await bounded((async () => {
-      await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
-      await dbPool.end().catch(() => undefined);
-    })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
   }
 }
 

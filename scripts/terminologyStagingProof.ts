@@ -31,7 +31,19 @@ import {
   observeTerminologyDetailed,
   refreshTerminologyLifecycle,
 } from '../server/terminologyIntelligence';
-import { verifyStagingTarget } from './stagingTargetGuard';
+import { sanitizedConnectionString, verifyStagingTarget } from './stagingTargetGuard';
+
+// Single pool constructor for this script: the connection string is stripped
+// of every TLS parameter first (proven: node-postgres lets URL parameters
+// override an explicit `ssl` object), then paired with the verdict's explicit
+// TLS configuration — no other TLS input can reach the opened connection.
+function stagingPool(
+  connectionString: string,
+  ssl: false | { rejectUnauthorized: boolean } | undefined,
+  extra?: Record<string, unknown>
+) {
+  return new pg.Pool({ connectionString: sanitizedConnectionString(connectionString), ssl, ...extra });
+}
 import { saveExtractedTerm, getExtractedVocabulary } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
 import type { QueryRecord } from '../src/types';
@@ -59,7 +71,7 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
-  const probe = new pg.Pool({ connectionString, ssl: verdict.ssl, connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  const probe = stagingPool(connectionString, verdict.ssl, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
   let probeError: unknown = null;
   try {
@@ -167,7 +179,10 @@ const PHRASE = `e2e probe ${randomUUID().slice(0, 8)}`;
 const DEMOTE_PHRASE = `e2e demote probe ${randomUUID().slice(0, 8)}`;
 const ALIAS_PHRASE = `e2e alias probe ${randomUUID().slice(0, 8)}`;
 const SCOPE_PHRASE = `e2e scope probe ${randomUUID().slice(0, 8)}`;
-const RUN = randomUUID().slice(0, 8);
+// Full-uuid run identity (32 hex): an 8-hex suffix leaves a 2^-32 birthday
+// collision across runs sharing one staging database; full uuids make fixture
+// identity unique in practice as well as by construction (RETURNING-gated).
+const RUN = randomUUID().replace(/-/g, '');
 // Unique fixture IDs per run: no existing record is ever modified, and reruns
 // never collide with prior fixtures on a reused staging database.
 const CHANNELS = [1, 2, 3].map(i => `e2e-${RUN}-ch-${i}`);
@@ -205,7 +220,7 @@ async function main() {
   // Script-owned pool: every connection this run opens carries the verified
   // TLS configuration, and getDb() (with its own SSL semantics plus
   // migrations/seeds) is never touched.
-  const pool = new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 });
+  const pool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000 });
   const db = pool;
   const scope: RunScope = {
     createdChannels: [],
@@ -226,9 +241,13 @@ async function main() {
     );
     if (inserted.rows.length > 0) scope.createdChannels.push(channelId);
   }
-  // Phrase must be genuinely novel for the intended country on this database.
-  const pre = await db.query(`SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(PHRASE), COUNTRY]);
-  check('phrase novel', pre.rows.length === 0, { phrase: PHRASE });
+  // Fixture identities must be novel for their intended countries: abort
+  // when any pre-exists rather than reusing (and later deleting) another run's rows.
+  const pre = await db.query(
+    `SELECT normalized_term, country FROM canonical_trading_terms WHERE (normalized_term = ANY($1) AND country = ANY($2))`,
+    [scope.normPhrases, scope.countries]
+  );
+  check('fixture identities novel', pre.rows.length === 0, { clashes: pre.rows });
 
   // Leg 1: observation + save.
   const first = await observeTerminologyDetailed({
@@ -322,7 +341,7 @@ async function main() {
   const demoteQuery = { generation_metadata: { learnedTerm: DEMOTE_PHRASE }, country: COUNTRY } as unknown as QueryRecord;
   const zeroRun = funnel({ averageQualityScore: 5, performanceScore: 2 });
   for (let i = 0; i < 6; i++) {
-    await attributeTerminologyPerformance(demoteQuery, zeroRun as never, 1000);
+    await attributeTerminologyPerformance(demoteQuery, zeroRun as never, 1000, undefined, undefined, pool);
   }
   const demoted = await db.query(`SELECT lifecycle_status,search_eligible FROM canonical_trading_terms WHERE id=$1`, [demoteTermId]);
   check('term demotes and loses eligibility', demoted.rows[0]?.lifecycle_status === 'DEMOTED' && demoted.rows[0]?.search_eligible === false, demoted.rows[0]);
@@ -359,8 +378,11 @@ async function main() {
 
   console.log(`E2E PROOF COMPLETE (${passed} legs)`);
   } finally {
-    await cleanupRunFixtures(db, scope);
-    await pool.end().catch(() => undefined);
+    try {
+      await cleanupRunFixtures(db, scope);
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
   }
 }
 

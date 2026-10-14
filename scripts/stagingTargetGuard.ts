@@ -75,6 +75,40 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 /**
+ * Strip every TLS-related query parameter (`sslmode`, `sslcert`, `sslkey`,
+ * `sslrootcert`, …). Proven necessary by first-flight capture: in the bundled
+ * node-postgres, connection-string parameters OVERRIDE an explicitly supplied
+ * `ssl` object (URL `sslmode=disable` won over `{rejectUnauthorized:true}`,
+ * and the URL authority won over an explicit host), so a downgrade smuggled
+ * through the URL would survive an explicit object. Callers always pair the
+ * sanitized string with the verdict's explicit `ssl`, leaving no TLS input
+ * except the validated one. Throws on any `host`/`hostaddr` parameter, which
+ * must be refused (never silently rewritten) at the verdict layer.
+ */
+export function sanitizedConnectionString(connectionString: string): string {
+  const queryIndex = connectionString.indexOf('?');
+  if (queryIndex < 0) return connectionString;
+  const base = connectionString.slice(0, queryIndex);
+  const query = connectionString.slice(queryIndex + 1);
+  const kept: string[] = [];
+  for (const pair of query.split('&')) {
+    if (!pair) continue;
+    let name = pair.split('=', 1)[0];
+    try {
+      name = decodeURIComponent(name).toLowerCase();
+    } catch {
+      throw new Error('undecodable connection-string parameter');
+    }
+    if (name === 'host' || name === 'hostaddr') {
+      throw new Error('host query parameter must be refused, never rewritten');
+    }
+    if (name === 'sslmode' || name.startsWith('ssl')) continue;
+    kept.push(pair);
+  }
+  return kept.length > 0 ? `${base}?${kept.join('&')}` : base;
+}
+
+/**
  * Fail-closed verdict for a staging target. Refusals:
  * - empty hostname (kills implicit-socket / `?host=` bypass classes);
  * - any explicit `host` query parameter (pool must resolve the authority host);
