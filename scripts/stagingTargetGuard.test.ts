@@ -15,6 +15,8 @@ import {
   parseTargetHost,
   sslModeParam,
   sslModeParams,
+  sslRootCertParams,
+  tlsPoolConfig,
   verifyStagingTarget,
 } from './stagingTargetGuard';
 
@@ -149,6 +151,44 @@ test('downgradable sslmodes are refused on remote targets', () => {
       assert.deepEqual(verdict.ssl, { rejectUnauthorized: true });
     }
   });
+});
+
+test('loopback honors an explicit TLS request instead of PGSSL plaintext', () => {
+  withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
+    const verdict = verifyStagingTarget('postgresql://postgres:x@127.0.0.1:55433/postgres?sslmode=require');
+    assert.equal(verdict.ok, true);
+    assert.equal(verdict.loopback, true);
+    assert.deepEqual(verdict.ssl, { rejectUnauthorized: true });
+  });
+});
+
+test('client-certificate parameters are refused, plain and encoded', () => {
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:5432/db?sslcert=/c.pem&sslkey=/k.pem').ok, false);
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:5432/db?%73slcert=/c.pem').ok, false);
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:5432/db?%73slkey=/k.pem').ok, false);
+  });
+});
+
+test('custom CA files are carried for explicit loading, conflicts refused', () => {
+  assert.deepEqual(sslRootCertParams('postgresql://h/db?sslrootcert=/ca.pem'), ['/ca.pem']);
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'h' }, () => {
+    const verdict = verifyStagingTarget('postgresql://u:p@h/db?sslmode=verify-full&sslrootcert=/ca.pem');
+    assert.equal(verdict.ok, true);
+    assert.equal(verdict.caFile, '/ca.pem');
+    assert.deepEqual(tlsPoolConfig(verdict, () => 'CA-CONTENTS'), { rejectUnauthorized: true, ca: 'CA-CONTENTS' });
+    assert.throws(() => tlsPoolConfig(verdict, () => { throw new Error('unreadable'); }), /unreadable/);
+    const conflicted = verifyStagingTarget('postgresql://u:p@h/db?sslmode=require&sslrootcert=/a.pem&sslrootcert=/b.pem');
+    assert.equal(conflicted.ok, false);
+    const contradictory = verifyStagingTarget('postgresql://postgres:x@127.0.0.1:5432/db?sslrootcert=/ca.pem');
+    assert.equal(contradictory.ok, false);
+  });
+});
+
+test('tlsPoolConfig passes through loopback and verified settings', () => {
+  assert.equal(tlsPoolConfig({ ssl: false }), false);
+  assert.equal(tlsPoolConfig({ ssl: undefined }), undefined);
+  assert.deepEqual(tlsPoolConfig({ ssl: { rejectUnauthorized: true } }), { rejectUnauthorized: true });
 });
 
 test('loopback keeps application TLS semantics, including PGSSL=disable', () => {

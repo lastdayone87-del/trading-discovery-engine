@@ -7,14 +7,6 @@
  * `getDb()` must never be touched before, because it runs migrations and
  * seedDefaults() (both write).
  */
-export interface TargetVerdict {
-  ok: boolean;
-  reason?: string;
-  loopback: boolean;
-  host: string;
-  /** Exact `ssl` value to pass node-postgres. `false` only for loopback. */
-  ssl: false | { rejectUnauthorized: boolean } | undefined;
-}
 
 /** Hostname exactly as the pool will resolve it (brackets stripped). */
 export function parseTargetHost(connectionString: string): string {
@@ -72,6 +64,52 @@ export function sslModeParam(connectionString: string): string | null {
 
 export function isLoopbackHost(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+export interface TargetVerdict {
+  ok: boolean;
+  reason?: string;
+  loopback: boolean;
+  host: string;
+  /** Exact `ssl` value to pass node-postgres. `false` only for loopback. */
+  ssl: false | { rejectUnauthorized: boolean } | undefined;
+  /** Custom CA file from `sslrootcert`, for the caller to load explicitly. */
+  caFile?: string;
+}
+
+/** Decoded `sslrootcert` values present (pg applies the last one). */
+export function sslRootCertParams(connectionString: string): string[] | null {
+  const queryIndex = connectionString.indexOf('?');
+  if (queryIndex < 0) return [];
+  const values: string[] = [];
+  try {
+    const query = decodeURIComponent(connectionString.slice(queryIndex));
+    const pattern = /[?&]sslrootcert=([^&#]*)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(query)) !== null) values.push(decodeURIComponent(match[1]));
+  } catch {
+    return null;
+  }
+  return values;
+}
+
+/**
+ * Concrete node-postgres TLS configuration for a passing verdict. A custom CA
+ * file is loaded explicitly (never silently dropped); any load failure
+ * refuses the connection. The file reader is injectable for unit tests.
+ */
+export function tlsPoolConfig(
+  verdict: Pick<TargetVerdict, 'ssl' | 'caFile'>,
+  readFile: (path: string) => string = (path: string): string => {
+    const fs: { readFileSync(path: string, encoding: 'utf8'): string } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('node:fs') as unknown as { readFileSync(path: string, encoding: 'utf8'): string };
+    return fs.readFileSync(path, 'utf8');
+  }
+): false | { rejectUnauthorized: boolean; ca?: string } | undefined {
+  if (verdict.ssl === false || verdict.ssl === undefined) return verdict.ssl;
+  if (verdict.caFile === undefined) return verdict.ssl;
+  return { rejectUnauthorized: true, ca: readFile(verdict.caFile) };
 }
 
 /**
@@ -148,6 +186,23 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
   if (!targetAllowlist().includes(host)) {
     return { ok: false, loopback, host, ssl: undefined, reason: `host '${host}' is not allowlisted for staging targets (STAGING_TARGET_ALLOWLIST)` };
   }
+  // Client-certificate parameters must never be silently dropped (which
+  // would fail confusingly) nor ingested by throwaway scripts: refuse them
+  // outright. Checked on the DECODED query — `%73slcert`-style encodings are
+  // honored by the driver and must not slip through a raw-string check.
+  const decoded = decodedQuery(connectionString);
+  if (decoded !== null && /(?:^|[?&])ssl(cert|key)\s*=/i.test(decoded)) {
+    return { ok: false, loopback, host, ssl: undefined, reason: 'client-certificate parameters (sslcert/sslkey) are not supported by staging scripts — refusing instead of dropping them silently' };
+  }
+  const caFiles = sslRootCertParams(connectionString);
+  if (caFiles === null) {
+    return { ok: false, loopback, host, ssl: undefined, reason: 'undecodable query string' };
+  }
+  if (new Set(caFiles).size > 1) {
+    return { ok: false, loopback, host, ssl: undefined, reason: 'conflicting sslrootcert parameters' };
+  }
+  const caFile = caFiles.length > 0 ? caFiles[caFiles.length - 1] : undefined;
+  const withCa = caFile !== undefined ? { caFile } : {};
   if (!loopback) {
     // Conflicting duplicates are refused instead of guessing which value the
     // driver applies — ambiguity must never resolve toward weaker transport.
@@ -166,7 +221,21 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
     // (verified: an explicit `ssl` object overrides any URL-parsed downgrade,
     // including encoded or duplicated parameters), so the opened connection
     // cannot differ from what was validated here.
-    return { ok: true, loopback, host, ssl: { rejectUnauthorized: true } };
+    return { ok: true, loopback, host, ssl: { rejectUnauthorized: true }, ...withCa };
+  }
+  const modes = sslModeParams(connectionString);
+  if (modes === null) {
+    return { ok: false, loopback, host, ssl: undefined, reason: 'undecodable query string' };
+  }
+  // An explicitly requested TLS upgrade is honored even on loopback: the
+  // URL's request wins over the PGSSL default, so `sslmode=require` never
+  // silently becomes plaintext.
+  const requestedTls = modes.some(mode => mode === 'require' || mode === 'verify-ca' || mode === 'verify-full');
+  if (caFile !== undefined && !requestedTls) {
+    return { ok: false, loopback, host, ssl: undefined, reason: 'sslrootcert without a TLS request (sslmode=require) is contradictory — refusing' };
+  }
+  if (requestedTls) {
+    return { ok: true, loopback, host, ssl: { rejectUnauthorized: true }, ...withCa };
   }
   const ssl =
     process.env.PGSSL === 'disable'
@@ -174,5 +243,5 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
       : process.env.NODE_ENV === 'production'
         ? { rejectUnauthorized: false }
         : undefined;
-  return { ok: true, loopback, host, ssl };
+  return { ok: true, loopback, host, ssl, ...withCa };
 }

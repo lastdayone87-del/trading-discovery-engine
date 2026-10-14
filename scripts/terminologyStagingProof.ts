@@ -31,7 +31,7 @@ import {
   observeTerminologyDetailed,
   refreshTerminologyLifecycle,
 } from '../server/terminologyIntelligence';
-import { sanitizedConnectionString, verifyStagingTarget } from './stagingTargetGuard';
+import { sanitizedConnectionString, tlsPoolConfig, verifyStagingTarget } from './stagingTargetGuard';
 
 // Single pool constructor for this script: the connection string is stripped
 // of every TLS parameter first (proven: node-postgres lets URL parameters
@@ -39,10 +39,10 @@ import { sanitizedConnectionString, verifyStagingTarget } from './stagingTargetG
 // TLS configuration — no other TLS input can reach the opened connection.
 function stagingPool(
   connectionString: string,
-  ssl: false | { rejectUnauthorized: boolean } | undefined,
+  tls: { ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string },
   extra?: Record<string, unknown>
 ) {
-  return new pg.Pool({ connectionString: sanitizedConnectionString(connectionString), ssl, ...extra });
+  return new pg.Pool({ connectionString: sanitizedConnectionString(connectionString), ssl: tlsPoolConfig(tls), ...extra });
 }
 import { saveExtractedTerm, getExtractedVocabulary } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
@@ -71,7 +71,7 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
-  const probe = stagingPool(connectionString, verdict.ssl, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  const probe = stagingPool(connectionString, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
   let probeError: unknown = null;
   try {
@@ -240,7 +240,7 @@ async function main() {
   // Script-owned pool: every connection this run opens carries the verified
   // TLS configuration, and getDb() (with its own SSL semantics plus
   // migrations/seeds) is never touched.
-  const pool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
+  const pool = stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
   const db = pool;
   const scope: RunScope = {
     createdChannels: [],

@@ -24,7 +24,7 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { normalizeTerm, observeTerminologyDetailed } from '../server/terminologyIntelligence';
-import { sanitizedConnectionString, verifyStagingTarget } from './stagingTargetGuard';
+import { sanitizedConnectionString, tlsPoolConfig, verifyStagingTarget } from './stagingTargetGuard';
 
 // Single pool constructor for this script: the connection string is stripped
 // of every TLS parameter first (proven: node-postgres lets URL parameters
@@ -32,11 +32,12 @@ import { sanitizedConnectionString, verifyStagingTarget } from './stagingTargetG
 // TLS configuration — no other TLS input can reach the opened connection.
 function stagingPool(
   connectionString: string,
-  ssl: false | { rejectUnauthorized: boolean } | undefined,
+  tls: { ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string },
   extra?: Record<string, unknown>
 ) {
-  return new pg.Pool({ connectionString: sanitizedConnectionString(connectionString), ssl, ...extra });
+  return new pg.Pool({ connectionString: sanitizedConnectionString(connectionString), ssl: tlsPoolConfig(tls), ...extra });
 }
+
 import { saveExtractedTerm } from '../server/dbCore';
 import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
 
@@ -61,7 +62,7 @@ async function verifyStagingTargetOrThrow(connectionString: string): Promise<fal
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
-  const probe = stagingPool(connectionString, verdict.ssl, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  const probe = stagingPool(connectionString, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
   let probeError: unknown = null;
   try {
@@ -209,7 +210,7 @@ async function main() {
   // (transaction-bound advisory locks), the main pool serves seeds/asserts,
   // and getDb() is never touched. application_name tags race backends so a
   // straggler timeout can terminate exactly those connections.
-  const dbPool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000 });
+  const dbPool = stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000 });
   onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   const db = dbPool;
   const createdChannels: string[] = [];
@@ -218,8 +219,8 @@ async function main() {
   // never kill another concurrent run's writers sharing this database.
   const appName = `terminology-vocab-race-${RUN}`;
   const pools = [
-    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
-    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
+    stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000, application_name: appName }),
+    stagingPool(connectionString, { ssl: targetSsl }, { connectionTimeoutMillis: 15_000, application_name: appName }),
   ];
   for (const pool of pools) {
     // Idle-client deaths must never crash the run; checked-out failures
