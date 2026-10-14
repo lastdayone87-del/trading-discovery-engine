@@ -7,6 +7,8 @@
  * `getDb()` must never be touched before, because it runs migrations and
  * seedDefaults() (both write).
  */
+import { readFileSync } from 'node:fs';
+import { lookup as dnsLookupCallback } from 'node:dns';
 
 /** Hostname exactly as the pool will resolve it (brackets stripped). */
 export function parseTargetHost(connectionString: string): string {
@@ -100,12 +102,7 @@ export function sslRootCertParams(connectionString: string): string[] | null {
  */
 export function tlsPoolConfig(
   verdict: Pick<TargetVerdict, 'ssl' | 'caFile'>,
-  readFile: (path: string) => string = (path: string): string => {
-    const fs: { readFileSync(path: string, encoding: 'utf8'): string } =
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('node:fs') as unknown as { readFileSync(path: string, encoding: 'utf8'): string };
-    return fs.readFileSync(path, 'utf8');
-  }
+  readFile: (path: string) => string = (path: string): string => readFileSync(path, 'utf8')
 ): false | { rejectUnauthorized: boolean; ca?: string } | undefined {
   if (verdict.ssl === false || verdict.ssl === undefined) return verdict.ssl;
   if (verdict.caFile === undefined) return verdict.ssl;
@@ -251,4 +248,79 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
         ? { rejectUnauthorized: false }
         : undefined;
   return { ok: true, loopback, host, ssl, ...withCa };
+}
+
+export type DnsLookup = (host: string) => Promise<string[]>;
+
+export function isLoopbackAddress(ip: string): boolean {
+  return ip.startsWith('127.') || ip === '::1';
+}
+
+function defaultLookup(host: string): Promise<string[]> {
+  return new Promise<string[]>((resolve, reject) => {
+    dnsLookupCallback(host, { all: true }, (error, addresses) => {
+      if (error) reject(error);
+      else resolve(addresses.map(entry => entry.address));
+    });
+  });
+}
+
+/**
+ * Resolve a loopback-classified hostname and pin the connection string to a
+ * verified loopback IP. Refuses when any resolved address is not loopback
+ * (poisoned resolver/hosts file) or when resolution itself fails. Remote
+ * targets are returned unchanged — their verified TLS (hostname-checked
+ * against the original name) already defeats resolver lies.
+ */
+export async function pinLoopbackTarget(
+  connectionString: string,
+  lookup: DnsLookup = defaultLookup
+): Promise<{ connectionString: string; address: string }> {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    throw new Error('unparseable connection string — refusing');
+  }
+  let addrs: string[];
+  try {
+    addrs = (await lookup(url.hostname)).map(entry => entry.toLowerCase());
+  } catch (error) {
+    throw new Error(`DNS resolution failed for '${url.hostname}' — refusing (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (addrs.length === 0 || !addrs.every(isLoopbackAddress)) {
+    throw new Error(`loopback hostname '${url.hostname}' resolves to non-loopback addresses [${addrs.join(',')}] — refusing (possible resolver poisoning)`);
+  }
+  url.hostname = addrs[0];
+  return { connectionString: url.toString(), address: addrs[0] };
+}
+
+export interface StagingIdentity {
+  token: string;
+  serverAddr: string | null;
+  dbName: string;
+}
+
+/**
+ * Re-verify staging identity on a work pool before its first write: the same
+ * marker token, server address, and database name the probe verified. A DNS
+ * or routing change between the probe and pool creation surfaces here instead
+ * of silently writing to a different database.
+ */
+export async function assertStagingIdentity(
+  db: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> },
+  expected: StagingIdentity
+): Promise<void> {
+  const res = await db.query(
+    `SELECT (SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging') AS token,
+            inet_server_addr()::text AS addr, current_database() AS db`
+  );
+  const row = (res.rows[0] ?? {}) as Record<string, unknown>;
+  if (row.token !== expected.token) throw new Error('staging identity re-check failed: marker token mismatch');
+  if ((row.addr ?? null) !== expected.serverAddr) {
+    throw new Error(`staging identity re-check failed: server address changed (${String(row.addr)} !== ${String(expected.serverAddr)})`);
+  }
+  if (row.db !== expected.dbName) {
+    throw new Error(`staging identity re-check failed: database changed (${String(row.db)} !== ${expected.dbName})`);
+  }
 }

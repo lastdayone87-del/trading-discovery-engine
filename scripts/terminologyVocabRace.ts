@@ -24,7 +24,8 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { normalizeTerm, observeTerminologyDetailed } from '../server/terminologyIntelligence';
-import { sanitizedConnectionString, tlsPoolConfig, verifyStagingTarget } from './stagingTargetGuard';
+import { assertStagingIdentity, pinLoopbackTarget, sanitizedConnectionString, tlsPoolConfig, verifyStagingTarget } from './stagingTargetGuard';
+import type { StagingIdentity } from './stagingTargetGuard';
 
 // Single pool constructor for this script: the connection string is stripped
 // of every TLS parameter first (proven: node-postgres lets URL parameters
@@ -59,15 +60,25 @@ function targetConnectionString(): string {
 // pools below.
 async function verifyStagingTargetOrThrow(
   connectionString: string
-): Promise<{ ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string }> {
+): Promise<{
+  connectionString: string;
+  tls: { ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string };
+  identity: StagingIdentity;
+}> {
   const expectedToken = process.env.STAGING_PROOF_TOKEN;
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
-  const probe = stagingPool(connectionString, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  let pinned = connectionString;
+  if (verdict.loopback) {
+    pinned = (await pinLoopbackTarget(connectionString)).connectionString;
+  }
+  const probe = stagingPool(pinned, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
   let activeJobs = -1;
   let clusterId: string | null = null;
+  let serverAddr: string | null = null;
+  let dbName = '';
   let probeError: unknown = null;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
@@ -78,6 +89,9 @@ async function verifyStagingTargetOrThrow(
     activeJobs = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
     const sysid = await probe.query(`SELECT system_identifier::text AS sysid FROM pg_control_system()`);
     clusterId = String((sysid.rows[0] as Record<string, unknown> | undefined)?.sysid ?? '');
+    const endpoint = await probe.query(`SELECT inet_server_addr()::text AS addr, current_database() AS db`);
+    serverAddr = (endpoint.rows[0] as Record<string, unknown> | undefined)?.addr as string | null ?? null;
+    dbName = String((endpoint.rows[0] as Record<string, unknown> | undefined)?.db ?? '');
   } catch (error) {
     probeError = error;
   } finally {
@@ -110,7 +124,11 @@ async function verifyStagingTargetOrThrow(
   if (clusterId !== expectedClusterId) {
     throw new Error('Refusing to run: cluster identifier mismatch — target is not the provisioned staging database (possible clone).');
   }
-  return { ssl: verdict.ssl, caFile: verdict.caFile };
+  return {
+    connectionString: pinned,
+    tls: { ssl: verdict.ssl, caFile: verdict.caFile },
+    identity: { token: expectedToken, serverAddr, dbName },
+  };
 }
 
 const COUNTRY_ALIAS = 'US';
@@ -238,13 +256,17 @@ async function cleanupRaceFixtures(
 
 async function main() {
   const connectionString = targetConnectionString();
-  const targetSsl = await verifyStagingTargetOrThrow(connectionString);
-  process.env.DATABASE_URL = connectionString!;
-  // Script-owned pools (verified TLS): race writers each get a pool directly
-  // (transaction-bound advisory locks), the main pool serves seeds/asserts,
-  // and getDb() is never touched. application_name tags race backends so a
-  // straggler timeout can terminate exactly those connections.
-  const dbPool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000 });
+  const target = await verifyStagingTargetOrThrow(connectionString);
+  process.env.DATABASE_URL = target.connectionString!;
+  // Script-owned pools on the PINNED connection string (verified TLS):
+  // race writers each get a pool directly (transaction-bound advisory locks),
+  // the main pool serves seeds/asserts, and getDb() is never touched.
+  // application_name tags race backends so a straggler timeout can terminate
+  // exactly those connections.
+  const dbPool = stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
+  onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
+  // Endpoint re-verification before any write.
+  await assertStagingIdentity(dbPool, target.identity);
   onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   const db = dbPool;
   const createdChannels: string[] = [];
@@ -253,9 +275,13 @@ async function main() {
   // never kill another concurrent run's writers sharing this database.
   const appName = `terminology-vocab-race-${RUN}`;
   const pools = [
-    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
-    stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, application_name: appName }),
+    stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, application_name: appName }),
+    stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, application_name: appName }),
   ];
+  // Endpoint re-verification on each writer pool before racers launch.
+  for (const pool of pools) {
+    await assertStagingIdentity(pool, target.identity);
+  }
   for (const pool of pools) {
     // Idle-client deaths must never crash the run; checked-out failures
     // surface through the writers' rejected promises below.

@@ -15,6 +15,13 @@
  *   Run with STAGING_PROOF_TOKEN=<same-token>: the pre-init check compares it
  *   before any initializing connection, so a database that merely contains
  *   the marker row (e.g. a copy) still refuses without the pairing token.
+ *   Run with STAGING_SYSTEM_IDENTIFIER=<pg_control_system() of staging> and
+ *   (for non-loopback targets) STAGING_TARGET_ALLOWLIST=<host,...>.
+ *
+ * Quiescence requirement: run only against a staging database with no
+ * workers pointed at it. The scripts refuse active queue work at startup
+ * and fail loudly if any appears mid-run; they cannot prevent an operator
+ * from starting workers against staging during verification.
  *
  * Non-coverage note: this proof exercises duplicate-observation suppression
  * (Leg 2), not removal of rule-admitted instruments from overlapping AI
@@ -31,7 +38,8 @@ import {
   observeTerminologyDetailed,
   refreshTerminologyLifecycle,
 } from '../server/terminologyIntelligence';
-import { sanitizedConnectionString, tlsPoolConfig, verifyStagingTarget } from './stagingTargetGuard';
+import { assertStagingIdentity, pinLoopbackTarget, sanitizedConnectionString, tlsPoolConfig, verifyStagingTarget } from './stagingTargetGuard';
+import type { StagingIdentity } from './stagingTargetGuard';
 
 // Single pool constructor for this script: the connection string is stripped
 // of every TLS parameter first (proven: node-postgres lets URL parameters
@@ -68,15 +76,29 @@ function targetConnectionString(): string {
 // a black-holed endpoint fails instead of hanging.
 async function verifyStagingTargetOrThrow(
   connectionString: string
-): Promise<{ ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string }> {
+): Promise<{
+  connectionString: string;
+  tls: { ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string };
+  identity: StagingIdentity;
+}> {
   const expectedToken = process.env.STAGING_PROOF_TOKEN;
   if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
-  const probe = stagingPool(connectionString, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  // Pin loopback hostnames to a verified loopback IP so later pools cannot
+  // resolve the same name differently (DNS change between probe and work
+  // pools). Remote targets keep the original hostname: their verified TLS
+  // checks the certificate against that name.
+  let pinned = connectionString;
+  if (verdict.loopback) {
+    pinned = (await pinLoopbackTarget(connectionString)).connectionString;
+  }
+  const probe = stagingPool(pinned, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
   let activeJobs = -1;
   let clusterId: string | null = null;
+  let serverAddr: string | null = null;
+  let dbName = '';
   let probeError: unknown = null;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
@@ -87,6 +109,9 @@ async function verifyStagingTargetOrThrow(
     activeJobs = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
     const sysid = await probe.query(`SELECT system_identifier::text AS sysid FROM pg_control_system()`);
     clusterId = String((sysid.rows[0] as Record<string, unknown> | undefined)?.sysid ?? '');
+    const endpoint = await probe.query(`SELECT inet_server_addr()::text AS addr, current_database() AS db`);
+    serverAddr = (endpoint.rows[0] as Record<string, unknown> | undefined)?.addr as string | null ?? null;
+    dbName = String((endpoint.rows[0] as Record<string, unknown> | undefined)?.db ?? '');
   } catch (error) {
     probeError = error;
   } finally {
@@ -117,7 +142,11 @@ async function verifyStagingTargetOrThrow(
   if (clusterId !== expectedClusterId) {
     throw new Error('Refusing to run: cluster identifier mismatch — target is not the provisioned staging database (possible clone).');
   }
-  return { ssl: verdict.ssl, caFile: verdict.caFile };
+  return {
+    connectionString: pinned,
+    tls: { ssl: verdict.ssl, caFile: verdict.caFile },
+    identity: { token: expectedToken, serverAddr, dbName },
+  };
 }
 
 interface RunScope {
@@ -269,11 +298,14 @@ function evidenceFor(channelId: string, videoId: string, phrase: string) {
 
 async function main() {
   const connectionString = targetConnectionString();
-  const targetSsl = await verifyStagingTargetOrThrow(connectionString);
-  // Script-owned pool: every connection this run opens carries the verified
-  // TLS configuration, and getDb() (with its own SSL semantics plus
-  // migrations/seeds) is never touched.
-  const pool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
+  const target = await verifyStagingTargetOrThrow(connectionString);
+  // Script-owned pool on the PINNED connection string: every connection this
+  // run opens carries the verified TLS configuration, and getDb() (with its
+  // own SSL semantics plus migrations/seeds) is never touched.
+  const pool = stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
+  // Endpoint re-verification: a DNS/routing change between the probe and this
+  // pool would otherwise write to an unprobed database.
+  await assertStagingIdentity(pool, target.identity);
   const db = pool;
   let shuttingDown = false;
   // First signal stops scheduling new writes: legs abort at the next check

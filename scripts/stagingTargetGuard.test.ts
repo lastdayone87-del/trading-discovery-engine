@@ -9,10 +9,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  assertStagingIdentity,
   decodedQuery,
   hasHostOverrideParam,
+  isLoopbackAddress,
   isLoopbackHost,
   parseTargetHost,
+  pinLoopbackTarget,
   sslModeParam,
   sslModeParams,
   sslRootCertParams,
@@ -74,27 +77,37 @@ test('percent-encoded host parameters are decoded and rejected', () => {
   assert.equal(hasHostOverrideParam('postgresql:///db?%68ost=evil.example'), true);
   // Empty-authority rejection alone would also pass here, so assert the
   // valid-authority case: the verdict must refuse on the decoded parameter.
-  assert.equal(verifyStagingTarget('postgresql://dbhost/db?%68ost=evil.example').ok, false);
-  assert.equal(verifyStagingTarget('postgresql://dbhost/db?host=evil.example').ok, false);
+  // (Allowlisted: without it the default loopback-only list refuses first and
+  // the parameter check is never exercised.)
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost' }, () => {
+    assert.equal(verifyStagingTarget('postgresql://dbhost/db?%68ost=evil.example').ok, false);
+    assert.equal(verifyStagingTarget('postgresql://dbhost/db?host=evil.example').ok, false);
+  });
 });
 
 test('percent-encoded TLS downgrades are decoded and rejected', () => {
   // ?%73slmode=disable parses to ssl=false (verified empirically).
   assert.deepEqual(sslModeParams('postgresql://10.0.1.8/db?%73slmode=disable'), ['disable']);
-  assert.equal(verifyStagingTarget('postgresql://10.0.1.8/db?%73slmode=disable').ok, false);
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: '10.0.1.8' }, () => {
+    assert.equal(verifyStagingTarget('postgresql://10.0.1.8/db?%73slmode=disable').ok, false);
+  });
 });
 
 test('malformed percent-encoding fails closed', () => {
   assert.equal(decodedQuery('postgresql://h/db?%zz'), null);
-  assert.equal(verifyStagingTarget('postgresql://h/db?%zz').ok, false);
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'h' }, () => {
+    assert.equal(verifyStagingTarget('postgresql://h/db?%zz').ok, false);
+  });
 });
 
 test('duplicate parameters resolve safely: host refused, conflicting sslmode refused', () => {
   // pg applies the LAST duplicate; conflicting values are refused instead of
   // guessing. Identical repeats are harmless.
-  assert.equal(verifyStagingTarget('postgresql://h/db?host=a.example&host=b.example').ok, false);
-  assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=require&sslmode=disable').ok, false);
-  assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=disable&sslmode=require').ok, false);
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'h,a.example,b.example' }, () => {
+    assert.equal(verifyStagingTarget('postgresql://h/db?host=a.example&host=b.example').ok, false);
+    assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=require&sslmode=disable').ok, false);
+    assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=disable&sslmode=require').ok, false);
+  });
   withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost,h,10.0.1.8' }, () => {
     assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=require&sslmode=require').ok, true);
   });
@@ -121,6 +134,11 @@ test('empty authority hostname is refused (no implicit host fallback)', () => {
 test('explicit host query parameter is refused', () => {
   const verdict = verifyStagingTarget('postgresql:///dbname?host=10.0.1.8');
   assert.equal(verdict.ok, false);
+  // Non-empty authority: refusal must come from the parameter check itself,
+  // not from the empty-authority rule.
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost' }, () => {
+    assert.equal(verifyStagingTarget('postgresql://dbhost/db?host=10.0.1.8').ok, false);
+  });
 });
 
 test('silent non-loopback target is upgraded to verified TLS, never plaintext', () => {
@@ -132,8 +150,10 @@ test('silent non-loopback target is upgraded to verified TLS, never plaintext', 
 });
 
 test('PGSSL=disable never disables TLS for a remote target', () => {
+  // No sslmode in the URL: the verdict must upgrade the silent remote target
+  // to verified TLS on its own — PGSSL=disable applies to loopback only.
   withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost,h,10.0.1.8' }, () => {
-    const verdict = verifyStagingTarget('postgresql://u:p@10.0.1.8:5432/db?sslmode=require');
+    const verdict = verifyStagingTarget('postgresql://u:p@10.0.1.8:5432/db');
     assert.equal(verdict.ok, true);
     assert.deepEqual(verdict.ssl, { rejectUnauthorized: true });
   });
@@ -215,4 +235,47 @@ test('loopback keeps application TLS semantics, including PGSSL=disable', () => 
     assert.equal(verdict.loopback, true);
     assert.equal(verdict.ssl, undefined);
   });
+});
+
+test('loopback hostnames pin to verified loopback IPs', async () => {
+  const pinned = await pinLoopbackTarget('postgresql://postgres:x@localhost:55433/postgres', async () => ['127.0.0.1']);
+  assert.equal(pinned.address, '127.0.0.1');
+  assert.ok(pinned.connectionString.includes('127.0.0.1'));
+  // Poisoned resolver: one non-loopback address refuses the target.
+  await assert.rejects(
+    pinLoopbackTarget('postgresql://postgres:x@localhost:55433/postgres', async () => ['127.0.0.1', '10.0.1.8']),
+    /non-loopback/
+  );
+  await assert.rejects(
+    pinLoopbackTarget('postgresql://postgres:x@localhost:55433/postgres', async () => { throw new Error('no DNS'); }),
+    /DNS resolution failed/
+  );
+});
+
+test('loopback address classification is strict', () => {
+  assert.equal(isLoopbackAddress('127.0.0.1'), true);
+  assert.equal(isLoopbackAddress('127.0.0.2'), true);
+  assert.equal(isLoopbackAddress('::1'), true);
+  assert.equal(isLoopbackAddress('10.0.1.8'), false);
+  assert.equal(isLoopbackAddress('::ffff:127.0.0.1'), false);
+});
+
+test('work-pool identity re-check detects endpoint changes', async () => {
+  const expected = { token: 'tok', serverAddr: '10.0.1.8', dbName: 'postgres' };
+  const goodDb = {
+    query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.8', db: 'postgres' }] }),
+  };
+  await assertStagingIdentity(goodDb, expected);
+  const badToken = {
+    query: async () => ({ rows: [{ token: 'other', addr: '10.0.1.8', db: 'postgres' }] }),
+  };
+  await assert.rejects(assertStagingIdentity(badToken, expected), /token mismatch/);
+  const movedHost = {
+    query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.9', db: 'postgres' }] }),
+  };
+  await assert.rejects(assertStagingIdentity(movedHost, expected), /server address changed/);
+  const movedDb = {
+    query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.8', db: 'prod' }] }),
+  };
+  await assert.rejects(assertStagingIdentity(movedDb, expected), /database changed/);
 });
