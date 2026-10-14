@@ -299,6 +299,9 @@ export interface StagingIdentity {
   token: string;
   serverAddr: string | null;
   dbName: string;
+  /** Cluster identifier: a rerouted clone in another cluster fails here even
+   * when token, address, and database name all match. */
+  sysid: string;
 }
 
 /**
@@ -313,7 +316,8 @@ export async function assertStagingIdentity(
 ): Promise<void> {
   const res = await db.query(
     `SELECT (SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging') AS token,
-            inet_server_addr()::text AS addr, current_database() AS db`
+            inet_server_addr()::text AS addr, current_database() AS db,
+            (SELECT system_identifier::text AS sysid FROM pg_control_system()) AS sysid`
   );
   const row = (res.rows[0] ?? {}) as Record<string, unknown>;
   if (row.token !== expected.token) throw new Error('staging identity re-check failed: marker token mismatch');
@@ -322,5 +326,8 @@ export async function assertStagingIdentity(
   }
   if (row.db !== expected.dbName) {
     throw new Error(`staging identity re-check failed: database changed (${String(row.db)} !== ${expected.dbName})`);
+  }
+  if (String(row.sysid ?? '') !== expected.sysid) {
+    throw new Error('staging identity re-check failed: cluster identifier changed (possible reroute to a cloned cluster)');
   }
 }

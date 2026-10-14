@@ -145,7 +145,7 @@ async function verifyStagingTargetOrThrow(
   return {
     connectionString: pinned,
     tls: { ssl: verdict.ssl, caFile: verdict.caFile },
-    identity: { token: expectedToken, serverAddr, dbName },
+    identity: { token: expectedToken, serverAddr, dbName, sysid: clusterId ?? '' },
   };
 }
 
@@ -250,6 +250,83 @@ async function cleanupRunFixtures(
     console.log('cleanup: removed run fixtures, residue verified 0');
   }
 }
+
+// Durable run ownership: every run registers itself AFTER the novelty
+// preflight passes, and marks completion at the end. A process crash between
+// those points leaves an unfinished row; `--recover` cleans runs abandoned
+// for over an hour (younger rows may still be alive) by re-resolving their
+// run-unique fixture identity — the same scoping rules as normal cleanup,
+// never broader. The registry table is staging-only tooling state.
+type RunDb = { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> };
+
+async function ensureRunRegistry(db: RunDb): Promise<void> {
+  await db.query(
+    `CREATE TABLE IF NOT EXISTS staging_proof_runs(run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'started')`
+  );
+}
+
+async function registerRun(db: RunDb, runId: string, kind: string): Promise<void> {
+  await ensureRunRegistry(db);
+  await db.query(`INSERT INTO staging_proof_runs(run_id, kind) VALUES($1,$2) ON CONFLICT(run_id) DO NOTHING`, [runId, kind]);
+}
+
+async function finishRun(db: RunDb, runId: string, status: 'complete' | 'failed' | 'recovered' | 'recovery-failed'): Promise<void> {
+  await db
+    .query(`UPDATE staging_proof_runs SET finished_at=now(), status=$2 WHERE run_id=$1`, [runId, status])
+    .catch(error => console.warn('run registry update failed (non-fatal)', error instanceof Error ? error.message : String(error)));
+}
+
+// Recovery entry point for `--recover` runs: abandoned run ids (unfinished
+// for over an hour — younger rows may still be alive). Never throws for a
+// missing registry (a staging database without it simply has nothing).
+async function findAbandonedRuns(db: RunDb, kind: string): Promise<Array<{ runId: string }>> {
+  const rows = await db
+    .query(
+      `SELECT run_id FROM staging_proof_runs WHERE kind=$1 AND finished_at IS NULL AND started_at < now() - interval '1 hour'`,
+      [kind]
+    )
+    .catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  return (rows.rows as Array<Record<string, unknown>>)
+    .map(row => String(row.run_id ?? ''))
+    .filter(runId => runId.length >= 8)
+    .map(runId => ({ runId }));
+}
+
+// Resolve one abandoned run's fixtures by its run-unique identity and remove
+// them through the same scoped cleanup as normal runs, then mark it
+// recovered. Returns leftover row counts for reporting.
+async function recoverProofRun(db: RunDb, runId: string): Promise<number> {
+  const terms = await db.query(
+    `SELECT normalized_term, country FROM canonical_trading_terms WHERE normalized_term LIKE $1`, [`%${runId.toLowerCase()}%`]
+  );
+  const vocabs = await db.query(`SELECT term, country FROM extracted_trading_vocabulary WHERE term ILIKE $1`, [`%${runId}%`]);
+  const chans = await db.query(`SELECT channel_id FROM channels WHERE channel_id LIKE $1`, [`%${runId}%`]);
+  const scope: RunScope = {
+    createdChannels: (chans.rows as Array<Record<string, unknown>>).map(row => String(row.channel_id)),
+    rawPhrases: (vocabs.rows as Array<Record<string, unknown>>).map(row => String(row.term)),
+    normPhrases: (terms.rows as Array<Record<string, unknown>>).map(row => String(row.normalized_term)),
+    countries: [...new Set([
+      ...(terms.rows as Array<Record<string, unknown>>).map(row => String(row.country)),
+      ...(vocabs.rows as Array<Record<string, unknown>>).map(row => String(row.country)),
+    ])],
+    preflightPassed: true,
+  };
+  try {
+    await cleanupRunFixtures(db, scope);
+  } catch (error) {
+    console.error(`recovery of run ${runId} incomplete`, error instanceof Error ? error.message : String(error));
+  }
+  const residue = await db.query(
+    `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE term ILIKE $1) AS vocab,
+            (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term LIKE $2) AS terms,
+            (SELECT COUNT(*) FROM channels WHERE channel_id LIKE $1) AS channels`,
+    [`%${runId}%`, `%${runId.toLowerCase()}%`]
+  ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
+  const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
+  await finishRun(db, runId, remaining === 0 ? 'recovered' : 'recovery-failed');
+  return remaining;
+}
 const COUNTRY = 'Germany';
 const ALIAS_COUNTRY = 'US';
 // Full-uuid run identity (32 hex): an 8-hex suffix leaves a 2^-32 birthday
@@ -307,6 +384,22 @@ async function main() {
   // pool would otherwise write to an unprobed database.
   await assertStagingIdentity(pool, target.identity);
   const db = pool;
+  if (process.argv.includes('--recover')) {
+    // Recovery mode: clean abandoned runs only, then exit. Full target
+    // verification above still applies — recovery deletes data.
+    try {
+      const abandoned = await findAbandonedRuns(db, 'proof');
+      let leftovers = 0;
+      for (const run of abandoned) {
+        leftovers += Math.max(0, await recoverProofRun(db, run.runId));
+      }
+      console.log(`recovery complete: ${abandoned.length} abandoned runs, ${leftovers} leftover rows`);
+      process.exitCode = leftovers === 0 ? 0 : 1;
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
+    return;
+  }
   let shuttingDown = false;
   // First signal stops scheduling new writes: legs abort at the next check
   // and the main finally below runs the single scoped cleanup — the handler
@@ -352,6 +445,7 @@ async function main() {
   );
   check('fixture identities novel', pre.rows.length === 0, { clashes: pre.rows });
   scope.preflightPassed = true;
+  await registerRun(db, RUN, 'proof');
 
   // Leg 1: observation + save.
   const first = await observeTerminologyDetailed({
@@ -494,11 +588,15 @@ async function main() {
     `SELECT native_evidence_status, source_provenance_family FROM terminology_observations WHERE canonical_term_id=$1 ORDER BY id DESC LIMIT 1`,
     [nativeTermId]
   );
-  check('native provenance persisted', nativeRow.rows[0]?.native_evidence_status === 'NATIVE_OBSERVED', nativeRow.rows[0]);
+  check('native provenance persisted', nativeRow.rows[0]?.native_evidence_status === 'NATIVE_OBSERVED' && nativeRow.rows[0]?.source_provenance_family === 'CREATOR_METADATA', nativeRow.rows[0]);
   const nativeProj = await db.query(
-    `SELECT canonical_term_id FROM country_native_evidence_projections WHERE canonical_term_id=$1`, [nativeTermId]
+    `SELECT native_observed_count, native_evidence_status, source_provenance_family FROM country_native_evidence_projections WHERE canonical_term_id=$1`, [nativeTermId]
   );
-  check('native projection recomputed', nativeProj.rows.length === 1, { termId: nativeTermId });
+  check(
+    'native projection recomputed',
+    nativeProj.rows.length === 1 && Number(nativeProj.rows[0]?.native_observed_count ?? 0) >= 1 && nativeProj.rows[0]?.native_evidence_status === 'NATIVE_OBSERVED',
+    nativeProj.rows[0] ?? null
+  );
 
   // End-quiescence: no queue worker may have acted mid-run. Active work now
   // fails the run loudly instead of passing silently.
@@ -506,6 +604,7 @@ async function main() {
   check('staging stayed worker-free', Number(endJobs.rows[0]?.n) === 0, endJobs.rows[0]);
 
   console.log(`E2E PROOF COMPLETE (${passed} legs)`);
+  await finishRun(db, RUN, 'complete');
   } catch (error) {
     // A leg/check failure is captured, not lost: cleanup still runs below,
     // and the original error propagates after pool shutdown instead of being
@@ -520,7 +619,10 @@ async function main() {
   } finally {
     await pool.end().catch(() => undefined);
   }
-  if (legError !== null) throw legError;
+  if (legError !== null) {
+    await finishRun(db, RUN, 'failed');
+    throw legError;
+  }
 }
 
 main().then(

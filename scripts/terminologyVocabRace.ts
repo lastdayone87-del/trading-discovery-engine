@@ -127,7 +127,7 @@ async function verifyStagingTargetOrThrow(
   return {
     connectionString: pinned,
     tls: { ssl: verdict.ssl, caFile: verdict.caFile },
-    identity: { token: expectedToken, serverAddr, dbName },
+    identity: { token: expectedToken, serverAddr, dbName, sysid: clusterId ?? '' },
   };
 }
 
@@ -254,6 +254,86 @@ async function cleanupRaceFixtures(
   console.log('cleanup: removed run fixtures, residue verified 0');
 }
 
+type RaceRunDb = { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> };
+
+async function ensureRaceRunRegistry(db: RaceRunDb): Promise<void> {
+  await db.query(
+    `CREATE TABLE IF NOT EXISTS staging_proof_runs(run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'started')`
+  );
+}
+
+async function registerRaceRun(db: RaceRunDb, runId: string): Promise<void> {
+  await ensureRaceRunRegistry(db);
+  await db.query(`INSERT INTO staging_proof_runs(run_id, kind) VALUES($1,'race') ON CONFLICT(run_id) DO NOTHING`, [runId]);
+}
+
+async function finishRaceRun(db: RaceRunDb, runId: string, status: 'complete' | 'failed' | 'recovered' | 'recovery-failed'): Promise<void> {
+  await db
+    .query(`UPDATE staging_proof_runs SET finished_at=now(), status=$2 WHERE run_id=$1`, [runId, status])
+    .catch(error => console.warn('run registry update failed (non-fatal)', error instanceof Error ? error.message : String(error)));
+}
+
+// Abandoned race runs: unfinished for over an hour (younger rows may still
+// be alive). Never throws for a missing registry.
+async function findAbandonedRaceRuns(db: RaceRunDb): Promise<Array<{ runId: string }>> {
+  const rows = await db
+    .query(
+      `SELECT run_id FROM staging_proof_runs WHERE kind='race' AND finished_at IS NULL AND started_at < now() - interval '1 hour'`
+    )
+    .catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  return (rows.rows as Array<Record<string, unknown>>)
+    .map(row => String(row.run_id ?? ''))
+    .filter(runId => runId.length >= 8)
+    .map(runId => ({ runId }));
+}
+
+// Resolve one abandoned race run's fixtures by its run-unique identity and
+// remove them with the same table ordering as normal cleanup, then mark the
+// run recovered. Returns leftover row counts for reporting.
+async function recoverRaceRun(db: RaceRunDb, runId: string): Promise<number> {
+  return recoverRaceRunByPattern(db, runId, runId.toLowerCase());
+}
+
+async function recoverRaceRunByPattern(db: RaceRunDb, runId: string, norm: string): Promise<number> {
+  const failures: string[] = [];
+  const step = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+    try {
+      await fn();
+    } catch (error) {
+      failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const like = `%${runId}%`;
+  const normLike = `%${norm}%`;
+  await step('observations', () => db.query(
+    `DELETE FROM terminology_observations WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1 AND country=$2)`, [normLike, COUNTRY_CANON]));
+  await step('links', () => db.query(
+    `DELETE FROM extracted_vocabulary_sources WHERE term_id IN (SELECT id FROM extracted_trading_vocabulary WHERE term ILIKE $1 AND country=$2)`, [like, COUNTRY_CANON]));
+  await step('vocab', () => db.query(
+    `DELETE FROM extracted_trading_vocabulary WHERE term ILIKE $1 AND country=$2`, [like, COUNTRY_CANON]));
+  await step('canonical', () => db.query(
+    `DELETE FROM canonical_trading_terms WHERE normalized_term LIKE $1 AND country=$2`, [normLike, COUNTRY_CANON]));
+  await step('channels', () => db.query(`DELETE FROM channels WHERE channel_id LIKE $1`, [like]));
+  for (const table of ['terminology_performance', 'terminology_lifecycle_events', 'terminology_score_snapshots', 'trading_term_aliases', 'country_native_evidence_projections', 'country_native_performance_attribution']) {
+    await step(table, () => db.query(
+      `DELETE FROM ${table} WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1 AND country=$2)`, [normLike, COUNTRY_CANON]));
+  }
+  const residue = await db.query(
+    `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE term ILIKE $1 AND country=$2) AS vocab,
+            (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term LIKE $2 AND country=$1) AS terms,
+            (SELECT COUNT(*) FROM channels WHERE channel_id LIKE $1) AS channels`,
+    [like, normLike, COUNTRY_CANON]
+  ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
+  const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
+  await finishRaceRun(db, runId, failures.length > 0 || remaining !== 0 ? 'recovery-failed' : 'recovered');
+  if (failures.length > 0 || remaining !== 0) {
+    throw new Error(`recovery incomplete for run ${runId} (failures=[${failures.join('; ')}] remaining=${remaining})`);
+  }
+  console.log(`recovery: removed fixtures of abandoned run ${runId}, residue verified 0`);
+  return remaining;
+}
+
 async function main() {
   const connectionString = targetConnectionString();
   const target = await verifyStagingTargetOrThrow(connectionString);
@@ -267,7 +347,6 @@ async function main() {
   onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   // Endpoint re-verification before any write.
   await assertStagingIdentity(dbPool, target.identity);
-  onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   const db = dbPool;
   const createdChannels: string[] = [];
   const racers: Array<Promise<unknown>> = [];
@@ -278,15 +357,17 @@ async function main() {
     stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, application_name: appName }),
     stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, application_name: appName }),
   ];
+  for (const pool of pools) {
+    // Idle-client deaths must never crash the run; checked-out failures
+    // surface through the writers' rejected promises below. Listeners attach
+    // before any query so an early idle-client error cannot go unhandled.
+    onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
+  }
   // Endpoint re-verification on each writer pool before racers launch.
   for (const pool of pools) {
     await assertStagingIdentity(pool, target.identity);
   }
-  for (const pool of pools) {
-    // Idle-client deaths must never crash the run; checked-out failures
-    // surface through the writers' rejected promises below.
-    onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
-  }
+
   let shuttingDown = false;
   // First signal stops new writes and unblocks settlement: in-flight racers
   // are cancelled (their promises settle rejected), checks abort via the
@@ -315,11 +396,28 @@ async function main() {
   process.once('SIGINT', () => onSignal('SIGINT'));
   process.once('SIGTERM', () => onSignal('SIGTERM'));
   // Shared shutdown, used by the preflight guard (which runs before the main
-  // try/finally) and by the main finally alike.
+  // try/finally), the recovery branch, and by the main finally alike.
+  // Declared before any use: --recover and preflight paths call it directly.
   const closePools = () => bounded((async () => {
     await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
     await dbPool.end().catch(() => undefined);
   })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
+  if (process.argv.includes('--recover')) {
+    // Recovery mode: clean abandoned race runs only, then exit. Full target
+    // verification above still applies — recovery deletes data.
+    try {
+      const abandoned = await findAbandonedRaceRuns(db);
+      let leftovers = 0;
+      for (const run of abandoned) {
+        leftovers += Math.max(0, await recoverRaceRun(db, run.runId));
+      }
+      console.log(`recovery complete: ${abandoned.length} abandoned runs, ${leftovers} leftover rows`);
+      process.exitCode = leftovers === 0 ? 0 : 1;
+    } finally {
+      await closePools();
+    }
+    return;
+  }
   // Fixture-identity preflight FIRST: abort when this run's normalized term
   // already exists for the intended country, before any observation can
   // commit a row the run would then mistake for its own. Cleanup below is
@@ -332,6 +430,7 @@ async function main() {
     );
     check('fixture identity novel', clash.rows.length === 0, { term: TERM });
     preflightPassed = true;
+    await registerRaceRun(db, RUN);
   } catch (error) {
     // Preflight runs before the main try/finally: close pools here so a
     // failed preflight exits with its error instead of hanging.
@@ -416,6 +515,7 @@ async function main() {
   check('staging stayed worker-free', Number(endJobs.rows[0]?.n) === 0, endJobs.rows[0]);
 
   console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
+  await finishRaceRun(db, RUN, 'complete');
   } catch (error) {
     // A failed check is captured, not lost: teardown still runs below, and
     // the original error propagates after pool shutdown instead of being
@@ -474,7 +574,10 @@ async function main() {
     // Both errors are reported and the run exits nonzero either way, but a
     // failed check is never hidden behind a cleanup failure.
     if (cleanupError !== null) console.error('cleanup failed', cleanupError);
-    if (legError !== null) throw legError;
+    if (legError !== null) {
+      await finishRaceRun(db, RUN, 'failed');
+      throw legError;
+    }
     if (cleanupError !== null) throw cleanupError;
   }
 }
