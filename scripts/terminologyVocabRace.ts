@@ -127,6 +127,71 @@ function check(name: string, cond: boolean, evidence: unknown) {
   console.log(`PASS ${name} ${JSON.stringify(evidence)}`);
 }
 
+interface RaceCleanupScope {
+  normTerm: string;
+  createdChannels: string[];
+}
+
+// Fixture cleanup, resolved by run-unique normalized identity plus intended
+// country — never by bare id lists or unscoped text matching. Vocabulary-row
+// ids are resolved first because source links reference them, not
+// canonical-term ids. Only channels whose insert actually created a row are
+// removed. Every step runs independently (INJECT_CLEANUP_FAILURE=<step>
+// forces a fault for drills); any step failure or leftover residue throws so
+// incomplete cleanup is never reported as successful.
+async function cleanupRaceFixtures(
+  db: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> },
+  scope: RaceCleanupScope
+): Promise<void> {
+  const failures: string[] = [];
+  const cleanupStep = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+    try {
+      if (process.env.INJECT_CLEANUP_FAILURE === name) throw new Error(`injected cleanup failure at step ${name}`);
+      await fn();
+    } catch (error) {
+      failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const normTerm = scope.normTerm;
+  const termRows = await db.query(
+    `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normTerm, COUNTRY_CANON]
+  );
+  const ids = termRows.rows.map(row => Number(row.id));
+  const vocabRows = await db.query(
+    `SELECT id FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
+    [COUNTRY_CANON, normTerm]
+  );
+  const vocabIds = vocabRows.rows.map(row => Number(row.id));
+  const byTerm = (table: string) => `DELETE FROM ${table} WHERE canonical_term_id = ANY($1)`;
+  if (ids.length > 0) {
+    await cleanupStep('observations', () => db.query(byTerm('terminology_observations'), [ids]));
+    await cleanupStep('performance', () => db.query(byTerm('terminology_performance'), [ids]));
+    await cleanupStep('lifecycle', () => db.query(byTerm('terminology_lifecycle_events'), [ids]));
+    await cleanupStep('snapshots', () => db.query(byTerm('terminology_score_snapshots'), [ids]));
+    await cleanupStep('aliases', () => db.query(byTerm('trading_term_aliases'), [ids]));
+    await cleanupStep('projections', () => db.query(byTerm('country_native_evidence_projections'), [ids]));
+    await cleanupStep('attribution', () => db.query(byTerm('country_native_performance_attribution'), [ids]));
+  }
+  if (vocabIds.length > 0) {
+    await cleanupStep('links', () => db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [vocabIds]));
+    await cleanupStep('vocab', () => db.query(`DELETE FROM extracted_trading_vocabulary WHERE id = ANY($1)`, [vocabIds]));
+  }
+  if (ids.length > 0) await cleanupStep('canonical', () => db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [ids]));
+  if (scope.createdChannels.length > 0) await cleanupStep('channels', () => db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [scope.createdChannels]));
+  const residue = await db.query(
+    `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2) AS vocab,
+            (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term=$2 AND country=$1) AS terms,
+            (SELECT COUNT(*) FROM channels WHERE channel_id = ANY($3)) AS channels`,
+    [COUNTRY_CANON, normTerm, scope.createdChannels.length > 0 ? scope.createdChannels : ['']]
+  ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+  const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
+  const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
+  if (failures.length > 0 || remaining !== 0) {
+    throw new Error(`cleanup incomplete (failures=[${failures.join('; ')}] remaining=${remaining})`);
+  }
+  console.log('cleanup: removed run fixtures, residue verified 0');
+}
+
 async function main() {
   const connectionString = targetConnectionString();
   const targetSsl = await verifyStagingTargetOrThrow(connectionString);
@@ -152,6 +217,17 @@ async function main() {
     // surface through the writers' rejected promises below.
     onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
   }
+  // Fixture-identity preflight FIRST: abort when this run's normalized term
+  // already exists for the intended country, before any observation can
+  // commit a row the run would then mistake for its own. Cleanup below is
+  // skipped on preflight failure — the matching row belongs to another run
+  // (or prior residue), never to this one, so deleting it would be wrong.
+  let preflightPassed = false;
+  const clash = await db.query(
+    `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(TERM), COUNTRY_CANON]
+  );
+  check('fixture identity novel', clash.rows.length === 0, { term: TERM });
+  preflightPassed = true;
   try {
   for (const channelId of CHANNELS) {
     const inserted = await db.query(
@@ -177,10 +253,6 @@ async function main() {
       }, dbPool);
     }
   }
-  const clash = await db.query(
-    `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(TERM), COUNTRY_CANON]
-  );
-  check('fixture identity novel', clash.rows.length === 0, { term: TERM });
   const expected = await db.query(
     `SELECT COUNT(*)::int n FROM terminology_observations o JOIN canonical_trading_terms t ON t.id=o.canonical_term_id
      WHERE t.country=$1 AND t.normalized_term=$2`, [COUNTRY_CANON, normalizeTerm(TERM)]
@@ -266,66 +338,23 @@ async function main() {
         }
       }
     }
-    const failures: string[] = [];
-    const cleanupStep = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+    if (!preflightPassed) {
+      console.warn('cleanup: skipped — preflight aborted before this run created any fixture');
+    } else {
       try {
-        if (process.env.INJECT_CLEANUP_FAILURE === name) throw new Error(`injected cleanup failure at step ${name}`);
-        await fn();
+        await cleanupRaceFixtures(db, { normTerm: normalizeTerm(TERM), createdChannels });
       } catch (error) {
-        failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+        console.warn('cleanup: fixture removal incomplete (identity is run-unique; later runs unaffected)', error);
+        throw error;
       }
-    };
-    try {
-      const normTerm = normalizeTerm(TERM);
-      const termRows = await db.query(
-        `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normTerm, COUNTRY_CANON]
-      );
-      const ids = (termRows.rows as Array<Record<string, unknown>>).map(row => Number(row.id));
-      const vocabRows = await db.query(
-        `SELECT id FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
-        [COUNTRY_CANON, normTerm]
-      );
-      const vocabIds = (vocabRows.rows as Array<Record<string, unknown>>).map(row => Number(row.id));
-      const byTerm = (table: string) => `DELETE FROM ${table} WHERE canonical_term_id = ANY($1)`;
-      if (ids.length > 0) {
-        await cleanupStep('observations', () => db.query(byTerm('terminology_observations'), [ids]));
-        await cleanupStep('performance', () => db.query(byTerm('terminology_performance'), [ids]));
-        await cleanupStep('lifecycle', () => db.query(byTerm('terminology_lifecycle_events'), [ids]));
-        await cleanupStep('snapshots', () => db.query(byTerm('terminology_score_snapshots'), [ids]));
-        await cleanupStep('aliases', () => db.query(byTerm('trading_term_aliases'), [ids]));
-        await cleanupStep('projections', () => db.query(byTerm('country_native_evidence_projections'), [ids]));
-        await cleanupStep('attribution', () => db.query(byTerm('country_native_performance_attribution'), [ids]));
-      }
-      if (vocabIds.length > 0) {
-        await cleanupStep('links', () => db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [vocabIds]));
-        await cleanupStep('vocab', () => db.query(`DELETE FROM extracted_trading_vocabulary WHERE id = ANY($1)`, [vocabIds]));
-      }
-      if (ids.length > 0) await cleanupStep('canonical', () => db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [ids]));
-      if (createdChannels.length > 0) await cleanupStep('channels', () => db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [createdChannels]));
-      const residue = await db.query(
-        `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2) AS vocab,
-                (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term=$2 AND country=$1) AS terms,
-                (SELECT COUNT(*) FROM channels WHERE channel_id = ANY($3)) AS channels`,
-        [COUNTRY_CANON, normTerm, createdChannels.length > 0 ? createdChannels : ['']]
-      ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-      const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
-      const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
-      if (failures.length > 0 || remaining !== 0) {
-        throw new Error(`cleanup incomplete (failures=[${failures.join('; ')}] remaining=${remaining})`);
-      }
-      console.log('cleanup: removed run fixtures, residue verified 0');
-    } catch (error) {
-      console.warn('cleanup: fixture removal incomplete (identity is run-unique; later runs unaffected)', error);
-      throw error;
-    } finally {
-      // Pool shutdown runs even when cleanup throws: a failed cleanup must
-      // still release connections so the run exits with its error instead of
-      // hanging. Outer `timeout` remains the final backstop.
+    }
+    // Pool shutdown is unconditional within this finally: a failed cleanup
+    // still releases connections so the run exits with its error instead of
+    // hanging. Outer `timeout` remains the final backstop.
       await bounded((async () => {
         await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
         await dbPool.end().catch(() => undefined);
       })(), 20_000, () => console.warn('cleanup: pool close timed out; proceeding to exit code')).catch(() => undefined);
-    }
   }
 }
 
