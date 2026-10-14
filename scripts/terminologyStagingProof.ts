@@ -97,6 +97,7 @@ interface RunScope {
   rawPhrases: string[];
   normPhrases: string[];
   countries: string[];
+  preflightPassed: boolean;
 }
 
 // Best-effort removal of this run's fixtures, resolved by run-unique phrase
@@ -127,18 +128,37 @@ async function cleanupRunFixtures(
   db: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> },
   scope: RunScope
 ): Promise<void> {
+  // Preflight-abort path: only RETURNING-created channels can exist (no
+  // observation committed), so remove just those and never resolve or delete
+  // term-scoped rows that belong to another run.
+  if (!scope.preflightPassed) {
+    if (scope.createdChannels.length > 0) {
+      await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [scope.createdChannels])
+        .then(() => console.log('cleanup: removed created channels after preflight abort'))
+        .catch(error => { throw new Error(`cleanup incomplete (preflight-abort channel removal failed: ${error instanceof Error ? error.message : String(error)})`); });
+    } else {
+      console.log('cleanup: nothing created before preflight abort');
+    }
+    return;
+  }
   const failures: string[] = [];
   {
-    const termRows = await db.query(
-      `SELECT id FROM canonical_trading_terms WHERE normalized_term = ANY($1) AND country = ANY($2)`,
-      [scope.normPhrases, scope.countries]
-    );
-    const termIds = termRows.rows.map(row => Number(row.id));
-    const vocabRows = await db.query(
-      `SELECT id FROM extracted_trading_vocabulary WHERE term = ANY($1) AND country = ANY($2)`,
-      [scope.rawPhrases, scope.countries]
-    );
-    const vocabIds = vocabRows.rows.map(row => Number(row.id));
+    let termIds: number[] = [];
+    let vocabIds: number[] = [];
+    try {
+      const termRows = await db.query(
+        `SELECT id FROM canonical_trading_terms WHERE normalized_term = ANY($1) AND country = ANY($2)`,
+        [scope.normPhrases, scope.countries]
+      );
+      termIds = termRows.rows.map(row => Number(row.id));
+      const vocabRows = await db.query(
+        `SELECT id FROM extracted_trading_vocabulary WHERE term = ANY($1) AND country = ANY($2)`,
+        [scope.rawPhrases, scope.countries]
+      );
+      vocabIds = vocabRows.rows.map(row => Number(row.id));
+    } catch (error) {
+      failures.push(`resolve: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const byTerm = (table: string) => `DELETE FROM ${table} WHERE canonical_term_id = ANY($1)`;
     if (termIds.length > 0) {
       await cleanupStep(failures, 'observations', () => db.query(byTerm('terminology_observations'), [termIds]));
@@ -220,14 +240,16 @@ async function main() {
   // Script-owned pool: every connection this run opens carries the verified
   // TLS configuration, and getDb() (with its own SSL semantics plus
   // migrations/seeds) is never touched.
-  const pool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000 });
+  const pool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
   const db = pool;
   const scope: RunScope = {
     createdChannels: [],
     rawPhrases: [PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE, SCOPE_PHRASE],
     normPhrases: [normalizeTerm(PHRASE), normalizeTerm(DEMOTE_PHRASE), normalizeTerm(ALIAS_PHRASE), normalizeTerm(SCOPE_PHRASE)],
     countries: [COUNTRY, 'United States'],
+    preflightPassed: false,
   };
+  let legError: unknown = null;
   try {
   // Fixture creators: confirmed traders eligible for links, retry and trial.
   // Only ids whose insert actually creates a row are registered for cleanup,
@@ -248,6 +270,7 @@ async function main() {
     [scope.normPhrases, scope.countries]
   );
   check('fixture identities novel', pre.rows.length === 0, { clashes: pre.rows });
+  scope.preflightPassed = true;
 
   // Leg 1: observation + save.
   const first = await observeTerminologyDetailed({
@@ -352,7 +375,7 @@ async function main() {
   // simulated by removing the vocab row); the production retry repair must
   // restore the exact derived count. No mocks in the repair itself.
   const mainObs = await db.query(`SELECT COUNT(*)::int n FROM terminology_observations WHERE canonical_term_id=$1`, [termId]);
-  await db.query(`DELETE FROM extracted_trading_vocabulary WHERE term=$1`, [PHRASE]);
+  await db.query(`DELETE FROM extracted_trading_vocabulary WHERE term=$1 AND country=$2`, [PHRASE, COUNTRY]);
   // Every observing channel reconciles: the lost row took all of its links.
   for (const ch of [CHANNELS[0], CHANNELS[1], CHANNELS[2]]) {
     await defaultReconcileExtractedTerm(COUNTRY, PHRASE, 'terminology', ch, pool);
@@ -377,13 +400,21 @@ async function main() {
   check('alias read finds canonical row with count 1', aliasEntry?.country === 'United States' && aliasEntry?.occurrences === 1, aliasEntry ?? null);
 
   console.log(`E2E PROOF COMPLETE (${passed} legs)`);
-  } finally {
-    try {
-      await cleanupRunFixtures(db, scope);
-    } finally {
-      await pool.end().catch(() => undefined);
-    }
+  } catch (error) {
+    // A leg/check failure is captured, not lost: cleanup still runs below,
+    // and the original error propagates after pool shutdown instead of being
+    // replaced by a cleanup failure (both are reported).
+    legError = error;
   }
+  try {
+    await cleanupRunFixtures(db, scope);
+  } catch (error) {
+    console.error('cleanup failed', error);
+    if (legError === null) throw error;
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+  if (legError !== null) throw legError;
 }
 
 main().then(

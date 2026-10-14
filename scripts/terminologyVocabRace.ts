@@ -250,6 +250,7 @@ async function main() {
     await closePools();
     throw error;
   }
+  let legError: unknown = null;
   try {
   for (const channelId of CHANNELS) {
     const inserted = await db.query(
@@ -323,6 +324,11 @@ async function main() {
   check('occurrences converged to committed evidence', Number(rows.rows[0]?.occurrences) === expectedCount, { got: rows.rows[0]?.occurrences, expectedCount });
 
   console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
+  } catch (error) {
+    // A failed check is captured, not lost: teardown still runs below, and
+    // the original error propagates after pool shutdown instead of being
+    // replaced by a teardown failure (both are reported).
+    legError = error;
   } finally {
     // Stragglers from a deadline breach settle here (bounded) before cleanup
     // touches fixtures. On timeout the race backends are terminated by
@@ -360,19 +366,24 @@ async function main() {
         }
       }
     }
+    let cleanupError: unknown = null;
     if (!preflightPassed) {
       console.warn('cleanup: skipped — preflight aborted before this run created any fixture');
     } else {
       try {
         await cleanupRaceFixtures(db, { normTerm: normalizeTerm(TERM), createdChannels });
       } catch (error) {
-        console.warn('cleanup: fixture removal incomplete (identity is run-unique; later runs unaffected)', error);
-        throw error;
+        cleanupError = error;
       }
     }
     // Bounded close (shared with the preflight guard above): runs even when
     // cleanup throws. Outer `timeout` remains the final backstop.
     await closePools();
+    // Both errors are reported and the run exits nonzero either way, but a
+    // failed check is never hidden behind a cleanup failure.
+    if (cleanupError !== null) console.error('cleanup failed', cleanupError);
+    if (legError !== null) throw legError;
+    if (cleanupError !== null) throw cleanupError;
   }
 }
 

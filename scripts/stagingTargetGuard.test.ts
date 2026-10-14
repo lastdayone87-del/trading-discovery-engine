@@ -3,8 +3,8 @@
  *
  * Pure unit tests — no database required. Run explicitly:
  *   npx tsx --test scripts/stagingTargetGuard.test.ts
- * (The `npm test` finder covers server/ and tests/ only; this file is run as
- * part of staging-script verification.)
+ * This file runs in the normal automated workflow (`npm test` covers
+ * scripts/ alongside server/ and tests/).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -17,6 +17,21 @@ import {
   sslModeParams,
   verifyStagingTarget,
 } from './stagingTargetGuard';
+
+test('unlisted hosts are refused even with valid TLS parameters', () => {
+  // A cloned database reached through a non-allowlisted host must fail even
+  // when every other check would pass: identity comes from explicit listing,
+  // never from in-database state alone.
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
+    const verdict = verifyStagingTarget('postgresql://u:p@10.0.1.8:5432/db?sslmode=require');
+    assert.equal(verdict.ok, false);
+  });
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'db-staging.internal, 10.0.1.8' }, () => {
+    const verdict = verifyStagingTarget('postgresql://u:p@10.0.1.8:5432/db?sslmode=require');
+    assert.equal(verdict.ok, true);
+    assert.deepEqual(verdict.ssl, { rejectUnauthorized: true });
+  });
+});
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void) {
   const saved: Record<string, string | undefined> = {};
@@ -78,7 +93,7 @@ test('duplicate parameters resolve safely: host refused, conflicting sslmode ref
   assert.equal(verifyStagingTarget('postgresql://h/db?host=a.example&host=b.example').ok, false);
   assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=require&sslmode=disable').ok, false);
   assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=disable&sslmode=require').ok, false);
-  withEnv({ PGSSL: undefined, NODE_ENV: undefined }, () => {
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost,h,10.0.1.8' }, () => {
     assert.equal(verifyStagingTarget('postgresql://h/db?sslmode=require&sslmode=require').ok, true);
   });
 });
@@ -107,7 +122,7 @@ test('explicit host query parameter is refused', () => {
 });
 
 test('silent non-loopback target is upgraded to verified TLS, never plaintext', () => {
-  withEnv({ PGSSL: undefined, NODE_ENV: undefined }, () => {
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost,h,10.0.1.8' }, () => {
     const verdict = verifyStagingTarget('postgresql://u:p@10.0.1.8:5432/db');
     assert.equal(verdict.ok, true);
     assert.deepEqual(verdict.ssl, { rejectUnauthorized: true });
@@ -115,7 +130,7 @@ test('silent non-loopback target is upgraded to verified TLS, never plaintext', 
 });
 
 test('PGSSL=disable never disables TLS for a remote target', () => {
-  withEnv({ PGSSL: 'disable', NODE_ENV: undefined }, () => {
+  withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost,h,10.0.1.8' }, () => {
     const verdict = verifyStagingTarget('postgresql://u:p@10.0.1.8:5432/db?sslmode=require');
     assert.equal(verdict.ok, true);
     assert.deepEqual(verdict.ssl, { rejectUnauthorized: true });
@@ -123,7 +138,7 @@ test('PGSSL=disable never disables TLS for a remote target', () => {
 });
 
 test('downgradable sslmodes are refused on remote targets', () => {
-  withEnv({ PGSSL: undefined, NODE_ENV: undefined }, () => {
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: 'dbhost,h,10.0.1.8' }, () => {
     for (const mode of ['disable', 'allow', 'prefer']) {
       const verdict = verifyStagingTarget(`postgresql://u:p@10.0.1.8:5432/db?sslmode=${mode}`);
       assert.equal(verdict.ok, false, mode);
@@ -137,13 +152,14 @@ test('downgradable sslmodes are refused on remote targets', () => {
 });
 
 test('loopback keeps application TLS semantics, including PGSSL=disable', () => {
-  withEnv({ PGSSL: 'disable', NODE_ENV: undefined }, () => {
+  // Default allowlist already covers loopback; explicit listing unnecessary.
+  withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
     const verdict = verifyStagingTarget('postgresql://postgres:x@127.0.0.1:55433/postgres');
     assert.equal(verdict.ok, true);
     assert.equal(verdict.loopback, true);
     assert.equal(verdict.ssl, false);
   });
-  withEnv({ PGSSL: undefined, NODE_ENV: undefined }, () => {
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
     const verdict = verifyStagingTarget('postgresql://postgres:x@[::1]:5432/postgres');
     assert.equal(verdict.ok, true);
     assert.equal(verdict.loopback, true);

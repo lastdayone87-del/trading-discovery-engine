@@ -75,6 +75,25 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 /**
+ * Explicitly allowlisted staging target identities. A database CLONE carries
+ * the marker row and token with it, so token comparison alone cannot tell a
+ * clone from the provisioned staging database. Defaults to loopback only
+ * (the tunnel topology); any remote staging host must be listed explicitly
+ * via STAGING_TARGET_ALLOWLIST (comma-separated, bracket-tolerant).
+ */
+export function targetAllowlist(): string[] {
+  const raw = process.env.STAGING_TARGET_ALLOWLIST;
+  const entries = (raw === undefined ? 'localhost,127.0.0.1,::1' : raw)
+    .split(',')
+    .map(entry => {
+      const trimmed = entry.trim().toLowerCase();
+      return trimmed.startsWith('[') && trimmed.endsWith(']') ? trimmed.slice(1, -1) : trimmed;
+    })
+    .filter(entry => entry !== '');
+  return entries;
+}
+
+/**
  * Strip every TLS-related query parameter (`sslmode`, `sslcert`, `sslkey`,
  * `sslrootcert`, …). Proven necessary by first-flight capture: in the bundled
  * node-postgres, connection-string parameters OVERRIDE an explicitly supplied
@@ -126,6 +145,9 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
     return { ok: false, loopback: false, host, ssl: undefined, reason: 'explicit host query parameter — pool must resolve the authority host' };
   }
   const loopback = isLoopbackHost(host);
+  if (!targetAllowlist().includes(host)) {
+    return { ok: false, loopback, host, ssl: undefined, reason: `host '${host}' is not allowlisted for staging targets (STAGING_TARGET_ALLOWLIST)` };
+  }
   if (!loopback) {
     // Conflicting duplicates are refused instead of guessing which value the
     // driver applies — ambiguity must never resolve toward weaker transport.
