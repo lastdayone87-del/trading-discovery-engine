@@ -191,6 +191,16 @@ test('tlsPoolConfig passes through loopback and verified settings', () => {
   assert.deepEqual(tlsPoolConfig({ ssl: { rejectUnauthorized: true } }), { rejectUnauthorized: true });
 });
 
+test('loopback in production mode without TLS request is refused', () => {
+  withEnv({ PGSSL: undefined, NODE_ENV: 'production', STAGING_TARGET_ALLOWLIST: undefined }, () => {
+    const verdict = verifyStagingTarget('postgresql://postgres:x@127.0.0.1:55433/postgres');
+    assert.equal(verdict.ok, false);
+    const requested = verifyStagingTarget('postgresql://postgres:x@127.0.0.1:55433/postgres?sslmode=require');
+    assert.equal(requested.ok, true);
+    assert.deepEqual(requested.ssl, { rejectUnauthorized: true });
+  });
+});
+
 test('loopback keeps application TLS semantics, including PGSSL=disable', () => {
   // Default allowlist already covers loopback; explicit listing unnecessary.
   withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {

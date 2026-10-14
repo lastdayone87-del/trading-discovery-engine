@@ -75,13 +75,18 @@ async function verifyStagingTargetOrThrow(
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
   const probe = stagingPool(connectionString, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
-  let jobCount = -1;
+  let activeJobs = -1;
+  let clusterId: string | null = null;
   let probeError: unknown = null;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
     tokenMatches = (marker.rows[0] as Record<string, unknown> | undefined)?.token === expectedToken;
-    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`);
-    jobCount = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
+    // Active (non-terminal) jobs only: COMPLETED/FAILED history rows must not
+    // block verification, but live queue work does.
+    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs WHERE status NOT IN ('COMPLETED','FAILED')`);
+    activeJobs = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
+    const sysid = await probe.query(`SELECT system_identifier::text AS sysid FROM pg_control_system()`);
+    clusterId = String((sysid.rows[0] as Record<string, unknown> | undefined)?.sysid ?? '');
   } catch (error) {
     probeError = error;
   } finally {
@@ -95,10 +100,22 @@ async function verifyStagingTargetOrThrow(
   }
   if (!tokenMatches) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
   // Staging quiescence: these scripts require a worker-free database (fixture
-  // channels must never be claimed by queue workers mid-run). The provisioned
-  // staging database satisfies this; any jobs table activity refuses the run.
-  if (jobCount !== 0) {
-    throw new Error(`Refusing to run: jobs table has ${jobCount} rows — staging database must have no workers pointed at it.`);
+  // channels must never be claimed by queue workers mid-run). Only ACTIVE
+  // queue work refuses the run — COMPLETED/FAILED history is tolerated. The
+  // provisioned staging database satisfies this.
+  if (activeJobs !== 0) {
+    throw new Error(`Refusing to run: jobs table has ${activeJobs} active rows — staging database must have no workers pointed at it.`);
+  }
+  // Cluster identity: a filesystem/container clone of staging carries the
+  // marker row and token with it, so token comparison alone cannot tell a
+  // clone from the provisioned database. The expected cluster identifier is
+  // supplied out-of-band (never read from the target itself). Residual gap:
+  // a clone inside the SAME cluster (e.g. another database) shares the
+  // identifier and is not distinguished — see the provisioning notes.
+  const expectedClusterId = process.env.STAGING_SYSTEM_IDENTIFIER;
+  if (!expectedClusterId) throw new Error('Refusing to run: STAGING_SYSTEM_IDENTIFIER is required (cluster identity from staging provisioning).');
+  if (clusterId !== expectedClusterId) {
+    throw new Error('Refusing to run: cluster identifier mismatch — target is not the provisioned staging database (possible clone).');
   }
   return { ssl: verdict.ssl, caFile: verdict.caFile };
 }
@@ -214,6 +231,7 @@ const PHRASE = `e2e probe ${RUN}`;
 const DEMOTE_PHRASE = `e2e demote probe ${RUN}`;
 const ALIAS_PHRASE = `e2e alias probe ${RUN}`;
 const SCOPE_PHRASE = `e2e scope probe ${RUN}`;
+const NATIVE_PHRASE = `e2e handelsstrategie ${RUN}`;
 // Unique fixture IDs per run: no existing record is ever modified, and reruns
 // never collide with prior fixtures on a reused staging database.
 const CHANNELS = [1, 2, 3].map(i => `e2e-${RUN}-ch-${i}`);
@@ -258,6 +276,10 @@ async function main() {
   const pool = stagingPool(connectionString, targetSsl, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
   const db = pool;
   let shuttingDown = false;
+  // First signal stops scheduling new writes: legs abort at the next check
+  // and the main finally below runs the single scoped cleanup — the handler
+  // itself never cleans up, so cleanup runs exactly once. A second signal
+  // forces immediate exit (documented escape hatch if teardown itself hangs).
   const onSignal = (signal: 'SIGINT' | 'SIGTERM') => {
     if (shuttingDown) {
       console.error(`second ${signal}; forcing immediate exit`);
@@ -265,23 +287,14 @@ async function main() {
     }
     shuttingDown = true;
     signalAborting = true;
-    void (async () => {
-      console.warn(`${signal} received; running scoped cleanup then exiting`);
-      try {
-        await cleanupRunFixtures(db, scope);
-      } catch (error) {
-        console.error('signal cleanup failed', error);
-      }
-      await pool.end().catch(() => undefined);
-      process.exit(1);
-    })();
+    console.warn(`${signal} received; aborting legs — scoped cleanup runs in the main finally path`);
   };
   process.once('SIGINT', () => onSignal('SIGINT'));
   process.once('SIGTERM', () => onSignal('SIGTERM'));
   const scope: RunScope = {
     createdChannels: [],
-    rawPhrases: [PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE, SCOPE_PHRASE],
-    normPhrases: [normalizeTerm(PHRASE), normalizeTerm(DEMOTE_PHRASE), normalizeTerm(ALIAS_PHRASE), normalizeTerm(SCOPE_PHRASE)],
+    rawPhrases: [PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE, SCOPE_PHRASE, NATIVE_PHRASE],
+    normPhrases: [normalizeTerm(PHRASE), normalizeTerm(DEMOTE_PHRASE), normalizeTerm(ALIAS_PHRASE), normalizeTerm(SCOPE_PHRASE), normalizeTerm(NATIVE_PHRASE)],
     countries: [COUNTRY, 'United States'],
     preflightPassed: false,
   };
@@ -434,6 +447,31 @@ async function main() {
   const viaAlias = await getExtractedVocabulary(ALIAS_COUNTRY, pool);
   const aliasEntry = viaAlias.find(entry => entry.term === ALIAS_PHRASE);
   check('alias read finds canonical row with count 1', aliasEntry?.country === 'United States' && aliasEntry?.occurrences === 1, aliasEntry ?? null);
+
+  // Leg 8: native-evidence inference. A German-language observation from a
+  // German creator must persist NATIVE_OBSERVED provenance (not merely
+  // survive classification), with a matching evidence projection row.
+  const nativeObs = await observeTerminologyDetailed({
+    term: NATIVE_PHRASE, country: COUNTRY, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+    channelId: CHANNELS[0], videoId: 'e2e-native-v1', language: 'de', locale: 'de-DE',
+    sourceCreatorCountry: COUNTRY, evidence: evidenceFor(CHANNELS[0], 'e2e-native-v1', NATIVE_PHRASE),
+  }, pool);
+  check('native observation inserted', nativeObs !== null && nativeObs.observationInserted === true, nativeObs);
+  const nativeTermId = Number(nativeObs!.termId);
+  const nativeRow = await db.query(
+    `SELECT native_evidence_status, source_provenance_family FROM terminology_observations WHERE canonical_term_id=$1 ORDER BY id DESC LIMIT 1`,
+    [nativeTermId]
+  );
+  check('native provenance persisted', nativeRow.rows[0]?.native_evidence_status === 'NATIVE_OBSERVED', nativeRow.rows[0]);
+  const nativeProj = await db.query(
+    `SELECT canonical_term_id FROM country_native_evidence_projections WHERE canonical_term_id=$1`, [nativeTermId]
+  );
+  check('native projection recomputed', nativeProj.rows.length === 1, { termId: nativeTermId });
+
+  // End-quiescence: no queue worker may have acted mid-run. Active work now
+  // fails the run loudly instead of passing silently.
+  const endJobs = await db.query(`SELECT count(*)::int n FROM jobs WHERE status NOT IN ('COMPLETED','FAILED')`);
+  check('staging stayed worker-free', Number(endJobs.rows[0]?.n) === 0, endJobs.rows[0]);
 
   console.log(`E2E PROOF COMPLETE (${passed} legs)`);
   } catch (error) {

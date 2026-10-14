@@ -237,6 +237,13 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
   if (requestedTls) {
     return { ok: true, loopback, host, ssl: { rejectUnauthorized: true }, ...withCa };
   }
+  if (loopback && process.env.NODE_ENV === 'production') {
+    // No verification-bypass TLS in production mode, even on loopback: a
+    // local on-path peer could impersonate the database and receive queries
+    // and credentials without presenting a trusted certificate. Request TLS
+    // explicitly (sslmode=require) or run outside production mode.
+    return { ok: false, loopback, host, ssl: undefined, reason: 'loopback target in production mode without an explicit TLS request — refusing unverified TLS' };
+  }
   const ssl =
     process.env.PGSSL === 'disable'
       ? false

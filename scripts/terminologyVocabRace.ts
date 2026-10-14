@@ -66,13 +66,18 @@ async function verifyStagingTargetOrThrow(
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
   const probe = stagingPool(connectionString, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
-  let jobCount = -1;
+  let activeJobs = -1;
+  let clusterId: string | null = null;
   let probeError: unknown = null;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
     tokenMatches = (marker.rows[0] as Record<string, unknown> | undefined)?.token === expectedToken;
-    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`);
-    jobCount = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
+    // Active (non-terminal) jobs only: COMPLETED/FAILED history rows must not
+    // block verification, but live queue work does.
+    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs WHERE status NOT IN ('COMPLETED','FAILED')`);
+    activeJobs = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
+    const sysid = await probe.query(`SELECT system_identifier::text AS sysid FROM pg_control_system()`);
+    clusterId = String((sysid.rows[0] as Record<string, unknown> | undefined)?.sysid ?? '');
   } catch (error) {
     probeError = error;
   } finally {
@@ -86,12 +91,24 @@ async function verifyStagingTargetOrThrow(
   }
   if (!tokenMatches) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
   // Staging quiescence: this script requires a worker-free database (fixture
-  // channels must never be claimed by queue workers mid-run). The provisioned
-  // staging database satisfies this; any jobs table activity refuses the run.
+  // channels must never be claimed by queue workers mid-run). Only ACTIVE
+  // queue work refuses the run — COMPLETED/FAILED history is tolerated; the
+  // provisioned staging database satisfies this.
   // (Checked inside the probe above so connectivity failures report as probe
   // failures, never as a dirty jobs table.)
-  if (jobCount !== 0) {
-    throw new Error(`Refusing to run: jobs table has ${jobCount} rows — staging database must have no workers pointed at it.`);
+  if (activeJobs !== 0) {
+    throw new Error(`Refusing to run: jobs table has ${activeJobs} active rows — staging database must have no workers pointed at it.`);
+  }
+  // Cluster identity: a filesystem/container clone of staging carries the
+  // marker row and token with it, so token comparison alone cannot tell a
+  // clone from the provisioned database. The expected cluster identifier is
+  // supplied out-of-band (never read from the target itself). Residual gap:
+  // a clone inside the SAME cluster (e.g. another database) shares the
+  // identifier and is not distinguished — see the provisioning notes.
+  const expectedClusterId = process.env.STAGING_SYSTEM_IDENTIFIER;
+  if (!expectedClusterId) throw new Error('Refusing to run: STAGING_SYSTEM_IDENTIFIER is required (cluster identity from staging provisioning).');
+  if (clusterId !== expectedClusterId) {
+    throw new Error('Refusing to run: cluster identifier mismatch — target is not the provisioned staging database (possible clone).');
   }
   return { ssl: verdict.ssl, caFile: verdict.caFile };
 }
@@ -245,6 +262,11 @@ async function main() {
     onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
   }
   let shuttingDown = false;
+  // First signal stops new writes and unblocks settlement: in-flight racers
+  // are cancelled (their promises settle rejected), checks abort via the
+  // flag, and the main finally below runs the single scoped cleanup — the
+  // handler itself never cleans up or exits, so cleanup runs exactly once. A
+  // second signal forces immediate exit (documented escape hatch).
   const onSignal = (signal: 'SIGINT' | 'SIGTERM') => {
     if (shuttingDown) {
       console.error(`second ${signal}; forcing immediate exit`);
@@ -252,15 +274,16 @@ async function main() {
     }
     shuttingDown = true;
     signalAborting = true;
+    console.warn(`${signal} received; cancelling racers — scoped cleanup runs in the main finally path`);
     void (async () => {
-      console.warn(`${signal} received; running scoped cleanup then exiting`);
       try {
-        await cleanupRaceFixtures(db, { normTerm: normalizeTerm(TERM), createdChannels });
-      } catch (error) {
-        console.error('signal cleanup failed', error);
+        await db.query(
+          `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE application_name=$1 AND pid<>pg_backend_pid()) s WHERE cancelled`,
+          [appName]
+        );
+      } catch {
+        // Settlement timeouts below surface the failure; nothing more to do here.
       }
-      await closePools();
-      process.exit(1);
     })();
   };
   process.once('SIGINT', () => onSignal('SIGINT'));
@@ -361,6 +384,10 @@ async function main() {
   check('exactly one vocabulary row across equivalent spellings', rows.rows.length === 1, rows.rows);
   check('row under canonical country', rows.rows[0]?.country === COUNTRY_CANON, rows.rows[0]);
   check('occurrences converged to committed evidence', Number(rows.rows[0]?.occurrences) === expectedCount, { got: rows.rows[0]?.occurrences, expectedCount });
+
+  // End-quiescence: no queue worker may have acted mid-run.
+  const endJobs = await db.query(`SELECT count(*)::int n FROM jobs WHERE status NOT IN ('COMPLETED','FAILED')`);
+  check('staging stayed worker-free', Number(endJobs.rows[0]?.n) === 0, endJobs.rows[0]);
 
   console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
   } catch (error) {
