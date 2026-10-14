@@ -81,6 +81,12 @@ const SPELLINGS = [TERM, TERM.toUpperCase(), TERM.replace(/ /g, '  '), ` ${TERM}
 const CHANNELS = [1, 2, 3, 4].map(i => `race-${RUN}-ch-${i}`);
 const OBS_PER_CHANNEL = 1;
 
+// pg typings omit EventEmitter.on for Pool (present at runtime — verified);
+// route pool error subscriptions through this helper instead of fighting it.
+function onPoolError(pool: InstanceType<typeof pg.Pool>, listener: (error: unknown) => void): void {
+  (pool as unknown as { on: (event: 'error', listener: (error: unknown) => void) => void }).on('error', listener);
+}
+
 // Bounded wait: the loser timer is always cleared, so a fast operation never
 // trips a stale timeout later (and never holds the event loop open).
 async function bounded<T>(promise: Promise<T>, ms: number, onTimeout: () => void): Promise<T> {
@@ -115,6 +121,7 @@ async function main() {
   // and getDb() is never touched. application_name tags race backends so a
   // straggler timeout can terminate exactly those connections.
   const dbPool = new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000 });
+  onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
   const db = dbPool;
   const createdChannels: string[] = [];
   const racers: Array<Promise<unknown>> = [];
@@ -122,6 +129,11 @@ async function main() {
     new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000, application_name: 'terminology-vocab-race' }),
     new pg.Pool({ connectionString, ssl: targetSsl, connectionTimeoutMillis: 15_000, application_name: 'terminology-vocab-race' }),
   ];
+  for (const pool of pools) {
+    // Idle-client deaths must never crash the run; checked-out failures
+    // surface through the writers' rejected promises below.
+    onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
+  }
   try {
   for (const channelId of CHANNELS) {
     const inserted = await db.query(
@@ -204,11 +216,25 @@ async function main() {
     let stragglers = false;
     await bounded(Promise.allSettled(racers), 30_000, () => { stragglers = true; }).catch(() => { stragglers = true; });
     if (stragglers) {
-      const killed = await db.query(
-        `SELECT count(*)::int n FROM (SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name='terminology-vocab-race' AND pid<>pg_backend_pid()) s WHERE killed`
+      // Cancel first: aborting the in-flight query rolls back that writer's
+      // transaction while keeping its connection alive, so settlement errors
+      // flow through promises instead of crashing the process on dead-client
+      // 'error' events. Termination below is the last resort for backends
+      // that ignore cancel (their connections die; pool error handlers above
+      // absorb the fallout).
+      const cancelled = await db.query(
+        `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE application_name='terminology-vocab-race' AND pid<>pg_backend_pid()) s WHERE cancelled`
       ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-      console.warn(`cleanup: terminated ${Number((killed.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} straggler backends; in-flight transactions rolled back`);
-      await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after termination; proceeding best-effort')).catch(() => undefined);
+      console.warn(`cleanup: cancelled ${Number((cancelled.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} straggler backends; their transactions abort`);
+      let stillStuck = false;
+      await bounded(Promise.allSettled(racers), 15_000, () => { stillStuck = true; }).catch(() => { stillStuck = true; });
+      if (stillStuck) {
+        const killed = await db.query(
+          `SELECT count(*)::int n FROM (SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity WHERE application_name='terminology-vocab-race' AND pid<>pg_backend_pid()) s WHERE killed`
+        ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+        console.warn(`cleanup: terminated ${Number((killed.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} unresponsive backends; their transactions rolled back server-side`);
+        await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after termination; proceeding best-effort')).catch(() => undefined);
+      }
     }
     const failures: string[] = [];
     const cleanupStep = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
