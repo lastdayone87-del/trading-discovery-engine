@@ -175,14 +175,14 @@ async function cleanupRunFixtures(
 }
 const COUNTRY = 'Germany';
 const ALIAS_COUNTRY = 'US';
-const PHRASE = `e2e probe ${randomUUID().slice(0, 8)}`;
-const DEMOTE_PHRASE = `e2e demote probe ${randomUUID().slice(0, 8)}`;
-const ALIAS_PHRASE = `e2e alias probe ${randomUUID().slice(0, 8)}`;
-const SCOPE_PHRASE = `e2e scope probe ${randomUUID().slice(0, 8)}`;
 // Full-uuid run identity (32 hex): an 8-hex suffix leaves a 2^-32 birthday
 // collision across runs sharing one staging database; full uuids make fixture
 // identity unique in practice as well as by construction (RETURNING-gated).
 const RUN = randomUUID().replace(/-/g, '');
+const PHRASE = `e2e probe ${RUN}`;
+const DEMOTE_PHRASE = `e2e demote probe ${RUN}`;
+const ALIAS_PHRASE = `e2e alias probe ${RUN}`;
+const SCOPE_PHRASE = `e2e scope probe ${RUN}`;
 // Unique fixture IDs per run: no existing record is ever modified, and reruns
 // never collide with prior fixtures on a reused staging database.
 const CHANNELS = [1, 2, 3].map(i => `e2e-${RUN}-ch-${i}`);
