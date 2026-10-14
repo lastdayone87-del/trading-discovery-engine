@@ -75,10 +75,13 @@ async function verifyStagingTargetOrThrow(
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
   const probe = stagingPool(connectionString, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
   let tokenMatches = false;
+  let jobCount = -1;
   let probeError: unknown = null;
   try {
     const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
     tokenMatches = (marker.rows[0] as Record<string, unknown> | undefined)?.token === expectedToken;
+    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`);
+    jobCount = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
   } catch (error) {
     probeError = error;
   } finally {
@@ -94,14 +97,6 @@ async function verifyStagingTargetOrThrow(
   // Staging quiescence: these scripts require a worker-free database (fixture
   // channels must never be claimed by queue workers mid-run). The provisioned
   // staging database satisfies this; any jobs table activity refuses the run.
-  let jobCount = -1;
-  try {
-    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs`);
-    jobCount = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
-  } catch (error) {
-    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-    throw new Error(`Refusing to run: staging probe failed on jobs check (${detail}) — verify the tunnel and staging database instead of retrying blindly.`);
-  }
   if (jobCount !== 0) {
     throw new Error(`Refusing to run: jobs table has ${jobCount} rows — staging database must have no workers pointed at it.`);
   }
