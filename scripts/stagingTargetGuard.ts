@@ -138,11 +138,10 @@ export function tlsPoolConfig(
 }
 
 /**
- * Explicitly allowlisted staging target identities. A database CLONE carries
- * the marker row and token with it, so token comparison alone cannot tell a
- * clone from the provisioned staging database. Defaults to loopback only
+ * Explicitly allowlisted staging target identities. Defaults to loopback only
  * (the tunnel topology); any remote staging host must be listed explicitly
- * via STAGING_TARGET_ALLOWLIST (comma-separated, bracket-tolerant).
+ * via STAGING_TARGET_ALLOWLIST (comma-separated, bracket-tolerant, with
+ * optional :port pins).
  */
 export function targetAllowlist(): string[] {
   const raw = process.env.STAGING_TARGET_ALLOWLIST;
@@ -386,17 +385,16 @@ export async function pinLoopbackTarget(
 }
 
 export interface StagingIdentity {
-  token: string;
+  /** Run nonce written by the probe; a rerouted pool lands on a database
+   * without it and refuses before writing. */
+  nonce: string;
   serverAddr: string | null;
   dbName: string;
-  /** Cluster identifier: a rerouted clone in another cluster fails here even
-   * when token, address, and database name all match. */
-  sysid: string;
 }
 
 /**
  * Re-verify staging identity on a work pool before its first write: the same
- * marker token, server address, and database name the probe verified. A DNS
+ * run nonce, server address, and database name the probe verified. A DNS
  * or routing change between the probe and pool creation surfaces here instead
  * of silently writing to a different database.
  */
@@ -405,19 +403,15 @@ export async function assertStagingIdentity(
   expected: StagingIdentity
 ): Promise<void> {
   const res = await db.query(
-    `SELECT (SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging') AS token,
-            inet_server_addr()::text AS addr, current_database() AS db,
-            (SELECT system_identifier::text AS sysid FROM pg_control_system()) AS sysid`
+    `SELECT (SELECT run_id FROM staging_run_nonce LIMIT 1) AS nonce,
+            inet_server_addr()::text AS addr, current_database() AS db`
   );
   const row = (res.rows[0] ?? {}) as Record<string, unknown>;
-  if (row.token !== expected.token) throw new Error('staging identity re-check failed: marker token mismatch');
+  if (row.nonce !== expected.nonce) throw new Error('staging identity re-check failed: run nonce absent — refusing to write');
   if ((row.addr ?? null) !== expected.serverAddr) {
     throw new Error(`staging identity re-check failed: server address changed (${String(row.addr)} !== ${String(expected.serverAddr)})`);
   }
   if (row.db !== expected.dbName) {
     throw new Error(`staging identity re-check failed: database changed (${String(row.db)} !== ${expected.dbName})`);
-  }
-  if (String(row.sysid ?? '') !== expected.sysid) {
-    throw new Error('staging identity re-check failed: cluster identifier changed (possible reroute to a cloned cluster)');
   }
 }

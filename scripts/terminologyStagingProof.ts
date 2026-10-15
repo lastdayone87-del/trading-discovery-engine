@@ -1,27 +1,34 @@
 /**
  * Staging E2E proof for the terminology native-discovery loop (PR #522).
  *
- * Runs ONLY against a disposable staging database. Requires DATABASE_URL to
- * point at staging (refuses to run when STAGING_OK is not 'true' as a guard
- * against accidental production execution). Every leg executes production
- * functions against live PostgreSQL and asserts persisted evidence.
+ * Runs ONLY against a freshly provisioned disposable database: one
+ * single-purpose Postgres container per run, migrated, verified, exercised,
+ * then destroyed with proof of absence. Requires DATABASE_URL to point at
+ * that database plus STAGING_OK=true as an explicit intent guard.
  *
- * Run: STAGING_OK=true DATABASE_URL=<staging> npx tsx scripts/terminologyStagingProof.ts
+ * Provisioning (per run, on the VPS host):
+ *   PASS=$(openssl rand -hex 24); PORT=<free high port, 127.0.0.1 only>
+ *   docker run -d --name term-proof-<id> -p 127.0.0.1:$PORT:5432 \
+ *     -e POSTGRES_USER=postgres -e POSTGRES_DB=postgres \
+ *     -e POSTGRES_PASSWORD_FILE=/run/secrets/pgpass \
+ *     --mount type=bind,source=/root/.staging-pg-pass,target=/run/secrets/pgpass,readonly \
+ *     -v term-proof-<id>-data:/var/lib/postgresql postgres:18-alpine
+ *  Tunnel local $PORT to the VPS, then:
+ *   DATABASE_URL=postgresql://postgres:$PASS@127.0.0.1:$PORT/postgres \
+ *     npx tsx scripts/runMigrations.ts
+ *   STAGING_OK=true DATABASE_URL=<same> npx tsx scripts/terminologyStagingProof.ts
+ * Teardown (proof of absence required):
+ *   docker rm -f -v term-proof-<id>; docker inspect fails; port refused;
+ *   named volume gone from `docker volume ls`.
  *
- * Provisioning (once per staging database, before first run):
- *   npx tsx scripts/runMigrations.ts   (DATABASE_URL pointed at staging)
- *   CREATE TABLE staging_proof_marker(note text PRIMARY KEY, token text NOT NULL);
- *   INSERT INTO staging_proof_marker(note, token) VALUES('terminology-e2e-staging', '<random-token>');
- *   Run with STAGING_PROOF_TOKEN=<same-token>: the pre-init check compares it
- *   before any initializing connection, so a database that merely contains
- *   the marker row (e.g. a copy) still refuses without the pairing token.
- *   Run with STAGING_SYSTEM_IDENTIFIER=<pg_control_system() of staging> and
- *   (for non-loopback targets) STAGING_TARGET_ALLOWLIST=<host,...>.
- *
- * Quiescence requirement: run only against a staging database with no
- * workers pointed at it. The scripts refuse active queue work at startup
- * and fail loudly if any appears mid-run; they cannot prevent an operator
- * from starting workers against staging during verification.
+ * Why this is safe without marker/token/registry machinery: the target must
+ * be an EMPTY freshly-migrated database (the probe refuses any terms or
+ * channels), reachable only via an operator-created localhost tunnel with a
+ * random single-run password. No queue worker can address it (workers point
+ * at production; nothing else knows the port or password), so no quiescence
+ * checks are needed — documented here instead of asserted. Fixture identity
+ * is run-unique for log correlation, not for collision safety: a duplicate
+ * fails loudly on plain inserts instead of being silently reconciled.
  *
  * Non-coverage note: this proof exercises duplicate-observation suppression
  * (Leg 2), not removal of rule-admitted instruments from overlapping AI
@@ -81,8 +88,6 @@ async function verifyStagingTargetOrThrow(
   tls: { ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string };
   identity: StagingIdentity;
 }> {
-  const expectedToken = process.env.STAGING_PROOF_TOKEN;
-  if (!expectedToken) throw new Error('Refusing to run: STAGING_PROOF_TOKEN is required (pairing token from staging provisioning).');
   const verdict = verifyStagingTarget(connectionString);
   if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
   // Pin loopback hostnames to a verified loopback IP so later pools cannot
@@ -94,239 +99,54 @@ async function verifyStagingTargetOrThrow(
     pinned = (await pinLoopbackTarget(connectionString)).connectionString;
   }
   const probe = stagingPool(pinned, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
-  let tokenMatches = false;
-  let activeJobs = -1;
-  let clusterId: string | null = null;
+  // Fresh-database proof: a disposable staging database, migrated moments
+  // ago by the operator, contains no terminology rows and no channels. Any
+  // other content means this is NOT the disposable target — refuse before
+  // writing anything. Queries that fail (e.g. unmigrated target) refuse via
+  // the probe error below, never as an empty result.
   let serverAddr: string | null = null;
   let dbName = '';
   let probeError: unknown = null;
+  let populated = -1;
+  let nonce = '';
   try {
-    const marker = await probe.query(`SELECT token FROM staging_proof_marker WHERE note='terminology-e2e-staging'`);
-    tokenMatches = (marker.rows[0] as Record<string, unknown> | undefined)?.token === expectedToken;
-    // Active (non-terminal) jobs only: COMPLETED/FAILED history rows must not
-    // block verification, but live queue work does.
-    const jobs = await probe.query(`SELECT count(*)::int n FROM jobs WHERE status NOT IN ('COMPLETED','FAILED')`);
-    activeJobs = Number((jobs.rows[0] as Record<string, unknown> | undefined)?.n ?? -1);
-    const sysid = await probe.query(`SELECT system_identifier::text AS sysid FROM pg_control_system()`);
-    clusterId = String((sysid.rows[0] as Record<string, unknown> | undefined)?.sysid ?? '');
     const endpoint = await probe.query(`SELECT inet_server_addr()::text AS addr, current_database() AS db`);
     serverAddr = (endpoint.rows[0] as Record<string, unknown> | undefined)?.addr as string | null ?? null;
     dbName = String((endpoint.rows[0] as Record<string, unknown> | undefined)?.db ?? '');
+    const terms = await probe.query(`SELECT count(*)::int n FROM canonical_trading_terms`);
+    const channels = await probe.query(`SELECT count(*)::int n FROM channels`);
+    populated = Number(terms.rows[0]?.n ?? -1) + Number(channels.rows[0]?.n ?? -1);
+    if (populated !== 0) {
+      throw new Error('TARGET-POPULATED');
+    }
+    // Run nonce: re-checked on every work pool before its first write, so a
+    // mid-run DNS flip lands on a database without the nonce and aborts
+    // instead of writing elsewhere.
+    nonce = randomUUID().replace(/-/g, '');
+    await probe.query(`CREATE TABLE IF NOT EXISTS staging_run_nonce(run_id TEXT PRIMARY KEY)`);
+    await probe.query(`INSERT INTO staging_run_nonce(run_id) VALUES($1) ON CONFLICT DO NOTHING`, [nonce]);
   } catch (error) {
     probeError = error;
   } finally {
     await probe.end().catch(() => undefined);
   }
-  // Distinguish a failed probe (connectivity — fail closed) from a wrong
-  // identity so a dead tunnel is never misreported as a token mismatch.
+  // Distinguish refusal causes so a dead tunnel is never misreported: real
+  // connectivity/schema failures name themselves, while a populated target
+  // gets the explicit freshness refusal.
   if (probeError !== null) {
+    if (probeError instanceof Error && probeError.message === 'TARGET-POPULATED') {
+      throw new Error(`Refusing to run: target database is not a fresh disposable database (terms/channels present) — refusing to write.`);
+    }
     const detail = probeError instanceof Error ? `${probeError.name}: ${probeError.message}` : String(probeError);
-    throw new Error(`Refusing to run: staging probe failed (${detail}) — verify the tunnel and staging database instead of retrying blindly.`);
-  }
-  if (!tokenMatches) throw new Error('Refusing to run: staging pairing token mismatch — target is not the provisioned staging database.');
-  // Staging quiescence: these scripts require a worker-free database (fixture
-  // channels must never be claimed by queue workers mid-run). Only ACTIVE
-  // queue work refuses the run — COMPLETED/FAILED history is tolerated. The
-  // provisioned staging database satisfies this.
-  if (activeJobs !== 0) {
-    throw new Error(`Refusing to run: jobs table has ${activeJobs} active rows — staging database must have no workers pointed at it.`);
-  }
-  // Cluster identity: a filesystem/container clone of staging carries the
-  // marker row and token with it, so token comparison alone cannot tell a
-  // clone from the provisioned database. The expected cluster identifier is
-  // supplied out-of-band (never read from the target itself). Residual gap:
-  // a clone inside the SAME cluster (e.g. another database) shares the
-  // identifier and is not distinguished — see the provisioning notes.
-  const expectedClusterId = process.env.STAGING_SYSTEM_IDENTIFIER;
-  if (!expectedClusterId) throw new Error('Refusing to run: STAGING_SYSTEM_IDENTIFIER is required (cluster identity from staging provisioning).');
-  if (clusterId !== expectedClusterId) {
-    throw new Error('Refusing to run: cluster identifier mismatch — target is not the provisioned staging database (possible clone).');
+    throw new Error(`Refusing to run: staging probe failed (${detail}) — verify the tunnel, migration, and staging database instead of retrying blindly.`);
   }
   return {
     connectionString: pinned,
     tls: { ssl: verdict.ssl, caFile: verdict.caFile },
-    identity: { token: expectedToken, serverAddr, dbName, sysid: clusterId ?? '' },
+    identity: { nonce, serverAddr, dbName },
   };
 }
 
-interface RunScope {
-  createdChannels: string[];
-  rawPhrases: string[];
-  normPhrases: string[];
-  countries: string[];
-  preflightPassed: boolean;
-}
-
-// Best-effort removal of this run's fixtures, resolved by run-unique phrase
-// identity plus intended country — never by bare id lists or unscoped text
-// matching, so unrelated rows sharing a numeric id or a substring survive.
-// Vocabulary-row ids are resolved first because source links reference them,
-// not canonical-term ids. Only channels whose insert actually created a row
-// are removed.
-//
-// Every step runs independently: one failing DELETE is recorded and the rest
-// still execute. INJECT_CLEANUP_FAILURE=<step> forces a step to fail (staging
-// fault drill). Any step failure — or leftover residue found afterwards —
-// throws, so incomplete cleanup is never reported as successful.
-const INJECTED_CLEANUP_FAILURE = process.env.INJECT_CLEANUP_FAILURE;
-async function cleanupStep(
-  failures: string[],
-  name: string,
-  fn: () => Promise<unknown>
-): Promise<void> {
-  try {
-    if (INJECTED_CLEANUP_FAILURE === name) throw new Error(`injected cleanup failure at step ${name}`);
-    await fn();
-  } catch (error) {
-    failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-async function cleanupRunFixtures(
-  db: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> },
-  scope: RunScope
-): Promise<void> {
-  // Preflight-abort path: only RETURNING-created channels can exist (no
-  // observation committed), so remove just those and never resolve or delete
-  // term-scoped rows that belong to another run.
-  if (!scope.preflightPassed) {
-    if (scope.createdChannels.length > 0) {
-      await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [scope.createdChannels])
-        .then(() => console.log('cleanup: removed created channels after preflight abort'))
-        .catch(error => { throw new Error(`cleanup incomplete (preflight-abort channel removal failed: ${error instanceof Error ? error.message : String(error)})`); });
-    } else {
-      console.log('cleanup: nothing created before preflight abort');
-    }
-    return;
-  }
-  const failures: string[] = [];
-  {
-    let termIds: number[] = [];
-    let vocabIds: number[] = [];
-    try {
-      const termRows = await db.query(
-        `SELECT id FROM canonical_trading_terms WHERE normalized_term = ANY($1) AND country = ANY($2)`,
-        [scope.normPhrases, scope.countries]
-      );
-      termIds = termRows.rows.map(row => Number(row.id));
-      const vocabRows = await db.query(
-        `SELECT id FROM extracted_trading_vocabulary WHERE term = ANY($1) AND country = ANY($2)`,
-        [scope.rawPhrases, scope.countries]
-      );
-      vocabIds = vocabRows.rows.map(row => Number(row.id));
-    } catch (error) {
-      failures.push(`resolve: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const byTerm = (table: string) => `DELETE FROM ${table} WHERE canonical_term_id = ANY($1)`;
-    if (termIds.length > 0) {
-      await cleanupStep(failures, 'observations', () => db.query(byTerm('terminology_observations'), [termIds]));
-      await cleanupStep(failures, 'performance', () => db.query(byTerm('terminology_performance'), [termIds]));
-      await cleanupStep(failures, 'lifecycle', () => db.query(byTerm('terminology_lifecycle_events'), [termIds]));
-      await cleanupStep(failures, 'snapshots', () => db.query(byTerm('terminology_score_snapshots'), [termIds]));
-      await cleanupStep(failures, 'aliases', () => db.query(byTerm('trading_term_aliases'), [termIds]));
-      await cleanupStep(failures, 'projections', () => db.query(byTerm('country_native_evidence_projections'), [termIds]));
-      await cleanupStep(failures, 'attribution', () => db.query(byTerm('country_native_performance_attribution'), [termIds]));
-    }
-    if (vocabIds.length > 0) {
-      await cleanupStep(failures, 'links', () => db.query(`DELETE FROM extracted_vocabulary_sources WHERE term_id = ANY($1)`, [vocabIds]));
-      await cleanupStep(failures, 'vocab', () => db.query(`DELETE FROM extracted_trading_vocabulary WHERE id = ANY($1)`, [vocabIds]));
-    }
-    if (termIds.length > 0) {
-      await cleanupStep(failures, 'canonical', () => db.query(`DELETE FROM canonical_trading_terms WHERE id = ANY($1)`, [termIds]));
-    }
-    if (scope.createdChannels.length > 0) {
-      await cleanupStep(failures, 'channels', () => db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [scope.createdChannels]));
-    }
-    const residue = await db.query(
-      `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE term = ANY($1) AND country = ANY($2)) AS vocab,
-              (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term = ANY($3) AND country = ANY($2)) AS terms,
-              (SELECT COUNT(*) FROM channels WHERE channel_id = ANY($4)) AS channels`,
-      [scope.rawPhrases, scope.countries, scope.normPhrases, scope.createdChannels]
-    ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-    const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
-    const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
-    if (failures.length > 0 || remaining !== 0) {
-      throw new Error(`cleanup incomplete (failures=[${failures.join('; ')}] remaining=${remaining})`);
-    }
-    console.log('cleanup: removed run fixtures, residue verified 0');
-  }
-}
-
-// Durable run ownership: every run registers itself AFTER the novelty
-// preflight passes, and marks completion at the end. A process crash between
-// those points leaves an unfinished row; `--recover` cleans runs abandoned
-// for over an hour (younger rows may still be alive) by re-resolving their
-// run-unique fixture identity — the same scoping rules as normal cleanup,
-// never broader. The registry table is staging-only tooling state.
-type RunDb = { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> };
-
-async function ensureRunRegistry(db: RunDb): Promise<void> {
-  await db.query(
-    `CREATE TABLE IF NOT EXISTS staging_proof_runs(run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'started')`
-  );
-}
-
-async function registerRun(db: RunDb, runId: string, kind: string): Promise<void> {
-  await ensureRunRegistry(db);
-  await db.query(`INSERT INTO staging_proof_runs(run_id, kind) VALUES($1,$2) ON CONFLICT(run_id) DO NOTHING`, [runId, kind]);
-}
-
-async function finishRun(db: RunDb, runId: string, status: 'complete' | 'failed' | 'recovered' | 'recovery-failed'): Promise<void> {
-  await db
-    .query(`UPDATE staging_proof_runs SET finished_at=now(), status=$2 WHERE run_id=$1`, [runId, status])
-    .catch(error => console.warn('run registry update failed (non-fatal)', error instanceof Error ? error.message : String(error)));
-}
-
-// Recovery entry point for `--recover` runs: abandoned run ids (unfinished
-// for over an hour — younger rows may still be alive). Never throws for a
-// missing registry (a staging database without it simply has nothing).
-async function findAbandonedRuns(db: RunDb, kind: string): Promise<Array<{ runId: string }>> {
-  const rows = await db
-    .query(
-      `SELECT run_id FROM staging_proof_runs WHERE kind=$1 AND finished_at IS NULL AND started_at < now() - interval '1 hour'`,
-      [kind]
-    )
-    .catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-  return (rows.rows as Array<Record<string, unknown>>)
-    .map(row => String(row.run_id ?? ''))
-    .filter(runId => runId.length >= 8)
-    .map(runId => ({ runId }));
-}
-
-// Resolve one abandoned run's fixtures by its run-unique identity and remove
-// them through the same scoped cleanup as normal runs, then mark it
-// recovered. Returns leftover row counts for reporting.
-async function recoverProofRun(db: RunDb, runId: string): Promise<number> {
-  const terms = await db.query(
-    `SELECT normalized_term, country FROM canonical_trading_terms WHERE normalized_term LIKE $1`, [`%${runId.toLowerCase()}%`]
-  );
-  const vocabs = await db.query(`SELECT term, country FROM extracted_trading_vocabulary WHERE term ILIKE $1`, [`%${runId}%`]);
-  const chans = await db.query(`SELECT channel_id FROM channels WHERE channel_id LIKE $1`, [`%${runId}%`]);
-  const scope: RunScope = {
-    createdChannels: (chans.rows as Array<Record<string, unknown>>).map(row => String(row.channel_id)),
-    rawPhrases: (vocabs.rows as Array<Record<string, unknown>>).map(row => String(row.term)),
-    normPhrases: (terms.rows as Array<Record<string, unknown>>).map(row => String(row.normalized_term)),
-    countries: [...new Set([
-      ...(terms.rows as Array<Record<string, unknown>>).map(row => String(row.country)),
-      ...(vocabs.rows as Array<Record<string, unknown>>).map(row => String(row.country)),
-    ])],
-    preflightPassed: true,
-  };
-  try {
-    await cleanupRunFixtures(db, scope);
-  } catch (error) {
-    console.error(`recovery of run ${runId} incomplete`, error instanceof Error ? error.message : String(error));
-  }
-  const residue = await db.query(
-    `SELECT (SELECT COUNT(*) FROM extracted_trading_vocabulary WHERE term ILIKE $1) AS vocab,
-            (SELECT COUNT(*) FROM canonical_trading_terms WHERE normalized_term LIKE $2) AS terms,
-            (SELECT COUNT(*) FROM channels WHERE channel_id LIKE $1) AS channels`,
-    [`%${runId}%`, `%${runId.toLowerCase()}%`]
-  ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
-  const leftovers = residue.rows[0] as Record<string, unknown> | undefined;
-  const remaining = leftovers ? Number(leftovers.vocab ?? 0) + Number(leftovers.terms ?? 0) + Number(leftovers.channels ?? 0) : -1;
-  await finishRun(db, runId, remaining === 0 ? 'recovered' : 'recovery-failed');
-  return remaining;
-}
 const COUNTRY = 'Germany';
 const ALIAS_COUNTRY = 'US';
 // Full-uuid run identity (32 hex): an 8-hex suffix leaves a 2^-32 birthday
@@ -384,22 +204,6 @@ async function main() {
   // pool would otherwise write to an unprobed database.
   await assertStagingIdentity(pool, target.identity);
   const db = pool;
-  if (process.argv.includes('--recover')) {
-    // Recovery mode: clean abandoned runs only, then exit. Full target
-    // verification above still applies — recovery deletes data.
-    try {
-      const abandoned = await findAbandonedRuns(db, 'proof');
-      let leftovers = 0;
-      for (const run of abandoned) {
-        leftovers += Math.max(0, await recoverProofRun(db, run.runId));
-      }
-      console.log(`recovery complete: ${abandoned.length} abandoned runs, ${leftovers} leftover rows`);
-      process.exitCode = leftovers === 0 ? 0 : 1;
-    } finally {
-      await pool.end().catch(() => undefined);
-    }
-    return;
-  }
   let shuttingDown = false;
   // First signal stops scheduling new writes: legs abort at the next check
   // and the main finally below runs the single scoped cleanup — the handler
@@ -416,44 +220,28 @@ async function main() {
   };
   process.once('SIGINT', () => onSignal('SIGINT'));
   process.once('SIGTERM', () => onSignal('SIGTERM'));
-  const scope: RunScope = {
-    createdChannels: [],
-    rawPhrases: [PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE, SCOPE_PHRASE, NATIVE_PHRASE],
-    normPhrases: [normalizeTerm(PHRASE), normalizeTerm(DEMOTE_PHRASE), normalizeTerm(ALIAS_PHRASE), normalizeTerm(SCOPE_PHRASE), normalizeTerm(NATIVE_PHRASE)],
-    countries: [COUNTRY, 'United States'],
-    preflightPassed: false,
-  };
   let legError: unknown = null;
   try {
-  // Fixture identities must be novel for their intended countries: abort
-  // when any pre-exists rather than reusing (and later deleting) another
-  // run's rows. Checked BEFORE any fixture insert so no unregistered row can
-  // exist if this aborts — registration immediately follows, so every later
-  // write belongs to a registered run. Covers canonical terms AND vocabulary
-  // rows: an orphan vocab row (no canonical term) would otherwise be claimed
-  // by the recovery leg and deleted by cleanup.
+  // Fresh-database sanity: a disposable target holds no terminology rows at
+  // all. This aborts before any write if the database is not fresh.
   const pre = await db.query(
     `SELECT normalized_term, country FROM canonical_trading_terms WHERE (normalized_term = ANY($1) AND country = ANY($2))`,
-    [scope.normPhrases, scope.countries]
+    [[normalizeTerm(PHRASE), normalizeTerm(DEMOTE_PHRASE), normalizeTerm(ALIAS_PHRASE), normalizeTerm(SCOPE_PHRASE), normalizeTerm(NATIVE_PHRASE)], [COUNTRY, 'United States']]
   );
   const preVocab = await db.query(
     `SELECT term, country FROM extracted_trading_vocabulary WHERE term = ANY($1) AND country = ANY($2)`,
-    [scope.rawPhrases, scope.countries]
+    [[PHRASE, DEMOTE_PHRASE, ALIAS_PHRASE, SCOPE_PHRASE, NATIVE_PHRASE], [COUNTRY, 'United States']]
   );
   check('fixture identities novel', pre.rows.length === 0 && preVocab.rows.length === 0, { clashes: pre.rows, vocabClashes: preVocab.rows });
-  scope.preflightPassed = true;
-  await registerRun(db, RUN, 'proof');
   // Fixture creators: confirmed traders eligible for links, retry and trial.
-  // Only ids whose insert actually creates a row are registered for cleanup,
-  // so a pre-existing channel is never removed.
+  // Plain inserts: a duplicate fails loudly — there is nothing legitimate to
+  // conflict with on a disposable database.
   for (const channelId of CHANNELS) {
-    const inserted = await db.query(
+    await db.query(
       `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
-       VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','e2e-proof',now(),90,'TRADING_CONFIRMED')
-       ON CONFLICT(channel_id) DO NOTHING RETURNING channel_id`,
+       VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','e2e-proof',now(),90,'TRADING_CONFIRMED')`,
       [channelId, `https://youtube.com/channel/${channelId}`, COUNTRY]
     );
-    if (inserted.rows.length > 0) scope.createdChannels.push(channelId);
   }
 
   // Leg 1: observation + save.
@@ -607,36 +395,23 @@ async function main() {
     nativeProj.rows[0] ?? null
   );
 
-  // End-quiescence: no queue worker may have acted mid-run. Active work now
-  // fails the run loudly instead of passing silently.
-  const endJobs = await db.query(`SELECT count(*)::int n FROM jobs WHERE status NOT IN ('COMPLETED','FAILED')`);
-  check('staging stayed worker-free', Number(endJobs.rows[0]?.n) === 0, endJobs.rows[0]);
+  // (No end-quiescence check by design: no worker can address this
+  // disposable database — see the header. The planner leg above already
+  // proves the term reached a searchable lifecycle state.)
 
   console.log(`E2E PROOF COMPLETE (${passed} legs)`);
   } catch (error) {
-    // A leg/check failure is captured, not lost: cleanup still runs below,
-    // and the original error propagates after pool shutdown instead of being
-    // replaced by a cleanup failure (both are reported).
+    // A leg/check failure is captured, not lost: pool shutdown still runs
+    // below, and the original error propagates after it instead of being
+    // replaced (both are reported).
     legError = error;
+  } finally {
+    await pool.end().catch(() => undefined);
   }
-  let cleanupError: unknown = null;
-  try {
-    await cleanupRunFixtures(db, scope);
-  } catch (error) {
-    console.error('cleanup failed', error);
-    cleanupError = error;
-  }
-  // Registry marking happens while the pool is still open (finishRun would
-  // silently fail after pool.end), and 'complete' is recorded only when both
-  // legs and cleanup succeeded — otherwise the run stays recoverable.
-  if (legError === null && cleanupError === null) {
-    await finishRun(db, RUN, 'complete');
-  } else {
-    await finishRun(db, RUN, 'failed');
-  }
-  await pool.end().catch(() => undefined);
+  // No fixture cleanup here by design: every row this run wrote lives in its
+  // disposable database, which the operator destroys after the run (verified
+  // gone: container absent, port refused, volume removed).
   if (legError !== null) throw legError;
-  if (cleanupError !== null) throw cleanupError;
 }
 
 main().then(

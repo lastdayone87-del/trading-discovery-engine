@@ -263,27 +263,23 @@ test('loopback address classification is strict', () => {
 });
 
 test('work-pool identity re-check detects endpoint changes', async () => {
-  const expected = { token: 'tok', serverAddr: '10.0.1.8', dbName: 'postgres', sysid: '111' };
+  const expected = { nonce: 'abc123', serverAddr: '10.0.1.8', dbName: 'postgres' };
   const goodDb = {
-    query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.8', db: 'postgres', sysid: '111' }] }),
+    query: async () => ({ rows: [{ nonce: 'abc123', addr: '10.0.1.8', db: 'postgres' }] }),
   };
   await assertStagingIdentity(goodDb, expected);
-  const badToken = {
-    query: async () => ({ rows: [{ token: 'other', addr: '10.0.1.8', db: 'postgres', sysid: '111' }] }),
+  const missingNonce = {
+    query: async () => ({ rows: [{ nonce: 'other', addr: '10.0.1.8', db: 'postgres' }] }),
   };
-  await assert.rejects(assertStagingIdentity(badToken, expected), /token mismatch/);
+  await assert.rejects(assertStagingIdentity(missingNonce, expected), /run nonce absent/);
   const movedHost = {
-    query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.9', db: 'postgres', sysid: '111' }] }),
+    query: async () => ({ rows: [{ nonce: 'abc123', addr: '10.0.1.9', db: 'postgres' }] }),
   };
   await assert.rejects(assertStagingIdentity(movedHost, expected), /server address changed/);
   const movedDb = {
-    query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.8', db: 'prod', sysid: '111' }] }),
+    query: async () => ({ rows: [{ nonce: 'abc123', addr: '10.0.1.8', db: 'prod' }] }),
   };
   await assert.rejects(assertStagingIdentity(movedDb, expected), /database changed/);
-  const clonedCluster = {
-    query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.8', db: 'postgres', sysid: '222' }] }),
-  };
-  await assert.rejects(assertStagingIdentity(clonedCluster, expected), /cluster identifier changed/);
 });
 
 test('unexpected query parameters are refused', () => {
