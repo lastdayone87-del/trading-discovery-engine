@@ -224,7 +224,7 @@ async function main() {
     }
     shuttingDown = true;
     signalAborting = true;
-    console.warn(`${signal} received; aborting legs — scoped cleanup runs in the main finally path`);
+    console.warn(`${signal} received; aborting legs — pools close in the main finally path`);
   };
   process.once('SIGINT', () => onSignal('SIGINT'));
   process.once('SIGTERM', () => onSignal('SIGTERM'));
