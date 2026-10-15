@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb } from './db';
 import { observeTerminologyDetailed, readNativeQualityEvidence } from './terminologyIntelligence';
-import { computeLegacyObservationKey, computeObservationKey } from './countryNativeIntelligence';
+import { computeObservationKey } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
 
@@ -279,12 +279,10 @@ test('provider language reaches native evidence, projection, and lifecycle gates
     evidence: altEvidence
   });
   assert.ok(altFirst && altFirst.observationInserted);
-  // Simulate the exact pre-change production row: legacy key, NULL status.
-  const legacyKey = computeLegacyObservationKey({
-    canonicalTermId: altFirst.termId, channelId, videoId: `v-alt-${suffix}`,
-    observationType: 'VIDEO_TITLE', nativeEvidenceStatus: null, sourceProvenanceFamily: null,
-    evidence: altEvidence
-  });
+  // Simulate a pre-change production row: a non-current key with NULL
+  // status. Reconciliation matches by source identity plus evidence
+  // substance, so any key vintage heals the same way.
+  const legacyKey = `legacy-simulated-${suffix}`;
   await db.query(`UPDATE terminology_observations SET observation_key=$1, native_evidence_status=NULL WHERE canonical_term_id=$2`, [legacyKey, altFirst.termId]);
   const altSecond = await observeTerminologyDetailed({
     term: altTerm, country: 'Germany', termType: 'TERMINOLOGY',
@@ -337,6 +335,62 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   );
   assert.equal(umzugRows.rows.length, 1);
   assert.equal(umzugRows.rows[0]?.source_creator_country, 'France');
+
+  // (k) Superseded residue merges: a legacy-keyed duplicate alongside a live
+  // new-format row folds its classification into the survivor's revisions
+  // and is removed, so aggregates count one row per source.
+  const dupeTerm = `Dupe ${suffix}`;
+  const dupeFirst = await observeTerminologyDetailed({
+    term: dupeTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-dupe-${suffix}`,
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
+  });
+  assert.ok(dupeFirst && dupeFirst.observationInserted);
+  const dupeKey = `legacy-dupe-key-${suffix}`;
+  await db.query(
+    `INSERT INTO terminology_observations(canonical_term_id, source_channel_id, source_video_id, observation_type,
+       human_approved, evidence_weight, evidence, source_creator_country, locale, term_language,
+       native_evidence_status, observation_key)
+     VALUES($1,$2,$3,'VIDEO_TITLE',false,1.0,$4,'Germany','de-DE','de','NATIVE_OBSERVED',$5)`,
+    [dupeFirst.termId, channelId, `v-dupe-${suffix}`,
+     JSON.stringify({ extractor: 'OLD', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }),
+     dupeKey]
+  );
+  await observeTerminologyDetailed({
+    term: dupeTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-dupe-${suffix}`,
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
+  });
+  const dupeRows = await db.query(
+    `SELECT id, observation_key, evidence->'revisions' AS revs FROM terminology_observations WHERE canonical_term_id=$1`,
+    [dupeFirst.termId]
+  );
+  assert.equal(dupeRows.rows.length, 1);
+  const dupeRevs = dupeRows.rows[0]?.revs as Array<Record<string, unknown>> | null;
+  assert.ok(Array.isArray(dupeRevs) && dupeRevs.some(r => r?.superseded_legacy_key === dupeKey));
+
+  // (l) Keyless rows heal by source identity: a NULL-keyed observation for
+  // the same source is rekeyed in place instead of duplicating.
+  const nullTerm = `Nullkey ${suffix}`;
+  const nullFirst = await observeTerminologyDetailed({
+    term: nullTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-null-${suffix}`,
+    evidence: { extractor: 'TEST' }
+  });
+  assert.ok(nullFirst && nullFirst.observationInserted);
+  await db.query(`UPDATE terminology_observations SET observation_key=NULL WHERE canonical_term_id=$1`, [nullFirst.termId]);
+  await observeTerminologyDetailed({
+    term: nullTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-null-${suffix}`,
+    evidence: { extractor: 'TEST' }
+  });
+  const nullRows = await db.query(
+    `SELECT observation_key FROM terminology_observations WHERE canonical_term_id=$1`, [nullFirst.termId]
+  );
+  assert.equal(nullRows.rows.length, 1);
+  assert.ok(typeof nullRows.rows[0]?.observation_key === 'string' && nullRows.rows[0]?.observation_key.length > 0);
 });
 
 test('configureTestTls encrypts remote traffic by default', () => {

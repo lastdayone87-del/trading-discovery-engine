@@ -979,17 +979,27 @@ export function usableVideoLanguages(videos: Array<{ language?: unknown }>): str
  * Channel-fallback selection for enrichment: usable video languages always
  * win (even conflicting ones — the selector then fail-closes); the channel
  * default applies only when no video carries a usable signal; a stale
- * fallback survives only when nothing newer exists.
+ * fallback survives only when nothing newer exists. A valid transcript
+ * language disagreeing with the selected context vetoes it: transcripts
+ * describe actual spoken content, so disagreement fails closed instead of
+ * trusting one signal.
  */
 export function resolveEnrichmentDetectedLanguages(
   channelSnippet: any,
   videos: Array<{ language?: unknown }>,
-  fallbackDetectedLanguages: Array<{ language: string; confidence?: number }> | undefined
+  fallbackDetectedLanguages: Array<{ language: string; confidence?: number }> | undefined,
+  transcripts: Array<{ language?: unknown }> = []
 ): Array<{ language: string }> | undefined {
   if (usableVideoLanguages(videos).length > 0) return undefined;
   const channelTag = snippetLanguage(channelSnippet);
-  if (channelTag !== undefined) return [{ language: channelTag }];
-  return fallbackDetectedLanguages;
+  const selected = channelTag !== undefined ? [{ language: channelTag }] : fallbackDetectedLanguages;
+  if (!selected) return undefined;
+  const selectedLang = normalizeLanguageCode(selected[0].language);
+  const dissent = usableVideoLanguages(transcripts)
+    .map(tag => normalizeLanguageCode(tag))
+    .some(lang => lang !== '' && lang !== selectedLang);
+  if (dissent) return undefined;
+  return selected;
 }
 
 /**
@@ -1008,6 +1018,28 @@ export interface ClassifiableVideo {
   source_family_id?: string;
   source_entity_id?: string;
   language?: string;
+}
+
+/**
+ * Terminology-isolation boundary for classifier inputs. Enrichment-added
+ * provider language (videos[].language, detectedLanguages set by YouTube
+ * enrichment) is a terminology-selection signal only and must not reach the
+ * trading classifier. Non-enrichment passes preserve candidate hints
+ * untouched — search-path candidates carry none today, and any legitimate
+ * future producer flowing outside enrichment keeps its signals.
+ * The terminology selector reads the same signals from the candidate
+ * object, which is never modified here.
+ */
+export function classifierLanguageInputs(
+  candidate: Pick<DiscoveredChannelRaw, 'detectedLanguages'>,
+  structuredVideos: ClassifiableVideo[],
+  isEnrichmentPass: boolean
+): {
+  videos: Array<ClassifiableVideo> | Array<Omit<ClassifiableVideo, 'language'>>;
+  detected_languages: Array<{ language: string; confidence?: number }> | undefined;
+} {
+  if (!isEnrichmentPass) return { videos: structuredVideos, detected_languages: candidate.detectedLanguages };
+  return { videos: withoutVideoLanguages(structuredVideos), detected_languages: undefined };
 }
 
 export function withoutVideoLanguages(videos: Array<ClassifiableVideo>): Array<Omit<ClassifiableVideo, 'language'>> {
@@ -1121,7 +1153,9 @@ export async function fetchYouTubeChannelEnrichment(
       // channel default applies solely when no video carries a usable
       // signal; a stale fallback survives only when nothing newer exists.
       // Provider-asserted, never country-derived.
-      const channelFallbackLangs = resolveEnrichmentDetectedLanguages(channelLanguageSnippet(channel), videos, fallback.detectedLanguages);
+      const channelFallbackLangs = resolveEnrichmentDetectedLanguages(
+        channelLanguageSnippet(channel), videos, fallback.detectedLanguages, fallback.transcriptExcerpts ?? []
+      );
 
       return {
         ...fallback,
@@ -1199,7 +1233,8 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
         // snippet/branding language is retained so later extraction passes
         // without a full enrichment round.
         detectedLanguages: resolveEnrichmentDetectedLanguages(
-          channelLanguageSnippet(channel), fallback.videos ?? [], fallback.detectedLanguages
+          channelLanguageSnippet(channel), fallback.videos ?? [], fallback.detectedLanguages,
+          fallback.transcriptExcerpts ?? []
         ),
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
     } catch (error) { recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++; }

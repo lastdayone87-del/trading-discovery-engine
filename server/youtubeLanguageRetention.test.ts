@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { channelLanguageSnippet, resolveEnrichmentDetectedLanguages, snippetLanguage, usableVideoLanguages, withoutVideoLanguages } from './youtube';
+import { channelLanguageSnippet, classifierLanguageInputs, resolveEnrichmentDetectedLanguages, snippetLanguage, usableVideoLanguages, withoutVideoLanguages } from './youtube';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 
 test('snippetLanguage prefers per-video audio language, then default language', () => {
@@ -94,8 +94,8 @@ test('withoutVideoLanguages strips only the language key for classifier inputs',
 
 test('trading-classifier inputs carry no provider language hints', () => {
   const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
-  assert.match(source, /videos:withoutVideoLanguages\(structuredVideos\)/);
-  assert.match(source, /detected_languages:undefined/);
+  assert.match(source, /videos:languageInputs\.videos/);
+  assert.match(source, /detected_languages:languageInputs\.detected_languages/);
 });
 
 test('channel language prefers snippet default, then brandingSettings default', () => {
@@ -135,4 +135,20 @@ test('channel language validates snippet before branding fallback', () => {
     }),
     { defaultAudioLanguage: undefined, defaultLanguage: '!!!' }
   );
+});
+
+test('classifier inputs strip only enrichment-added language hints', () => {
+  const videos = [{ id: 'v1', title: 't', language: 'de' }];
+  const hints = [{ language: 'de' }];
+  // Enrichment pass: enrichment-added hints are isolated from classification.
+  assert.deepEqual(classifierLanguageInputs({ detectedLanguages: hints }, videos, true), {
+    videos: [{ id: 'v1', title: 't' }],
+    detected_languages: undefined,
+  });
+  // Other passes preserve candidate hints untouched.
+  assert.deepEqual(classifierLanguageInputs({ detectedLanguages: hints }, videos, false), {
+    videos,
+    detected_languages: hints,
+  });
+  assert.deepEqual(classifierLanguageInputs({}, [], false), { videos: [], detected_languages: undefined });
 });

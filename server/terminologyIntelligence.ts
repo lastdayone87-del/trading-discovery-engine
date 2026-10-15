@@ -6,7 +6,6 @@ import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
 import {
   computeEvidenceChecksum,
-  computeLegacyObservationKey,
   computeObservationKey,
   detectCodeSwitching,
   inferScript,
@@ -762,46 +761,77 @@ export async function observeTerminologyDetailed(args: {
     evidence: args.evidence
   });
 
-  // 3b. Legacy reconciliation (one-time per row after the identity change):
-  // rows still keyed in the pre-change format are rekeyed in place on first
-  // re-observation instead of duplicating. Two legacy variants are checked:
-  // current classification values (unchanged replays) and NULL/None values
-  // (the dominant production shape — every pre-change production row is
-  // unclassified, so reclassification with new language still reconciles).
-  // A pre-existing new-format duplicate (re-observed across the change) is
-  // left in place: inert for counts, and deleted rows cannot be audited.
-  const legacyKey = computeLegacyObservationKey({
-    canonicalTermId: termId,
-    channelId: args.channelId,
-    videoId: args.videoId,
-    observationType: args.observationType,
-    nativeEvidenceStatus: resolvedNativeStatus,
-    sourceProvenanceFamily: resolvedProvenanceFamily,
-    sourceEvidenceId: args.sourceEvidenceId,
-    evidence: args.evidence
-  });
-  const legacyNullKey = computeLegacyObservationKey({
-    canonicalTermId: termId,
-    channelId: args.channelId,
-    videoId: args.videoId,
-    observationType: args.observationType,
-    nativeEvidenceStatus: null,
-    sourceProvenanceFamily: null,
-    sourceEvidenceId: args.sourceEvidenceId,
-    evidence: args.evidence
-  });
-  const legacyHit = await runner.query(
-    `SELECT id FROM terminology_observations WHERE observation_key<>$1 AND observation_key IN ($2,$3) LIMIT 1`,
-    [obsKey, legacyKey, legacyNullKey]
+  // 3b. Legacy reconciliation: rows keyed before the identity change (old
+  // status-bearing keys, extractor-bearing checksums, or keyless rows) are
+  // converged in place on first re-observation instead of duplicating.
+  // Matching is by source identity plus evidence substance (recomputed with
+  // the stored evidence): genuinely different evidence stays separate, while
+  // any same-substance row — whatever its key vintage — heals onto the
+  // current identity. The first match is rekeyed; further matches are
+  // folded into its revision log and removed so aggregates count one row.
+  // (One-time per row; the per-term advisory lock above serializes this.)
+  const legacyCandidates = await runner.query(
+    `SELECT id, observation_key, evidence, native_evidence_status, source_provenance_family,
+            term_language, locale, observed_at
+     FROM terminology_observations
+     WHERE canonical_term_id=$1
+       AND COALESCE(source_channel_id,'')=COALESCE($2::text,'')
+       AND COALESCE(source_video_id,'')=COALESCE($3::text,'')
+       AND observation_type=$4
+       AND (observation_key IS NULL OR observation_key<>$5)
+     ORDER BY observed_at ASC`,
+    [termId, args.channelId || null, args.videoId || null, args.observationType, obsKey]
   );
-  if (legacyHit.rows && legacyHit.rows[0]) {
+  let convergedNewKeyId: number | null = null;
+  // Set when reconciliation merges or removes rows (counts change): forces
+  // the refresh below even if the main upsert is a no-op. Rekeys alone do
+  // not set it — the subsequent upsert refreshes when anything changed.
+  let legacyCountsChanged = false;
+  {
     const newKeyHit = await runner.query(
       `SELECT id FROM terminology_observations WHERE observation_key=$1`, [obsKey]
     );
-    if (!newKeyHit.rows || !newKeyHit.rows[0]) {
+    if (newKeyHit.rows && newKeyHit.rows[0]) convergedNewKeyId = Number(newKeyHit.rows[0].id);
+  }
+  for (const row of (legacyCandidates.rows || []) as Array<Record<string, unknown>>) {
+    // Same evidence substance under the current identity? Recompute this
+    // row's key from its stored evidence: equality means same source.
+    const substanceKey = computeObservationKey({
+      canonicalTermId: termId,
+      channelId: args.channelId,
+      videoId: args.videoId,
+      observationType: args.observationType,
+      sourceEvidenceId: undefined,
+      evidence: (row.evidence || {}) as Record<string, unknown>
+    });
+    if (substanceKey !== obsKey) continue;
+    if (convergedNewKeyId === null) {
       await runner.query(
-        `UPDATE terminology_observations SET observation_key=$1 WHERE id=$2`, [obsKey, legacyHit.rows[0].id]
+        `UPDATE terminology_observations SET observation_key=$1 WHERE id=$2`, [obsKey, Number(row.id)]
       );
+      convergedNewKeyId = Number(row.id);
+    } else if (Number(row.id) !== convergedNewKeyId) {
+      // Superseded residue: fold its classification into the surviving row's
+      // revision log, then remove the duplicate. Observations are leaves
+      // (no foreign keys reference them), so removal is safe. The entry is
+      // serialized in JS and passed as one typed parameter: inline params
+      // inside jsonb_build_object would have indeterminable types.
+      const supersededEntry = JSON.stringify({
+        observed_at: row.observed_at ?? null,
+        native_evidence_status: row.native_evidence_status ?? null,
+        source_provenance_family: row.source_provenance_family ?? null,
+        term_language: row.term_language ?? null,
+        locale: row.locale ?? null,
+        superseded_legacy_key: row.observation_key ?? null,
+      });
+      await runner.query(
+        `UPDATE terminology_observations SET evidence = evidence || jsonb_build_object('revisions',
+          COALESCE(evidence->'revisions', '[]'::jsonb) || jsonb_build_array($2::jsonb)
+        ) WHERE id = $1`,
+        [convergedNewKeyId, supersededEntry]
+      );
+      await runner.query(`DELETE FROM terminology_observations WHERE id=$1`, [Number(row.id)]);
+      legacyCountsChanged = true;
     }
   }
 
@@ -850,6 +880,12 @@ export async function observeTerminologyDetailed(args: {
         OR terminology_observations.source_creator_country IS DISTINCT FROM EXCLUDED.source_creator_country
         OR terminology_observations.target_market_country IS DISTINCT FROM EXCLUDED.target_market_country
         OR (terminology_observations.evidence->>'spamConfirmed') IS DISTINCT FROM (EXCLUDED.evidence->>'spamConfirmed')
+        -- Any other evidence-substance change (novelty flips, generic flags,
+        -- spam-signal or translation-risk updates, extractor-label aside):
+        -- without this, re-observations that only change quality metadata
+        -- would skip the update and leave stale rollup inputs in place.
+        -- Revisions bookkeeping is excluded (it always differs post-update).
+        OR ((terminology_observations.evidence - 'revisions') IS DISTINCT FROM (EXCLUDED.evidence - 'revisions'))
      RETURNING id, observed_at, (xmax = 0) AS inserted`,
     [
       termId,
@@ -890,7 +926,7 @@ export async function observeTerminologyDetailed(args: {
       [termId, obsAt]
     );
   }
-  if (writtenRow) {
+  if (writtenRow || legacyCountsChanged) {
     await refreshTerminologyLifecycle(termId, DEFAULT_TERMINOLOGY_POLICY, runner);
     await recomputeNativeEvidenceProjection(termId, runner);
   }
