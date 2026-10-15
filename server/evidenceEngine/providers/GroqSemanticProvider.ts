@@ -197,11 +197,6 @@ export interface GroqRouteFailoverOptions {
    * Absent by default (existing callers behave exactly as before).
    */
   deadlineAtMs?: number;
-  /**
-   * Per-attempt pacing hook, awaited before each route attempt (e.g.
-   * per-organization start reservation). Absent by default.
-   */
-  paceOrg?: (orgId: string) => Promise<void>;
   nowMs?: () => number;
 }
 
@@ -227,7 +222,12 @@ export async function runGroqRouteFailover<T>(
     // same-org sibling of an exhausted account is never retried.
     if (tried.has(route)) continue;
     tried.add(route);
-    await opts?.paceOrg?.(groqRouteOrg(route));
+    // A paced wait can outlast the aggregate budget: recheck before calling
+    // so an expired budget skips the fetch instead of wasting quota on a
+    // result the caller has already abandoned.
+    if (opts?.deadlineAtMs !== undefined && (opts?.nowMs ?? Date.now)() >= opts.deadlineAtMs) {
+      throw lastError || new ProviderCallError('Groq route pool aggregate deadline exhausted.', 'TIMEOUT', true);
+    }
     try {
       return await call(route);
     } catch (error) {
@@ -346,7 +346,6 @@ export async function runGroqTextCompletion(
   // Gemini fallback is reached in finite time. Per-attempt timers below take
   // the minimum of the route timeout and the remaining aggregate budget.
   const deadlineAtMs = now() + (deps?.aggregateMs ?? groqVocabularyAggregateMs());
-  const paceOrg = (orgId: string): Promise<void> => reserveGroqVocabularyStart(orgId, minIntervalMs, now, sleep);
   // Outer bound: pacing sleeps, cooldown-ledger reads, and telemetry emits
   // are individually small but unbounded in principle. The race guarantees
   // caller progress (Gemini fallback) by the aggregate deadline even if an
@@ -370,9 +369,15 @@ export async function runGroqTextCompletion(
     try {
       const remainingMs = groqOrgCooldownRemainingMs(orgId);
       if (remainingMs > 0) throw groqCooldownDeferredError(remainingMs);
+      // Bounded ledger read: a stalled database must not outlive the
+      // aggregate budget. Timeout or failure fails open (the in-process
+      // cooldown and 429-driven arming remain authoritative).
       let persistedExpiryMs: number | undefined;
       try {
-        persistedExpiryMs = await persistedCooldownExpiryMs(orgId);
+        const lookupBudgetMs = Math.max(0, deadlineAtMs - now());
+        persistedExpiryMs = lookupBudgetMs > 0
+          ? await Promise.race([persistedCooldownExpiryMs(orgId), sleep(lookupBudgetMs).then(() => undefined)])
+          : undefined;
       } catch {
         persistedExpiryMs = undefined;
       }
@@ -380,6 +385,14 @@ export async function runGroqTextCompletion(
         const known = groqOrgCooldownUntilMs.get(orgId) || 0;
         groqOrgCooldownUntilMs.set(orgId, Math.max(known, persistedExpiryMs));
         throw groqCooldownDeferredError(persistedExpiryMs - Date.now());
+      }
+      // Reserve immediately before fetching: all async preflight is done, so
+      // concurrent callers cannot interleave between reservation and start.
+      // Re-check the budget after any paced wait; an expired slot is skipped
+      // (its map entry harmlessly represents the abandoned start).
+      await reserveGroqVocabularyStart(orgId, minIntervalMs, now, sleep);
+      if (Date.now() >= deadlineAtMs) {
+        throw new ProviderCallError('Groq extraction exceeded its aggregate deadline.', 'TIMEOUT', true);
       }
       const res = await fetchImpl(GROQ_API_BASE_URL, {
         method: 'POST',
@@ -455,7 +468,6 @@ export async function runGroqTextCompletion(
     isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0,
     deadlineAtMs,
     nowMs: now,
-    paceOrg,
   });
   let aggregateTimer: ReturnType<typeof setTimeout> | undefined;
   try {

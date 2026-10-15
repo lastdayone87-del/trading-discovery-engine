@@ -714,3 +714,94 @@ test('unusable groq output yields no observations without crashing', {
     resetGroqVocabularyPacingForTests();
   }
 });
+
+test('paced-then-expired attempts skip the fetch', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-exp' }, 'org-exp');
+    let fetches = 0;
+    const deps = {
+      fetchImpl: stubFetch(async () => {
+        fetches++;
+        return envelope('{}');
+      }),
+      emit: async () => undefined,
+      persistedCooldownExpiryMs: async () => undefined,
+      minIntervalMs: 300,
+      aggregateMs: 10000,
+    };
+    await runGroqTextCompletion({ prompt: 'a' }, deps);
+    assert.equal(fetches, 1);
+    // Second start must wait out the interval, by which time its own
+    // 100ms aggregate has expired: it throws without fetching.
+    await assert.rejects(
+      runGroqTextCompletion({ prompt: 'b' }, { ...deps, aggregateMs: 100 }),
+      (error: unknown) => error instanceof ProviderCallError
+    );
+    assert.equal(fetches, 1);
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('slow ledger lookups do not bunch same-org starts', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-bunch' }, 'org-bunch');
+    const starts: number[] = [];
+    const slowLedger = async () => {
+      await new Promise(resolve => setTimeout(resolve, 80));
+      return undefined;
+    };
+    const deps = {
+      fetchImpl: stubFetch(async () => {
+        starts.push(Date.now());
+        return envelope('{}');
+      }),
+      emit: async () => undefined,
+      persistedCooldownExpiryMs: slowLedger,
+      minIntervalMs: 100,
+    };
+    await Promise.all([
+      runGroqTextCompletion({ prompt: 'a' }, deps),
+      runGroqTextCompletion({ prompt: 'b' }, deps),
+    ]);
+    starts.sort((a, b) => a - b);
+    assert.equal(starts.length, 2);
+    assert.ok(starts[1] - starts[0] >= 70, 'ledger stall let starts bunch');
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('hung ledger lookups stay within the aggregate bound', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-hung' }, 'org-hung');
+    const hangingLedger = async () => new Promise<undefined>(() => undefined);
+    const started = Date.now();
+    await assert.rejects(
+      runGroqTextCompletion(
+        { prompt: 'extract' },
+        {
+          fetchImpl: stubFetch(async () => envelope('{}')),
+          emit: async () => undefined,
+          persistedCooldownExpiryMs: hangingLedger,
+          minIntervalMs: 0,
+          timeoutMs: 5000,
+          aggregateMs: 200,
+        }
+      ),
+      (error: unknown) => error instanceof ProviderCallError
+    );
+    assert.ok(Date.now() - started < 3000, 'hung ledger outlived the bound');
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
