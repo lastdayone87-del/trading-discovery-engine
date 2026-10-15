@@ -319,6 +319,20 @@ export async function runGroqTextCompletion(
 ): Promise<string | undefined> {
   const routes = configuredGroqRoutes();
   if (!routes.length) return undefined;
+  // Cooling pre-filter (extraction-local): known-cooling orgs are excluded
+  // before pacing or fetching, so no wait is spent on a short-circuit and
+  // fallback stays fast. The shared failover loop is untouched (semantic
+  // behavior identical); expiry is time-based so orgs rejoin on their own.
+  const usable = routes.filter(route => groqOrgCooldownRemainingMs(groqRouteOrg(route)) <= 0);
+  if (!usable.length) {
+    const remainingMs = Math.max(0, ...routes.map(route => groqOrgCooldownRemainingMs(groqRouteOrg(route))));
+    throw Object.assign(
+      new ProviderCallError('Groq routes cooling; deferring.', 'RATE_LIMIT', true, {
+        providerReasons: [GROQ_RATE_LIMITED_REASON],
+      }),
+      { groqCooldownDeferred: true, retryAfterMs: remainingMs }
+    );
+  }
   const operation = input.operation || GROQ_VOCABULARY_OPERATION;
   const model = input.model || process.env.GROQ_CANDIDATE_MODEL || DEFAULT_GROQ_VOCABULARY_MODEL;
   const timeoutMs = deps?.timeoutMs ?? groqTimeoutMs();
@@ -333,7 +347,13 @@ export async function runGroqTextCompletion(
   // the minimum of the route timeout and the remaining aggregate budget.
   const deadlineAtMs = now() + (deps?.aggregateMs ?? groqVocabularyAggregateMs());
   const paceOrg = (orgId: string): Promise<void> => reserveGroqVocabularyStart(orgId, minIntervalMs, now, sleep);
-  return runGroqRouteFailover(routes, async route => {
+  // Outer bound: pacing sleeps, cooldown-ledger reads, and telemetry emits
+  // are individually small but unbounded in principle. The race guarantees
+  // caller progress (Gemini fallback) by the aggregate deadline even if an
+  // inner wait stalls. A late inner settlement still emits its telemetry but
+  // its result is discarded — double-spend with fallback is possible but rare
+  // and deduped downstream.
+  const pending = runGroqRouteFailover(usable, async route => {
     const started = Date.now();
     const controller = new AbortController();
     // Extraction always enforces a finite deadline, independent of the
@@ -394,6 +414,11 @@ export async function runGroqTextCompletion(
       if (!/\{[\s\S]*\}/.test(content)) {
         throw Object.assign(new Error('Groq returned no JSON object.'), { status: res.status });
       }
+      // SUCCESS means the provider returned a well-formed completion;
+      // extraction yield (usable vocabulary) is measured downstream by the
+      // caller and admission counts. Retrying another same-model org on
+      // content issues would burn independent quota for an identical prompt,
+      // so content problems fall through to the cross-model Gemini fallback.
       await emit({
         ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
         actualCost: 0, occurredAt: new Date().toISOString(),
@@ -432,6 +457,21 @@ export async function runGroqTextCompletion(
     nowMs: now,
     paceOrg,
   });
+  let aggregateTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    pending.catch(() => undefined);
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        aggregateTimer = setTimeout(
+          () => reject(new ProviderCallError('Groq extraction exceeded its aggregate deadline.', 'TIMEOUT', true)),
+          Math.max(0, deadlineAtMs - now())
+        );
+      }),
+    ]);
+  } finally {
+    if (aggregateTimer !== undefined) clearTimeout(aggregateTimer);
+  }
 }
 
 /** Organization that produced a rate-limit failure: carried on the error when present, else the attempting route's org. */

@@ -573,8 +573,40 @@ test('usability gate accepts shapes, rejects non-vocabulary JSON', () => {
   assert.equal(hasUsableVocabularyArrays({}), false);
   assert.equal(hasUsableVocabularyArrays({ foo: 1 } as any), false);
   assert.equal(hasUsableVocabularyArrays({ terminology: 'DAX' }), false);
-  assert.equal(hasUsableVocabularyArrays({ terminology: [] }), true);
+  assert.equal(hasUsableVocabularyArrays({ terminology: [] }), false);
+  assert.equal(hasUsableVocabularyArrays({ terminology: [42, null] }), false);
   assert.equal(hasUsableVocabularyArrays({ instruments: ['ES'] }), true);
+  assert.equal(hasUsableVocabularyArrays({ terminology: ['DAX', 42] }), true);
+});
+
+test('auth failures are transient and never arm rate-limit cooldowns', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-auth2' }, 'org-auth-pin');
+    await assert.rejects(
+      runGroqTextCompletion(
+        { prompt: 'extract' },
+        {
+          fetchImpl: stubFetch(
+            async () => new Response(JSON.stringify({ error: { message: 'Invalid API key', code: 401 } }), { status: 401 })
+          ),
+          emit: async () => undefined,
+          persistedCooldownExpiryMs: async () => undefined,
+          minIntervalMs: 0,
+        }
+      ),
+      (error: unknown) => {
+        // 401 is not quota pressure: TRANSIENT (retryable), never RATE_LIMIT.
+        assert.ok(error instanceof ProviderCallError && error.errorClass === 'TRANSIENT');
+        return true;
+      }
+    );
+    assert.equal(groqOrgCooldownRemainingMs('org-auth-pin'), 0);
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
 });
 
 const e2eDatabaseUrl = process.env.PHASE10_POSTGRES_URL;
@@ -653,7 +685,11 @@ test('unusable groq output yields no observations without crashing', {
   try {
     withEnv({ GROQ_API_KEY: 'test-e2e-key2' }, 'org-e2e2');
     delete process.env.GEMINI_API_KEY;
-    globalThis.fetch = stubFetch(async () => envelope(JSON.stringify({ foo: 1 }))) as typeof fetch;
+    let groqFetches = 0;
+    globalThis.fetch = stubFetch(async () => {
+      groqFetches++;
+      return envelope(JSON.stringify({ foo: 1 }));
+    }) as typeof fetch;
     const suffix = `e2u${Date.now().toString(36)}${process.pid}`;
     const channelId = `GROQ_E2U_${suffix}`;
     await db.query(
@@ -665,6 +701,10 @@ test('unusable groq output yields no observations without crashing', {
     await extractVocabularyFromCreator(channel, ['Morgenstimmung'], '', false, undefined, undefined);
     const count = await db.query(`SELECT count(*)::int n FROM terminology_observations WHERE source_channel_id=$1`, [channelId]);
     assert.equal(Number(count.rows[0]?.n), 0);
+    // The Groq attempt genuinely ran and declined (leaving parsed unset for
+    // Gemini fallback): this is not a vacuous skip. Live Gemini-fallback
+    // verification needs provider keys and is documented as a gap.
+    assert.ok(groqFetches >= 1, 'groq extraction never ran');
   } finally {
     globalThis.fetch = realFetch;
     if (savedGemini === undefined) delete process.env.GEMINI_API_KEY;

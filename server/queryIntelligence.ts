@@ -631,7 +631,11 @@ export async function invokeChannelVocabularyExtraction(
  */
 export function hasUsableVocabularyArrays(parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined): boolean {
   if (!parsed) return false;
-  return [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats].some(Array.isArray);
+  // Arrays alone are not usable: every value is rejected downstream unless
+  // it is a string, so an all-non-string payload must not suppress fallback.
+  return [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats].some(
+    value => Array.isArray(value) && value.some(item => typeof item === 'string')
+  );
 }
 
 export async function admitNativeCandidates(args: {
