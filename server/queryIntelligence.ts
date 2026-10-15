@@ -758,8 +758,7 @@ export async function extractVocabularyFromCreator(
     // here: they propagate to the caller for retry instead of being
     // misreported as Gemini errors or silently swallowed.
     let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined;
-    try {
-      const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
+    const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
 Description: "${effDesc}"
 Recent Titles:
@@ -774,23 +773,36 @@ Return ONLY a valid JSON object with format:
   "formats": ["format1"]
 }`;
 
-      const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: prompt
-      })}));
-
-      const resText = response.text || '';
-      parsed = parseNativeVocabularyResponse(resText);
+    // Groq primary: same prompt, same parser, same admission below. Any
+    // Groq failure (no keys, deferral, 429, error) falls through to the
+    // unchanged Gemini path; total failure keeps warn-and-skip.
+    try {
+      const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
+      const groqText = await runGroqTextCompletion({ prompt });
+      if (groqText) parsed = parseNativeVocabularyResponse(groqText);
     } catch (e: any) {
-      const msg = e?.message || String(e);
-      const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-      const is503 = msg.includes('503') || msg.includes('high demand');
-      if (isQuota) {
-        console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
-      } else if (is503) {
-        console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
-      } else {
-        console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
+      console.warn(`[Vocabulary Extraction] Groq attempt skipped for channel ${channel.channel_id}; trying Gemini fallback.`);
+    }
+    if (!parsed && ai) {
+      try {
+        const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
+          model: 'gemini-3.6-flash',
+          contents: prompt
+        })}));
+
+        const resText = response.text || '';
+        parsed = parseNativeVocabularyResponse(resText);
+      } catch (e: any) {
+        const msg = e?.message || String(e);
+        const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+        const is503 = msg.includes('503') || msg.includes('high demand');
+        if (isQuota) {
+          console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
+        } else if (is503) {
+          console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
+        } else {
+          console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
+        }
       }
     }
     if (parsed) {

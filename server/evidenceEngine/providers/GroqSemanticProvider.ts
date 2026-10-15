@@ -69,7 +69,23 @@ export function missingGroqOrgLabels(env: NodeJS.ProcessEnv = process.env): stri
     .map(slot => (slot === 1 ? 'GROQ_ORG_ID' : `GROQ_ORG_ID_${slot}`));
 }
 
-/** Return only ordered, non-empty route slots; credentials never leave this process. */
+/**
+ * Return only ordered, non-empty route slots; credentials never leave this process.
+ *
+ * Configuration (config-only, no code changes, no key-count limit):
+ * - `GROQ_API_KEY`, `GROQ_API_KEY_2`, `GROQ_API_KEY_3`, ... — any slot number
+ *   >= 2 matches; gaps are fine; empty/whitespace values are skipped;
+ *   identical key values are deduplicated; unrecognized names
+ *   (`GROQ_API_KEY_0`, `GROQ_API_KEY_X`) are ignored.
+ * - `GROQ_ORG_ID`, `GROQ_ORG_ID_2`, ... — quota-fate label per slot. Keys
+ *   sharing one Groq account MUST share one label: provider rate limits
+ *   apply per organization, so unlabeled same-account keys do NOT multiply
+ *   capacity and failover would spill into the same exhausted pool.
+ *   Unlabeled slots default to independent orgs (`slot-N`).
+ * Adding, removing, or rotating a key takes effect on the next call without
+ * a restart (routes are discovered from the environment on every call) and
+ * never logs key values (telemetry carries route ids and org labels only).
+ */
 export function configuredGroqRoutes(env: NodeJS.ProcessEnv = process.env): GroqRoute[] {
   const names = Object.keys(env).filter(name => name === 'GROQ_API_KEY' || /^GROQ_API_KEY_[2-9][0-9]*$/.test(name));
   names.sort((a, b) => {
@@ -202,6 +218,148 @@ export async function runGroqRouteFailover<T>(
     }
   }
   throw lastError || new ProviderCallError('No configured Groq route is available.', 'TRANSIENT', true);
+}
+
+export const GROQ_VOCABULARY_OPERATION = 'vocabulary-extraction';
+export const DEFAULT_GROQ_VOCABULARY_MODEL = DEFAULT_GROQ_CANDIDATE_MODEL;
+export const DEFAULT_GROQ_VOCABULARY_MIN_INTERVAL_MS = 2500;
+
+export function groqVocabularyMinIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.GROQ_VOCABULARY_MIN_INTERVAL_MS || '2500');
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_GROQ_VOCABULARY_MIN_INTERVAL_MS;
+}
+
+let groqVocabularyLastStartMs = 0;
+/** Test-only reset for extraction pacing. */
+export function resetGroqVocabularyPacingForTests(): void {
+  groqVocabularyLastStartMs = 0;
+}
+
+export interface GroqTextCompletionDeps {
+  emit?: (event: ProviderCallEvent) => Promise<void>;
+  persistedCooldownExpiryMs?: (orgId?: string) => Promise<number | undefined>;
+  minIntervalMs?: number;
+  timeoutMs?: number;
+  deadlinesEnabled?: boolean;
+  fetchImpl?: typeof fetch;
+  nowMs?: () => number;
+  sleepMs?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Raw text completion over the Groq route pool for vocabulary extraction.
+ * Reuses route discovery (unbounded key slots — adding keys is config-only),
+ * per-org cooldowns, org-aware failover, bounded bodies, pacing, and the
+ * shared error taxonomy; the semantic-classification path is untouched.
+ * Returns undefined when no keys are configured (fail-closed, no fetch).
+ * Callers parse via parseNativeVocabularyResponse, which skips non-JSON
+ * output, so provider prose can never become vocabulary.
+ */
+export async function runGroqTextCompletion(
+  input: { prompt: string; model?: string; operation?: string },
+  deps?: GroqTextCompletionDeps
+): Promise<string | undefined> {
+  const routes = configuredGroqRoutes();
+  if (!routes.length) return undefined;
+  const operation = input.operation || GROQ_VOCABULARY_OPERATION;
+  const model = input.model || DEFAULT_GROQ_VOCABULARY_MODEL;
+  const timeoutMs = deps?.timeoutMs ?? groqTimeoutMs();
+  const deadlines = deps?.deadlinesEnabled ?? groqDeadlinesEnabled();
+  const emit = deps?.emit ?? emitGroqEvent;
+  const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
+  const fetchImpl = deps?.fetchImpl ?? fetch;
+  const now = deps?.nowMs ?? Date.now;
+  const sleep = deps?.sleepMs ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  // Pacing: the free-tier RPM envelope is per-org; spacing starts keeps a
+  // lone worker under it. Concurrent-worker bursts still 429 into the shared
+  // per-org cooldown, which remains the authoritative guard.
+  const minIntervalMs = deps?.minIntervalMs ?? groqVocabularyMinIntervalMs();
+  const elapsedMs = now() - groqVocabularyLastStartMs;
+  if (minIntervalMs > 0 && elapsedMs < minIntervalMs) await sleep(minIntervalMs - elapsedMs);
+  groqVocabularyLastStartMs = now();
+  return runGroqRouteFailover(routes, async route => {
+    const started = Date.now();
+    const controller = new AbortController();
+    const timer = deadlines ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+    const orgId = groqRouteOrg(route);
+    const base = {
+      id: randomUUID(), provider: 'groq', operation,
+      requestMetadata: { groqRoute: route.id, groqOrg: orgId, groqModel: model }, attempt: 1,
+      reservedCost: 0, policyVersion: 'provider-resilience-v1',
+    };
+    try {
+      const remainingMs = groqOrgCooldownRemainingMs(orgId);
+      if (remainingMs > 0) throw groqCooldownDeferredError(remainingMs);
+      let persistedExpiryMs: number | undefined;
+      try {
+        persistedExpiryMs = await persistedCooldownExpiryMs(orgId);
+      } catch {
+        persistedExpiryMs = undefined;
+      }
+      if (persistedExpiryMs !== undefined && persistedExpiryMs > Date.now()) {
+        const known = groqOrgCooldownUntilMs.get(orgId) || 0;
+        groqOrgCooldownUntilMs.set(orgId, Math.max(known, persistedExpiryMs));
+        throw groqCooldownDeferredError(persistedExpiryMs - Date.now());
+      }
+      const res = await fetchImpl(GROQ_API_BASE_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${route.key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: input.prompt }],
+          ...groqRequestExtras(),
+        }),
+        signal: controller.signal,
+      });
+      const bounded = await readBoundedResponseText(res);
+      if (bounded.truncated) {
+        throw Object.assign(
+          new Error(`Groq response exceeded the ${MAX_CRAWL_RESPONSE_CHARS}-char bound.`),
+          { status: res.status },
+        );
+      }
+      const text = bounded.text;
+      if (!res.ok) {
+        throw Object.assign(new Error(`Groq HTTP ${res.status}: ${text.slice(0, 500)}`),
+          { status: res.status, code: res.status });
+      }
+      const content = (JSON.parse(text) as any)?.choices?.[0]?.message?.content;
+      if (typeof content !== 'string' || !content) {
+        throw Object.assign(new Error('Groq returned no message content.'), { status: res.status });
+      }
+      await emit({
+        ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+      });
+      return content;
+    } catch (error) {
+      const aborted = controller.signal.aborted;
+      const typed = aborted
+        ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
+        : classifyProviderError(error);
+      if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred !== true) {
+        armGroqOrgCooldown(orgId);
+      }
+      if (typed.errorClass === 'RATE_LIMIT') {
+        const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
+          ? ((typed as { providerReasons?: unknown }).providerReasons as string[]).map(String)
+          : [];
+        if (!reasons.includes(GROQ_RATE_LIMITED_REASON)) {
+          (typed as { providerReasons?: string[] }).providerReasons = [...reasons, GROQ_RATE_LIMITED_REASON];
+        }
+        (typed as { groqOrg?: string }).groqOrg = orgId;
+      }
+      const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
+      await emit({
+        ...base, status: statusFor(typed), latencyMs: Date.now() - started,
+        actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
+        ...(deferred ? { requestMetadata: { ...base.requestMetadata, groqCooldownDeferral: 'true' } } : {}),
+      });
+      throw typed;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }, { isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0 });
 }
 
 /** Organization that produced a rate-limit failure: carried on the error when present, else the attempting route's org. */
