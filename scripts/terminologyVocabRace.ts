@@ -1,0 +1,379 @@
+/**
+ * Live-PostgreSQL vocabulary race verification (PR #522 follow-up).
+ *
+ * Proves the advisory-lock serialization and derived occurrence counts of
+ * saveExtractedTerm / defaultReconcileExtractedTerm under genuine concurrent
+ * connections — the requirement deterministic fakes cannot satisfy.
+ *
+ * Runs ONLY against a freshly provisioned disposable database: one
+ * single-purpose Postgres container per run (localhost-only, random
+ * credentials), migrated, verified, exercised, then destroyed with proof of
+ * absence. See scripts/terminologyStagingProof.ts header for the provisioning
+ * and teardown procedure (same for both scripts).
+ *
+ * Why this is safe without marker/token/registry machinery: the target must
+ * be an EMPTY freshly-migrated database (the probe refuses any terms or
+ * channels), reachable only via an operator-created localhost tunnel with a
+ * random single-run password. No queue worker can address it, so no
+ * quiescence checks are needed. Fixture identity is run-unique for log
+ * correlation; a duplicate fails loudly on plain inserts instead of being
+ * silently reconciled.
+ *
+ * Race pools intentionally carry no query timeout: advisory-lock blocking
+ * waits are the behavior under test, and a timeout would abort legitimate
+ * contention. Connection establishment alone is bounded (15s).
+ */
+import { randomUUID } from 'node:crypto';
+import pg from 'pg';
+import { normalizeTerm, observeTerminologyDetailed } from '../server/terminologyIntelligence';
+import { assertStagingIdentity, pinLoopbackTarget, sanitizedConnectionString, tlsPoolConfig, verifyStagingTarget } from './stagingTargetGuard';
+import type { StagingIdentity } from './stagingTargetGuard';
+
+// Single pool constructor for this script: the connection string is stripped
+// of every TLS parameter first (proven: node-postgres lets URL parameters
+// override an explicit `ssl` object), then paired with the verdict's explicit
+// TLS configuration — no other TLS input can reach the opened connection.
+function stagingPool(
+  connectionString: string,
+  tls: { ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string },
+  extra?: Record<string, unknown>
+) {
+  return new pg.Pool({ connectionString: sanitizedConnectionString(connectionString), ssl: tlsPoolConfig(tls), ...extra });
+}
+
+import { saveExtractedTerm } from '../server/dbCore';
+import { defaultReconcileExtractedTerm } from '../server/queryIntelligence';
+
+// TLS configuration comes from the verified guard verdict (see
+// scripts/stagingTargetGuard.ts): PGSSL=disable applies to loopback only;
+// every non-loopback target uses fully verified TLS regardless of PGSSL.
+function targetConnectionString(): string {
+  const connectionString = process.env.PHASE10_POSTGRES_URL || process.env.DATABASE_URL;
+  if (process.env.STAGING_OK !== 'true' || !connectionString) {
+    throw new Error('Refusing to run: set STAGING_OK=true and PHASE10_POSTGRES_URL (or DATABASE_URL) to a writable staging database (never production).');
+  }
+  return connectionString;
+}
+
+// Target verification BEFORE any initializing connection: getDb() runs
+// migrations and seedDefaults() (both write), so staging identity is proven
+// here through a one-shot non-initializing pool (guard verdict + pairing
+// token, both fail-closed). Returns the verified TLS configuration for the
+// pools below.
+async function verifyStagingTargetOrThrow(
+  connectionString: string
+): Promise<{
+  connectionString: string;
+  tls: { ssl: false | { rejectUnauthorized: boolean } | undefined; caFile?: string };
+  identity: StagingIdentity;
+}> {
+  const verdict = verifyStagingTarget(connectionString);
+  if (!verdict.ok) throw new Error(`Refusing to run: ${verdict.reason} — never production.`);
+  let pinned = connectionString;
+  if (verdict.loopback) {
+    pinned = (await pinLoopbackTarget(connectionString)).connectionString;
+  }
+  const probe = stagingPool(pinned, verdict, { connectionTimeoutMillis: 15_000, query_timeout: 30_000 });
+  // Fresh-database proof plus run nonce (see the E2E proof header): a
+  // disposable per-run container holds no terminology rows, and the nonce
+  // below is re-checked on every work pool before its first write.
+  let serverAddr: string | null = null;
+  let dbName = '';
+  let populated = -1;
+  let nonce = '';
+  let probeError: unknown = null;
+  try {
+    const endpoint = await probe.query(`SELECT inet_server_addr()::text AS addr, current_database() AS db`);
+    serverAddr = (endpoint.rows[0] as Record<string, unknown> | undefined)?.addr as string | null ?? null;
+    dbName = String((endpoint.rows[0] as Record<string, unknown> | undefined)?.db ?? '');
+    const terms = await probe.query(`SELECT count(*)::int n FROM canonical_trading_terms`);
+    const channels = await probe.query(`SELECT count(*)::int n FROM channels`);
+    const vocab = await probe.query(`SELECT count(*)::int n FROM extracted_trading_vocabulary`);
+    const observations = await probe.query(`SELECT count(*)::int n FROM terminology_observations`);
+    populated = Number(terms.rows[0]?.n ?? -1) + Number(channels.rows[0]?.n ?? -1) + Number(vocab.rows[0]?.n ?? -1) + Number(observations.rows[0]?.n ?? -1);
+    if (populated !== 0) {
+      throw new Error('TARGET-POPULATED');
+    }
+    nonce = randomUUID().replace(/-/g, '');
+    await probe.query(`CREATE TABLE IF NOT EXISTS staging_run_nonce(run_id TEXT PRIMARY KEY)`);
+    await probe.query(`INSERT INTO staging_run_nonce(run_id) VALUES($1) ON CONFLICT DO NOTHING`, [nonce]);
+  } catch (error) {
+    probeError = error;
+  } finally {
+    await probe.end().catch(() => undefined);
+  }
+  if (probeError !== null) {
+    if (probeError instanceof Error && probeError.message === 'TARGET-POPULATED') {
+      throw new Error(`Refusing to run: target database is not a fresh disposable database (terms/channels present) — refusing to write.`);
+    }
+    const detail = probeError instanceof Error ? `${probeError.name}: ${probeError.message}` : String(probeError);
+    throw new Error(`Refusing to run: staging probe failed (${detail}) — verify the tunnel, migration, and staging database instead of retrying blindly.`);
+  }
+  return {
+    connectionString: pinned,
+    tls: { ssl: verdict.ssl, caFile: verdict.caFile },
+    identity: { nonce, serverAddr, dbName },
+  };
+}
+
+const COUNTRY_ALIAS = 'US';
+const COUNTRY_CANON = 'United States';
+// Full-uuid run identity (32 hex): 8-hex suffixes collide across runs
+// sharing one staging database with probability 2^-32 per pair; full uuids
+// make fixture identity unique in practice as well as by construction.
+const RUN = randomUUID().replace(/-/g, '');
+const TERM = `race probe ${RUN}`;
+// Equivalent spellings, one canonical identity: racers must collapse to a
+// single vocabulary row no matter which surface form wins the insert race.
+// Unique fixture IDs per run: no existing record is ever modified.
+const SPELLINGS = [TERM, TERM.toUpperCase(), TERM.replace(/ /g, '  '), ` ${TERM} `];
+const CHANNELS = [1, 2, 3, 4].map(i => `race-${RUN}-ch-${i}`);
+const OBS_PER_CHANNEL = 1;
+
+// pg typings omit EventEmitter.on for Pool (present at runtime — verified);
+// route pool error subscriptions through this helper instead of fighting it.
+function onPoolError(pool: InstanceType<typeof pg.Pool>, listener: (error: unknown) => void): void {
+  (pool as unknown as { on: (event: 'error', listener: (error: unknown) => void) => void }).on('error', listener);
+}
+
+// Bounded wait: the loser timer is always cleared, so a fast operation never
+// trips a stale timeout later (and never holds the event loop open).
+async function bounded<T>(promise: Promise<T>, ms: number, onTimeout: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => { onTimeout(); reject(new Error(`bounded wait expired after ${ms}ms`)); }, ms);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+let passed = 0;
+// Set by the SIGINT/SIGTERM handler below: checks abort at the next gate so
+// an interrupted run stops writing before scoped cleanup runs.
+let signalAborting = false;
+// Fail fast: a failed check throws, so no further writes follow a break.
+function check(name: string, cond: boolean, evidence: unknown) {
+  if (signalAborting) throw new Error('aborting: process signal received');
+  if (!cond) throw new Error(`CHECK FAILED: ${name} ${JSON.stringify(evidence)}`);
+  passed += 1;
+  console.log(`PASS ${name} ${JSON.stringify(evidence)}`);
+}
+
+async function main() {
+  const connectionString = targetConnectionString();
+  const target = await verifyStagingTargetOrThrow(connectionString);
+  process.env.DATABASE_URL = target.connectionString!;
+  // Script-owned pools on the PINNED connection string (verified TLS):
+  // race writers each get a pool directly (transaction-bound advisory locks),
+  // the main pool serves seeds/asserts, and getDb() is never touched.
+  // Script-owned pools on the PINNED connection string (verified TLS):
+  // race writers each get a pool directly (transaction-bound advisory locks),
+  // the main pool serves seeds/asserts, and getDb() is never touched.
+  const dbPool = stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
+  onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
+  // Endpoint re-verification on the main pool before its first write: without
+  // this, a DNS/routing change could redirect seeds and fixture inserts.
+  await assertStagingIdentity(dbPool, target.identity);
+  const db = dbPool;
+  const racers: Array<Promise<unknown>> = [];
+  const pools = [
+    stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000 }),
+    stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000 }),
+  ];
+  for (const pool of pools) {
+    // Idle-client deaths must never crash the run; checked-out failures
+    // surface through the writers' rejected promises below. Listeners attach
+    // before any query so an early idle-client error cannot go unhandled.
+    onPoolError(pool, error => console.warn(`pool: race pool client error (${error})`));
+  }
+  // Endpoint re-verification on each writer pool before racers launch.
+  for (const pool of pools) {
+    await assertStagingIdentity(pool, target.identity);
+  }
+  // Cancel this run's backends (every connection on this disposable database
+  // except our own): aborts in-flight queries so their transactions roll
+  // back, without touching anything outside this database.
+  const cancelRunBackends = async (): Promise<number> => {
+    const res = await db.query(
+      `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()) s WHERE cancelled`
+    ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+    return Number((res.rows[0] as Record<string, unknown> | undefined)?.n ?? 0);
+  };
+  let shuttingDown = false;
+  // First signal stops new writes and unblocks settlement: in-flight racers
+  // are cancelled (their promises settle rejected), checks abort via the
+  // flag, and the main finally below runs teardown — the handler itself never
+  // cleans up or exits, so teardown runs exactly once. A second signal forces
+  // immediate exit (documented escape hatch).
+  const onSignal = (signal: 'SIGINT' | 'SIGTERM') => {
+    if (shuttingDown) {
+      console.error(`second ${signal}; forcing immediate exit`);
+      process.exit(1);
+    }
+    shuttingDown = true;
+    signalAborting = true;
+    console.warn(`${signal} received; cancelling racers — teardown runs in the main finally path`);
+    void (async () => {
+      try {
+        await cancelRunBackends();
+      } catch {
+        // Settlement timeouts below surface the failure; nothing more to do here.
+      }
+    })();
+  };
+  process.once('SIGINT', () => onSignal('SIGINT'));
+  process.once('SIGTERM', () => onSignal('SIGTERM'));
+  // Shared shutdown. Declared before any use: preflight paths call it
+  // directly. Returns false when the bound expires with pools still open.
+  const closePools = async (): Promise<boolean> => {
+    let closed = true;
+    await bounded((async () => {
+      await Promise.all(pools.map(pool => pool.end().catch(() => undefined)));
+      await dbPool.end().catch(() => undefined);
+    })(), 20_000, () => { closed = false; }).catch(() => { closed = false; });
+    if (!closed) console.warn('cleanup: pool close timed out');
+    return closed;
+  };
+  // Fixture-identity preflight: on a fresh disposable database this doubles
+  // as template-health proof (any row at all aborts the run). Covers canonical
+  // terms AND vocabulary rows: an orphan vocab row would otherwise be reused
+  // by the writers. Failing here closes pools explicitly: preflight runs
+  // before the main try/finally, and a timed-out shutdown becomes a teardown
+  // error rather than a silent hang.
+  try {
+    const clash = await db.query(
+      `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(TERM), COUNTRY_CANON]
+    );
+    const clashVocab = await db.query(
+      `SELECT id FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
+      [COUNTRY_CANON, normalizeTerm(TERM)]
+    );
+    check('fixture identity novel', clash.rows.length === 0 && clashVocab.rows.length === 0, { term: TERM });
+  } catch (error) {
+    if (!(await closePools())) throw new Error(`pool shutdown timed out during preflight failure (${error instanceof Error ? error.message : String(error)})`);
+    throw error;
+  }
+  let legError: unknown = null;
+  try {
+  // Fresh-database fixtures: plain inserts (a duplicate fails loudly — there
+  // is nothing legitimate to conflict with on a disposable database).
+  for (const channelId of CHANNELS) {
+    await db.query(
+      `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+       VALUES($1,$1,$2,$3,'CONFIRMED','UNKNOWN','PENDING','vocab-race',now(),90,'TRADING_CONFIRMED')`,
+      [channelId, `https://youtube.com/channel/${channelId}`, COUNTRY_CANON]
+    );
+  }
+  // Committed observation evidence all racers must converge to.
+  for (const channelId of CHANNELS) {
+    for (let v = 0; v < OBS_PER_CHANNEL; v++) {
+      const videoId = `race-${channelId}-v${v}`;
+      await observeTerminologyDetailed({
+        term: TERM, country: COUNTRY_ALIAS, termType: 'TERMINOLOGY', observationType: 'VIDEO_TITLE',
+        channelId, videoId,
+        evidence: {
+          extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
+          sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: TERM, videoId, sourceHash: `race-${videoId}` },
+          novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [], translationRisk: null,
+        },
+      }, dbPool);
+    }
+  }
+  const expected = await db.query(
+    `SELECT COUNT(*)::int n FROM terminology_observations o JOIN canonical_trading_terms t ON t.id=o.canonical_term_id
+     WHERE t.country=$1 AND t.normalized_term=$2`, [COUNTRY_CANON, normalizeTerm(TERM)]
+  );
+  const expectedCount = Number(expected.rows[0]?.n);
+  check('race preconditions committed', expectedCount === CHANNELS.length * OBS_PER_CHANNEL, { expectedCount });
+
+  // Genuine overlap: separate pools so advisory-lock blocking is real.
+  // Bounded overall deadline (RACE_DEADLINE_MS): a wedged query rejects the
+  // run instead of hanging it. Settlement is always awaited below — even on
+  // failure — so cleanup never runs while writers are still in flight.
+  const deadlineMs = Number(process.env.RACE_DEADLINE_MS || '180000');
+  CHANNELS.forEach((channelId, i) => {
+    // Pass each pool directly: the writers detect the Pool, pin lock, reads
+    // and writes to one transaction-bound client, and hold the advisory lock
+    // across the critical section — the serialization under test. Spellings
+    // rotate so concurrently arriving surface forms must still converge.
+    const runner = pools[i % pools.length];
+    const spelling = SPELLINGS[i % SPELLINGS.length];
+    racers.push(saveExtractedTerm(COUNTRY_ALIAS, spelling, 'terminology', channelId, runner as never));
+    racers.push(saveExtractedTerm(COUNTRY_ALIAS, SPELLINGS[(i + 1) % SPELLINGS.length], 'terminology', channelId, runner as never));
+    racers.push(defaultReconcileExtractedTerm(COUNTRY_ALIAS, SPELLINGS[(i + 2) % SPELLINGS.length], 'terminology', channelId, runner as never));
+  });
+  const settlement = racers.map((racer, index) => racer.then(
+    () => ({ index, ok: true as const, error: null as unknown }),
+    (error: unknown) => ({ index, ok: false as const, error })
+  ));
+  const deadline = new Promise<never>((_, reject) => {
+    const timer = setTimeout(() => reject(new Error(`race deadline exceeded after ${deadlineMs}ms with writers pending`)), deadlineMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  const outcomes = await Promise.race([Promise.all(settlement), deadline]);
+  const failed = outcomes.filter(outcome => !outcome.ok);
+  check('all racers settled successfully', failed.length === 0, failed.map(entry => ({ index: entry.index, error: String(entry.error) })));
+
+  // Exact fixture identity: intended country plus the SQL-normalized surface
+  // form (lower/collapse/trim — exact for this ASCII spelling set). No
+  // substring matching, so unrelated rows containing the run token can
+  // neither hide a split nor fail the check.
+  const rows = await db.query(
+    `SELECT country,term,occurrences FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
+    [COUNTRY_CANON, normalizeTerm(TERM)]
+  );
+  check('exactly one vocabulary row across equivalent spellings', rows.rows.length === 1, rows.rows);
+  check('row under canonical country', rows.rows[0]?.country === COUNTRY_CANON, rows.rows[0]);
+  check('occurrences converged to committed evidence', Number(rows.rows[0]?.occurrences) === expectedCount, { got: rows.rows[0]?.occurrences, expectedCount });
+
+  // (No end-quiescence check by design: no worker can address this
+  // disposable database — see the header. The planner leg in the proof and
+  // the exact-count checks here already prove the terms reached their
+  // lifecycle states.)
+
+  console.log(`VOCAB RACE COMPLETE (${passed} checks)`);
+  } catch (error) {
+    // A failed check is captured, not lost: teardown still runs below, and
+    // the original error propagates after pool shutdown instead of being
+    // replaced by a teardown failure (both are reported).
+    legError = error;
+  } finally {
+    // Stragglers from a deadline breach settle here (bounded) so a hung
+    // writer cannot stall shutdown: cancel everything else on this disposable
+    // database (transactions roll back; settlement errors flow through
+    // promises). No application names needed — this database belongs
+    // entirely to this run.
+    let stragglers = false;
+    await bounded(Promise.allSettled(racers), 30_000, () => { stragglers = true; }).catch(() => { stragglers = true; });
+    if (stragglers) {
+      const cancelled = await db.query(
+        `SELECT count(*)::int n FROM (SELECT pg_cancel_backend(pid) AS cancelled FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()) s WHERE cancelled`
+      ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+      console.warn(`cleanup: cancelled ${Number((cancelled.rows[0] as Record<string, unknown> | undefined)?.n ?? 0)} straggler backends; their transactions abort`);
+      await bounded(Promise.allSettled(racers), 15_000, () => console.warn('cleanup: writers still unsettled after cancel')).catch(() => undefined);
+    }
+    // No fixture cleanup here by design: every row this run wrote lives in
+    // its disposable database, which the operator destroys after the run
+    // (verified gone: container absent, port refused, volume removed).
+    // Bounded close runs on every path; a timed-out shutdown becomes a
+    // teardown error rather than a silent hang. Outer `timeout` remains the
+    // final backstop.
+    if (!(await closePools()) && legError === null) {
+      legError = new Error('pool shutdown timed out');
+    }
+    // A failed check is never hidden: the original leg error propagates, and
+    // the run exits nonzero either way.
+    if (legError !== null) throw legError;
+  }
+}
+
+main().then(
+  () => { process.exitCode = 0; },
+  error => { console.error('VOCAB RACE ERROR', error); process.exitCode = 1; }
+);
