@@ -568,6 +568,17 @@ test('observation identity is stable across novelty reclassification', () => {
   assert.notEqual(first, other);
 });
 
+test('observation identity ignores provider labels', () => {
+  const base = {
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true, sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1' }, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] },
+  };
+  // Same source re-extracted by another provider converges onto one key:
+  // classification outcomes are not source identity.
+  const groq = computeObservationKey({ ...base, evidence: { ...base.evidence, extractor: 'GROQ' } });
+  assert.equal(groq, computeObservationKey(base));
+});
+
 test('promotion holds below three executions regardless of creators', () => {
   const thin = {
     novel: true, spamConfirmed: false, executions: 2, quotaConsumed: 2000,
@@ -877,7 +888,7 @@ test('observation path acquires the advisory lock before any term-row write', as
       statements.push(text);
       if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
       if (text.startsWith('INSERT INTO canonical_trading_terms')) return { rows: [{ id: 7 }] };
-      if (text.startsWith('INSERT INTO terminology_observations')) return { rows: [{ id: 1, observed_at: new Date().toISOString() }] };
+      if (text.startsWith('INSERT INTO terminology_observations')) return { rows: [{ id: 1, observed_at: new Date().toISOString(), inserted: true }] };
       if (text.startsWith('SELECT t.*')) return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
       if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) return { rows: [{ v1: 0, spam: false, novel: false }] };
       return { rows: [] };

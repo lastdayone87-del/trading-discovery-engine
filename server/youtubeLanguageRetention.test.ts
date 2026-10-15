@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { resolveEnrichmentDetectedLanguages, snippetLanguage, usableVideoLanguages, withoutVideoLanguages } from './youtube';
+import { channelLanguageSnippet, resolveEnrichmentDetectedLanguages, snippetLanguage, usableVideoLanguages, withoutVideoLanguages } from './youtube';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 
 test('snippetLanguage prefers per-video audio language, then default language', () => {
@@ -96,4 +96,25 @@ test('trading-classifier inputs carry no provider language hints', () => {
   const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   assert.match(source, /videos:withoutVideoLanguages\(structuredVideos\)/);
   assert.match(source, /detected_languages:undefined/);
+});
+
+test('channel language prefers snippet default, then brandingSettings default', () => {
+  assert.deepEqual(channelLanguageSnippet({ snippet: { defaultLanguage: 'de' } }), {
+    defaultAudioLanguage: undefined,
+    defaultLanguage: 'de',
+  });
+  assert.deepEqual(
+    channelLanguageSnippet({ snippet: {}, brandingSettings: { channel: { defaultLanguage: 'fr' } } }),
+    { defaultAudioLanguage: undefined, defaultLanguage: 'fr' }
+  );
+  // Snippet wins on conflict; nothing is inferred from country.
+  assert.deepEqual(
+    channelLanguageSnippet({
+      snippet: { defaultLanguage: 'de' },
+      brandingSettings: { channel: { defaultLanguage: 'fr' } },
+    }),
+    { defaultAudioLanguage: undefined, defaultLanguage: 'de' }
+  );
+  assert.deepEqual(channelLanguageSnippet({}), { defaultAudioLanguage: undefined, defaultLanguage: undefined });
+  assert.deepEqual(channelLanguageSnippet(null), { defaultAudioLanguage: undefined, defaultLanguage: undefined });
 });

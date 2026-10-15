@@ -58,22 +58,46 @@ const LANGUAGE_CODES: Record<string, string> = {
 
 const normalizeCountry = (country: string) => country.normalize('NFKC').trim().toLocaleLowerCase('en');
 
-const LANGUAGE_TAG_SEGMENT = /^[a-z0-9]{2,8}$/;
-const PRIMARY_LANGUAGE_SUBTAG = /^[a-z]{2,3}$/;
+const NON_INFORMATIVE_PRIMARIES = new Set(['und', 'mul', 'zxx']);
+
+/**
+ * Platform-grounded registry check: the primary subtag is treated as assigned
+ * when the locale resolves to itself instead of falling back to the default
+ * locale. Unassigned codes (qzz, zzz, xx) and uncoded content fall back and
+ * are rejected; assigned codes — including three-letter ISO 639-2/3 primaries
+ * like fil, yue, or ckb — resolve to themselves. Codes without display data
+ * (e.g. tlh) fail closed. Deterministic for a fixed ICU version.
+ */
+function isAssignedLanguagePrimary(primary: string): boolean {
+  try {
+    const resolved = new Intl.DisplayNames([primary], { type: 'language' }).resolvedOptions().locale;
+    return resolved.toLowerCase().startsWith(primary);
+  } catch {
+    return false;
+  }
+}
 
 export function normalizeLanguageCode(value: string): string {
   if (typeof value !== 'string') return '';
-  const lowered = value.trim().toLocaleLowerCase('en');
+  // Providers use hyphens and underscores interchangeably; BCP 47 is hyphens.
+  const dashed = value.trim().replace(/_/g, '-');
+  if (!dashed) return '';
   // Named languages first (names contain spaces/scripts the tag rule rejects).
+  const lowered = dashed.toLocaleLowerCase('en');
   if (LANGUAGE_CODES[lowered]) return LANGUAGE_CODES[lowered];
-  // Full-tag validation: every segment must be clean so a malformed tag like
-  // 'de-!!' cannot borrow a valid prefix. The primary subtag accepts ISO
-  // 639-1 and 639-2 (two- and three-letter codes such as 'fil' or 'yue').
-  const segments = lowered.split(/[-_]/);
-  if (segments.some(segment => !LANGUAGE_TAG_SEGMENT.test(segment))) return '';
-  const primary = segments[0];
-  if (LANGUAGE_CODES[primary]) return LANGUAGE_CODES[primary];
-  return PRIMARY_LANGUAGE_SUBTAG.test(primary) ? primary : '';
+  // Structural BCP 47: malformed tags (de-!!, de-12, trailing dashes) die
+  // here, while valid extensions (de-u-co-phonebk) and private use survive.
+  let canonical: string;
+  try {
+    canonical = Intl.getCanonicalLocales(dashed)[0];
+  } catch {
+    return '';
+  }
+  const primary = canonical.split('-')[0].toLowerCase();
+  // Specials carry no usable language signal for context selection.
+  if (NON_INFORMATIVE_PRIMARIES.has(primary)) return '';
+  if (!isAssignedLanguagePrimary(primary)) return '';
+  return primary;
 }
 
 export function countrySearchLanguageCandidates(countryName: string, declaredLanguages: string[] = []): string[] {

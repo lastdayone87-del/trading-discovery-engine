@@ -11,11 +11,20 @@ const databaseUrl = process.env.PHASE10_POSTGRES_URL;
  * URLs keep the default TLS behavior so test traffic stays encrypted.
  */
 function configureTestTls(databaseUrl: string): void {
-  if (/^postgres(ql)?:\/\/(localhost|127\.0\.0\.1|\[?::1\]?)([:/]|$)/i.test(databaseUrl)) {
+  // Optional userinfo (user:pass@) precedes the host and carries no signal.
+  if (/^postgres(ql)?:\/\/(?:[^@/]*@)?(localhost|127\.0\.0\.1|\[?::1\]?)([:/]|$)/i.test(databaseUrl)) {
     process.env.PGSSL = 'disable';
-  } else {
-    delete process.env.PGSSL;
+    return;
   }
+  // Remote test databases keep TLS: only explicit sslmode=require (or
+  // stronger) in the URL is accepted, letting the driver negotiate it.
+  // Anything else fails closed instead of sending credentials in plaintext.
+  const sslmode = /[?&]sslmode=([^&]*)/i.exec(databaseUrl)?.[1]?.toLowerCase();
+  if (sslmode === 'require' || sslmode === 'verify-ca' || sslmode === 'verify-full') {
+    delete process.env.PGSSL;
+    return;
+  }
+  throw new Error('Refusing remote test database without explicit TLS (append ?sslmode=require or use a local disposable container).');
 }
 
 /**
@@ -183,4 +192,89 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   )).rows[0];
   assert.equal(spamLife.search_eligible, false);
   assert.ok(spamLife.lifecycle_status !== 'SEARCH_TRIAL', 'spam-confirmed term must not trial');
+
+  // (g) Reclassification converges: the same source (term, channel, video,
+  // evidence substance) re-observed with unknown language and another
+  // provider label updates the one row instead of inserting a duplicate, and
+  // the projection drops the stale native count back to zero.
+  const relocal = await observeTerminologyDetailed({
+    term: `Saisonalität ${suffix}`, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-local-${suffix}`,
+    evidence: { extractor: 'OTHER', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
+  });
+  assert.ok(relocal, 're-observation failed');
+  assert.equal(relocal.observationInserted, false);
+  const relocalCount = await db.query(
+    `SELECT count(*)::int n, max(native_evidence_status) AS status FROM terminology_observations WHERE canonical_term_id=$1`,
+    [local.termId]
+  );
+  assert.equal(Number(relocalCount.rows[0]?.n), 1);
+  assert.equal(relocalCount.rows[0]?.status, null);
+  const relocalProj = await db.query(
+    `SELECT native_observed_count FROM country_native_evidence_projections WHERE canonical_term_id=$1`,
+    [local.termId]
+  );
+  // Zero-native projections are deleted outright: absence is the strongest
+  // proof that no stale native evidence is retained.
+  assert.ok(
+    !relocalProj.rows[0] || Number(relocalProj.rows[0].native_observed_count) === 0,
+    'stale native projection retained'
+  );
+
+  // (h) Canonical language reconciles forward from unknown, never backward
+  // from concrete: und -> de on new evidence, then stays de on conflict.
+  const nachTerm = `Nachzugriff ${suffix}`;
+  await observeTerminologyDetailed({
+    term: nachTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-und-${suffix}`,
+    evidence: { extractor: 'TEST' }
+  });
+  const undCanon = (await db.query(
+    `SELECT language FROM canonical_trading_terms WHERE normalized_term=$1 AND country='Germany'`,
+    [nachTerm.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en')]
+  )).rows[0];
+  assert.equal(undCanon?.language, 'und');
+  await observeTerminologyDetailed({
+    term: nachTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-und2-${suffix}`,
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
+  });
+  const deCanon = (await db.query(
+    `SELECT language FROM canonical_trading_terms WHERE normalized_term=$1 AND country='Germany'`,
+    [nachTerm.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en')]
+  )).rows[0];
+  assert.equal(deCanon?.language, 'de');
+  await observeTerminologyDetailed({
+    term: nachTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-und3-${suffix}`,
+    language: 'en', locale: 'en-US',
+    evidence: { extractor: 'TEST' }
+  });
+  const keptCanon = (await db.query(
+    `SELECT language FROM canonical_trading_terms WHERE normalized_term=$1 AND country='Germany'`,
+    [nachTerm.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en')]
+  )).rows[0];
+  assert.equal(keptCanon?.language, 'de');
+});
+
+test('configureTestTls encrypts remote traffic by default', () => {
+  const saved = process.env.PGSSL;
+  try {
+    configureTestTls('postgresql://u:p@127.0.0.1:5432/db');
+    assert.equal(process.env.PGSSL, 'disable');
+    configureTestTls('postgresql://u:p@localhost/db');
+    assert.equal(process.env.PGSSL, 'disable');
+    configureTestTls('postgresql://u:p@[::1]:5432/db');
+    assert.equal(process.env.PGSSL, 'disable');
+    configureTestTls('postgresql://u:p@db.example.com/db?sslmode=require');
+    assert.equal(process.env.PGSSL, undefined);
+    configureTestTls('postgresql://u:p@db.example.com/db?sslmode=verify-full');
+    assert.equal(process.env.PGSSL, undefined);
+    assert.throws(() => configureTestTls('postgresql://u:p@db.example.com/db'), /explicit TLS/);
+    assert.throws(() => configureTestTls('postgresql://u:p@10.0.0.5/db?sslmode=disable'), /explicit TLS/);
+  } finally {
+    if (saved === undefined) delete process.env.PGSSL;
+    else process.env.PGSSL = saved;
+  }
 });

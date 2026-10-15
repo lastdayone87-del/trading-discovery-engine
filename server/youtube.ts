@@ -935,6 +935,19 @@ export function adaptPlaylistItemsToSearchShape(payload: { items?: Array<Record<
  * normalizeLanguageCode, and the language selector stays fail-closed on
  * missing/conflicting signals. Exported for unit testing.
  */
+/**
+ * Effective channel language snippet: the channels.list snippet plus the
+ * channel's configured default from brandingSettings (YouTube exposes the
+ * uploader default there, not in the snippet). Snippet fields win on
+ * conflict; nothing is inferred from country.
+ */
+export function channelLanguageSnippet(channel: any): { defaultAudioLanguage?: unknown; defaultLanguage?: unknown } {
+  return {
+    defaultAudioLanguage: channel?.snippet?.defaultAudioLanguage,
+    defaultLanguage: channel?.snippet?.defaultLanguage ?? channel?.brandingSettings?.channel?.defaultLanguage,
+  };
+}
+
 export function snippetLanguage(snippet: any): string | undefined {
   // First VALID tag wins: an invalid audio tag must never suppress a valid
   // default. The raw tag is returned (region preserved for explicitLocale);
@@ -1102,7 +1115,7 @@ export async function fetchYouTubeChannelEnrichment(
       // channel default applies solely when no video carries a usable
       // signal; a stale fallback survives only when nothing newer exists.
       // Provider-asserted, never country-derived.
-      const channelFallbackLangs = resolveEnrichmentDetectedLanguages(channel.snippet, videos, fallback.detectedLanguages);
+      const channelFallbackLangs = resolveEnrichmentDetectedLanguages(channelLanguageSnippet(channel), videos, fallback.detectedLanguages);
 
       return {
         ...fallback,

@@ -686,11 +686,15 @@ export async function observeTerminologyDetailed(args: {
   const codeSwitching = detectCodeSwitching(canonical, contextLang);
   const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
 
-  // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict
+  // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict.
+  // A conflicting row keeps its timestamps; its language/script reconcile
+  // forward only from unknown ('und'/empty) to a concrete provider language.
+  // A concrete existing language always wins (first-writer-wins on conflict),
+  // so ambiguous re-evidence can never overwrite an established language.
   const saved = await runner.query(
     `INSERT INTO canonical_trading_terms(canonical_term, normalized_term, country, language, script, term_type, first_observed_at, last_observed_at)
      VALUES($1, $2, $3, $4, $5, $6, now(), now())
-     ON CONFLICT(country, normalized_term) DO NOTHING
+     ON CONFLICT(country, normalized_term) DO UPDATE SET language=EXCLUDED.language, script=EXCLUDED.script WHERE canonical_trading_terms.language IN ('und','')
      RETURNING id`,
     [canonical, normalized, country, contextLang, inferScript(canonical), args.termType]
   );
@@ -745,19 +749,24 @@ export async function observeTerminologyDetailed(args: {
     resolvedProvenanceFamily = 'CREATOR_METADATA';
   }
 
-  // 3. Compute deterministic observation key for single-write idempotency
+  // 3. Compute deterministic observation key for single-write idempotency.
+  // Classification outcomes are excluded from identity (see
+  // computeObservationKey): reclassification converges onto one row.
   const obsKey = computeObservationKey({
     canonicalTermId: termId,
     channelId: args.channelId,
     videoId: args.videoId,
     observationType: args.observationType,
-    nativeEvidenceStatus: resolvedNativeStatus,
-    sourceProvenanceFamily: resolvedProvenanceFamily,
     sourceEvidenceId: args.sourceEvidenceId,
     evidence: args.evidence
   });
 
-  // 4. Perform single, authoritative observation write
+  // 4. Perform single, authoritative observation write. Reclassification of
+  // the same source converges: ON CONFLICT refreshes the volatile
+  // classification columns (locale, languages, status, family, evidence) in
+  // place instead of inserting a duplicate row, so projections never retain
+  // stale native evidence. Identity columns (term, channel, video, type,
+  // approvals, weight, community) are first-write-wins.
   const obsInsert = await runner.query(
     `INSERT INTO terminology_observations(
        canonical_term_id, source_channel_id, source_video_id, observation_type,
@@ -767,8 +776,13 @@ export async function observeTerminologyDetailed(args: {
        observation_key
      )
      VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-     ON CONFLICT(observation_key) DO NOTHING
-     RETURNING id, observed_at`,
+     ON CONFLICT(observation_key) DO UPDATE SET
+       locale=EXCLUDED.locale, is_code_switched=EXCLUDED.is_code_switched,
+       native_language=EXCLUDED.native_language, term_language=EXCLUDED.term_language,
+       native_evidence_status=EXCLUDED.native_evidence_status,
+       source_provenance_family=EXCLUDED.source_provenance_family,
+       code_switch_type=EXCLUDED.code_switch_type, evidence=EXCLUDED.evidence
+     RETURNING id, observed_at, (xmax = 0) AS inserted`,
     [
       termId,
       args.channelId || null,
@@ -792,16 +806,23 @@ export async function observeTerminologyDetailed(args: {
     ]
   );
 
-  // 5. Invoke authoritative terminology lifecycle refresh & projection recompute ONLY if a new observation row was actually inserted!
-  const observationInserted = Boolean(obsInsert.rows && obsInsert.rows.length > 0);
-  if (observationInserted) {
-    const obsAt = obsInsert.rows[0].observed_at || new Date().toISOString();
+  // 5. Invoke authoritative terminology lifecycle refresh & projection
+  // recompute on insert AND on reclassification-update (a status change can
+  // promote, demote, or revoke eligibility). last_observed_at advances only
+  // on insert. (xmax = 0) is true solely for freshly inserted rows; the
+  // per-term advisory lock above excludes concurrent modifiers.
+  const writtenRow = (obsInsert.rows && obsInsert.rows[0]) || null;
+  const observationInserted = writtenRow?.inserted === true;
+  if (observationInserted && writtenRow) {
+    const obsAt = writtenRow.observed_at || new Date().toISOString();
     await runner.query(
       `UPDATE canonical_trading_terms
        SET last_observed_at = GREATEST(last_observed_at, $2)
        WHERE id = $1`,
       [termId, obsAt]
     );
+  }
+  if (writtenRow) {
     await refreshTerminologyLifecycle(termId, DEFAULT_TERMINOLOGY_POLICY, runner);
     await recomputeNativeEvidenceProjection(termId, runner);
   }

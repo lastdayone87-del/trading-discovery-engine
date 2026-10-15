@@ -504,6 +504,9 @@ export async function processChannelThroughPipeline(
     // terminology-selection signal only. The trading classifier keeps its
     // pre-existing inputs (no language keys); the terminology selector reads
     // the same signals from the candidate object, which is untouched.
+    // Contract for future producers: candidate language hints are the
+    // terminology path's input. Any new legitimate classifier need must be
+    // wired explicitly at this boundary — never by removing this strip.
     videos:withoutVideoLanguages(structuredVideos),
     video_titles:candidate.videoTitles,video_descriptions:candidate.videoDescriptions||[],videoDescriptionsAuthoritative:candidate.videoDescriptionsAuthoritative,
     playlists:candidate.playlists,
