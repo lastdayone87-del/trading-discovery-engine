@@ -9,11 +9,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  allowlistMatches,
   assertStagingIdentity,
   decodedQuery,
   hasHostOverrideParam,
   isLoopbackAddress,
   isLoopbackHost,
+  parseAllowlistEntry,
   parseTargetHost,
   pinLoopbackTarget,
   sslModeParam,
@@ -229,7 +231,7 @@ test('loopback keeps application TLS semantics, including PGSSL=disable', () => 
     assert.equal(verdict.loopback, true);
     assert.equal(verdict.ssl, false);
   });
-  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
+  withEnv({ PGSSL: undefined, NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: '[::1]:5432' }, () => {
     const verdict = verifyStagingTarget('postgresql://postgres:x@[::1]:5432/postgres');
     assert.equal(verdict.ok, true);
     assert.equal(verdict.loopback, true);
@@ -282,4 +284,40 @@ test('work-pool identity re-check detects endpoint changes', async () => {
     query: async () => ({ rows: [{ token: 'tok', addr: '10.0.1.8', db: 'postgres', sysid: '222' }] }),
   };
   await assert.rejects(assertStagingIdentity(clonedCluster, expected), /cluster identifier changed/);
+});
+
+test('unexpected query parameters are refused', () => {
+  withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:55433/db?options=-c%20search_path%3Devil').ok, false);
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:55433/db?application_name=evil').ok, false);
+    // TLS parameters remain consumable (not "unexpected").
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:55433/db?sslmode=require').ok, true);
+  });
+});
+
+test('allowlist pins host and port', () => {
+  withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: undefined }, () => {
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:9999/db').ok, false);
+  });
+  withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: '127.0.0.1:9999' }, () => {
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:9999/db').ok, true);
+  });
+  withEnv({ PGSSL: 'disable', NODE_ENV: undefined, STAGING_TARGET_ALLOWLIST: '127.0.0.1' }, () => {
+    assert.equal(verifyStagingTarget('postgresql://postgres:x@127.0.0.1:9999/db').ok, true);
+  });
+  assert.deepEqual(parseAllowlistEntry('[::1]:5432'), { host: '::1', port: '5432' });
+  assert.deepEqual(parseAllowlistEntry('dbhost'), { host: 'dbhost', port: null });
+  assert.equal(allowlistMatches(['[::1]:5432'], '::1', '5432'), true);
+  assert.equal(allowlistMatches(['[::1]:5432'], '::1', '9999'), false);
+});
+
+test('IPv6 pinning normalizes brackets both ways', async () => {
+  let seenHost = '';
+  const pinned = await pinLoopbackTarget('postgresql://postgres:x@[::1]:5432/postgres', async (host: string) => {
+    seenHost = host;
+    return ['::1'];
+  });
+  assert.equal(seenHost, '::1');
+  assert.ok(pinned.connectionString.includes('[::1]'));
+  assert.equal(pinned.address, '::1');
 });

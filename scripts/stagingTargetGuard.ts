@@ -68,6 +68,34 @@ export function isLoopbackHost(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1';
 }
 
+/**
+ * Query parameter names present (decoded, lowercased). Used to refuse
+ * parameters the scripts do not consume: pg honors several URL parameters
+ * (`options`, `host`, `port`, `application_name`, …) that could redirect
+ * table resolution, endpoint selection, or backend tagging behind the
+ * verdict's back. Only TLS parameters (consumed by the verdict, stripped
+ * before pools) may appear.
+ */
+const CONSUMED_QUERY_PARAMS = new Set(['sslmode', 'sslcert', 'sslkey', 'sslrootcert']);
+
+export function unexpectedQueryParams(connectionString: string): string[] | null {
+  const queryIndex = connectionString.indexOf('?');
+  if (queryIndex < 0) return [];
+  const names: string[] = [];
+  try {
+    const query = decodeURIComponent(connectionString.slice(queryIndex));
+    const pattern = /[?&]([^=&#]*)=?/gi;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(query)) !== null) {
+      const name = decodeURIComponent(match[1]).toLowerCase();
+      if (!CONSUMED_QUERY_PARAMS.has(name)) names.push(name);
+    }
+  } catch {
+    return null;
+  }
+  return [...new Set(names)];
+}
+
 export interface TargetVerdict {
   ok: boolean;
   reason?: string;
@@ -118,14 +146,48 @@ export function tlsPoolConfig(
  */
 export function targetAllowlist(): string[] {
   const raw = process.env.STAGING_TARGET_ALLOWLIST;
-  const entries = (raw === undefined ? 'localhost,127.0.0.1,::1' : raw)
+  const entries = (raw === undefined ? 'localhost:55433,127.0.0.1:55433,[::1]:55433' : raw)
     .split(',')
-    .map(entry => {
-      const trimmed = entry.trim().toLowerCase();
-      return trimmed.startsWith('[') && trimmed.endsWith(']') ? trimmed.slice(1, -1) : trimmed;
-    })
+    .map(entry => entry.trim().toLowerCase())
     .filter(entry => entry !== '');
   return entries;
+}
+
+export interface AllowlistEntry {
+  host: string;
+  port: string | null;
+}
+
+/** Split an allowlist entry into host + optional port (`[::1]:5432` aware). */
+export function parseAllowlistEntry(entry: string): AllowlistEntry {
+  if (entry.startsWith('[')) {
+    const close = entry.indexOf(']');
+    if (close < 0) return { host: entry, port: null };
+    const host = entry.slice(1, close);
+    const rest = entry.slice(close + 1);
+    return { host, port: rest.startsWith(':') && rest.length > 1 ? rest.slice(1) : null };
+  }
+  const lastColon = entry.lastIndexOf(':');
+  if (lastColon >= 0 && /^[0-9]+$/.test(entry.slice(lastColon + 1))) {
+    return { host: entry.slice(0, lastColon), port: entry.slice(lastColon + 1) };
+  }
+  return { host: entry, port: null };
+}
+
+/**
+ * Allowlist match on host AND port. An entry without a port matches any port
+ * (explicit opt-out of pinning); an entry with a port must match exactly
+ * (empty URL port means the PostgreSQL default 5432). A rogue local listener
+ * on an unlisted port is therefore refused even on loopback.
+ */
+export function allowlistMatches(entries: string[], host: string, port: string): boolean {
+  const effectivePort = port === '' ? '5432' : port;
+  return entries.some(entry => {
+    const parsed = parseAllowlistEntry(entry);
+    if (parsed.host !== host) return false;
+    if (parsed.port === null) return true;
+    return parsed.port === effectivePort;
+  });
 }
 
 /**
@@ -180,8 +242,25 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
     return { ok: false, loopback: false, host, ssl: undefined, reason: 'explicit host query parameter — pool must resolve the authority host' };
   }
   const loopback = isLoopbackHost(host);
-  if (!targetAllowlist().includes(host)) {
-    return { ok: false, loopback, host, ssl: undefined, reason: `host '${host}' is not allowlisted for staging targets (STAGING_TARGET_ALLOWLIST)` };
+  let port = '';
+  try {
+    port = new URL(connectionString).port;
+  } catch {
+    return { ok: false, loopback, host, ssl: undefined, reason: 'unparseable connection string' };
+  }
+  if (!allowlistMatches(targetAllowlist(), host, port)) {
+    return { ok: false, loopback, host, ssl: undefined, reason: `host '${host}' port '${port === '' ? '5432' : port}' is not allowlisted for staging targets (STAGING_TARGET_ALLOWLIST pins host and port)` };
+  }
+  // Only TLS parameters are consumed (by the checks below) and stripped
+  // before pools; anything else pg would honor behind our back (`options`
+  // can redirect table resolution, `application_name` would poison backend
+  // tagging, …) is refused outright.
+  const unexpected = unexpectedQueryParams(connectionString);
+  if (unexpected === null) {
+    return { ok: false, loopback, host, ssl: undefined, reason: 'undecodable query string' };
+  }
+  if (unexpected.length > 0) {
+    return { ok: false, loopback, host, ssl: undefined, reason: `unexpected connection-string parameters (${unexpected.join(',')}) — refusing` };
   }
   // Client-certificate parameters must never be silently dropped (which
   // would fail confusingly) nor ingested by throwaway scripts: refuse them
@@ -214,10 +293,11 @@ export function verifyStagingTarget(connectionString: string): TargetVerdict {
     if (mode !== null && mode !== 'require' && mode !== 'verify-ca' && mode !== 'verify-full') {
       return { ok: false, loopback, host, ssl: undefined, reason: `sslmode=${mode} permits downgraded or plaintext transport` };
     }
-    // Explicit verified TLS. Callers pass this object to every pool they open
-    // (verified: an explicit `ssl` object overrides any URL-parsed downgrade,
-    // including encoded or duplicated parameters), so the opened connection
-    // cannot differ from what was validated here.
+    // Explicit verified TLS object, paired with a connection string the
+    // caller sanitizes (TLS parameters stripped) before pool creation:
+    // first-flight capture proved URL parameters override an explicit `ssl`
+    // object in the bundled driver, so validation alone cannot constrain the
+    // opened connection — sanitization is load-bearing here.
     return { ok: true, loopback, host, ssl: { rejectUnauthorized: true }, ...withCa };
   }
   const modes = sslModeParams(connectionString);
@@ -282,16 +362,26 @@ export async function pinLoopbackTarget(
   } catch {
     throw new Error('unparseable connection string — refusing');
   }
+  // Strip brackets before DNS lookup (getaddrinfo rejects them) and re-add
+  // when assigning: the URL setter requires the bracketed literal form, and
+  // assigning bare `::1` silently leaves the original hostname in place.
+  const lookupHost = url.hostname.startsWith('[') && url.hostname.endsWith(']')
+    ? url.hostname.slice(1, -1)
+    : url.hostname;
   let addrs: string[];
   try {
-    addrs = (await lookup(url.hostname)).map(entry => entry.toLowerCase());
+    addrs = (await lookup(lookupHost)).map(entry => entry.toLowerCase());
   } catch (error) {
     throw new Error(`DNS resolution failed for '${url.hostname}' — refusing (${error instanceof Error ? error.message : String(error)})`);
   }
   if (addrs.length === 0 || !addrs.every(isLoopbackAddress)) {
     throw new Error(`loopback hostname '${url.hostname}' resolves to non-loopback addresses [${addrs.join(',')}] — refusing (possible resolver poisoning)`);
   }
-  url.hostname = addrs[0];
+  const pinned = addrs[0].includes(':') && !addrs[0].startsWith('[') ? `[${addrs[0]}]` : addrs[0];
+  url.hostname = pinned;
+  if (!url.toString().includes(pinned)) {
+    throw new Error('pinning failed: connection string does not contain the verified address — refusing');
+  }
   return { connectionString: url.toString(), address: addrs[0] };
 }
 
