@@ -7,19 +7,21 @@
  * that database plus STAGING_OK=true as an explicit intent guard.
  *
  * Provisioning (per run, on the VPS host):
- *   PASS=$(openssl rand -hex 24); PORT=<free high port, 127.0.0.1 only>
+ *   PASS=$(openssl rand -hex 24); printf '%s' "$PASS" > /root/.term-run-pass; chmod 600 /root/.term-run-pass
+ *   PORT=<free high port, 127.0.0.1 only>
  *   docker run -d --name term-proof-<id> -p 127.0.0.1:$PORT:5432 \
  *     -e POSTGRES_USER=postgres -e POSTGRES_DB=postgres \
  *     -e POSTGRES_PASSWORD_FILE=/run/secrets/pgpass \
- *     --mount type=bind,source=/root/.staging-pg-pass,target=/run/secrets/pgpass,readonly \
+ *     --mount type=bind,source=/root/.term-run-pass,target=/run/secrets/pgpass,readonly \
  *     -v term-proof-<id>-data:/var/lib/postgresql postgres:18-alpine
  *  Tunnel local $PORT to the VPS, then:
  *   DATABASE_URL=postgresql://postgres:$PASS@127.0.0.1:$PORT/postgres \
  *     npx tsx scripts/runMigrations.ts
  *   STAGING_OK=true DATABASE_URL=<same> npx tsx scripts/terminologyStagingProof.ts
  * Teardown (proof of absence required):
- *   docker rm -f -v term-proof-<id>; docker inspect fails; port refused;
- *   named volume gone from `docker volume ls`.
+ *   docker rm -f term-proof-<id>; docker volume rm term-proof-<id>-data;
+ *   shred -u /root/.term-run-pass; docker inspect fails; port refused.
+ *  (Named volumes survive `docker rm -v`: remove them explicitly.)
  *
  * Why this is safe without marker/token/registry machinery: the target must
  * be an EMPTY freshly-migrated database (the probe refuses any terms or
@@ -113,9 +115,15 @@ async function verifyStagingTargetOrThrow(
     const endpoint = await probe.query(`SELECT inet_server_addr()::text AS addr, current_database() AS db`);
     serverAddr = (endpoint.rows[0] as Record<string, unknown> | undefined)?.addr as string | null ?? null;
     dbName = String((endpoint.rows[0] as Record<string, unknown> | undefined)?.db ?? '');
+    // Every table the legs write: terms, channels, vocabulary (orphans
+    // included), observations, and links. Anything present means this is not
+    // a fresh disposable database.
     const terms = await probe.query(`SELECT count(*)::int n FROM canonical_trading_terms`);
     const channels = await probe.query(`SELECT count(*)::int n FROM channels`);
-    populated = Number(terms.rows[0]?.n ?? -1) + Number(channels.rows[0]?.n ?? -1);
+    const vocab = await probe.query(`SELECT count(*)::int n FROM extracted_trading_vocabulary`);
+    const observations = await probe.query(`SELECT count(*)::int n FROM terminology_observations`);
+    const links = await probe.query(`SELECT count(*)::int n FROM extracted_vocabulary_sources`);
+    populated = Number(terms.rows[0]?.n ?? -1) + Number(channels.rows[0]?.n ?? -1) + Number(vocab.rows[0]?.n ?? -1) + Number(observations.rows[0]?.n ?? -1) + Number(links.rows[0]?.n ?? -1);
     if (populated !== 0) {
       throw new Error('TARGET-POPULATED');
     }

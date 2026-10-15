@@ -88,7 +88,9 @@ async function verifyStagingTargetOrThrow(
     dbName = String((endpoint.rows[0] as Record<string, unknown> | undefined)?.db ?? '');
     const terms = await probe.query(`SELECT count(*)::int n FROM canonical_trading_terms`);
     const channels = await probe.query(`SELECT count(*)::int n FROM channels`);
-    populated = Number(terms.rows[0]?.n ?? -1) + Number(channels.rows[0]?.n ?? -1);
+    const vocab = await probe.query(`SELECT count(*)::int n FROM extracted_trading_vocabulary`);
+    const observations = await probe.query(`SELECT count(*)::int n FROM terminology_observations`);
+    populated = Number(terms.rows[0]?.n ?? -1) + Number(channels.rows[0]?.n ?? -1) + Number(vocab.rows[0]?.n ?? -1) + Number(observations.rows[0]?.n ?? -1);
     if (populated !== 0) {
       throw new Error('TARGET-POPULATED');
     }
@@ -175,6 +177,9 @@ async function main() {
   // the main pool serves seeds/asserts, and getDb() is never touched.
   const dbPool = stagingPool(target.connectionString, target.tls, { connectionTimeoutMillis: 15_000, statement_timeout: 60_000 });
   onPoolError(dbPool, error => console.warn(`pool: database pool client error (${error})`));
+  // Endpoint re-verification on the main pool before its first write: without
+  // this, a DNS/routing change could redirect seeds and fixture inserts.
+  await assertStagingIdentity(dbPool, target.identity);
   const db = dbPool;
   const racers: Array<Promise<unknown>> = [];
   const pools = [
@@ -236,15 +241,22 @@ async function main() {
     return closed;
   };
   // Fixture-identity preflight: on a fresh disposable database this doubles
-  // as template-health proof (any row at all aborts the run). Failing here
-  // closes pools explicitly: preflight runs before the main try/finally.
+  // as template-health proof (any row at all aborts the run). Covers canonical
+  // terms AND vocabulary rows: an orphan vocab row would otherwise be reused
+  // by the writers. Failing here closes pools explicitly: preflight runs
+  // before the main try/finally, and a timed-out shutdown becomes a teardown
+  // error rather than a silent hang.
   try {
     const clash = await db.query(
       `SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country=$2`, [normalizeTerm(TERM), COUNTRY_CANON]
     );
-    check('fixture identity novel', clash.rows.length === 0, { term: TERM });
+    const clashVocab = await db.query(
+      `SELECT id FROM extracted_trading_vocabulary WHERE country=$1 AND lower(regexp_replace(trim(term), '\\s+', ' ', 'g')) = $2`,
+      [COUNTRY_CANON, normalizeTerm(TERM)]
+    );
+    check('fixture identity novel', clash.rows.length === 0 && clashVocab.rows.length === 0, { term: TERM });
   } catch (error) {
-    await closePools();
+    if (!(await closePools())) throw new Error(`pool shutdown timed out during preflight failure (${error instanceof Error ? error.message : String(error)})`);
     throw error;
   }
   let legError: unknown = null;
@@ -349,9 +361,12 @@ async function main() {
     // No fixture cleanup here by design: every row this run wrote lives in
     // its disposable database, which the operator destroys after the run
     // (verified gone: container absent, port refused, volume removed).
-    // Bounded close runs on every path. Outer `timeout` remains the final
-    // backstop.
-    await closePools();
+    // Bounded close runs on every path; a timed-out shutdown becomes a
+    // teardown error rather than a silent hang. Outer `timeout` remains the
+    // final backstop.
+    if (!(await closePools()) && legError === null) {
+      legError = new Error('pool shutdown timed out');
+    }
     // A failed check is never hidden: the original leg error propagates, and
     // the run exits nonzero either way.
     if (legError !== null) throw legError;
