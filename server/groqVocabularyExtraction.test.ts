@@ -5,13 +5,17 @@ import {
   groqKeySlotNumber,
   groqOrgIdForSlot,
   groqOrgCooldownRemainingMs,
+  groqRateLimitCooldownMs,
+  groqTimeoutMs,
+  groqVocabularyAggregateMs,
+  groqVocabularyMinIntervalMs,
   reserveGroqVocabularyStart,
   resetGroqCooldownForTests,
   resetGroqVocabularyPacingForTests,
   runGroqTextCompletion,
 } from './evidenceEngine/providers/GroqSemanticProvider';
 import { ProviderCallError, type ProviderCallEvent } from './providerResilience';
-import { hasUsableVocabularyArrays, extractVocabularyFromCreator } from './queryIntelligence';
+import { hasAdmissibleVocabulary, extractVocabularyFromCreator } from './queryIntelligence';
 import { getDb } from './db';
 
 const GROQ_ENV_PATTERN = /^GROQ_/;
@@ -417,6 +421,10 @@ test('high-numbered slots are discovered without a maximum', () => {
     assert.equal(groqKeySlotNumber('GROQ_API_KEY_0'), null);
     assert.equal(groqKeySlotNumber('GROQ_API_KEY_1'), null);
     assert.equal(groqKeySlotNumber('GROQ_API_KEY_X'), null);
+    // Leading-zero suffixes are rejected so diagnostics (which check the
+    // canonical name) can never miss a loaded key.
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_02'), null);
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_007'), null);
     const routes = configuredGroqRoutes();
     assert.deepEqual(routes.map(route => route.key), ['h1', 'h2', 'h10', 'h12', 'h19', 'h20', 'h100']);
   } finally {
@@ -568,15 +576,29 @@ test('independent orgs pace independently', async () => {
   resetGroqVocabularyPacingForTests('test-org-x');
 });
 
-test('usability gate accepts shapes, rejects non-vocabulary JSON', () => {
-  assert.equal(hasUsableVocabularyArrays(undefined), false);
-  assert.equal(hasUsableVocabularyArrays({}), false);
-  assert.equal(hasUsableVocabularyArrays({ foo: 1 } as any), false);
-  assert.equal(hasUsableVocabularyArrays({ terminology: 'DAX' }), false);
-  assert.equal(hasUsableVocabularyArrays({ terminology: [] }), false);
-  assert.equal(hasUsableVocabularyArrays({ terminology: [42, null] }), false);
-  assert.equal(hasUsableVocabularyArrays({ instruments: ['ES'] }), true);
-  assert.equal(hasUsableVocabularyArrays({ terminology: ['DAX', 42] }), true);
+test('admissibility gate requires admission-passable candidates', () => {
+  const sources = [{ kind: 'VIDEO_TITLE', index: 0, text: 'Saisonalität Heute DAX Analyse' }] as const;
+  const src = sources as unknown as Parameters<typeof hasAdmissibleVocabulary>[1];
+  assert.equal(hasAdmissibleVocabulary(undefined, src), false);
+  assert.equal(hasAdmissibleVocabulary({}, src), false);
+  assert.equal(hasAdmissibleVocabulary({ foo: 1 } as any, src), false);
+  assert.equal(hasAdmissibleVocabulary({ terminology: 'DAX' }, src), false);
+  assert.equal(hasAdmissibleVocabulary({ terminology: [] }, src), false);
+  assert.equal(hasAdmissibleVocabulary({ terminology: [42, null] }, src), false);
+  // Not literally present: classifier would reject as non-literal.
+  assert.equal(hasAdmissibleVocabulary({ terminology: ['NonexistentTermXYZ'] }, src), false);
+  // Too short for admission.
+  assert.equal(hasAdmissibleVocabulary({ terminology: ['a'] }, src), false);
+  // Genuinely admissible: literal, long enough, no spam.
+  assert.equal(hasAdmissibleVocabulary({ terminology: ['Saisonalität'] }, src), true);
+  assert.equal(hasAdmissibleVocabulary({ instruments: ['DAX'] }, src), true);
+  assert.equal(hasAdmissibleVocabulary({ terminology: ['DAX', 42] }, src), true);
+});
+
+test('spam candidates do not suppress fallback', () => {
+  const sources = [{ kind: 'VIDEO_TITLE', index: 0, text: 'gratis Signale Gruppe beitreten' }] as const;
+  const src = sources as unknown as Parameters<typeof hasAdmissibleVocabulary>[1];
+  assert.equal(hasAdmissibleVocabulary({ terminology: ['gratis Signale Gruppe'] }, src), false);
 });
 
 test('auth failures are transient and never arm rate-limit cooldowns', async () => {
@@ -804,4 +826,14 @@ test('hung ledger lookups stay within the aggregate bound', async () => {
     resetGroqCooldownForTests();
     resetGroqVocabularyPacingForTests();
   }
+});
+
+test('absurd timeout configs clamp instead of firing immediately', async () => {
+  assert.equal(groqVocabularyAggregateMs({ GROQ_VOCABULARY_AGGREGATE_TIMEOUT_MS: '99999999999999' }), 2147483647);
+  assert.equal(groqTimeoutMs({ GROQ_PROVIDER_TIMEOUT_MS: '99999999999999' }), 2147483647);
+  assert.equal(groqVocabularyMinIntervalMs({ GROQ_VOCABULARY_MIN_INTERVAL_MS: '99999999999999' }), 2147483647);
+  assert.equal(groqRateLimitCooldownMs({ GROQ_RATE_LIMIT_COOLDOWN_MS: '99999999999999' }), 2147483647);
+  // Sane values pass through untouched.
+  assert.equal(groqVocabularyAggregateMs({}), 120000);
+  assert.equal(groqVocabularyMinIntervalMs({}), 2500);
 });

@@ -629,12 +629,31 @@ export async function invokeChannelVocabularyExtraction(
  * novelty baseline is unknown (counts by reason only, never source content),
  * so model drift and admission rate are observable.
  */
-export function hasUsableVocabularyArrays(parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined): boolean {
+/**
+ * Admissibility gate: at least one vocabulary value that can pass native
+ * candidate admission's provider-independent checks (string, long enough,
+ * literally present in the sources, no spam signals). Novelty still needs
+ * the database baseline and stays downstream — but a novelty-only rejection
+ * means the same terms are already known, so Gemini fallback would be futile
+ * there too. Anything weaker would suppress the fallback while admitting
+ * nothing.
+ */
+export function hasAdmissibleVocabulary(
+  parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined,
+  sources: LiteralSourceText[]
+): boolean {
   if (!parsed) return false;
-  // Arrays alone are not usable: every value is rejected downstream unless
-  // it is a string, so an all-non-string payload must not suppress fallback.
-  return [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats].some(
-    value => Array.isArray(value) && value.some(item => typeof item === 'string')
+  const values = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats];
+  return values.some(
+    value =>
+      Array.isArray(value) &&
+      value.some(
+        item =>
+          typeof item === 'string' &&
+          item.normalize('NFKC').trim().length >= 2 &&
+          findLiteralSpan(item, sources) !== null &&
+          detectSpamSignals(item).length === 0
+      )
   );
 }
 
@@ -787,16 +806,21 @@ Return ONLY a valid JSON object with format:
   "formats": ["format1"]
 }`;
 
+    // Literal sources are built before any provider attempt: the
+    // admissibility gate needs them to decide whether Groq output is worth
+    // keeping or the Gemini fallback should run. Pure and synchronous.
+    const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
     // Groq primary: same prompt, same parser, same admission below. Any
     // Groq failure (no keys, deferral, 429, error) falls through to the
     // unchanged Gemini path; total failure keeps warn-and-skip.
     try {
       const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
       const groqText = await runGroqTextCompletion({ prompt });
-      // Usability gate: JSON without vocabulary arrays is not a result —
-      // the Gemini fallback stays available instead of being suppressed.
+      // Admissibility gate: provider output with no admissible candidate
+      // (wrong shape, non-strings, non-literal, spam) is not a result — the
+      // Gemini fallback stays available instead of being suppressed.
       const groqParsed = groqText ? parseNativeVocabularyResponse(groqText) : undefined;
-      if (hasUsableVocabularyArrays(groqParsed)) {
+      if (hasAdmissibleVocabulary(groqParsed, literalSources)) {
         parsed = groqParsed;
         parsedSource = 'GROQ';
       }
@@ -829,7 +853,7 @@ Return ONLY a valid JSON object with format:
         // Literal, traceable admission (native-v1 pipeline) via the shared
         // admitNativeCandidates helper: classification (literal → spam →
         // fail-closed novelty), observe-first persistence, rejection stats.
-        const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
+        // Sources were built above for the admissibility gate and are reused.
         // Fail closed: a missing country row marks the baseline unknown and
         // every candidate is rejected as novelty-unknown — a transient read
         // error must never make a known term look novel. Lookup
