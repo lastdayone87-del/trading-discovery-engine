@@ -130,7 +130,9 @@ export function computeObservationKey(params: {
   // The extractor label is likewise provenance metadata, not source identity.
   // translationRisk derives from the (term, language-context) pairing, so a
   // language correction that flips the flag must reach the same row.
-  const { novel: _novel, knownAs: _knownAs, generic: _generic, extractor: _extractor, translationRisk: _translationRisk, ...stableEvidence } =
+  // Spam screening is classification too: re-screening the same source must
+  // update the row (and refresh the gates) rather than fork a duplicate.
+  const { novel: _novel, knownAs: _knownAs, generic: _generic, extractor: _extractor, translationRisk: _translationRisk, spamConfirmed: _spamConfirmed, spamSignals: _spamSignals, ...stableEvidence } =
     (params.evidence || {}) as Record<string, unknown>;
   // Positional source index is not source identity: the same video (or the
   // same title text) at another list position must reuse its key instead of

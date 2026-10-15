@@ -889,15 +889,18 @@ test('revoke follows legacy demotion when the legacy decision demotes', async ()
 });
 
 test('observation path acquires the advisory lock before any term-row write', async () => {
-  // Deterministic lock-order regression: canonical upsert (exempt,
-  // uncontended) may precede the lock, but the observation insert, recency
-  // update, and refresh must all follow it — no row lock is ever held while
-  // requesting the advisory lock.
+  // Deterministic lock-order regression: a lock-free plain SELECT resolves
+  // the term first, then the advisory lock precedes EVERY row write —
+  // including the canonical upsert, whose language-reconcile UPDATE takes a
+  // real row lock. Lifecycle refresh holds advisory across its read phase
+  // before writing the same row; any row-first order would AB-BA deadlock.
+  // No row lock is ever held while requesting the advisory lock.
   const statements: string[] = [];
   const runner = {
     query: async (text: string, params: unknown[] = []) => {
       statements.push(text);
       if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+      if (text.startsWith('SELECT id FROM canonical_trading_terms WHERE country')) return { rows: [{ id: 7 }] };
       if (text.startsWith('INSERT INTO canonical_trading_terms')) return { rows: [{ id: 7 }] };
       if (text.startsWith('INSERT INTO terminology_observations')) return { rows: [{ id: 1, observed_at: new Date().toISOString(), inserted: true }] };
       if (text.startsWith('SELECT t.*')) return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
@@ -912,11 +915,13 @@ test('observation path acquires the advisory lock before any term-row write', as
   }, runner as never);
   assert.deepEqual(result, { termId: 7, observationInserted: true });
   const at = (fragment: string) => statements.findIndex(text => text.includes(fragment));
+  const preselectAt = at('SELECT id FROM canonical_trading_terms WHERE country');
   const canonicalAt = at('INSERT INTO canonical_trading_terms');
   const lockAt = at('pg_advisory_xact_lock');
   const obsAt = at('INSERT INTO terminology_observations');
   const recencyAt = at('SET last_observed_at');
-  assert.ok(canonicalAt >= 0 && lockAt > canonicalAt, 'lock follows the exempt canonical upsert');
+  assert.ok(preselectAt >= 0 && lockAt > preselectAt, 'advisory lock follows the lock-free pre-select');
+  assert.ok(canonicalAt > lockAt, 'canonical upsert (including reconcile writes) follows the lock');
   assert.ok(obsAt > lockAt, 'observation insert follows the lock');
   assert.ok(recencyAt > lockAt, 'recency update follows the lock');
   const rowLockAt = statements.findIndex(

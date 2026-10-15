@@ -6,12 +6,24 @@ import { computeObservationKey } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
 
+// Run-scoped identity for every row this file creates: teardown deletes by
+// suffix, and the shape guard below keeps a future suffix change from ever
+// widening into a broad delete.
+const runSuffix = `lng${Date.now().toString(36)}${process.pid}`;
+if (!/^[a-z0-9]+$/.test(runSuffix)) throw new Error('Unsafe test-run suffix');
+
 /**
  * Disposable-database TLS policy: TLS is disabled only for explicit local
  * loopback databases (the approved disposable-container pattern). Remote
  * URLs keep the default TLS behavior so test traffic stays encrypted.
  */
 function configureTestTls(databaseUrl: string): void {
+  // Test databases must never inherit production TLS overrides: under
+  // NODE_ENV=production getDb() forces rejectUnauthorized:false, which would
+  // silently disable verification even for verify-full URLs.
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Refusing to run integration tests under NODE_ENV=production (pool TLS verification would be disabled).');
+  }
   // Optional userinfo (user:pass@) precedes the host and carries no signal.
   if (/^postgres(ql)?:\/\/(?:[^@/]*@)?(localhost|127\.0\.0\.1|\[?::1\]?)([:/]|$)/i.test(databaseUrl)) {
     process.env.PGSSL = 'disable';
@@ -44,7 +56,7 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   process.env.DATABASE_URL = databaseUrl!;
   configureTestTls(databaseUrl!);
   const db = await getDb();
-  const suffix = `lng${Date.now().toString(36)}${process.pid}`;
+  const suffix = runSuffix;
   const channelId = `LANG_CH_${suffix}`;
   await db.query(
     `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
@@ -370,6 +382,11 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   assert.equal(dupeRows.rows.length, 1);
   const dupeRevs = dupeRows.rows[0]?.revs as Array<Record<string, unknown>> | null;
   assert.ok(Array.isArray(dupeRevs) && dupeRevs.some(r => r?.superseded_legacy_key === dupeKey));
+  // The merged entry preserves the complete prior evidence payload.
+  const merged = dupeRevs.find(r => r?.superseded_legacy_key === dupeKey) as Record<string, any> | undefined;
+  assert.ok(merged);
+  assert.equal((merged.evidence as any)?.extractor, 'OLD');
+  assert.equal(merged.native_evidence_status, 'NATIVE_OBSERVED');
 
   // (l) Keyless rows heal by source identity: a NULL-keyed observation for
   // the same source is rekeyed in place instead of duplicating.
@@ -413,4 +430,24 @@ test('configureTestTls encrypts remote traffic by default', () => {
     if (saved === undefined) delete process.env.PGSSL;
     else process.env.PGSSL = saved;
   }
+});
+
+test('teardown removes every row created by this run', async () => {
+  if (!databaseUrl) return;
+  process.env.DATABASE_URL = databaseUrl;
+  const db = await getDb();
+  const like = `%${runSuffix}`;
+  await db.query(`DELETE FROM terminology_observations WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1)`, [like]);
+  await db.query(`DELETE FROM terminology_lifecycle_events WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1)`, [like]);
+  await db.query(`DELETE FROM country_native_evidence_projections WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1)`, [like]);
+  await db.query(`DELETE FROM terminology_score_snapshots WHERE canonical_term_id IN (SELECT id FROM canonical_trading_terms WHERE normalized_term LIKE $1)`, [like]);
+  await db.query(`DELETE FROM canonical_trading_terms WHERE normalized_term LIKE $1`, [like]);
+  await db.query(`DELETE FROM channels WHERE channel_id LIKE $1`, [like]);
+  const leftovers = await db.query(
+    `SELECT (SELECT count(*) FROM canonical_trading_terms WHERE normalized_term LIKE $1)::int AS terms,
+            (SELECT count(*) FROM channels WHERE channel_id LIKE $1)::int AS channels`,
+    [like]
+  );
+  assert.equal(Number(leftovers.rows[0]?.terms), 0);
+  assert.equal(Number(leftovers.rows[0]?.channels), 0);
 });

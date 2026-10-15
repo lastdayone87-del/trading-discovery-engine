@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { channelLanguageSnippet, classifierLanguageInputs, resolveEnrichmentDetectedLanguages, snippetLanguage, usableVideoLanguages, withoutVideoLanguages } from './youtube';
+import { channelLanguageSnippet, classifierLanguageInputs, resolveEnrichmentDetectedLanguages, snippetLanguage, usableVideoLanguages, withoutTranscriptLanguages, withoutVideoLanguages } from './youtube';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 
 test('snippetLanguage prefers per-video audio language, then default language', () => {
@@ -61,22 +61,83 @@ test('stale fallbacks never override usable video languages', () => {
   const stale = [{ language: 'fr' }];
   // Usable videos suppress every fallback — even conflicting ones, so the
   // selector fail-closes instead of applying the stale context.
-  assert.equal(
+  assert.deepEqual(
     resolveEnrichmentDetectedLanguages({ defaultLanguage: 'de' }, [{ language: 'en' }], stale),
-    undefined
+    { detectedLanguages: undefined, dissented: false }
   );
-  assert.equal(
+  assert.deepEqual(
     resolveEnrichmentDetectedLanguages({ defaultLanguage: 'de' }, [{ language: 'de' }], stale),
-    undefined
+    { detectedLanguages: undefined, dissented: false }
   );
   // Invalid video tags are ignored: the channel fallback still applies.
   assert.deepEqual(
     resolveEnrichmentDetectedLanguages({ defaultLanguage: 'de' }, [{ language: '!!!' }], stale),
-    [{ language: 'de' }]
+    { detectedLanguages: [{ language: 'de' }], dissented: false }
   );
   // Nothing usable anywhere: the stale fallback survives (pre-existing data).
-  assert.deepEqual(resolveEnrichmentDetectedLanguages({}, [], stale), stale);
-  assert.equal(resolveEnrichmentDetectedLanguages({}, [], undefined), undefined);
+  assert.deepEqual(resolveEnrichmentDetectedLanguages({}, [], stale), {
+    detectedLanguages: stale,
+    dissented: false,
+  });
+  assert.deepEqual(resolveEnrichmentDetectedLanguages({}, [], undefined), {
+    detectedLanguages: undefined,
+    dissented: false,
+  });
+});
+
+test('transcript dissent vetoes the selection for suppression downstream', () => {
+  // Channel default vs disagreeing transcript: vetoed, flagged for stripping.
+  assert.deepEqual(
+    resolveEnrichmentDetectedLanguages(
+      { defaultLanguage: 'de' }, [], undefined, [{ language: 'fr' }]
+    ),
+    { detectedLanguages: undefined, dissented: true }
+  );
+  // Agreeing transcripts do not veto.
+  assert.deepEqual(
+    resolveEnrichmentDetectedLanguages(
+      { defaultLanguage: 'de' }, [], undefined, [{ language: 'de' }, { language: 'und' }]
+    ),
+    { detectedLanguages: [{ language: 'de' }], dissented: false }
+  );
+  // No transcripts: unchanged behavior.
+  assert.deepEqual(resolveEnrichmentDetectedLanguages({ defaultLanguage: 'de' }, [], undefined), {
+    detectedLanguages: [{ language: 'de' }],
+    dissented: false,
+  });
+});
+
+test('fallback confidence winner decides the veto target', () => {
+  const fallback = [
+    { language: 'fr', confidence: 40 },
+    { language: 'de', confidence: 90 },
+  ];
+  // Transcripts agreeing with the low-confidence entry but contradicting
+  // the winner still veto: the selector would admit the winner.
+  assert.deepEqual(
+    resolveEnrichmentDetectedLanguages({}, [], fallback, [{ language: 'fr' }]),
+    { detectedLanguages: undefined, dissented: true }
+  );
+  assert.deepEqual(
+    resolveEnrichmentDetectedLanguages({}, [], fallback, [{ language: 'de' }]),
+    { detectedLanguages: fallback, dissented: false }
+  );
+  // Tied winners admit nothing downstream: no selection, no veto needed.
+  const tied = [
+    { language: 'fr', confidence: 90 },
+    { language: 'de', confidence: 90 },
+  ];
+  assert.deepEqual(resolveEnrichmentDetectedLanguages({}, [], tied, [{ language: 'fr' }]), {
+    detectedLanguages: undefined,
+    dissented: false,
+  });
+});
+
+test('withoutTranscriptLanguages strips only the language key', () => {
+  assert.deepEqual(withoutTranscriptLanguages([{ video_id: 'v1', text: 't', language: 'de' }]), [
+    { video_id: 'v1', text: 't' },
+  ]);
+  assert.deepEqual(withoutTranscriptLanguages([]), []);
 });
 
 test('withoutVideoLanguages strips only the language key for classifier inputs', () => {
@@ -145,7 +206,14 @@ test('classifier inputs strip only enrichment-added language hints', () => {
     videos: [{ id: 'v1', title: 't' }],
     detected_languages: undefined,
   });
-  // Other passes preserve candidate hints untouched.
+  // Provider-flagged hints are stripped on EVERY pass (metadata hydration
+  // can attach them outside enrichment): the round-5 metadata hole stays shut.
+  assert.deepEqual(
+    classifierLanguageInputs({ detectedLanguages: hints, providerDeclaredLanguage: true }, videos, false),
+    { videos: [{ id: 'v1', title: 't' }], detected_languages: undefined }
+  );
+  // Unflagged hints (content-analyzed or future legitimate producers) pass
+  // through untouched outside enrichment.
   assert.deepEqual(classifierLanguageInputs({ detectedLanguages: hints }, videos, false), {
     videos,
     detected_languages: hints,

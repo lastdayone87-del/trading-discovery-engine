@@ -691,6 +691,22 @@ export async function observeTerminologyDetailed(args: {
   // forward only from unknown ('und'/empty) to a concrete provider language.
   // A concrete existing language always wins (first-writer-wins on conflict),
   // so ambiguous re-evidence can never overwrite an established language.
+  //
+  // Lock order: the advisory lock precedes EVERY row write below, including
+  // this upsert. The reconcile UPDATE takes a real row lock, and lifecycle
+  // refresh holds the advisory lock across its read phase before writing the
+  // same row — upserting first would let an observer hold the row while
+  // requesting the advisory lock the refresher holds (and vice versa), a
+  // classic AB-BA deadlock PostgreSQL can only abort. A plain SELECT needs
+  // no term id and takes no locks, so resolution starts lock-free; new-term
+  // races arbitrate inside the upsert (unique/speculative waits hold no
+  // advisory-relevant locks) before the winner proceeds to lock.
+  const preexisting = await runner.query(
+    `SELECT id FROM canonical_trading_terms WHERE country = $1 AND normalized_term = $2`,
+    [country, normalized]
+  );
+  const preexistingId = preexisting.rows && preexisting.rows[0] ? Number(preexisting.rows[0].id) : null;
+  if (preexistingId !== null) await acquireTerminologyLifecycleLock(preexistingId, runner);
   const saved = await runner.query(
     `INSERT INTO canonical_trading_terms(canonical_term, normalized_term, country, language, script, term_type, first_observed_at, last_observed_at)
      VALUES($1, $2, $3, $4, $5, $6, now(), now())
@@ -710,18 +726,16 @@ export async function observeTerminologyDetailed(args: {
     if (!existing.rows || !existing.rows[0]) return null;
     termId = Number(existing.rows[0].id);
   }
+  if (preexistingId === null) await acquireTerminologyLifecycleLock(termId, runner);
 
-  // Lock order: advisory, then FOR UPDATE, BEFORE the observation insert,
-  // recency update, and refresh below (see acquireTerminologyLifecycleLock).
-  // The canonical upsert above is exempt: for existing terms it writes nothing,
-  // and for new terms the row is uncontended (concurrent creators block on
-  // speculative insert holding nothing). Taking FOR UPDATE before any KEY
+  // Lock order: advisory (acquired above, before any row write), then FOR
+  // UPDATE, BEFORE the observation insert, recency update, and refresh below
+  // (see acquireTerminologyLifecycleLock). Taking FOR UPDATE before any KEY
   // SHARE (observation/performance FK checks) is load-bearing: two concurrent
   // observers each holding KEY SHARE while requesting FOR UPDATE (e.g. inside
   // projection recomputation) deadlock, and either order with the upgrade
   // reversed reintroduces it. Re-entrant below: refresh re-acquires the
   // advisory harmlessly, and recomputation re-locks the already-held row.
-  await acquireTerminologyLifecycleLock(termId, runner);
   await runner.query(`SELECT id FROM canonical_trading_terms WHERE id=$1 FOR UPDATE`, [termId]);
 
   // 2. Resolve native creator/locale evidence status
@@ -795,13 +809,15 @@ export async function observeTerminologyDetailed(args: {
   }
   for (const row of (legacyCandidates.rows || []) as Array<Record<string, unknown>>) {
     // Same evidence substance under the current identity? Recompute this
-    // row's key from its stored evidence: equality means same source.
+    // row's key from its stored evidence: equality means same source. The
+    // explicit sourceEvidenceId carries over: without it, an explicitly
+    // identified re-observation could never match its prior row.
     const substanceKey = computeObservationKey({
       canonicalTermId: termId,
       channelId: args.channelId,
       videoId: args.videoId,
       observationType: args.observationType,
-      sourceEvidenceId: undefined,
+      sourceEvidenceId: args.sourceEvidenceId,
       evidence: (row.evidence || {}) as Record<string, unknown>
     });
     if (substanceKey !== obsKey) continue;
@@ -816,6 +832,8 @@ export async function observeTerminologyDetailed(args: {
       // (no foreign keys reference them), so removal is safe. The entry is
       // serialized in JS and passed as one typed parameter: inline params
       // inside jsonb_build_object would have indeterminable types.
+      const priorEvidence = (row.evidence || {}) as Record<string, unknown>;
+      const { revisions: _priorRevisions, ...priorEvidenceFlat } = priorEvidence;
       const supersededEntry = JSON.stringify({
         observed_at: row.observed_at ?? null,
         native_evidence_status: row.native_evidence_status ?? null,
@@ -823,6 +841,9 @@ export async function observeTerminologyDetailed(args: {
         term_language: row.term_language ?? null,
         locale: row.locale ?? null,
         superseded_legacy_key: row.observation_key ?? null,
+        // Complete prior evidence payload (minus nested revisions) so the
+        // removed row stays fully auditable: spans, extractor, quality flags.
+        evidence: priorEvidenceFlat,
       });
       await runner.query(
         `UPDATE terminology_observations SET evidence = evidence || jsonb_build_object('revisions',
@@ -867,7 +888,11 @@ export async function observeTerminologyDetailed(args: {
            'native_evidence_status', terminology_observations.native_evidence_status,
            'source_provenance_family', terminology_observations.source_provenance_family,
            'term_language', terminology_observations.term_language,
-           'locale', terminology_observations.locale
+           'locale', terminology_observations.locale,
+           -- Complete prior evidence payload (minus nested revisions) so the
+           -- superseded version stays fully auditable: source spans,
+           -- extractor details, and quality flags are all preserved.
+           'evidence', terminology_observations.evidence - 'revisions'
          )
        )
      -- No-op when nothing material changed: identical re-observations skip
@@ -876,6 +901,8 @@ export async function observeTerminologyDetailed(args: {
      WHERE terminology_observations.native_evidence_status IS DISTINCT FROM EXCLUDED.native_evidence_status
         OR terminology_observations.source_provenance_family IS DISTINCT FROM EXCLUDED.source_provenance_family
         OR terminology_observations.term_language IS DISTINCT FROM EXCLUDED.term_language
+        OR terminology_observations.is_code_switched IS DISTINCT FROM EXCLUDED.is_code_switched
+        OR terminology_observations.code_switch_type IS DISTINCT FROM EXCLUDED.code_switch_type
         OR terminology_observations.locale IS DISTINCT FROM EXCLUDED.locale
         OR terminology_observations.source_creator_country IS DISTINCT FROM EXCLUDED.source_creator_country
         OR terminology_observations.target_market_country IS DISTINCT FROM EXCLUDED.target_market_country
