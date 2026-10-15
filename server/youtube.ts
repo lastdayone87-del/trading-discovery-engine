@@ -932,6 +932,19 @@ export function adaptPlaylistItemsToSearchShape(payload: { items?: Array<Record<
  * creator. Unlike discovery search, this is only called by a durable enrichment
  * job and throws when all configured keys fail so queue retry/backoff applies.
  */
+/**
+ * Provider-supplied uploader language from an already-fetched YouTube snippet
+ * (videos.list `defaultAudioLanguage` first, then channels/videos.list
+ * `defaultLanguage`). Zero extra quota: the snippet is in hand. Never
+ * inferred from country; invalid tags are dropped downstream by
+ * normalizeLanguageCode, and the language selector stays fail-closed on
+ * missing/conflicting signals. Exported for unit testing.
+ */
+export function snippetLanguage(snippet: any): string | undefined {
+  const tag = snippet?.defaultAudioLanguage || snippet?.defaultLanguage;
+  return typeof tag === 'string' && tag.trim() !== '' ? tag : undefined;
+}
+
 export async function fetchYouTubeChannelEnrichment(
   channelId: string,
   fallback: DiscoveredChannelRaw,
@@ -1012,7 +1025,7 @@ export async function fetchYouTubeChannelEnrichment(
       const activityScore = !latestUploadAt ? 50 : Math.max(5, Math.round(100 * Math.exp(-ageDays / 365)));
       const officialCountry = channel.brandingSettings?.channel?.country;
       const extractedLinks = description.match(/https?:\/\/[^\s)\]}]+/g) || [];
-      let videos=recentItems.map((item:any)=>({id:item.id?.videoId,title:String(item.snippet?.title||''),description:String(item.snippet?.description||''),published_at:item.snippet?.publishedAt,content_type:'youtube_video'})).filter((video:any)=>video.title);
+      let videos: Array<{id?:string;title:string;description?:string;published_at?:string;content_type?:string;language?:string}>=recentItems.map((item:any)=>({id:item.id?.videoId,title:String(item.snippet?.title||''),description:String(item.snippet?.description||''),published_at:item.snippet?.publishedAt,content_type:'youtube_video'})).filter((video:any)=>video.title);
       let playlists=fallback.playlists||[];
       if(stage>=2){
         const ids=videos.map(video=>video.id).filter(Boolean).join(',');
@@ -1025,8 +1038,17 @@ export async function fetchYouTubeChannelEnrichment(
         }
         const playlistPayload=playlistsCheckpoint;
         playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
-        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await accountYouTubeQuotaResponse(videoResponse, 1);videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||'')}));}
+        if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await accountYouTubeQuotaResponse(videoResponse, 1);videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));}
       }
+
+      // Channel-level provider language as fallback only: per-video uploader
+      // language above takes precedence through the selector; the channel
+      // default applies solely when no video carries one. Provider-asserted,
+      // never country-derived.
+      const enrichedVideoLangs = videos.map(video => video.language).filter(Boolean);
+      const channelFallbackLangs = !enrichedVideoLangs.length && snippetLanguage(channel.snippet)
+        ? [{ language: snippetLanguage(channel.snippet) as string }]
+        : undefined;
 
       return {
         ...fallback,
@@ -1036,6 +1058,7 @@ export async function fetchYouTubeChannelEnrichment(
         description,
         videoTitles: recentItems.map((item: any) => item.snippet?.title || ''),
         videos,playlists,videoDescriptions:videos.map(video=>video.description||''),
+        detectedLanguages:channelFallbackLangs??fallback.detectedLanguages,
         // Authoritative recent-channel sample (order=date recent uploads):
         // the only discovery-side descriptions permitted to vote in the
         // aggregated-content-language country path.

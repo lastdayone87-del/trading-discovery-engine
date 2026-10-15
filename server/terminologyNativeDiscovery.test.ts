@@ -2416,3 +2416,68 @@ test('lifecycle refresh consults the trial-entry gate', () => {
   const source = readFileSync(new URL('./terminologyIntelligence.ts', import.meta.url), 'utf8');
   assert.match(source, /evaluateTrialEntry\(\{ novel: quality\.novel, spamConfirmed: quality\.spamConfirmed \}\)/);
 });
+
+// --- Language-context admission: genuine-local vs instrument vs English-in-context ---
+
+const deContextBaseline = () =>
+  buildNoveltyBaseline({
+    country: 'Germany',
+    vocab: {
+      country: 'Germany',
+      languages: ['de'],
+      native_trading_terminology: ['Börsenanalyse'],
+      popular_instruments: [],
+      local_market_phrases: [],
+      common_content_format_names: [],
+    },
+    vocabOk: true,
+    existingTerms: [],
+    existingOk: true,
+  });
+
+test('genuine local term with language context admits as novel, non-generic', () => {
+  const verdict = classifyNativeCandidate(
+    'Saisonalität',
+    [{ kind: 'VIDEO_TITLE', index: 0, text: 'Saisonalität erklärt' }],
+    deContextBaseline(),
+    { language: 'de' }
+  );
+  assert.equal(verdict.admit, true);
+  if (!verdict.admit) return;
+  assert.deepEqual(verdict.novelty, { novel: true, knownAs: null });
+  assert.equal(verdict.flags.generic, false);
+  assert.equal(verdict.flags.translationRisk, null);
+});
+
+test('known instrument admits as non-novel generic and is barred from trial entry', () => {
+  const verdict = classifyNativeCandidate(
+    'DAX',
+    [{ kind: 'VIDEO_TITLE', index: 0, text: 'DAX Analyse heute' }],
+    deContextBaseline(),
+    { language: 'de' }
+  );
+  assert.equal(verdict.admit, true);
+  if (!verdict.admit) return;
+  assert.deepEqual(verdict.novelty, { novel: false, knownAs: 'instrument:DAX' });
+  assert.equal(verdict.flags.generic, true);
+  // Trial entry bars non-novel terms: instruments are observed but can never
+  // trial as discoveries, with or without language context.
+  assert.deepEqual(evaluateTrialEntry({ novel: verdict.novelty.novel, spamConfirmed: false }), {
+    allowed: false,
+    reasons: ['not-novel'],
+  });
+});
+
+test('english finance term in german context admits without a native claim at classify time', () => {
+  const verdict = classifyNativeCandidate(
+    'Breakout Trading',
+    [{ kind: 'VIDEO_TITLE', index: 0, text: 'Breakout Trading Signale' }],
+    deContextBaseline(),
+    { language: 'de' }
+  );
+  assert.equal(verdict.admit, true);
+  if (!verdict.admit) return;
+  assert.equal(verdict.novelty.novel, true);
+  // termLanguage is resolved at observe time (code-switched: en inside de
+  // context), never here: classification must not call it native.
+});
