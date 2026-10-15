@@ -2,13 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   configuredGroqRoutes,
+  groqKeySlotNumber,
   groqOrgIdForSlot,
   groqOrgCooldownRemainingMs,
+  reserveGroqVocabularyStart,
   resetGroqCooldownForTests,
   resetGroqVocabularyPacingForTests,
   runGroqTextCompletion,
 } from './evidenceEngine/providers/GroqSemanticProvider';
 import { ProviderCallError, type ProviderCallEvent } from './providerResilience';
+import { hasUsableVocabularyArrays, extractVocabularyFromCreator } from './queryIntelligence';
+import { getDb } from './db';
 
 const GROQ_ENV_PATTERN = /^GROQ_/;
 
@@ -385,6 +389,286 @@ test('pacing spaces starts under the free-tier envelope', async () => {
     await runGroqTextCompletion({ prompt: 'b' }, deps);
     assert.ok(Date.now() - started >= 50, 'second start was not paced');
   } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('high-numbered slots are discovered without a maximum', () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv(
+      {
+        GROQ_API_KEY: 'h1',
+        GROQ_API_KEY_2: 'h2',
+        GROQ_API_KEY_10: 'h10',
+        GROQ_API_KEY_12: 'h12',
+        GROQ_API_KEY_19: 'h19',
+        GROQ_API_KEY_20: 'h20',
+        GROQ_API_KEY_100: 'h100',
+      },
+      'org-high'
+    );
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY'), 1);
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_2'), 2);
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_12'), 12);
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_100'), 100);
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_0'), null);
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_1'), null);
+    assert.equal(groqKeySlotNumber('GROQ_API_KEY_X'), null);
+    const routes = configuredGroqRoutes();
+    assert.deepEqual(routes.map(route => route.key), ['h1', 'h2', 'h10', 'h12', 'h19', 'h20', 'h100']);
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+  }
+});
+
+test('configured candidate model override reaches the request', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-model' }, 'org-model');
+    process.env.GROQ_CANDIDATE_MODEL = 'test-model-override';
+    let requestedModel = '';
+    await runGroqTextCompletion(
+      { prompt: 'extract' },
+      {
+        fetchImpl: stubFetch(async (_url: any, init?: any) => {
+          requestedModel = String(JSON.parse(String(init?.body))?.model || '');
+          return envelope('{"terminology":[],"instruments":[],"phrases":[],"formats":[]}');
+        }),
+        emit: async () => undefined,
+        persistedCooldownExpiryMs: async () => undefined,
+        minIntervalMs: 0,
+      }
+    );
+    assert.equal(requestedModel, 'test-model-override');
+  } finally {
+    delete process.env.GROQ_CANDIDATE_MODEL;
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('aggregate deadline bounds multi-route failover', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-agg1', GROQ_API_KEY_2: 'test-key-agg2' }, 'org-agg');
+    const hanging = stubFetch(
+      (_url: any, init?: any) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }))
+          );
+        })
+    );
+    const started = Date.now();
+    await assert.rejects(
+      runGroqTextCompletion(
+        { prompt: 'extract' },
+        {
+          fetchImpl: hanging,
+          emit: async () => undefined,
+          persistedCooldownExpiryMs: async () => undefined,
+          minIntervalMs: 0,
+          timeoutMs: 5000,
+          aggregateMs: 250,
+        }
+      ),
+      (error: unknown) => error instanceof ProviderCallError && error.retryable
+    );
+    // Two 5s route timeouts must not each run: the aggregate bounds everything.
+    assert.ok(Date.now() - started < 3000, 'failover exceeded the aggregate budget');
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('content without a JSON object fails over instead of succeeding', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-c1', GROQ_API_KEY_2: 'test-key-c2' }, 'org-content');
+    process.env.GROQ_ORG_ID = 'org-c1';
+    process.env.GROQ_ORG_ID_2 = 'org-c2';
+    const events: ProviderCallEvent[] = [];
+    const text = await runGroqTextCompletion(
+      { prompt: 'extract' },
+      {
+        fetchImpl: stubFetch(async (_url: any, init?: any) => {
+          const auth = String(init?.headers?.Authorization || '');
+          if (auth === 'Bearer test-key-c1') return envelope('just some prose, no object');
+          return envelope('{"terminology":["Saisonalität"],"instruments":[],"phrases":[],"formats":[]}');
+        }),
+        emit: async event => {
+          events.push(event);
+        },
+        persistedCooldownExpiryMs: async () => undefined,
+        minIntervalMs: 0,
+      }
+    );
+    assert.ok((text as string).includes('Saisonalität'));
+    assert.ok(events.every(event => event.status !== 'SUCCESS' || String(event.requestMetadata?.groqRoute) === 'groq-2'));
+    assert.ok(events.some(event => event.status === 'TRANSIENT_ERROR'));
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('concurrent same-org calls space out atomically', async () => {
+  const saved = saveGroqEnv();
+  try {
+    withEnv({ GROQ_API_KEY: 'test-key-conc' }, 'org-conc');
+    const starts: number[] = [];
+    const deps = {
+      fetchImpl: stubFetch(async () => {
+        starts.push(Date.now());
+        return envelope('{}');
+      }),
+      emit: async () => undefined,
+      persistedCooldownExpiryMs: async () => undefined,
+      minIntervalMs: 100,
+    };
+    await Promise.all([
+      runGroqTextCompletion({ prompt: 'a' }, deps),
+      runGroqTextCompletion({ prompt: 'b' }, deps),
+      runGroqTextCompletion({ prompt: 'c' }, deps),
+    ]);
+    starts.sort((a, b) => a - b);
+    assert.equal(starts.length, 3);
+    assert.ok(starts[1] - starts[0] >= 70, 'concurrent starts bunched');
+    assert.ok(starts[2] - starts[1] >= 70, 'concurrent starts bunched');
+  } finally {
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('independent orgs pace independently', async () => {
+  const t0 = Date.now();
+  const now = () => Date.now();
+  const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+  await Promise.all([
+    reserveGroqVocabularyStart('test-org-x', 150, now, sleep),
+    reserveGroqVocabularyStart('test-org-y', 150, now, sleep),
+  ]);
+  assert.ok(Date.now() - t0 < 120, 'independent orgs waited on each other');
+  resetGroqVocabularyPacingForTests('test-org-x');
+  resetGroqVocabularyPacingForTests('test-org-y');
+  const t1 = Date.now();
+  await reserveGroqVocabularyStart('test-org-x', 150, now, sleep);
+  await reserveGroqVocabularyStart('test-org-x', 150, now, sleep);
+  assert.ok(Date.now() - t1 >= 120, 'same-org starts were not spaced');
+  resetGroqVocabularyPacingForTests('test-org-x');
+});
+
+test('usability gate accepts shapes, rejects non-vocabulary JSON', () => {
+  assert.equal(hasUsableVocabularyArrays(undefined), false);
+  assert.equal(hasUsableVocabularyArrays({}), false);
+  assert.equal(hasUsableVocabularyArrays({ foo: 1 } as any), false);
+  assert.equal(hasUsableVocabularyArrays({ terminology: 'DAX' }), false);
+  assert.equal(hasUsableVocabularyArrays({ terminology: [] }), true);
+  assert.equal(hasUsableVocabularyArrays({ instruments: ['ES'] }), true);
+});
+
+const e2eDatabaseUrl = process.env.PHASE10_POSTGRES_URL;
+
+function configureE2eTls(databaseUrl: string): void {
+  if (/^postgres(ql)?:\/\/(localhost|127\.0\.0\.1|\[?::1\]?)([:/]|$)/i.test(databaseUrl)) {
+    process.env.PGSSL = 'disable';
+  } else {
+    delete process.env.PGSSL;
+  }
+}
+
+test('groq-only extraction persists GROQ provenance end to end', {
+  skip: e2eDatabaseUrl ? false : 'PHASE10_POSTGRES_URL is required for extraction e2e coverage'
+}, async () => {
+  process.env.DATABASE_URL = e2eDatabaseUrl!;
+  configureE2eTls(e2eDatabaseUrl!);
+  const db = await getDb();
+  const saved = saveGroqEnv();
+  const savedGemini = process.env.GEMINI_API_KEY;
+  const realFetch = globalThis.fetch;
+  try {
+    // Groq-only configuration: a Groq key, no Gemini key.
+    withEnv({ GROQ_API_KEY: 'test-e2e-key' }, 'org-e2e');
+    delete process.env.GEMINI_API_KEY;
+    globalThis.fetch = stubFetch(async () =>
+      envelope(JSON.stringify({
+        terminology: ['Saisonalität'],
+        instruments: ['DAX'],
+        phrases: [],
+        formats: [],
+      }))
+    ) as typeof fetch;
+    const suffix = `e2e${Date.now().toString(36)}${process.pid}`;
+    const channelId = `GROQ_E2E_${suffix}`;
+    await db.query(
+      `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+       VALUES($1,'Probe Wxy Kanal',$2,'Germany','CONFIRMED','UNKNOWN','PENDING','groq-e2e',now(),90,'TRADING_CONFIRMED')`,
+      [channelId, `https://youtube.com/channel/${channelId}`]
+    );
+    const channel = await db.query(`SELECT * FROM channels WHERE channel_id=$1`, [channelId]).then(r => r.rows[0]);
+    await extractVocabularyFromCreator(
+      channel, ['Saisonalität Heute', 'DAX Analyse'], '', false, undefined, undefined
+    );
+    const rows = (await db.query(
+      `SELECT t.canonical_term, o.evidence->>'extractor' AS extractor
+       FROM terminology_observations o JOIN canonical_trading_terms t ON t.id=o.canonical_term_id
+       WHERE o.source_channel_id=$1 ORDER BY 1`,
+      [channelId]
+    )).rows as Array<{ canonical_term: string; extractor: string }>;
+    const ai = rows.find(row => row.canonical_term === `saisonalität` || row.canonical_term.includes('Saisonalität'));
+    assert.ok(ai, `no AI observation persisted: ${JSON.stringify(rows)}`);
+    assert.equal(ai.extractor, 'GROQ');
+    const dax = rows.filter(row => row.canonical_term.toLowerCase() === 'dax');
+    assert.equal(dax.length, 1);
+    assert.equal(dax[0].extractor, 'KNOWN_INSTRUMENT_V1');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedGemini === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = savedGemini;
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
+});
+
+test('unusable groq output yields no observations without crashing', {
+  skip: e2eDatabaseUrl ? false : 'PHASE10_POSTGRES_URL is required for extraction e2e coverage'
+}, async () => {
+  process.env.DATABASE_URL = e2eDatabaseUrl!;
+  configureE2eTls(e2eDatabaseUrl!);
+  const db = await getDb();
+  const saved = saveGroqEnv();
+  const savedGemini = process.env.GEMINI_API_KEY;
+  const realFetch = globalThis.fetch;
+  try {
+    withEnv({ GROQ_API_KEY: 'test-e2e-key2' }, 'org-e2e2');
+    delete process.env.GEMINI_API_KEY;
+    globalThis.fetch = stubFetch(async () => envelope(JSON.stringify({ foo: 1 }))) as typeof fetch;
+    const suffix = `e2u${Date.now().toString(36)}${process.pid}`;
+    const channelId = `GROQ_E2U_${suffix}`;
+    await db.query(
+      `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+       VALUES($1,'Wxy Kanal Beobachter',$2,'Germany','CONFIRMED','UNKNOWN','PENDING','groq-e2e',now(),90,'TRADING_CONFIRMED')`,
+      [channelId, `https://youtube.com/channel/${channelId}`]
+    );
+    const channel = await db.query(`SELECT * FROM channels WHERE channel_id=$1`, [channelId]).then(r => r.rows[0]);
+    await extractVocabularyFromCreator(channel, ['Morgenstimmung'], '', false, undefined, undefined);
+    const count = await db.query(`SELECT count(*)::int n FROM terminology_observations WHERE source_channel_id=$1`, [channelId]);
+    assert.equal(Number(count.rows[0]?.n), 0);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedGemini === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = savedGemini;
     restoreGroqEnv(saved);
     resetGroqCooldownForTests();
     resetGroqVocabularyPacingForTests();

@@ -629,6 +629,11 @@ export async function invokeChannelVocabularyExtraction(
  * novelty baseline is unknown (counts by reason only, never source content),
  * so model drift and admission rate are observable.
  */
+export function hasUsableVocabularyArrays(parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined): boolean {
+  if (!parsed) return false;
+  return [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats].some(Array.isArray);
+}
+
 export async function admitNativeCandidates(args: {
   channel: ChannelRecord;
   sources: LiteralSourceText[];
@@ -638,6 +643,8 @@ export async function admitNativeCandidates(args: {
   locale?: string;
   humanApproved: boolean;
   humanObservation: 'HUMAN_APPROVED_CHANNEL' | 'ENRICHMENT';
+  /** Extraction provider recorded on observation evidence (default GEMINI preserves existing callers). */
+  extractor?: string;
   deps?: NativeAdmissionDeps;
 }): Promise<NativeAdmissionReport> {
   const saveTerm = args.deps?.saveTerm ?? ((country, term, category, channelId) => saveExtractedTerm(country, term, category, channelId));
@@ -665,7 +672,7 @@ export async function admitNativeCandidates(args: {
       language: args.language, locale: args.locale,
       communityFingerprint: args.channel.discord_invite || undefined,
       evidence: {
-        extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
+        extractor: args.extractor ?? 'GEMINI', qualityVersion: 'native-v1', literal: true,
         sourceRef: { kind: verdict.located.sourceKind, index: verdict.located.sourceIndex, span: verdict.located.span, videoId: verdict.located.videoId ?? null, sourceHash: verdict.located.sourceHash },
         novel: verdict.novelty.novel, knownAs: verdict.novelty.knownAs,
         generic: verdict.flags.generic, spamConfirmed: false, spamSignals: verdict.spamSignals, sourceSpamSignals: verdict.sourceSpamSignals,
@@ -752,12 +759,15 @@ export async function extractVocabularyFromCreator(
   // sources, rule spans, or quoted prompt context.
   const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
   const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
-  if (ai && hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
+  // Groq runs on its own key configuration: only the Gemini fallback is
+  // gated on the Gemini client.
+  if (hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
     // Provider failures (quota/busy/malformed model output) warn and skip AI
     // extraction. Persistence failures from admission below are NOT caught
     // here: they propagate to the caller for retry instead of being
     // misreported as Gemini errors or silently swallowed.
     let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined;
+    let parsedSource: 'GROQ' | 'GEMINI' = 'GEMINI';
     const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
 Description: "${effDesc}"
@@ -779,7 +789,13 @@ Return ONLY a valid JSON object with format:
     try {
       const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
       const groqText = await runGroqTextCompletion({ prompt });
-      if (groqText) parsed = parseNativeVocabularyResponse(groqText);
+      // Usability gate: JSON without vocabulary arrays is not a result —
+      // the Gemini fallback stays available instead of being suppressed.
+      const groqParsed = groqText ? parseNativeVocabularyResponse(groqText) : undefined;
+      if (hasUsableVocabularyArrays(groqParsed)) {
+        parsed = groqParsed;
+        parsedSource = 'GROQ';
+      }
     } catch (e: any) {
       console.warn(`[Vocabulary Extraction] Groq attempt skipped for channel ${channel.channel_id}; trying Gemini fallback.`);
     }
@@ -833,6 +849,7 @@ Return ONLY a valid JSON object with format:
           locale: languageContext?.locale,
           humanApproved,
           humanObservation,
+          extractor: parsedSource,
         });
     }
   }
