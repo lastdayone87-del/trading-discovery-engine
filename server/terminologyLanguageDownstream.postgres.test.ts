@@ -1,9 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb } from './db';
-import { observeTerminologyDetailed } from './terminologyIntelligence';
+import { observeTerminologyDetailed, readNativeQualityEvidence } from './terminologyIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
+
+/**
+ * Disposable-database TLS policy: TLS is disabled only for explicit local
+ * loopback databases (the approved disposable-container pattern). Remote
+ * URLs keep the default TLS behavior so test traffic stays encrypted.
+ */
+function configureTestTls(databaseUrl: string): void {
+  if (/^postgres(ql)?:\/\/(localhost|127\.0\.0\.1|\[?::1\]?)([:/]|$)/i.test(databaseUrl)) {
+    process.env.PGSSL = 'disable';
+  } else {
+    delete process.env.PGSSL;
+  }
+}
 
 /**
  * Downstream proof for retained provider language: real language signals
@@ -17,7 +30,7 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   skip: databaseUrl ? false : 'PHASE10_POSTGRES_URL is required for language-downstream coverage'
 }, async () => {
   process.env.DATABASE_URL = databaseUrl!;
-  process.env.PGSSL = 'disable';
+  configureTestTls(databaseUrl!);
   const db = await getDb();
   const suffix = `lng${Date.now().toString(36)}${process.pid}`;
   const channelId = `LANG_CH_${suffix}`;
@@ -31,7 +44,8 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   const local = await observeTerminologyDetailed({
     term: `Saisonalität ${suffix}`, country: 'Germany', termType: 'TERMINOLOGY',
     observationType: 'VIDEO_TITLE', channelId, videoId: `v-local-${suffix}`,
-    language: 'de', locale: 'de-DE', evidence: { extractor: 'TEST' }
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
   });
   assert.ok(local && local.observationInserted, 'local observation not inserted');
   const localRow = (await db.query(
@@ -85,7 +99,8 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   const inst = await observeTerminologyDetailed({
     term: `DAX ${suffix}`, country: 'Germany', termType: 'INSTRUMENT',
     observationType: 'VIDEO_TITLE', channelId, videoId: `v-inst-${suffix}`,
-    language: 'de', locale: 'de-DE', evidence: { extractor: 'TEST', generic: true }
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'KNOWN_INSTRUMENT_V1', qualityVersion: 'native-v1', literal: true, novel: false, knownAs: 'instrument:DAX', generic: true, spamConfirmed: false, spamSignals: [] }
   });
   assert.ok(inst && inst.observationInserted, 'instrument observation not inserted');
   const instLife = (await db.query(
@@ -98,7 +113,8 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   const cs = await observeTerminologyDetailed({
     term: `Breakout Wxy9 ${suffix}`, country: 'Germany', termType: 'TERMINOLOGY',
     observationType: 'VIDEO_TITLE', channelId, videoId: `v-cs-${suffix}`,
-    language: 'de', locale: 'de-DE', evidence: { extractor: 'TEST' }
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
   });
   assert.ok(cs && cs.observationInserted, 'code-switched observation not inserted');
   const csRow = (await db.query(
@@ -108,4 +124,63 @@ test('provider language reaches native evidence, projection, and lifecycle gates
   assert.equal(csRow.term_language, 'en');
   assert.equal(csRow.is_code_switched, true);
   assert.equal(csRow.native_evidence_status, null);
+
+  // (e) Trial-entry gate, eligible outcome: novel native-v1 evidence across
+  // three creators and two communities (5 ENRICHMENT observations at weight
+  // 1.25 clear the trial-evidence bar of 5 with margin for decay between
+  // writes) enters SEARCH_TRIAL eligible.
+  const trialChannels = [`TRIAL_A_${suffix}`, `TRIAL_B_${suffix}`, `TRIAL_C_${suffix}`];
+  for (const trialChannel of trialChannels) {
+    await db.query(
+      `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+       VALUES($1,$1,$2,'Germany','CONFIRMED','UNKNOWN','PENDING','language-downstream',now(),90,'TRADING_CONFIRMED')`,
+      [trialChannel, `https://youtube.com/channel/${trialChannel}`]
+    );
+  }
+  const trialTerm = `Trialzugriff ${suffix}`;
+  const trialPrints = ['comm-a', 'comm-a', 'comm-b', 'comm-b', 'comm-b'];
+  const trialVideos = [1, 2, 3, 4, 5].map(n => `v-trial-${n}-${suffix}`);
+  let trialTermId = 0;
+  for (let i = 0; i < 5; i++) {
+    const observed = await observeTerminologyDetailed({
+      term: trialTerm, country: 'Germany', termType: 'TERMINOLOGY',
+      observationType: 'ENRICHMENT', channelId: trialChannels[Math.min(i, 2)], videoId: trialVideos[i],
+      communityFingerprint: trialPrints[i], language: 'de', locale: 'de-DE',
+      evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
+    });
+    assert.ok(observed && observed.observationInserted, `trial observation ${i} not inserted`);
+    trialTermId = observed.termId;
+  }
+  const trialQuality = await readNativeQualityEvidence(trialTermId, db);
+  assert.equal(trialQuality.v1Observations, 5);
+  assert.equal(trialQuality.novel, true);
+  assert.equal(trialQuality.spamConfirmed, false);
+  const trialLife = (await db.query(
+    `SELECT lifecycle_status, search_eligible FROM canonical_trading_terms WHERE id=$1`, [trialTermId]
+  )).rows[0];
+  assert.equal(trialLife.lifecycle_status, 'SEARCH_TRIAL');
+  assert.equal(trialLife.search_eligible, true);
+
+  // (f) Trial-entry gate, ineligible outcome: identical evidence shape with
+  // spam confirmation is blocked from trial despite meeting legacy bars.
+  const spamTerm = `Spamzugriff ${suffix}`;
+  let spamTermId = 0;
+  for (let i = 0; i < 5; i++) {
+    const observed = await observeTerminologyDetailed({
+      term: spamTerm, country: 'Germany', termType: 'TERMINOLOGY',
+      observationType: 'ENRICHMENT', channelId: trialChannels[Math.min(i, 2)], videoId: `v-spam-${i}-${suffix}`,
+      communityFingerprint: trialPrints[i], language: 'de', locale: 'de-DE',
+      evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: true, spamSignals: ['promotional'] }
+    });
+    assert.ok(observed && observed.observationInserted, `spam observation ${i} not inserted`);
+    spamTermId = observed.termId;
+  }
+  const spamQuality = await readNativeQualityEvidence(spamTermId, db);
+  assert.equal(spamQuality.v1Observations, 5);
+  assert.equal(spamQuality.spamConfirmed, true);
+  const spamLife = (await db.query(
+    `SELECT lifecycle_status, search_eligible FROM canonical_trading_terms WHERE id=$1`, [spamTermId]
+  )).rows[0];
+  assert.equal(spamLife.search_eligible, false);
+  assert.ok(spamLife.lifecycle_status !== 'SEARCH_TRIAL', 'spam-confirmed term must not trial');
 });

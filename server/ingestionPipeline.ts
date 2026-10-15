@@ -1,5 +1,5 @@
 import { ChannelRecord, DiscoverySource, DiscordStatus } from '../src/types';
-import { DiscoveredChannelRaw, fetchYouTubeChannelCountryMetadata } from './youtube';
+import { DiscoveredChannelRaw, fetchYouTubeChannelCountryMetadata, withoutVideoLanguages } from './youtube';
 import { aggregatedLanguageCandidateSet, validateChannelCountry } from './countryValidator';
 import { bumpGate1Evaluation } from './operationsTelemetry';
 import { resolveScopeEligibility } from './scopeEligibility';
@@ -500,10 +500,14 @@ export async function processChannelThroughPipeline(
     channel_id:candidate.channelId,channel_name:candidate.channelName,description:candidate.description||'',country:creatorCountry || undefined,
     channel_entity_id:channelEntityId,channel_source_family_id:channelSourceFamilyId,
     location_tag:candidate.locationTag,external_links:candidate.channelLinks||[],external_link_details:structuredExternalLinks,
-    videos:structuredVideos,
+    // Terminology-isolation boundary: provider video/channel language is a
+    // terminology-selection signal only. The trading classifier keeps its
+    // pre-existing inputs (no language keys); the terminology selector reads
+    // the same signals from the candidate object, which is untouched.
+    videos:withoutVideoLanguages(structuredVideos),
     video_titles:candidate.videoTitles,video_descriptions:candidate.videoDescriptions||[],videoDescriptionsAuthoritative:candidate.videoDescriptionsAuthoritative,
     playlists:candidate.playlists,
-    transcript_excerpts:candidate.transcriptExcerpts,detected_languages:candidate.detectedLanguages,visual_evidence:candidate.visualEvidence,
+    transcript_excerpts:candidate.transcriptExcerpts,detected_languages:undefined,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
     search_match_context:candidate.matchedDocument?{type:candidate.matchedDocument.type,provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}

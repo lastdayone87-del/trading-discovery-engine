@@ -57,11 +57,23 @@ const LANGUAGE_CODES: Record<string, string> = {
 };
 
 const normalizeCountry = (country: string) => country.normalize('NFKC').trim().toLocaleLowerCase('en');
-const normalizeLanguage = (language: string) => language.trim().toLocaleLowerCase('en').split(/[-_]/)[0];
+
+const LANGUAGE_TAG_SEGMENT = /^[a-z0-9]{2,8}$/;
+const PRIMARY_LANGUAGE_SUBTAG = /^[a-z]{2,3}$/;
 
 export function normalizeLanguageCode(value: string): string {
-  const normalized = normalizeLanguage(value);
-  return LANGUAGE_CODES[normalized] || (/^[a-z]{2}$/.test(normalized) ? normalized : '');
+  if (typeof value !== 'string') return '';
+  const lowered = value.trim().toLocaleLowerCase('en');
+  // Named languages first (names contain spaces/scripts the tag rule rejects).
+  if (LANGUAGE_CODES[lowered]) return LANGUAGE_CODES[lowered];
+  // Full-tag validation: every segment must be clean so a malformed tag like
+  // 'de-!!' cannot borrow a valid prefix. The primary subtag accepts ISO
+  // 639-1 and 639-2 (two- and three-letter codes such as 'fil' or 'yue').
+  const segments = lowered.split(/[-_]/);
+  if (segments.some(segment => !LANGUAGE_TAG_SEGMENT.test(segment))) return '';
+  const primary = segments[0];
+  if (LANGUAGE_CODES[primary]) return LANGUAGE_CODES[primary];
+  return PRIMARY_LANGUAGE_SUBTAG.test(primary) ? primary : '';
 }
 
 export function countrySearchLanguageCandidates(countryName: string, declaredLanguages: string[] = []): string[] {

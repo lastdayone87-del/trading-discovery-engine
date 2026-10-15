@@ -41,3 +41,24 @@ test('excluded-country language names normalize instead of dropping to empty', (
   assert.equal(normalizeLanguageCode('Korean'), 'ko');
   assert.equal(normalizeLanguageCode('NotALanguage!'), '');
 });
+
+test('normalizeLanguageCode validates full tags and three-letter primaries', () => {
+  // Malformed tags must not borrow a valid prefix.
+  assert.equal(normalizeLanguageCode('de-!!'), '');
+  assert.equal(normalizeLanguageCode('en-'), '');
+  assert.equal(normalizeLanguageCode('-de'), '');
+  assert.equal(normalizeLanguageCode('de--DE'), '');
+  assert.equal(normalizeLanguageCode(''), '');
+  // Valid ISO 639-2 three-letter primary subtags are accepted.
+  assert.equal(normalizeLanguageCode('fil-PH'), 'fil');
+  assert.equal(normalizeLanguageCode('yue'), 'yue');
+  // Well-formed tags behave exactly as before (primary subtag only).
+  assert.equal(normalizeLanguageCode('de'), 'de');
+  assert.equal(normalizeLanguageCode('de-DE'), 'de');
+  assert.equal(normalizeLanguageCode('zh-Hant-TW'), 'zh');
+  assert.equal(normalizeLanguageCode('pt_BR'), 'pt');
+  assert.equal(normalizeLanguageCode('es-419'), 'es');
+  assert.equal(normalizeLanguageCode('sr-Latn'), 'sr');
+  // Non-string input never fabricates a code.
+  assert.equal(normalizeLanguageCode(undefined as unknown as string), '');
+});

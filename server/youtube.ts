@@ -26,7 +26,7 @@ import {
 import { executeProviderCall, ProviderCallError } from './providerResilience';
 import { RetrievalLane } from './retrievalLanes';
 import { SearchOrdering, youtubeOrder } from './searchOrdering';
-import { countrySearchHints } from './countrySearchHints';
+import { countrySearchHints, normalizeLanguageCode } from './countrySearchHints';
 import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from './youtubePoolBackoff';
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler, type YouTubeRequestPriority } from './youtubeRequestScheduler';
@@ -936,8 +936,63 @@ export function adaptPlaylistItemsToSearchShape(payload: { items?: Array<Record<
  * missing/conflicting signals. Exported for unit testing.
  */
 export function snippetLanguage(snippet: any): string | undefined {
-  const tag = snippet?.defaultAudioLanguage || snippet?.defaultLanguage;
-  return typeof tag === 'string' && tag.trim() !== '' ? tag : undefined;
+  // First VALID tag wins: an invalid audio tag must never suppress a valid
+  // default. The raw tag is returned (region preserved for explicitLocale);
+  // validity is judged by the shared normalizer.
+  for (const tag of [snippet?.defaultAudioLanguage, snippet?.defaultLanguage]) {
+    if (typeof tag === 'string' && tag.trim() !== '' && normalizeLanguageCode(tag) !== '') return tag;
+  }
+  return undefined;
+}
+
+/**
+ * Usable video-language signals: raw tags that survive normalization. Only
+ * these count when deciding whether the channel fallback applies — invalid
+ * tags are ignored instead of suppressing the fallback.
+ */
+export function usableVideoLanguages(videos: Array<{ language?: unknown }>): string[] {
+  return videos
+    .map(video => video.language)
+    .filter((tag): tag is string => typeof tag === 'string' && normalizeLanguageCode(tag) !== '');
+}
+
+/**
+ * Channel-fallback selection for enrichment: usable video languages always
+ * win (even conflicting ones — the selector then fail-closes); the channel
+ * default applies only when no video carries a usable signal; a stale
+ * fallback survives only when nothing newer exists.
+ */
+export function resolveEnrichmentDetectedLanguages(
+  channelSnippet: any,
+  videos: Array<{ language?: unknown }>,
+  fallbackDetectedLanguages: Array<{ language: string; confidence?: number }> | undefined
+): Array<{ language: string }> | undefined {
+  if (usableVideoLanguages(videos).length > 0) return undefined;
+  const channelTag = snippetLanguage(channelSnippet);
+  if (channelTag !== undefined) return [{ language: channelTag }];
+  return fallbackDetectedLanguages;
+}
+
+/**
+ * Trading-classification isolation: provider video language is a
+ * terminology-selection signal only. Classifier inputs keep their
+ * pre-existing shape (no language key); everything else is identical.
+ */
+/** Video shape shared with trading-classification inputs (superset kept local so youtube.ts gains no new imports). */
+export interface ClassifiableVideo {
+  id?: string;
+  title: string;
+  description?: string;
+  published_at?: string;
+  content_type?: string;
+  script?: string;
+  source_family_id?: string;
+  source_entity_id?: string;
+  language?: string;
+}
+
+export function withoutVideoLanguages(videos: Array<ClassifiableVideo>): Array<Omit<ClassifiableVideo, 'language'>> {
+  return videos.map(({ language: _terminologyOnly, ...rest }) => rest);
 }
 
 /**
@@ -1041,14 +1096,13 @@ export async function fetchYouTubeChannelEnrichment(
         if(ids){if(!videoDetailsCheckpoint){if(attempt>0)await topUp(1);const videoResponse=await youtubeFetch(buildYouTubeApiUrl('videos',apiKey,{part:'snippet',id:ids}),'enrichment-video-details',1,attempt+1,acquisition,priority,apiKey);const videoDetailsPayload=await readYouTubeJsonObject(videoResponse,'enrichment-video-details');await accountYouTubeQuotaResponse(videoResponse, 1);videoDetailsCheckpoint=videoDetailsPayload;}const byId=new Map(videoDetailsCheckpoint.items?.map((item:any)=>[item.id,item.snippet])||[]);videos=videos.map(video=>({...video,description:String((byId.get(video.id) as any)?.description||video.description||''),language:snippetLanguage(byId.get(video.id))}));}
       }
 
-      // Channel-level provider language as fallback only: per-video uploader
-      // language above takes precedence through the selector; the channel
-      // default applies solely when no video carries one. Provider-asserted,
-      // never country-derived.
-      const enrichedVideoLangs = videos.map(video => video.language).filter(Boolean);
-      const channelFallbackLangs = !enrichedVideoLangs.length && snippetLanguage(channel.snippet)
-        ? [{ language: snippetLanguage(channel.snippet) as string }]
-        : undefined;
+      // Channel-level provider language as fallback only, resolved through
+      // resolveEnrichmentDetectedLanguages: usable video languages suppress
+      // every fallback (even each other — the selector fail-closes); the
+      // channel default applies solely when no video carries a usable
+      // signal; a stale fallback survives only when nothing newer exists.
+      // Provider-asserted, never country-derived.
+      const channelFallbackLangs = resolveEnrichmentDetectedLanguages(channel.snippet, videos, fallback.detectedLanguages);
 
       return {
         ...fallback,
@@ -1058,7 +1112,7 @@ export async function fetchYouTubeChannelEnrichment(
         description,
         videoTitles: recentItems.map((item: any) => item.snippet?.title || ''),
         videos,playlists,videoDescriptions:videos.map(video=>video.description||''),
-        detectedLanguages:channelFallbackLangs??fallback.detectedLanguages,
+        detectedLanguages:channelFallbackLangs,
         // Authoritative recent-channel sample (order=date recent uploads):
         // the only discovery-side descriptions permitted to vote in the
         // aggregated-content-language country path.
