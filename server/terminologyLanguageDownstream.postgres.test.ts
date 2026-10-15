@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb } from './db';
 import { observeTerminologyDetailed, readNativeQualityEvidence } from './terminologyIntelligence';
+import { computeLegacyObservationKey, computeObservationKey } from './countryNativeIntelligence';
 
 const databaseUrl = process.env.PHASE10_POSTGRES_URL;
 
@@ -16,15 +17,17 @@ function configureTestTls(databaseUrl: string): void {
     process.env.PGSSL = 'disable';
     return;
   }
-  // Remote test databases keep TLS: only explicit sslmode=require (or
-  // stronger) in the URL is accepted, letting the driver negotiate it.
-  // Anything else fails closed instead of sending credentials in plaintext.
+  // Remote test databases require VERIFIED TLS: bare sslmode=require (or
+  // weaker) negotiates encryption without authenticating the server, so a
+  // network attacker could impersonate the database and capture credentials.
+  // Only verify-ca / verify-full are accepted (the driver verifies against
+  // configured trust roots); anything else fails closed.
   const sslmode = /[?&]sslmode=([^&]*)/i.exec(databaseUrl)?.[1]?.toLowerCase();
-  if (sslmode === 'require' || sslmode === 'verify-ca' || sslmode === 'verify-full') {
+  if (sslmode === 'verify-ca' || sslmode === 'verify-full') {
     delete process.env.PGSSL;
     return;
   }
-  throw new Error('Refusing remote test database without explicit TLS (append ?sslmode=require or use a local disposable container).');
+  throw new Error('Refusing remote test database without verified TLS (use ?sslmode=verify-full with a trusted CA, or a local disposable container).');
 }
 
 /**
@@ -220,6 +223,14 @@ test('provider language reaches native evidence, projection, and lifecycle gates
     !relocalProj.rows[0] || Number(relocalProj.rows[0].native_observed_count) === 0,
     'stale native projection retained'
   );
+  // The superseded classification survives inside the row's revision log.
+  const revRow = await db.query(
+    `SELECT evidence->'revisions' AS revs FROM terminology_observations WHERE canonical_term_id=$1`,
+    [local.termId]
+  );
+  const revs = revRow.rows[0]?.revs as Array<Record<string, unknown>> | null;
+  assert.ok(Array.isArray(revs) && revs.length >= 1, 'no revision preserved');
+  assert.equal(revs[revs.length - 1]?.native_evidence_status, 'NATIVE_OBSERVED');
 
   // (h) Canonical language reconciles forward from unknown, never backward
   // from concrete: und -> de on new evidence, then stays de on conflict.
@@ -256,6 +267,76 @@ test('provider language reaches native evidence, projection, and lifecycle gates
     [nachTerm.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en')]
   )).rows[0];
   assert.equal(keptCanon?.language, 'de');
+
+  // (i) Legacy reconciliation: a row still keyed in the pre-change format
+  // (the exact state of production rows: old key, NULL status) is rekeyed
+  // in place on re-observation instead of duplicating.
+  const altTerm = `Altlast ${suffix}`;
+  const altEvidence = { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] };
+  const altFirst = await observeTerminologyDetailed({
+    term: altTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-alt-${suffix}`,
+    evidence: altEvidence
+  });
+  assert.ok(altFirst && altFirst.observationInserted);
+  // Simulate the exact pre-change production row: legacy key, NULL status.
+  const legacyKey = computeLegacyObservationKey({
+    canonicalTermId: altFirst.termId, channelId, videoId: `v-alt-${suffix}`,
+    observationType: 'VIDEO_TITLE', nativeEvidenceStatus: null, sourceProvenanceFamily: null,
+    evidence: altEvidence
+  });
+  await db.query(`UPDATE terminology_observations SET observation_key=$1, native_evidence_status=NULL WHERE canonical_term_id=$2`, [legacyKey, altFirst.termId]);
+  const altSecond = await observeTerminologyDetailed({
+    term: altTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId, videoId: `v-alt-${suffix}`,
+    language: 'de', locale: 'de-DE',
+    evidence: altEvidence
+  });
+  assert.ok(altSecond);
+  assert.equal(altSecond.observationInserted, false);
+  const altRows = await db.query(
+    `SELECT observation_key, native_evidence_status FROM terminology_observations WHERE canonical_term_id=$1`,
+    [altFirst.termId]
+  );
+  assert.equal(altRows.rows.length, 1);
+  assert.equal(altRows.rows[0]?.native_evidence_status, 'NATIVE_OBSERVED');
+  assert.equal(
+    altRows.rows[0]?.observation_key,
+    computeObservationKey({
+      canonicalTermId: altFirst.termId, channelId, videoId: `v-alt-${suffix}`,
+      observationType: 'VIDEO_TITLE',
+      evidence: altEvidence
+    })
+  );
+
+  // (j) Country attribution refreshes on reclassification: a moved creator
+  // is reported under the current country, not first-write values.
+  const umzugChannel = `UMZUG_CH_${suffix}`;
+  await db.query(
+    `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+     VALUES($1,$1,$2,'Germany','CONFIRMED','UNKNOWN','PENDING','language-downstream',now(),90,'TRADING_CONFIRMED')`,
+    [umzugChannel, `https://youtube.com/channel/${umzugChannel}`]
+  );
+  const umzugTerm = `Umzug ${suffix}`;
+  await observeTerminologyDetailed({
+    term: umzugTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId: umzugChannel, videoId: `v-umzug-${suffix}`,
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
+  });
+  await db.query(`UPDATE channels SET country='France' WHERE channel_id=$1`, [umzugChannel]);
+  await observeTerminologyDetailed({
+    term: umzugTerm, country: 'Germany', termType: 'TERMINOLOGY',
+    observationType: 'VIDEO_TITLE', channelId: umzugChannel, videoId: `v-umzug-${suffix}`,
+    language: 'de', locale: 'de-DE',
+    evidence: { extractor: 'TEST', qualityVersion: 'native-v1', literal: true, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] }
+  });
+  const umzugRows = await db.query(
+    `SELECT source_creator_country FROM terminology_observations WHERE canonical_term_id=(SELECT id FROM canonical_trading_terms WHERE normalized_term=$1 AND country='Germany')`,
+    [umzugTerm.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en')]
+  );
+  assert.equal(umzugRows.rows.length, 1);
+  assert.equal(umzugRows.rows[0]?.source_creator_country, 'France');
 });
 
 test('configureTestTls encrypts remote traffic by default', () => {
@@ -267,12 +348,13 @@ test('configureTestTls encrypts remote traffic by default', () => {
     assert.equal(process.env.PGSSL, 'disable');
     configureTestTls('postgresql://u:p@[::1]:5432/db');
     assert.equal(process.env.PGSSL, 'disable');
-    configureTestTls('postgresql://u:p@db.example.com/db?sslmode=require');
+    configureTestTls('postgresql://u:p@db.example.com/db?sslmode=verify-ca');
     assert.equal(process.env.PGSSL, undefined);
     configureTestTls('postgresql://u:p@db.example.com/db?sslmode=verify-full');
     assert.equal(process.env.PGSSL, undefined);
-    assert.throws(() => configureTestTls('postgresql://u:p@db.example.com/db'), /explicit TLS/);
-    assert.throws(() => configureTestTls('postgresql://u:p@10.0.0.5/db?sslmode=disable'), /explicit TLS/);
+    assert.throws(() => configureTestTls('postgresql://u:p@db.example.com/db'), /verified TLS/);
+    assert.throws(() => configureTestTls('postgresql://u:p@db.example.com/db?sslmode=require'), /verified TLS/);
+    assert.throws(() => configureTestTls('postgresql://u:p@10.0.0.5/db?sslmode=disable'), /verified TLS/);
   } finally {
     if (saved === undefined) delete process.env.PGSSL;
     else process.env.PGSSL = saved;

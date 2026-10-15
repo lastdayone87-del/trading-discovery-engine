@@ -942,9 +942,15 @@ export function adaptPlaylistItemsToSearchShape(payload: { items?: Array<Record<
  * conflict; nothing is inferred from country.
  */
 export function channelLanguageSnippet(channel: any): { defaultAudioLanguage?: unknown; defaultLanguage?: unknown } {
+  const snippetDefault = channel?.snippet?.defaultLanguage;
+  const brandingDefault = channel?.brandingSettings?.channel?.defaultLanguage;
+  // Validate before choosing: an invalid snippet default must not suppress a
+  // valid branding default (validated downstream by snippetLanguage).
+  const validSnippetDefault =
+    typeof snippetDefault === 'string' && normalizeLanguageCode(snippetDefault) !== '' ? snippetDefault : undefined;
   return {
     defaultAudioLanguage: channel?.snippet?.defaultAudioLanguage,
-    defaultLanguage: channel?.snippet?.defaultLanguage ?? channel?.brandingSettings?.channel?.defaultLanguage,
+    defaultLanguage: validSnippetDefault ?? brandingDefault,
   };
 }
 
@@ -1189,6 +1195,12 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
       return { ...fallback, description: channel.snippet?.description || fallback.description,
         locationTag: officialCountry || fallback.locationTag,
         subscriberCount,
+        // Same validated fallback rules as enrichment: already-fetched
+        // snippet/branding language is retained so later extraction passes
+        // without a full enrichment round.
+        detectedLanguages: resolveEnrichmentDetectedLanguages(
+          channelLanguageSnippet(channel), fallback.videos ?? [], fallback.detectedLanguages
+        ),
         countryMetadataStatus: officialCountry ? 'AVAILABLE_DECLARED' : 'AVAILABLE_NOT_DECLARED', countryMetadataCheckedAt: checkedAt };
     } catch (error) { recordProviderFailure(keys[index],error);if (isQuotaExceeded(error)) quotaExceededCount++; }
   }

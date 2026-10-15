@@ -6,6 +6,7 @@ import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
 import {
   computeEvidenceChecksum,
+  computeLegacyObservationKey,
   computeObservationKey,
   detectCodeSwitching,
   inferScript,
@@ -761,6 +762,49 @@ export async function observeTerminologyDetailed(args: {
     evidence: args.evidence
   });
 
+  // 3b. Legacy reconciliation (one-time per row after the identity change):
+  // rows still keyed in the pre-change format are rekeyed in place on first
+  // re-observation instead of duplicating. Two legacy variants are checked:
+  // current classification values (unchanged replays) and NULL/None values
+  // (the dominant production shape — every pre-change production row is
+  // unclassified, so reclassification with new language still reconciles).
+  // A pre-existing new-format duplicate (re-observed across the change) is
+  // left in place: inert for counts, and deleted rows cannot be audited.
+  const legacyKey = computeLegacyObservationKey({
+    canonicalTermId: termId,
+    channelId: args.channelId,
+    videoId: args.videoId,
+    observationType: args.observationType,
+    nativeEvidenceStatus: resolvedNativeStatus,
+    sourceProvenanceFamily: resolvedProvenanceFamily,
+    sourceEvidenceId: args.sourceEvidenceId,
+    evidence: args.evidence
+  });
+  const legacyNullKey = computeLegacyObservationKey({
+    canonicalTermId: termId,
+    channelId: args.channelId,
+    videoId: args.videoId,
+    observationType: args.observationType,
+    nativeEvidenceStatus: null,
+    sourceProvenanceFamily: null,
+    sourceEvidenceId: args.sourceEvidenceId,
+    evidence: args.evidence
+  });
+  const legacyHit = await runner.query(
+    `SELECT id FROM terminology_observations WHERE observation_key<>$1 AND observation_key IN ($2,$3) LIMIT 1`,
+    [obsKey, legacyKey, legacyNullKey]
+  );
+  if (legacyHit.rows && legacyHit.rows[0]) {
+    const newKeyHit = await runner.query(
+      `SELECT id FROM terminology_observations WHERE observation_key=$1`, [obsKey]
+    );
+    if (!newKeyHit.rows || !newKeyHit.rows[0]) {
+      await runner.query(
+        `UPDATE terminology_observations SET observation_key=$1 WHERE id=$2`, [obsKey, legacyHit.rows[0].id]
+      );
+    }
+  }
+
   // 4. Perform single, authoritative observation write. Reclassification of
   // the same source converges: ON CONFLICT refreshes the volatile
   // classification columns (locale, languages, status, family, evidence) in
@@ -781,7 +825,31 @@ export async function observeTerminologyDetailed(args: {
        native_language=EXCLUDED.native_language, term_language=EXCLUDED.term_language,
        native_evidence_status=EXCLUDED.native_evidence_status,
        source_provenance_family=EXCLUDED.source_provenance_family,
-       code_switch_type=EXCLUDED.code_switch_type, evidence=EXCLUDED.evidence
+       source_creator_country=EXCLUDED.source_creator_country,
+       target_market_country=EXCLUDED.target_market_country,
+       code_switch_type=EXCLUDED.code_switch_type,
+       -- Audit trail: the superseded classification is appended to an
+       -- in-evidence revision log (no schema change) instead of being lost.
+       -- Quality rollups read only top-level keys and are unaffected.
+       evidence = EXCLUDED.evidence || jsonb_build_object('revisions',
+         COALESCE(terminology_observations.evidence->'revisions', '[]'::jsonb) || jsonb_build_object(
+           'observed_at', terminology_observations.observed_at,
+           'native_evidence_status', terminology_observations.native_evidence_status,
+           'source_provenance_family', terminology_observations.source_provenance_family,
+           'term_language', terminology_observations.term_language,
+           'locale', terminology_observations.locale
+         )
+       )
+     -- No-op when nothing material changed: identical re-observations skip
+     -- the write (and the refresh below), so replays stay cheap and the
+     -- revision log grows only on genuine reclassification.
+     WHERE terminology_observations.native_evidence_status IS DISTINCT FROM EXCLUDED.native_evidence_status
+        OR terminology_observations.source_provenance_family IS DISTINCT FROM EXCLUDED.source_provenance_family
+        OR terminology_observations.term_language IS DISTINCT FROM EXCLUDED.term_language
+        OR terminology_observations.locale IS DISTINCT FROM EXCLUDED.locale
+        OR terminology_observations.source_creator_country IS DISTINCT FROM EXCLUDED.source_creator_country
+        OR terminology_observations.target_market_country IS DISTINCT FROM EXCLUDED.target_market_country
+        OR (terminology_observations.evidence->>'spamConfirmed') IS DISTINCT FROM (EXCLUDED.evidence->>'spamConfirmed')
      RETURNING id, observed_at, (xmax = 0) AS inserted`,
     [
       termId,

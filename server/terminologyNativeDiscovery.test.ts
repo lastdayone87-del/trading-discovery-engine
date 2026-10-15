@@ -42,7 +42,7 @@ import {
 } from './queryIntelligence';
 import { getExtractedVocabulary, saveExtractedTerm } from './dbCore';
 import { isRetryableInfrastructureFailure } from './dbCore';
-import { computeObservationKey } from './countryNativeIntelligence';
+import { computeLegacyObservationKey, computeObservationKey } from './countryNativeIntelligence';
 import { extractDiscoveredChannels } from './youtube';
 import { planDiverseQueries } from './queryPlanner';
 
@@ -577,6 +577,18 @@ test('observation identity ignores provider labels', () => {
   // classification outcomes are not source identity.
   const groq = computeObservationKey({ ...base, evidence: { ...base.evidence, extractor: 'GROQ' } });
   assert.equal(groq, computeObservationKey(base));
+});
+
+test('legacy keys are recognized for one-time reconciliation', () => {
+  const base = {
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    nativeEvidenceStatus: 'NATIVE_OBSERVED', sourceProvenanceFamily: 'CREATOR_METADATA',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', sourceRef: { kind: 'VIDEO_TITLE', span: 'X' } },
+  };
+  // Legacy format binds status/family/extractor: differs from current identity.
+  const legacy = computeLegacyObservationKey(base);
+  assert.notEqual(legacy, computeObservationKey(base));
+  assert.equal(legacy, computeLegacyObservationKey(base));
 });
 
 test('promotion holds below three executions regardless of creators', () => {

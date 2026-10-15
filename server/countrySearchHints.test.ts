@@ -91,3 +91,11 @@ test('normalizeLanguageCode enforces BCP 47 structure and registry', () => {
   // Codes without display data fail closed (documented limitation).
   assert.equal(normalizeLanguageCode('tlh'), '');
 });
+
+test('normalizeLanguageCode rejects prototype pollution and unassigned codes', () => {
+  // Inherited object members are truthy non-strings: hasOwn guard drops them.
+  assert.equal(normalizeLanguageCode('constructor'), '');
+  assert.equal(normalizeLanguageCode('__proto__'), '');
+  assert.equal(normalizeLanguageCode('toString'), '');
+  assert.equal(normalizeLanguageCode('hasOwnProperty'), '');
+});

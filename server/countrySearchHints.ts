@@ -77,6 +77,17 @@ function isAssignedLanguagePrimary(primary: string): boolean {
   }
 }
 
+/**
+ * Prototype-safe language-name lookup: plain-object indexing returns
+ * inherited members (constructor, __proto__) for malformed tags, which are
+ * truthy non-strings that downstream code could mistake for a language.
+ */
+function lookupLanguageName(key: string): string {
+  if (!Object.hasOwn(LANGUAGE_CODES, key)) return '';
+  const mapped: unknown = LANGUAGE_CODES[key];
+  return typeof mapped === 'string' ? mapped : '';
+}
+
 export function normalizeLanguageCode(value: string): string {
   if (typeof value !== 'string') return '';
   // Providers use hyphens and underscores interchangeably; BCP 47 is hyphens.
@@ -84,7 +95,8 @@ export function normalizeLanguageCode(value: string): string {
   if (!dashed) return '';
   // Named languages first (names contain spaces/scripts the tag rule rejects).
   const lowered = dashed.toLocaleLowerCase('en');
-  if (LANGUAGE_CODES[lowered]) return LANGUAGE_CODES[lowered];
+  const named = lookupLanguageName(lowered);
+  if (named) return named;
   // Structural BCP 47: malformed tags (de-!!, de-12, trailing dashes) die
   // here, while valid extensions (de-u-co-phonebk) and private use survive.
   let canonical: string;

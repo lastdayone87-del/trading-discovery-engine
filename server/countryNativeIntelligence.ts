@@ -149,6 +149,42 @@ export function computeObservationKey(params: {
 }
 
 /**
+ * @deprecated Pre-identity-change observation key (binds native status,
+ * provenance family, and the extractor-bearing evidence checksum). Used ONLY
+ * for one-time lazy reconciliation: on re-observation, a row still keyed in
+ * this format is rekeyed in place instead of duplicating. Remove once no
+ * pre-change rows remain.
+ */
+export function computeLegacyObservationKey(params: {
+  canonicalTermId: number;
+  channelId?: string | null;
+  videoId?: string | null;
+  observationType: string;
+  nativeEvidenceStatus?: string | null;
+  sourceProvenanceFamily?: string | null;
+  sourceEvidenceId?: string | null;
+  evidence?: Record<string, unknown> | null;
+}): string {
+  const normChannel = (params.channelId || 'none').trim().toLowerCase();
+  const normVideo = (params.videoId || 'none').trim().toLowerCase();
+  const normType = params.observationType.trim().toUpperCase();
+  const normStatus = (params.nativeEvidenceStatus || 'none').trim().toUpperCase();
+  const normFamily = (params.sourceProvenanceFamily || 'none').trim().toUpperCase();
+  const { novel: _novel, knownAs: _knownAs, generic: _generic, ...stableEvidence } =
+    (params.evidence || {}) as Record<string, unknown>;
+  const sourceRef = (stableEvidence.sourceRef || {}) as Record<string, unknown>;
+  if (sourceRef.index !== undefined) {
+    const { index: _droppedIndex, ...stableRef } = sourceRef;
+    stableEvidence.sourceRef = stableRef;
+  }
+  const checksum = computeEvidenceChecksum(stableEvidence);
+  const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();
+
+  const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}|${evidenceId}`;
+  return createHash('sha256').update(raw).digest('hex');
+}
+
+/**
  * Deterministically normalizes a candidate native term.
  * Preserves NFKC forms, diacritics/accents, ticker symbols, and multi-word terms.
  */

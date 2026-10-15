@@ -118,3 +118,21 @@ test('channel language prefers snippet default, then brandingSettings default', 
   assert.deepEqual(channelLanguageSnippet({}), { defaultAudioLanguage: undefined, defaultLanguage: undefined });
   assert.deepEqual(channelLanguageSnippet(null), { defaultAudioLanguage: undefined, defaultLanguage: undefined });
 });
+
+test('channel language validates snippet before branding fallback', () => {
+  // Invalid snippet default must not suppress a valid branding default.
+  assert.deepEqual(
+    channelLanguageSnippet({
+      snippet: { defaultLanguage: '!!!' },
+      brandingSettings: { channel: { defaultLanguage: 'fr' } },
+    }),
+    { defaultAudioLanguage: undefined, defaultLanguage: 'fr' }
+  );
+  assert.deepEqual(
+    channelLanguageSnippet({
+      snippet: { defaultLanguage: '!!!' },
+      brandingSettings: { channel: { defaultLanguage: '!!!' } },
+    }),
+    { defaultAudioLanguage: undefined, defaultLanguage: '!!!' }
+  );
+});
