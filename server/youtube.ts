@@ -928,11 +928,6 @@ export function adaptPlaylistItemsToSearchShape(payload: { items?: Array<Record<
   };
 }
 /**
- * Fetches richer official channel metadata and recent uploads for a borderline
- * creator. Unlike discovery search, this is only called by a durable enrichment
- * job and throws when all configured keys fail so queue retry/backoff applies.
- */
-/**
  * Provider-supplied uploader language from an already-fetched YouTube snippet
  * (videos.list `defaultAudioLanguage` first, then channels/videos.list
  * `defaultLanguage`). Zero extra quota: the snippet is in hand. Never
@@ -945,6 +940,11 @@ export function snippetLanguage(snippet: any): string | undefined {
   return typeof tag === 'string' && tag.trim() !== '' ? tag : undefined;
 }
 
+/**
+ * Fetches richer official channel metadata and recent uploads for a borderline
+ * creator. Unlike discovery search, this is only called by a durable enrichment
+ * job and throws when all configured keys fail so queue retry/backoff applies.
+ */
 export async function fetchYouTubeChannelEnrichment(
   channelId: string,
   fallback: DiscoveredChannelRaw,
