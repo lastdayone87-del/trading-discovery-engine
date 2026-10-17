@@ -23,7 +23,7 @@
  * opens one repeatable-read, read-only transaction for a stable snapshot, and
  * issues SELECT statements only.
  */
-import pg from 'pg';
+import pg, { type PoolClient } from 'pg';
 import { TERMINOLOGY_KILL_SWITCH_KEY, isTerminologyKillSwitchActive } from '../server/terminologyKillSwitch';
 
 const PILOT_COUNTRIES = ['Germany', 'France', 'United Kingdom', 'United States', 'Canada', 'Australia'];
@@ -39,9 +39,11 @@ async function main(): Promise<void> {
     ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
     max: 1,
   });
-  const client = await pool.connect();
+  let clientRef: PoolClient | undefined;
   let txOpen = false;
   try {
+    const client = await pool.connect();
+    clientRef = client;
     // One stable snapshot for the whole report: repeatable-read + read-only.
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     txOpen = true;
@@ -136,8 +138,10 @@ async function main(): Promise<void> {
 
     console.log(JSON.stringify(report, null, 2));
   } finally {
-    if (txOpen) await client.query('ROLLBACK').catch(() => undefined);
-    client.release();
+    if (clientRef) {
+      if (txOpen) await clientRef.query('ROLLBACK').catch(() => undefined);
+      clientRef.release();
+    }
     await pool.end().catch(() => undefined);
   }
 }

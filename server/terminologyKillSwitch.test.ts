@@ -60,6 +60,25 @@ test('kill switch: settings read failure is failure-safe (loop continues, warn e
   );
 });
 
+test('kill switch: the default production reader is failure-safe when the settings store is unreachable', async () => {
+  // Exercises the real default wiring (app_settings through the app pool):
+  // with no database configured the read throws and must fall back to
+  // default-ON with the warning — the injected-reader test above covers the
+  // stub; this one locks the production wiring itself.
+  const savedDatabaseUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  try {
+    const { result, warnings } = await withCapturedWarnings(() => isTerminologyKillSwitchActive());
+    assert.equal(result, false);
+    assert.ok(
+      warnings.some(w => w.includes('[Terminology Kill Switch]') && w.includes('default-ON')),
+      `expected default-ON warning from the default reader, got: ${JSON.stringify(warnings)}`
+    );
+  } finally {
+    if (savedDatabaseUrl !== undefined) process.env.DATABASE_URL = savedDatabaseUrl;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Extraction path: extractVocabularyFromCreator is a hard no-op while active
 // ---------------------------------------------------------------------------
@@ -71,10 +90,10 @@ const confirmedChannel = {
   trading_status: 'TRADING_CONFIRMED',
 } as any;
 
-test('extraction path: active switch short-circuits before any database/provider work', async () => {
-  // No DATABASE_URL is configured in this unit test: if the guard were not the
-  // first thing to run, the function would fail while loading rule-observation
-  // infrastructure instead of returning cleanly.
+test('extraction path: active switch returns [] without entering extraction work', async () => {
+  // The injected seam lets this unit context prove the guard is the first
+  // branch: with the switch active the function returns [] and warns before
+  // any rule-observation or provider work runs.
   const { result, warnings } = await withCapturedWarnings(() =>
     extractVocabularyFromCreator(confirmedChannel, ['DAX Analyse'], 'Beschreibung', false, undefined, undefined, undefined, {
       isKillSwitchActive: async () => true,
@@ -133,4 +152,42 @@ test('planner path: inactive switch returns trial atoms unchanged', async () => 
   const terms = await getPlannerTerminology('Germany', fakeClient(calls), { isKillSwitchActive: async () => false });
   assert.deepEqual(terms, [{ id: 1, term: 'DAX', score: 0.5, lifecycle: 'SEARCH_TRIAL' }]);
   assert.equal(calls.n, 1);
+});
+
+const scriptedPlannerClient = (calls: { sql: string[] }, settingValue: string | null) => ({
+  query: async (sql: string) => {
+    calls.sql.push(sql);
+    if (sql.includes('app_settings')) {
+      return { rows: settingValue == null ? [] : [{ setting_value: settingValue }] };
+    }
+    return { rows: [plannerTermsRow] };
+  },
+}) as any;
+
+test('planner path: caller-supplied client reads the switch through that client (no app pool)', async () => {
+  // Regression lock: the switch must not be read through getDb() when the
+  // caller deliberately supplied its own client (staging proofs and read-only
+  // tooling pass a client precisely to avoid the app pool's migration/seed
+  // bootstrap). Without runner-aware reading this test would issue an atoms
+  // query first, or leak a settings-read failure warning.
+  const calls = { sql: [] as string[] };
+  const terms = await getPlannerTerminology('Germany', scriptedPlannerClient(calls, 'true'));
+  assert.deepEqual(terms, []);
+  assert.equal(calls.sql.length, 1, `expected only the settings read, got: ${JSON.stringify(calls.sql)}`);
+  assert.ok(
+    calls.sql[0].includes('app_settings'),
+    `expected the settings read through the supplied client, got: ${calls.sql[0]}`
+  );
+});
+
+test('planner path: caller-supplied client with stop not set proceeds through the same client', async () => {
+  const calls = { sql: [] as string[] };
+  const terms = await getPlannerTerminology('Germany', scriptedPlannerClient(calls, null));
+  assert.deepEqual(terms, [{ id: 1, term: 'DAX', score: 0.5, lifecycle: 'SEARCH_TRIAL' }]);
+  assert.equal(calls.sql.length, 2, `expected settings read then atoms read, got: ${JSON.stringify(calls.sql)}`);
+  assert.ok(calls.sql[0].includes('app_settings'), `first query should be the settings read, got: ${calls.sql[0]}`);
+  assert.ok(
+    calls.sql[1].includes('canonical_trading_terms'),
+    `second query should be the atoms read, got: ${calls.sql[1]}`
+  );
 });

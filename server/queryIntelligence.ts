@@ -468,7 +468,10 @@ export interface ExtractionVideoSource {
  * so a save that failed after its observation committed cannot strand missing
  * rows behind early-return paths. Honors the normal extraction bars (confirmed
  * trading status, quality threshold, no manual-search training) exactly like
- * the main path. Idempotent; returns true when extraction ran.
+ * the main path. Idempotent; returns true when the replay completed without
+ * error. While the terminology kill switch is active extraction is a no-op,
+ * so `true` then means "no error", not "work performed" (production callers
+ * currently ignore the value; tests assert it).
  */
 export async function replayVocabularyForRetry(
   channel: ChannelRecord,

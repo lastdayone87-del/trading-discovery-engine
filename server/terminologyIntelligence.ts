@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import type { CountryVocabulary, QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
-import { isTerminologyKillSwitchActive } from './terminologyKillSwitch';
+import { isTerminologyKillSwitchActive, isTerminologyKillSwitchActiveOn } from './terminologyKillSwitch';
 import { canonicalCountry } from './countryInference';
 import {
   computeEvidenceChecksum,
@@ -1239,8 +1239,12 @@ export async function getPlannerTerminology(country: string, clientOverride?: Qu
   // Planner-path kill switch: while active the planner sees no trial/proven
   // terminology atoms at all, so the serving loop stops without touching
   // eligibility data (search_eligible / lifecycle rows stay intact and the
-  // stop lifts the moment the setting is cleared).
-  if (await (deps?.isKillSwitchActive ?? isTerminologyKillSwitchActive)()) return [];
+  // stop lifts the moment the setting is cleared). Callers that supplied
+  // their own client read the setting through that same client, so tooling
+  // that avoids the app pool (migrations/seed bootstrap) keeps avoiding it.
+  const isActive = deps?.isKillSwitchActive
+    ?? (clientOverride ? () => isTerminologyKillSwitchActiveOn(clientOverride) : isTerminologyKillSwitchActive);
+  if (await isActive()) return [];
   const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country)]);
   return result.rows.map(row => ({ id: Number(row.id), term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }));
 }

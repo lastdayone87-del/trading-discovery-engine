@@ -1,6 +1,10 @@
 /**
- * Terminology kill switch — the single operator-held emergency stop for the
- * native-terminology loop (vocabulary extraction + planner serving).
+ * Terminology kill switch — the operator-held emergency stop for the
+ * native-terminology loop: vocabulary extraction + planner serving.
+ *
+ * Boundary (agreed scope): the stop freezes new discovery and serving, not
+ * the whole database. Attribution and lifecycle refresh driven by
+ * already-collected evidence still run while the switch is active.
  *
  * Semantics (agreed before activation):
  * - Default-ON: the loop runs unless `app_settings.terminology_kill_switch`
@@ -29,11 +33,10 @@ export interface TerminologyKillSwitchDeps {
   readSetting?: (key: string) => Promise<string>;
 }
 
-/** True only when the setting is explicitly the value `'true'`. */
-export async function isTerminologyKillSwitchActive(deps?: TerminologyKillSwitchDeps): Promise<boolean> {
-  const read = deps?.readSetting ?? ((key: string) => getAppSetting(key, ''));
+/** Shared failure-safe evaluation: only the exact value `'true'` stops. */
+async function readSwitch(read: () => Promise<string>): Promise<boolean> {
   try {
-    const value = await read(TERMINOLOGY_KILL_SWITCH_KEY);
+    const value = await read();
     return String(value).trim().toLowerCase() === 'true';
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -42,4 +45,28 @@ export async function isTerminologyKillSwitchActive(deps?: TerminologyKillSwitch
     );
     return false;
   }
+}
+
+/** True only when the setting is explicitly the value `'true'`. */
+export async function isTerminologyKillSwitchActive(deps?: TerminologyKillSwitchDeps): Promise<boolean> {
+  const read = deps?.readSetting ?? ((key: string) => getAppSetting(key, ''));
+  return readSwitch(() => read(TERMINOLOGY_KILL_SWITCH_KEY));
+}
+
+/**
+ * Same semantics, read through a caller-supplied queryable instead of the app
+ * pool. Callers that deliberately pass their own client (e.g. read-only or
+ * staging tooling that must not initialize the app pool's migration/seed
+ * bootstrap) keep that guarantee for the switch read too.
+ */
+export async function isTerminologyKillSwitchActiveOn(queryable: {
+  query: (sql: string, params?: any[]) => Promise<any>;
+}): Promise<boolean> {
+  return readSwitch(async () => {
+    const result = await queryable.query(
+      `SELECT setting_value FROM app_settings WHERE setting_key=$1`,
+      [TERMINOLOGY_KILL_SWITCH_KEY]
+    );
+    return String(result?.rows?.[0]?.setting_value ?? '');
+  });
 }
