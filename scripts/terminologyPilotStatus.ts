@@ -17,11 +17,11 @@
  *
  * Usage: DATABASE_URL=... npx tsx scripts/terminologyPilotStatus.ts
  *
- * Safety: connects with a bare `pg` client (never the app pool, whose
- * bootstrap runs migrations/seeding), pins the session read-only, and issues
- * SELECT statements only.
+ * Safety: connects with a standalone single-connection `pg` pool (never the
+ * app's `getDb()` bootstrap, whose initialization runs migrations/seeding),
+ * pins the session read-only, and issues SELECT statements only.
  */
-import { Client } from 'pg';
+import pg from 'pg';
 import { TERMINOLOGY_KILL_SWITCH_KEY, isTerminologyKillSwitchActive } from '../server/terminologyKillSwitch';
 
 const PILOT_COUNTRIES = ['Germany', 'France', 'United Kingdom', 'United States', 'Canada', 'Australia'];
@@ -32,11 +32,12 @@ const per1k = (numerator: number, quota: number): number | null =>
 async function main(): Promise<void> {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error('DATABASE_URL is required');
-  const client = new Client({
+  const pool = new pg.Pool({
     connectionString: url,
     ssl: process.env.PGSSL === 'disable' ? false : undefined,
+    max: 1,
   });
-  await client.connect();
+  const client = await pool.connect();
   try {
     await client.query('SET default_transaction_read_only = on');
 
@@ -127,7 +128,8 @@ async function main(): Promise<void> {
 
     console.log(JSON.stringify(report, null, 2));
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
+    await pool.end().catch(() => undefined);
   }
 }
 
