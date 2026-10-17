@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import type { CountryVocabulary, QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
+import { isTerminologyKillSwitchActive } from './terminologyKillSwitch';
 import { canonicalCountry } from './countryInference';
 import {
   computeEvidenceChecksum,
@@ -1232,9 +1233,14 @@ export async function getTerminologyDashboard(country?: string, clientOverride?:
   return result.rows;
 }
 
-export async function getPlannerTerminology(country: string, clientOverride?: Queryable): Promise<Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }>> {
+export async function getPlannerTerminology(country: string, clientOverride?: Queryable, deps?: { isKillSwitchActive?: () => Promise<boolean> }): Promise<Array<{ id: number; term: string; score: number; lifecycle: 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }>> {
   const runner = clientOverride || (process.env.DATABASE_URL ? await getDb() : null);
   if (!runner) return [];
+  // Planner-path kill switch: while active the planner sees no trial/proven
+  // terminology atoms at all, so the serving loop stops without touching
+  // eligibility data (search_eligible / lifecycle rows stay intact and the
+  // stop lifts the moment the setting is cleared).
+  if (await (deps?.isKillSwitchActive ?? isTerminologyKillSwitchActive)()) return [];
   const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country)]);
   return result.rows.map(row => ({ id: Number(row.id), term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }));
 }
