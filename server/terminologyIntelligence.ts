@@ -686,11 +686,31 @@ export async function observeTerminologyDetailed(args: {
   const codeSwitching = detectCodeSwitching(canonical, contextLang);
   const weight = args.humanApproved ? 2.5 : args.observationType === 'ENRICHMENT' ? 1.25 : 1;
 
-  // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict
+  // 1. Insert or fetch canonical trading term WITHOUT advancing last_observed_at on conflict.
+  // A conflicting row keeps its timestamps; its language/script reconcile
+  // forward only from unknown ('und'/empty) to a concrete provider language.
+  // A concrete existing language always wins (first-writer-wins on conflict),
+  // so ambiguous re-evidence can never overwrite an established language.
+  //
+  // Lock order: the advisory lock precedes EVERY row write below, including
+  // this upsert. The reconcile UPDATE takes a real row lock, and lifecycle
+  // refresh holds the advisory lock across its read phase before writing the
+  // same row — upserting first would let an observer hold the row while
+  // requesting the advisory lock the refresher holds (and vice versa), a
+  // classic AB-BA deadlock PostgreSQL can only abort. A plain SELECT needs
+  // no term id and takes no locks, so resolution starts lock-free; new-term
+  // races arbitrate inside the upsert (unique/speculative waits hold no
+  // advisory-relevant locks) before the winner proceeds to lock.
+  const preexisting = await runner.query(
+    `SELECT id FROM canonical_trading_terms WHERE country = $1 AND normalized_term = $2`,
+    [country, normalized]
+  );
+  const preexistingId = preexisting.rows && preexisting.rows[0] ? Number(preexisting.rows[0].id) : null;
+  if (preexistingId !== null) await acquireTerminologyLifecycleLock(preexistingId, runner);
   const saved = await runner.query(
     `INSERT INTO canonical_trading_terms(canonical_term, normalized_term, country, language, script, term_type, first_observed_at, last_observed_at)
      VALUES($1, $2, $3, $4, $5, $6, now(), now())
-     ON CONFLICT(country, normalized_term) DO NOTHING
+     ON CONFLICT(country, normalized_term) DO UPDATE SET language=EXCLUDED.language, script=EXCLUDED.script WHERE canonical_trading_terms.language IN ('und','')
      RETURNING id`,
     [canonical, normalized, country, contextLang, inferScript(canonical), args.termType]
   );
@@ -706,18 +726,16 @@ export async function observeTerminologyDetailed(args: {
     if (!existing.rows || !existing.rows[0]) return null;
     termId = Number(existing.rows[0].id);
   }
+  if (preexistingId === null) await acquireTerminologyLifecycleLock(termId, runner);
 
-  // Lock order: advisory, then FOR UPDATE, BEFORE the observation insert,
-  // recency update, and refresh below (see acquireTerminologyLifecycleLock).
-  // The canonical upsert above is exempt: for existing terms it writes nothing,
-  // and for new terms the row is uncontended (concurrent creators block on
-  // speculative insert holding nothing). Taking FOR UPDATE before any KEY
+  // Lock order: advisory (acquired above, before any row write), then FOR
+  // UPDATE, BEFORE the observation insert, recency update, and refresh below
+  // (see acquireTerminologyLifecycleLock). Taking FOR UPDATE before any KEY
   // SHARE (observation/performance FK checks) is load-bearing: two concurrent
   // observers each holding KEY SHARE while requesting FOR UPDATE (e.g. inside
   // projection recomputation) deadlock, and either order with the upgrade
   // reversed reintroduces it. Re-entrant below: refresh re-acquires the
   // advisory harmlessly, and recomputation re-locks the already-held row.
-  await acquireTerminologyLifecycleLock(termId, runner);
   await runner.query(`SELECT id FROM canonical_trading_terms WHERE id=$1 FOR UPDATE`, [termId]);
 
   // 2. Resolve native creator/locale evidence status
@@ -745,19 +763,105 @@ export async function observeTerminologyDetailed(args: {
     resolvedProvenanceFamily = 'CREATOR_METADATA';
   }
 
-  // 3. Compute deterministic observation key for single-write idempotency
+  // 3. Compute deterministic observation key for single-write idempotency.
+  // Classification outcomes are excluded from identity (see
+  // computeObservationKey): reclassification converges onto one row.
   const obsKey = computeObservationKey({
     canonicalTermId: termId,
     channelId: args.channelId,
     videoId: args.videoId,
     observationType: args.observationType,
-    nativeEvidenceStatus: resolvedNativeStatus,
-    sourceProvenanceFamily: resolvedProvenanceFamily,
     sourceEvidenceId: args.sourceEvidenceId,
     evidence: args.evidence
   });
 
-  // 4. Perform single, authoritative observation write
+  // 3b. Legacy reconciliation: rows keyed before the identity change (old
+  // status-bearing keys, extractor-bearing checksums, or keyless rows) are
+  // converged in place on first re-observation instead of duplicating.
+  // Matching is by source identity plus evidence substance (recomputed with
+  // the stored evidence): genuinely different evidence stays separate, while
+  // any same-substance row — whatever its key vintage — heals onto the
+  // current identity. The first match is rekeyed; further matches are
+  // folded into its revision log and removed so aggregates count one row.
+  // (One-time per row; the per-term advisory lock above serializes this.)
+  const legacyCandidates = await runner.query(
+    `SELECT id, observation_key, evidence, native_evidence_status, source_provenance_family,
+            term_language, locale, observed_at
+     FROM terminology_observations
+     WHERE canonical_term_id=$1
+       AND COALESCE(source_channel_id,'')=COALESCE($2::text,'')
+       AND COALESCE(source_video_id,'')=COALESCE($3::text,'')
+       AND observation_type=$4
+       AND (observation_key IS NULL OR observation_key<>$5)
+     ORDER BY observed_at ASC`,
+    [termId, args.channelId || null, args.videoId || null, args.observationType, obsKey]
+  );
+  let convergedNewKeyId: number | null = null;
+  // Set when reconciliation merges or removes rows (counts change): forces
+  // the refresh below even if the main upsert is a no-op. Rekeys alone do
+  // not set it — the subsequent upsert refreshes when anything changed.
+  let legacyCountsChanged = false;
+  {
+    const newKeyHit = await runner.query(
+      `SELECT id FROM terminology_observations WHERE observation_key=$1`, [obsKey]
+    );
+    if (newKeyHit.rows && newKeyHit.rows[0]) convergedNewKeyId = Number(newKeyHit.rows[0].id);
+  }
+  for (const row of (legacyCandidates.rows || []) as Array<Record<string, unknown>>) {
+    // Same evidence substance under the current identity? Recompute this
+    // row's key from its stored evidence: equality means same source. The
+    // explicit sourceEvidenceId carries over: without it, an explicitly
+    // identified re-observation could never match its prior row.
+    const substanceKey = computeObservationKey({
+      canonicalTermId: termId,
+      channelId: args.channelId,
+      videoId: args.videoId,
+      observationType: args.observationType,
+      sourceEvidenceId: args.sourceEvidenceId,
+      evidence: (row.evidence || {}) as Record<string, unknown>
+    });
+    if (substanceKey !== obsKey) continue;
+    if (convergedNewKeyId === null) {
+      await runner.query(
+        `UPDATE terminology_observations SET observation_key=$1 WHERE id=$2`, [obsKey, Number(row.id)]
+      );
+      convergedNewKeyId = Number(row.id);
+    } else if (Number(row.id) !== convergedNewKeyId) {
+      // Superseded residue: fold its classification into the surviving row's
+      // revision log, then remove the duplicate. Observations are leaves
+      // (no foreign keys reference them), so removal is safe. The entry is
+      // serialized in JS and passed as one typed parameter: inline params
+      // inside jsonb_build_object would have indeterminable types.
+      const priorEvidence = (row.evidence || {}) as Record<string, unknown>;
+      const { revisions: _priorRevisions, ...priorEvidenceFlat } = priorEvidence;
+      const supersededEntry = JSON.stringify({
+        observed_at: row.observed_at ?? null,
+        native_evidence_status: row.native_evidence_status ?? null,
+        source_provenance_family: row.source_provenance_family ?? null,
+        term_language: row.term_language ?? null,
+        locale: row.locale ?? null,
+        superseded_legacy_key: row.observation_key ?? null,
+        // Complete prior evidence payload (minus nested revisions) so the
+        // removed row stays fully auditable: spans, extractor, quality flags.
+        evidence: priorEvidenceFlat,
+      });
+      await runner.query(
+        `UPDATE terminology_observations SET evidence = evidence || jsonb_build_object('revisions',
+          COALESCE(evidence->'revisions', '[]'::jsonb) || jsonb_build_array($2::jsonb)
+        ) WHERE id = $1`,
+        [convergedNewKeyId, supersededEntry]
+      );
+      await runner.query(`DELETE FROM terminology_observations WHERE id=$1`, [Number(row.id)]);
+      legacyCountsChanged = true;
+    }
+  }
+
+  // 4. Perform single, authoritative observation write. Reclassification of
+  // the same source converges: ON CONFLICT refreshes the volatile
+  // classification columns (locale, languages, status, family, evidence) in
+  // place instead of inserting a duplicate row, so projections never retain
+  // stale native evidence. Identity columns (term, channel, video, type,
+  // approvals, weight, community) are first-write-wins.
   const obsInsert = await runner.query(
     `INSERT INTO terminology_observations(
        canonical_term_id, source_channel_id, source_video_id, observation_type,
@@ -767,8 +871,49 @@ export async function observeTerminologyDetailed(args: {
        observation_key
      )
      VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-     ON CONFLICT(observation_key) DO NOTHING
-     RETURNING id, observed_at`,
+     ON CONFLICT(observation_key) DO UPDATE SET
+       locale=EXCLUDED.locale, is_code_switched=EXCLUDED.is_code_switched,
+       native_language=EXCLUDED.native_language, term_language=EXCLUDED.term_language,
+       native_evidence_status=EXCLUDED.native_evidence_status,
+       source_provenance_family=EXCLUDED.source_provenance_family,
+       source_creator_country=EXCLUDED.source_creator_country,
+       target_market_country=EXCLUDED.target_market_country,
+       code_switch_type=EXCLUDED.code_switch_type,
+       -- Audit trail: the superseded classification is appended to an
+       -- in-evidence revision log (no schema change) instead of being lost.
+       -- Quality rollups read only top-level keys and are unaffected.
+       evidence = EXCLUDED.evidence || jsonb_build_object('revisions',
+         COALESCE(terminology_observations.evidence->'revisions', '[]'::jsonb) || jsonb_build_object(
+           'observed_at', terminology_observations.observed_at,
+           'native_evidence_status', terminology_observations.native_evidence_status,
+           'source_provenance_family', terminology_observations.source_provenance_family,
+           'term_language', terminology_observations.term_language,
+           'locale', terminology_observations.locale,
+           -- Complete prior evidence payload (minus nested revisions) so the
+           -- superseded version stays fully auditable: source spans,
+           -- extractor details, and quality flags are all preserved.
+           'evidence', terminology_observations.evidence - 'revisions'
+         )
+       )
+     -- No-op when nothing material changed: identical re-observations skip
+     -- the write (and the refresh below), so replays stay cheap and the
+     -- revision log grows only on genuine reclassification.
+     WHERE terminology_observations.native_evidence_status IS DISTINCT FROM EXCLUDED.native_evidence_status
+        OR terminology_observations.source_provenance_family IS DISTINCT FROM EXCLUDED.source_provenance_family
+        OR terminology_observations.term_language IS DISTINCT FROM EXCLUDED.term_language
+        OR terminology_observations.is_code_switched IS DISTINCT FROM EXCLUDED.is_code_switched
+        OR terminology_observations.code_switch_type IS DISTINCT FROM EXCLUDED.code_switch_type
+        OR terminology_observations.locale IS DISTINCT FROM EXCLUDED.locale
+        OR terminology_observations.source_creator_country IS DISTINCT FROM EXCLUDED.source_creator_country
+        OR terminology_observations.target_market_country IS DISTINCT FROM EXCLUDED.target_market_country
+        OR (terminology_observations.evidence->>'spamConfirmed') IS DISTINCT FROM (EXCLUDED.evidence->>'spamConfirmed')
+        -- Any other evidence-substance change (novelty flips, generic flags,
+        -- spam-signal or translation-risk updates, extractor-label aside):
+        -- without this, re-observations that only change quality metadata
+        -- would skip the update and leave stale rollup inputs in place.
+        -- Revisions bookkeeping is excluded (it always differs post-update).
+        OR ((terminology_observations.evidence - 'revisions') IS DISTINCT FROM (EXCLUDED.evidence - 'revisions'))
+     RETURNING id, observed_at, (xmax = 0) AS inserted`,
     [
       termId,
       args.channelId || null,
@@ -792,16 +937,23 @@ export async function observeTerminologyDetailed(args: {
     ]
   );
 
-  // 5. Invoke authoritative terminology lifecycle refresh & projection recompute ONLY if a new observation row was actually inserted!
-  const observationInserted = Boolean(obsInsert.rows && obsInsert.rows.length > 0);
-  if (observationInserted) {
-    const obsAt = obsInsert.rows[0].observed_at || new Date().toISOString();
+  // 5. Invoke authoritative terminology lifecycle refresh & projection
+  // recompute on insert AND on reclassification-update (a status change can
+  // promote, demote, or revoke eligibility). last_observed_at advances only
+  // on insert. (xmax = 0) is true solely for freshly inserted rows; the
+  // per-term advisory lock above excludes concurrent modifiers.
+  const writtenRow = (obsInsert.rows && obsInsert.rows[0]) || null;
+  const observationInserted = writtenRow?.inserted === true;
+  if (observationInserted && writtenRow) {
+    const obsAt = writtenRow.observed_at || new Date().toISOString();
     await runner.query(
       `UPDATE canonical_trading_terms
        SET last_observed_at = GREATEST(last_observed_at, $2)
        WHERE id = $1`,
       [termId, obsAt]
     );
+  }
+  if (writtenRow || legacyCountsChanged) {
     await refreshTerminologyLifecycle(termId, DEFAULT_TERMINOLOGY_POLICY, runner);
     await recomputeNativeEvidenceProjection(termId, runner);
   }

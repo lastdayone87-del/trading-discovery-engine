@@ -101,30 +101,38 @@ export function computeEvidenceChecksum(evidence?: Record<string, unknown> | nul
 
 /**
  * Computes a deterministic SHA-256 key for a native terminology observation to guarantee observation idempotency.
- * Binds canonical term ID, channel ID, video ID, observation type, native evidence status, provenance family,
- * and stable source evidence checksum/identity.
+ * Binds canonical term ID, channel ID, video ID, observation type, and stable
+ * source evidence checksum/identity. Classification outcomes (native status,
+ * provenance family, extractor label) are deliberately EXCLUDED: the same
+ * source reclassified later (provider switch, language correction) must
+ * converge onto one row (updated in place) instead of inserting duplicates
+ * that inflate evidence. One-time effect: rows recorded with the older
+ * status-bearing keys re-observe once after deploy, then stay stable; legacy
+ * all-NULL rows contribute nothing to native counts, so the duplicates are
+ * inert.
  */
 export function computeObservationKey(params: {
   canonicalTermId: number;
   channelId?: string | null;
   videoId?: string | null;
   observationType: string;
-  nativeEvidenceStatus?: string | null;
-  sourceProvenanceFamily?: string | null;
   sourceEvidenceId?: string | null;
   evidence?: Record<string, unknown> | null;
 }): string {
   const normChannel = (params.channelId || 'none').trim().toLowerCase();
   const normVideo = (params.videoId || 'none').trim().toLowerCase();
   const normType = params.observationType.trim().toUpperCase();
-  const normStatus = (params.nativeEvidenceStatus || 'none').trim().toUpperCase();
-  const normFamily = (params.sourceProvenanceFamily || 'none').trim().toUpperCase();
 
   // Novelty-derived fields (novel/knownAs/generic) describe the classification
   // at observation time, not the source: re-extraction after the term is saved
   // flips them (novel true->false) and must reuse the original observation key
   // instead of inserting a duplicate observation that inflates evidence.
-  const { novel: _novel, knownAs: _knownAs, generic: _generic, ...stableEvidence } =
+  // The extractor label is likewise provenance metadata, not source identity.
+  // translationRisk derives from the (term, language-context) pairing, so a
+  // language correction that flips the flag must reach the same row.
+  // Spam screening is classification too: re-screening the same source must
+  // update the row (and refresh the gates) rather than fork a duplicate.
+  const { novel: _novel, knownAs: _knownAs, generic: _generic, extractor: _extractor, translationRisk: _translationRisk, spamConfirmed: _spamConfirmed, spamSignals: _spamSignals, ...stableEvidence } =
     (params.evidence || {}) as Record<string, unknown>;
   // Positional source index is not source identity: the same video (or the
   // same title text) at another list position must reuse its key instead of
@@ -140,7 +148,7 @@ export function computeObservationKey(params: {
   const checksum = computeEvidenceChecksum(stableEvidence);
   const evidenceId = (params.sourceEvidenceId || (checksum !== '' ? checksum : 'none')).trim().toLowerCase();
 
-  const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${normStatus}|${normFamily}|${evidenceId}`;
+  const raw = `${params.canonicalTermId}|${normChannel}|${normVideo}|${normType}|${evidenceId}`;
   return createHash('sha256').update(raw).digest('hex');
 }
 

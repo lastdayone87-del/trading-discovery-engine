@@ -568,6 +568,28 @@ test('observation identity is stable across novelty reclassification', () => {
   assert.notEqual(first, other);
 });
 
+test('observation identity ignores provider labels', () => {
+  const base = {
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true, sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1' }, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] },
+  };
+  // Same source re-extracted by another provider converges onto one key:
+  // classification outcomes are not source identity.
+  const groq = computeObservationKey({ ...base, evidence: { ...base.evidence, extractor: 'GROQ' } });
+  assert.equal(groq, computeObservationKey(base));
+});
+
+test('identity ignores classification outcomes and key vintage', () => {
+  const base = {
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', sourceRef: { kind: 'VIDEO_TITLE', span: 'X' } },
+  };
+  // Same source reclassified (provider switch, status change) converges:
+  // extractor labels and metadata beyond the evidence substance never fork identity.
+  const groq = computeObservationKey({ ...base, evidence: { ...base.evidence, extractor: 'GROQ' } });
+  assert.equal(groq, computeObservationKey(base));
+});
+
 test('promotion holds below three executions regardless of creators', () => {
   const thin = {
     novel: true, spamConfirmed: false, executions: 2, quotaConsumed: 2000,
@@ -867,17 +889,20 @@ test('revoke follows legacy demotion when the legacy decision demotes', async ()
 });
 
 test('observation path acquires the advisory lock before any term-row write', async () => {
-  // Deterministic lock-order regression: canonical upsert (exempt,
-  // uncontended) may precede the lock, but the observation insert, recency
-  // update, and refresh must all follow it — no row lock is ever held while
-  // requesting the advisory lock.
+  // Deterministic lock-order regression: a lock-free plain SELECT resolves
+  // the term first, then the advisory lock precedes EVERY row write —
+  // including the canonical upsert, whose language-reconcile UPDATE takes a
+  // real row lock. Lifecycle refresh holds advisory across its read phase
+  // before writing the same row; any row-first order would AB-BA deadlock.
+  // No row lock is ever held while requesting the advisory lock.
   const statements: string[] = [];
   const runner = {
     query: async (text: string, params: unknown[] = []) => {
       statements.push(text);
       if (text.includes('pg_advisory_xact_lock')) return { rows: [{ locked: true }] };
+      if (text.startsWith('SELECT id FROM canonical_trading_terms WHERE country')) return { rows: [{ id: 7 }] };
       if (text.startsWith('INSERT INTO canonical_trading_terms')) return { rows: [{ id: 7 }] };
-      if (text.startsWith('INSERT INTO terminology_observations')) return { rows: [{ id: 1, observed_at: new Date().toISOString() }] };
+      if (text.startsWith('INSERT INTO terminology_observations')) return { rows: [{ id: 1, observed_at: new Date().toISOString(), inserted: true }] };
       if (text.startsWith('SELECT t.*')) return { rows: [{ lifecycle_status: 'CANDIDATE', search_eligible: false, term_type: 'TERMINOLOGY', distinct_creators: 1, distinct_communities: 1, human_approved: 0, decayed_evidence: 1, executions: 0, decayed_yield: 0, trust_tier: 3 }] };
       if (text.includes('FROM terminology_observations WHERE canonical_term_id=$1')) return { rows: [{ v1: 0, spam: false, novel: false }] };
       return { rows: [] };
@@ -890,11 +915,13 @@ test('observation path acquires the advisory lock before any term-row write', as
   }, runner as never);
   assert.deepEqual(result, { termId: 7, observationInserted: true });
   const at = (fragment: string) => statements.findIndex(text => text.includes(fragment));
+  const preselectAt = at('SELECT id FROM canonical_trading_terms WHERE country');
   const canonicalAt = at('INSERT INTO canonical_trading_terms');
   const lockAt = at('pg_advisory_xact_lock');
   const obsAt = at('INSERT INTO terminology_observations');
   const recencyAt = at('SET last_observed_at');
-  assert.ok(canonicalAt >= 0 && lockAt > canonicalAt, 'lock follows the exempt canonical upsert');
+  assert.ok(preselectAt >= 0 && lockAt > preselectAt, 'advisory lock follows the lock-free pre-select');
+  assert.ok(canonicalAt > lockAt, 'canonical upsert (including reconcile writes) follows the lock');
   assert.ok(obsAt > lockAt, 'observation insert follows the lock');
   assert.ok(recencyAt > lockAt, 'recency update follows the lock');
   const rowLockAt = statements.findIndex(
@@ -2415,4 +2442,69 @@ test('extraction admits only literal, non-spam candidates with observe-first ord
 test('lifecycle refresh consults the trial-entry gate', () => {
   const source = readFileSync(new URL('./terminologyIntelligence.ts', import.meta.url), 'utf8');
   assert.match(source, /evaluateTrialEntry\(\{ novel: quality\.novel, spamConfirmed: quality\.spamConfirmed \}\)/);
+});
+
+// --- Language-context admission: genuine-local vs instrument vs English-in-context ---
+
+const deContextBaseline = () =>
+  buildNoveltyBaseline({
+    country: 'Germany',
+    vocab: {
+      country: 'Germany',
+      languages: ['de'],
+      native_trading_terminology: ['Börsenanalyse'],
+      popular_instruments: [],
+      local_market_phrases: [],
+      common_content_format_names: [],
+    },
+    vocabOk: true,
+    existingTerms: [],
+    existingOk: true,
+  });
+
+test('genuine local term with language context admits as novel, non-generic', () => {
+  const verdict = classifyNativeCandidate(
+    'Saisonalität',
+    [{ kind: 'VIDEO_TITLE', index: 0, text: 'Saisonalität erklärt' }],
+    deContextBaseline(),
+    { language: 'de' }
+  );
+  assert.equal(verdict.admit, true);
+  if (!verdict.admit) return;
+  assert.deepEqual(verdict.novelty, { novel: true, knownAs: null });
+  assert.equal(verdict.flags.generic, false);
+  assert.equal(verdict.flags.translationRisk, null);
+});
+
+test('known instrument admits as non-novel generic and is barred from trial entry', () => {
+  const verdict = classifyNativeCandidate(
+    'DAX',
+    [{ kind: 'VIDEO_TITLE', index: 0, text: 'DAX Analyse heute' }],
+    deContextBaseline(),
+    { language: 'de' }
+  );
+  assert.equal(verdict.admit, true);
+  if (!verdict.admit) return;
+  assert.deepEqual(verdict.novelty, { novel: false, knownAs: 'instrument:DAX' });
+  assert.equal(verdict.flags.generic, true);
+  // Trial entry bars non-novel terms: instruments are observed but can never
+  // trial as discoveries, with or without language context.
+  assert.deepEqual(evaluateTrialEntry({ novel: verdict.novelty.novel, spamConfirmed: false }), {
+    allowed: false,
+    reasons: ['not-novel'],
+  });
+});
+
+test('english finance term in german context admits without a native claim at classify time', () => {
+  const verdict = classifyNativeCandidate(
+    'Breakout Trading',
+    [{ kind: 'VIDEO_TITLE', index: 0, text: 'Breakout Trading Signale' }],
+    deContextBaseline(),
+    { language: 'de' }
+  );
+  assert.equal(verdict.admit, true);
+  if (!verdict.admit) return;
+  assert.equal(verdict.novelty.novel, true);
+  // termLanguage is resolved at observe time (code-switched: en inside de
+  // context), never here: classification must not call it native.
 });
