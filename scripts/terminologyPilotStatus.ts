@@ -107,7 +107,7 @@ async function main(): Promise<void> {
     const report = {
       generated_at: identity.rows[0]?.at ?? null,
       database: identity.rows[0]?.db ?? null,
-      read_only_user: identity.rows[0]?.usr ?? null,
+      database_user: identity.rows[0]?.usr ?? null,
       kill_switch: {
         key: TERMINOLOGY_KILL_SWITCH_KEY,
         raw_value: killRaw,
