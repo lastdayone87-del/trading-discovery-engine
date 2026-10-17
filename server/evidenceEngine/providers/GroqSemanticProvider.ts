@@ -48,11 +48,26 @@ export function groqRouteOrg(route: { orgId?: unknown }): string {
   return label || 'shared';
 }
 
+/**
+ * Slot number for a Groq key env name, or null when the name is not a key
+ * slot. Unbounded: any numeric suffix >= 2 is accepted (gaps allowed, no
+ * maximum); malformed suffixes (`_0`, `_1`, `_X`, `_EXTRA`) never match.
+ */
+export function groqKeySlotNumber(name: string): number | null {
+  if (name === 'GROQ_API_KEY') return 1;
+  // No leading zeros: `GROQ_API_KEY_02` would otherwise load as slot 2 while
+  // slot diagnostics check the canonical `GROQ_API_KEY_2` and miss it.
+  const match = /^GROQ_API_KEY_(0|[1-9][0-9]*)$/.exec(name);
+  if (!match) return null;
+  const slot = Number(match[1]);
+  return Number.isSafeInteger(slot) && slot >= 2 ? slot : null;
+}
+
 /** Configured key slot numbers (1-based) with a non-empty key. */
 export function groqConfiguredSlotNumbers(env: NodeJS.ProcessEnv = process.env): number[] {
   return Object.keys(env)
-    .filter(name => name === 'GROQ_API_KEY' || /^GROQ_API_KEY_[2-9][0-9]*$/.test(name))
-    .map(name => (name === 'GROQ_API_KEY' ? 1 : Number(name.slice('GROQ_API_KEY_'.length))))
+    .map(name => groqKeySlotNumber(name))
+    .filter((slot): slot is number => slot !== null)
     .filter(slot => String(env[slot === 1 ? 'GROQ_API_KEY' : `GROQ_API_KEY_${slot}`] || '').trim())
     .sort((a, b) => a - b);
 }
@@ -69,11 +84,27 @@ export function missingGroqOrgLabels(env: NodeJS.ProcessEnv = process.env): stri
     .map(slot => (slot === 1 ? 'GROQ_ORG_ID' : `GROQ_ORG_ID_${slot}`));
 }
 
-/** Return only ordered, non-empty route slots; credentials never leave this process. */
+/**
+ * Return only ordered, non-empty route slots; credentials never leave this process.
+ *
+ * Configuration (config-only, no code changes, no key-count limit):
+ * - `GROQ_API_KEY`, `GROQ_API_KEY_2`, `GROQ_API_KEY_3`, ... — any slot number
+ *   >= 2 matches; gaps are fine; empty/whitespace values are skipped;
+ *   identical key values are deduplicated; unrecognized names
+ *   (`GROQ_API_KEY_0`, `GROQ_API_KEY_X`) are ignored.
+ * - `GROQ_ORG_ID`, `GROQ_ORG_ID_2`, ... — quota-fate label per slot. Keys
+ *   sharing one Groq account MUST share one label: provider rate limits
+ *   apply per organization, so unlabeled same-account keys do NOT multiply
+ *   capacity and failover would spill into the same exhausted pool.
+ *   Unlabeled slots default to independent orgs (`slot-N`).
+ * Adding, removing, or rotating a key takes effect on the next call without
+ * a restart (routes are discovered from the environment on every call) and
+ * never logs key values (telemetry carries route ids and org labels only).
+ */
 export function configuredGroqRoutes(env: NodeJS.ProcessEnv = process.env): GroqRoute[] {
-  const names = Object.keys(env).filter(name => name === 'GROQ_API_KEY' || /^GROQ_API_KEY_[2-9][0-9]*$/.test(name));
+  const names = Object.keys(env).filter(name => groqKeySlotNumber(name) !== null);
   names.sort((a, b) => {
-    const routeNumber = (name: string) => name === 'GROQ_API_KEY' ? 1 : Number(name.slice('GROQ_API_KEY_'.length));
+    const routeNumber = (name: string) => groqKeySlotNumber(name) as number;
     return routeNumber(a) - routeNumber(b);
   });
   const seen = new Set<string>();
@@ -84,15 +115,23 @@ export function configuredGroqRoutes(env: NodeJS.ProcessEnv = process.env): Groq
     if (!key || seen.has(key)) continue;
     seen.add(key);
     counter++;
-    const slotNumber = name === 'GROQ_API_KEY' ? 1 : Number(name.slice('GROQ_API_KEY_'.length));
+    const slotNumber = groqKeySlotNumber(name) as number;
     out.push({ id: `groq-${counter}`, key, orgId: groqOrgIdForSlot(env, slotNumber) });
   }
   return out;
 }
 
+/** Node clamps setTimeout delays above 2^31-1 to ~1ms; reject absurd values instead of firing immediately. */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+function clampTimeoutMs(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value < 0) return fallback;
+  return Math.min(Math.floor(value), MAX_TIMEOUT_MS);
+}
+
 export function groqTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env.GROQ_PROVIDER_TIMEOUT_MS || '135000');
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 135000;
+  return parsed > 0 ? clampTimeoutMs(parsed, 135000) : 135000;
 }
 
 /** Global provider-deadline rollout contract (mirrors the Gemini semantic call site). */
@@ -114,7 +153,7 @@ export const GROQ_RATE_LIMITED_REASON = 'GROQ_RATE_LIMITED';
 
 export function groqRateLimitCooldownMs(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env.GROQ_RATE_LIMIT_COOLDOWN_MS || '90000');
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_GROQ_RATE_LIMIT_COOLDOWN_MS;
+  return clampTimeoutMs(parsed, DEFAULT_GROQ_RATE_LIMIT_COOLDOWN_MS);
 }
 
 /** Per-organization in-process cooldown expiries (ms epoch), keyed by org label. No state is shared across organizations. */
@@ -162,6 +201,13 @@ export interface GroqRouteFailoverOptions {
    * orgs on a 429; same-org 429s never spill regardless of this predicate).
    */
   isOrgCooling?: (orgId: string) => boolean;
+  /**
+   * Failover-wide deadline (ms epoch): no new route attempt starts once it
+   * has passed, bounding total failover time for latency-sensitive callers.
+   * Absent by default (existing callers behave exactly as before).
+   */
+  deadlineAtMs?: number;
+  nowMs?: () => number;
 }
 
 export async function runGroqRouteFailover<T>(
@@ -178,11 +224,20 @@ export async function runGroqRouteFailover<T>(
     (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
   );
   for (const route of ordered) {
+    if (opts?.deadlineAtMs !== undefined && (opts?.nowMs ?? Date.now)() >= opts.deadlineAtMs) {
+      throw lastError || new ProviderCallError('Groq route pool aggregate deadline exhausted.', 'TIMEOUT', true);
+    }
     // A 429 marks its whole organization tried (see catch below), so this
     // head-pick always lands on the next eligible independent org — a
     // same-org sibling of an exhausted account is never retried.
     if (tried.has(route)) continue;
     tried.add(route);
+    // A paced wait can outlast the aggregate budget: recheck before calling
+    // so an expired budget skips the fetch instead of wasting quota on a
+    // result the caller has already abandoned.
+    if (opts?.deadlineAtMs !== undefined && (opts?.nowMs ?? Date.now)() >= opts.deadlineAtMs) {
+      throw lastError || new ProviderCallError('Groq route pool aggregate deadline exhausted.', 'TIMEOUT', true);
+    }
     try {
       return await call(route);
     } catch (error) {
@@ -202,6 +257,371 @@ export async function runGroqRouteFailover<T>(
     }
   }
   throw lastError || new ProviderCallError('No configured Groq route is available.', 'TRANSIENT', true);
+}
+
+export const GROQ_VOCABULARY_OPERATION = 'vocabulary-extraction';
+export const DEFAULT_GROQ_VOCABULARY_MODEL = DEFAULT_GROQ_CANDIDATE_MODEL;
+export const DEFAULT_GROQ_VOCABULARY_MIN_INTERVAL_MS = 2500;
+export const DEFAULT_GROQ_VOCABULARY_AGGREGATE_TIMEOUT_MS = 120_000;
+export const DEFAULT_GROQ_EMIT_BUDGET_MS = 2500;
+
+/**
+ * Emits one telemetry event under a hard time budget. A hung or failing write
+ * is dropped instead of stalling the caller: telemetry must never delay or
+ * reclassify an extraction attempt. The timer is always cleared, so settled
+ * emits leave no scheduled work behind.
+ */
+async function emitBounded(
+  emit: (event: ProviderCallEvent) => Promise<void>,
+  event: ProviderCallEvent,
+  budgetMs: number
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      emit(event).catch(() => undefined),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, Math.max(0, budgetMs));
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+export function groqVocabularyMinIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.GROQ_VOCABULARY_MIN_INTERVAL_MS || '2500');
+  return clampTimeoutMs(parsed, DEFAULT_GROQ_VOCABULARY_MIN_INTERVAL_MS);
+}
+
+export function groqVocabularyAggregateMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.GROQ_VOCABULARY_AGGREGATE_TIMEOUT_MS || '120000');
+  return parsed > 0 ? clampTimeoutMs(parsed, DEFAULT_GROQ_VOCABULARY_AGGREGATE_TIMEOUT_MS) : DEFAULT_GROQ_VOCABULARY_AGGREGATE_TIMEOUT_MS;
+}
+
+interface GroqVocabularyOrgPaceState {
+  tail: Promise<void>;
+  lastStartMs: number;
+}
+
+const groqVocabularyOrgPace = new Map<string, GroqVocabularyOrgPaceState>();
+
+/** Test-only reset for extraction pacing (one org, or all when omitted). */
+export function resetGroqVocabularyPacingForTests(orgId?: string): void {
+  if (orgId === undefined) {
+    groqVocabularyOrgPace.clear();
+    return;
+  }
+  groqVocabularyOrgPace.delete(orgId);
+}
+
+/**
+ * Runs fn under the organization's pacing gate. Callers serialize through a
+ * per-org promise chain, then wait out the minimum interval measured from the
+ * last actual start — concurrent callers space out instead of bunching, and
+ * an abandoned holder always releases via finally, so no slot can poison
+ * later calls. Same-org keys share one bucket (one quota pool by provider
+ * design); independent orgs pace independently. Cross-process coordination is
+ * intentionally out of scope (single-container deployment): the persisted
+ * cooldown ledger remains the cross-replica backstop, and any 429 arms the
+ * shared per-org cooldown.
+ */
+export async function withGroqOrgPacingSlot<T>(
+  orgId: string,
+  minIntervalMs: number,
+  now: () => number,
+  sleep: (ms: number) => Promise<void>,
+  fn: () => Promise<T>
+): Promise<T> {
+  let state = groqVocabularyOrgPace.get(orgId);
+  if (!state) {
+    state = { tail: Promise.resolve(), lastStartMs: 0 };
+    groqVocabularyOrgPace.set(orgId, state);
+  }
+  const prev = state.tail;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  state.tail = prev.then(() => gate);
+  try {
+    await prev;
+    const waitMs = state.lastStartMs + Math.max(0, minIntervalMs) - now();
+    if (waitMs > 0) await sleep(waitMs);
+    state.lastStartMs = now();
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+export interface GroqTextCompletionDeps {
+  emit?: (event: ProviderCallEvent) => Promise<void>;
+  persistedCooldownExpiryMs?: (orgId?: string) => Promise<number | undefined>;
+  minIntervalMs?: number;
+  timeoutMs?: number;
+  aggregateMs?: number;
+  fetchImpl?: typeof fetch;
+  nowMs?: () => number;
+  sleepMs?: (ms: number) => Promise<void>;
+  /**
+   * Content admissibility decided by the caller (which owns sources and the
+   * admission rules). A false verdict fails the route as non-retryable so
+   * failover breaks to the cross-model fallback instead of burning more
+   * same-model quota or recording a false success.
+   */
+  validateContent?: (content: string) => boolean;
+  /**
+   * Hard time budget for each telemetry emit inside the adapter. Telemetry is
+   * best-effort: a hung provider_call_events write must not stall the internal
+   * failover promise (delaying the next route or turning a completed fetch
+   * into an aggregate TIMEOUT) or hold a pool connection past the caller's
+   * bound. Defaults to DEFAULT_GROQ_EMIT_BUDGET_MS; tests inject a stub.
+   */
+  emitBudgetMs?: number;
+}
+
+/**
+ * Raw text completion over the Groq route pool for vocabulary extraction.
+ * Reuses route discovery (unbounded key slots — adding keys is config-only),
+ * per-org cooldowns, org-aware failover, bounded bodies, pacing, and the
+ * shared error taxonomy; the semantic-classification path is untouched.
+ * Returns undefined when no keys are configured (fail-closed, no fetch).
+ * Callers parse via parseNativeVocabularyResponse, which skips non-JSON
+ * output, so provider prose can never become vocabulary.
+ */
+export async function runGroqTextCompletion(
+  input: { prompt: string; model?: string; operation?: string },
+  deps?: GroqTextCompletionDeps
+): Promise<string | undefined> {
+  const routes = configuredGroqRoutes();
+  if (!routes.length) return undefined;
+  // Cooling pre-filter (extraction-local): known-cooling orgs are excluded
+  // before pacing or fetching, so no wait is spent on a short-circuit and
+  // fallback stays fast. The shared failover loop is untouched (semantic
+  // behavior identical); expiry is time-based so orgs rejoin on their own.
+  const usable = routes.filter(route => groqOrgCooldownRemainingMs(groqRouteOrg(route)) <= 0);
+  if (!usable.length) {
+    const remainingMs = Math.max(0, ...routes.map(route => groqOrgCooldownRemainingMs(groqRouteOrg(route))));
+    throw Object.assign(
+      new ProviderCallError('Groq routes cooling; deferring.', 'RATE_LIMIT', true, {
+        providerReasons: [GROQ_RATE_LIMITED_REASON],
+      }),
+      { groqCooldownDeferred: true, retryAfterMs: remainingMs }
+    );
+  }
+  const operation = input.operation || GROQ_VOCABULARY_OPERATION;
+  const model = input.model || process.env.GROQ_CANDIDATE_MODEL || DEFAULT_GROQ_VOCABULARY_MODEL;
+  const timeoutMs = deps?.timeoutMs ?? groqTimeoutMs();
+  const emit = deps?.emit ?? emitGroqEvent;
+  const emitBudgetMs = deps?.emitBudgetMs ?? DEFAULT_GROQ_EMIT_BUDGET_MS;
+  const persistedCooldownExpiryMs = deps?.persistedCooldownExpiryMs ?? defaultPersistedCooldownExpiryMs;
+  const fetchImpl = deps?.fetchImpl ?? fetch;
+  const now = deps?.nowMs ?? Date.now;
+  const sleep = deps?.sleepMs ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const minIntervalMs = deps?.minIntervalMs ?? groqVocabularyMinIntervalMs();
+  // Aggregate deadline: the whole pool attempt (all routes) stays bounded so
+  // Gemini fallback is reached in finite time. Per-attempt timers below take
+  // the minimum of the route timeout and the remaining aggregate budget.
+  const deadlineAtMs = now() + (deps?.aggregateMs ?? groqVocabularyAggregateMs());
+  // Outer bound: pacing sleeps, cooldown-ledger reads, and telemetry emits
+  // are individually small but unbounded in principle. The race guarantees
+  // caller progress (Gemini fallback) by the aggregate deadline even if an
+  // inner wait stalls. A late inner settlement still emits its telemetry but
+  // its result is discarded — double-spend with fallback is possible but rare
+  // and deduped downstream.
+  const pending = runGroqRouteFailover(usable, async route => {
+    const started = Date.now();
+    const controller = new AbortController();
+    // Extraction always enforces a finite deadline, independent of the
+    // general provider-deadline rollout flag: a stalled request or body must
+    // fail into fallback, never hang the caller.
+    const attemptTimeoutMs = Math.max(1, Math.min(timeoutMs, deadlineAtMs - Date.now()));
+    const attemptDeadlineMs = started + attemptTimeoutMs;
+    const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
+    const orgId = groqRouteOrg(route);
+    const base = {
+      id: randomUUID(), provider: 'groq', operation,
+      requestMetadata: { groqRoute: route.id, groqOrg: orgId, groqModel: model }, attempt: 1,
+      reservedCost: 0, policyVersion: 'provider-resilience-v1',
+    };
+    try {
+      const remainingMs = groqOrgCooldownRemainingMs(orgId);
+      if (remainingMs > 0) throw groqCooldownDeferredError(remainingMs);
+      // Bounded ledger read: a stalled database must not outlive the
+      // aggregate budget. Timeout or failure fails open (the in-process
+      // cooldown and 429-driven arming remain authoritative). The losing
+      // timer is always cleared so settled lookups retain no resources.
+      // The budget is also bounded by the attempt deadline: preflight waits
+      // must not consume the timeout and then fetch with a pre-aborted
+      // signal — the attempt is abandoned as soon as either bound lapses.
+      let persistedExpiryMs: number | undefined;
+      let lookupTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const lookupBudgetMs = Math.max(0, Math.min(deadlineAtMs, attemptDeadlineMs) - now());
+        if (lookupBudgetMs <= 0) {
+          persistedExpiryMs = undefined;
+        } else {
+          persistedExpiryMs = await new Promise<number | undefined>(resolve => {
+            let settled = false;
+            lookupTimer = setTimeout(() => {
+              if (!settled) {
+                settled = true;
+                resolve(undefined);
+              }
+            }, lookupBudgetMs);
+            persistedCooldownExpiryMs(orgId).then(
+              value => {
+                if (!settled) {
+                  settled = true;
+                  resolve(value);
+                }
+              },
+              () => {
+                if (!settled) {
+                  settled = true;
+                  resolve(undefined);
+                }
+              }
+            );
+          });
+        }
+      } catch {
+        persistedExpiryMs = undefined;
+      } finally {
+        if (lookupTimer !== undefined) clearTimeout(lookupTimer);
+      }
+      if (persistedExpiryMs !== undefined && persistedExpiryMs > Date.now()) {
+        const known = groqOrgCooldownUntilMs.get(orgId) || 0;
+        groqOrgCooldownUntilMs.set(orgId, Math.max(known, persistedExpiryMs));
+        throw groqCooldownDeferredError(persistedExpiryMs - Date.now());
+      }
+      // Paced start, serialized per org: cooldown preflight is complete, and
+      // the gate re-checks both the cooldown (another caller may have armed
+      // it while this call waited) and the budget before fetching.
+      return await withGroqOrgPacingSlot(orgId, minIntervalMs, now, sleep, async () => {
+        const recooledMs = groqOrgCooldownRemainingMs(orgId);
+        if (recooledMs > 0) throw groqCooldownDeferredError(recooledMs);
+        if (Date.now() >= Math.min(deadlineAtMs, attemptDeadlineMs)) {
+          throw new ProviderCallError('Groq extraction exceeded its aggregate deadline.', 'TIMEOUT', true);
+        }
+        const res = await fetchImpl(GROQ_API_BASE_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${route.key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: input.prompt }],
+          ...groqRequestExtras(),
+        }),
+        signal: controller.signal,
+      });
+      const bounded = await readBoundedResponseText(res);
+      if (bounded.truncated) {
+        throw Object.assign(
+          new Error(`Groq response exceeded the ${MAX_CRAWL_RESPONSE_CHARS}-char bound.`),
+          { status: res.status },
+        );
+      }
+      const text = bounded.text;
+      if (!res.ok) {
+        throw Object.assign(new Error(`Groq HTTP ${res.status}: ${text.slice(0, 500)}`),
+          { status: res.status, code: res.status });
+      }
+      const content = (JSON.parse(text) as any)?.choices?.[0]?.message?.content;
+      if (typeof content !== 'string' || !content) {
+        throw new ProviderCallError('Groq returned no message content.', 'TRANSIENT', false, {
+          status: res.status,
+        });
+      }
+      // Content must parse as JSON (mirroring the caller's parser). All
+      // content failures below are non-retryable within the pool: an empty,
+      // braceless, or malformed-but-complete completion repeats identically
+      // at temperature 0 with json_object mode, so retrying would burn one
+      // paced attempt per remaining org. Failover breaks immediately toward
+      // Gemini instead. Telemetry carries metadata only, never content.
+      // Whether the JSON carries usable vocabulary is decided caller-side,
+      // where a different model (Gemini) can still be tried.
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new ProviderCallError('Groq returned no JSON object.', 'TRANSIENT', false, {
+          status: res.status,
+        });
+      }
+      try {
+        JSON.parse(jsonMatch[0]);
+      } catch {
+        // Truncation (bounded body above) stays retryable: another attempt
+        // may return complete output. Malformed-but-complete JSON will not —
+        // at temperature 0 with json_object mode it repeats identically —
+        // so it breaks failover immediately toward Gemini instead of burning
+        // one paced attempt per remaining org.
+        throw new ProviderCallError('Groq returned malformed JSON.', 'TRANSIENT', false, {
+          status: res.status,
+        });
+      }
+      // SUCCESS means the provider returned a well-formed completion;
+      // extraction yield (usable vocabulary) is measured downstream by the
+      // caller and admission counts. Retrying another same-model org on
+      // content issues would burn independent quota for an identical prompt,
+      // so content problems fall through to the cross-model Gemini fallback.
+      if (deps?.validateContent && !deps.validateContent(content)) {
+        throw new ProviderCallError('Groq completion has no admissible vocabulary.', 'TRANSIENT', false, {
+          status: res.status,
+        });
+      }
+      await emitBounded(emit, {
+        ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+      }, emitBudgetMs);
+      return content;
+      });
+    } catch (error) {
+      const aborted = controller.signal.aborted;
+      const typed = aborted
+        ? new ProviderCallError(`Groq call exceeded ${timeoutMs}ms deadline.`, 'TIMEOUT', true, { cause: error })
+        : classifyProviderError(error);
+      if (!aborted && typed.errorClass === 'RATE_LIMIT' && (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred !== true) {
+        armGroqOrgCooldown(orgId);
+      }
+      if (typed.errorClass === 'RATE_LIMIT') {
+        const reasons = Array.isArray((typed as { providerReasons?: unknown }).providerReasons)
+          ? ((typed as { providerReasons?: unknown }).providerReasons as string[]).map(String)
+          : [];
+        if (!reasons.includes(GROQ_RATE_LIMITED_REASON)) {
+          (typed as { providerReasons?: string[] }).providerReasons = [...reasons, GROQ_RATE_LIMITED_REASON];
+        }
+        (typed as { groqOrg?: string }).groqOrg = orgId;
+      }
+      const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
+      await emitBounded(emit, {
+        ...base, status: statusFor(typed), latencyMs: Date.now() - started,
+        actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
+        ...(deferred ? { requestMetadata: { ...base.requestMetadata, groqCooldownDeferral: 'true' } } : {}),
+      }, emitBudgetMs);
+      throw typed;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }, {
+    isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0,
+    deadlineAtMs,
+    nowMs: now,
+  });
+  let aggregateTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    pending.catch(() => undefined);
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        aggregateTimer = setTimeout(
+          () => reject(new ProviderCallError('Groq extraction exceeded its aggregate deadline.', 'TIMEOUT', true)),
+          Math.max(0, deadlineAtMs - now())
+        );
+      }),
+    ]);
+  } finally {
+    if (aggregateTimer !== undefined) clearTimeout(aggregateTimer);
+  }
 }
 
 /** Organization that produced a rate-limit failure: carried on the error when present, else the attempting route's org. */

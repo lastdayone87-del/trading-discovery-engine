@@ -629,6 +629,46 @@ export async function invokeChannelVocabularyExtraction(
  * novelty baseline is unknown (counts by reason only, never source content),
  * so model drift and admission rate are observable.
  */
+/**
+ * Single success/failure boundary for AI-extracted vocabulary: at least one
+ * candidate must survive the real admission checks the persistence path
+ * applies — rule-exclusion, then literal/length/spam/novelty classification
+ * via classifyNativeCandidate. This deliberately reuses the admission
+ * classifier instead of a weaker duplicate validator, so the gate can never
+ * accept what admission would reject (suppressing fallback for nothing) nor
+ * reject what admission would accept. Novelty uses the provided baseline;
+ * baseline-unavailable fails closed here exactly as in admission.
+ */
+export interface VocabularyAdmissibilityContext {
+  sources: LiteralSourceText[];
+  baseline: NoveltyBaseline;
+  language?: string;
+  ruleObserved: Set<string>;
+}
+
+export function isAdmissibleParsed(
+  parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined,
+  ctx: VocabularyAdmissibilityContext
+): boolean {
+  if (!parsed) return false;
+  const buckets = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats];
+  return buckets.some(
+    bucket =>
+      Array.isArray(bucket) &&
+      bucket.some(raw => {
+        if (typeof raw !== 'string') return false;
+        if (ctx.ruleObserved.has(normalizeTerm(raw))) return false;
+        // Mirrors observeTerminologyDetailed's upper length bound, which the
+        // classifier does not enforce: overlong candidates are rejected
+        // downstream without throwing, so accepting them here would suppress
+        // fallback for nothing.
+        if (normalizeTerm(raw).length > 80) return false;
+        const verdict = classifyNativeCandidate(raw, ctx.sources, ctx.baseline, { language: ctx.language });
+        return verdict.admit === true;
+      })
+  );
+}
+
 export async function admitNativeCandidates(args: {
   channel: ChannelRecord;
   sources: LiteralSourceText[];
@@ -638,6 +678,8 @@ export async function admitNativeCandidates(args: {
   locale?: string;
   humanApproved: boolean;
   humanObservation: 'HUMAN_APPROVED_CHANNEL' | 'ENRICHMENT';
+  /** Extraction provider recorded on observation evidence (default GEMINI preserves existing callers). */
+  extractor?: string;
   deps?: NativeAdmissionDeps;
 }): Promise<NativeAdmissionReport> {
   const saveTerm = args.deps?.saveTerm ?? ((country, term, category, channelId) => saveExtractedTerm(country, term, category, channelId));
@@ -665,7 +707,7 @@ export async function admitNativeCandidates(args: {
       language: args.language, locale: args.locale,
       communityFingerprint: args.channel.discord_invite || undefined,
       evidence: {
-        extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true,
+        extractor: args.extractor ?? 'GEMINI', qualityVersion: 'native-v1', literal: true,
         sourceRef: { kind: verdict.located.sourceKind, index: verdict.located.sourceIndex, span: verdict.located.span, videoId: verdict.located.videoId ?? null, sourceHash: verdict.located.sourceHash },
         novel: verdict.novelty.novel, knownAs: verdict.novelty.knownAs,
         generic: verdict.flags.generic, spamConfirmed: false, spamSignals: verdict.spamSignals, sourceSpamSignals: verdict.sourceSpamSignals,
@@ -752,14 +794,16 @@ export async function extractVocabularyFromCreator(
   // sources, rule spans, or quoted prompt context.
   const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
   const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
-  if (ai && hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
+  // Groq runs on its own key configuration: only the Gemini fallback is
+  // gated on the Gemini client.
+  if (hasNativeExtractionText(channel.channel_name, effTitles, effDesc)) {
     // Provider failures (quota/busy/malformed model output) warn and skip AI
     // extraction. Persistence failures from admission below are NOT caught
     // here: they propagate to the caller for retry instead of being
     // misreported as Gemini errors or silently swallowed.
     let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined;
-    try {
-      const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
+    let parsedSource: 'GROQ' | 'GEMINI' = 'GEMINI';
+    const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
 Description: "${effDesc}"
 Recent Titles:
@@ -774,36 +818,85 @@ Return ONLY a valid JSON object with format:
   "formats": ["format1"]
 }`;
 
-      const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: prompt
-      })}));
-
-      const resText = response.text || '';
-      parsed = parseNativeVocabularyResponse(resText);
+    // Literal sources are built before any provider attempt, and the novelty
+    // baseline loads here too, so the success/failure boundary below can
+    // apply the real admission checks. Pure/sync sources; baseline infra
+    // failures throw here (fail fast, no provider spend) and the job retries.
+    const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
+    const baseline = await loadNoveltyBaseline(channel.country);
+    const isAdmissible = (
+      p: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined
+    ): boolean =>
+      isAdmissibleParsed(p, {
+        sources: literalSources,
+        baseline,
+        language: languageContext?.language,
+        ruleObserved,
+      });
+    // Groq primary: same prompt, same parser, same admission below. Any
+    // Groq failure (no keys, deferral, 429, error) falls through to the
+    // unchanged Gemini path; total failure keeps warn-and-skip.
+    try {
+      const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
+      const groqText = await runGroqTextCompletion(
+        { prompt },
+        {
+          validateContent: text => {
+            let candidate: ReturnType<typeof parseNativeVocabularyResponse>;
+            try {
+              candidate = parseNativeVocabularyResponse(text);
+            } catch {
+              return false;
+            }
+            return isAdmissible(candidate);
+          },
+        }
+      );
+      // Admissibility gate: provider output with no admissible candidate is
+      // not a result — the Gemini fallback stays available instead of being
+      // suppressed. Rule exclusion runs INSIDE the gate (not after it), so
+      // instruments the rule pass already admitted cannot suppress fallback
+      // on their own.
+      const groqParsed = groqText ? parseNativeVocabularyResponse(groqText) : undefined;
+      if (isAdmissible(groqParsed)) {
+        parsed = groqParsed;
+        parsedSource = 'GROQ';
+      }
     } catch (e: any) {
-      const msg = e?.message || String(e);
-      const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-      const is503 = msg.includes('503') || msg.includes('high demand');
-      if (isQuota) {
-        console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
-      } else if (is503) {
-        console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
-      } else {
-        console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
+      console.warn(`[Vocabulary Extraction] Groq attempt skipped for channel ${channel.channel_id}; trying Gemini fallback.`);
+    }
+    if (!parsed && ai) {
+      try {
+        const response = await callGeminiSafe(() => executeProviderCall({context:{provider:'gemini',operation:'vocabulary-extraction',requestMetadata:{geminiRoute:resolveGeminiRouteId('gemini-1'),geminiOrg:geminiOrgIdForSlot(process.env,1)}},timeoutMs:Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS||'45000'),enabled:process.env.PROVIDER_DEADLINES_ENABLED==='true',emit:appendProviderCallEvent,call:() => ai.models.generateContent({
+          model: 'gemini-3.6-flash',
+          contents: prompt
+        })}));
+
+        const resText = response.text || '';
+        parsed = parseNativeVocabularyResponse(resText);
+      } catch (e: any) {
+        const msg = e?.message || String(e);
+        const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+        const is503 = msg.includes('503') || msg.includes('high demand');
+        if (isQuota) {
+          console.warn(`[Vocabulary Extraction] Gemini API quota limit reached (429) for channel ${channel.channel_id}. Falling back to heuristic vocabulary extraction.`);
+        } else if (is503) {
+          console.warn(`[Vocabulary Extraction] Gemini API temporarily busy (503) for channel ${channel.channel_id}. Heuristic extraction retained.`);
+        } else {
+          console.warn(`[Vocabulary Extraction] Notice for channel ${channel.channel_id}:`, msg.length > 150 ? msg.slice(0, 150) + '...' : msg);
+        }
       }
     }
     if (parsed) {
         // Literal, traceable admission (native-v1 pipeline) via the shared
         // admitNativeCandidates helper: classification (literal → spam →
         // fail-closed novelty), observe-first persistence, rejection stats.
-        const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
-        // Fail closed: a missing country row marks the baseline unknown and
-        // every candidate is rejected as novelty-unknown — a transient read
-        // error must never make a known term look novel. Lookup
-        // infrastructure failures throw (via loadNoveltyBaseline) so the job
-        // retries instead of silently discarding candidates.
-        const baseline = await loadNoveltyBaseline(channel.country);
+        // Sources and baseline were built above for the admissibility gate
+        // and are reused. Fail closed: a missing country row marks the
+        // baseline unknown and every candidate is rejected as novelty-unknown
+        // — a transient read error must never make a known term look novel.
+        // Lookup infrastructure failures throw (via loadNoveltyBaseline) so
+        // the job retries instead of silently discarding candidates.
         const humanObservation = humanApproved ? 'HUMAN_APPROVED_CHANNEL' as const : 'ENRICHMENT' as const;
         // Within-run dedupe against rule-admitted instruments (see above).
         const deduped = (values: unknown[] | undefined) => excludeRuleAdmittedInstruments(values, ruleObserved);
@@ -821,6 +914,7 @@ Return ONLY a valid JSON object with format:
           locale: languageContext?.locale,
           humanApproved,
           humanObservation,
+          extractor: parsedSource,
         });
     }
   }
