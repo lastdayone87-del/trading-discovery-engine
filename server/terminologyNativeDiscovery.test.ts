@@ -568,6 +568,28 @@ test('observation identity is stable across novelty reclassification', () => {
   assert.notEqual(first, other);
 });
 
+test('observation identity ignores provider labels', () => {
+  const base = {
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', literal: true, sourceRef: { kind: 'VIDEO_TITLE', index: 0, span: 'P2P-Algo', videoId: 'vid-1' }, novel: true, knownAs: null, generic: false, spamConfirmed: false, spamSignals: [] },
+  };
+  // Same source re-extracted by another provider converges onto one key:
+  // classification outcomes are not source identity.
+  const groq = computeObservationKey({ ...base, evidence: { ...base.evidence, extractor: 'GROQ' } });
+  assert.equal(groq, computeObservationKey(base));
+});
+
+test('identity ignores classification outcomes and key vintage', () => {
+  const base = {
+    canonicalTermId: 1, channelId: 'ch', videoId: 'vid-1', observationType: 'ENRICHMENT',
+    evidence: { extractor: 'GEMINI', qualityVersion: 'native-v1', sourceRef: { kind: 'VIDEO_TITLE', span: 'X' } },
+  };
+  // Same source reclassified (provider switch, status change) converges:
+  // extractor labels and metadata beyond the evidence substance never fork identity.
+  const groq = computeObservationKey({ ...base, evidence: { ...base.evidence, extractor: 'GROQ' } });
+  assert.equal(groq, computeObservationKey(base));
+});
+
 test('promotion holds below three executions regardless of creators', () => {
   const thin = {
     novel: true, spamConfirmed: false, executions: 2, quotaConsumed: 2000,

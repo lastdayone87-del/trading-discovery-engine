@@ -630,30 +630,42 @@ export async function invokeChannelVocabularyExtraction(
  * so model drift and admission rate are observable.
  */
 /**
- * Admissibility gate: at least one vocabulary value that can pass native
- * candidate admission's provider-independent checks (string, long enough,
- * literally present in the sources, no spam signals). Novelty still needs
- * the database baseline and stays downstream — but a novelty-only rejection
- * means the same terms are already known, so Gemini fallback would be futile
- * there too. Anything weaker would suppress the fallback while admitting
- * nothing.
+ * Single success/failure boundary for AI-extracted vocabulary: at least one
+ * candidate must survive the real admission checks the persistence path
+ * applies — rule-exclusion, then literal/length/spam/novelty classification
+ * via classifyNativeCandidate. This deliberately reuses the admission
+ * classifier instead of a weaker duplicate validator, so the gate can never
+ * accept what admission would reject (suppressing fallback for nothing) nor
+ * reject what admission would accept. Novelty uses the provided baseline;
+ * baseline-unavailable fails closed here exactly as in admission.
  */
-export function hasAdmissibleVocabulary(
+export interface VocabularyAdmissibilityContext {
+  sources: LiteralSourceText[];
+  baseline: NoveltyBaseline;
+  language?: string;
+  ruleObserved: Set<string>;
+}
+
+export function isAdmissibleParsed(
   parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined,
-  sources: LiteralSourceText[]
+  ctx: VocabularyAdmissibilityContext
 ): boolean {
   if (!parsed) return false;
-  const values = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats];
-  return values.some(
-    value =>
-      Array.isArray(value) &&
-      value.some(
-        item =>
-          typeof item === 'string' &&
-          item.normalize('NFKC').trim().length >= 2 &&
-          findLiteralSpan(item, sources) !== null &&
-          detectSpamSignals(item).length === 0
-      )
+  const buckets = [parsed.terminology, parsed.instruments, parsed.phrases, parsed.formats];
+  return buckets.some(
+    bucket =>
+      Array.isArray(bucket) &&
+      bucket.some(raw => {
+        if (typeof raw !== 'string') return false;
+        if (ctx.ruleObserved.has(normalizeTerm(raw))) return false;
+        // Mirrors observeTerminologyDetailed's upper length bound, which the
+        // classifier does not enforce: overlong candidates are rejected
+        // downstream without throwing, so accepting them here would suppress
+        // fallback for nothing.
+        if (normalizeTerm(raw).length > 80) return false;
+        const verdict = classifyNativeCandidate(raw, ctx.sources, ctx.baseline, { language: ctx.language });
+        return verdict.admit === true;
+      })
   );
 }
 
@@ -806,21 +818,47 @@ Return ONLY a valid JSON object with format:
   "formats": ["format1"]
 }`;
 
-    // Literal sources are built before any provider attempt: the
-    // admissibility gate needs them to decide whether Groq output is worth
-    // keeping or the Gemini fallback should run. Pure and synchronous.
+    // Literal sources are built before any provider attempt, and the novelty
+    // baseline loads here too, so the success/failure boundary below can
+    // apply the real admission checks. Pure/sync sources; baseline infra
+    // failures throw here (fail fast, no provider spend) and the job retries.
     const literalSources = buildLiteralSources(channel.channel_name, effTitles, effDesc, videoIds, origins);
+    const baseline = await loadNoveltyBaseline(channel.country);
+    const isAdmissible = (
+      p: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown } | undefined
+    ): boolean =>
+      isAdmissibleParsed(p, {
+        sources: literalSources,
+        baseline,
+        language: languageContext?.language,
+        ruleObserved,
+      });
     // Groq primary: same prompt, same parser, same admission below. Any
     // Groq failure (no keys, deferral, 429, error) falls through to the
     // unchanged Gemini path; total failure keeps warn-and-skip.
     try {
       const { runGroqTextCompletion } = await import('./evidenceEngine/providers/GroqSemanticProvider');
-      const groqText = await runGroqTextCompletion({ prompt });
-      // Admissibility gate: provider output with no admissible candidate
-      // (wrong shape, non-strings, non-literal, spam) is not a result — the
-      // Gemini fallback stays available instead of being suppressed.
+      const groqText = await runGroqTextCompletion(
+        { prompt },
+        {
+          validateContent: text => {
+            let candidate: ReturnType<typeof parseNativeVocabularyResponse>;
+            try {
+              candidate = parseNativeVocabularyResponse(text);
+            } catch {
+              return false;
+            }
+            return isAdmissible(candidate);
+          },
+        }
+      );
+      // Admissibility gate: provider output with no admissible candidate is
+      // not a result — the Gemini fallback stays available instead of being
+      // suppressed. Rule exclusion runs INSIDE the gate (not after it), so
+      // instruments the rule pass already admitted cannot suppress fallback
+      // on their own.
       const groqParsed = groqText ? parseNativeVocabularyResponse(groqText) : undefined;
-      if (hasAdmissibleVocabulary(groqParsed, literalSources)) {
+      if (isAdmissible(groqParsed)) {
         parsed = groqParsed;
         parsedSource = 'GROQ';
       }
@@ -853,13 +891,12 @@ Return ONLY a valid JSON object with format:
         // Literal, traceable admission (native-v1 pipeline) via the shared
         // admitNativeCandidates helper: classification (literal → spam →
         // fail-closed novelty), observe-first persistence, rejection stats.
-        // Sources were built above for the admissibility gate and are reused.
-        // Fail closed: a missing country row marks the baseline unknown and
-        // every candidate is rejected as novelty-unknown — a transient read
-        // error must never make a known term look novel. Lookup
-        // infrastructure failures throw (via loadNoveltyBaseline) so the job
-        // retries instead of silently discarding candidates.
-        const baseline = await loadNoveltyBaseline(channel.country);
+        // Sources and baseline were built above for the admissibility gate
+        // and are reused. Fail closed: a missing country row marks the
+        // baseline unknown and every candidate is rejected as novelty-unknown
+        // — a transient read error must never make a known term look novel.
+        // Lookup infrastructure failures throw (via loadNoveltyBaseline) so
+        // the job retries instead of silently discarding candidates.
         const humanObservation = humanApproved ? 'HUMAN_APPROVED_CHANNEL' as const : 'ENRICHMENT' as const;
         // Within-run dedupe against rule-admitted instruments (see above).
         const deduped = (values: unknown[] | undefined) => excludeRuleAdmittedInstruments(values, ruleObserved);

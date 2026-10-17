@@ -745,14 +745,14 @@ export async function observeTerminologyDetailed(args: {
     resolvedProvenanceFamily = 'CREATOR_METADATA';
   }
 
-  // 3. Compute deterministic observation key for single-write idempotency
+  // 3. Compute deterministic observation key for single-write idempotency.
+  // Classification outcomes are excluded from identity (see
+  // computeObservationKey): reclassification converges onto one row.
   const obsKey = computeObservationKey({
     canonicalTermId: termId,
     channelId: args.channelId,
     videoId: args.videoId,
     observationType: args.observationType,
-    nativeEvidenceStatus: resolvedNativeStatus,
-    sourceProvenanceFamily: resolvedProvenanceFamily,
     sourceEvidenceId: args.sourceEvidenceId,
     evidence: args.evidence
   });
