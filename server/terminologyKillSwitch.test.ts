@@ -87,15 +87,26 @@ test('extraction path: active switch short-circuits before any database/provider
   );
 });
 
-test('extraction path: inactive switch proceeds past the guard (existing behavior preserved)', async () => {
-  // With the switch off the function walks its normal guards. An unknown
-  // country is the existing early exit, proving the switch-off path did not
-  // get short-circuited by the kill-switch branch.
-  const unknownCountryChannel = { ...confirmedChannel, country: 'Unknown' } as any;
-  const result = await extractVocabularyFromCreator(unknownCountryChannel, [], '', false, undefined, undefined, undefined, {
-    isKillSwitchActive: async () => false,
-  });
-  assert.deepEqual(result, []);
+test('extraction path: inactive switch proceeds into normal extraction work', async () => {
+  // With the switch off the function must walk past the guard into its normal
+  // dependencies. This unit context has no database, so the first database
+  // touch (novelty-baseline load) rejects with the DATABASE_URL error —
+  // proving the inactive path is not short-circuited the way the active path
+  // is. A regression that also skipped inactive extraction would resolve []
+  // instead of rejecting.
+  const savedDatabaseUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  try {
+    await assert.rejects(
+      () =>
+        extractVocabularyFromCreator(confirmedChannel, [], '', false, undefined, undefined, undefined, {
+          isKillSwitchActive: async () => false,
+        }),
+      /DATABASE_URL is required/
+    );
+  } finally {
+    if (savedDatabaseUrl !== undefined) process.env.DATABASE_URL = savedDatabaseUrl;
+  }
 });
 
 // ---------------------------------------------------------------------------

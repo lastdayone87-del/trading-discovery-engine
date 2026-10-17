@@ -11,15 +11,17 @@
  * - lifecycle events and guardrail events for the last 7 days
  * - yield snapshot from terminology_performance, clearly labelled:
  *     * confirmed_incl_repeats / quota  = raw (repeat sightings included), and
- *     * new_creators / quota            = upper-bound proxy for the new-only
- *       promotion basis (the actual promotion gate additionally applies a
- *       time window and takes min(confirmed, fresh new creators)).
+ *     * new_creators / quota            = upper-bound proxy for the promotion
+ *       bar, which sums the term's full persisted performance ledger and uses
+ *       min(confirmed_trading_creators, new_creators) — no execution-time
+ *       window exists today, so read it as an upper bound, not a windowed rate.
  *
  * Usage: DATABASE_URL=... npx tsx scripts/terminologyPilotStatus.ts
  *
  * Safety: connects with a standalone single-connection `pg` pool (never the
  * app's `getDb()` bootstrap, whose initialization runs migrations/seeding),
- * pins the session read-only, and issues SELECT statements only.
+ * opens one repeatable-read, read-only transaction for a stable snapshot, and
+ * issues SELECT statements only.
  */
 import pg from 'pg';
 import { TERMINOLOGY_KILL_SWITCH_KEY, isTerminologyKillSwitchActive } from '../server/terminologyKillSwitch';
@@ -34,12 +36,15 @@ async function main(): Promise<void> {
   if (!url) throw new Error('DATABASE_URL is required');
   const pool = new pg.Pool({
     connectionString: url,
-    ssl: process.env.PGSSL === 'disable' ? false : undefined,
+    ssl: process.env.PGSSL === 'disable' ? false : process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
     max: 1,
   });
   const client = await pool.connect();
+  let txOpen = false;
   try {
-    await client.query('SET default_transaction_read_only = on');
+    // One stable snapshot for the whole report: repeatable-read + read-only.
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    txOpen = true;
 
     const identity = await client.query('SELECT current_database() AS db, current_user AS usr, now() AS at');
     const killRow = await client.query(`SELECT setting_value FROM app_settings WHERE setting_key=$1`, [TERMINOLOGY_KILL_SWITCH_KEY]);
@@ -88,6 +93,9 @@ async function main(): Promise<void> {
       WHERE t.search_eligible = true
       GROUP BY t.country ORDER BY t.country`);
 
+    await client.query('COMMIT');
+    txOpen = false;
+
     const servingRows = serving.rows as Array<{ country: string; eligible_terms: number; trial_terms: number; proven_terms: number }>;
     const coverage = Object.fromEntries(
       PILOT_COUNTRIES.map(country => {
@@ -121,19 +129,20 @@ async function main(): Promise<void> {
         per_1k_new_creators: per1k(row.new_creators, row.quota_consumed),
       })),
       notes: [
-        'Raw yield includes repeat sightings; the promotion gate uses time-windowed fresh new-only min(confirmed, new_creators).',
+        "Raw yield includes repeat sightings; the promotion bar sums the term's full persisted performance ledger and uses min(confirmed_trading_creators, new_creators) — no execution-time window exists today, so per_1k_new_creators is an upper bound.",
         'This script is read-only and never writes.',
       ],
     };
 
     console.log(JSON.stringify(report, null, 2));
   } finally {
+    if (txOpen) await client.query('ROLLBACK').catch(() => undefined);
     client.release();
     await pool.end().catch(() => undefined);
   }
 }
 
-main().then(() => process.exit(0)).catch(err => {
+main().catch(err => {
   console.error(`[terminologyPilotStatus] failed: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
+  process.exitCode = 1;
 });
