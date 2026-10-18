@@ -1,5 +1,20 @@
 const VIDEO_ID = '[a-zA-Z0-9_-]{11}';
 
+/**
+ * V8 represents regexp captures over a large subject as SlicedString views:
+ * storing a capture keeps the whole scanned page alive even after the page
+ * itself is dropped. Copy a capture into an independent string before it
+ * escapes the page's scope. The Discord candidate path uses the same detach
+ * step (see discordCandidates.ts) because this retention class is what fills
+ * the heap during sustained crawling. The UTF-16LE round trip copies code
+ * units exactly, including unpaired surrogates (for example a lone `\uD800`
+ * from JSON-escaped page data); a UTF-8 round trip would replace those with
+ * U+FFFD and silently corrupt extracted values.
+ */
+export function detachPageSlice(value: string): string {
+  return Buffer.from(value, 'utf16le').toString('utf16le');
+}
+
 export function decodeEmbeddedMarkup(text: string): string {
   return String(text || '')
     .replace(/\\\\\//gi, '/')
@@ -25,6 +40,8 @@ export function extractEmbeddedUrls(text: string): string[] {
   for (let raw of matches) {
     raw = raw.replace(/[\.,\)\;\:\><"]+$/, '');
     if (raw.startsWith('//')) raw = `https:${raw}`;
+    // `raw` can still be a SlicedString capture of the scanned page.
+    raw = detachPageSlice(raw);
     if (!results.includes(raw)) results.push(raw);
   }
   return results;
@@ -35,7 +52,9 @@ export function extractDynamicTargetValues(text: string): string[] {
   const results: string[] = [];
   const attributePattern = /(?:data-(?:href|url|link|target)|(?:href|url|link))\s*=\s*(?:["']([^"']+)["']|([^\s>]+))/gi;
   for (let match; (match = attributePattern.exec(clean)) !== null;) {
-    const value = (match[1] || match[2] || '').trim();
+    // match[1]/match[2] are SlicedString captures of the scanned page; trim()
+    // returns the same view when there is nothing to trim.
+    const value = detachPageSlice((match[1] || match[2] || '').trim());
     if (value && !results.includes(value)) results.push(value);
   }
   return results;
@@ -52,7 +71,8 @@ export function extractYouTubeVideoIds(html: string, limit = 5): string[] {
   const ids: string[] = [];
   for (const pattern of patterns) {
     for (let match; (match = pattern.exec(clean)) !== null;) {
-      const id = match[1];
+      // match[1] is a SlicedString capture of the scanned page.
+      const id = match[1] ? detachPageSlice(match[1]) : match[1];
       if (id && !ids.includes(id)) {
         ids.push(id);
         if (ids.length >= limit) return ids;
