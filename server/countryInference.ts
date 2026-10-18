@@ -226,7 +226,11 @@ const SOCIAL_HOSTS = ['instagram.com', 'x.com', 'twitter.com', 'facebook.com', '
 
 export function canonicalCountry(value: string): string {
   const normalized = normalizeCountryName(value);
-  return COUNTRY_ALIASES[normalized] || Object.keys(COUNTRY_SIGNALS).find(country => normalizeCountryName(country) === normalized) || value.trim();
+  // Own-property read: spellings like 'constructor' or '__proto__' must miss
+  // the alias table like any unknown identity, never resolve to a member of
+  // Object.prototype (which would return a function/object instead of a name).
+  const alias = Object.prototype.hasOwnProperty.call(COUNTRY_ALIASES, normalized) ? COUNTRY_ALIASES[normalized] : undefined;
+  return alias || Object.keys(COUNTRY_SIGNALS).find(country => normalizeCountryName(country) === normalized) || value.trim();
 }
 
 /** Returns the authoritative two-letter alias for a canonical country identity, when configured. */
@@ -254,7 +258,10 @@ let cachedCountryIdentityResolution: Readonly<Record<string, string>> | null = n
  */
 export function countryIdentityResolution(): Readonly<Record<string, string>> {
   if (cachedCountryIdentityResolution === null) {
-    const resolution: Record<string, string> = {};
+    // Null prototype: the table is keyed by arbitrary country spellings, so a
+    // lookup for 'constructor'/'__proto__' must miss like any unknown identity
+    // instead of reading Object.prototype and returning a non-string.
+    const resolution: Record<string, string> = Object.create(null);
     for (const [alias, country] of Object.entries(COUNTRY_ALIASES)) {
       resolution[normalizeCountryName(alias)] = normalizeCountryName(canonicalCountry(country));
     }

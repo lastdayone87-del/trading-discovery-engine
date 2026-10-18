@@ -10,8 +10,10 @@ const databaseUrl = process.env.PHASE10_POSTGRES_URL;
 // transaction holds pg_advisory_xact_lock_shared for the whole check-then-write
 // span, so an exclusion-list writer (the EXCLUSIVE variant, used by
 // addExcludedCountry/removeExcludedCountry) cannot commit between the guarded
-// read and the guarded write. Skipped unless a disposable test database is
-// provided via PHASE10_POSTGRES_URL.
+// read and the guarded write. The production writer is started while the
+// shared lock is held and must not settle until the guarded transaction
+// commits - a raw try-lock probe cannot prove that. Skipped unless a
+// disposable test database is provided via PHASE10_POSTGRES_URL.
 test('PostgreSQL concurrency: exclusion writers serialize with guarded shared-lock readers', {
   skip: databaseUrl ? false : 'PHASE10_POSTGRES_URL is required for PostgreSQL concurrency coverage'
 }, async () => {
@@ -21,6 +23,7 @@ test('PostgreSQL concurrency: exclusion writers serialize with guarded shared-lo
   const country = `ZZ-RACE-${Date.now()}-${process.pid}`;
   const first = await db.connect();
   const second = await db.connect();
+  let writer: Promise<void> | null = null;
   try {
     // 1. A guarded reader takes the shared policy lock inside its transaction.
     await first.query('BEGIN');
@@ -28,16 +31,27 @@ test('PostgreSQL concurrency: exclusion writers serialize with guarded shared-lo
     const before = await readExcludedCountries(first);
     assert.equal(before.some(row => row.country_name === country), false);
 
-    // 2. While the guarded transaction runs, the exclusive lock is unavailable:
-    //    a policy writer cannot commit an exclusion between check and write.
-    await second.query('BEGIN');
-    const blocked = await second.query(`SELECT pg_try_advisory_xact_lock(hashtext($1)) AS acquired`, [COUNTRY_EXCLUSION_POLICY_LOCK]);
-    assert.equal(blocked.rows[0].acquired, false, 'exclusive policy lock must be blocked by an in-flight guarded read');
-    await second.query('COMMIT');
-    await first.query('COMMIT');
+    // 2. While the guarded transaction holds the shared lock, start the real
+    //    writer path (`addExcludedCountry`, which takes the EXCLUSIVE variant).
+    //    It must stay blocked until the guarded transaction commits. A raw
+    //    try-lock probe cannot prove this: the probe would still report
+    //    contention even if the writer path dropped its exclusive lock
+    //    entirely, because the holder is the guarded transaction.
+    writer = addExcludedCountry({ country_name: country, reason: 'concurrency probe' });
+    const settled = writer.then(() => true, () => true);
+    const settledEarly = await Promise.race([
+      settled,
+      new Promise<boolean>(resolve => setTimeout(() => resolve(false), 250))
+    ]);
+    assert.equal(settledEarly, false, 'the policy writer must block on the shared lock held by the guarded transaction');
+    const midFlight = await readExcludedCountries(first);
+    assert.equal(midFlight.some(row => row.country_name === country), false, 'no exclusion may commit between the guarded check and the guarded write');
 
-    // 3. The writer path commits the exclusion via the production helper.
-    await addExcludedCountry({ country_name: country, reason: 'concurrency probe' });
+    // 3. Committing the guarded transaction releases the shared lock: the
+    //    writer acquires the exclusive lock, commits, and the exclusion exists.
+    await first.query('COMMIT');
+    await writer;
+    writer = null;
 
     // 4. The exclusive lock is free again and a new guarded read observes the
     //    committed exclusion (post-change writes fail closed).
@@ -58,6 +72,7 @@ test('PostgreSQL concurrency: exclusion writers serialize with guarded shared-lo
     await second.query('ROLLBACK').catch(() => undefined);
     first.release();
     second.release();
+    if (writer) await writer.catch(() => undefined);
     await removeExcludedCountry(country).catch(() => undefined);
   }
 });

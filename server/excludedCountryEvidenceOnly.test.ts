@@ -6,7 +6,7 @@ import { buildFrontierProposal, generateCountryNativeProposals, persistFrontierP
 import { materializeExternalOsintProposals, persistExternalOsintProposal } from './externalOsint';
 import { generateMultilingualActions } from './persistentResearchController';
 import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, readExcludedCountries } from './countryExclusion';
-import { countryAliasResolutionJson, countryIdentityResolution } from './countryInference';
+import { canonicalCountry, countryAliasResolutionJson, countryIdentityResolution, resolveCountryIdentity } from './countryInference';
 import { addExcludedCountryGuarded } from './countryExclusionRules';
 import { getNeighborhoodCandidates } from './discoveryFrontierAllocator';
 import { evaluateTrialGate } from './discoveryFrontierTrials';
@@ -655,6 +655,20 @@ test('the shared identity-resolution table is frozen: importers cannot corrupt e
   assert.equal(findCountryExclusionWithAliases('DE', [{ country_name: 'Germany', reason: 'x' }])?.country, 'Germany');
 });
 
+test('identity resolution never reads Object.prototype for unknown spellings', () => {
+  // 'constructor' and '__proto__' are spelled exactly like Object.prototype
+  // members. A plain-object lookup would return a function/object here, and
+  // the documented fallback ("unknown spellings resolve to themselves") would
+  // be violated - with a non-string leaking into exclusion matching.
+  for (const spelling of ['constructor', '__proto__', 'toString', 'valueOf', 'hasOwnProperty']) {
+    assert.equal(typeof resolveCountryIdentity(spelling), 'string', `${spelling} must resolve to a string`);
+    assert.equal(resolveCountryIdentity(spelling), spelling, `${spelling} is unknown and falls back unchanged`);
+    assert.equal(typeof canonicalCountry(spelling), 'string', `${spelling} must never leak Object.prototype`);
+  }
+  assert.equal(countryIdentityResolution()['constructor'], undefined, 'the resolution table is own-keyed only');
+  assert.equal(findCountryExclusionWithAliases('constructor', [{ country_name: 'Germany', reason: 'x' }]), null);
+});
+
 test('pagination has a hard page backstop: a window that never advances cannot loop unbounded', async () => {
   // Pathological runner: every window returns a full page of excluded rows
   // that only the JS matcher drops (a SQL/JS mismatch deeper than the
@@ -672,15 +686,15 @@ test('pagination has a hard page backstop: a window that never advances cannot l
   assert.equal(offsets[99], 99 * 200);
 });
 
-test('pagination order is total: ties cannot skip or duplicate eligible surfaces across offset pages', async () => {
+test('pagination order is total: every GROUP BY key is an ordering tiebreaker for offset pages', async () => {
   // 205 excluded German rows and 2 eligible US rows share one
   // (concept, locale) bucket, with the US rows straddling the 200-row page
-  // boundary. Under a non-total ORDER BY (c.id, s.locale only) PostgreSQL is
-  // free to resolve the tie differently for each offset query, so an eligible
-  // row that sits near the boundary can be skipped (or repeated). The fake
-  // emulates exactly that freedom - insertion order for offset 0, reversed
-  // insertion order afterwards - so this test fails if the pagination order
-  // loses any grouping-key tiebreaker.
+  // boundary. The emulated database sorts by exactly the ORDER BY it is given;
+  // because the ORDER BY (asserted verbatim below) covers every GROUP BY key,
+  // no two groups can tie and each offset page is deterministic. The exact
+  // assertion is what fails if any grouping key loses its tiebreaker; the
+  // corpus then proves the eligible rows behind the boundary are still reached
+  // page by page instead of being skipped or duplicated.
   const tieRow = (idx: number, country: string, surfaceId: number): Row => ({
     concept_id: 1, surface_id: surfaceId, literal: `tie ${surfaceId}`, normalized: `tie ${surfaceId}`,
     language: country === 'United States' ? 'en' : 'de', script: 'Latn', locale: 'en-US',
@@ -707,9 +721,11 @@ test('pagination order is total: ties cannot skip or duplicate eligible surfaces
           const av = orderField(key, a), bv = orderField(key, b);
           if (av !== bv) return av < bv ? -1 : 1;
         }
-        // Reached only for rows the ORDER BY leaves tied: the cross-page
-        // freedom PostgreSQL has (and that must never be reachable).
-        return offset === 0 ? a.__idx - b.__idx : b.__idx - a.__idx;
+        // Equal keys: stable sort keeps insertion order. Cannot happen while
+        // the ORDER BY is total (no two groups tie); determinism for a
+        // non-total ORDER BY is guarded by the exact assertion below, not by
+        // an adversarial emulation.
+        return 0;
       });
       return { rows: rows.slice(offset, offset + limit) };
     } },
@@ -718,8 +734,8 @@ test('pagination order is total: ties cannot skip or duplicate eligible surfaces
     { match: /INSERT INTO discovery_actions/, respond: () => ({ rows: [{ id: 8 }], rowCount: 1 }) }
   ]);
   const count = await generateMultilingualActions('2026-10-18T00:00:00Z', runner);
-  assert.equal(count, 2, 'both eligible surfaces must survive pagination when the ORDER BY is total');
-  assert.deepEqual(offsets, [0, 200], 'bounded pagination: two windows cover the tie bucket');
+  assert.equal(count, 2, 'both eligible surfaces must be reached across offset pages');
+  assert.deepEqual(offsets, [0, 200], 'bounded pagination: two windows cover the bucket');
   const paged = runner.calls.find(c => /concept_market_affinities/.test(c.sql));
   assert.match(paged!.sql, /ORDER BY c\.id,s\.locale,s\.id,a\.country,cs\.id LIMIT \$2 OFFSET \$3/, 'every GROUP BY key must act as an ordering tiebreaker so offset pages are deterministic');
 });
