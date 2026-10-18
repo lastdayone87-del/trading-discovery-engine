@@ -17,21 +17,23 @@ test('rejected diagnostics filters in SQL with the legacy predicate', async () =
   await listRejectedChannelDiagnostics(fakeDb as never);
   assert.equal(statements.length, 1);
   const sql = statements[0];
-  for (const cond of [
-    `country_status='REJECTED'`,
-    `scan_status='SKIPPED_EXCLUDED'`,
-    `trading_status='NON_TRADING'`,
-    `discord_status='NON_TRADING'`
-  ]) {
-    assert.ok(sql.includes(cond), cond);
-  }
-  assert.ok(sql.includes('ORDER BY first_seen DESC'));
+  // Assert the whole predicate, not just the four column fragments: an AND
+  // rewrite of the legacy OR predicate must fail this test.
+  assert.match(
+    sql,
+    /WHERE country_status='REJECTED' OR scan_status='SKIPPED_EXCLUDED' OR trading_status='NON_TRADING' OR discord_status='NON_TRADING' ORDER BY first_seen DESC$/,
+    'rejected diagnostics must keep the legacy OR predicate and ordering'
+  );
   assert.ok(!sql.includes('LIMIT'));
 });
 
 // The route must never load the full channel table into Node memory.
 test('rejected diagnostics route uses the SQL-filtered listing', () => {
   const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
-  assert.ok(server.includes('listRejectedChannelDiagnostics()'));
-  assert.ok(!server.includes('getAllChannels'));
+  const start = server.indexOf("app.get('/api/channels/diagnostics/rejected'");
+  assert.ok(start >= 0);
+  const nextRoute = server.indexOf('\n  app.', start + 10);
+  const route = server.slice(start, nextRoute > start ? nextRoute : undefined);
+  assert.ok(route.includes('listRejectedChannelDiagnostics()'));
+  assert.ok(!route.includes('getAllChannels'));
 });

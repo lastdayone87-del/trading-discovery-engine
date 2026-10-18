@@ -33,8 +33,9 @@ test('candidate extraction does not pin the scanned page snapshot', () => {
   const result = JSON.parse(output.trim().split('\n').at(-1) || '{}');
   assert.equal(result.kept, 16);
   assert.deepEqual(result.codes, Array.from({ length: 16 }, (_, i) => `code${i}`));
-  // Calibration: detached candidates retain ~8 MB (the shared filler); the old
-  // sliced-string behavior retained ~120 MB for the same 16 snapshots.
+  // Calibration: detached candidates retained ~8 MB after GC for this
+  // workload; the old sliced-string behavior retained ~120 MB for the same
+  // 16 snapshots. The threshold keeps a wide margin below that signal.
   assert.ok(
     result.retained < 48 * 1024 * 1024,
     `candidate extraction retained ${(result.retained / 1048576).toFixed(1)} MB of page snapshots`
