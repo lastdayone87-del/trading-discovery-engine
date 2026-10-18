@@ -13,6 +13,7 @@ import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from '
 import type { AuditEvent } from './operatorAuth';
 import type { ProviderCallEvent } from './providerResilience';
 import { canonicalCountry } from './countryInference';
+import { addExcludedCountryGuarded, removeExcludedCountryGuarded } from './countryExclusionRules';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { browserCapabilityIsUnavailable } from './browserCapability';
@@ -693,8 +694,39 @@ export async function saveCountryVocabulary(vocab: CountryVocabulary): Promise<v
 }
 
 export async function getExcludedCountries(): Promise<ExcludedCountry[]> { const db=await getDb(); const res=await db.query('SELECT * FROM excluded_countries ORDER BY country_name'); return res.rows; }
-export async function addExcludedCountry(country: ExcludedCountry): Promise<void> { const db=await getDbNoInit().catch(getDb); await db.query('INSERT INTO excluded_countries(country_name,reason) VALUES($1,$2) ON CONFLICT(country_name) DO UPDATE SET reason=excluded.reason',[country.country_name,country.reason]); }
-export async function removeExcludedCountry(countryName: string): Promise<void> { const db=await getDb(); await db.query('DELETE FROM excluded_countries WHERE country_name=$1',[countryName]); }
+export async function addExcludedCountry(country: ExcludedCountry): Promise<void> {
+  const db = await getDbNoInit().catch(getDb);
+  // Exclusion-policy writers take the EXCLUSIVE policy lock so the change
+  // serializes with guarded writes that hold the shared variant across their
+  // check-then-write (see lockExclusionPolicyForGuardedWrite). The lock and
+  // the write share one transaction: the change becomes visible only after
+  // all in-flight guarded transactions have committed.
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await addExcludedCountryGuarded(client, country);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+export async function removeExcludedCountry(countryName: string): Promise<void> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await removeExcludedCountryGuarded(client, countryName);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 export async function getQueueStatus(): Promise<QueueStatus> {
   const db=await getDb();

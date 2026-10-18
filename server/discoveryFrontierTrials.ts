@@ -1,5 +1,6 @@
 import { getDb } from './db';
 import { getNeighborhoodFrontierState } from './discoveryFrontierState';
+import { findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import type { DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 
 export type TrialStatus = 'INITIATED' | 'COMPLETED' | 'FAILED' | 'KILLED';
@@ -117,6 +118,19 @@ export async function evaluateTrialGate(
 
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
     return { eligible: false, reason: 'Proposal has expired.' };
+  }
+
+  // 2b. Excluded-Country Check (Fail Closed)
+  // A previously persisted PENDING proposal must not be authorized for trial
+  // execution after its country joins the exclusion list. evaluateTrialGate
+  // is called inside initiateCanaryTrial's transaction (which also writes the
+  // trial), so the shared policy lock taken here is held until that write
+  // commits; a directly-invoked gate still reads current policy state.
+  await lockExclusionPolicyForGuardedWrite(db);
+  const exclusions = await readExcludedCountries(db);
+  const countryExclusion = findCountryExclusionWithAliases(row.country, exclusions);
+  if (countryExclusion) {
+    return { eligible: false, reason: `Country '${row.country}' is excluded: ${countryExclusion.reason}` };
   }
 
   // 3. Neighborhood Eligibility Check (Fail Closed)

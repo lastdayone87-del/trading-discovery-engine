@@ -226,7 +226,11 @@ const SOCIAL_HOSTS = ['instagram.com', 'x.com', 'twitter.com', 'facebook.com', '
 
 export function canonicalCountry(value: string): string {
   const normalized = normalizeCountryName(value);
-  return COUNTRY_ALIASES[normalized] || Object.keys(COUNTRY_SIGNALS).find(country => normalizeCountryName(country) === normalized) || value.trim();
+  // Own-property read: spellings like 'constructor' or '__proto__' must miss
+  // the alias table like any unknown identity, never resolve to a member of
+  // Object.prototype (which would return a function/object instead of a name).
+  const alias = Object.prototype.hasOwnProperty.call(COUNTRY_ALIASES, normalized) ? COUNTRY_ALIASES[normalized] : undefined;
+  return alias || Object.keys(COUNTRY_SIGNALS).find(country => normalizeCountryName(country) === normalized) || value.trim();
 }
 
 /** Returns the authoritative two-letter alias for a canonical country identity, when configured. */
@@ -236,6 +240,53 @@ export function countryIsoAlias(value: string): string | null {
     key.length === 2 && canonicalCountry(country) === canonical
   )?.[0];
   return alias ? alias.toUpperCase() : null;
+}
+
+let cachedCountryIdentityResolution: Readonly<Record<string, string>> | null = null;
+
+/**
+ * Normalized spelling-to-canonical resolution table: normalized
+ * `COUNTRY_ALIASES` keys plus the modeled localized/exonym variants from
+ * `BARE_COUNTRY_NAME_VARIANTS` map to their normalized canonical country
+ * (e.g. `{"de":"germany","côte d'ivoire":"ivory coast"}`). It is the single
+ * source for (a) `resolveCountryIdentity`, which the in-code country-exclusion
+ * matcher resolves stored spellings through, and (b) the `::jsonb` parameter
+ * of the server-side exclusion prefilters (`excludedCountrySqlPredicate`), so
+ * SQL and JS share one alias universe and stored localized forms cannot
+ * survive a WHERE clause or bypass the guard. The returned table is frozen:
+ * importers cannot mutate a shared guard input out from under either matcher.
+ */
+export function countryIdentityResolution(): Readonly<Record<string, string>> {
+  if (cachedCountryIdentityResolution === null) {
+    // Null prototype: the table is keyed by arbitrary country spellings, so a
+    // lookup for 'constructor'/'__proto__' must miss like any unknown identity
+    // instead of reading Object.prototype and returning a non-string.
+    const resolution: Record<string, string> = Object.create(null);
+    for (const [alias, country] of Object.entries(COUNTRY_ALIASES)) {
+      resolution[normalizeCountryName(alias)] = normalizeCountryName(canonicalCountry(country));
+    }
+    for (const [country, variants] of Object.entries(BARE_COUNTRY_NAME_VARIANTS)) {
+      const canonical = normalizeCountryName(canonicalCountry(country));
+      for (const variant of variants) resolution[normalizeCountryName(variant)] = canonical;
+    }
+    cachedCountryIdentityResolution = Object.freeze(resolution);
+  }
+  return cachedCountryIdentityResolution;
+}
+
+/**
+ * Resolves a stored country spelling (canonical name, ISO code, alias, or
+ * modeled localized/exonym variant) to its canonical identity. Unknown
+ * spellings fall back to `canonicalCountry` unchanged, so callers keep the
+ * existing behavior for anything outside the modeled universe.
+ */
+export function resolveCountryIdentity(value: string): string {
+  return countryIdentityResolution()[normalizeCountryName(value)] ?? canonicalCountry(value);
+}
+
+/** JSON form of `countryIdentityResolution()` for SQL predicates (see its doc). */
+export function countryAliasResolutionJson(): string {
+  return JSON.stringify(countryIdentityResolution());
 }
 
 /**

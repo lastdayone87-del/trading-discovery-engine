@@ -71,15 +71,18 @@ test('Phase 10: projection proposal provenance preserves all governed native evi
 });
 
 test('Phase 10: canonical country identities and ISO aliases resolve localized static seeds', async () => {
+  // Empty exclusion list + no rows: the localized static seed dictionary is
+  // the authoritative fallback for known-allowed markets (canonical or ISO).
+  const noExclusionsNoRows = { query: async () => ({ rows: [] as any[] }) };
   for (const [country, expected] of [
     ['Germany', 'DAX trading'], ['DE', 'DAX trading'],
     ['Japan', '日経平均'], ['JP', '日経平均'],
     ['United States', 'S&P 500 futures'], ['US', 'S&P 500 futures']
   ] as const) {
-    const proposals = await generateCountryNativeProposals(country, 1);
+    const proposals = await generateCountryNativeProposals(country, 1, { runner: noExclusionsNoRows });
     assert.equal(proposals[0]?.concept, expected, `${country} must use its localized authoritative alias seed set`);
   }
-  const generic = await generateCountryNativeProposals('Atlantis', 1);
+  const generic = await generateCountryNativeProposals('Atlantis', 1, { runner: noExclusionsNoRows });
   assert.equal(generic[0]?.concept, 'local exchange trading');
 });
 

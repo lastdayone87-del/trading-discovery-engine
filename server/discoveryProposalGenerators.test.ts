@@ -39,13 +39,16 @@ test('Phase 6: Common proposal contract contains required fields and valid TTL',
 });
 
 test('Phase 6: Country-native proposal generator uses native market terms without English translation', async () => {
-  const proposalsJP = await generateCountryNativeProposals('JP', 5);
+  // No exclusions + no database rows: the static seed dictionary is still the
+  // fallback for markets whose exclusion status is known (empty list).
+  const noExclusionsNoRows = { query: async () => ({ rows: [] as any[] }) };
+  const proposalsJP = await generateCountryNativeProposals('JP', 5, { runner: noExclusionsNoRows });
   assert.ok(proposalsJP.length > 0);
   assert.equal(proposalsJP[0].proposalFamily, 'COUNTRY_NATIVE');
   assert.equal(proposalsJP[0].country, 'Japan');
   assert.ok(proposalsJP.some(p => p.concept.includes('日経平均') || p.concept.includes('FX')), 'Japanese native terms must be present');
 
-  const proposalsBR = await generateCountryNativeProposals('BR', 5);
+  const proposalsBR = await generateCountryNativeProposals('BR', 5, { runner: noExclusionsNoRows });
   assert.ok(proposalsBR.length > 0);
   assert.equal(proposalsBR[0].country, 'Brazil');
   assert.ok(proposalsBR.some(p => p.concept.includes('B3') || p.concept.includes('mini indice')), 'Brazilian native terms must be present');

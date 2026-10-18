@@ -471,6 +471,11 @@ export async function recomputeNativeEvidenceProjection(
 
   // Native Proposal Eligibility Rule:
   // Requires native_observed_count >= 1 AND (qualityCreatorCount >= 2 OR structuredMatched) OR governed country_vocabularies / BOOTSTRAP_SEED
+  // Evidence-only by design: exclusion policy is enforced where proposals are
+  // read/served (the fail-closed generation prelude and the guarded proposal
+  // persistence), never persisted into this flag. Persisting policy here would
+  // keep a market hidden after its exclusion is removed until the next
+  // recompute, so removal would not take effect immediately.
   const governedBootstrapEvidence = bootstrapSeedCount > 0 || Boolean(provenanceCounts.COUNTRY_VOCABULARY);
   const nativeProposalEligible =
     (nativeObservedCount >= 1 && (nativeQualityCreatorCount >= 2 || structuredMatched)) ||

@@ -4,7 +4,8 @@ import type { CountryVocabulary, QueryRecord } from '../src/types';
 import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
 import { isTerminologyKillSwitchActive, isTerminologyKillSwitchActiveOn } from './terminologyKillSwitch';
-import { canonicalCountry } from './countryInference';
+import { canonicalCountry, countryAliasResolutionJson } from './countryInference';
+import { excludedCountrySqlPredicate, findCountryExclusionWithAliases, lockExclusionPolicyForGuardedWrite, readExcludedCountries } from './countryExclusion';
 import {
   computeEvidenceChecksum,
   computeObservationKey,
@@ -1043,6 +1044,52 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   if (!result.rows[0]) return;
   const row = result.rows[0];
   const decision = decideLifecycle({ current: row.lifecycle_status, decayedEvidence: row.decayed_evidence, distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedYield: row.decayed_yield, termType: row.term_type }, policy);
+  let qualityBlocked = false;
+  // Actual persisted lifecycle_status when blocked (entry block preserves the
+  // row status; revoke preserves it too unless legacy rules demote).
+  let blockedStatus: string | null = null;
+  const enteringEligibility = !row.search_eligible && decision.searchEligible;
+  let effectiveDecision = decision;
+  // Excluded-country guardrail: countries on the exclusion list are
+  // evidence-only. This function is the only writer of search_eligible, so
+  // the guard intercepts entry and revokes stale eligibility. It runs BEFORE
+  // the native quality gate and its evidence reads: a failed quality read
+  // must never abort this transaction before the revocation is applied, and
+  // an excluded term must not depend on later evidence at all. The shared
+  // policy lock is held through this transaction, so an exclusion committed
+  // concurrently cannot land between this check and the guarded writes
+  // below. Status is preserved unless the legacy decision demotes on yield;
+  // the exclusion reason is recorded idempotently like the quality gate.
+  let exclusionBlocked = false;
+  await lockExclusionPolicyForGuardedWrite(runner);
+  const exclusion = findCountryExclusionWithAliases(row.country, await readExcludedCountries(runner));
+  if (exclusion && (effectiveDecision.searchEligible || row.search_eligible)) {
+    exclusionBlocked = true;
+    const demoteFollows = row.search_eligible && effectiveDecision.status === 'DEMOTED';
+    blockedStatus = demoteFollows ? 'DEMOTED' : row.lifecycle_status;
+    if (row.search_eligible) {
+      await runner.query(
+        'UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=false,trust_tier=$3 WHERE id=$1',
+        [termId, blockedStatus, demoteFollows ? (effectiveDecision.searchEligible ? 2 : 3) : row.trust_tier]
+      );
+    }
+    const exclusionReason = `excluded-country: evidence-only (${exclusion.country}: ${exclusion.reason})`;
+    const latestExclusionEvent = await runner.query(
+      `SELECT event_type, reason FROM terminology_lifecycle_events WHERE canonical_term_id=$1 ORDER BY id DESC LIMIT 1`,
+      [termId]
+    );
+    const lastExclusionEvent = ((latestExclusionEvent.rows || [])[0] || {}) as Record<string, unknown>;
+    // Event semantics match the quality gate: an exclusion-driven revoke that
+    // also follows a yield demotion records DEMOTION; eligibility-only
+    // changes record ELIGIBILITY_CHANGE.
+    const eventType = demoteFollows ? 'DEMOTION' : 'ELIGIBILITY_CHANGE';
+    if (!(lastExclusionEvent.event_type === eventType && lastExclusionEvent.reason === exclusionReason)) {
+      await runner.query(
+        `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`,
+        [termId, row.lifecycle_status, blockedStatus, eventType, exclusionReason, JSON.stringify({ excludedCountry: exclusion.country, exclusionReason: exclusion.reason })]
+      );
+    }
+  }
   // Native quality gate: applies whenever the term carries new-pipeline
   // (qualityVersion) evidence, whether entering eligibility or already
   // eligible. Legacy-only terms take the legacy path below byte-identically.
@@ -1054,18 +1101,15 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // observation is uncommitted, and the later observation refresh would skip
   // the gate (already eligible) and leave the ineligible term eligible.
   // Demotion stays yield-driven. The quality rollup is read once; per-term
-  // serialization makes re-reads unnecessary.
-  let qualityBlocked = false;
-  // Actual persisted lifecycle_status when blocked (entry block preserves the
-  // row status; revoke preserves it too unless legacy rules demote).
-  let blockedStatus: string | null = null;
-  const enteringEligibility = !row.search_eligible && decision.searchEligible;
+  // serialization makes re-reads unnecessary. A term already blocked by the
+  // exclusion guard skips the read entirely: no promotion can apply, and a
+  // failing read here must not roll back the revocation.
   // The gate below acts only when legacy keeps/grants eligibility or the row
   // already has it; otherwise the outcome is the legacy path regardless, so
   // the aggregate read is skipped (identical outcome, no wasted query). A
   // PROVEN legacy decision always sets searchEligible, so the PROVEN cap
   // below never faces a skipped read.
-  const quality = (enteringEligibility || row.search_eligible)
+  const quality = (!exclusionBlocked && (enteringEligibility || row.search_eligible))
     ? await readNativeQualityEvidence(termId, runner)
     : { v1Observations: 0, spamConfirmed: false, novel: false };
   // Native PROVEN gate: the legacy lifecycle must not automatically mark a
@@ -1076,11 +1120,10 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
   // (still search-eligible, still trialed). Already-PROVEN rows are left
   // untouched — only new promotions are gated. coordinatedBurst has no stored
   // signal, so burst review stays operator-side (conservative: absent).
-  let effectiveDecision = decision;
   // New promotions only: an already-PROVEN row keeps its status (and trust
   // tier) even when current performance would not clear the bar fresh —
   // downgrades stay exclusively yield-driven via DEMOTED.
-  if (decision.status === 'PROVEN_SEARCH_TERM' && row.lifecycle_status !== 'PROVEN_SEARCH_TERM' && quality.v1Observations > 0) {
+  if (!exclusionBlocked && decision.status === 'PROVEN_SEARCH_TERM' && row.lifecycle_status !== 'PROVEN_SEARCH_TERM' && quality.v1Observations > 0) {
     const perf = await runner.query(
       `SELECT COALESCE(SUM(executions),0)::int executions, COALESCE(SUM(quota_consumed),0)::int quota,
         COALESCE(SUM(confirmed_trading_creators),0)::int confirmed, COALESCE(SUM(non_trading_creators),0)::int nontrading,
@@ -1120,7 +1163,10 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       };
     }
   }
-  if (quality.v1Observations > 0) {
+  // Excluded-country guardrail is applied above, before the native gate: the
+  // quality/performance gate below must never run (or abort the transaction)
+  // after an exclusion-driven revocation.
+  if (!exclusionBlocked && quality.v1Observations > 0) {
     const entry = evaluateTrialEntry({ novel: quality.novel, spamConfirmed: quality.spamConfirmed });
     if (!entry.allowed) {
       if (effectiveDecision.searchEligible || row.search_eligible) {
@@ -1161,13 +1207,13 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       }
     }
   }
-  if (!qualityBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
+  if (!qualityBlocked && !exclusionBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
     await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, effectiveDecision.status, effectiveDecision.searchEligible, effectiveDecision.status === 'PROVEN_SEARCH_TERM' ? 1 : effectiveDecision.searchEligible ? 2 : 3]);
     await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield })]);
   }
   // The snapshot records the persisted lifecycle state: when the quality
   // gate blocks a transition, decision.status was never applied.
-  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, qualityBlocked ? (blockedStatus ?? row.lifecycle_status) : effectiveDecision.status, JSON.stringify(policy)]);
+  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, (qualityBlocked || exclusionBlocked) ? (blockedStatus ?? row.lifecycle_status) : effectiveDecision.status, JSON.stringify(policy)]);
 }
 
 /**
@@ -1245,6 +1291,16 @@ export async function getPlannerTerminology(country: string, clientOverride?: Qu
   const isActive = deps?.isKillSwitchActive
     ?? (clientOverride ? () => isTerminologyKillSwitchActiveOn(clientOverride) : isTerminologyKillSwitchActive);
   if (await isActive()) return [];
-  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country)]);
+  // Excluded-country guardrail: an excluded market is evidence-only, so its
+  // terminology never reaches planner serving — including while stale legacy
+  // rows remain search_eligible until their next lifecycle refresh revokes.
+  // Stored terms are keyed by canonical country; the raw input is checked too
+  // so ISO/alias forms cannot slip past the list. The serving query embeds the
+  // same predicate against the live policy table, so an exclusion committed
+  // after this read but before the SELECT is still honored (statement
+  // snapshot), closing the check-then-serve window.
+  const exclusions = await readExcludedCountries(runner);
+  if (findCountryExclusionWithAliases(country, exclusions)) return [];
+  const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') AND ${excludedCountrySqlPredicate('t.country', '$2')} GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country), countryAliasResolutionJson()]);
   return result.rows.map(row => ({ id: Number(row.id), term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }));
 }

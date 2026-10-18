@@ -134,8 +134,9 @@ test('extraction path: inactive switch proceeds into normal extraction work', as
 
 const plannerTermsRow = { id: 1, term: 'DAX', lifecycle_status: 'SEARCH_TRIAL', score: 0.5 };
 const fakeClient = (calls: { n: number }) => ({
-  query: async () => {
+  query: async (sql: string) => {
     calls.n++;
+    if (sql === 'SELECT country_name, reason FROM excluded_countries') return { rows: [] };
     return { rows: [plannerTermsRow] };
   },
 }) as any;
@@ -151,7 +152,8 @@ test('planner path: inactive switch returns trial atoms unchanged', async () => 
   const calls = { n: 0 };
   const terms = await getPlannerTerminology('Germany', fakeClient(calls), { isKillSwitchActive: async () => false });
   assert.deepEqual(terms, [{ id: 1, term: 'DAX', score: 0.5, lifecycle: 'SEARCH_TRIAL' }]);
-  assert.equal(calls.n, 1);
+  // Two reads now: the exclusion-list guardrail read, then the atoms query.
+  assert.equal(calls.n, 2);
 });
 
 const SAVEPOINT_SQL = /^(SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT)/;
@@ -171,6 +173,7 @@ const scriptedPlannerClient = (calls: { sql: string[] }, settingValue: string | 
     if (sql.includes('app_settings')) {
       return { rows: settingValue == null ? [] : [{ setting_value: settingValue }] };
     }
+    if (sql === 'SELECT country_name, reason FROM excluded_countries') return { rows: [] };
     return { rows: [plannerTermsRow] };
   },
 }) as any;
@@ -204,6 +207,7 @@ const scriptedTransactionClient = (calls: { sql: string[] }, settingValue: strin
       if (poisoned) {
         throw new Error('current transaction is aborted, commands ignored until end of transaction block');
       }
+      if (sql === 'SELECT country_name, reason FROM excluded_countries') return { rows: [] };
       return { rows: [plannerTermsRow] };
     },
   } as any;
@@ -231,11 +235,15 @@ test('planner path: caller-supplied client with stop not set proceeds through th
   const terms = await getPlannerTerminology('Germany', scriptedPlannerClient(calls, null));
   assert.deepEqual(terms, [{ id: 1, term: 'DAX', score: 0.5, lifecycle: 'SEARCH_TRIAL' }]);
   const data = dataQueries(calls);
-  assert.equal(data.length, 2, `expected settings read then atoms read, got: ${JSON.stringify(calls.sql)}`);
+  assert.equal(data.length, 3, `expected settings, exclusions, then atoms read, got: ${JSON.stringify(calls.sql)}`);
   assert.ok(data[0].includes('app_settings'), `first query should be the settings read, got: ${data[0]}`);
   assert.ok(
-    data[1].includes('canonical_trading_terms'),
-    `second query should be the atoms read, got: ${data[1]}`
+    data[1].includes('excluded_countries'),
+    `second query should be the exclusion-list guardrail read, got: ${data[1]}`
+  );
+  assert.ok(
+    data[2].includes('canonical_trading_terms'),
+    `third query should be the atoms read, got: ${data[2]}`
   );
 });
 
