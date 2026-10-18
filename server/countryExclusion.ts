@@ -1,3 +1,4 @@
+import type { ExcludedCountry } from '../src/types';
 import { getExcludedCountries } from './db';
 import { CountryExclusionMatch, findCountryExclusion, normalizeCountryName } from './countryExclusionRules';
 
@@ -63,4 +64,17 @@ export async function assertCountryAllowed(country: string | null | undefined, c
     timestamp: new Date().toISOString()
   }));
   throw new ExcludedCountryError(exclusion.country, exclusion.reason, context);
+}
+
+/**
+ * Reads the exclusion list through a caller-supplied runner so guardrails can
+ * read the same authority as the guarded write (a transaction-bound client
+ * stays on that transaction; a pool stays on the pool). Throws on read
+ * failure: guardrails fail closed at the caller, never silently open.
+ */
+export async function readExcludedCountries(
+  runner: { query: (sql: string, params?: any[]) => Promise<any> }
+): Promise<ExcludedCountry[]> {
+  const result = await runner.query('SELECT country_name, reason FROM excluded_countries');
+  return (result.rows || []) as ExcludedCountry[];
 }

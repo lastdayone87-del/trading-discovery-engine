@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getDb } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry, countryIsoAlias } from './countryInference';
+import { findCountryExclusion, readExcludedCountries } from './countryExclusion';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 
@@ -304,14 +305,18 @@ export function projectionProposalProvenance(
   return { provenanceType: 'bootstrap_vocabulary', sourceProvenance: `bootstrap_vocabulary:static_bootstrap:${identity}` };
 }
 
-export async function generateCountryNativeProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+export async function generateCountryNativeProposals(country: string, limit = 10, deps?: { runner?: { query: (sql: string, params?: any[]) => Promise<any> } }): Promise<DiscoveryFrontierProposal[]> {
   const canonicalC = canonicalCountry(country);
   const normC = canonicalC.toUpperCase();
   const seedKey = country.toUpperCase().trim();
 
   try {
-    const db = await getDb().catch(() => null);
+    const db = deps?.runner || await getDb().catch(() => null);
     if (db) {
+      // Excluded-country guardrail: excluded markets are evidence-only, so no
+      // country-native proposal may be generated for them — even when stale
+      // eligible projections remain. Fail closed before any eligible query.
+      if (findCountryExclusion(country, await readExcludedCountries(db))) return [];
       // 1. First, check Phase 10 proposal-eligible native projections from canonical_trading_terms
       const nativeProjRes = await db.query(
         `SELECT

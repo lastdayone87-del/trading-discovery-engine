@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { getDb } from './db';
 import { canonicalCountry } from './countryInference';
+import { findCountryExclusion, readExcludedCountries } from './countryExclusion';
 import { inferScript, isNoiseOrBoilerplate, normalizeNativeTerm } from './countryNativeIntelligence';
 import { buildFrontierProposal, type DiscoveryFrontierProposal } from './discoveryProposalGenerators';
 import { createNeighborhoodChecksum } from './discoveryNeighborhood';
@@ -209,6 +210,9 @@ export function buildExternalOsintProposal(evidence: OsintEvidenceAggregate, rev
 
 export async function persistExternalOsintProposal(proposal: DiscoveryFrontierProposal, runner?: Queryable): Promise<boolean> {
   const db=runner||await getDb(); const d=proposal.targetDimensions;
+  // Excluded-country guardrail: excluded markets are evidence-only; OSINT
+  // proposals must not materialize for them.
+  if (findCountryExclusion(proposal.country, await readExcludedCountries(db))) return false;
   // Resolve to the existing terminology authority when it already knows this
   // identity. OSINT retains distinct evidence/proposal provenance and never
   // creates or mutates canonical terminology on its own.

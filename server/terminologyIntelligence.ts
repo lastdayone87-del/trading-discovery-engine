@@ -5,6 +5,7 @@ import type { QueryFunnelMetrics } from './queryPerformance';
 import { getDb } from './db';
 import { isTerminologyKillSwitchActive, isTerminologyKillSwitchActiveOn } from './terminologyKillSwitch';
 import { canonicalCountry } from './countryInference';
+import { findCountryExclusion, readExcludedCountries } from './countryExclusion';
 import {
   computeEvidenceChecksum,
   computeObservationKey,
@@ -1120,7 +1121,39 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       };
     }
   }
-  if (quality.v1Observations > 0) {
+  // Excluded-country guardrail: countries on the exclusion list are
+  // evidence-only. This function is the only writer of search_eligible, so
+  // the guard intercepts entry and revokes stale eligibility before the
+  // native gate and the legacy apply can run: an excluded-country term can
+  // never persist search_eligible=true through any decision path. Status is
+  // preserved unless the legacy decision demotes on yield; the exclusion
+  // reason is recorded idempotently like the quality gate above.
+  let exclusionBlocked = false;
+  const exclusion = findCountryExclusion(row.country, await readExcludedCountries(runner));
+  if (exclusion && (effectiveDecision.searchEligible || row.search_eligible)) {
+    exclusionBlocked = true;
+    const demoteFollows = row.search_eligible && effectiveDecision.status === 'DEMOTED';
+    blockedStatus = demoteFollows ? 'DEMOTED' : row.lifecycle_status;
+    if (row.search_eligible) {
+      await runner.query(
+        'UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=false,trust_tier=$3 WHERE id=$1',
+        [termId, blockedStatus, demoteFollows ? (effectiveDecision.searchEligible ? 2 : 3) : row.trust_tier]
+      );
+    }
+    const exclusionReason = `excluded-country: evidence-only (${exclusion.country}: ${exclusion.reason})`;
+    const latestExclusionEvent = await runner.query(
+      `SELECT event_type, reason FROM terminology_lifecycle_events WHERE canonical_term_id=$1 ORDER BY id DESC LIMIT 1`,
+      [termId]
+    );
+    const lastExclusionEvent = ((latestExclusionEvent.rows || [])[0] || {}) as Record<string, unknown>;
+    if (!(lastExclusionEvent.event_type === 'ELIGIBILITY_CHANGE' && lastExclusionEvent.reason === exclusionReason)) {
+      await runner.query(
+        `INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`,
+        [termId, row.lifecycle_status, blockedStatus, 'ELIGIBILITY_CHANGE', exclusionReason, JSON.stringify({ excludedCountry: exclusion.country, exclusionReason: exclusion.reason })]
+      );
+    }
+  }
+  if (!exclusionBlocked && quality.v1Observations > 0) {
     const entry = evaluateTrialEntry({ novel: quality.novel, spamConfirmed: quality.spamConfirmed });
     if (!entry.allowed) {
       if (effectiveDecision.searchEligible || row.search_eligible) {
@@ -1161,13 +1194,13 @@ export async function refreshTerminologyLifecycle(termId: number, policy = DEFAU
       }
     }
   }
-  if (!qualityBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
+  if (!qualityBlocked && !exclusionBlocked && (effectiveDecision.status !== row.lifecycle_status || effectiveDecision.searchEligible !== row.search_eligible)) {
     await runner.query('UPDATE canonical_trading_terms SET lifecycle_status=$2,search_eligible=$3,trust_tier=$4 WHERE id=$1', [termId, effectiveDecision.status, effectiveDecision.searchEligible, effectiveDecision.status === 'PROVEN_SEARCH_TERM' ? 1 : effectiveDecision.searchEligible ? 2 : 3]);
     await runner.query(`INSERT INTO terminology_lifecycle_events(canonical_term_id,from_status,to_status,event_type,reason,evidence_snapshot) VALUES($1,$2,$3,$4,$5,$6)`, [termId, row.lifecycle_status, effectiveDecision.status, effectiveDecision.status === 'DEMOTED' ? 'DEMOTION' : 'PROMOTION', effectiveDecision.reason, JSON.stringify({ distinctCreators: row.distinct_creators, distinctCommunities: row.distinct_communities, executions: row.executions, decayedEvidence: row.decayed_evidence, decayedYield: row.decayed_yield })]);
   }
   // The snapshot records the persisted lifecycle state: when the quality
   // gate blocks a transition, decision.status was never applied.
-  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, qualityBlocked ? (blockedStatus ?? row.lifecycle_status) : effectiveDecision.status, JSON.stringify(policy)]);
+  await runner.query(`INSERT INTO terminology_score_snapshots(canonical_term_id,distinct_creators,distinct_communities,human_approved_creators,decayed_evidence,decayed_yield_score,lifecycle_status,configuration) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [termId, row.distinct_creators, row.distinct_communities, row.human_approved, row.decayed_evidence, row.decayed_yield, (qualityBlocked || exclusionBlocked) ? (blockedStatus ?? row.lifecycle_status) : effectiveDecision.status, JSON.stringify(policy)]);
 }
 
 /**
@@ -1245,6 +1278,13 @@ export async function getPlannerTerminology(country: string, clientOverride?: Qu
   const isActive = deps?.isKillSwitchActive
     ?? (clientOverride ? () => isTerminologyKillSwitchActiveOn(clientOverride) : isTerminologyKillSwitchActive);
   if (await isActive()) return [];
+  // Excluded-country guardrail: an excluded market is evidence-only, so its
+  // terminology never reaches planner serving — including while stale legacy
+  // rows remain search_eligible until their next lifecycle refresh revokes.
+  // Stored terms are keyed by canonical country; the raw input is checked too
+  // so ISO/alias forms cannot slip past the list.
+  const exclusions = await readExcludedCountries(runner);
+  if (findCountryExclusion(country, exclusions) || findCountryExclusion(canonicalCountry(country), exclusions)) return [];
   const result = await runner.query(`SELECT t.id,t.canonical_term term,t.lifecycle_status,COALESCE(AVG(p.decayed_yield_score),0)::float score FROM canonical_trading_terms t LEFT JOIN terminology_performance p ON p.canonical_term_id=t.id WHERE t.country=$1 AND t.search_eligible=true AND t.lifecycle_status IN ('SEARCH_TRIAL','PROVEN_SEARCH_TERM') GROUP BY t.id ORDER BY score DESC,t.last_observed_at DESC NULLS LAST LIMIT 50`, [canonicalCountry(country)]);
   return result.rows.map(row => ({ id: Number(row.id), term: row.term, score: Number(row.score), lifecycle: row.lifecycle_status as 'SEARCH_TRIAL' | 'PROVEN_SEARCH_TERM' }));
 }
