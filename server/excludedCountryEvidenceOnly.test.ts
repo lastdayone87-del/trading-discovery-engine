@@ -499,6 +499,58 @@ test('more than 200 excluded surfaces cannot starve eligible markets behind the 
   assert.ok(runner.calls.some(c => /INSERT INTO discovery_actions/.test(c.sql)));
 });
 
+test('pagination order is total: ties cannot skip or duplicate eligible surfaces across offset pages', async () => {
+  // 205 excluded German rows and 2 eligible US rows share one
+  // (concept, locale) bucket, with the US rows straddling the 200-row page
+  // boundary. Under a non-total ORDER BY (c.id, s.locale only) PostgreSQL is
+  // free to resolve the tie differently for each offset query, so an eligible
+  // row that sits near the boundary can be skipped (or repeated). The fake
+  // emulates exactly that freedom - insertion order for offset 0, reversed
+  // insertion order afterwards - so this test fails if the pagination order
+  // loses any grouping-key tiebreaker.
+  const tieRow = (idx: number, country: string, surfaceId: number): Row => ({
+    concept_id: 1, surface_id: surfaceId, literal: `tie ${surfaceId}`, normalized: `tie ${surfaceId}`,
+    language: country === 'United States' ? 'en' : 'de', script: 'Latn', locale: 'en-US',
+    country, sense_id: 9000 + idx, source_ids: [`artifact-tie-${idx}`, `artifact-tie2-${idx}`], __idx: idx
+  });
+  const corpus: Row[] = [
+    ...Array.from({ length: 199 }, (_, i) => tieRow(i, 'Germany', 1000 + i)),
+    tieRow(199, 'United States', 5000),
+    tieRow(200, 'United States', 5001),
+    ...Array.from({ length: 6 }, (_, i) => tieRow(201 + i, 'Germany', 1200 + i))
+  ];
+  const orderField = (key: string, row: Row) =>
+    key === 'c.id' ? row.concept_id : key === 's.locale' ? row.locale : key === 's.id' ? row.surface_id : key === 'a.country' ? row.country : key === 'cs.id' ? row.sense_id : undefined;
+  const offsets: number[] = [];
+  const runner = makeRunner([
+    excludedGermany,
+    { match: /concept_market_affinities/, respond: (sql, params) => {
+      const order = (sql.match(/ORDER BY (.+?) LIMIT/) || [])[1]?.split(',').map(k => k.trim()) ?? [];
+      const offset = Number(params?.[2] ?? 0);
+      const limit = Number(params?.[1] ?? 200);
+      offsets.push(offset);
+      const rows = [...corpus].sort((a, b) => {
+        for (const key of order) {
+          const av = orderField(key, a), bv = orderField(key, b);
+          if (av !== bv) return av < bv ? -1 : 1;
+        }
+        // Reached only for rows the ORDER BY leaves tied: the cross-page
+        // freedom PostgreSQL has (and that must never be reachable).
+        return offset === 0 ? a.__idx - b.__idx : b.__idx - a.__idx;
+      });
+      return { rows: rows.slice(offset, offset + limit) };
+    } },
+    { match: /research_programs/, respond: () => ({ rows: [{ id: 1, scope: '{}' }] }) },
+    { match: /INSERT INTO discovery_hypotheses/, respond: () => ({ rows: [{ id: 7 }], rowCount: 1 }) },
+    { match: /INSERT INTO discovery_actions/, respond: () => ({ rows: [{ id: 8 }], rowCount: 1 }) }
+  ]);
+  const count = await generateMultilingualActions('2026-10-18T00:00:00Z', runner);
+  assert.equal(count, 2, 'both eligible surfaces must survive pagination when the ORDER BY is total');
+  assert.deepEqual(offsets, [0, 200], 'bounded pagination: two windows cover the tie bucket');
+  const paged = runner.calls.find(c => /concept_market_affinities/.test(c.sql));
+  assert.match(paged!.sql, /ORDER BY c\.id,s\.locale,s\.id,a\.country,cs\.id LIMIT \$2 OFFSET \$3/, 'every GROUP BY key must act as an ordering tiebreaker so offset pages are deterministic');
+});
+
 test('concept-graph action generation aborts when the exclusion read fails (fail closed)', async () => {
   const runner = makeRunner([
     throwingExclusions,
