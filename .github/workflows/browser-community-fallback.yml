@@ -7,6 +7,7 @@ on:
       - 'server/renderedCrawlerPolicy.ts'
       - 'server/browserCommunityFallback.test.ts'
       - 'server/browserCommunityFallback.integration.test.ts'
+      - 'server/renderedQueueIsolation.test.ts'
       - 'server/inspector.ts'
       - 'package.json'
       - 'package-lock.json'
