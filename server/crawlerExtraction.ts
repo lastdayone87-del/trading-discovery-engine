@@ -6,10 +6,13 @@ const VIDEO_ID = '[a-zA-Z0-9_-]{11}';
  * itself is dropped. Copy a capture into an independent string before it
  * escapes the page's scope. The Discord candidate path uses the same detach
  * step (see discordCandidates.ts) because this retention class is what fills
- * the heap during sustained crawling.
+ * the heap during sustained crawling. The UTF-16LE round trip copies code
+ * units exactly, including unpaired surrogates (for example a lone `\uD800`
+ * from JSON-escaped page data); a UTF-8 round trip would replace those with
+ * U+FFFD and silently corrupt extracted values.
  */
 export function detachPageSlice(value: string): string {
-  return Buffer.from(value, 'utf8').toString('utf8');
+  return Buffer.from(value, 'utf16le').toString('utf16le');
 }
 
 export function decodeEmbeddedMarkup(text: string): string {
