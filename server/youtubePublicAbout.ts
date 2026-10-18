@@ -2,7 +2,7 @@
  * Public YouTube channel About retrieval (no Data API keys).
  * Shared by Gate 1 country validation fallback and channel inspection.
  */
-import { decodeEmbeddedMarkup, extractEmbeddedUrls } from './crawlerExtraction';
+import { decodeEmbeddedMarkup, detachPageSlice, extractEmbeddedUrls } from './crawlerExtraction';
 import { readBoundedResponseText } from './crawlResponseBounds';
 import { isPageAssetInfrastructureUrl } from './communitySurfacePolicy';
 
@@ -185,14 +185,14 @@ export function parseYouTubeChannelAboutFromHtml(
     const ogImg =
       html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i) ||
       html.match(/<link\s+rel="image_src"\s+href="([^"]+)"/i);
-    if (ogImg?.[1]) thumbnailUrl = ogImg[1];
+    if (ogImg?.[1]) thumbnailUrl = detachPageSlice(ogImg[1]);
   }
 
   if (!bio) {
     const ogDesc =
       html.match(/<meta\s+name="description"\s+content="([^"]+)"/i) ||
       html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);
-    if (ogDesc?.[1]) bio = ogDesc[1];
+    if (ogDesc?.[1]) bio = detachPageSlice(ogDesc[1]);
   }
 
   // Page-asset infrastructure endpoints (thumbnails, playback, telemetry,
