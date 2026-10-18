@@ -2,9 +2,11 @@
  * Terminology kill switch — the operator-held emergency stop for the
  * native-terminology loop: vocabulary extraction + planner serving.
  *
- * Boundary (agreed scope): the stop freezes new discovery and serving, not
- * the whole database. Attribution and lifecycle refresh driven by
- * already-collected evidence still run while the switch is active.
+ * Boundary (agreed scope): the stop freezes extraction entirely and removes
+ * the governed canonical trial/proven atoms from planning — it is not a
+ * whole-planner halt. Legacy tier-2 learned vocabulary and organic candidate
+ * queries remain eligible in query generation, and evidence-driven
+ * attribution/lifecycle refresh continues.
  *
  * Semantics (agreed before activation):
  * - Default-ON: the loop runs unless `app_settings.terminology_kill_switch`
@@ -57,16 +59,39 @@ export async function isTerminologyKillSwitchActive(deps?: TerminologyKillSwitch
  * Same semantics, read through a caller-supplied queryable instead of the app
  * pool. Callers that deliberately pass their own client (e.g. read-only or
  * staging tooling that must not initialize the app pool's migration/seed
- * bootstrap) keep that guarantee for the switch read too.
+ * bootstrap) keep that guarantee for the switch read too. When that client is
+ * inside a transaction, the read is confined to a savepoint so a failed
+ * settings read cannot abort the caller's transaction and break the
+ * failure-safe contract ("current transaction is aborted" on the next query).
  */
 export async function isTerminologyKillSwitchActiveOn(queryable: {
   query: (sql: string, params?: any[]) => Promise<any>;
 }): Promise<boolean> {
   return readSwitch(async () => {
-    const result = await queryable.query(
-      `SELECT setting_value FROM app_settings WHERE setting_key=$1`,
-      [TERMINOLOGY_KILL_SWITCH_KEY]
+    // Inside a transaction block any statement error aborts the transaction and
+    // every later statement fails with "current transaction is aborted", which
+    // would poison the caller's transaction. Outside a transaction block
+    // PostgreSQL rejects SAVEPOINT ("can only be used in transaction blocks"),
+    // so the attempt simply falls back to a plain read — autocommit statement
+    // failures do not poison later statements.
+    const savepointed = await queryable.query('SAVEPOINT terminology_kill_switch').then(
+      () => true,
+      () => false
     );
-    return String(result?.rows?.[0]?.setting_value ?? '');
+    try {
+      const result = await queryable.query(
+        `SELECT setting_value FROM app_settings WHERE setting_key=$1`,
+        [TERMINOLOGY_KILL_SWITCH_KEY]
+      );
+      if (savepointed) {
+        await queryable.query('RELEASE SAVEPOINT terminology_kill_switch').catch(() => undefined);
+      }
+      return String(result?.rows?.[0]?.setting_value ?? '');
+    } catch (e) {
+      if (savepointed) {
+        await queryable.query('ROLLBACK TO SAVEPOINT terminology_kill_switch').catch(() => undefined);
+      }
+      throw e;
+    }
   });
 }

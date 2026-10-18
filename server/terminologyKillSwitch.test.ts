@@ -154,15 +154,60 @@ test('planner path: inactive switch returns trial atoms unchanged', async () => 
   assert.equal(calls.n, 1);
 });
 
+const SAVEPOINT_SQL = /^(SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT)/;
+
+/**
+ * Scripted queryable that mirrors PostgreSQL in autocommit mode (a pool, or a
+ * client with no open transaction): SAVEPOINT is rejected with "can only be
+ * used in transaction blocks", so the switch read falls back to a plain
+ * statement — exactly what the staging proof's pool sees.
+ */
 const scriptedPlannerClient = (calls: { sql: string[] }, settingValue: string | null) => ({
   query: async (sql: string) => {
     calls.sql.push(sql);
+    if (SAVEPOINT_SQL.test(sql)) {
+      throw new Error('SAVEPOINT can only be used in transaction blocks');
+    }
     if (sql.includes('app_settings')) {
       return { rows: settingValue == null ? [] : [{ setting_value: settingValue }] };
     }
     return { rows: [plannerTermsRow] };
   },
 }) as any;
+
+/** Data statements only — savepoint protocol calls are not gate semantics. */
+const dataQueries = (calls: { sql: string[] }) => calls.sql.filter(sql => !SAVEPOINT_SQL.test(sql));
+
+/**
+ * Scripted queryable that mirrors a PoolClient inside an open transaction: a
+ * failed statement aborts the transaction, and only a savepoint rollback
+ * restores it (verified against PostgreSQL: until then every later statement
+ * fails with "current transaction is aborted").
+ */
+const scriptedTransactionClient = (calls: { sql: string[] }, settingValue: string | null) => {
+  let poisoned = false;
+  return {
+    query: async (sql: string) => {
+      calls.sql.push(sql);
+      if (sql.startsWith('SAVEPOINT') || sql.startsWith('RELEASE SAVEPOINT')) return { rows: [] };
+      if (sql.startsWith('ROLLBACK TO SAVEPOINT')) {
+        poisoned = false; // savepoint rollback restores a usable transaction
+        return { rows: [] };
+      }
+      if (sql.includes('app_settings')) {
+        if (settingValue == null) {
+          poisoned = true; // e.g. a missing app_settings table aborts the transaction
+          throw new Error('relation "app_settings" does not exist');
+        }
+        return { rows: [{ setting_value: settingValue }] };
+      }
+      if (poisoned) {
+        throw new Error('current transaction is aborted, commands ignored until end of transaction block');
+      }
+      return { rows: [plannerTermsRow] };
+    },
+  } as any;
+};
 
 test('planner path: caller-supplied client reads the switch through that client (no app pool)', async () => {
   // Regression lock: the switch must not be read through getDb() when the
@@ -173,10 +218,11 @@ test('planner path: caller-supplied client reads the switch through that client 
   const calls = { sql: [] as string[] };
   const terms = await getPlannerTerminology('Germany', scriptedPlannerClient(calls, 'true'));
   assert.deepEqual(terms, []);
-  assert.equal(calls.sql.length, 1, `expected only the settings read, got: ${JSON.stringify(calls.sql)}`);
+  const data = dataQueries(calls);
+  assert.equal(data.length, 1, `expected only the settings read, got: ${JSON.stringify(calls.sql)}`);
   assert.ok(
-    calls.sql[0].includes('app_settings'),
-    `expected the settings read through the supplied client, got: ${calls.sql[0]}`
+    data[0].includes('app_settings'),
+    `expected the settings read through the supplied client, got: ${data[0]}`
   );
 });
 
@@ -184,10 +230,49 @@ test('planner path: caller-supplied client with stop not set proceeds through th
   const calls = { sql: [] as string[] };
   const terms = await getPlannerTerminology('Germany', scriptedPlannerClient(calls, null));
   assert.deepEqual(terms, [{ id: 1, term: 'DAX', score: 0.5, lifecycle: 'SEARCH_TRIAL' }]);
-  assert.equal(calls.sql.length, 2, `expected settings read then atoms read, got: ${JSON.stringify(calls.sql)}`);
-  assert.ok(calls.sql[0].includes('app_settings'), `first query should be the settings read, got: ${calls.sql[0]}`);
+  const data = dataQueries(calls);
+  assert.equal(data.length, 2, `expected settings read then atoms read, got: ${JSON.stringify(calls.sql)}`);
+  assert.ok(data[0].includes('app_settings'), `first query should be the settings read, got: ${data[0]}`);
   assert.ok(
-    calls.sql[1].includes('canonical_trading_terms'),
-    `second query should be the atoms read, got: ${calls.sql[1]}`
+    data[1].includes('canonical_trading_terms'),
+    `second query should be the atoms read, got: ${data[1]}`
   );
+});
+
+test('planner path: failed settings read inside a caller transaction is confined by a savepoint', async () => {
+  // Regression lock for the reviewed transaction-poisoning finding: without
+  // the savepoint confinement the aborted transaction would make the atoms
+  // query throw "current transaction is aborted" and the planner call would
+  // reject instead of continuing failure-safe (default-ON).
+  const calls = { sql: [] as string[] };
+  const { result, warnings } = await withCapturedWarnings(() =>
+    getPlannerTerminology('Germany', scriptedTransactionClient(calls, null))
+  );
+  assert.deepEqual(result, [{ id: 1, term: 'DAX', score: 0.5, lifecycle: 'SEARCH_TRIAL' }]);
+  assert.ok(
+    calls.sql.some(sql => sql.startsWith('ROLLBACK TO SAVEPOINT terminology_kill_switch')),
+    `expected the failed read to roll back to the savepoint, got: ${JSON.stringify(calls.sql)}`
+  );
+  assert.ok(
+    warnings.some(w => w.includes('[Terminology Kill Switch]') && w.includes('default-ON')),
+    `expected default-ON warning, got: ${JSON.stringify(warnings)}`
+  );
+});
+
+test('planner path: successful settings read inside a caller transaction releases the savepoint', async () => {
+  const calls = { sql: [] as string[] };
+  const { result, warnings } = await withCapturedWarnings(() =>
+    getPlannerTerminology('Germany', scriptedTransactionClient(calls, 'true'))
+  );
+  assert.deepEqual(result, []);
+  assert.ok(
+    calls.sql.some(sql => sql.startsWith('RELEASE SAVEPOINT terminology_kill_switch')),
+    `expected the savepoint to be released, got: ${JSON.stringify(calls.sql)}`
+  );
+  assert.equal(
+    calls.sql.filter(sql => sql.includes('canonical_trading_terms')).length,
+    0,
+    'no atoms query may run while the stop is active'
+  );
+  assert.equal(warnings.length, 0, `expected no warnings, got: ${JSON.stringify(warnings)}`);
 });

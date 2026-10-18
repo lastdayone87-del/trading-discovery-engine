@@ -49,8 +49,21 @@ async function main(): Promise<void> {
     txOpen = true;
 
     const identity = await client.query('SELECT current_database() AS db, current_user AS usr, now() AS at');
-    const killRow = await client.query(`SELECT setting_value FROM app_settings WHERE setting_key=$1`, [TERMINOLOGY_KILL_SWITCH_KEY]);
-    const killRaw = killRow.rows[0]?.setting_value ?? null;
+    // Settings read guarded by a savepoint: if it fails (missing table,
+    // permissions) the snapshot still reports everything else, with the switch
+    // interpreted as default-ON and the failure surfaced in the report.
+    let killRaw: string | null = null;
+    let killReadError: string | null = null;
+    await client.query('SAVEPOINT terminology_status_guard');
+    try {
+      const killRow = await client.query(`SELECT setting_value FROM app_settings WHERE setting_key=$1`, [TERMINOLOGY_KILL_SWITCH_KEY]);
+      killRaw = killRow.rows[0]?.setting_value ?? null;
+      await client.query('RELEASE SAVEPOINT terminology_status_guard');
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT terminology_status_guard').catch(() => undefined);
+      killReadError = e instanceof Error ? e.message : String(e);
+      console.warn(`[terminologyPilotStatus] app_settings read failed; reporting default-ON (unavailable): ${killReadError}`);
+    }
     // Reuse the production semantics without the app pool (the injected reader
     // keeps this script free of migration/seed bootstrap).
     const killActive = await isTerminologyKillSwitchActive({ readSetting: async () => killRaw ?? '' });
@@ -66,7 +79,7 @@ async function main(): Promise<void> {
 
     const observations = await client.query(`
       SELECT count(*)::int AS observations_7d,
-             count(*) FILTER (WHERE term_language IS NOT NULL AND term_language <> 'und')::int AS with_language_7d,
+             count(*) FILTER (WHERE NULLIF(BTRIM(term_language), '') IS NOT NULL AND BTRIM(term_language) <> 'und')::int AS with_language_7d,
              count(*) FILTER (WHERE native_evidence_status IS NOT NULL)::int AS with_native_status_7d,
              count(*) FILTER (WHERE is_code_switched)::int AS code_switched_7d
       FROM terminology_observations WHERE observed_at > now() - interval '7 days'`);
@@ -114,6 +127,7 @@ async function main(): Promise<void> {
         key: TERMINOLOGY_KILL_SWITCH_KEY,
         raw_value: killRaw,
         active: killActive,
+        read_error: killReadError,
         semantics: "default-ON: loop runs unless the setting is exactly 'true'",
       },
       serving_eligible_terms_by_country: servingRows,
